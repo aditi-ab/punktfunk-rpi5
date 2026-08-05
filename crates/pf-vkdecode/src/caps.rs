@@ -151,6 +151,14 @@ pub enum CapsError {
     /// so the per-plane `R8`/`R8G8` views the presenter samples through cannot
     /// exist on this device.
     NoMutableFormat { mode: &'static str },
+    /// The driver forces COINCIDE mode AND a layered DPB (one image array, no
+    /// `SEPARATE_REFERENCE_IMAGES`): the picture-pool model — a re-activated slot
+    /// binding a fresh free image, so delivered pictures are never decode targets
+    /// — cannot exist when every slot is a fixed layer of one array. No fleet
+    /// device has this shape (NVIDIA = distinct, RADV = separate reference
+    /// images); a device that does demotes to the next decoder rung rather than
+    /// getting a degraded copy path built for it.
+    CoincideLayeredDpb,
 }
 
 impl std::fmt::Display for CapsError {
@@ -177,6 +185,13 @@ impl std::fmt::Display for CapsError {
                     "the {mode} NV12 entry does not allow MUTABLE_FORMAT (per-plane views)"
                 )
             }
+            CapsError::CoincideLayeredDpb => {
+                write!(
+                    f,
+                    "coincide mode with a layered DPB (no SEPARATE_REFERENCE_IMAGES) — \
+                     the picture-pool model needs per-slot images; demote this device"
+                )
+            }
         }
     }
 }
@@ -196,12 +211,20 @@ pub fn derive_caps(raw: &RawH264Caps) -> Result<DecodeCaps, CapsError> {
         return Err(CapsError::NoDecodeMode);
     }
 
+    let layered_dpb = !raw
+        .capability_flags
+        .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
     // Coincide preferred when both are offered (struct docs). Each picked entry is
     // validated against the EXACT usage/create-flags its pool will use: presenter-
     // facing images (coincide pool, distinct outputs) additionally need
     // MUTABLE_FORMAT for their per-plane views; the distinct DPB needs neither
     // sampling nor plane views.
     let (dpb_format, output_format) = if coincide {
+        if layered_dpb {
+            // The picture-pool model needs per-slot images (a slot re-binds a
+            // fresh image at activation); one fixed layer per slot cannot do that.
+            return Err(CapsError::CoincideLayeredDpb);
+        }
         let mode = "coincide (DPB|DST|SAMPLED)";
         let entry = pick_nv12(&raw.coincide_formats, mode)?;
         require_usage(&entry, COINCIDE_USAGE, mode)?;
@@ -219,9 +242,7 @@ pub fn derive_caps(raw: &RawH264Caps) -> Result<DecodeCaps, CapsError> {
 
     Ok(DecodeCaps {
         coincide,
-        layered_dpb: !raw
-            .capability_flags
-            .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES),
+        layered_dpb,
         min_bitstream_offset_alignment: raw.min_bitstream_buffer_offset_alignment.max(1),
         min_bitstream_size_alignment: raw.min_bitstream_buffer_size_alignment.max(1),
         picture_access_granularity: raw.picture_access_granularity,
@@ -654,6 +675,19 @@ mod tests {
             height: 241,
         });
         assert_eq!((aligned.width, aligned.height), (321, 241));
+    }
+
+    #[test]
+    fn coincide_with_a_layered_dpb_is_unsupported_not_worked_around() {
+        // A driver forcing coincide AND a single layered DPB array: the pool
+        // model (fresh image per activation) cannot exist there, and no fleet
+        // device has this shape — refuse so the ladder demotes.
+        let mut raw = radv_like();
+        raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
+        assert_eq!(
+            derive_caps(&raw).unwrap_err(),
+            CapsError::CoincideLayeredDpb
+        );
     }
 
     #[test]

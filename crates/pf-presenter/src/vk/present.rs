@@ -408,12 +408,13 @@ impl Presenter {
             // stamped layout/semaphore/value at delivery and nothing mutates them).
             // Transition the picture's LAYER for sampling, run the same CSC pass with
             // the coded-vs-display UV scale (the 1088-row lesson), then transition BACK
-            // to the decode layout: a coincide-mode picture is a live DPB slot the next
-            // decode must find in VIDEO_DECODE_DPB_KHR (distinct-mode DST images get the
-            // same round-trip — the decoder's reuse barrier discards via UNDEFINED, so
-            // the restore costs nothing and keeps one rule). The pool images are created
-            // CONCURRENT across the graphics+decode families, so these are plain layout
-            // transitions — no queue-family ownership transfer.
+            // to the decode layout the frame names — and the submit below signals the
+            // image's timeline at `value + 1` when these reads/restores complete, which
+            // the decoder (told via the release token) waits before that image's next
+            // decode use: the layout round-trip is ORDERED against decode, not raced.
+            // The pool images are created CONCURRENT across the graphics+decode
+            // families, so these are plain layout transitions — no queue-family
+            // ownership transfer.
             let mut native_wait: Option<(vk::Semaphore, u64)> = None;
             if let (Some(f), Some(v)) = (&native_frame, &self.video) {
                 let image = vk::Image::from_raw(f.image);
@@ -638,15 +639,18 @@ impl Presenter {
             }
             // The native frame's decode-complete timeline: wait it at FRAGMENT_SHADER
             // (chaining with the acquire barrier — the same dependency-chain rule as
-            // `vkframe_acquire_barrier`). Deliberately NO signal back on the decoder's
-            // timeline: its per-slot values are the DECODER's counter (a foreign signal
-            // would collide with its next decode's value) — the slot-return contract is
-            // the release token the frame's guard sends once our fence proves the reads
-            // done.
+            // `vkframe_acquire_barrier`), and SIGNAL `value + 1` when our reads and
+            // the layout restore are done — the exact AVVkFrame write-back contract
+            // of the arm above. The decoder learns of the enqueued signal through
+            // the release token (`mark_presented`) and waits it before the image's
+            // next decode use; per-IMAGE timelines make the value spaces private, so
+            // this cannot collide with any other image's counter.
             if let Some((sem, value)) = &native_wait {
                 wait_sems.push(*sem);
                 wait_stages.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
                 wait_values.push(*value);
+                signal_sems.push(*sem);
+                signal_values.push(*value + 1);
             }
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
@@ -721,9 +725,14 @@ impl Presenter {
             if let Some(f) = win_frame.take() {
                 self.retired_hw = Some(Retired::D3d11(f));
             }
-            // Native frame: parked until the fence proves the sampling reads done — its
-            // drop THEN sends the decoder's release token (never at record time).
-            if let Some(f) = native_frame.take() {
+            // Native frame: the submit above enqueued our `value + 1` signal — mark
+            // the token so the decoder waits that write-back before reusing the
+            // image (a failed submit skipped this whole block, leaving the token
+            // unmarked: no phantom signal is ever promised). Then park until the
+            // fence proves the sampling reads done — the drop THEN sends the
+            // release token (never at record time).
+            if let Some(mut f) = native_frame.take() {
+                f.guard.mark_presented();
                 self.retired_hw = Some(Retired::NativeVk(f));
             }
 

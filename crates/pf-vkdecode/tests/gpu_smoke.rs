@@ -15,15 +15,18 @@
 //! - `timelineSemaphore` + `synchronization2` feature support (Vulkan 1.3 core).
 //!
 //! What it proves: device wrap → caps query/derivation on REAL caps → session +
-//! parameters creation → DPB/output/ring pools → 48 AUs of the vendored 25fps
-//! vector decoded through `vkCmdDecodeVideoKHR` — well past DPB-full, so the
-//! bump-eviction slot-reuse path runs — with the full frame lifecycle each
-//! delivery: `wait_status` reading the RESULT_STATUS_ONLY query back as
-//! COMPLETE, then `release_frame` returning the slot (the two-phase release the
-//! coincide-mode overwrite fix depends on). What it deliberately does NOT prove
-//! (WP-D on-glass): pixel correctness vs the ffmpeg rung, presenter
-//! interop/layout round-trips, soak, and both vendors' DPB arrangements at once
-//! (each box exercises only its own).
+//! parameters creation → the decoupled picture pool → 48 AUs of the vendored
+//! 25fps vector decoded through `vkCmdDecodeVideoKHR` — well past DPB-full, so
+//! slot re-activation binds fresh pool images repeatedly — while the consumer
+//! HOLDS FOUR delivered frames unreleased at steady state (the real client's
+//! pipeline shape: bounded channels, FrameStore preroll, in-flight present).
+//! Every frame's RESULT_STATUS_ONLY query must read COMPLETE before its
+//! release. This is the regression test for the .25 field failure class: any
+//! pool sizing that ignores the stream's DPB depth or the client's hold depth
+//! starves exactly here. What it deliberately does NOT prove (WP-D on-glass):
+//! pixel correctness vs the ffmpeg rung, presenter interop (the `value + 1`
+//! signal-back — no presenter runs here, so releases pass `false`), soak, and
+//! both vendors' DPB arrangements at once (each box exercises only its own).
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -69,7 +72,7 @@ fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
 
 #[test]
 #[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
-fn decodes_48_aus_with_status_reads_and_frame_releases_past_dpb_full() {
+fn decodes_48_aus_holding_four_frames_like_the_real_client() {
     // ---- instance ----
     // SAFETY: loads the system Vulkan loader; no Vulkan objects exist yet.
     let entry = unsafe { ash::Entry::load() }.expect("a Vulkan loader on this box");
@@ -116,6 +119,30 @@ fn decodes_48_aus_with_status_reads_and_frame_releases_past_dpb_full() {
             .map(|f| f.queue_family_properties.queue_flags)
             .collect();
         drop(families); // release the &mut borrows so video_props is readable
+
+        // Print each family's video ops + RESULT_STATUS query support — the
+        // context every failure report needs first (which mode the box runs and
+        // whether per-op status verdicts even exist here; RADV: they do not,
+        // and recording one hangs the VCN — the 2026-08 .25 lesson).
+        {
+            let mut status_props =
+                vec![vk::QueueFamilyQueryResultStatusPropertiesKHR::default(); family_count];
+            let mut families2: Vec<vk::QueueFamilyProperties2<'_>> = status_props
+                .iter_mut()
+                .map(|s| vk::QueueFamilyProperties2::default().push_next(s))
+                .collect();
+            // SAFETY: as the query above.
+            unsafe { instance.get_physical_device_queue_family_properties2(pd, &mut families2) };
+            drop(families2);
+            for (i, s) in status_props.iter().enumerate() {
+                eprintln!(
+                    "family {i}: flags={:?} video_ops={:?} query_result_status={}",
+                    flags_per_family[i],
+                    video_props[i].video_codec_operations,
+                    s.query_result_status_support != vk::FALSE,
+                );
+            }
+        }
 
         let mut decode_qf = None;
         let mut graphics_qf = None;
@@ -187,22 +214,34 @@ fn decodes_48_aus_with_status_reads_and_frame_releases_past_dpb_full() {
         let mut decoder = unsafe { VkH264Decoder::new(&handles, Box::new(NoopQueueLock)) }
             .expect("wrap the device");
 
-        // 48 AUs — far past the vector's DPB depth, so evicted slots recycle
-        // repeatedly — with WP-C's one-in/one-out lifecycle on every delivered
-        // frame: wait its status (the program's whole point: the driver must
-        // say COMPLETE, per op) and release it so its slot may host a later
-        // decode. Output lags decode by a couple of AUs (B-pictures), so the
-        // delivered count is asserted with slack.
+        // 48 AUs — far past the vector's DPB depth (max_dpb_frames = 7), so DPB
+        // slots re-activate onto fresh pool images repeatedly — with the REAL
+        // client's consumption shape: the consumer HOLDS four delivered frames
+        // and releases only the oldest beyond that (its channels + preroll +
+        // in-flight present hold ~4-7). Status is read (COMPLETE required, the
+        // program's whole point) as each frame retires; `take_ready` is drained
+        // every AU so nothing is stranded. No presenter runs here, so releases
+        // report `presenter_signaled = false` (no `value+1` write-back).
+        const CLIENT_HOLD: usize = 4;
         let aus = split_into_aus(TEST_25FPS);
+        let mut held: std::collections::VecDeque<pf_vkdecode::DecodedVkFrame> =
+            std::collections::VecDeque::new();
         let mut delivered = 0usize;
         let mut geometry_checked = false;
-        for au in aus.iter().take(48) {
-            let mut next = decoder
-                .decode(au)
-                .expect("decode an AU of the clean vector");
+        for (index, au) in aus.iter().enumerate().take(48) {
+            let mut next = decoder.decode(au).unwrap_or_else(|e| {
+                panic!(
+                    "AU {index}: decode failed: {e}\n  state: {}",
+                    decoder.debug_snapshot()
+                )
+            });
             while let Some(frame) = next {
                 if !geometry_checked {
-                    assert_eq!((frame.coded_width, frame.coded_height), (320, 240));
+                    assert_eq!(
+                        (frame.coded_width, frame.coded_height),
+                        (320, 240),
+                        "ALLOCATED extent (320x240 needs no granularity padding here)"
+                    );
                     assert_eq!(
                         (frame.crop.width, frame.crop.height),
                         (320, 240),
@@ -213,17 +252,30 @@ fn decodes_48_aus_with_status_reads_and_frame_releases_past_dpb_full() {
                     assert!(frame.value > 0);
                     geometry_checked = true;
                 }
-                assert_eq!(
-                    decoder.wait_status(&frame),
-                    DecodeStatus::Ok,
-                    "the driver must report every decode op COMPLETE"
-                );
-                decoder
-                    .release_frame(&frame)
-                    .expect("a current-generation frame releases");
+                held.push_back(frame);
                 delivered += 1;
+                // Steady state: keep CLIENT_HOLD frames in hand, retire beyond.
+                while held.len() > CLIENT_HOLD {
+                    let oldest = held.pop_front().expect("nonempty");
+                    assert_eq!(
+                        decoder.wait_status(&oldest),
+                        DecodeStatus::Ok,
+                        "AU {index}: decode op not COMPLETE\n  state: {}",
+                        decoder.debug_snapshot()
+                    );
+                    decoder
+                        .release_frame(&oldest, false)
+                        .unwrap_or_else(|e| panic!("AU {index}: release failed: {e}"));
+                }
                 next = decoder.take_ready();
             }
+        }
+        // Retire the tail the consumer still holds.
+        for frame in held.drain(..) {
+            assert_eq!(decoder.wait_status(&frame), DecodeStatus::Ok);
+            decoder
+                .release_frame(&frame, false)
+                .expect("tail frames release");
         }
         assert!(
             delivered >= 40,

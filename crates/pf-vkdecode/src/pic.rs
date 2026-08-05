@@ -360,6 +360,114 @@ mod tests {
         aus
     }
 
+    /// The decoder's picture-pool occupancy (`bound`/`pending`/`held`, exactly
+    /// `decode_inner`'s bookkeeping minus the GPU) over the WHOLE vendored
+    /// vector, with a consumer that HOLDS `hold` delivered frames before
+    /// releasing the oldest — the real client's shape (~4-7 held across its
+    /// channels, preroll and in-flight present). Returns the first starved AU
+    /// index, if any.
+    fn simulate_pool_occupancy(pool_size: usize, hold: usize) -> Option<usize> {
+        use std::collections::VecDeque;
+
+        #[derive(Clone, Default)]
+        struct SimPicture {
+            bound: bool,
+            pending: bool,
+            held: u32,
+        }
+
+        let aus = split_into_aus(TEST_25FPS);
+        let mut planner = H264Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut pictures = vec![SimPicture::default(); pool_size];
+        let mut slot_image: Vec<Option<usize>> = Vec::new();
+        // id -> pool image of the decoded picture awaiting its output verdict.
+        let mut pending: BTreeMap<PicId, usize> = BTreeMap::new();
+        // Delivered frames the consumer holds, oldest first.
+        let mut consumer: VecDeque<usize> = VecDeque::new();
+
+        for (index, au) in aus.iter().enumerate() {
+            let plan = planner.plan_au(au).expect("the clean vector plans");
+            let slots = slots.get_or_insert_with(|| {
+                slot_image = vec![None; plan.picture.max_dpb_frames + 1];
+                SlotMap::new(plan.picture.max_dpb_frames)
+            });
+            let vk = plan_to_vk(&plan, slots, 0).expect("the clean vector converts");
+
+            // Binding sync: released slots unbind; the setup slot rebinds fresh.
+            let setup = usize::from(vk.setup_slot);
+            let mut held_slots = vec![false; slot_image.len()];
+            for (slot, _id) in slots.held() {
+                held_slots[usize::from(slot)] = true;
+            }
+            for (slot, binding) in slot_image.iter_mut().enumerate() {
+                if let Some(picture) = *binding {
+                    if !held_slots[slot] || slot == setup {
+                        pictures[picture].bound = false;
+                        *binding = None;
+                    }
+                }
+            }
+
+            // The decode target: a free pool image.
+            let Some(dst) = pictures
+                .iter()
+                .position(|p| !p.bound && !p.pending && p.held == 0)
+            else {
+                return Some(index);
+            };
+            pictures[dst].pending = true;
+            pictures[dst].bound = true;
+            slot_image[setup] = Some(dst);
+            pending.insert(vk.setup_id, dst);
+
+            // Settle: outputs deliver to the consumer; removed-never-output free.
+            for id in &plan.dpb.outputs {
+                if let Some(picture) = pending.remove(id) {
+                    pictures[picture].pending = false;
+                    pictures[picture].held += 1;
+                    consumer.push_back(picture);
+                }
+            }
+            for id in &plan.dpb.removed {
+                if let Some(picture) = pending.remove(id) {
+                    pictures[picture].pending = false;
+                }
+            }
+            // The hold-N consumer: releases only once it holds MORE than `hold`.
+            while consumer.len() > hold {
+                let released = consumer.pop_front().expect("nonempty");
+                pictures[released].held -= 1;
+            }
+        }
+        None
+    }
+
+    /// The .25 field-failure regression, pool-model edition: the vendored vector
+    /// keeps up to `max_dpb_frames + 1 = 8` pictures resident AND the real
+    /// client holds ~4 delivered frames — the pool must absorb BOTH at once.
+    /// `required_slots + HOLD_HEADROOM` never starves; the counterfactual shows
+    /// an under-headroomed pool starving on the same clean stream, which is the
+    /// exact class the fixed-size ring shipped in the first WP-B round.
+    #[test]
+    fn the_full_vector_with_a_hold_four_consumer_never_starves_the_picture_pool() {
+        // This vector: max_dpb_frames = 7 → required_slots = 8 (measured;
+        // asserted inside via SlotMap sizing).
+        let required_slots = 8;
+        let headroom = crate::images::HOLD_HEADROOM as usize;
+        assert_eq!(
+            simulate_pool_occupancy(required_slots + headroom, 4),
+            None,
+            "the shipped sizing must survive the whole vector with 4 held frames"
+        );
+        // Counterfactual: holds beyond the headroom starve — the documented
+        // NoFreeSlot condition, now meaning exactly what it says.
+        assert!(
+            simulate_pool_occupancy(required_slots + 2, 4).is_some(),
+            "an under-headroomed pool must starve (else this regression proves nothing)"
+        );
+    }
+
     #[test]
     fn the_full_25fps_vector_converts_with_stable_slots_and_start_code_offsets() {
         let aus = split_into_aus(TEST_25FPS);
@@ -684,15 +792,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_dpb_bump_reuses_the_evicted_slot_only_after_its_frame_is_released() {
+    fn a_full_dpb_bump_reuses_the_slot_but_the_pool_model_binds_a_fresh_image() {
         // Depth-1 DPB (Level 1 at 320x240 ⇒ max_dpb_frames 1, capacity 2): every
         // stored P evicts the previous picture, and that picture's id lands in
-        // BOTH `outputs` and `removed` of the SAME plan — the exact sequence
-        // where, without pins, `plan_to_vk` frees the evicted slot and
-        // immediately re-assigns it as this AU's setup while the evicted
-        // picture's frame is still in the consumer's hands (the HIGH overwrite
-        // bug of the adversarial round). This test drives the decoder's exact
-        // call pattern: pin at frame creation, unpin at release_frame.
+        // BOTH `outputs` and `removed` of the SAME plan — so `plan_to_vk` frees
+        // the evicted slot and immediately re-assigns it as this AU's setup.
+        // That SLOT reuse is fine and expected; the picture-pool model's whole
+        // point is that the re-activated slot binds a DIFFERENT free image, so
+        // the delivered picture's image is never the new decode target while the
+        // consumer holds it (the HIGH overwrite bug of the adversarial round,
+        // and the .25 field failure's class).
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
             .profile_idc(Profile::Main)
@@ -714,64 +823,54 @@ mod tests {
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice(None));
 
-        // First, the COUNTERFACTUAL (no pins): the bump hands the evicted
-        // picture's slot straight back as the next setup — the bug this guards.
-        {
-            let mut planner = H264Planner::new();
-            let p0 = planner.plan_au(&au0).unwrap();
-            let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
-            let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
-            let p1 = planner
-                .plan_au(&write_p_slice(1, 2, None, 1, None))
-                .unwrap();
-            let id0 = vk0.setup_id;
-            assert!(p1.dpb.outputs.contains(&id0) && p1.dpb.removed.contains(&id0));
-            let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
-            assert_eq!(
-                vk1.setup_slot, vk0.setup_slot,
-                "without pins the delivered frame's image IS the next decode target"
-            );
-        }
-
-        // Now the decoder's discipline: every frame pins its slot at creation.
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
         let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
         let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
-        slots.pin(vk0.setup_slot);
 
-        // AU1 bumps AU0's picture (outputs + removed) — the freed slot is
-        // pinned, so the setup lands elsewhere and the unreleased frame's image
-        // is never a decode target.
+        // Decoder-side pool bookkeeping (mirrors decode_inner): image 0 hosts
+        // picture 0; the consumer receives and HOLDS its frame.
+        let pool = 2 + 1; // required_slots + 1 of headroom is enough here
+        let mut bound = vec![false; pool];
+        let mut held = vec![0u32; pool];
+        let mut slot_image: Vec<Option<usize>> = vec![None; slots.capacity()];
+        let free = |bound: &[bool], held: &[u32]| (0..pool).find(|&i| !bound[i] && held[i] == 0);
+
+        let img0 = free(&bound, &held).unwrap();
+        bound[img0] = true;
+        slot_image[usize::from(vk0.setup_slot)] = Some(img0);
+
+        // AU1 bumps AU0's picture: outputs+removed carry id0, and plan_to_vk
+        // hands the SAME slot back as the setup.
         let p1 = planner
             .plan_au(&write_p_slice(1, 2, None, 1, None))
             .unwrap();
-        assert!(p1.dpb.removed.contains(&vk0.setup_id));
+        assert!(p1.dpb.outputs.contains(&vk0.setup_id) && p1.dpb.removed.contains(&vk0.setup_id));
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
-        assert_ne!(
+        assert_eq!(
             vk1.setup_slot, vk0.setup_slot,
-            "a pinned (delivered, unreleased) slot must never be the setup"
+            "slot reuse across the bump is the planner's normal behaviour"
         );
-        slots.pin(vk1.setup_slot);
 
-        // With NOTHING released, the next AU has no assignable slot: explicit
-        // backpressure (AllPinned → the decoder's NoFreeSlot), never an overwrite.
-        let p2 = planner
-            .plan_au(&write_p_slice(2, 4, None, 1, None))
-            .unwrap();
-        assert!(matches!(
-            plan_to_vk(&p2, &mut slots, 0),
-            Err(PlanToVkError::Slot(SlotError::AllPinned { .. }))
-        ));
+        // Binding sync: the re-activated slot drops its old binding; picture 0's
+        // image is now delivered to the consumer (held), NOT freed.
+        bound[img0] = false;
+        held[img0] += 1; // outputs → delivered, consumer holds it
+        slot_image[usize::from(vk1.setup_slot)] = None;
 
-        // The consumer releases frame 0 (decoder: release_frame → unpin): its
-        // slot becomes the next setup — reuse happens exactly one release later.
-        assert!(slots.unpin(vk0.setup_slot));
-        let p3 = planner
-            .plan_au(&write_idr_slice(None))
-            .expect("an IDR restart plans after the stalled AU");
-        let vk3 = plan_to_vk(&p3, &mut slots, 0).unwrap();
-        assert_eq!(vk3.setup_slot, vk0.setup_slot);
+        // The pool hands the re-activated slot a FRESH image — never image 0.
+        let img1 = free(&bound, &held).expect("headroom guarantees a free image");
+        assert_ne!(
+            img1, img0,
+            "the held (delivered, unreleased) image must never be re-bound as a \
+             decode target — the pool decoupling IS the overwrite fix"
+        );
+        bound[img1] = true;
+        slot_image[usize::from(vk1.setup_slot)] = Some(img1);
+
+        // Once the consumer releases frame 0, image 0 returns to the free list.
+        held[img0] -= 1;
+        assert_eq!(free(&bound, &held), Some(img0));
     }
 
     #[test]

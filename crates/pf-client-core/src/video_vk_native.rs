@@ -107,6 +107,10 @@ struct Shipped {
     frame: DecodedVkFrame,
     /// The presenter (or a drop on the way there) returned the token.
     released: bool,
+    /// The token said the sampling submission (with its `value + 1` timeline
+    /// signal) was enqueued — forwarded to `release_frame` so the decoder waits
+    /// the write-back before reusing the image.
+    presented: bool,
     /// The status query read a conclusive verdict (or the poll belt expired).
     resolved: bool,
     /// Polls attempted after the token returned — see [`MAX_POLLS_AFTER_RELEASE`].
@@ -124,6 +128,7 @@ fn note_token(outstanding: &mut [Shipped], token: NativeReleaseToken) -> bool {
                 "a token's generation always matches the frame it rode on"
             );
             s.released = true;
+            s.presented = token.presented;
             true
         }
         None => false,
@@ -133,9 +138,14 @@ fn note_token(outstanding: &mut [Shipped], token: NativeReleaseToken) -> bool {
 /// The native backend: the decoder plus the shipped-frame ledger and release channel.
 pub(crate) struct NativeVulkanDecoder {
     dec: VkH264Decoder,
-    /// Cloned into every shipped frame's guard.
-    release_tx: mpsc::Sender<NativeReleaseToken>,
+    /// Cloned into every shipped frame's guard. `Option` so teardown can DROP the
+    /// backend's own sender: only then does `release_rx` report Disconnected once
+    /// the last guard is gone — the teardown short-circuit signal.
+    release_tx: Option<mpsc::Sender<NativeReleaseToken>>,
     release_rx: mpsc::Receiver<NativeReleaseToken>,
+    /// Display-ready frames not yet handed to the pump (burst outputs — decode
+    /// delivers one per call; the rest wait here, oldest first).
+    deliverable: std::collections::VecDeque<DecodedVkFrame>,
     outstanding: Vec<Shipped>,
     next_seq: u64,
 }
@@ -181,8 +191,9 @@ impl NativeVulkanDecoder {
         let (release_tx, release_rx) = mpsc::channel();
         Ok(NativeVulkanDecoder {
             dec,
-            release_tx,
+            release_tx: Some(release_tx),
             release_rx,
+            deliverable: std::collections::VecDeque::new(),
             outstanding: Vec::new(),
             next_seq: 0,
         })
@@ -193,31 +204,44 @@ impl NativeVulkanDecoder {
     /// decode trouble — a decoder error, a plan that needed concealment, or a
     /// driver-reported corrupt PREVIOUS frame — routed through the caller's shared
     /// streak/demotion machinery.
+    ///
+    /// Ordering: the CURRENT AU decodes FIRST — the planner's reference state must
+    /// advance even when a PRIOR frame's status turns out Failed, or the recovery
+    /// IDR would land on a decoder that skipped an AU and reports a phantom
+    /// reference gap. The prior-frame verdicts are checked after; a corrupt verdict
+    /// costs exactly this one AU's output (released unshown), never parser state.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<NativeVkFrame>> {
         self.drain_releases();
-        let corrupt = self.settle_statuses();
-        if corrupt > 0 {
-            // Driver-reported decode corruption on an already-delivered frame — the
-            // Ally X class, invisible to FFmpeg's query-less decoder. The frame is on
-            // (or past) the glass; erroring THIS call is what arms the reanchor gate
-            // and gets the IDR that replaces the corrupt content.
-            return Err(anyhow!(
-                "driver reported decode corruption on {corrupt} prior frame(s) \
-                 (RESULT_STATUS_ONLY query) — re-anchor needed"
-            ));
-        }
 
         let delivered = self.dec.decode(au).map_err(|e| anyhow!("decode: {e}"))?;
         let warnings = self.dec.take_warnings();
-        if !warnings.is_empty() {
-            // The AU was planned around missing/damaged references: the picture
-            // decodes, but its content is concealed. Release it unshown and surface
-            // the AU as decode trouble — same path, same volume as an FFmpeg
+        // Everything this AU made display-ready, oldest first (`take_ready` drained
+        // so burst outputs are never stranded inside the decoder).
+        let mut fresh: Vec<DecodedVkFrame> = Vec::new();
+        if let Some(frame) = delivered {
+            fresh.push(frame);
+        }
+        while let Some(frame) = self.dec.take_ready() {
+            fresh.push(frame);
+        }
+
+        let corrupt = self.settle_statuses();
+        if !warnings.is_empty() || corrupt > 0 {
+            // Concealment planned into THIS AU, or driver-reported corruption on a
+            // PRIOR frame (the Ally X class, invisible to FFmpeg's query-less
+            // decoder): this call's output is released unshown and the call errors,
+            // arming the reanchor gate — same path, same volume as an FFmpeg
             // reference-miss error (never quieter).
-            if let Some(frame) = &delivered {
-                if let Err(e) = self.dec.release_frame(frame) {
-                    tracing::debug!(error = %e, "releasing a concealed frame failed");
+            for frame in fresh {
+                if let Err(e) = self.dec.release_frame(&frame, false) {
+                    tracing::debug!(error = %e, "releasing an unshown frame failed");
                 }
+            }
+            if corrupt > 0 {
+                return Err(anyhow!(
+                    "driver reported decode corruption on {corrupt} prior frame(s) \
+                     (RESULT_STATUS_ONLY query) — re-anchor needed"
+                ));
             }
             tracing::warn!(
                 ?warnings,
@@ -230,7 +254,8 @@ impl NativeVulkanDecoder {
             );
         }
 
-        Ok(delivered.map(|frame| self.ship(frame)))
+        self.deliverable.extend(fresh);
+        Ok(self.deliverable.pop_front().map(|frame| self.ship(frame)))
     }
 
     /// Wrap a delivered [`DecodedVkFrame`] for the presenter and enter it into the
@@ -241,6 +266,7 @@ impl NativeVulkanDecoder {
         let token = NativeReleaseToken {
             seq,
             generation: frame.generation,
+            presented: false,
         };
         let native = NativeVkFrame {
             image: frame.image.as_raw(),
@@ -270,12 +296,19 @@ impl NativeVulkanDecoder {
             },
             keyframe: frame.is_idr,
             poc: frame.poc,
-            guard: NativeReleaseGuard::new(self.release_tx.clone(), token),
+            guard: NativeReleaseGuard::new(
+                self.release_tx
+                    .as_ref()
+                    .expect("release_tx lives until Drop")
+                    .clone(),
+                token,
+            ),
         };
         self.outstanding.push(Shipped {
             seq,
             frame,
             released: false,
+            presented: false,
             resolved: false,
             polls_after_release: 0,
         });
@@ -357,7 +390,7 @@ impl NativeVulkanDecoder {
             if !(s.released && s.resolved) {
                 return true;
             }
-            match dec.release_frame(&s.frame) {
+            match dec.release_frame(&s.frame, s.presented) {
                 Ok(()) => {}
                 // A session rebuild (stream renegotiation) already dropped the pools
                 // this frame indexed — nothing left to release.
@@ -371,14 +404,43 @@ impl NativeVulkanDecoder {
 
 impl Drop for NativeVulkanDecoder {
     fn drop(&mut self) {
-        // Wait (bounded) for the presenter to hand back every shipped frame before the
-        // decoder's Drop destroys the pool images: a returned token proves the
-        // sampling submission's fence was waited, i.e. no GPU work of the presenter's
-        // still reads the pools (the decoder's own drain covers only decode work).
+        // Ordering contract: the run loop drops the PRESENTER's frame (its retired
+        // slot, fence-waited) before joining the pump that owns this backend — so
+        // by the time this Drop runs, outstanding tokens are either already in the
+        // channel or arrive imminently; the bounded wait below is for that hand-off,
+        // not for future GPU work.
+        //
+        // Frames never handed to the pump release directly (unsampled).
+        for frame in std::mem::take(&mut self.deliverable) {
+            if let Err(e) = self.dec.release_frame(&frame, false) {
+                tracing::debug!(error = %e, "releasing an undelivered frame failed");
+            }
+        }
+        // Drop our own sender FIRST: once every shipped guard is gone too, the
+        // channel reports Disconnected — the "presenter can no longer produce
+        // tokens" signal that short-circuits the wait instead of burning the full
+        // budget against a presenter that is already gone.
+        drop(self.release_tx.take());
+        // Wait (bounded) for the presenter to hand back every shipped frame before
+        // the decoder's Drop destroys the pool images: a returned token proves the
+        // sampling submission's fence was waited, i.e. no GPU work of the
+        // presenter's still reads the pools (the decoder's own drain covers only
+        // decode work; graveyarded pools ride the same token contract).
         let deadline = Instant::now() + TEARDOWN_BUDGET;
         loop {
             self.drain_releases();
-            self.outstanding.retain(|s| !s.released);
+            let Self {
+                dec, outstanding, ..
+            } = self;
+            outstanding.retain(|s| {
+                if !s.released {
+                    return true;
+                }
+                if let Err(e) = dec.release_frame(&s.frame, s.presented) {
+                    tracing::debug!(error = %e, "teardown release_frame: {e}");
+                }
+                false
+            });
             if self.outstanding.is_empty() {
                 break;
             }
@@ -391,7 +453,6 @@ impl Drop for NativeVulkanDecoder {
                 );
                 break;
             }
-            // `self` holds a Sender, so the channel can't disconnect — only time out.
             match self
                 .release_rx
                 .recv_timeout((deadline - now).min(Duration::from_millis(50)))
@@ -399,10 +460,25 @@ impl Drop for NativeVulkanDecoder {
                 Ok(token) => {
                     note_token(&mut self.outstanding, token);
                 }
-                Err(_) => continue,
+                // Every sender is gone (ours dropped above, every guard dropped):
+                // no more tokens can EVER arrive — anything still outstanding is a
+                // bookkeeping ghost, not a held frame. Stop waiting.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !self.outstanding.is_empty() {
+                        tracing::debug!(
+                            outstanding = self.outstanding.len(),
+                            "release channel disconnected with entries outstanding — \
+                             no tokens can arrive; proceeding with teardown"
+                        );
+                    }
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
             }
         }
-        // `self.dec` drops after this body: it drains its own decode-side GPU work.
+        // `self.dec` drops after this body: it drains its own decode-side GPU work
+        // and destroys any remaining graveyard pools (warned — a forfeit here means
+        // the presenter kept frames past the budget).
     }
 }
 
@@ -428,9 +504,12 @@ mod tests {
                 poc: 0,
                 is_idr: false,
                 query_slot: 0,
+                submission: 0,
+                picture: 0,
                 generation,
             },
             released: false,
+            presented: false,
             resolved: false,
             polls_after_release: 0,
         }
@@ -452,18 +531,25 @@ mod tests {
             &mut outstanding,
             NativeReleaseToken {
                 seq: 1,
-                generation: 1
+                generation: 1,
+                presented: true,
             }
         ));
         assert!(!outstanding[0].released);
         assert!(outstanding[1].released);
+        assert!(
+            outstanding[1].presented,
+            "the token's presented flag rides into the ledger (the decoder waits \
+             the presenter's value+1 write-back only when it was really enqueued)"
+        );
         // A stray token (frame already settled away — e.g. a post-demotion drain)
         // matches nothing and must not panic or mis-mark.
         assert!(!note_token(
             &mut outstanding,
             NativeReleaseToken {
                 seq: 7,
-                generation: 1
+                generation: 1,
+                presented: false,
             }
         ));
         assert!(!outstanding[0].released);
@@ -475,6 +561,7 @@ mod tests {
         let token = NativeReleaseToken {
             seq: 42,
             generation: 3,
+            presented: false,
         };
         let guard = NativeReleaseGuard::new(tx, token);
         assert!(
@@ -518,6 +605,7 @@ mod tests {
                 NativeReleaseToken {
                     seq: 9,
                     generation: 5,
+                    presented: false,
                 },
             ),
         };
@@ -526,8 +614,11 @@ mod tests {
             rx.try_recv().ok(),
             Some(NativeReleaseToken {
                 seq: 9,
-                generation: 5
-            })
+                generation: 5,
+                presented: false,
+            }),
+            "an unpresented drop reports presented=false — the decoder must not \
+             wait a value+1 write-back that was never enqueued"
         );
     }
 
@@ -542,6 +633,7 @@ mod tests {
             NativeReleaseToken {
                 seq: 1,
                 generation: 1,
+                presented: false,
             },
         );
         drop(guard); // must not panic

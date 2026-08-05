@@ -163,11 +163,18 @@ pub enum NativeVkLayout {
 
 /// The release token a presented/dropped [`NativeVkFrame`] hands back to the native
 /// decode backend: `seq` names the shipped frame, `generation` the decoder session it
-/// belongs to (a stale generation releases nothing — the pools it indexed are gone).
+/// belongs to (a stale generation routes to the decoder's graveyard — retired pools
+/// die on their last token), and `presented` reports whether the presenter SAMPLED
+/// the image — i.e. whether its submission enqueued the frame's `value + 1` timeline
+/// signal (the AVVkFrame write-back the decoder must wait before reusing the image).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeReleaseToken {
     pub seq: u64,
     pub generation: u64,
+    /// The presenter's sampling submission (with its `value + 1` signal) was
+    /// enqueued for this frame. `false` for frames dropped unpresented
+    /// (newest-wins displacement, demotion drain, failed submit).
+    pub presented: bool,
 }
 
 /// Sends the frame's [`NativeReleaseToken`] exactly once, on drop — the native path's
@@ -190,6 +197,16 @@ impl NativeReleaseGuard {
         Self {
             tx,
             token: Some(token),
+        }
+    }
+
+    /// Record that the sampling submission — including the frame's `value + 1`
+    /// timeline signal — was enqueued. The presenter calls this exactly when its
+    /// submit succeeded; the token then tells the decoder to wait that write-back
+    /// before the image's next use.
+    pub fn mark_presented(&mut self) {
+        if let Some(token) = &mut self.token {
+            token.presented = true;
         }
     }
 }
@@ -442,8 +459,23 @@ const HW_DEMOTE_MIN_STREAK: std::time::Duration = std::time::Duration::from_mill
 /// presenter's device actually advertises Vulkan Video decode. Deliberately NOT an
 /// `auto` rung: entering the automatic ladder is WP-D's A/B verdict. Pure so the
 /// decision is CPU-testable.
-fn native_vulkan_gate(choice: &str, codec_id: ffmpeg::codec::Id, video_decode: bool) -> bool {
-    choice == "native-vulkan" && codec_id == ffmpeg::codec::Id::H264 && video_decode
+/// `VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR` — the raw flag bit within
+/// [`VulkanDecodeDevice::decode_video_caps`] (this crate stays ash-free).
+const VIDEO_CODEC_OP_DECODE_H264: u32 = 0x0000_0001;
+
+fn native_vulkan_gate(
+    choice: &str,
+    codec_id: ffmpeg::codec::Id,
+    video_decode: bool,
+    decode_video_caps: u32,
+) -> bool {
+    choice == "native-vulkan"
+        && codec_id == ffmpeg::codec::Id::H264
+        && video_decode
+        // The decode family must advertise the H264 op specifically —
+        // `video_decode` alone proves the extension stack, not the codec (an
+        // AV1-only decode family exists on real hardware).
+        && decode_video_caps & VIDEO_CODEC_OP_DECODE_H264 != 0
 }
 
 /// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
@@ -642,7 +674,12 @@ impl Decoder {
         // other, than the FFmpeg rungs' failures do.
         let mut choice = choice;
         if choice == "native-vulkan" {
-            if native_vulkan_gate(&choice, codec_id, vk.is_some_and(|v| v.video_decode)) {
+            if native_vulkan_gate(
+                &choice,
+                codec_id,
+                vk.is_some_and(|v| v.video_decode),
+                vk.map_or(0, |v| v.decode_video_caps),
+            ) {
                 let vk = vk.expect("gate demands video_decode, so vk is Some");
                 match NativeVulkanDecoder::new(vk) {
                     Ok(n) => {
@@ -1314,16 +1351,34 @@ mod tests {
     #[test]
     fn native_vulkan_gate_is_by_name_h264_and_capable_device_only() {
         use ffmpeg::codec::Id;
-        assert!(native_vulkan_gate("native-vulkan", Id::H264, true));
+        const H264_OP: u32 = VIDEO_CODEC_OP_DECODE_H264;
+        assert!(native_vulkan_gate("native-vulkan", Id::H264, true, H264_OP));
         // Never by any other preference — it is not an auto rung yet.
         for choice in ["auto", "", "hardware", "vulkan", "software"] {
-            assert!(!native_vulkan_gate(choice, Id::H264, true), "{choice:?}");
+            assert!(
+                !native_vulkan_gate(choice, Id::H264, true, H264_OP),
+                "{choice:?}"
+            );
         }
         // The one codec pf-vkdecode speaks.
-        assert!(!native_vulkan_gate("native-vulkan", Id::HEVC, true));
-        assert!(!native_vulkan_gate("native-vulkan", Id::AV1, true));
+        assert!(!native_vulkan_gate(
+            "native-vulkan",
+            Id::HEVC,
+            true,
+            H264_OP
+        ));
+        assert!(!native_vulkan_gate("native-vulkan", Id::AV1, true, H264_OP));
         // No Vulkan-Video-capable presenter device.
-        assert!(!native_vulkan_gate("native-vulkan", Id::H264, false));
+        assert!(!native_vulkan_gate(
+            "native-vulkan",
+            Id::H264,
+            false,
+            H264_OP
+        ));
+        // A decode family WITHOUT the H264 op (e.g. AV1-only) refuses even with
+        // the extension stack present — the caps BIT is the codec gate.
+        assert!(!native_vulkan_gate("native-vulkan", Id::H264, true, 0));
+        assert!(!native_vulkan_gate("native-vulkan", Id::H264, true, 0x4));
     }
 
     /// Lock the DRM FourCC magic numbers against typos — these are the exact values

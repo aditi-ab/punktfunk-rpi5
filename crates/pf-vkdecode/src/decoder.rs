@@ -5,18 +5,31 @@
 //! (barriers, `vkCmdBeginVideoCodingKHR` with every bound DPB slot, the one-time
 //! session RESET control, a `RESULT_STATUS_ONLY` query bracketing
 //! `vkCmdDecodeVideoKHR`) → submit on the decode queue under the caller's
-//! [`QueueLock`] with a per-output-slot timeline signal.
+//! [`QueueLock`] with a per-image timeline signal.
+//!
+//! **Image model (zero-copy, the FFmpeg pool contract):** decode targets come from
+//! a picture pool DECOUPLED from DPB slots ([`crate::images`] module docs) — a
+//! slot binds a fresh free image at activation, so a delivered picture is never a
+//! decode target while the consumer reads it. Each image's own timeline semaphore
+//! carries the AVVkFrame hand-off: the decoder signals `value+1` at decode-write,
+//! the presenter waits it, samples, restores the layout and signals `value+1`
+//! again in its own submission; [`VkH264Decoder::release_frame`] reports that
+//! write-back and the decoder waits it before the image's next use — presenter
+//! layout traffic is ordered against decode reads without any copy.
 //!
 //! The status query is THE point of this program: FFmpeg's `vulkan_decode.c` runs
 //! `nb_queries = 0` and therefore architecturally cannot see driver-reported decode
 //! corruption (the Xbox Ally X field case). Here every decode op has a query slot,
 //! [`VkH264Decoder::poll_status`] reads it WITHOUT waiting, and a non-COMPLETE
-//! result is the concealment signal WP-C wires to `want_keyframe`.
+//! result is the concealment signal the integration layer wires to
+//! `want_keyframe`.
 //!
-//! What stays for WP-C (the integration layer): feeding `PlanWarning`s and Failed
-//! statuses into the recovery machinery, presenting frames (including the
-//! coincide-mode layout dance — see [`DecodedVkFrame::layout`]), and throttling so
-//! output slots are consumed before their ring position recycles.
+//! Known residual (WP-D on-glass, same class as the shipping AVVkFrame arm): a
+//! delivered frame whose picture is STILL a live reference can be sampled by the
+//! presenter while a decode references it — reads on both sides, but the
+//! presenter's layout round-trip writes metadata. `VK_KHR_unified_image_layouts`
+//! (GENERAL everywhere) removes the round-trip entirely and is the documented
+//! fast-path TODO once the fleet's drivers carry it.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -45,8 +58,9 @@ use crate::device::DeviceHandles;
 use crate::device::QueueLock;
 use crate::device::QueueSubmitGuard;
 use crate::images::plan_pools;
-use crate::images::ImagePool;
-use crate::images::OUTPUT_RING;
+use crate::images::DpbPool;
+use crate::images::PicturePool;
+use crate::images::HOLD_HEADROOM;
 use crate::params::level_to_std;
 use crate::params::ParamsError;
 use crate::pic::plan_to_vk;
@@ -61,7 +75,6 @@ use crate::session::ParamsAction;
 use crate::session::SessionConfig;
 use crate::session::SessionError;
 use crate::session::VideoSession;
-use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
 /// Ceiling on any blocking GPU wait on the decode thread (5 s) — generous against
@@ -82,45 +95,50 @@ pub enum DecodeStatus {
     Failed,
 }
 
-/// One decoded, display-ready picture. Handles are BORROWED from the decoder's
-/// pools: valid until the decoder rebuilds its session (stream renegotiation —
-/// detectable via [`Self::generation`]). The consumer waits `semaphore >= value`
-/// before reading pixels and MUST hand every delivered frame back through
-/// [`VkH264Decoder::release_frame`] once done — the frame's slot is excluded from
-/// every reuse path (setup assignment, output-ring recycling) until then, which
-/// is what makes a delivered image safe to read while decoding continues.
+/// One decoded, display-ready picture over a pool image the decoder will not
+/// touch again until [`VkH264Decoder::release_frame`] returns it.
+///
+/// Sync contract (the AVVkFrame shape): pixels are ready when `semaphore`
+/// reaches [`Self::value`]. A consumer that SAMPLES the image must, in the same
+/// submission that waits `value`, signal `value + 1` after its reads (and layout
+/// restore) — and report that via `release_frame(frame, true)`; a consumer that
+/// drops the frame unsampled releases with `false`. Handles survive session
+/// rebuilds via the graveyard: release every frame exactly once, even
+/// stale-generation ones.
 #[derive(Debug, Clone)]
 pub struct DecodedVkFrame {
     pub image: vk::Image,
-    /// Full-picture NV12 view (what decode wrote through).
+    /// Full-picture NV12 view.
     pub view: vk::ImageView,
     /// `R8`/`R8G8` per-plane views for the presenter's sampler path.
     pub plane_views: [vk::ImageView; 2],
-    /// The image array layer the picture occupies (the views already select it).
+    /// Always 0 — pool images are single-layer (kept for the consumer ABI).
     pub layer: u32,
-    /// The layout the picture is in when the semaphore signals:
-    /// `VIDEO_DECODE_DST_KHR` (distinct mode) or `VIDEO_DECODE_DPB_KHR` (coincide
-    /// mode — the picture may still be a live reference, so a consumer that
-    /// transitions it for sampling MUST transition it back before the next decode
-    /// references the slot; WP-C owns that dance).
+    /// The layout the picture is in when the semaphore signals — and the layout
+    /// the consumer must RESTORE after sampling: `VIDEO_DECODE_DPB_KHR`
+    /// (coincide) or `VIDEO_DECODE_DST_KHR` (distinct).
     pub layout: vk::ImageLayout,
+    /// The ALLOCATED picture extent (`pictureAccessGranularity`-aligned) — what
+    /// UV-scale math must divide by (the 1088-row class); the DISPLAY region is
+    /// [`Self::crop`].
     pub coded_width: u32,
     pub coded_height: u32,
-    /// Conformance-window crop: the region to display. First-class here so no
-    /// consumer ever derives geometry from the (padded) pool shape again.
+    /// Conformance-window crop: the region to display.
     pub crop: DisplayCrop,
-    /// Timeline pair: the picture's pixels are ready when `semaphore` reaches
-    /// `value`.
+    /// Timeline pair: pixels ready at `semaphore >= value`; the sampling
+    /// consumer signals `value + 1` (see the type docs).
     pub semaphore: vk::Semaphore,
     pub value: u64,
     pub poc: i32,
     pub is_idr: bool,
-    /// The decode op's slot in the status query pool (for [`VkH264Decoder::poll_status`]).
+    /// The decode op's slot in the status query pool.
     pub query_slot: u32,
-    /// The session generation this frame's handles belong to. Bumped on every
-    /// session rebuild; a frame from an older generation points into destroyed
-    /// pools, so every decoder entry point taking a frame checks this FIRST and
-    /// reports the frame stale rather than touching the new pools.
+    /// The decode op's submission ordinal (validates the query slot has not been
+    /// re-armed since).
+    pub submission: u64,
+    /// The pool index of the image (release bookkeeping).
+    pub picture: u32,
+    /// The session generation this frame belongs to (graveyard routing).
     pub generation: u64,
 }
 
@@ -150,14 +168,14 @@ pub enum VkDecodeError {
     /// A bounded GPU wait expired: the driver is wedged; treat as fatal for this
     /// decoder instance.
     Timeout(&'static str),
-    /// Every slot that could host this decode still backs an unreleased frame:
-    /// the consumer owes [`VkH264Decoder::release_frame`] calls. Unreachable
-    /// under WP-C's one-in/one-out loop (each delivered frame is released before
-    /// the next `decode`); reaching it means the AU was planned but NOT decoded —
-    /// the caller should release frames and request a keyframe.
+    /// The picture pool is exhausted: the consumer holds more than
+    /// [`HOLD_HEADROOM`] unreleased frames while the stream's whole DPB depth is
+    /// live — a real backpressure fault worth surfacing (the pool is sized so a
+    /// correct consumer can never hit this). The AU was planned but NOT decoded;
+    /// release frames and request a keyframe.
     NoFreeSlot,
-    /// The frame belongs to an older session generation (its handles point into
-    /// destroyed pools). Delivered frames do not survive a stream renegotiation.
+    /// The frame belongs to a generation whose retired pool is already gone
+    /// (double release, or a frame outliving its graveyard entry).
     StaleFrame {
         frame_generation: u64,
         current_generation: u64,
@@ -186,7 +204,8 @@ impl std::fmt::Display for VkDecodeError {
             VkDecodeError::NoFreeSlot => {
                 write!(
                     f,
-                    "every candidate slot backs an unreleased frame — release_frame owed"
+                    "picture pool exhausted — more than {HOLD_HEADROOM} delivered frames \
+                     are unreleased (release_frame owed)"
                 )
             }
             VkDecodeError::StaleFrame {
@@ -195,8 +214,8 @@ impl std::fmt::Display for VkDecodeError {
             } => {
                 write!(
                     f,
-                    "frame from session generation {frame_generation}, current is \
-                     {current_generation} — its handles are gone"
+                    "frame from session generation {frame_generation} (current \
+                     {current_generation}) has no retired pool — double release?"
                 )
             }
             VkDecodeError::NoMemoryType { type_bits, flags } => {
@@ -279,11 +298,18 @@ impl From<AllocError> for VkDecodeError {
     }
 }
 
-/// Query pool + command pool/buffers, one op slot per output slot. Owns and
-/// destroys its Vulkan objects.
+/// Query pool + command pool/buffers. Query slots cycle per SUBMISSION (validated
+/// against [`DecodedVkFrame::submission`]); command buffers cycle within the
+/// bitstream ring's in-flight bound. Owns and destroys its Vulkan objects.
+///
+/// `query_pool` is `None` when the decode family lacks `queryResultStatusSupport`
+/// (RADV): recording a RESULT_STATUS query there is invalid — on the .25 box it
+/// HANGS the VCN ring — so no query objects exist at all and status verdicts fall
+/// back to timeline completion.
 struct OpRing {
     device: ash::Device,
-    query_pool: vk::QueryPool,
+    query_pool: Option<vk::QueryPool>,
+    query_count: u32,
     cmd_pool: vk::CommandPool,
     cmds: Vec<vk::CommandBuffer>,
 }
@@ -295,21 +321,36 @@ impl OpRing {
     unsafe fn create(
         dev: &DecodeDevice,
         std_profile_idc: hh::StdVideoH264ProfileIdc,
-        op_slots: u32,
+        query_count: u32,
+        cmd_count: u32,
     ) -> Result<Self, vk::Result> {
-        let mut chain = H264ProfileChain::new(std_profile_idc);
-        let profile = chain.wire();
-        let mut query_ci = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::RESULT_STATUS_ONLY_KHR)
-            .query_count(op_slots);
-        // Chained manually: `push_next` would clobber the profile's own `p_next`
-        // (its H264 half) — the encoder's exact precedent for this trap.
-        query_ci.p_next = (profile as *const vk::VideoProfileInfoKHR<'_>).cast();
-        // SAFETY: live device; `query_ci` roots the wired chain for the call. The
-        // video profile chained in satisfies the "same profile as the session"
-        // rule for queries used inside a coding scope.
-        let query_pool = unsafe { dev.ash().create_query_pool(&query_ci, None)? };
+        let query_pool = if dev.result_status_queries() {
+            let mut chain = H264ProfileChain::new(std_profile_idc);
+            let profile = chain.wire();
+            let mut query_ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::RESULT_STATUS_ONLY_KHR)
+                .query_count(query_count);
+            // Chained manually: `push_next` would clobber the profile's own
+            // `p_next` (its H264 half) — the encoder's exact precedent.
+            query_ci.p_next = (profile as *const vk::VideoProfileInfoKHR<'_>).cast();
+            // SAFETY: live device; `query_ci` roots the wired chain for the call.
+            // The video profile chained in satisfies the "same profile as the
+            // session" rule for queries used inside a coding scope.
+            Some(unsafe { dev.ash().create_query_pool(&query_ci, None)? })
+        } else {
+            debug!(
+                "decode family lacks queryResultStatusSupport — no per-op status \
+                 queries on this driver (verdicts fall back to timeline completion)"
+            );
+            None
+        };
 
+        let destroy_query = |pool: Option<vk::QueryPool>| {
+            if let Some(pool) = pool {
+                // SAFETY: destroying the just-created query pool (unwind path).
+                unsafe { dev.ash().destroy_query_pool(pool, None) };
+            }
+        };
         let pool_ci = vk::CommandPoolCreateInfo::default()
             .queue_family_index(dev.decode_qf())
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -317,30 +358,28 @@ impl OpRing {
         let cmd_pool = match unsafe { dev.ash().create_command_pool(&pool_ci, None) } {
             Ok(p) => p,
             Err(e) => {
-                // SAFETY: destroying the just-created query pool.
-                unsafe { dev.ash().destroy_query_pool(query_pool, None) };
+                destroy_query(query_pool);
                 return Err(e);
             }
         };
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(cmd_pool)
-            .command_buffer_count(op_slots);
+            .command_buffer_count(cmd_count);
         // SAFETY: live device + the pool created above; unwind destroys both pools
         // (destroying the command pool frees any allocated buffers).
         let cmds = match unsafe { dev.ash().allocate_command_buffers(&alloc) } {
             Ok(c) => c,
             Err(e) => {
-                // SAFETY: destroying the two pools created above.
-                unsafe {
-                    dev.ash().destroy_command_pool(cmd_pool, None);
-                    dev.ash().destroy_query_pool(query_pool, None);
-                }
+                // SAFETY: destroying the command pool created above.
+                unsafe { dev.ash().destroy_command_pool(cmd_pool, None) };
+                destroy_query(query_pool);
                 return Err(e);
             }
         };
         Ok(Self {
             device: dev.ash().clone(),
             query_pool,
+            query_count,
             cmd_pool,
             cmds,
         })
@@ -354,17 +393,42 @@ impl Drop for OpRing {
         // its buffers; both destroys ignore NULL.
         unsafe {
             self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_query_pool(self.query_pool, None);
+            if let Some(pool) = self.query_pool {
+                self.device.destroy_query_pool(pool, None);
+            }
         }
     }
 }
 
-/// Everything tied to ONE session generation. A stream renegotiation (extent, DPB
-/// depth, profile) drops and rebuilds the whole struct.
+/// A decoded picture awaiting its output verdict: which pool image holds it and
+/// everything its eventual [`DecodedVkFrame`] needs.
+struct PendingPic {
+    image: usize,
+    submission: u64,
+    query_slot: u32,
+    /// The image's timeline value the decode signalled (frame readiness).
+    timeline_value: u64,
+    crop: DisplayCrop,
+    poc: i32,
+    is_idr: bool,
+}
+
+/// A retired generation's picture pool: images the presenter still holds live
+/// here until their release tokens return, then the pool dies.
+struct RetiredPool {
+    generation: u64,
+    pool: PicturePool,
+}
+
+/// Everything tied to ONE session generation. A stream renegotiation (extent,
+/// DPB depth, profile) retires it and builds fresh.
 struct SessionState {
     session: VideoSession,
     slots: SlotMap,
-    pool: ImagePool,
+    /// Distinct mode's reference-only DPB backing; `None` in coincide mode (the
+    /// picture pool backs the DPB there).
+    dpb: Option<DpbPool>,
+    pool: PicturePool,
     ring: BitstreamRing,
     ops: OpRing,
     /// Last-known Std reference info per DPB slot — `vkCmdBeginVideoCodingKHR`
@@ -372,40 +436,21 @@ struct SessionState {
     /// slices do not reference; refreshed from each plan's setup/ref entries so
     /// marking transitions (e.g. MMCO long-term promotion) propagate.
     slot_refs: Vec<Option<hh::StdVideoDecodeH264ReferenceInfo>>,
-    /// Distinct-mode output ring cursor (unused in coincide mode).
-    out_cursor: usize,
-    /// Live-frame counts per OUTPUT slot: every [`DecodedVkFrame`] built over the
-    /// slot (pending, ready, or delivered-and-unreleased) counts one; the slot is
-    /// not reusable while nonzero. The coincide twin of this gate additionally
-    /// pins the [`SlotMap`] so `plan_to_vk`'s setup assignment skips the slot.
-    live_frames: Vec<u32>,
-}
-
-impl SessionState {
-    /// Count a new frame over `out_slot` (and pin its DPB slot in coincide mode,
-    /// where output slot == DPB slot).
-    fn note_frame_live(&mut self, out_slot: usize) {
-        self.live_frames[out_slot] += 1;
-        if self.pool.coincide {
-            // Output slots mirror DPB slots one-to-one in coincide mode; the
-            // envelope-gated capacity (<= 17) keeps the index within u8.
-            self.slots.pin(out_slot as u8);
-        }
-    }
-
-    /// Un-count a frame over `out_slot` (release or internal drop).
-    fn note_frame_dead(&mut self, out_slot: usize) {
-        match self.live_frames[out_slot].checked_sub(1) {
-            Some(remaining) => self.live_frames[out_slot] = remaining,
-            None => {
-                debug!(out_slot, "frame released more often than counted");
-                return;
-            }
-        }
-        if self.pool.coincide && !self.slots.unpin(out_slot as u8) {
-            debug!(out_slot, "coincide slot unpinned without a pin");
-        }
-    }
+    /// Coincide mode: which pool image each DPB slot currently binds (rebound at
+    /// every activation — the decoupling that keeps delivered images safe).
+    slot_image: Vec<Option<usize>>,
+    /// Per command-buffer completion tokens (reuse gate).
+    cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
+    /// Per query-slot submission ordinals (staleness validation).
+    query_marks: Vec<u64>,
+    /// Submissions recorded on this session (cmd/query indexing).
+    submitted: u64,
+    /// The newest submission's completion token (session drain).
+    last_submit: Option<(vk::Semaphore, u64)>,
+    /// The STREAM's coded extent (renegotiation comparison).
+    coded_extent: vk::Extent2D,
+    /// The granularity-aligned allocation extent (picture resources + frames).
+    image_extent: vk::Extent2D,
 }
 
 /// The native Vulkan Video H.264 decoder.
@@ -417,18 +462,18 @@ pub struct VkH264Decoder {
     caps: Option<(hh::StdVideoH264ProfileIdc, DecodeCaps)>,
     state: Option<SessionState>,
     /// Decoded pictures awaiting their planner output verdict, keyed by [`PicId`].
-    pending_frames: BTreeMap<PicId, DecodedVkFrame>,
+    pending: BTreeMap<PicId, PendingPic>,
     /// Display-ready frames not yet handed out (under the zero-reorder punktfunk
     /// envelope at most one per AU; deeper only around discontinuities/flushes).
     ready: VecDeque<DecodedVkFrame>,
-    /// Session generation: bumped on every rebuild, stamped into frames so stale
-    /// ones are detectable ([`DecodedVkFrame::generation`]).
+    /// Retired generations' pools with consumer-held images (die on their last
+    /// release token).
+    graveyard: Vec<RetiredPool>,
+    /// The most recent plan's warnings ([`Self::take_warnings`]).
+    last_warnings: Vec<PlanWarning>,
+    /// Session generation: bumped on every rebuild, stamped into frames.
     generation: u64,
     device_lost: bool,
-    /// The last `decode` call's plan warnings (concealment signals), held for
-    /// [`Self::take_warnings`] — the integration layer's recovery hook. Cleared at
-    /// every `decode` entry so a warning is never attributed to the wrong AU.
-    last_warnings: Vec<PlanWarning>,
 }
 
 impl VkH264Decoder {
@@ -452,11 +497,12 @@ impl VkH264Decoder {
             planner: H264Planner::new(),
             caps: None,
             state: None,
-            pending_frames: BTreeMap::new(),
+            pending: BTreeMap::new(),
             ready: VecDeque::new(),
+            graveyard: Vec::new(),
+            last_warnings: Vec::new(),
             generation: 0,
             device_lost: false,
-            last_warnings: Vec::new(),
         })
     }
 
@@ -466,7 +512,6 @@ impl VkH264Decoder {
     /// Never panics. `VkDecodeError::DeviceLost` latches: every later call fails
     /// fast until the owner rebuilds the decoder on fresh handles.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
-        self.last_warnings.clear();
         if self.device_lost {
             return Err(VkDecodeError::DeviceLost);
         }
@@ -477,28 +522,11 @@ impl VkH264Decoder {
         result
     }
 
-    /// The plan warnings (concealment signals) of the most recent [`Self::decode`]
-    /// call, taken. Non-empty means the AU was planned around missing/damaged
-    /// references — the picture decodes but its content is concealed, and the caller
-    /// should request a re-anchor (the recovery wiring the module doc reserves for
-    /// the integration layer).
-    pub fn take_warnings(&mut self) -> Vec<PlanWarning> {
-        std::mem::take(&mut self.last_warnings)
-    }
-
-    /// The current session generation ([`DecodedVkFrame::generation`]'s counterpart):
-    /// lets a caller holding delivered frames tell a STALE frame (its session was
-    /// rebuilt — every decoder entry point would report it so) apart from a live one,
-    /// without tripping the conservative `Failed` a stale status poll returns.
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     fn decode_inner(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         let plan = self.planner.plan_au(au)?;
         for warning in &plan.warnings {
-            // The recovery verdict is the integration layer's ([`Self::take_warnings`]);
-            // never silent here though.
+            // The recovery verdict is the integration layer's
+            // ([`Self::take_warnings`]); never silent here though.
             trace!(?warning, "plan warning");
         }
         self.last_warnings = plan.warnings.clone();
@@ -541,18 +569,6 @@ impl VkH264Decoder {
                     );
                     self.rebuild_state(&plan)?;
                 }
-                Err(PlanToVkError::Slot(SlotError::AllPinned { free })) => {
-                    // Every free slot backs an unreleased frame. A GPU drain
-                    // first (bounded — it costs nothing on this error path and
-                    // rules out any in-flight hold), but consumer pins clear
-                    // ONLY via release_frame, so the verdict stands: explicit
-                    // backpressure. The AU was planned but not decoded; the
-                    // caller releases frames and requests recovery. Unreachable
-                    // under the one-in/one-out release loop.
-                    debug!(free, "no unpinned DPB slot — release_frame owed");
-                    self.drain_gpu()?;
-                    return Err(VkDecodeError::NoFreeSlot);
-                }
                 Err(e) => return Err(VkDecodeError::Convert(e)),
             }
         }
@@ -570,43 +586,69 @@ impl VkH264Decoder {
             )));
         }
 
-        // Output slot: the setup slot itself (coincide — output IS the DPB
-        // picture, and the pin layer above already guaranteed it backs no live
-        // frame) or the next FREE ring slot (distinct — slots with live frames
-        // are skipped; all-busy is the same backpressure verdict as AllPinned).
-        let out_slot = if state.pool.coincide {
-            usize::from(vk_plan.setup_slot)
-        } else {
-            let ring_len = state.pool.outputs.len();
-            let mut chosen = None;
-            for _ in 0..ring_len {
-                let candidate = state.out_cursor;
-                state.out_cursor = (state.out_cursor + 1) % ring_len;
-                if state.live_frames[candidate] == 0 {
-                    chosen = Some(candidate);
-                    break;
+        // Coincide binding sync: slots the planner released no longer bind their
+        // images (the pictures may still be pending/held — untouched), and the
+        // setup slot's PREVIOUS binding is cleared before it binds fresh.
+        let setup = usize::from(vk_plan.setup_slot);
+        if state.dpb.is_none() {
+            let mut held = vec![false; state.slot_image.len()];
+            for (slot, _id) in state.slots.held() {
+                held[usize::from(slot)] = true;
+            }
+            for (slot, binding) in state.slot_image.iter_mut().enumerate() {
+                if let Some(picture) = *binding {
+                    if !held[slot] || slot == setup {
+                        state.pool.pictures[picture].bound = false;
+                        *binding = None;
+                    }
                 }
             }
-            match chosen {
-                Some(slot) => slot,
-                None => {
-                    debug!("every output-ring slot backs an unreleased frame");
-                    self.drain_gpu()?;
-                    return Err(VkDecodeError::NoFreeSlot);
-                }
-            }
-        };
-        let state = self.state.as_mut().expect("ensured above");
-        // The op slot's command buffer + query must not still be in flight, and
-        // (distinct mode) neither may the output image.
-        let prev = (
-            state.pool.outputs[out_slot].semaphore,
-            state.pool.outputs[out_slot].value,
-        );
-        // SAFETY: live device; the semaphore is the pool's own.
-        unsafe { wait_timeline(self.dev.ash(), prev.0, prev.1, "output slot reuse")? };
+        }
 
-        // Upload the AU (recycles/grows against the same timeline facts).
+        // The decode target: a FREE pool image (never one a consumer holds — the
+        // whole point of the pool model). Exhaustion means the consumer owes
+        // more than HOLD_HEADROOM releases; no wait can free an image here.
+        let Some(dst) = state.pool.free_index() else {
+            debug!(
+                held = state.pool.held_total(),
+                "picture pool exhausted — release_frame owed"
+            );
+            return Err(VkDecodeError::NoFreeSlot);
+        };
+
+        // Cross-queue waits (the AVVkFrame contract): the dst image's last known
+        // timeline value (covers a presenter write-back after release), plus —
+        // coincide mode — every referenced image's value, so reference reads
+        // order after any presenter layout restore already reported back.
+        let mut waits: Vec<(vk::Semaphore, u64)> = Vec::new();
+        {
+            let dst_pic = &state.pool.pictures[dst];
+            if dst_pic.value > 0 {
+                waits.push((dst_pic.semaphore, dst_pic.value));
+            }
+        }
+        if state.dpb.is_none() {
+            for r in &vk_plan.refs {
+                if let Some(picture) = state.slot_image[usize::from(r.slot)] {
+                    let pic = &state.pool.pictures[picture];
+                    if pic.value > 0 && !waits.iter().any(|(sem, _)| *sem == pic.semaphore) {
+                        waits.push((pic.semaphore, pic.value));
+                    }
+                }
+            }
+        }
+        let signal_value = state.pool.pictures[dst].value + 1;
+
+        // Command buffer + query slot for this submission.
+        let submission = state.submitted;
+        let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
+        if let Some((sem, value)) = state.cmd_marks[cmd_index] {
+            // SAFETY: live device; the token is a pool image's semaphore.
+            unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
+        }
+        let query_index = (submission % u64::from(state.ops.query_count)) as u32;
+
+        // Upload the AU (recycles/grows against submission-completion tokens).
         let device = self.dev.ash().clone();
         let mut poll = |token: &(vk::Semaphore, u64)| -> Result<bool, VkDecodeError> {
             // SAFETY: live device; the token's semaphore is a pool semaphore.
@@ -619,133 +661,243 @@ impl VkH264Decoder {
             // SAFETY: as above.
             unsafe { wait_timeline(&device2, token.0, token.1, "bitstream slot drain") }
         };
-        // SAFETY: live device; the pending tokens cover their slots' GPU reads by
-        // construction (every submit signals its output slot's semaphore and marks
-        // its bitstream slot with that pair).
-        let upload = unsafe { state.ring.upload(&self.dev, au, &mut poll, &mut wait)? };
+        // The bitstream buffer carries the SLICE NALUs only, concatenated — a
+        // real AU opens with AUD/SEI (and, at IDRs, SPS/PPS) NALUs, and feeding
+        // those to the VCN firmware inside the decode range HANGS it (the .25
+        // `vcn_unified_0 ring timeout`; FFmpeg feeds slices-only for the same
+        // reason). Slice offsets are rebased into the packed buffer.
+        let segments: Vec<std::ops::Range<usize>> =
+            plan.slices.iter().map(|s| s.data.clone()).collect();
+        let mut slice_offsets = Vec::with_capacity(segments.len());
+        let mut cursor = 0u32;
+        for segment in &segments {
+            slice_offsets.push(cursor);
+            cursor += segment.len() as u32;
+        }
+        // SAFETY: live device; the segments are the plan's own in-bounds slice
+        // ranges; every pending token is the completion signal of the submission
+        // that consumed the slot.
+        let upload = unsafe {
+            state
+                .ring
+                .upload(&self.dev, au, &segments, &mut poll, &mut wait)?
+        };
 
-        // Record + submit, signalling the output slot's next timeline value.
-        let signal_value = state.pool.outputs[out_slot].value + 1;
+        // Record + submit, signalling the dst image's next timeline value.
         // SAFETY: live device; every handle recorded below belongs to this
-        // session generation, and the AU sits uploaded in the ring slot.
+        // session generation, and the packed slices sit uploaded in the ring slot.
         unsafe {
             record_and_submit(
                 &self.dev,
                 &*self.lock,
                 state,
                 &vk_plan,
+                &slice_offsets,
                 &upload,
-                out_slot,
+                dst,
+                cmd_index,
+                query_index,
+                &waits,
                 signal_value,
             )?;
         }
-        state.pool.outputs[out_slot].value = signal_value;
-        state.ring.pending.set_pending(
-            upload.slot,
-            (state.pool.outputs[out_slot].semaphore, signal_value),
-        );
+
+        // Post-submit bookkeeping.
+        let dst_sem = state.pool.pictures[dst].semaphore;
+        state.pool.pictures[dst].value = signal_value;
+        state.pool.pictures[dst].pending = true;
+        if state.dpb.is_none() {
+            state.pool.pictures[dst].bound = true;
+            state.slot_image[setup] = Some(dst);
+        }
+        state.cmd_marks[cmd_index] = Some((dst_sem, signal_value));
+        state.query_marks[query_index as usize] = submission;
+        state.submitted += 1;
+        state.last_submit = Some((dst_sem, signal_value));
+        state
+            .ring
+            .pending
+            .set_pending(upload.slot, (dst_sem, signal_value));
 
         // Refresh the per-slot reference cache from this AU's facts.
-        state.slot_refs[usize::from(vk_plan.setup_slot)] = Some(vk_plan.setup_ref);
+        state.slot_refs[setup] = Some(vk_plan.setup_ref);
         for r in &vk_plan.refs {
             state.slot_refs[usize::from(r.slot)] = Some(r.std);
         }
 
-        // Frame bookkeeping: the decoded picture waits for its output verdict,
-        // and counts as LIVE over its slot from this moment (two-phase release:
-        // the slot is reusable only after the DPB removed the picture AND
-        // release_frame ran / the frame was dropped internally).
-        let out = &state.pool.outputs[out_slot];
-        let frame = DecodedVkFrame {
-            image: out.image,
-            view: out.view,
-            plane_views: out.plane_views,
-            layer: out.layer,
-            layout: if state.pool.coincide {
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR
-            } else {
-                vk::ImageLayout::VIDEO_DECODE_DST_KHR
+        self.pending.insert(
+            vk_plan.setup_id,
+            PendingPic {
+                image: dst,
+                submission,
+                query_slot: query_index,
+                timeline_value: signal_value,
+                crop: plan.picture.display_crop,
+                poc: plan.picture.pic_order_cnt,
+                is_idr: plan.picture.is_idr,
             },
-            coded_width: plan.picture.coded_width,
-            coded_height: plan.picture.coded_height,
-            crop: plan.picture.display_crop,
-            semaphore: out.semaphore,
-            value: signal_value,
-            poc: plan.picture.pic_order_cnt,
-            is_idr: plan.picture.is_idr,
-            query_slot: out_slot as u32,
-            generation: self.generation,
-        };
-        state.note_frame_live(out_slot);
-        self.pending_frames.insert(vk_plan.setup_id, frame);
+        );
 
-        // The plan's DPB verdicts over the pending map: outputs become ready,
-        // removed-but-never-output ids (no_output_of_prior_pics_flag discards)
-        // are DROPPED — releasing their slots, not leaking their frames.
-        let (ready, dropped) = settle_dpb(&mut self.pending_frames, &plan.dpb);
-        for frame in ready {
+        // The plan's DPB verdicts over the pending map: outputs become ready
+        // frames (their images move pending → held until released);
+        // removed-but-never-output pictures free their images.
+        let (ready, dropped) = settle_dpb(&mut self.pending, &plan.dpb);
+        let state = self.state.as_mut().expect("ensured above");
+        for entry in ready {
+            let frame = build_frame(state, &entry, self.generation);
             self.ready.push_back(frame);
         }
-        for frame in dropped {
+        for entry in dropped {
             debug!(
-                poc = frame.poc,
-                slot = frame.query_slot,
-                "picture removed without output — dropping its frame"
+                poc = entry.poc,
+                "picture removed without output — freeing its image"
             );
-            state.note_frame_dead(frame.query_slot as usize);
+            state.pool.pictures[entry.image].pending = false;
         }
         Ok(self.ready.pop_front())
     }
 
-    /// Hand a delivered frame back: its slot becomes reusable (once the planner's
-    /// DPB has also removed the picture). Every frame `decode`/`take_ready`
-    /// returns MUST come back through here exactly once — until then its image is
-    /// protected from every decode target and the pipeline eventually reports
-    /// [`VkDecodeError::NoFreeSlot`] instead of overwriting it.
-    pub fn release_frame(&mut self, frame: &DecodedVkFrame) -> Result<(), VkDecodeError> {
-        if frame.generation != self.generation {
-            // The pools this frame indexed are gone; there is nothing to release.
-            return Err(VkDecodeError::StaleFrame {
-                frame_generation: frame.generation,
-                current_generation: self.generation,
-            });
-        }
-        let Some(state) = &mut self.state else {
-            return Err(VkDecodeError::StaleFrame {
-                frame_generation: frame.generation,
-                current_generation: self.generation,
-            });
+    /// Hand a delivered frame back. `presenter_signaled` reports whether the
+    /// consumer SAMPLED the image (and therefore enqueued the `value + 1`
+    /// timeline signal per the [`DecodedVkFrame`] contract) — the decoder then
+    /// waits that write-back before the image's next use. Every frame
+    /// `decode`/`take_ready` returns must come back exactly once, including
+    /// stale-generation frames (their retired pool dies on its last token).
+    pub fn release_frame(
+        &mut self,
+        frame: &DecodedVkFrame,
+        presenter_signaled: bool,
+    ) -> Result<(), VkDecodeError> {
+        let pool = if frame.generation == self.generation {
+            match &mut self.state {
+                Some(state) => &mut state.pool,
+                None => {
+                    return Err(VkDecodeError::StaleFrame {
+                        frame_generation: frame.generation,
+                        current_generation: self.generation,
+                    })
+                }
+            }
+        } else {
+            match self
+                .graveyard
+                .iter_mut()
+                .find(|r| r.generation == frame.generation)
+            {
+                Some(retired) => &mut retired.pool,
+                None => {
+                    return Err(VkDecodeError::StaleFrame {
+                        frame_generation: frame.generation,
+                        current_generation: self.generation,
+                    })
+                }
+            }
         };
-        let slot = frame.query_slot as usize;
-        if slot >= state.live_frames.len() {
+        let index = frame.picture as usize;
+        if index >= pool.pictures.len() {
             return Err(VkDecodeError::StaleFrame {
                 frame_generation: frame.generation,
                 current_generation: self.generation,
             });
         }
-        state.note_frame_dead(slot);
+        let picture = &mut pool.pictures[index];
+        match picture.held.checked_sub(1) {
+            Some(remaining) => picture.held = remaining,
+            None => {
+                debug!(index, "frame released more often than delivered");
+                return Ok(());
+            }
+        }
+        if presenter_signaled {
+            picture.value = picture.value.max(frame.value + 1);
+        }
+        // A retired pool dies on its last token (presenter fence-waited before
+        // the token per the release contract; decode work drained at retirement).
+        if frame.generation != self.generation {
+            self.graveyard
+                .retain(|r| r.generation != frame.generation || r.pool.held_total() > 0);
+        }
         Ok(())
     }
 
     /// A display-ready frame beyond the one `decode` returned, if any (only
     /// non-empty around discontinuities/flushes — the punktfunk envelope is
-    /// zero-reorder).
+    /// zero-reorder). Drain after every decode; frames left here still occupy
+    /// pool images.
     pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         self.ready.pop_front()
+    }
+
+    /// The warnings of the most recent successfully planned AU (concealment
+    /// signals — the integration layer's want_keyframe hook). Cleared by the
+    /// next `decode`.
+    pub fn take_warnings(&mut self) -> Vec<PlanWarning> {
+        std::mem::take(&mut self.last_warnings)
+    }
+
+    /// The current session generation ([`DecodedVkFrame::generation`] of newly
+    /// delivered frames).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// One-line state snapshot for failure paths and field logs (not a stable
+    /// format).
+    pub fn debug_snapshot(&self) -> String {
+        match &self.state {
+            None => format!("gen={} <no session>", self.generation),
+            Some(state) => {
+                let occupancy: Vec<String> = state
+                    .pool
+                    .pictures
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        format!(
+                            "{i}:{}{}h{}",
+                            if p.bound { "B" } else { "-" },
+                            if p.pending { "P" } else { "-" },
+                            p.held
+                        )
+                    })
+                    .collect();
+                format!(
+                    "gen={} mode={} slots_held={}/{} pool=[{}] pending={} ready={} graveyard={}",
+                    self.generation,
+                    if state.dpb.is_none() {
+                        "coincide"
+                    } else {
+                        "distinct"
+                    },
+                    state.slots.active(),
+                    state.slots.capacity(),
+                    occupancy.join(" "),
+                    self.pending.len(),
+                    self.ready.len(),
+                    self.graveyard.len(),
+                )
+            }
+        }
     }
 
     /// Read `frame`'s decode status WITHOUT waiting.
     ///
     /// [`DecodeStatus::Failed`] covers driver-reported errors AND a query slot
-    /// recycled before it was read (the status is then unprovable — same
-    /// conservative verdict), so poll before the pipeline wraps a ring.
+    /// re-armed before it was read (the status is then unprovable — same
+    /// conservative verdict).
+    ///
+    /// On drivers whose decode family lacks `queryResultStatusSupport` (RADV)
+    /// there is no per-op verdict to read: `Ok` then means "the decode op
+    /// COMPLETED on the timeline" — the same information FFmpeg has on every
+    /// driver, no worse; the Ally-X-class detection exists exactly where the
+    /// driver can give it (NVIDIA, AMD's Windows driver).
     pub fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, false)
     }
 
     /// [`Self::poll_status`], but WAITs for the op to complete first — the only
-    /// place a status read blocks (the GPU smoke test's assertion path; WP-C's
-    /// steady state polls).
+    /// place a status read blocks (the GPU smoke test's assertion path; the
+    /// integration layer's steady state polls).
     pub fn wait_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, true)
     }
@@ -763,11 +915,38 @@ impl VkH264Decoder {
         let Some(state) = &self.state else {
             return DecodeStatus::Failed;
         };
+        let Some(query_pool) = state.ops.query_pool else {
+            // No queries on this driver: the verdict degrades to timeline
+            // completion (poll_status docs).
+            if block {
+                // SAFETY: live device; pool-owned semaphore.
+                return match unsafe {
+                    wait_timeline(self.dev.ash(), frame.semaphore, frame.value, "status wait")
+                } {
+                    Ok(()) => DecodeStatus::Ok,
+                    Err(VkDecodeError::DeviceLost) => {
+                        self.device_lost = true;
+                        DecodeStatus::Failed
+                    }
+                    Err(_) => DecodeStatus::Failed,
+                };
+            }
+            // SAFETY: live device; pool-owned semaphore.
+            return match unsafe { self.dev.ash().get_semaphore_counter_value(frame.semaphore) } {
+                Ok(current) if current >= frame.value => DecodeStatus::Ok,
+                Ok(_) => DecodeStatus::Pending,
+                Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    self.device_lost = true;
+                    DecodeStatus::Failed
+                }
+                Err(_) => DecodeStatus::Failed,
+            };
+        };
         let slot = frame.query_slot as usize;
-        if slot >= state.pool.outputs.len() || state.pool.outputs[slot].value != frame.value {
+        if slot >= state.query_marks.len() || state.query_marks[slot] != frame.submission {
             trace!(
                 slot,
-                "status query slot recycled before it was read — unprovable, reported Failed"
+                "status query slot re-armed before it was read — unprovable, reported Failed"
             );
             return DecodeStatus::Failed;
         }
@@ -779,14 +958,11 @@ impl VkH264Decoder {
         let mut status = [0i32; 1];
         // SAFETY: live device; the query pool is this session generation's own and
         // `frame.query_slot` indexes within its count (checked above against the
-        // output ring it is sized to).
+        // marks array it is sized to).
         let result = unsafe {
-            self.dev.ash().get_query_pool_results(
-                state.ops.query_pool,
-                frame.query_slot,
-                &mut status,
-                flags,
-            )
+            self.dev
+                .ash()
+                .get_query_pool_results(query_pool, frame.query_slot, &mut status, flags)
         };
         match result {
             // VkQueryResultStatusKHR: >0 complete, 0 not ready, <0 error.
@@ -806,28 +982,29 @@ impl VkH264Decoder {
     }
 
     /// Drain the planner (teardown / stream discontinuity): every buffered
-    /// picture becomes display-ready via [`Self::take_ready`] (those frames stay
-    /// live until released), all DPB slots free, and any picture removed without
-    /// ever reaching output has its frame dropped and its slot un-counted.
+    /// picture becomes display-ready via [`Self::take_ready`] (zero-copy — the
+    /// images already hold the content), all DPB slots free, and any picture
+    /// removed without ever reaching output frees its image.
     pub fn flush(&mut self) {
         let update = self.planner.flush();
-        let (ready, dropped) = settle_dpb(&mut self.pending_frames, &update);
+        let (ready, dropped) = settle_dpb(&mut self.pending, &update);
         if let Some(state) = &mut self.state {
             state.slots.apply(&update);
-            for frame in &dropped {
-                state.note_frame_dead(frame.query_slot as usize);
+            for entry in ready {
+                let frame = build_frame(state, &entry, self.generation);
+                self.ready.push_back(frame);
             }
-            // Defensive: a pending frame neither output nor removed should not
-            // exist (flush drains everything); un-count any leftover.
-            for (_, frame) in std::mem::take(&mut self.pending_frames) {
-                debug!(poc = frame.poc, "pending frame survived a flush — dropped");
-                state.note_frame_dead(frame.query_slot as usize);
+            for entry in dropped {
+                state.pool.pictures[entry.image].pending = false;
+            }
+            // Defensive: a pending picture neither output nor removed should not
+            // exist after a flush; free any leftover.
+            for (_, entry) in std::mem::take(&mut self.pending) {
+                debug!(poc = entry.poc, "pending picture survived a flush — freed");
+                state.pool.pictures[entry.image].pending = false;
             }
         } else {
-            self.pending_frames.clear();
-        }
-        for frame in ready {
-            self.ready.push_back(frame);
+            self.pending.clear();
         }
     }
 
@@ -859,10 +1036,8 @@ impl VkH264Decoder {
             height: plan.picture.coded_height,
         };
         match &self.state {
-            // Compared against the STREAM's coded extent (the pool tracks it
-            // beside its granularity-rounded image extent).
             Some(state)
-                if state.pool.coded_extent == coded
+                if state.coded_extent == coded
                     && state.session.config.std_profile_idc == std_profile =>
             {
                 Ok(())
@@ -871,34 +1046,52 @@ impl VkH264Decoder {
         }
     }
 
-    /// Tear down the current session generation (draining its GPU work) and build
-    /// a fresh one shaped by `plan`, bumping [`Self::generation`] so frames of the
-    /// old one are detectably stale.
+    /// Tear down the current session generation (draining its decode work,
+    /// retiring its picture pool to the graveyard when the consumer still holds
+    /// images) and build a fresh one shaped by `plan`, bumping
+    /// [`Self::generation`] so frames of the old one route to the graveyard.
     fn rebuild_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         self.drain_gpu()?;
-        if self.state.is_some() {
+        if let Some(state) = self.state.take() {
             debug!("rebuilding decode session (stream renegotiation)");
+            // Move the fields out (SessionState has no Drop of its own): the
+            // session/dpb/ring/ops die here — decode work was just drained and
+            // the presenter never references them. The PICTURE POOL may outlive:
+            // undelivered frames drop (their holds cleared), pending pictures
+            // free, and if the consumer still holds delivered images the pool
+            // retires to the graveyard until its last release token.
+            let SessionState { mut pool, .. } = state;
+            for frame in self.ready.drain(..) {
+                let picture = &mut pool.pictures[frame.picture as usize];
+                picture.held = picture.held.saturating_sub(1);
+            }
+            for (_, entry) in std::mem::take(&mut self.pending) {
+                pool.pictures[entry.image].pending = false;
+            }
+            for picture in &mut pool.pictures {
+                picture.bound = false;
+            }
+            let held = pool.held_total();
+            if held > 0 {
+                debug!(
+                    held,
+                    generation = self.generation,
+                    "consumer still holds images of the retired generation — graveyarding"
+                );
+                self.graveyard.push(RetiredPool {
+                    generation: self.generation,
+                    pool,
+                });
+            }
         }
-        // Frames referencing the old pools die with them (their generation stamp
-        // makes any copy the consumer still holds report stale, never read).
-        if !self.pending_frames.is_empty() || !self.ready.is_empty() {
-            debug!(
-                pending = self.pending_frames.len(),
-                ready = self.ready.len(),
-                "dropping undelivered frames across a session rebuild"
-            );
-            self.pending_frames.clear();
-            self.ready.clear();
-        }
-        self.state = None;
         self.generation += 1;
 
         let (std_profile, caps) = self.caps.as_ref().expect("ensure_state queried caps");
         let std_profile = *std_profile;
-        let dpb_slots = plan.picture.max_dpb_frames as u32 + 1;
-        if dpb_slots > caps.max_dpb_slots {
+        let required_slots = plan.picture.max_dpb_frames as u32 + 1;
+        if required_slots > caps.max_dpb_slots {
             return Err(VkDecodeError::Unsupported(format!(
-                "stream needs {dpb_slots} DPB slots, device caps at {}",
+                "stream needs {required_slots} DPB slots, device caps at {}",
                 caps.max_dpb_slots
             )));
         }
@@ -929,17 +1122,25 @@ impl VkH264Decoder {
 
         let config = SessionConfig {
             max_coded_extent: image_extent,
-            max_dpb_slots: dpb_slots,
-            max_active_references: (dpb_slots - 1).min(caps.max_active_references),
+            max_dpb_slots: required_slots,
+            max_active_references: (required_slots - 1).min(caps.max_active_references),
             std_profile_idc: std_profile,
         };
-        let pool_plan = plan_pools(caps, dpb_slots, OUTPUT_RING);
+        let pool_plan = plan_pools(caps, required_slots);
         // SAFETY: live device per the constructor contract, for every create in
         // this block; each created half is owned by a Drop type the moment it
         // exists, so a mid-build failure unwinds cleanly.
         let state = unsafe {
             let session = VideoSession::create(&self.dev, caps, config)?;
-            let pool = ImagePool::create(&self.dev, caps, &pool_plan, coded, std_profile)
+            let dpb = if caps.coincide {
+                None
+            } else {
+                Some(
+                    DpbPool::create(&self.dev, caps, &pool_plan, image_extent, std_profile)
+                        .map_err(VkDecodeError::from)?,
+                )
+            };
+            let pool = PicturePool::create(&self.dev, caps, &pool_plan, image_extent, std_profile)
                 .map_err(VkDecodeError::from)?;
             let ring = BitstreamRing::create(
                 &self.dev,
@@ -952,31 +1153,37 @@ impl VkH264Decoder {
                 std_profile,
             )
             .map_err(VkDecodeError::from)?;
-            let ops = OpRing::create(&self.dev, std_profile, pool_plan.output_slots)
+            let ops = OpRing::create(&self.dev, std_profile, pool_plan.picture_count, RING_SLOTS)
                 .map_err(VkDecodeError::from)?;
             SessionState {
                 session,
                 slots: SlotMap::new(plan.picture.max_dpb_frames),
-                slot_refs: vec![None; dpb_slots as usize],
-                live_frames: vec![0; pool_plan.output_slots as usize],
+                slot_refs: vec![None; required_slots as usize],
+                slot_image: vec![None; required_slots as usize],
+                cmd_marks: vec![None; RING_SLOTS as usize],
+                query_marks: vec![u64::MAX; pool_plan.picture_count as usize],
+                submitted: 0,
+                last_submit: None,
+                coded_extent: coded,
+                image_extent,
+                dpb,
                 pool,
                 ring,
                 ops,
-                out_cursor: 0,
             }
         };
         self.state = Some(state);
         Ok(())
     }
 
-    /// Wait out every in-flight decode of the current session generation.
+    /// Wait out every in-flight decode submission of the current session.
     fn drain_gpu(&mut self) -> Result<(), VkDecodeError> {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        for out in &state.pool.outputs {
-            // SAFETY: live device; pool-owned semaphore.
-            unsafe { wait_timeline(self.dev.ash(), out.semaphore, out.value, "session drain")? };
+        if let Some((sem, value)) = state.last_submit {
+            // SAFETY: live device; the token is a pool image's semaphore.
+            unsafe { wait_timeline(self.dev.ash(), sem, value, "session drain")? };
         }
         Ok(())
     }
@@ -984,12 +1191,21 @@ impl VkH264Decoder {
 
 impl Drop for VkH264Decoder {
     fn drop(&mut self) {
-        // Best-effort drain so the pools' Drop impls never destroy in-flight
-        // objects; a wedged driver falls through after the bounded timeout (the
-        // destroys then race the GPU, but the alternative is hanging teardown
-        // forever — same trade the encoder's fence budget makes).
+        // Best-effort decode drain so the pools' Drop impls never destroy
+        // in-flight decode work; a wedged driver falls through after the bounded
+        // timeout. Presenter-side sampling of graveyarded/held images is the
+        // CALLER's teardown contract: the integration layer waits (bounded) for
+        // every release token BEFORE dropping this decoder, so remaining
+        // graveyard pools here are either token-drained or a warned forfeit.
         if let Err(e) = self.drain_gpu() {
             debug!(error = %e, "drain on drop failed; tearing down anyway");
+        }
+        if !self.graveyard.is_empty() {
+            debug!(
+                pools = self.graveyard.len(),
+                "graveyard not fully token-drained at decoder drop — destroying anyway \
+                 (upstream teardown forfeited its bounded wait)"
+            );
         }
     }
 }
@@ -1005,19 +1221,49 @@ fn std_profile_for(plan: &AuPlan) -> Result<hh::StdVideoH264ProfileIdc, VkDecode
     }
 }
 
-/// Split one [`DpbUpdate`]'s verdicts over the pending-frame map: `outputs` (in
-/// bump order) become ready; `removed` ids that never reached output — an IDR's
+/// Build the delivered frame for one settled pending picture, moving its image
+/// pending → held.
+fn build_frame(state: &mut SessionState, entry: &PendingPic, generation: u64) -> DecodedVkFrame {
+    let picture = &mut state.pool.pictures[entry.image];
+    picture.pending = false;
+    picture.held += 1;
+    DecodedVkFrame {
+        image: picture.image,
+        view: picture.view,
+        plane_views: picture.plane_views,
+        layer: 0,
+        layout: if state.dpb.is_none() {
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR
+        } else {
+            vk::ImageLayout::VIDEO_DECODE_DST_KHR
+        },
+        coded_width: state.image_extent.width,
+        coded_height: state.image_extent.height,
+        crop: entry.crop,
+        semaphore: picture.semaphore,
+        value: entry.timeline_value,
+        poc: entry.poc,
+        is_idr: entry.is_idr,
+        query_slot: entry.query_slot,
+        submission: entry.submission,
+        picture: entry.image as u32,
+        generation,
+    }
+}
+
+/// Split one [`DpbUpdate`]'s verdicts over the pending map: `outputs` (in bump
+/// order) become deliverable; `removed` ids that never reached output — an IDR's
 /// `no_output_of_prior_pics_flag` discard, or a flush racing a drop — are
-/// returned separately so the caller releases their slots instead of leaking
-/// them in the map forever. Pure and generic for testability.
+/// returned separately so their images are freed instead of leaking. Pure and
+/// generic for testability.
 fn settle_dpb<F>(pending: &mut BTreeMap<PicId, F>, dpb: &DpbUpdate) -> (Vec<F>, Vec<F>) {
     let mut ready = Vec::new();
     for id in &dpb.outputs {
         match pending.remove(id) {
-            Some(frame) => ready.push(frame),
+            Some(entry) => ready.push(entry),
             // Ids planned before this decoder existed (post-recovery), or
             // dropped across a rebuild: display-order gaps, not errors.
-            None => trace!(id, "output id without a pending frame"),
+            None => trace!(id, "output id without a pending picture"),
         }
     }
     let dropped = dpb
@@ -1055,27 +1301,44 @@ unsafe fn wait_timeline(
     }
 }
 
-/// Record one decode op into the out-slot's command buffer and submit it under
-/// the queue lock with the timeline signal.
+/// The picture resource view bound for DPB `slot`: the bound pool image
+/// (coincide) or the DPB array layer (distinct). `None` when a coincide slot has
+/// no binding (unreachable in practice — every held slot was activated).
+fn slot_view(state: &SessionState, slot: u8) -> Option<vk::ImageView> {
+    match &state.dpb {
+        Some(dpb) => Some(dpb.dpb_view(slot)),
+        None => state.slot_image[usize::from(slot)].map(|p| state.pool.pictures[p].view),
+    }
+}
+
+/// Record one decode op into the chosen command buffer and submit it under the
+/// queue lock: image waits per the pool contract, the dst image's timeline
+/// signal at `signal_value`.
 ///
 /// # Safety
 ///
 /// Live device; `state` is the current session generation with `vk_plan` derived
-/// against its `SlotMap` and the AU resident in `upload`'s ring slot; the out
-/// slot's previous use has completed (caller waited its timeline value).
+/// against its `SlotMap`, `dst` a free pool image, the AU resident in `upload`'s
+/// ring slot, and the command buffer's previous submission completed (caller
+/// waited its mark).
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_and_submit(
     dev: &DecodeDevice,
     lock: &dyn QueueLock,
     state: &mut SessionState,
     vk_plan: &DecodePlanVk,
+    slice_offsets: &[u32],
     upload: &UploadedAu,
-    out_slot: usize,
+    dst: usize,
+    cmd_index: usize,
+    query_index: u32,
+    waits: &[(vk::Semaphore, u64)],
     signal_value: u64,
 ) -> Result<(), VkDecodeError> {
     let device = dev.ash();
-    let cmd = state.ops.cmds[out_slot];
-    let coded_extent = state.pool.coded_extent;
+    let cmd = state.ops.cmds[cmd_index];
+    let coded_extent = state.coded_extent;
+    let coincide = state.dpb.is_none();
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1096,8 +1359,8 @@ unsafe fn record_and_submit(
         .dst_access_mask(
             vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
         )];
-    // The setup target layer is fully overwritten: discard via UNDEFINED, with an
-    // execution+memory dependency on earlier ops that touched the layer.
+    // Decode targets are fully overwritten: discard via UNDEFINED with an
+    // execution+memory dependency on earlier ops that touched them.
     let decode_layer_barrier = |image: vk::Image, layer: u32, new_layout: vk::ImageLayout| {
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
@@ -1121,17 +1384,26 @@ unsafe fn record_and_submit(
                 layer_count: 1,
             })
     };
-    let (setup_image, setup_layer) = state.pool.dpb_target(vk_plan.setup_slot);
-    let mut image_barriers = vec![decode_layer_barrier(
-        setup_image,
-        setup_layer,
-        vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-    )];
-    if !state.pool.coincide {
-        let out = &state.pool.outputs[out_slot];
+    let dst_image = state.pool.pictures[dst].image;
+    let mut image_barriers = Vec::new();
+    if coincide {
+        // The dst pool image IS the setup DPB picture.
         image_barriers.push(decode_layer_barrier(
-            out.image,
-            out.layer,
+            dst_image,
+            0,
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+        ));
+    } else {
+        let dpb = state.dpb.as_ref().expect("distinct mode");
+        let (setup_image, setup_layer) = dpb.dpb_target(vk_plan.setup_slot);
+        image_barriers.push(decode_layer_barrier(
+            setup_image,
+            setup_layer,
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+        ));
+        image_barriers.push(decode_layer_barrier(
+            dst_image,
+            0,
             vk::ImageLayout::VIDEO_DECODE_DST_KHR,
         ));
     }
@@ -1143,44 +1415,66 @@ unsafe fn record_and_submit(
     unsafe { device.cmd_pipeline_barrier2(cmd, &dependency) };
 
     // This op's status query slot, reset before the coding scope (encoder idiom).
-    // SAFETY: recording; the pool is sized to the output ring (fn contract).
-    unsafe { device.cmd_reset_query_pool(cmd, state.ops.query_pool, out_slot as u32, 1) };
+    // None on drivers without queryResultStatusSupport (RADV — recording a query
+    // there hangs the VCN; OpRing docs).
+    if let Some(query_pool) = state.ops.query_pool {
+        // SAFETY: recording; `query_index` is within the pool's count (fn contract).
+        unsafe { device.cmd_reset_query_pool(cmd, query_pool, query_index, 1) };
+    }
 
     // ---- bound-slot staging ----
     // Scope list: this AU's references first, then every other still-held slot
     // (their resources must stay bound for their associations to persist), then
     // the setup slot as the ACTIVATION entry (slot index -1 binds its resource
     // without a current association; the decode op's setup slot then claims it).
-    let mut scope: Vec<(i32, u8, hh::StdVideoDecodeH264ReferenceInfo)> = Vec::new();
+    let mut scope: Vec<(i32, vk::ImageView, hh::StdVideoDecodeH264ReferenceInfo)> = Vec::new();
     for r in &vk_plan.refs {
-        scope.push((i32::from(r.slot), r.slot, r.std));
+        match slot_view(state, r.slot) {
+            Some(view) => scope.push((i32::from(r.slot), view, r.std)),
+            None => trace!(slot = r.slot, "referenced slot without a bound image"),
+        }
     }
     for (slot, _id) in state.slots.held() {
-        if slot == vk_plan.setup_slot || scope.iter().any(|(_, s, _)| *s == slot) {
+        if slot == vk_plan.setup_slot
+            || scope
+                .iter()
+                .any(|&(index, _, _)| index >= 0 && index as u8 == slot)
+        {
             continue;
         }
-        match state.slot_refs[usize::from(slot)] {
-            Some(std) => scope.push((i32::from(slot), slot, std)),
+        match (state.slot_refs[usize::from(slot)], slot_view(state, slot)) {
+            (Some(std), Some(view)) => scope.push((i32::from(slot), view, std)),
             // Unreachable in practice: every held slot was a setup slot once.
-            None => trace!(
+            _ => trace!(
                 slot,
-                "held slot without cached reference info — left unbound"
+                "held slot without reference info/binding — left unbound"
             ),
         }
     }
-    let reference_count = vk_plan.refs.len();
-    scope.push((-1, vk_plan.setup_slot, vk_plan.setup_ref));
+    let reference_count = vk_plan.refs.len().min(scope.len());
+    // The setup/dst resource: the fresh pool image (coincide) or the DPB layer
+    // (distinct — the pool image is the separate decode output).
+    let setup_view = if coincide {
+        state.pool.pictures[dst].view
+    } else {
+        state
+            .dpb
+            .as_ref()
+            .expect("distinct mode")
+            .dpb_view(vk_plan.setup_slot)
+    };
+    scope.push((-1, setup_view, vk_plan.setup_ref));
 
     // Staged arrays: resources → std infos → codec slot infos → slot infos. Each
     // vector is fully built before the next borrows it, so nothing reallocates
     // under a stored pointer.
     let resources: Vec<vk::VideoPictureResourceInfoKHR<'_>> = scope
         .iter()
-        .map(|&(_, slot, _)| {
+        .map(|&(_, view, _)| {
             vk::VideoPictureResourceInfoKHR::default()
                 .coded_extent(coded_extent)
                 .base_array_layer(0)
-                .image_view_binding(state.pool.dpb_view(slot))
+                .image_view_binding(view)
         })
         .collect();
     let std_refs: Vec<hh::StdVideoDecodeH264ReferenceInfo> =
@@ -1215,20 +1509,23 @@ unsafe fn record_and_submit(
         .picture_resource(&setup_resource)
         .push_next(&mut setup_dpb);
 
-    // Decode destination: the setup picture itself (coincide) or the output image.
-    let dst_resource = if state.pool.coincide {
+    // Decode destination: the setup picture itself (coincide) or the pool image
+    // (distinct).
+    let dst_resource = if coincide {
         setup_resource
     } else {
         vk::VideoPictureResourceInfoKHR::default()
             .coded_extent(coded_extent)
             .base_array_layer(0)
-            .image_view_binding(state.pool.outputs[out_slot].view)
+            .image_view_binding(state.pool.pictures[dst].view)
     };
 
     let std_pic = vk_plan.std_pic;
+    // Offsets rebased into the packed slices-only buffer (NOT the plan's
+    // AU-absolute offsets — the AU's non-slice NALUs were never uploaded).
     let mut h264_pic = vk::VideoDecodeH264PictureInfoKHR::default()
         .std_picture_info(&std_pic)
-        .slice_offsets(&vk_plan.slice_offsets);
+        .slice_offsets(slice_offsets);
     let mut decode_info = vk::VideoDecodeInfoKHR::default()
         .src_buffer(state.ring.buffer())
         .src_buffer_offset(upload.offset)
@@ -1260,14 +1557,13 @@ unsafe fn record_and_submit(
                 .flags(vk::VideoCodingControlFlagsKHR::RESET);
             (dev.video_queue().fp().cmd_control_video_coding_khr)(cmd, &control);
         }
-        device.cmd_begin_query(
-            cmd,
-            state.ops.query_pool,
-            out_slot as u32,
-            vk::QueryControlFlags::empty(),
-        );
+        if let Some(query_pool) = state.ops.query_pool {
+            device.cmd_begin_query(cmd, query_pool, query_index, vk::QueryControlFlags::empty());
+        }
         (dev.video_decode_queue().fp().cmd_decode_video_khr)(cmd, &decode_info);
-        device.cmd_end_query(cmd, state.ops.query_pool, out_slot as u32);
+        if let Some(query_pool) = state.ops.query_pool {
+            device.cmd_end_query(cmd, query_pool, query_index);
+        }
         (dev.video_queue().fp().cmd_end_video_coding_khr)(
             cmd,
             &vk::VideoEndCodingInfoKHR::default(),
@@ -1283,12 +1579,22 @@ unsafe fn record_and_submit(
 
     // ---- submit, under the caller's queue lock ----
     let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+    let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = waits
+        .iter()
+        .map(|&(semaphore, value)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+        })
+        .collect();
     let signals = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(state.pool.outputs[out_slot].semaphore)
+        .semaphore(state.pool.pictures[dst].semaphore)
         .value(signal_value)
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
     let submits = [vk::SubmitInfo2::default()
         .command_buffer_infos(&cmd_infos)
+        .wait_semaphore_infos(&wait_infos)
         .signal_semaphore_infos(&signals)];
     let guard = QueueSubmitGuard::acquire(lock);
     // SAFETY: the decode queue is the device's own (DeviceHandles contract) and
@@ -1318,7 +1624,7 @@ mod tests {
 
         // Picture 1 outputs (and is also removed — the normal bump); picture 2
         // is removed WITHOUT ever reaching output (no_output_of_prior_pics):
-        // its frame must come back as dropped, not leak in the map.
+        // its image must be freed, not leak in the map.
         let update = DpbUpdate {
             stored: Some(3),
             outputs: vec![1],

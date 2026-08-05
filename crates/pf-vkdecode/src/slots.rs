@@ -14,10 +14,8 @@ use tracing::trace;
 /// The H.264 slot ceiling: 16 reference frames plus the picture being decoded.
 const MAX_SLOTS: usize = 17;
 
-/// What went wrong with a slot operation. `Full`/`AlreadyAssigned` are caller
-/// bugs, not stream conditions — pf-bitstream degrades stream damage to warnings
-/// long before here. `AllPinned` is neither: it reports a consumer that has not
-/// released delivered frames (backpressure, not a ledger fault).
+/// What went wrong with a slot operation. Both variants are caller bugs, not stream
+/// conditions — pf-bitstream degrades stream damage to warnings long before here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotError {
     /// No free slot. The map is sized to `max_dpb_frames + 1`, which the planner's
@@ -25,11 +23,6 @@ pub enum SlotError {
     Full { capacity: usize },
     /// The id already holds a slot; ids are per-picture and never re-assigned.
     AlreadyAssigned { id: PicId, slot: u8 },
-    /// Free slots exist but every one is [pinned](SlotMap::pin) by an out-of-DPB
-    /// reader (a delivered frame the consumer has not released). Assigning one
-    /// would let the next decode overwrite an image someone is still reading —
-    /// the caller must surface backpressure instead.
-    AllPinned { free: usize },
 }
 
 impl std::fmt::Display for SlotError {
@@ -44,12 +37,6 @@ impl std::fmt::Display for SlotError {
             SlotError::AlreadyAssigned { id, slot } => {
                 write!(f, "picture {id} already holds slot {slot}")
             }
-            SlotError::AllPinned { free } => {
-                write!(
-                    f,
-                    "every free DPB slot ({free}) is pinned by an unreleased frame"
-                )
-            }
         }
     }
 }
@@ -62,19 +49,16 @@ impl std::error::Error for SlotError {}
 /// Invariants (unit-tested):
 /// - a [`PicId`] keeps its slot from [`Self::assign`] until [`Self::release`];
 /// - a slot is reused only after its holder is released;
-/// - assigning past capacity errors instead of evicting;
-/// - a [pinned](Self::pin) slot is never assigned, held or free — pins are the
-///   WP-B two-phase-release layer: a slot backing a DELIVERED-but-unreleased
-///   frame stays pinned past its DPB eviction, because in coincide mode the next
-///   setup assignment would otherwise overwrite the very image the consumer is
-///   still reading (the full-DPB bump hands `outputs`+`removed` the same id in
-///   the same plan, and the freed slot is exactly the lowest one).
+/// - assigning past capacity errors instead of evicting.
+///
+/// Slots are pure planner bookkeeping: consumers never hold a SLOT (the decoder's
+/// picture pool decouples IMAGES from slots — a re-activated slot binds a fresh
+/// free image, so a delivered picture's image is never a decode target while the
+/// consumer reads it).
 #[derive(Debug, Clone)]
 pub struct SlotMap {
     /// `slots[i]` holds the id bound to slot `i`, `None` while the slot is free.
     slots: Vec<Option<PicId>>,
-    /// Out-of-DPB reader counts per slot (refcounted, orthogonal to residency).
-    pinned: Vec<u32>,
 }
 
 impl SlotMap {
@@ -94,7 +78,6 @@ impl SlotMap {
         );
         Self {
             slots: vec![None; max_dpb_frames + 1],
-            pinned: vec![0; max_dpb_frames + 1],
         }
     }
 
@@ -119,62 +102,21 @@ impl SlotMap {
             .filter_map(|(index, slot)| slot.map(|id| (index as u8, id)))
     }
 
-    /// Bind `id` to the lowest free UNPINNED slot.
-    ///
-    /// Free-but-pinned slots are skipped (their images are still read outside the
-    /// DPB); when only such slots remain the error is [`SlotError::AllPinned`],
-    /// distinct from [`SlotError::Full`] because it names a consumer that owes a
-    /// release, not a ledger bug.
+    /// Bind `id` to the lowest free slot.
     pub fn assign(&mut self, id: PicId) -> Result<u8, SlotError> {
         if let Some(slot) = self.slot_of(id) {
             return Err(SlotError::AlreadyAssigned { id, slot });
         }
-        let mut free_but_pinned = 0usize;
-        let assignable = self.slots.iter().enumerate().position(|(index, slot)| {
-            if slot.is_some() {
-                return false;
-            }
-            if self.pinned[index] > 0 {
-                free_but_pinned += 1;
-                return false;
-            }
-            true
-        });
-        match assignable {
-            Some(free) => {
-                self.slots[free] = Some(id);
-                // The envelope-gated capacity (<= 17) keeps every index within u8.
-                Ok(free as u8)
-            }
-            None if free_but_pinned > 0 => Err(SlotError::AllPinned {
-                free: free_but_pinned,
-            }),
-            None => Err(SlotError::Full {
+        let free = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(SlotError::Full {
                 capacity: self.slots.len(),
-            }),
-        }
-    }
-
-    /// Add one out-of-DPB reader to `slot` (refcounted): the slot stays
-    /// unassignable — even after its picture leaves the DPB — until the matching
-    /// [`Self::unpin`]. The decoder pins a slot for every live [frame] it backs
-    /// and unpins on `release_frame`/internal drop.
-    ///
-    /// [frame]: crate::decoder::DecodedVkFrame
-    pub fn pin(&mut self, slot: u8) {
-        self.pinned[usize::from(slot)] += 1;
-    }
-
-    /// Remove one reader from `slot`. Returns `false` (and changes nothing) when
-    /// the slot carried no pin — a double release, tolerated but never silent at
-    /// the caller.
-    pub fn unpin(&mut self, slot: u8) -> bool {
-        let count = &mut self.pinned[usize::from(slot)];
-        if *count == 0 {
-            return false;
-        }
-        *count -= 1;
-        true
+            })?;
+        self.slots[free] = Some(id);
+        // The envelope-gated capacity (<= 17) keeps every index within u8.
+        Ok(free as u8)
     }
 
     /// The slot `id` holds, if any.
@@ -307,45 +249,6 @@ mod tests {
         });
         assert_eq!(slots.slot_of(1), Some(0));
         assert_eq!(slots.slot_of(2), None);
-    }
-
-    #[test]
-    fn a_pinned_slot_is_skipped_by_assign_until_every_pin_is_released() {
-        let mut slots = SlotMap::new(1); // capacity 2
-        let s0 = slots.assign(1).unwrap();
-        slots.pin(s0);
-        slots.pin(s0); // refcounted: two readers
-        slots.release(1); // DPB eviction — the pin must keep protecting the slot
-
-        // The pinned slot is skipped; the other free slot is handed out.
-        let s1 = slots.assign(2).unwrap();
-        assert_ne!(s1, s0);
-
-        // Now every free slot is pinned: a DISTINCT error from Full (the ledger
-        // is fine; the consumer owes a release).
-        assert_eq!(slots.assign(3), Err(SlotError::AllPinned { free: 1 }));
-
-        // One unpin is not enough (two readers were counted)…
-        assert!(slots.unpin(s0));
-        assert_eq!(slots.assign(3), Err(SlotError::AllPinned { free: 1 }));
-        // …the second frees it, and the slot is assignable again.
-        assert!(slots.unpin(s0));
-        assert_eq!(slots.assign(3), Ok(s0));
-
-        // A pin-less unpin is a reported no-op, not an underflow.
-        assert!(!slots.unpin(s1));
-    }
-
-    #[test]
-    fn full_and_all_pinned_stay_distinct_verdicts() {
-        let mut slots = SlotMap::new(1); // capacity 2
-        slots.assign(1).unwrap();
-        slots.assign(2).unwrap();
-        // Genuinely full (all HELD): the missed-removals bug class.
-        assert_eq!(slots.assign(3), Err(SlotError::Full { capacity: 2 }));
-        // A pin on a HELD slot changes nothing about that verdict.
-        slots.pin(0);
-        assert_eq!(slots.assign(3), Err(SlotError::Full { capacity: 2 }));
     }
 
     #[test]

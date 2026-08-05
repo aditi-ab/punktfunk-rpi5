@@ -161,6 +161,12 @@ pub struct DecodeDevice {
     decode_queue: vk::Queue,
     decode_qf: u32,
     graphics_qf: u32,
+    /// The decode family advertises `queryResultStatusSupport`: per-op
+    /// RESULT_STATUS queries are legal in its video coding scopes. FALSE on RADV
+    /// (2026-08, .25: recording one anyway hangs the VCN ring) — the decoder
+    /// must skip queries entirely there and fall back to timeline-completion
+    /// verdicts.
+    result_status_queries: bool,
 }
 
 impl DecodeDevice {
@@ -225,6 +231,32 @@ impl DecodeDevice {
         // name a queue the device was created with.
         let decode_queue =
             unsafe { device.get_device_queue(handles.decode_qf, handles.decode_queue_index) };
+
+        // Whether the decode family supports RESULT_STATUS queries (per-family
+        // cap; struct field docs).
+        let physical_device = vk::PhysicalDevice::from_raw(handles.physical_device as u64);
+        // SAFETY: live physical device (caller contract); the two-call form fills
+        // the chained per-family status-support structs.
+        let family_count =
+            unsafe { instance.get_physical_device_queue_family_properties2_len(physical_device) };
+        let result_status_queries = if (handles.decode_qf as usize) < family_count {
+            let mut status_props =
+                vec![vk::QueueFamilyQueryResultStatusPropertiesKHR::default(); family_count];
+            let mut families: Vec<vk::QueueFamilyProperties2<'_>> = status_props
+                .iter_mut()
+                .map(|s| vk::QueueFamilyProperties2::default().push_next(s))
+                .collect();
+            // SAFETY: as above, arrays sized to the reported count.
+            unsafe {
+                instance
+                    .get_physical_device_queue_family_properties2(physical_device, &mut families)
+            };
+            drop(families);
+            status_props[handles.decode_qf as usize].query_result_status_support != vk::FALSE
+        } else {
+            false
+        };
+
         // `entry` is only the ladder the tables above were loaded through; nothing
         // needs it afterwards (ash tables own their function pointers).
         drop(entry);
@@ -232,18 +264,25 @@ impl DecodeDevice {
         Ok(Self {
             instance,
             device,
-            physical_device: vk::PhysicalDevice::from_raw(handles.physical_device as u64),
+            physical_device,
             video_queue_instance,
             video_queue,
             video_decode_queue,
             decode_queue,
             decode_qf: handles.decode_qf,
             graphics_qf: handles.graphics_qf,
+            result_status_queries,
         })
     }
 
     pub(crate) fn ash(&self) -> &ash::Device {
         &self.device
+    }
+
+    /// Whether the decode family supports per-op RESULT_STATUS queries (struct
+    /// field docs — FALSE on RADV, where recording one hangs the VCN).
+    pub(crate) fn result_status_queries(&self) -> bool {
+        self.result_status_queries
     }
 
     pub(crate) fn physical_device(&self) -> vk::PhysicalDevice {

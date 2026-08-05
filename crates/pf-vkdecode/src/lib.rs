@@ -27,13 +27,17 @@
 //!   coincide/distinct/layered decision table ([`DecodeCaps`]).
 //! - [`session`]: `VkVideoSessionKHR` + versioned session parameters (pure ledger
 //!   decides Add-vs-Recreate; extent/DPB renegotiation rebuilds the session).
-//! - [`images`]: DPB + output pools for BOTH DPB arrangements (pure [`plan_pools`]
-//!   decides the shape), per-plane views, one timeline semaphore per output slot,
-//!   crop carried on the frame.
-//! - [`ring`]: the host-visible bitstream upload ring (pure alignment/growth math).
+//! - [`images`]: the picture pool DECOUPLED from DPB slots (the zero-copy FFmpeg
+//!   pool model — a re-activated slot binds a fresh free image, so delivered
+//!   pictures are never decode targets), per-image timeline semaphores with the
+//!   presenter `value+1` write-back, per-plane views, [`HOLD_HEADROOM`] sizing.
+//! - [`ring`]: the host-visible bitstream upload ring (pure alignment/growth
+//!   math) — SLICE NALUs only (feeding a whole AU hangs VCN firmware).
 //! - [`decoder`]: [`VkH264Decoder`] — plan → convert → upload → record → submit,
 //!   with a per-op `RESULT_STATUS_ONLY` query ([`VkH264Decoder::poll_status`]) so
-//!   driver-reported corruption is finally observable (the Ally X class).
+//!   driver-reported corruption is finally observable (the Ally X class) —
+//!   caps-gated per queue family: where `queryResultStatusSupport` is absent
+//!   (RADV), verdicts degrade to timeline completion, FFmpeg parity.
 //!
 //! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
 //! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
@@ -80,6 +84,7 @@ pub use device::QueueLock;
 pub use device::QueueSubmitGuard;
 pub use images::plan_pools;
 pub use images::PoolPlan;
+pub use images::HOLD_HEADROOM;
 pub use params::pps_to_std;
 pub use params::sps_to_std;
 pub use params::OwnedStdPps;

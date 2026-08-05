@@ -822,6 +822,12 @@ fn pump(
                         // every frame (its decode really is done by now).
                         let hw_fence = match &image {
                             DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
+                            // DecodedImage::NativeVk carries the same (semaphore,
+                            // value) pair and COULD feed this sampled decode-time
+                            // stat identically — deliberately deferred to WP-D:
+                            // the native rung's field A/B should measure the same
+                            // stats surface the FFmpeg rung had at parity time,
+                            // and grow new ones after the verdict, not during it.
                             _ => None,
                         };
                         if present {

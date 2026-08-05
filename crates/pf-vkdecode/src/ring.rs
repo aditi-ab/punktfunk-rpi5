@@ -297,19 +297,29 @@ impl BitstreamRing {
     /// it has (bounded by the caller's timeout policy). The split keeps this
     /// module free of any semaphore knowledge.
     ///
+    /// `segments` are the byte ranges of `au` to upload, CONCATENATED — the
+    /// decoder passes the SLICE NALUs only. The buffer must contain nothing but
+    /// slice data: the VCN firmware scans the submitted range itself, and
+    /// non-slice NALUs (AUD/SEI/SPS/PPS, which real AUs open with) in the range
+    /// hang it — the 2026-08 .25 `vcn_unified_0 ring timeout`. FFmpeg's decoder
+    /// feeds slices-only for the same reason; parameter sets ride the session
+    /// parameters object instead.
+    ///
     /// # Safety
     ///
-    /// Live device (contract), and the tokens passed to prior
-    /// [`SlotStates::set_pending`] calls must genuinely cover every GPU read of
-    /// their slots — recycling rewrites slot bytes as soon as a token reports done.
+    /// Live device (contract); `segments` are in-bounds ranges of `au`; and the
+    /// tokens passed to prior [`SlotStates::set_pending`] calls genuinely cover
+    /// every GPU read of their slots — recycling rewrites slot bytes as soon as a
+    /// token reports done.
     pub(crate) unsafe fn upload<E: From<AllocError>>(
         &mut self,
         dev: &DecodeDevice,
         au: &[u8],
+        segments: &[std::ops::Range<usize>],
         poll: &mut dyn FnMut(&Token) -> Result<bool, E>,
         wait: &mut dyn FnMut(&Token) -> Result<(), E>,
     ) -> Result<UploadedAu, E> {
-        let len = au.len() as u64;
+        let len: u64 = segments.iter().map(|s| s.len() as u64).sum();
         if !self.layout.fits(len) {
             // Grow: drain EVERYTHING in flight (their reads target the old buffer),
             // then recreate the backing under the grown layout.
@@ -356,14 +366,22 @@ impl BitstreamRing {
         // SAFETY: `ptr` is the live persistent mapping of a buffer of
         // `layout.buffer_size()` bytes; `offset + range <= buffer_size` because
         // `range <= slot_size` (fits/grown above) and offset is `slot * slot_size`
-        // with `slot < slots`. The slot is not concurrently read: its previous use
-        // completed (poll/wait above) and its next use is submitted after this copy.
+        // with `slot < slots`; each segment is an in-bounds range of `au` (fn
+        // contract) and the cursor advances by exactly the bytes written, staying
+        // within `len <= range`. The slot is not concurrently read: its previous
+        // use completed (poll/wait above) and its next use is submitted after
+        // this copy.
         unsafe {
             let base = self.ptr.add(offset as usize);
-            std::ptr::copy_nonoverlapping(au.as_ptr(), base, au.len());
+            let mut cursor = 0usize;
+            for segment in segments {
+                let bytes = &au[segment.clone()];
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(cursor), bytes.len());
+                cursor += bytes.len();
+            }
             // Zero the alignment tail so the recorded range never hands the driver
             // stale bytes from a previous AU behind this one's end.
-            std::ptr::write_bytes(base.add(au.len()), 0, (range - len) as usize);
+            std::ptr::write_bytes(base.add(cursor), 0, (range - len) as usize);
         }
         Ok(UploadedAu {
             offset,
