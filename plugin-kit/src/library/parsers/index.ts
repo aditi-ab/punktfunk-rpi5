@@ -38,6 +38,7 @@ export {
 	type RegValue,
 	validRegKey,
 } from "./registry.js";
+export { openReadOnly, type ReadOnlyDb, withReadOnlyDb } from "./sqlite.js";
 export {
 	crc32,
 	parseShortcuts,
