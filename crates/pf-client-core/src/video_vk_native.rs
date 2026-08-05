@@ -1,8 +1,10 @@
 //! Native Vulkan Video H.264 decode backend (WP-C of the native-decode program):
 //! pf-vkdecode's [`VkH264Decoder`] running on the PRESENTER's own VkDevice — the same
-//! zero-copy shape as the FFmpeg-Vulkan backend, with no FFmpeg in the path. Strictly
-//! the `PUNKTFUNK_DECODER=native-vulkan` runtime opt-in (`video::native_vulkan_gate`);
-//! the automatic ladder stays FFmpeg's until WP-D's A/B verdict.
+//! zero-copy shape as the FFmpeg-Vulkan backend, with no FFmpeg in the path. Auto's
+//! rung immediately ABOVE FFmpeg-Vulkan since the 2026-08-05 ladder decision (WP-D
+//! closed bit-exact — the program is dropping FFmpeg from the client), also pinnable
+//! via `PUNKTFUNK_DECODER=native-vulkan`; `video::native_vulkan_gate` is the
+//! admission either way, and a failure falls through to the FFmpeg-Vulkan rung.
 //!
 //! **Queue lock:** pf-vkdecode submits on queue 0 of the decode family
 //! ([`DECODE_QUEUE_INDEX`] — the presenter creates exactly one queue per family). When

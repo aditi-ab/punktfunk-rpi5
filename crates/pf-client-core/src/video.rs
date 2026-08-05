@@ -1,13 +1,18 @@
 //! Video decode: reassembled HEVC access units → frames for the presenter.
 //!
-//! Three backends, picked at session start (auto is vendor-ordered on BOTH desktop OSes —
-//! see [`VulkanDecodeDevice::prefer_vulkan_first`]. Linux: vaapi → vulkan → software on
-//! desktop Mesa, vulkan first on NVIDIA/VanGogh. Windows: d3d11va → vulkan → software on
-//! Intel/unknown, vulkan first on NVIDIA/AMD.
-//! Override: `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software`; additionally
-//! `native-vulkan` — the pf-vkdecode H.264 decoder on the presenter's device
-//! (`video_vk_native`), runtime-opt-in ONLY until WP-D's A/B verdict admits it to the
-//! ladder — see [`native_vulkan_gate`]):
+//! Backends, picked at session start (auto is vendor-ordered on BOTH desktop OSes —
+//! see [`VulkanDecodeDevice::prefer_vulkan_first`]; on H.264 sessions the native
+//! pf-vkdecode decoder (`video_vk_native`, gated by [`native_vulkan_gate`]) slots in
+//! immediately ABOVE the FFmpeg-Vulkan rung wherever the ladder reaches it — the
+//! program's goal is dropping FFmpeg from the client, and a native INIT failure
+//! falls through to FFmpeg-Vulkan; a runtime error streak instead demotes past it,
+//! same as FFmpeg-Vulkan's own streaks do — see `decode_frame`). Linux: native →
+//! vulkan → vaapi → software on NVIDIA and ALL AMD (VanGogh included), vaapi →
+//! native → vulkan → software on Intel/unknown. Windows: native → vulkan → d3d11va →
+//! software on NVIDIA/AMD, d3d11va → native → vulkan → software on Intel/unknown.
+//! Override: `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software|native-vulkan` —
+//! `vulkan` names the FFmpeg-Vulkan backend specifically; `native-vulkan` pins the
+//! pf-vkdecode decoder by name, skipping the vendor-ordered rungs ahead of it):
 //!
 //! * **Vulkan Video**: FFmpeg's Vulkan decoder running on the PRESENTER's own VkDevice
 //!   (its handles arrive via [`VulkanDecodeDevice`]) — the decoded VkImage feeds the
@@ -83,7 +88,8 @@ pub enum DecodedImage {
     /// samples them directly (BT.709 limited, the codec's fixed colour contract).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
-    /// Native Vulkan Video output (pf-vkdecode, `PUNKTFUNK_DECODER=native-vulkan`):
+    /// Native Vulkan Video output (pf-vkdecode — auto's H.264 rung immediately above
+    /// FFmpeg-Vulkan, also pinnable via `PUNKTFUNK_DECODER=native-vulkan`):
     /// an NV12 image + per-plane views already on the PRESENTER's device — same
     /// zero-copy contract as [`DecodedImage::VkFrame`], no FFmpeg involved. The
     /// presenter waits the frame's timeline pair, transitions the layer for sampling
@@ -389,10 +395,12 @@ impl Drop for DrmFrameGuard {
 
 enum Backend {
     Vulkan(VulkanDecoder),
-    /// Native Vulkan Video H.264 (pf-vkdecode) on the presenter's device — runtime
-    /// opt-in only (`PUNKTFUNK_DECODER=native-vulkan`, see [`native_vulkan_gate`]);
-    /// not in the automatic ladder until WP-D's A/B verdict. Errors ride the SAME
-    /// streak/demotion machinery as the FFmpeg-Vulkan rung.
+    /// Native Vulkan Video H.264 (pf-vkdecode) on the presenter's device — auto's
+    /// rung immediately above FFmpeg-Vulkan since the 2026-08-05 ladder decision
+    /// (WP-D closed bit-exact; the program's goal is dropping FFmpeg from the
+    /// client), also pinnable by name (`PUNKTFUNK_DECODER=native-vulkan`) — see
+    /// [`native_vulkan_gate`]. Errors ride the SAME streak/demotion machinery as
+    /// the FFmpeg-Vulkan rung.
     /// Boxed: the decoder (planner + shipped-frame ledger) dwarfs the other variants,
     /// same as PyroWave below.
     NativeVulkan(Box<NativeVulkanDecoder>),
@@ -454,24 +462,34 @@ const VAAPI_DEMOTE_AFTER: u32 = 3;
 /// software before the first requested IDR could even arrive.
 const HW_DEMOTE_MIN_STREAK: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// The native Vulkan Video opt-in gate (WP-C of the native-decode program): the
-/// pf-vkdecode backend engages ONLY when the operator asked for it by name
-/// (`PUNKTFUNK_DECODER=native-vulkan` — `choice` is env-first, so that's what carries
-/// it), the negotiated wire codec is H.264 (the one codec pf-vkdecode speaks), and the
-/// presenter's device actually advertises Vulkan Video decode. Deliberately NOT an
-/// `auto` rung: entering the automatic ladder is WP-D's A/B verdict. Pure so the
-/// decision is CPU-testable.
 /// `VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR` — the raw flag bit within
 /// [`VulkanDecodeDevice::decode_video_caps`] (this crate stays ash-free).
 const VIDEO_CODEC_OP_DECODE_H264: u32 = 0x0000_0001;
 
+/// The native Vulkan Video admission gate (WP-C of the native-decode program, widened
+/// by the 2026-08-05 ladder decision): the pf-vkdecode backend engages when `choice`
+/// asks for it — by name (`PUNKTFUNK_DECODER=native-vulkan` — `choice` is env-first,
+/// so that's what carries it) or as the auto family (`auto`/``/`hardware`), where
+/// native is the rung immediately ABOVE FFmpeg-Vulkan: WP-D closed with bit-exact
+/// parity against libavcodec (250/250 AUs on three drivers, clean 92-minute soak),
+/// and the program's goal is dropping FFmpeg from the client, so native goes first
+/// wherever the ladder would reach FFmpeg-Vulkan — a native INIT failure falls
+/// through to that rung, so admission can't cost a session its decoder at start
+/// (a runtime error streak demotes past FFmpeg-Vulkan to VAAPI/D3D11VA/software,
+/// like every hardware rung's streaks do — a native→FFmpeg-Vulkan runtime rung is
+/// deliberately absent; FFmpeg is on its way out). The explicit
+/// `vulkan` pin still names the FFmpeg-Vulkan backend specifically; it — and every
+/// other explicit backend pin — refuses. Beyond the choice: the negotiated wire codec
+/// must be H.264 (the one codec pf-vkdecode speaks) and the presenter's device must
+/// actually advertise Vulkan Video H.264 decode. Pure so the decision is
+/// CPU-testable.
 fn native_vulkan_gate(
     choice: &str,
     codec_id: ffmpeg::codec::Id,
     video_decode: bool,
     decode_video_caps: u32,
 ) -> bool {
-    choice == "native-vulkan"
+    matches!(choice, "native-vulkan" | "auto" | "" | "hardware")
         && codec_id == ffmpeg::codec::Id::H264
         && video_decode
         // The decode family must advertise the H264 op specifically —
@@ -631,11 +649,17 @@ impl Decoder {
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
     /// hatch, and the documented knob), then the setting; both default to auto.
     /// Auto's hardware order depends on the device on BOTH desktop OSes
-    /// ([`VulkanDecodeDevice::prefer_vulkan_first`]). Linux: VAAPI → Vulkan → software on
-    /// desktop Mesa (AMD/Intel), Vulkan → VAAPI → software on NVIDIA and the Deck's
-    /// VanGogh. Windows (no VAAPI there): Vulkan → D3D11VA → software on NVIDIA/AMD,
-    /// D3D11VA → Vulkan → software on Intel/unknown (Intel's driver advertises Vulkan
-    /// Video, but FFmpeg-Vulkan on it strobes/overruns the budget — B580 field report).
+    /// ([`VulkanDecodeDevice::prefer_vulkan_first`]); on H.264 sessions the native
+    /// pf-vkdecode rung sits immediately above FFmpeg-Vulkan wherever the ladder
+    /// reaches it ([`native_vulkan_gate`] — the program is dropping FFmpeg, and a
+    /// native INIT failure falls through to FFmpeg-Vulkan). Linux: native → Vulkan →
+    /// VAAPI → software on NVIDIA and ALL AMD (`prefer_vulkan_first` is vendor-wide —
+    /// desktop RADV included, on-glass verdict — not just the Deck's VanGogh);
+    /// VAAPI → native → Vulkan → software on Intel/unknown. Windows (no VAAPI
+    /// there): native → Vulkan → D3D11VA → software on NVIDIA/AMD, D3D11VA →
+    /// native → Vulkan → software on Intel/unknown (Intel's driver advertises Vulkan
+    /// Video, but FFmpeg-Vulkan on it strobes/overruns the budget — B580 field
+    /// report).
     pub fn new(
         codec_id: ffmpeg::codec::Id,
         pref: &str,
@@ -668,13 +692,16 @@ impl Decoder {
                 d3d11_hdr10,
             })
         };
-        // Native Vulkan Video (pf-vkdecode) — strictly the runtime opt-in
-        // (`PUNKTFUNK_DECODER=native-vulkan`); [`native_vulkan_gate`] is the whole
-        // decision. Any refusal or init failure logs and DEMOTES to the standard
-        // ladder below exactly as if the native rung errored (choice reads as `auto`
-        // from here on) — a native failure must never be quieter, or land somewhere
+        // Native Vulkan Video (pf-vkdecode), pinned by name (`PUNKTFUNK_DECODER=
+        // native-vulkan`). Since the 2026-08-05 ladder decision native is ALSO an
+        // auto rung (below, immediately above FFmpeg-Vulkan); the pin stays as the
+        // support/debug escape hatch that skips the vendor-ordered rungs ahead of
+        // it. Any refusal or init failure logs and DEMOTES to the standard ladder
+        // below exactly as if the native rung errored (choice reads as `auto` from
+        // here on) — a native failure must never be quieter, or land somewhere
         // other, than the FFmpeg rungs' failures do.
         let mut choice = choice;
+        let mut native_tried = false;
         if choice == "native-vulkan" {
             if native_vulkan_gate(
                 &choice,
@@ -682,6 +709,7 @@ impl Decoder {
                 vk.is_some_and(|v| v.video_decode),
                 vk.map_or(0, |v| v.decode_video_caps),
             ) {
+                native_tried = true;
                 let vk = vk.expect("gate demands video_decode, so vk is Some");
                 match NativeVulkanDecoder::new(vk) {
                     Ok(n) => {
@@ -771,6 +799,39 @@ impl Decoder {
                             "D3D11VA unavailable — trying Vulkan Video");
                     }
                 }
+            }
+        }
+        // Native Vulkan Video (pf-vkdecode) — auto's rung immediately ABOVE
+        // FFmpeg-Vulkan (2026-08-05 ladder decision: WP-D closed with bit-exact parity
+        // against libavcodec on three drivers and a clean soak, and the program's goal
+        // is dropping FFmpeg from the client entirely — so wherever auto would reach
+        // FFmpeg-Vulkan, native goes first). [`native_vulkan_gate`] carries the whole
+        // decision, including the choice: the explicit `vulkan` pin is NOT this rung —
+        // it names the FFmpeg-Vulkan backend specifically and keeps meaning exactly
+        // that. An init failure logs and falls through to FFmpeg-Vulkan below, so
+        // admission can never cost a session hardware decode it had before.
+        // (`native_tried` skips the repeat when the pin above already attempted — and
+        // failed — the same construction.)
+        if !native_tried
+            && native_vulkan_gate(
+                &choice,
+                codec_id,
+                vk.is_some_and(|v| v.video_decode),
+                vk.map_or(0, |v| v.decode_video_caps),
+            )
+        {
+            let vk = vk.expect("gate demands video_decode, so vk is Some");
+            match NativeVulkanDecoder::new(vk) {
+                Ok(n) => {
+                    tracing::info!(
+                        ?codec_id,
+                        "native Vulkan Video hardware decode active \
+                         (pf-vkdecode auto rung, presenter-shared device)"
+                    );
+                    return done(Backend::NativeVulkan(Box::new(n)));
+                }
+                Err(e) => tracing::info!(reason = %format!("{e:#}"),
+                    "native Vulkan decode unavailable — trying FFmpeg Vulkan Video"),
             }
         }
         if matches!(choice.as_str(), "auto" | "" | "vulkan" | "hardware") {
@@ -1350,40 +1411,59 @@ mod tests {
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) Pro Graphics").prefer_vulkan_first());
     }
 
-    /// The native-Vulkan opt-in gate (WP-C): by name only, H.264 only, and only on a
-    /// device that really decodes — every other combination takes the standard ladder.
-    /// Pinned so "native enters auto" can only ever be a deliberate WP-D change.
+    /// The native-Vulkan admission gate (WP-C, widened by the 2026-08-05 ladder
+    /// decision): the pin AND the auto family admit on a capable H.264 session —
+    /// native sits immediately above FFmpeg-Vulkan because the program is dropping
+    /// FFmpeg — while every explicit backend pin refuses (`vulkan` names the
+    /// FFmpeg-Vulkan backend specifically and must keep meaning exactly that), and
+    /// the codec/device legs still refuse for every choice.
     #[test]
-    fn native_vulkan_gate_is_by_name_h264_and_capable_device_only() {
+    fn native_vulkan_gate_admits_pin_and_auto_family_on_capable_h264_only() {
         use ffmpeg::codec::Id;
+        // Pin the raw spec value, not the implementation constant — a typo'd bit
+        // would refuse every real driver's caps and native would silently never
+        // engage (the program's own nb_queries=0 lesson: silent non-engagement is
+        // the failure mode nothing flags).
+        assert_eq!(
+            VIDEO_CODEC_OP_DECODE_H264, 0x1,
+            "VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR"
+        );
         const H264_OP: u32 = VIDEO_CODEC_OP_DECODE_H264;
-        assert!(native_vulkan_gate("native-vulkan", Id::H264, true, H264_OP));
-        // Never by any other preference — it is not an auto rung yet.
-        for choice in ["auto", "", "hardware", "vulkan", "software"] {
+        for choice in ["native-vulkan", "auto", "", "hardware"] {
+            // The pin and the whole auto family admit…
+            assert!(
+                native_vulkan_gate(choice, Id::H264, true, H264_OP),
+                "{choice:?}"
+            );
+            // …but only for the one codec pf-vkdecode speaks.
+            assert!(
+                !native_vulkan_gate(choice, Id::HEVC, true, H264_OP),
+                "{choice:?}"
+            );
+            assert!(
+                !native_vulkan_gate(choice, Id::AV1, true, H264_OP),
+                "{choice:?}"
+            );
+            // No Vulkan-Video-capable presenter device.
+            assert!(
+                !native_vulkan_gate(choice, Id::H264, false, H264_OP),
+                "{choice:?}"
+            );
+            // A decode family WITHOUT the H264 op (e.g. AV1-only) refuses even with
+            // the extension stack present — the caps BIT is the codec gate.
+            assert!(!native_vulkan_gate(choice, Id::H264, true, 0), "{choice:?}");
+            assert!(
+                !native_vulkan_gate(choice, Id::H264, true, 0x4),
+                "{choice:?}"
+            );
+        }
+        // Never for an explicit OTHER-backend pin, capable device or not.
+        for choice in ["vulkan", "vaapi", "d3d11va", "software"] {
             assert!(
                 !native_vulkan_gate(choice, Id::H264, true, H264_OP),
                 "{choice:?}"
             );
         }
-        // The one codec pf-vkdecode speaks.
-        assert!(!native_vulkan_gate(
-            "native-vulkan",
-            Id::HEVC,
-            true,
-            H264_OP
-        ));
-        assert!(!native_vulkan_gate("native-vulkan", Id::AV1, true, H264_OP));
-        // No Vulkan-Video-capable presenter device.
-        assert!(!native_vulkan_gate(
-            "native-vulkan",
-            Id::H264,
-            false,
-            H264_OP
-        ));
-        // A decode family WITHOUT the H264 op (e.g. AV1-only) refuses even with
-        // the extension stack present — the caps BIT is the codec gate.
-        assert!(!native_vulkan_gate("native-vulkan", Id::H264, true, 0));
-        assert!(!native_vulkan_gate("native-vulkan", Id::H264, true, 0x4));
     }
 
     /// Lock the DRM FourCC magic numbers against typos — these are the exact values

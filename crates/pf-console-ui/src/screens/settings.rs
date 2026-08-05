@@ -536,7 +536,7 @@ fn detail(id: RowId) -> &'static str {
             "Which compositor drives the virtual output — honored only if available on the host."
         }
         RowId::Codec => "A preference — the host falls back if it can't encode this one.",
-        RowId::Decoder => "Automatic prefers Vulkan Video, then VAAPI, then software.",
+        RowId::Decoder => "Automatic picks the best hardware decoder for this GPU, then software.",
         RowId::Hdr => {
             "HDR10 — engages when the host sends HDR content and this display supports it."
         }
