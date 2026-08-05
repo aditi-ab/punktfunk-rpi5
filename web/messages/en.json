@@ -601,5 +601,7 @@
 	"update_result_noop": "Your package source had nothing newer yet — try again in a few minutes.",
 	"update_opt_in": "To enable one-click updates from here, run this once on the host (then log out and back in):",
 	"update_result_failed": "Update to {to} failed during {stage}.",
-	"update_result_log": "Installer log:"
+	"update_result_log": "Installer log:",
+	"library_field_role": "This entry opens a launcher",
+	"library_field_role_help": "Shows it in the Launchers row above your games instead of in the grid. It still starts and stops the same way."
 }

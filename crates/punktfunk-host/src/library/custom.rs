@@ -371,8 +371,8 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 /// copies of the very primitive the `/hooks` carve-out exists to withhold.
 ///
 /// Returns the field name for the error message, so a plugin author sees exactly what was refused.
-/// The other launch kinds (`steam_appid`, `steam_ui`, `epic`, `gog`, `aumid`, `lutris_id`,
-/// `heroic`) are all
+/// The other launch kinds (`steam_appid`, `steam_ui`, `launcher_ui`, `epic`, `gog`, `aumid`,
+/// `lutris_id`, `heroic`) are all
 /// host-resolved from a validated id and stay open to every lane — a provider plugin can still
 /// publish its whole catalogue, it just cannot hand the host a shell command to run.
 pub fn privileged_field(
@@ -450,6 +450,15 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
             if launch.kind == "steam_ui" && !valid_steam_ui(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `steam_ui` must be `bigpicture` or `desktop`"
+                ));
+            }
+            // Refused rather than silently accepted, because the failure is otherwise invisible
+            // until a user clicks the tile: an unresolvable value yields no command at launch time.
+            if launch.kind == "launcher_ui" && !valid_launcher_ui(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `launcher_ui` names a launcher this host \
+                     cannot open (`{}`)",
+                    launch.value
                 ));
             }
         }

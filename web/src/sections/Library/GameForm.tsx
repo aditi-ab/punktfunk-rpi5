@@ -27,6 +27,10 @@ interface FormState {
 	 *  own comment at the render site (2026-08-05 review M-6). Never round-tripped from the
 	 *  server, so it is always empty on open, including when editing an entry that has one. */
 	password: string;
+	/** `true` = this entry opens a launcher rather than a game (design D4). Purely presentational:
+	 *  the console groups launcher entries into their own rail, and clients that don't know the
+	 *  field render them as ordinary tiles. */
+	isLauncher: boolean;
 	// Details — the flattened GameMeta fields; numbers and lists are kept as the raw
 	// text the user typed and only parsed on submit.
 	platform: string;
@@ -48,6 +52,7 @@ const emptyForm: FormState = {
 	logo: "",
 	command: "",
 	password: "",
+	isLauncher: false,
 	platform: "",
 	description: "",
 	developer: "",
@@ -68,6 +73,9 @@ function formFrom(entry: GameEntry): FormState {
 		logo: entry.art.logo ?? "",
 		command: entry.launch?.kind === "command" ? entry.launch.value : "",
 		password: "",
+		// Round-tripped like every other field: `update_custom` REPLACES the whole entry, so an
+		// unread field here would silently demote a launcher entry back to a game on any edit.
+		isLauncher: entry.role === "launcher",
 		platform: entry.platform ?? "",
 		description: entry.description ?? "",
 		developer: entry.developer ?? "",
@@ -113,6 +121,8 @@ function toInput(f: FormState): CustomInput {
 		// The BFF re-verifies this and strips it before forwarding; the host never sees the field.
 		// Only sent when there is a command to authorize, matching the conditional gate.
 		...(command ? { password: f.password } : {}),
+		// Omitted when it is the default, matching the host's skip-when-`game` serialization.
+		...(f.isLauncher ? { role: "launcher" as const } : {}),
 		platform: trim(f.platform),
 		description: trim(f.description),
 		developer: trim(f.developer),
@@ -297,6 +307,26 @@ export const GameForm: FC<{
 							required
 						/>
 					)}
+					{/* Design D4: a launcher entry opens the launcher itself rather than a title. It
+					    launches and leases like any other entry — this only moves it into the
+					    console's Launchers rail. Hand-adding one is the supported way to get a
+					    "Heroic" or "Lutris" tile without installing that source's plugin. */}
+					<div className="space-y-2">
+						<div className="flex items-center gap-2">
+							<input
+								id="lib-isLauncher"
+								type="checkbox"
+								checked={form.isLauncher}
+								onChange={(e) =>
+									setForm((f) => ({ ...f, isLauncher: e.target.checked }))
+								}
+							/>
+							<Label htmlFor="lib-isLauncher">{m.library_field_role()}</Label>
+						</div>
+						<p className="text-xs text-muted-foreground">
+							{m.library_field_role_help()}
+						</p>
+					</div>
 					<fieldset className="space-y-4 border-t pt-2">
 						<legend className="sr-only">{m.library_details_legend()}</legend>
 						<p

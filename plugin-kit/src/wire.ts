@@ -26,6 +26,7 @@ export type Artwork = typeof Artwork.Type;
  * | `command` | a shell command (operator-trust tier) | both |
  * | `steam_appid` | digits — an appid, or a 64-bit non-Steam-shortcut game id | both |
  * | `steam_ui` | `bigpicture` \| `desktop` — opens the Steam client itself | both |
+ * | `launcher_ui` | a store id (`heroic`, `lutris`) — opens that launcher's own UI | linux |
  * | `lutris_id` | digits — a pga.db game id | linux |
  * | `heroic` | `<runner>:<appName>`, runner ∈ legendary/gog/nile | linux |
  * | `epic` | `<namespace>:<catalogItemId>:<appName>` or a bare appName | windows |

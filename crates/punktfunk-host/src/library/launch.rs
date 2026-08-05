@@ -93,6 +93,18 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
             "desktop" => Some("steam".into()),
             _ => None,
         },
+        // The other launchers' own UIs (D4). The host builds the command — a plugin only names
+        // which launcher — so no shell string ever crosses the wire.
+        #[cfg(target_os = "linux")]
+        "launcher_ui" => match spec.value.as_str() {
+            // The same resolution the `heroic` game launches use (native binary, else Flatpak), just
+            // without `--no-gui` and without a URI: that opens Heroic's window, which IS the tile.
+            "heroic" => heroic_launch_prefix(),
+            // Bare `lutris` opens the Lutris window; with a `lutris:rungameid/…` URI it launches a
+            // game instead (the `lutris_id` kind above).
+            "lutris" => Some("lutris".into()),
+            _ => None,
+        },
         // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
@@ -246,6 +258,39 @@ pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
 /// never carry a third value that silently resolves to nothing at launch time.
 pub(crate) fn valid_steam_ui(value: &str) -> bool {
     matches!(value, "bigpicture" | "desktop")
+}
+
+/// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
+///
+/// One kind for every launcher but Steam, rather than one kind each: they all have exactly a single
+/// UI to open, so the value is just which launcher. Steam keeps its own [`valid_steam_ui`] kind
+/// because it has two (Big Picture and the desktop client), which is a genuinely different choice.
+///
+/// Platform-gated, because a value naming a launcher this OS cannot run is not a tile that merely
+/// looks odd — it is one that fails at launch. Validated inbound too, so a plugin gets a 400 it can
+/// act on instead of publishing a dead entry.
+///
+/// **Why a typed kind at all**, when design D4 originally said non-Steam launchers would ride the
+/// `command` kind: the 2026-08-05 review made `launch.kind = "command"` operator-only (it is handed
+/// to a shell), so a plugin publishing one is refused. A typed kind keeps D1's rule intact — the
+/// plugin supplies a validated *value*, the host builds the command — and is the only way a scanner
+/// plugin can offer a launcher tile at all.
+fn launcher_ui_stores() -> &'static [&'static str] {
+    #[cfg(target_os = "linux")]
+    {
+        &["heroic", "lutris"]
+    }
+    // Windows launchers (Epic, GOG Galaxy, the Xbox app) are not wired yet — each needs its own
+    // verified activation, and an unverified guess would ship a tile that does nothing.
+    #[cfg(not(target_os = "linux"))]
+    {
+        &[]
+    }
+}
+
+/// Is this a `launcher_ui` value this host can resolve?
+pub(crate) fn valid_launcher_ui(value: &str) -> bool {
+    launcher_ui_stores().contains(&value)
 }
 
 /// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
@@ -507,6 +552,50 @@ mod tests {
         assert!(!valid_steam_ui("gamepadui"));
         assert!(!valid_steam_ui(""));
         assert!(!valid_steam_ui("bigpicture; rm -rf ~"));
+    }
+
+    /// The `launcher_ui` kind exists because D4's original plan — non-Steam launchers riding the
+    /// `command` kind — stopped being available to plugins when the 2026-08-05 review made
+    /// `command` operator-only. A plugin names a launcher; the host builds the command.
+    #[test]
+    fn launcher_ui_accepts_only_launchers_this_host_can_open() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(valid_launcher_ui("heroic"));
+            assert!(valid_launcher_ui("lutris"));
+            // Not wired on this OS — refused inbound rather than becoming a tile that does nothing.
+            assert!(!valid_launcher_ui("gog"));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No Windows/macOS launcher UIs are wired yet, so every value is refused.
+            assert!(!valid_launcher_ui("heroic"));
+            assert!(!valid_launcher_ui("gog"));
+        }
+        assert!(!valid_launcher_ui(""));
+        assert!(!valid_launcher_ui("lutris; rm -rf ~"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_ui_opens_the_launcher_itself() {
+        let ui = |v: &str| {
+            command_for(&LaunchSpec {
+                kind: "launcher_ui".into(),
+                value: v.into(),
+            })
+        };
+        // Bare `lutris` opens the window; the URI form is the `lutris_id` kind and launches a game.
+        assert_eq!(ui("lutris").as_deref(), Some("lutris"));
+        assert!(!ui("lutris").unwrap().contains("rungameid"));
+        // Heroic resolves the same way its game launches do, but with no `--no-gui` and no URI — so
+        // the window IS what opens. `None` on a box without Heroic, which is a correct answer.
+        if let Some(cmd) = ui("heroic") {
+            assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
+            assert!(!cmd.contains("heroic://"), "no game URI: {cmd:?}");
+        }
+        assert_eq!(ui("nonsense"), None);
+        assert_eq!(ui(""), None);
     }
 
     #[cfg(not(windows))]
