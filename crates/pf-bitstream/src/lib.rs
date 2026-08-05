@@ -15,7 +15,10 @@
 //! where cheap; reject-with-log outside that envelope rather than half-decode.
 //!
 //! Nothing in this crate may touch a GPU API, an OS handle, or the network: CPU-only by
-//! construction, so its tests run on every CI leg including macOS.
+//! construction, so its tests run on every CI leg including macOS. And no `unsafe`,
+//! compiler-enforced — this layer exists to replace C parsers; it does not get to
+//! reintroduce their failure mode.
+#![forbid(unsafe_code)]
 
 // The vendor-pinning smoke tests below assert against byte counts and golden values from
 // the vendored snapshot's own test vectors; a cros-codecs re-sync that shifts parser

@@ -1255,12 +1255,18 @@ impl<T: Clone> Dpb<T> {
                 )
             };
 
-        let dpb_start = self.entries.as_ptr();
-        let refs_to_index = |refs: Vec<_>| {
+        // punktfunk deviation (PROVENANCE.md #5): upstream computed these indices with an
+        // unsafe `offset_from` against the entries base pointer. Same pointer-identity
+        // mapping, expressed safely — the DPB holds at most 16 entries, so the linear
+        // `position` is noise, and the crate stays `#![forbid(unsafe_code)]`.
+        let refs_to_index = |refs: Vec<&DpbEntry<T>>| {
             refs.into_iter()
-                .map(|r| r as *const DpbEntry<T>)
-                .map(|r| unsafe { r.offset_from(dpb_start) })
-                .map(|i| i as usize)
+                .map(|r| {
+                    self.entries
+                        .iter()
+                        .position(|e| std::ptr::eq(e, r))
+                        .expect("every reference list entry comes from this DPB")
+                })
                 .collect()
         };
 

@@ -2883,7 +2883,7 @@ mod tests {
         }
 
         // Safe because this type does not have any references
-        assert_eq!(hdr.pred_weight_table, unsafe { std::mem::zeroed() });
+        assert_eq!(hdr.pred_weight_table, Default::default());
 
         assert_eq!(hdr.dec_ref_pic_marking, Default::default());
 
@@ -2939,7 +2939,7 @@ mod tests {
         }
 
         // Safe because this type does not have any references
-        assert_eq!(hdr.pred_weight_table, unsafe { std::mem::zeroed() });
+        assert_eq!(hdr.pred_weight_table, Default::default());
 
         assert_eq!(hdr.dec_ref_pic_marking, Default::default());
 
@@ -2995,7 +2995,7 @@ mod tests {
         }
 
         // Safe because this type does not have any references
-        assert_eq!(hdr.pred_weight_table, unsafe { std::mem::zeroed() });
+        assert_eq!(hdr.pred_weight_table, Default::default());
 
         assert_eq!(hdr.dec_ref_pic_marking, Default::default());
 

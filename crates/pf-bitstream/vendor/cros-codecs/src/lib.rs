@@ -18,6 +18,11 @@
 // Held-back lints here, PROVENANCE.md records the posture.
 #![allow(clippy::all)]
 #![allow(mismatched_lifetime_syntaxes)]
+// The one bar vendored code IS held to, and the whole point of this layer: the code that
+// parses hostile bitstream bytes contains no unsafe, compiler-enforced. Upstream was one
+// pointer-subtraction away from this already (PROVENANCE.md #5); a re-sync that brings
+// unsafe into the codec module must fail here and be judged, not slide in.
+#![forbid(unsafe_code)]
 
 pub mod bitstream_utils;
 pub mod codec;

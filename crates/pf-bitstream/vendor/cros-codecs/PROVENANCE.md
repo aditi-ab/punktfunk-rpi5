@@ -40,6 +40,13 @@ in the future."
 3. `Cargo.toml` — rewritten: `log` is the only dependency the vendored subset needs,
    plus `env_logger`/`serde_json` dev-dependencies for upstream's in-tree tests.
 4. `cargo fmt` normalization under the workspace's rustfmt config (mechanical only).
+5. **Zero-unsafe, enforced**: `#![forbid(unsafe_code)]` added to lib.rs. Upstream's codec
+   module had exactly one production `unsafe` (h264/dpb.rs `build_ref_pic_lists`: ref→index
+   via pointer `offset_from`) — replaced with a safe `position(ptr::eq)` over the ≤16-entry
+   DPB — and three test-only `mem::zeroed()` asserts, replaced with `Default::default()`
+   (`PredWeightTable` derives `Default`; all-integer struct, identical value). The layer
+   facing untrusted bytes is now compiler-verified free of unsafe — the property that
+   motivates replacing libavcodec's C parsers in the first place.
 
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.
