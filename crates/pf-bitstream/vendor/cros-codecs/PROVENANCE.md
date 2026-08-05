@@ -54,7 +54,8 @@ in the future."
    double-counts the left/top crop and, worse, panics on u32 underflow for a
    large-but-parser-valid `frame_crop_left_offset` (e.g. 100 crop units on a 320-wide
    SPS). Found by pf-bitstream's conformance-window tests; upstream never hits it
-   because real encoders crop right/bottom only.
+   because real encoders crop right/bottom only. **Reported upstream 2026-08-06:
+   <https://github.com/chromeos/cros-codecs/issues/99>.**
 
 7. `src/codec/h265/parser.rs` — `parse_slice_header`: reject
    `num_long_term_sps + num_long_term_pics > 16` before the long-term RPS loop.
@@ -64,7 +65,8 @@ in the future."
    — a hostile slice header with 17+ entries panics the parser with an
    index-out-of-bounds (bounds checks stay on in release). Found by pf-bitstream's
    H.265 planner review; regression-tested there
-   (`a_hostile_long_term_count_is_a_parse_error_not_a_panic`). **Report upstream.**
+   (`a_hostile_long_term_count_is_a_parse_error_not_a_panic`). **Reported upstream
+   2026-08-06: <https://github.com/chromeos/cros-codecs/issues/100>.**
 
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.
