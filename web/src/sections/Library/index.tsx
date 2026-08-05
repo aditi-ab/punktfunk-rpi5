@@ -7,8 +7,7 @@ import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import { type FormTarget, GameFormSection } from "./GameForm";
 import { LibraryGridSection } from "./LibraryGrid";
-import { ProvidersCard } from "./Providers";
-import { SourceTogglesSection } from "./SourceToggles";
+import { SourcesSection } from "./Sources";
 
 // Library = an OVERVIEW grid + a SEPARATE add/edit form, deliberately split into their own files
 // (LibraryGrid / GameForm) so the two concerns never share a component. This container owns only the
@@ -44,11 +43,8 @@ export const SectionLibrary: FC = () => {
 					/>
 				)}
 
-				<SourceTogglesSection />
-
-				<ProvidersCard
-					entries={entries}
-					active={providerFilter}
+				<SourcesSection
+					activeFilter={providerFilter}
 					onFilter={setProviderFilter}
 				/>
 
