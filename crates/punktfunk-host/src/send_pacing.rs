@@ -55,7 +55,7 @@ pub(crate) enum ChunkPolicy {
 }
 
 /// The time the paced (post-burst) packets spread across.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PaceBudget {
     /// `min((deadline − now-after-burst) × fraction, cap)`, collapsing to 0 with no slack
     /// (native: fraction 0.9). `cap` bounds the spread to the time the overflow actually needs
@@ -68,8 +68,51 @@ pub(crate) enum PaceBudget {
         fraction: f32,
         cap: Duration,
     },
-    /// A precomputed fixed budget (GameStream: ¾ of the frame interval).
+    /// A precomputed fixed budget (GameStream: ¾ of the frame interval; native: the rate-cap
+    /// spread from [`native_budget`]).
     Fixed(Duration),
+}
+
+/// Absolute ceiling on one frame's paced spread (native plane): a pathological frame must not
+/// park the send thread for longer than this, whatever the rate math says. At the ceiling the
+/// tail is late but delivered whole — still strictly better than the blast-loss → freeze →
+/// recovery-IDR round trip it replaces.
+pub(crate) const MAX_PACE_SPREAD: Duration = Duration::from_millis(100);
+
+/// The native plane's pace budget for one frame (pure — unit-tested): with the T1.2 rate cap
+/// active, the paced overflow spreads across exactly the time it needs at the pace rate
+/// (`cap`, bounded by [`MAX_PACE_SPREAD`]) and is NEVER under-cut by the frame deadline.
+///
+/// The old schedule took `min(0.9 × time-to-deadline, cap)`. For a steady-state frame the cap
+/// is the smaller term and nothing changes. But for an OVERSIZED frame — a stall-resume scene
+/// delta after seconds of frozen composition, a cold IDR — the overflow needs SEVERAL frame
+/// intervals at the pace rate, and the deadline term clamped that into the remainder of ONE:
+/// an instantaneous many-×-stream-rate blast that overruns the socket tx-buffer and loses the
+/// very frame that would have ended the freeze (field fingerprint: WSAENOBUFS 10055 +
+/// `loss_ppm` spikes at capture-stall edges, then a recovery-IDR round trip per retry). The
+/// pace rate is ~3× a rate the link demonstrably carries, so holding it past the deadline is
+/// safe by the same argument that introduced the cap — the deadline stays a *target*, not a
+/// license to blast.
+///
+/// `pace_rate_bps == 0` (PUNKTFUNK_PACE_FACTOR=0) or an overflow-free frame keeps the legacy
+/// deadline-only spread.
+pub(crate) fn native_budget(
+    deadline: Instant,
+    pace_rate_bps: u64,
+    overflow_bytes: u64,
+) -> PaceBudget {
+    if pace_rate_bps > 0 && overflow_bytes > 0 {
+        let cap = Duration::from_nanos(
+            (overflow_bytes * 8).saturating_mul(1_000_000_000) / pace_rate_bps,
+        );
+        PaceBudget::Fixed(cap.min(MAX_PACE_SPREAD))
+    } else {
+        PaceBudget::UntilDeadline {
+            deadline,
+            fraction: 0.9,
+            cap: Duration::MAX,
+        }
+    }
 }
 
 /// Per-plane pacing parameters. See the module doc for the two canonical values.
@@ -596,6 +639,43 @@ mod tests {
             vec![10, 64, 64, 64, 8],
             "MAX cap = legacy no-slack blast"
         );
+    }
+
+    /// [`native_budget`]: with the rate cap active the budget is the overflow's wire time at
+    /// the pace rate — a FIXED spread the deadline can no longer under-cut — bounded by
+    /// [`MAX_PACE_SPREAD`]; rate 0 / no overflow keep the legacy deadline-only schedule.
+    #[test]
+    fn native_budget_is_rate_bound_never_deadline_cut() {
+        // The stall-resume case the fix exists for: a 3 MB overflow at 3×240 Mbps needs
+        // ~33 ms — an IMMINENT deadline (the old min() made this a blast) must not shrink it.
+        let deadline = Instant::now() + Duration::from_millis(4); // 240 fps interval
+        let b = native_budget(deadline, 720_000_000, 3_000_000);
+        assert_eq!(b, PaceBudget::Fixed(Duration::from_nanos(33_333_333)));
+
+        // A steady-state frame: overflow 90 KB at 3×240 Mbps = 1 ms — identical to what the
+        // old min(slack, cap) chose (cap was the smaller term), so nothing regresses.
+        let b = native_budget(deadline, 720_000_000, 90_000);
+        assert_eq!(b, PaceBudget::Fixed(Duration::from_micros(1_000)));
+
+        // A crater-rate resume (ABR backed off to 20 Mbps, pace 60 Mbps): the raw rate math
+        // says 400 ms for 3 MB — the absolute ceiling bounds the send thread's stall.
+        let b = native_budget(deadline, 60_000_000, 3_000_000);
+        assert_eq!(b, PaceBudget::Fixed(MAX_PACE_SPREAD));
+
+        // Rate cap off (PUNKTFUNK_PACE_FACTOR=0): the legacy deadline-only spread, uncapped.
+        let b = native_budget(deadline, 0, 3_000_000);
+        assert!(matches!(
+            b,
+            PaceBudget::UntilDeadline {
+                fraction,
+                cap: Duration::MAX,
+                ..
+            } if fraction == 0.9
+        ));
+
+        // No overflow (the whole frame bursts): budget is never consulted — legacy shape.
+        let b = native_budget(deadline, 720_000_000, 0);
+        assert!(matches!(b, PaceBudget::UntilDeadline { .. }));
     }
 
     /// `inject_video_drop` is a no-op when the knob is off (the default test env).

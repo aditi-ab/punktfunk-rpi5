@@ -441,26 +441,27 @@ fn idd_adaptive_enabled() -> bool {
 /// Seal one access unit and send it with MICROBURST pacing (the shared
 /// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
 /// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
-/// only the OVERFLOW beyond that is spread across `min(~90% of the time to deadline, the time
-/// the overflow needs at pace_rate_bps)` in ADAPTIVE chunks — 16 packets at today's rates,
-/// coarsening to at most 64 (the GSO-segment cap) once the rate would otherwise skip every
-/// sub-floor sleep, so ≥1 Gbps frames still pace instead of collapsing into an unpaced blast
-/// (plan Phase 1.2). `burst_cap` `None` = auto: `max(128 KB, this AU's wire bytes / 4)`, so
-/// the burst stays a bounded fraction of a high-rate frame instead of swallowing it whole
-/// (plan Phase 1.3); `Some` = PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a
-/// normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added latency, while a
-/// genuine IDR / sustained-high-bitrate frame (≫ cap) still spreads — keeping the freeze fix
-/// exactly where it's needed (an unpaced line-rate burst overruns the kernel tx buffer →
-/// EAGAIN drop → under infinite GOP, a freeze until the next keyframe). With no slack
-/// (encode ≈ interval) the budget collapses to 0 and even the overflow goes out immediately,
-/// so this is never slower than unpaced.
+/// only the OVERFLOW beyond that is spread across the time it needs at `pace_rate_bps` in
+/// ADAPTIVE chunks — 16 packets at today's rates, coarsening to at most 64 (the GSO-segment
+/// cap) once the rate would otherwise skip every sub-floor sleep, so ≥1 Gbps frames still pace
+/// instead of collapsing into an unpaced blast (plan Phase 1.2). `burst_cap` `None` = auto:
+/// `max(128 KB, this AU's wire bytes / 4)`, so the burst stays a bounded fraction of a
+/// high-rate frame instead of swallowing it whole (plan Phase 1.3); `Some` =
+/// PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a normal-bitrate frame (≤ cap) leaves in
+/// one immediate burst at ~0 added latency, while a genuine IDR / sustained-high-bitrate frame
+/// (≫ cap) still spreads — keeping the freeze fix exactly where it's needed (an unpaced
+/// line-rate burst overruns the kernel tx buffer → EAGAIN drop → under infinite GOP, a freeze
+/// until the next keyframe).
 ///
-/// `pace_rate_bps` (latency plan T1.2) bounds the spread from above: the deadline term alone
-/// smears a big frame's tail across the whole remaining interval (~15 ms at 60 fps) even when
-/// the link could drain it in 2–3 ms. The caller passes ~3× the live encoder bitrate — a rate
-/// the link is proven to carry sustained, so the bounded excursion keeps the anti-freeze
-/// property while the tail leaves as soon as the link plausibly allows. `0` = uncapped
-/// (legacy smoothness-only spread, and the fallback when the bitrate isn't known yet).
+/// `pace_rate_bps` (latency plan T1.2; resume-safe form, stall program T2): the caller passes
+/// ~3× the live encoder bitrate — a rate the link is proven to carry sustained — and the
+/// overflow's wire time at that rate IS the pace budget ([`crate::send_pacing::native_budget`],
+/// [`crate::send_pacing::MAX_PACE_SPREAD`]-bounded). The frame deadline no longer under-cuts
+/// the spread: for a steady-state frame the rate term was the smaller one anyway (tail gone in
+/// a fraction of the interval), and for an oversized frame (stall-resume scene delta, cold
+/// IDR) the old deadline clamp was exactly the line-rate blast → tx-overrun → freeze path this
+/// module exists to prevent. `0` = uncapped legacy deadline-only spread
+/// (PUNKTFUNK_PACE_FACTOR=0, and the fallback when the bitrate isn't known yet).
 #[allow(clippy::too_many_arguments)]
 fn paced_submit(
     session: &mut Session,
@@ -498,34 +499,22 @@ fn pace_sealed(
         chunk: crate::send_pacing::ChunkPolicy::Adaptive { base: 16, max: 64 },
         sleep_floor: std::time::Duration::from_micros(500),
     };
-    // T1.2 rate cap: the overflow's wire time at `pace_rate_bps`. Only the bytes past the
-    // burst pace at all, so only they bound the budget.
+    // T1.2 rate cap, resume-safe form (stall program T2): the overflow's wire time at
+    // `pace_rate_bps` IS the budget — the deadline no longer under-cuts it, so an oversized
+    // frame (a stall-resume scene delta, a cold IDR) paces at the proven 3× rate instead of
+    // collapsing into a line-rate blast that overruns the socket buffer and loses the very
+    // frame that ends a freeze. See `send_pacing::native_budget` for the full argument.
     let overflow_bytes = wire_bytes.saturating_sub(burst_bytes) as u64;
-    let cap = if pace_rate_bps > 0 && overflow_bytes > 0 {
-        std::time::Duration::from_nanos(
-            (overflow_bytes * 8).saturating_mul(1_000_000_000) / pace_rate_bps,
-        )
-    } else {
-        std::time::Duration::MAX
-    };
+    let budget = crate::send_pacing::native_budget(deadline, pace_rate_bps, overflow_bytes);
     // Time the socket handoff per chunk and fold it into the session's SealPerf split — the
     // sleeps between chunks stay excluded, so sock_ns is pure send_gso/sendmmsg time.
     let mut sock_ns = 0u64;
-    let result = crate::send_pacing::pace_frame(
-        &refs,
-        crate::send_pacing::PaceBudget::UntilDeadline {
-            deadline,
-            fraction: 0.9,
-            cap,
-        },
-        &cfg,
-        |chunk| {
-            let t0 = std::time::Instant::now();
-            let r = session.send_sealed(chunk).map(|_| ());
-            sock_ns += t0.elapsed().as_nanos() as u64;
-            r
-        },
-    );
+    let result = crate::send_pacing::pace_frame(&refs, budget, &cfg, |chunk| {
+        let t0 = std::time::Instant::now();
+        let r = session.send_sealed(chunk).map(|_| ());
+        sock_ns += t0.elapsed().as_nanos() as u64;
+        r
+    });
     drop(refs); // release the borrow of `wires` so it can return to the seal pool
     session.reclaim_wires(wires);
     session.note_sock_ns(sock_ns);
