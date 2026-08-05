@@ -337,9 +337,11 @@ export default definePlugin(() => {
   // controller config. Fire-and-forget: cosmetic library upkeep must never block plugin load.
   void ensureGamepadUiShortcut();
   return {
-    // `name` is the plugin's INTERNAL id — it must stay in sync with plugin.json (the loader
-    // keys plugins by it), so it stays lowercase; user-facing strings say "Punktfunk".
-    name: "punktfunk",
+    // `name` must stay in sync with plugin.json (the loader keys plugins by it) — and it is
+    // USER-VISIBLE: Decky labels the entry in its plugin list with it, so it carries the brand
+    // case. Decky finds an installed plugin by matching plugin.json "name" (never the folder
+    // name), so this is independent of the on-disk dir, which stays lowercase `punktfunk`.
+    name: "Punktfunk",
     // `staticClasses?.Title` is guarded so a future client that drops the export can't throw
     // at plugin-load time (an error boundary only catches render-time, not load-time, errors).
     titleView: <div className={staticClasses?.Title}>Punktfunk</div>,

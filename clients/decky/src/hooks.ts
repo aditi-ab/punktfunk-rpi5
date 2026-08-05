@@ -387,7 +387,10 @@ export async function applyUpdate(
         // before any result could arrive — so never await it. Decky shows its own confirm prompt.
         void backend.callable("utilities/install_plugin")(
           info.artifact,
-          "punktfunk",
+          // The name Decky uninstalls before extracting the new zip — it locates the folder by
+          // matching plugin.json "name", so this must equal THIS build's plugin.json name (the
+          // brand-cased one), not the lowercase on-disk dir.
+          "Punktfunk",
           info.latest,
           info.hash,
           INSTALL_TYPE_UPDATE,
