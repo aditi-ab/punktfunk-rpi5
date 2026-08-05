@@ -21,14 +21,25 @@ export const resolvePluginBase = (): string => {
 export const useIsEmbedded = (): boolean =>
 	typeof window !== "undefined" && window.parent !== window;
 
-/** Mirror a route into the console's address bar (best-effort, embedded only). */
+/**
+ * Mirror a route into the console's address bar (best-effort, embedded only).
+ *
+ * The `"*"` target origin is load-bearing and must stay: the console frames plugin UIs from a
+ * DIFFERENT ORIGIN than its own (they get their own port, so a plugin cannot act as the logged-in
+ * operator — security-review 2026-08-05 H-3). Narrowing this to `window.location.origin` would
+ * target the PLUGIN's origin, not the console's, and every message would be silently dropped.
+ *
+ * `"*"` is safe here because the payload is a route path the plugin itself just navigated to —
+ * nothing secret — and the console verifies `event.origin` against the plugin origin before acting
+ * on it, so the trust decision is made on the receiving side where it belongs.
+ */
 export const postNavigate = (path: string): void => {
 	try {
 		if (window.parent !== window) {
 			window.parent.postMessage({ type: "pf-ui:navigate", path }, "*");
 		}
 	} catch {
-		// cross-origin parent or detached — deep-link sync is best-effort
+		// detached parent — deep-link sync is best-effort
 	}
 };
 

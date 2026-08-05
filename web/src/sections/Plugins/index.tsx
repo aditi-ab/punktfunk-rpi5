@@ -1,14 +1,20 @@
 // A plugin's UI, embedded in the console (plugin-ui-surface §5). We probe the plugin's liveness
 // first and only mount the iframe when it answers — otherwise the iframe would show the proxy's raw
-// 502. The iframe is same-origin (proxied through /plugin-ui), so the plugin can talk to its own
-// loopback REST with the operator's session and, optionally, keep the address bar in sync by posting
-// `{ type: "pf-ui:navigate", path }` to the parent.
+// 502.
+//
+// The iframe is CROSS-ORIGIN: plugin UIs are served from their own origin (same scheme and host,
+// its own port — see nitro-entry/bun-https.mjs and 2026-08-05 review H-3). The plugin can still talk
+// to its own loopback REST with the operator's session, because that origin is same-SITE and the
+// `SameSite=Lax` cookie reaches it; what it can no longer do is read or drive the console. It may
+// still keep the address bar in sync by posting `{ type: "pf-ui:navigate", path }` to the parent —
+// now verified against the plugin origin before it is honoured.
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, useNavigate } from "@tanstack/react-router";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import { type FC, useEffect, useMemo, useRef } from "react";
 import { pluginIcon, usePlugins } from "@/api/plugins";
 import { useInstalledPlugins } from "@/api/store";
+import { pluginOriginFrom, useUiConfig } from "@/api/uiConfig";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
@@ -34,14 +40,21 @@ export const SectionPlugin: FC = () => {
 	const { data: installed } = useInstalledPlugins();
 	const provenance = installed?.find((p) => p.plugin_id === pluginId);
 
+	// Where plugin UIs are served from. `undefined` = still resolving, `null` = the plugin listener
+	// did not bind, so there is nowhere safe to render this and we say so instead of falling back to
+	// the console's own origin — that fallback IS the vulnerability.
+	const { data: uiConfig } = useUiConfig();
+	const pluginOrigin = pluginOriginFrom(uiConfig);
+
 	// Liveness: a 200 from /__health means the plugin is up.
 	//
 	// Two subtleties, both learned the hard way:
 	//
 	//  - A 200 is not enough. `fetch` follows redirects, so an expired session — where the gate
 	//    answers 302 → /login → 200 HTML — looked exactly like a healthy plugin, and the console
-	//    rendered its own login page inside the plugin's iframe. `redirect: "manual"` makes that
-	//    an opaque response we can reject instead.
+	//    rendered its own login page inside the plugin's iframe. This now asks the CONSOLE origin,
+	//    which probes the plugin server-side (the plugin origin is cross-origin to us and would need
+	//    CORS to be readable from here) — and a bounced session is a plain 401, not HTML.
 	//  - One failure must not be terminal. The runner is restarted at the end of every successful
 	//    install, so a single missed probe is routine; giving up on the first one threw away
 	//    whatever the operator had open in another plugin. Retry a few times, and keep probing on a
@@ -49,11 +62,11 @@ export const SectionPlugin: FC = () => {
 	const health = useQuery({
 		queryKey: ["plugin-health", pluginId],
 		queryFn: async () => {
-			const r = await fetch(`/plugin-ui/${pluginId}/__health`, {
+			const r = await fetch(`/_plugin-health/${pluginId}`, {
 				credentials: "same-origin",
 				redirect: "manual",
 			});
-			// `type === "opaqueredirect"` is the gate bouncing us to /login, not the plugin answering.
+			// `type === "opaqueredirect"` is the gate bouncing us to /login, not an answer.
 			if (r.type === "opaqueredirect") throw new Error("session expired");
 			if (!r.ok) throw new Error(`health ${r.status}`);
 			return true;
@@ -62,18 +75,49 @@ export const SectionPlugin: FC = () => {
 		refetchInterval: (q) => (q.state.status === "error" ? 5_000 : 20_000),
 	});
 
+	// Is the plugin ORIGIN reachable from this browser? Distinct from "is the plugin running".
+	//
+	// The console is served with the host's own self-signed certificate, and a browser stores a
+	// certificate exception PER ORIGIN — including the port. So the operator having trusted
+	// https://host:47992 says nothing about https://host:47993, and a certificate interstitial
+	// cannot be shown (let alone accepted) inside an iframe: the frame would just sit blank, with no
+	// way to fix it and nothing on screen explaining why.
+	//
+	// A `no-cors` probe distinguishes the two cases without needing CORS: the response is opaque and
+	// unreadable either way, but a TLS failure REJECTS while an ordinary answer — even a 401 —
+	// resolves. Rejection therefore means "this browser will not talk to that origin yet", which is
+	// a one-time, fixable thing, so we say so and link to it.
+	const reachable = useQuery({
+		queryKey: ["plugin-origin-reachable", pluginOrigin],
+		enabled: !!pluginOrigin,
+		queryFn: async () => {
+			await fetch(`${pluginOrigin}/plugin-ui/${pluginId}/__health`, {
+				mode: "no-cors",
+				cache: "no-store",
+			});
+			return true;
+		},
+		retry: 1,
+		staleTime: 60_000,
+	});
+
 	// The iframe src is fixed at the initial deep-link path; the plugin's own in-app navigation drives
 	// the console URL via postMessage (below), never the src — so there's no reload loop.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally pinned to the initial path
 	const initialSrc = useMemo(
-		() => `/plugin-ui/${pluginId}/${_splat ?? ""}`,
-		[pluginId],
+		() => `${pluginOrigin ?? ""}/plugin-ui/${pluginId}/${_splat ?? ""}`,
+		[pluginId, pluginOrigin],
 	);
 
 	// Keep the console address bar in sync with the plugin's internal routing.
 	useEffect(() => {
 		const onMessage = (e: MessageEvent) => {
 			if (e.source !== iframeRef.current?.contentWindow) return;
+			// Now that the frame is cross-origin, `e.origin` is a real check rather than a tautology:
+			// only the plugin origin may drive the console's address bar. (Empty `pluginOrigin` is
+			// the vite-dev same-origin arrangement, where `e.origin` is our own.)
+			const expected = pluginOrigin || window.location.origin;
+			if (e.origin !== expected) return;
 			const data = e.data as { type?: string; path?: string };
 			if (data?.type === "pf-ui:navigate" && typeof data.path === "string") {
 				navigate({
@@ -85,7 +129,7 @@ export const SectionPlugin: FC = () => {
 		};
 		window.addEventListener("message", onMessage);
 		return () => window.removeEventListener("message", onMessage);
-	}, [pluginId, navigate]);
+	}, [pluginId, navigate, pluginOrigin]);
 
 	return (
 		<div className="flex h-[calc(100dvh-7rem)] min-h-[480px] flex-col gap-3 sm:h-[calc(100dvh-5rem)]">
@@ -99,42 +143,45 @@ export const SectionPlugin: FC = () => {
 					</span>
 				)}
 				{provenance && <TierBadge tier={provenance.tier} />}
-				<a
-					href={`/plugin-ui/${pluginId}/`}
-					target="_blank"
-					rel="noreferrer"
-					className="ml-auto inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-				>
-					<ExternalLink className="size-4" />
-					{m.plugin_open_new_tab()}
-				</a>
+				{/* Full-window, on the PLUGIN origin. This link used to be the same escalation as the
+				    iframe with no sandbox involved at all — a top-level document on the console origin,
+				    holding the operator's session. It only stops being that because the origin moved,
+				    which is why the fix could never have been a sandbox attribute. */}
+				{pluginOrigin !== null && pluginOrigin !== undefined && (
+					<a
+						href={`${pluginOrigin}/plugin-ui/${pluginId}/`}
+						target="_blank"
+						rel="noreferrer"
+						className="ml-auto inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+					>
+						<ExternalLink className="size-4" />
+						{m.plugin_open_new_tab()}
+					</a>
+				)}
 			</div>
 
-			{health.isError ? (
+			{pluginOrigin === null ? (
+				<UnavailableCard />
+			) : reachable.isError ? (
+				<UntrustedOriginCard
+					href={`${pluginOrigin}/plugin-ui/${pluginId}/`}
+					onRetry={() => reachable.refetch()}
+				/>
+			) : health.isError ? (
 				<OfflineCard title={title} onRetry={() => health.refetch()} />
-			) : health.isSuccess ? (
+			) : health.isSuccess && pluginOrigin !== undefined ? (
 				<iframe
 					ref={iframeRef}
 					src={initialSrc}
 					title={title}
 					className="w-full flex-1 rounded-lg border bg-card"
-					// The plugin is operator-installed code on our own origin (no new trust boundary —
-					// plugin-ui-surface §7.4); allow it to run scripts, forms, popups, and full-window.
-					//
-					// ⚠ KNOWN GAP — security-review-2026-08-05 H-3. `allow-same-origin` means plugin JS
-					// runs as first-party on the console origin, so it can `fetch('/api/**')` with the
-					// operator's session and the BFF attaches the ADMIN bearer — reaching everything
-					// `plugin_may_access` withholds (arm pairing, read the PIN, approve a device, read
-					// `/hooks`). The "open in new tab" link above is the same escalation without any
-					// iframe at all, so the sandbox attribute alone is not where this gets fixed.
-					//
-					// Simply dropping `allow-same-origin` does NOT work: a sandboxed document has an
-					// opaque origin, its subresource requests are then treated as cross-site, the
-					// `SameSite=Lax` `pf_session` cookie is not sent, and every plugin asset 302s to
-					// /login — a blank frame. The real fix is to serve `/plugin-ui/**` from a distinct
-					// ORIGIN (a second listener on another port: different origin so the same-origin
-					// policy is the boundary, but still the same *site*, so the cookie keeps flowing),
-					// which changes the console's listener/deploy model and needs on-glass validation.
+					// `allow-same-origin` is correct HERE and was the vulnerability BEFORE, because what
+					// counts as "same origin" changed underneath it: the frame now loads from the plugin
+					// origin, so this grants the plugin its OWN origin (storage, its own fetches) rather
+					// than the console's. Removing it would give the frame an opaque origin instead,
+					// which stops the SameSite=Lax session cookie and 302s every plugin asset to /login
+					// — the dead end recorded in 2026-08-05 review H-3. Origin isolation is enforced by
+					// the two listeners (nitro-entry/bun-https.mjs), not by this attribute.
 					sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-modals"
 					allow="fullscreen"
 				/>
@@ -145,6 +192,57 @@ export const SectionPlugin: FC = () => {
 		</div>
 	);
 };
+
+/**
+ * The plugin-UI listener did not bind, so there is no origin to render a plugin on.
+ *
+ * Deliberately a dead end rather than a fallback: serving the plugin on the console's own origin is
+ * exactly the escalation the separate origin exists to prevent, so "the port is busy" must degrade
+ * to "no plugin UIs", never to "plugin UIs, unsafely".
+ */
+const UnavailableCard: FC = () => (
+	<div className="flex flex-1 items-center justify-center rounded-lg border border-dashed">
+		<div className="flex max-w-md flex-col items-center gap-3 p-8 text-center">
+			<h2 className="text-base font-semibold">
+				{m.plugin_origin_unavailable_title()}
+			</h2>
+			<p className="text-sm text-muted-foreground">
+				{m.plugin_origin_unavailable_hint()}
+			</p>
+		</div>
+	</div>
+);
+
+/**
+ * The plugin origin exists but this browser will not talk to it yet — almost always the host's
+ * self-signed certificate not having been accepted for that PORT (exceptions are per origin), which
+ * an iframe can never prompt for. One visit in a real tab fixes it for good.
+ */
+const UntrustedOriginCard: FC<{ href: string; onRetry: () => void }> = ({
+	href,
+	onRetry,
+}) => (
+	<div className="flex flex-1 items-center justify-center rounded-lg border border-dashed">
+		<div className="flex max-w-md flex-col items-center gap-3 p-8 text-center">
+			<h2 className="text-base font-semibold">
+				{m.plugin_origin_untrusted_title()}
+			</h2>
+			<p className="text-sm text-muted-foreground">
+				{m.plugin_origin_untrusted_hint()}
+			</p>
+			<Button asChild variant="outline" size="sm">
+				<a href={href} target="_blank" rel="noreferrer">
+					<ExternalLink className="size-4" />
+					{m.plugin_origin_untrusted_open()}
+				</a>
+			</Button>
+			<Button variant="ghost" size="sm" onClick={onRetry}>
+				<RefreshCw className="size-4" />
+				{m.plugin_retry()}
+			</Button>
+		</div>
+	</div>
+);
 
 const OfflineCard: FC<{ title: string; onRetry: () => void }> = ({
 	title,

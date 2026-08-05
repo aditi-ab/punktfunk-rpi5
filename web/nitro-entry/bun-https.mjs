@@ -14,10 +14,13 @@
 // (a local CA installed per device) fronted by a server that speaks them (e.g. Caddy) — deliberately
 // out of scope for a LAN console; TLS (no cleartext login/session) is the win.
 //
+// TWO LISTENERS, on purpose — see `PLUGIN ORIGIN` below.
+//
 // Env (set by the launchers / the systemd unit — see web.env.example):
 //   PUNKTFUNK_UI_TLS_CERT / _KEY   PEM file paths (the host's cert.pem / key.pem). BOTH set ⇒ HTTPS.
 //                                  Unset ⇒ plain HTTP (local dev only).
 //   PORT / HOST                    standard Nitro bind (3000 / 0.0.0.0).
+//   PUNKTFUNK_UI_PLUGIN_PORT       the plugin-UI origin's port (default: console port + 1).
 import "#nitro-internal-pollyfills";
 import wsAdapter from "crossws/adapters/bun";
 import { useNitroApp } from "nitropack/runtime";
@@ -39,6 +42,37 @@ const ws = import.meta._websocket
 // Any inbound copy is deleted first, so a client cannot forge it.
 // Read back by `peerAddress()` in server/util/auth.ts — keep the two names in sync.
 const PEER_IP_HEADER = "x-pf-peer-ip";
+
+// PLUGIN ORIGIN — which listener a request arrived on, stamped the same unforgeable way.
+//
+// A plugin's UI used to be reverse-proxied onto the CONSOLE's own origin and framed with
+// `allow-same-origin`, which means plugin JS ran as first-party code on the console origin: it
+// could `fetch('/api/**', {credentials:'same-origin'})` and the BFF would attach the operator's
+// ADMIN mgmt bearer. That reached everything `plugin_may_access` withholds — arm pairing, read the
+// host PIN, approve a device, read `/hooks` — i.e. any plugin was one line of JS away from full
+// operator admin (2026-08-05 review H-3). The "open in new tab" link was the same escalation with
+// no iframe involved at all, so no sandbox attribute could have fixed it.
+//
+// The fix is to make the browser's own same-origin policy the boundary, by serving plugin UIs from
+// a DIFFERENT ORIGIN: a second listener on its own port.
+//
+//   different ORIGIN — scheme+host+PORT — so SOP applies: plugin JS cannot read the console's DOM,
+//                      and its cross-origin `fetch` of `/api/**` is unreadable (we emit no CORS) and
+//                      unable to mutate (the Sec-Fetch-Site guard sees `same-site`, not
+//                      `same-origin`).
+//   same SITE        — because a cookie's scope ignores the port, and SameSite is computed on the
+//                      site, not the origin. So the `SameSite=Lax` session cookie still flows to the
+//                      plugin origin, and plugin pages keep loading their assets while logged in.
+//
+// That combination is why this works and why the obvious alternative does not: dropping
+// `allow-same-origin` gives the frame an OPAQUE origin, which makes its subresource requests
+// cross-site, which stops the Lax cookie, which 302s every plugin asset to /login — a blank frame.
+//
+// The console listener refuses `/plugin-ui/**` and the plugin listener refuses everything else
+// (server/middleware/auth.ts). Both halves matter: without the first the old path still works;
+// without the second, plugin JS could call `/api/**` on its OWN origin and get the admin bearer
+// attached right back.
+const LISTENER_HEADER = "x-pf-listener";
 
 // TLS from the host's identity cert (file PATHS → Bun.file, not PEM-in-env). Absent ⇒ plain HTTP.
 const certPath = process.env.PUNKTFUNK_UI_TLS_CERT;
@@ -76,8 +110,8 @@ if (!tls && secureFlag) {
 	process.exit(1);
 }
 
-const server = Bun.serve({
-	port: process.env.NITRO_PORT || process.env.PORT || 3000,
+/** The shared `Bun.serve` options both listeners use — only the port and the stamped lane differ. */
+const listenerOptions = (lane) => ({
 	host: process.env.NITRO_HOST || process.env.HOST,
 	// Bun defaults this to 10 s, which is SHORTER than the host's 15 s SSE keep-alive comment — so a
 	// proxied `/api/v1/events` stream (or any other quiet long-lived response) gets cut by us and
@@ -108,8 +142,10 @@ const server = Bun.serve({
 		// Strip any client-supplied value BEFORE stamping the real one (see PEER_IP_HEADER).
 		const headers = new Headers(req.headers);
 		headers.delete(PEER_IP_HEADER);
+		headers.delete(LISTENER_HEADER);
 		const peer = server.requestIP(req)?.address;
 		if (peer) headers.set(PEER_IP_HEADER, peer);
+		headers.set(LISTENER_HEADER, lane);
 		return nitroApp.localFetch(url.pathname + url.search, {
 			host: url.hostname,
 			protocol: url.protocol,
@@ -120,7 +156,39 @@ const server = Bun.serve({
 		});
 	},
 });
+
+const consolePort = Number(process.env.NITRO_PORT || process.env.PORT || 3000);
+const server = Bun.serve({ ...listenerOptions("console"), port: consolePort });
 console.log(`punktfunk web console listening on ${server.url} (tls=${!!tls})`);
+
+// The plugin-UI origin. Its own port, everything else identical.
+//
+// A bind failure does NOT fall back to serving plugin UIs on the console origin — that is the hole
+// this exists to close, and a security boundary that disappears when a port is busy is not one. It
+// degrades to "plugin UIs unavailable": the console reads the state below and renders an
+// explanation instead of a frame, and everything else about the console keeps working.
+const pluginPort = Number(process.env.PUNKTFUNK_UI_PLUGIN_PORT || consolePort + 1);
+let pluginServer;
+try {
+	pluginServer = Bun.serve({ ...listenerOptions("plugin"), port: pluginPort });
+	// Read back by the app (server/util/pluginOrigin.ts) — same process, so process.env is the
+	// simplest channel, and it is only ever SET here, never trusted from the environment we started
+	// with (a stale inherited value would otherwise advertise a port nothing is listening on).
+	process.env.PUNKTFUNK_UI_PLUGIN_PORT_ACTIVE = String(pluginPort);
+	process.env.PUNKTFUNK_UI_CONSOLE_PORT_ACTIVE = String(consolePort);
+	console.log(
+		`punktfunk plugin-UI origin listening on ${pluginServer.url} (tls=${!!tls})`,
+	);
+} catch (e) {
+	delete process.env.PUNKTFUNK_UI_PLUGIN_PORT_ACTIVE;
+	console.error(
+		`punktfunk web console: could not bind the plugin-UI origin on port ${pluginPort} ` +
+			`(${e?.message ?? e}). Plugin UIs are DISABLED until this is resolved — they are ` +
+			"deliberately not served on the console's own origin, because a plugin sharing that " +
+			"origin can act as the logged-in operator. Set PUNKTFUNK_UI_PLUGIN_PORT to a free port.",
+	);
+}
+
 if (import.meta._tasks) {
 	startScheduleRunner();
 }

@@ -655,39 +655,51 @@ fn web_setup(args: &[String]) -> Result<()> {
             server.display()
         );
     }
-    // 4. firewall: inbound TCP 47992. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
-    //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
-    //    Scoped to the same profiles as the streaming ports — Domain + Private by default, Public
-    //    only with `--allow-public-network`. Delete any prior rule first so an upgrade re-scopes it
-    //    instead of stacking a second (possibly all-profiles) rule behind the new one.
+    // 4. firewall: inbound TCP 47992 (console) and 47993 (plugin UIs). The console serves HTTPS
+    //    (HTTP/1.1 over TLS) with the host's identity cert. (No UDP/HTTP-3: browsers won't use QUIC
+    //    against a self-signed/no-SAN cert.) Scoped to the same profiles as the streaming ports —
+    //    Domain + Private by default, Public only with `--allow-public-network`. Delete any prior
+    //    rule first so an upgrade re-scopes it instead of stacking a second (possibly all-profiles)
+    //    rule behind the new one.
+    //
+    //    47993 is a SEPARATE ORIGIN, not a second copy of the console: plugin UIs are served there
+    //    precisely so a plugin cannot act as the logged-in operator on the console's origin
+    //    (security-review 2026-08-05 H-3). Same host, same certificate, different port — which is
+    //    what makes it a different origin to the browser while staying same-site for the session
+    //    cookie. Without this rule, plugin interfaces simply do not load from another device.
     let fw_profile =
         crate::service::firewall_profile_arg(crate::service::allow_public_network(args)?);
-    run_quiet(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            "name=Punktfunk web console (TCP 47992)",
-        ],
-    );
-    if !run_quiet(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            "name=Punktfunk web console (TCP 47992)",
-            "dir=in",
-            "action=allow",
-            "protocol=TCP",
-            "localport=47992",
-            fw_profile,
-        ],
-    ) {
-        eprintln!("warning: could not add the firewall rule for TCP 47992");
+    for (name, port) in [
+        ("Punktfunk web console (TCP 47992)", "47992"),
+        ("Punktfunk plugin UIs (TCP 47993)", "47993"),
+    ] {
+        run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={name}"),
+            ],
+        );
+        if !run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={port}"),
+                fw_profile,
+            ],
+        ) {
+            eprintln!("warning: could not add the firewall rule for TCP {port}");
+        }
     }
     // No start step: the PunktfunkHost service supervises the console and starts it the moment the
     // host has written the files it needs (mgmt token + identity cert/key) — there is nothing an
