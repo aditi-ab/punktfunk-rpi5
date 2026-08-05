@@ -848,11 +848,22 @@ pub(super) fn input_thread(
             // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
             // wakes for gyro samples instead of making them wait out the feedback poll interval.
             Ok(ClientInput::Rich(rich)) => {
-                if matches!(rich, punktfunk_core::quic::RichInput::Motion { .. }) {
+                // Debug-only instrument: skip the whole thing unless debug logging is actually
+                // enabled. It used to grow and `sort_unstable()` a Vec in the input hot loop
+                // regardless, so every session paid for a measurement nobody was reading — and the
+                // "bounded by a 5 s window at a plausible pad rate" reasoning was an assumption
+                // about the CLIENT's send rate, not a bound the host enforced (2026-08-05 review
+                // L-5). The explicit cap below makes it a bound.
+                if matches!(rich, punktfunk_core::quic::RichInput::Motion { .. })
+                    && tracing::enabled!(tracing::Level::DEBUG)
+                {
                     let now = std::time::Instant::now();
                     if let Some(prev) = last_motion.replace(now) {
                         let gap = now.duration_since(prev);
-                        if gap < std::time::Duration::from_secs(1) {
+                        // 30k samples is 5 s at 6 kHz — well past any real pad, and a hard stop
+                        // for a client that simply sends motion as fast as the link allows.
+                        if gap < std::time::Duration::from_secs(1) && motion_gaps_us.len() < 30_000
+                        {
                             motion_gaps_us.push(gap.as_micros() as u32);
                         }
                     }

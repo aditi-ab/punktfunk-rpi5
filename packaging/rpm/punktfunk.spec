@@ -191,9 +191,10 @@ The plugin/script runner for a punktfunk streaming host: it discovers loose scri
 ~/.config/punktfunk/scripts and installed punktfunk-plugin-* packages under ~/.config/punktfunk/
 plugins, and supervises each as an Effect fiber (capped-jittered restart; SIGTERM shuts the whole
 tree down structurally so plugin finalizers run). A plugin auto-wires to the host's mgmt token +
-identity cert on the same box — no env editing. Bundles its own bun runtime. OPT-IN: the systemd
---user unit ships disabled (the runner is inert until you add scripts/plugins). Enable with
-`systemctl --user enable --now punktfunk-scripting`.
+identity cert on the same box — no env editing. Bundles its own bun runtime. ON BY DEFAULT: the
+systemd --user unit is enabled for every user (systemctl --global). The game-library scanners ship
+as plugins, so a host without the runner has an empty library. Opt out per user with
+`systemctl --user mask punktfunk-scripting`.
 %endif
 
 %prep
@@ -554,6 +555,10 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %post
 # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
 getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
+# Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input': writing
+# 'attach' materialises an arbitrary emulated USB device — a root-only kernel primitive that must
+# not ride on the group users are told to join for gamepads (security-review 2026-08-05 M-4).
+getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc 2>/dev/null || :
@@ -561,6 +566,8 @@ udevadm trigger --subsystem-match=misc 2>/dev/null || :
 # it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
+echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \$USER"
+echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust."
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
 # Fedora/RHEL run firewalld by default — point the way to the installed service definitions.
@@ -584,16 +591,31 @@ fi
 echo "punktfunk-web installed. Enable the console for your user:"
 echo "    systemctl --user enable --now punktfunk-web"
 echo "A login password is generated on first start — read it with:"
-echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
+# From the 0600 file, NOT the journal: the journal is persistent and group-readable (adm /
+# systemd-journal on Debian-family, and this hint was copied around), so telling people to fish a
+# password out of it published the secret to every member of those groups (review 2026-08-05 L-18).
+echo "    cut -d= -f2- \${XDG_CONFIG_HOME:-\$HOME/.config}/punktfunk/web-password"
 echo "Then open https://<host-ip>:47992"
 %endif
 
 %if %{with scripting}
 %post scripting
-echo "punktfunk-scripting installed. It runs your automation — add scripts to"
+# `--global`, not `--user`: a scriptlet has no user session to act on, and this is the only
+# mechanism that makes a `--user` unit on-by-default for everyone (it symlinks into
+# /etc/systemd/user/…wants/). The game-library scanners are plugins now, so the runner is a default
+# component rather than an add-on (design D9); it stays opt-OUT via
+# `systemctl --user mask punktfunk-scripting`, since a plain `--user disable` cannot remove a global
+# symlink. $1 == 1 is a first INSTALL — on an upgrade ($1 > 1) this must not undo an operator's mask.
+if [ "$1" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || :
+fi
+echo "punktfunk-scripting installed and enabled for all users."
+echo "It runs your automation — game-library sources, scripts in"
 echo "    ~/.config/punktfunk/scripts/  (loose .ts/.js files)"
-echo "or install plugins into ~/.config/punktfunk/plugins/ (bun add punktfunk-plugin-<name>),"
-echo "then enable the runner: systemctl --user enable --now punktfunk-scripting"
+echo "and plugins under ~/.config/punktfunk/plugins/."
+echo "It starts with your next login; start it now with:"
+echo "    systemctl --user start punktfunk-scripting"
+echo "Don't want it? systemctl --user mask punktfunk-scripting"
 %endif
 
 %changelog

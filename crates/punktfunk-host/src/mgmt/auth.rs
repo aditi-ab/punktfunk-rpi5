@@ -17,6 +17,42 @@ use axum::http::Method;
 use axum::middleware::Next;
 use sha2::{Digest, Sha256};
 
+/// **Which credential authorized this request**, attached to the request extensions by
+/// [`require_auth`] on every request it forwards.
+///
+/// [`plugin_may_access`] answers "may this lane reach this route"; this answers "may this lane set
+/// this *field*". Some payloads carry operator-privileged fields on routes a plugin otherwise has
+/// every business calling — the library reconcile is the case that matters: a provider plugin owns
+/// its entry set, but `prep` and `launch.kind == "command"` are executed verbatim as the host user
+/// (`/bin/sh -c` / `cmd.exe /c`), which is the same primitive the `/hooks` carve-out withholds.
+/// Route-level authorization cannot express that; a handler holding this can (see
+/// [`crate::library::reject_privileged_fields`]).
+///
+/// Extracted by handlers as `Extension<AuthLane>`. A missing extension is a 500, not a default —
+/// a router that forgot the middleware must fail closed, never silently grant admin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthLane {
+    /// The operator's admin bearer token (loopback): everything, including the privileged fields.
+    Admin,
+    /// The scripting runner's scoped bearer token (loopback): [`plugin_may_access`] routes, and
+    /// never the operator-privileged fields inside them.
+    Plugin,
+    /// A paired streaming client certificate (mTLS, LAN): the read-only [`cert_may_access`] set.
+    Cert,
+    /// An always-open route (`/health`) or the loopback-only tray summary — no credential at all.
+    Public,
+}
+
+impl AuthLane {
+    /// Whether this lane may set fields that become command execution as the host user. Only the
+    /// operator's own token may: the console is the surface where the operator types a command, and
+    /// typing it there is the trust decision. Everything else is refused, including a paired cert
+    /// (which cannot reach a write route anyway — belt and braces if the allowlist ever grows).
+    pub(crate) fn may_set_privileged_fields(self) -> bool {
+        matches!(self, AuthLane::Admin)
+    }
+}
+
 /// Auth gate on the `/api/v1` routes: a paired client cert (mTLS, from anywhere) or the bearer token
 /// (from a **loopback** peer only) — required always (the host runs with a token by construction).
 /// `/api/v1/health` stays open for probes; `/api/v1/local/summary` is open to loopback peers only
@@ -28,8 +64,15 @@ pub(crate) async fn require_auth(
     req: Request,
     next: Next,
 ) -> Response {
+    /// Stamp the authorizing lane onto the request before it reaches a handler, so a handler can
+    /// refuse operator-privileged FIELDS to a non-operator lane (see [`AuthLane`]).
+    async fn forward(mut req: Request, next: Next, lane: AuthLane) -> Response {
+        req.extensions_mut().insert(lane);
+        next.run(req).await
+    }
+
     if req.uri().path() == "/api/v1/health" {
-        return next.run(req).await; // liveness probe is always open
+        return forward(req, next, AuthLane::Public).await; // liveness probe is always open
     }
     // The tray icon's status source: non-sensitive counts/booleans only, unauthenticated but
     // confined to LOOPBACK peers. The bearer-token file (and cert.pem) are SYSTEM/Administrators-
@@ -43,7 +86,7 @@ pub(crate) async fn require_auth(
             .get::<PeerAddr>()
             .is_none_or(|a| a.0.ip().is_loopback());
         return if from_loopback {
-            next.run(req).await
+            forward(req, next, AuthLane::Public).await
         } else {
             api_error(
                 StatusCode::UNAUTHORIZED,
@@ -61,7 +104,7 @@ pub(crate) async fn require_auth(
         if cert_may_access(req.method(), req.uri().path())
             && st.native.as_ref().is_some_and(|n| n.is_paired(fp))
         {
-            return next.run(req).await;
+            return forward(req, next, AuthLane::Cert).await;
         }
     }
     // Otherwise require the bearer token (the web console / admin) — but only from a LOOPBACK peer.
@@ -92,7 +135,7 @@ pub(crate) async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
-        Some(token) if token_eq(token, expected) => next.run(req).await,
+        Some(token) if token_eq(token, expected) => forward(req, next, AuthLane::Admin).await,
         // The scripting runner's scoped lane: same loopback confinement as the admin token, but
         // routes that would let a plugin escalate — registering hooks (arbitrary command
         // execution as the host user) or administering pairing (admitting/ejecting devices,
@@ -105,7 +148,7 @@ pub(crate) async fn require_auth(
                 .is_some_and(|pt| token_eq(token, pt)) =>
         {
             if plugin_may_access(req.method(), req.uri().path()) {
-                next.run(req).await
+                forward(req, next, AuthLane::Plugin).await
             } else {
                 api_error(
                     StatusCode::FORBIDDEN,
@@ -121,9 +164,18 @@ pub(crate) async fn require_auth(
     }
 }
 
-/// Which routes the scripting runner's **plugin token** may reach: the admin surface minus the
-/// escalation routes. Exclusion-based (a plugin legitimately reads status/library/events, drives
-/// sessions, and registers its UI lease), with these carve-outs:
+/// The routes the scripting runner's **plugin token** may reach — an explicit **allowlist**, so a
+/// route added later is denied until someone classifies it (`plugin_lane_classifies_every_route` in
+/// `mgmt::tests` fails the build otherwise).
+///
+/// This gate used to be a denylist of route prefixes, and that is precisely how the 2026-08-05
+/// review's H-1/H-2 arrived: `/api/v1/library` was never enumerated, so the plugin lane inherited
+/// two copies of the very "arbitrary command execution as the host user" primitive the `/hooks`
+/// carve-out exists to withhold, plus an unconfined file read. Every sibling gate in the system
+/// (`cert_may_access`, the QUIC pairing gate, the console's `isPublicPath`) is deny-by-default;
+/// this one now is too.
+///
+/// What stays *out* of the list, and why:
 /// - **hooks** — `hooks.json` runs operator commands on lifecycle events; writing it is arbitrary
 ///   command execution as the host user, and reading it can expose webhook credentials.
 /// - **pairing administration** — arming/approving/denying/unpairing (and PIN visibility) decide
@@ -133,29 +185,90 @@ pub(crate) async fn require_auth(
 ///   secret; only the console proxy (admin token) needs it.
 /// - **the plugin store** — installing a plugin is running new code with operator privileges, and a
 ///   plugin that can do that is a persistence/escalation primitive: it could install a helper that
-///   isn't constrained the way it is, or switch the runner's own service state. Denied wholesale
-///   (reads included — the catalog is not sensitive, but there is no reason a plugin needs it, and
-///   a whole-prefix deny can't be defeated by a route added later).
+///   isn't constrained the way it is, or switch the runner's own service state.
+/// - **the update surface** — operator business end to end (`apply` runs an installer / the root
+///   helper).
+///
+/// The library *writes* below are on the list because a provider plugin's whole job is reconciling
+/// its own entries — but the two operator-privileged FIELDS inside those payloads (`prep`, and
+/// `launch.kind == "command"`) are refused to this lane in the handlers, via [`AuthLane`]. Route
+/// reachability and field authority are separate questions and this gate only answers the first.
 pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
-    let denied = path == "/api/v1/hooks"
-        || path == "/api/v1/store"
-        || path.starts_with("/api/v1/store/")
-        || path == "/api/v1/pair"
-        || path.starts_with("/api/v1/pair/")
-        || path == "/api/v1/native/pair"
-        || path.starts_with("/api/v1/native/pair/")
-        || path == "/api/v1/native/pending"
-        || path.starts_with("/api/v1/native/pending/")
-        || (method == Method::DELETE
-            && (path.starts_with("/api/v1/clients/")
-                || path.starts_with("/api/v1/native/clients/")))
-        || (path.starts_with("/api/v1/plugins/") && path.ends_with("/ui-credential"))
-        // The update surface is operator business end to end: today it is only a check, but
-        // the same prefix will carry `apply` (running an installer / the root helper), and a
-        // whole-prefix deny can't be defeated by a route added later.
-        || path == "/api/v1/update"
-        || path.starts_with("/api/v1/update/");
-    !denied
+    // (method, path) pairs, `{}` matching exactly one path segment. Grouped as the route table is.
+    const ALLOWED: &[(&Method, &str)] = &[
+        // Host / status reads.
+        (&Method::GET, "/api/v1/health"),
+        (&Method::GET, "/api/v1/host"),
+        (&Method::GET, "/api/v1/status"),
+        (&Method::GET, "/api/v1/local/summary"),
+        (&Method::GET, "/api/v1/compositors"),
+        (&Method::GET, "/api/v1/events"),
+        (&Method::GET, "/api/v1/logs"),
+        // The paired-device rosters: read-only. (DELETE is pairing administration — not listed.)
+        (&Method::GET, "/api/v1/clients"),
+        (&Method::GET, "/api/v1/native/clients"),
+        // GPU + display control: host configuration a plugin may legitimately steer (a room
+        // automation plugin swaps the layout with the lights); no privilege boundary crossed.
+        (&Method::GET, "/api/v1/gpus"),
+        (&Method::PUT, "/api/v1/gpus/preference"),
+        (&Method::GET, "/api/v1/display/settings"),
+        (&Method::PUT, "/api/v1/display/settings"),
+        (&Method::GET, "/api/v1/display/state"),
+        (&Method::GET, "/api/v1/display/monitors"),
+        (&Method::PUT, "/api/v1/display/layout"),
+        (&Method::POST, "/api/v1/display/release"),
+        (&Method::GET, "/api/v1/display/presets"),
+        (&Method::POST, "/api/v1/display/presets"),
+        (&Method::PUT, "/api/v1/display/presets/{}"),
+        (&Method::DELETE, "/api/v1/display/presets/{}"),
+        // Session control: stopping/steering a session is what a launcher plugin exists to do.
+        (&Method::DELETE, "/api/v1/session"),
+        (&Method::POST, "/api/v1/session/idr"),
+        (&Method::GET, "/api/v1/session/settings"),
+        (&Method::PUT, "/api/v1/session/settings"),
+        (&Method::POST, "/api/v1/game/end"),
+        // Library: reads, plus the provider reconcile a scanner plugin is built around. The
+        // operator-only FIELDS inside these payloads are refused separately (see `AuthLane`).
+        (&Method::GET, "/api/v1/library"),
+        (&Method::GET, "/api/v1/library/art/{}/{}"),
+        (&Method::GET, "/api/v1/library/scanners"),
+        (&Method::PUT, "/api/v1/library/scanners/{}"),
+        (&Method::POST, "/api/v1/library/custom"),
+        (&Method::PUT, "/api/v1/library/custom/{}"),
+        (&Method::DELETE, "/api/v1/library/custom/{}"),
+        (&Method::PUT, "/api/v1/library/provider/{}"),
+        (&Method::DELETE, "/api/v1/library/provider/{}"),
+        // Stats / telemetry.
+        (&Method::POST, "/api/v1/stats/capture/start"),
+        (&Method::POST, "/api/v1/stats/capture/stop"),
+        (&Method::GET, "/api/v1/stats/capture/status"),
+        (&Method::GET, "/api/v1/stats/capture/live"),
+        (&Method::GET, "/api/v1/stats/recordings"),
+        (&Method::GET, "/api/v1/stats/recordings/{}"),
+        (&Method::DELETE, "/api/v1/stats/recordings/{}"),
+        // The plugin's own directory entry + log ingest (its UI lease registration).
+        (&Method::GET, "/api/v1/plugins"),
+        (&Method::POST, "/api/v1/plugins/logs"),
+        (&Method::PUT, "/api/v1/plugins/{}"),
+        (&Method::DELETE, "/api/v1/plugins/{}"),
+    ];
+    ALLOWED
+        .iter()
+        .any(|(m, pat)| *m == method && path_matches(pat, path))
+}
+
+/// Match a route pattern against a concrete path, `{}` standing for exactly one segment. Segment-
+/// wise (never a substring/prefix test), so `/api/v1/plugins/{}` cannot swallow
+/// `/api/v1/plugins/x/ui-credential` the way a `starts_with` would.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let (mut p, mut a) = (pattern.split('/'), path.split('/'));
+    loop {
+        match (p.next(), a.next()) {
+            (None, None) => return true,
+            (Some(pe), Some(ae)) if pe == "{}" || pe == ae => continue,
+            _ => return false,
+        }
+    }
 }
 
 /// Which routes a paired *streaming* cert (mTLS, no bearer token) may reach: a small allowlist of

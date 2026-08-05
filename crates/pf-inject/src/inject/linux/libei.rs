@@ -1022,10 +1022,21 @@ impl EiState {
             // Track held state on the wire codes so `release_all` can undo it at
             // session end (vanished clients must not leave anything latched).
             match ev.kind {
-                InputKind::KeyDown if !self.held_keys.contains(&ev.code) => {
-                    self.held_keys.push(ev.code);
+                // Track the code we ACTUALLY INJECTED, not the raw wire code.
+                //
+                // Injection truncates (`vk_to_evdev(ev.code as u8)`), so 0x41, 0x141, 0x241 … all
+                // press the same key — but this list stored the full 32 bits, so a KeyUp for 0x41
+                // never matched the entry a KeyDown for 0x141 left behind. A client sending
+                // distinct high bytes therefore appended entries that could never be removed, to a
+                // `Vec` scanned linearly on every keystroke, for the lifetime of the injector
+                // thread — which outlives the session (2026-08-05 review L-4). Tracking the
+                // truncated code makes the list correct AND bounds it at 256 entries by
+                // construction. `release_all` re-injects through the same truncation, so the
+                // release path is unchanged.
+                InputKind::KeyDown if !self.held_keys.contains(&(ev.code & 0xff)) => {
+                    self.held_keys.push(ev.code & 0xff);
                 }
-                InputKind::KeyUp => self.held_keys.retain(|&c| c != ev.code),
+                InputKind::KeyUp => self.held_keys.retain(|&c| c != ev.code & 0xff),
                 InputKind::MouseButtonDown if !self.held_buttons.contains(&ev.code) => {
                     self.held_buttons.push(ev.code);
                 }

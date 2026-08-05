@@ -1,12 +1,14 @@
 //! Title launch: resolve a library id / raw command into an executable command line (per-store +
 //! per-OS), and the gamescope-session launch helpers. Split out of the `library` facade (plan §W5).
+//!
+//! This module owns the **whole launch side** of the library: the `kind` vocabulary, its per-kind
+//! charset validators, and the per-OS resolvers. That split is deliberate and load-bearing — the
+//! scanner modules beside it do *enumeration only*, so they can be lifted out into library plugins
+//! without taking any launch logic with them (design/library-scanner-plugins.md D1: a client sends
+//! only an entry id and the host resolves the [`LaunchSpec`] it holds, which stays true whether the
+//! entry was enumerated in-process or reconciled in by a plugin).
 
-use super::custom::valid_steam_appid;
-#[cfg(target_os = "linux")]
-use super::heroic::heroic_command;
 use super::*;
-#[cfg(windows)]
-use super::{epic::epic_launch_uri, gog::gog_spawn};
 
 /// Everything a session needs about the title it is launching, resolved in **one** library scan:
 /// what to run, what to call it, and how to recognize it once it is running.
@@ -84,6 +86,25 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
         // Heroic: `<runner>:<appName>` → the validated heroic://launch command (see heroic_command).
         #[cfg(target_os = "linux")]
         "heroic" => heroic_command(&spec.value),
+        // A launcher entry (D4): open the Steam client itself, in Big Picture or on the desktop.
+        // Nested in gamescope this is the SteamOS game-mode shape.
+        "steam_ui" => match spec.value.as_str() {
+            "bigpicture" => Some("steam -gamepadui".into()),
+            "desktop" => Some("steam".into()),
+            _ => None,
+        },
+        // The other launchers' own UIs (D4). The host builds the command — a plugin only names
+        // which launcher — so no shell string ever crosses the wire.
+        #[cfg(target_os = "linux")]
+        "launcher_ui" => match spec.value.as_str() {
+            // The same resolution the `heroic` game launches use (native binary, else Flatpak), just
+            // without `--no-gui` and without a URI: that opens Heroic's window, which IS the tile.
+            "heroic" => heroic_launch_prefix(),
+            // Bare `lutris` opens the Lutris window; with a `lutris:rungameid/…` URI it launches a
+            // game instead (the `lutris_id` kind above).
+            "lutris" => Some("lutris".into()),
+            _ => None,
+        },
         // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
@@ -132,6 +153,21 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
             // Prefer launching Steam.exe with the URI as an argument; fall back to explorer.exe, which
             // resolves the steam:// handler from the user hive. (The appid is digits-validated, so the
             // only variable part of the line is a number either way.)
+            let cmdline = match steam_exe() {
+                Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
+                None => format!("explorer.exe \"{uri}\""),
+            };
+            Some((cmdline, None))
+        }
+        // A launcher entry (D4): open the Steam client's own UI. Same Steam.exe-then-explorer ladder
+        // as `steam_appid`, and the URI is one of exactly two host-owned literals — nothing from the
+        // entry is interpolated at all.
+        "steam_ui" => {
+            let uri = match spec.value.as_str() {
+                "bigpicture" => "steam://open/bigpicture",
+                "desktop" => "steam://open/main",
+                _ => return None,
+            };
             let cmdline = match steam_exe() {
                 Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
                 None => format!("explorer.exe \"{uri}\""),
@@ -189,6 +225,152 @@ fn steam_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+// ------------------------------------------------------- per-kind launch values (host-owned ABI)
+//
+// Each helper below turns a store's launch VALUE — the only part a scanner (or, after extraction, a
+// library plugin) supplies — into the URI/command line the host actually runs. They live here rather
+// than beside the enumeration that produces the value because the host keeps owning URI construction
+// and spawning no matter where the enumeration came from (D1). Every one of them is total and
+// validating: an unparseable or hostile value yields `None`, never a partially-interpolated command.
+
+/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
+/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
+/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
+/// ([`windows_launch_for`]).
+///
+/// Also accepts the 64-bit non-Steam-shortcut game id ([`shortcut_gameid`]), which is likewise
+/// digits — the two share the `steam_appid` kind precisely because `rungameid` takes either.
+pub(crate) fn valid_steam_appid(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The 64-bit game id `steam://rungameid/` needs to launch a non-Steam shortcut: high dword = the
+/// 32-bit shortcut appid, low dword = the shortcut marker `0x0200_0000`. (Handing `rungameid` the
+/// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
+pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
+    ((appid as u64) << 32) | 0x0200_0000
+}
+
+/// The `steam_ui` launch values (D4) — which Steam UI a launcher entry opens. A closed two-value
+/// enum, validated on the way IN (the reconcile payload) as well as on the way out, so an entry can
+/// never carry a third value that silently resolves to nothing at launch time.
+pub(crate) fn valid_steam_ui(value: &str) -> bool {
+    matches!(value, "bigpicture" | "desktop")
+}
+
+/// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
+///
+/// One kind for every launcher but Steam, rather than one kind each: they all have exactly a single
+/// UI to open, so the value is just which launcher. Steam keeps its own [`valid_steam_ui`] kind
+/// because it has two (Big Picture and the desktop client), which is a genuinely different choice.
+///
+/// Platform-gated, because a value naming a launcher this OS cannot run is not a tile that merely
+/// looks odd — it is one that fails at launch. Validated inbound too, so a plugin gets a 400 it can
+/// act on instead of publishing a dead entry.
+///
+/// **Why a typed kind at all**, when design D4 originally said non-Steam launchers would ride the
+/// `command` kind: the 2026-08-05 review made `launch.kind = "command"` operator-only (it is handed
+/// to a shell), so a plugin publishing one is refused. A typed kind keeps D1's rule intact — the
+/// plugin supplies a validated *value*, the host builds the command — and is the only way a scanner
+/// plugin can offer a launcher tile at all.
+fn launcher_ui_stores() -> &'static [&'static str] {
+    #[cfg(target_os = "linux")]
+    {
+        &["heroic", "lutris"]
+    }
+    // Windows launchers (Epic, GOG Galaxy, the Xbox app) are not wired yet — each needs its own
+    // verified activation, and an unverified guess would ship a tile that does nothing.
+    #[cfg(not(target_os = "linux"))]
+    {
+        &[]
+    }
+}
+
+/// Is this a `launcher_ui` value this host can resolve?
+pub(crate) fn valid_launcher_ui(value: &str) -> bool {
+    launcher_ui_stores().contains(&value)
+}
+
+/// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
+/// gamescope. The host owns this mapping; the client only ever sends the id. CAVEAT: Heroic is a
+/// single-instance Electron app — in a fresh per-session gamescope it boots, launches the game (which
+/// renders into that gamescope) and stays hidden via `--no-gui`; but if a Heroic GUI is ALREADY
+/// running on the box, the spawned process forwards the URI and exits, which would tear the session
+/// down. The validated path is the fresh-session case; needs live confirmation on a box with Heroic.
+#[cfg(target_os = "linux")]
+pub(crate) fn heroic_command(value: &str) -> Option<String> {
+    let (runner, app) = value.split_once(':')?;
+    if !matches!(runner, "legendary" | "gog" | "nile") {
+        return None;
+    }
+    // appName charset (Epic alnum, GOG digits, Amazon alnum) — keep the URI a single safe token.
+    if app.is_empty()
+        || !app
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let prefix = heroic_launch_prefix()?;
+    // No quotes: gamescope spawns the app by `split_whitespace()`, and the URI has no spaces (appName
+    // is validated above) so it stays a single argv token; `&` is fine (exec'd, not shell-parsed).
+    Some(format!(
+        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
+    ))
+}
+
+/// How to invoke Heroic: the native `heroic` binary if on `PATH`, else the Flatpak app if its data
+/// root is present. `None` ⇒ Heroic not found, so no launch command.
+#[cfg(target_os = "linux")]
+fn heroic_launch_prefix() -> Option<String> {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("heroic").is_file()));
+    if on_path {
+        return Some("heroic".into());
+    }
+    let flatpak = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .is_some_and(|h| h.join(".var/app/com.heroicgameslauncher.hgl").is_dir());
+    flatpak.then(|| "flatpak run com.heroicgameslauncher.hgl".into())
+}
+
+/// Map an `epic` LaunchSpec value to the Epic Games Launcher URI. The value is either the full
+/// `<namespace>:<catalogItemId>:<appName>` triple (what the manifests carry) or a bare `appName`;
+/// every part is charset-checked so the URI stays one safe argv token.
+#[cfg(windows)]
+pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    let inner = match value.split(':').collect::<Vec<_>>().as_slice() {
+        [ns, cat, app] if ok(ns) && ok(cat) && ok(app) => format!("{ns}%3A{cat}%3A{app}"),
+        [app] if ok(app) => (*app).to_string(),
+        _ => return None,
+    };
+    Some(format!(
+        "com.epicgames.launcher://apps/{inner}?action=launch&silent=true"
+    ))
+}
+
+/// Map a `gog` LaunchSpec value — the tab-separated `exe \t args \t workdir` spawn triple the scanner
+/// derived from `goggame-<id>.info` — to a `(command line, working dir)`. GOG games are spawned
+/// directly (no Galaxy), so the exe is quoted and the arguments ride verbatim.
+#[cfg(windows)]
+pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
+    let mut parts = value.split('\t');
+    let exe = parts.next().filter(|s| !s.is_empty())?;
+    let args = parts.next().unwrap_or("");
+    let workdir = parts.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let cmdline = if args.trim().is_empty() {
+        format!("\"{exe}\"")
+    } else {
+        format!("\"{exe}\" {args}")
+    };
+    Some((cmdline, workdir))
 }
 
 /// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the
@@ -358,6 +540,145 @@ mod tests {
             assert!(cmd.contains("heroic://launch?appName=Quail-1.2_x&runner=legendary"));
             assert!(cmd.contains("--no-gui"));
         }
+    }
+
+    /// The `steam_ui` launcher kind (D4): a closed two-value enum, mapped to the Steam client's own
+    /// UI on each OS. Nothing from the entry is interpolated — the value only SELECTS between two
+    /// host-owned literals — so there is no injection surface at all here.
+    #[test]
+    fn steam_ui_is_a_closed_two_value_enum() {
+        assert!(valid_steam_ui("bigpicture"));
+        assert!(valid_steam_ui("desktop"));
+        assert!(!valid_steam_ui("gamepadui"));
+        assert!(!valid_steam_ui(""));
+        assert!(!valid_steam_ui("bigpicture; rm -rf ~"));
+    }
+
+    /// The `launcher_ui` kind exists because D4's original plan — non-Steam launchers riding the
+    /// `command` kind — stopped being available to plugins when the 2026-08-05 review made
+    /// `command` operator-only. A plugin names a launcher; the host builds the command.
+    #[test]
+    fn launcher_ui_accepts_only_launchers_this_host_can_open() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(valid_launcher_ui("heroic"));
+            assert!(valid_launcher_ui("lutris"));
+            // Not wired on this OS — refused inbound rather than becoming a tile that does nothing.
+            assert!(!valid_launcher_ui("gog"));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No Windows/macOS launcher UIs are wired yet, so every value is refused.
+            assert!(!valid_launcher_ui("heroic"));
+            assert!(!valid_launcher_ui("gog"));
+        }
+        assert!(!valid_launcher_ui(""));
+        assert!(!valid_launcher_ui("lutris; rm -rf ~"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_ui_opens_the_launcher_itself() {
+        let ui = |v: &str| {
+            command_for(&LaunchSpec {
+                kind: "launcher_ui".into(),
+                value: v.into(),
+            })
+        };
+        // Bare `lutris` opens the window; the URI form is the `lutris_id` kind and launches a game.
+        assert_eq!(ui("lutris").as_deref(), Some("lutris"));
+        assert!(!ui("lutris").unwrap().contains("rungameid"));
+        // Heroic resolves the same way its game launches do, but with no `--no-gui` and no URI — so
+        // the window IS what opens. `None` on a box without Heroic, which is a correct answer.
+        if let Some(cmd) = ui("heroic") {
+            assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
+            assert!(!cmd.contains("heroic://"), "no game URI: {cmd:?}");
+        }
+        assert_eq!(ui("nonsense"), None);
+        assert_eq!(ui(""), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn steam_ui_resolves_to_the_client_ui_on_linux() {
+        let ui = |v: &str| {
+            command_for(&LaunchSpec {
+                kind: "steam_ui".into(),
+                value: v.into(),
+            })
+        };
+        // Big Picture is the SteamOS game-mode shape; nested in gamescope this is what `--steam`
+        // integration is built around.
+        assert_eq!(ui("bigpicture").as_deref(), Some("steam -gamepadui"));
+        assert_eq!(ui("desktop").as_deref(), Some("steam"));
+        assert_eq!(ui("nonsense"), None);
+        assert_eq!(ui(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn steam_ui_resolves_to_the_client_ui_on_windows() {
+        let ui = |v: &str| {
+            windows_launch_for(&LaunchSpec {
+                kind: "steam_ui".into(),
+                value: v.into(),
+            })
+        };
+        let (bp, wd) = ui("bigpicture").expect("bigpicture recipe");
+        assert!(bp.contains("steam://open/bigpicture"), "line was {bp:?}");
+        assert!(wd.is_none());
+        let (desk, _) = ui("desktop").expect("desktop recipe");
+        assert!(desk.contains("steam://open/main"), "line was {desk:?}");
+        assert!(ui("nonsense").is_none());
+        assert!(ui("").is_none());
+    }
+
+    #[test]
+    fn steam_appid_validation_accepts_appids_and_shortcut_gameids() {
+        assert!(valid_steam_appid("570"));
+        // The 64-bit shortcut game id shares the `steam_appid` kind — `rungameid` takes either.
+        assert!(valid_steam_appid(
+            &shortcut_gameid(2_456_789_012).to_string()
+        ));
+        assert!(!valid_steam_appid(""));
+        assert!(!valid_steam_appid("570; rm -rf ~"));
+        assert!(!valid_steam_appid("-1"));
+    }
+
+    /// Moved here with `shortcut_gameid` (WP1.1): the composed id is launch vocabulary, not
+    /// enumeration — the scanner only supplies the 32-bit appid it read out of `shortcuts.vdf`.
+    #[test]
+    fn shortcut_gameid_composes_appid_and_marker() {
+        let id = shortcut_gameid(0x8000_0000);
+        assert_eq!(id >> 32, 0x8000_0000, "high dword is the shortcut appid");
+        assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000, "low dword is the marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epic_launch_uri_triple_bare_and_guard() {
+        assert_eq!(
+            epic_launch_uri("fn:abc:Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/fn%3Aabc%3AFortnite?action=launch&silent=true")
+        );
+        assert_eq!(
+            epic_launch_uri("Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
+        );
+        assert!(epic_launch_uri("bad part:x:y").is_none()); // a space → rejected
+        assert!(epic_launch_uri("").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gog_spawn_parses_and_guards() {
+        let (cmd, wd) = gog_spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
+        assert_eq!(cmd, "\"C:\\Games\\W3\\witcher3.exe\" --skip");
+        assert_eq!(wd, Some(std::path::PathBuf::from("C:\\Games\\W3")));
+        let (cmd2, wd2) = gog_spawn("C:\\g.exe").unwrap();
+        assert_eq!(cmd2, "\"C:\\g.exe\"");
+        assert!(wd2.is_none());
+        assert!(gog_spawn("").is_none());
     }
 
     #[cfg(windows)]

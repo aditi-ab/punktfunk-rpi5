@@ -1,0 +1,104 @@
+// Where Steam lives on this host, and which `steamapps` dirs hold installed titles.
+//
+// Ported from the host scanner (steam.rs `steam_roots` / `steam_library_dirs`) with one deliberate
+// addition and one deliberate exclusion, both about the Windows runner's account:
+//
+//   * ADDED: HKLM `WOW6432Node\Valve\Steam\InstallPath`, so a non-default Steam install dir is
+//     found. The host scanner never covered this (it relied on an explorer.exe protocol fallback at
+//     launch time), but a plugin that can't find the root finds no games at all.
+//   * EXCLUDED: HKCU `Software\Valve\Steam`. The runner is LocalService, whose HKCU is its own empty
+//     hive, not the operator's — reading it would look like "Steam isn't installed".
+import * as os from "node:os";
+import * as path from "node:path";
+import { isDir, listDir, readTextCapped } from "./fs.js";
+import { regQueryValue } from "./registry.js";
+import { vdfPaths } from "./vdf.js";
+
+/** Canonicalize-ish: resolve and drop a trailing separator so dedup is reliable. */
+const norm = (p: string): string => path.resolve(p);
+
+/**
+ * Candidate Steam roots that actually exist (have a `steamapps` dir), deduped.
+ *
+ * A "root" is the Steam install itself — `userdata/`, `appcache/` and the first `steamapps/` live
+ * under it. Extra library folders on other drives are NOT roots; see {@link steamLibraryDirs}.
+ */
+export const steamRoots = (): string[] => {
+	const candidates: string[] = [];
+	if (process.platform === "win32") {
+		for (const v of ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"]) {
+			const pf = process.env[v];
+			if (pf) candidates.push(path.join(pf, "Steam"));
+		}
+		// The registry install path — covers a Steam installed somewhere other than Program Files.
+		for (const key of [
+			"HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam",
+			"HKLM\\SOFTWARE\\Valve\\Steam",
+		]) {
+			const p = regQueryValue(key, "InstallPath");
+			if (p) candidates.push(p);
+		}
+	} else {
+		const home = os.homedir();
+		if (home) {
+			candidates.push(
+				path.join(home, ".local/share/Steam"),
+				path.join(home, ".steam/steam"),
+				path.join(home, ".steam/root"),
+				// Flatpak Steam
+				path.join(home, ".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+			);
+		}
+	}
+	const seen = new Set<string>();
+	const roots: string[] = [];
+	for (const c of candidates) {
+		const n = norm(c);
+		if (!seen.has(n) && isDir(path.join(n, "steamapps"))) {
+			seen.add(n);
+			roots.push(n);
+		}
+	}
+	return roots;
+};
+
+/**
+ * Every `steamapps` dir holding installed titles: each root's own, plus the extra library folders
+ * listed in its `libraryfolders.vdf` (Steam installs to other drives).
+ */
+export const steamLibraryDirs = (roots = steamRoots()): string[] => {
+	const seen = new Set<string>();
+	const dirs: string[] = [];
+	const push = (p: string) => {
+		const n = norm(p);
+		if (!seen.has(n) && isDir(n)) {
+			seen.add(n);
+			dirs.push(n);
+		}
+	};
+	for (const root of roots) {
+		const steamapps = path.join(root, "steamapps");
+		const text = readTextCapped(path.join(steamapps, "libraryfolders.vdf"));
+		if (text !== undefined) {
+			for (const p of vdfPaths(text)) push(path.join(p, "steamapps"));
+		}
+		push(steamapps);
+	}
+	return dirs;
+};
+
+/**
+ * Every `userdata/<accountId>/config` dir across all roots — one per Steam account that has signed
+ * in on this host. `shortcuts.vdf` and the `grid/` art overrides live here.
+ */
+export const steamUserConfigDirs = (roots = steamRoots()): string[] => {
+	const out: string[] = [];
+	for (const root of roots) {
+		const userdata = path.join(root, "userdata");
+		for (const acct of listDir(userdata)) {
+			const cfg = path.join(userdata, acct, "config");
+			if (isDir(cfg)) out.push(cfg);
+		}
+	}
+	return out;
+};

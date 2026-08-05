@@ -159,6 +159,17 @@ const CAP_REPROBE_WINDOWS_MAX: u32 = 128;
 /// choke again at the same place, and only backoffs at a climbed-to rate can agree within the
 /// band (a cascade's second backoff sits at ×0.7 of the first: outside it by construction).
 const DECODE_CAP_SIMILAR_DIV: u32 = 8;
+/// A deciding window that DELIVERED under `current / STARVED_DELIVERY_DIV` is STARVED: the
+/// stream barely flowed (a host-side capture stall, an outage, a mid-window pause), so whatever
+/// distress the window carries — a flush, a keyframe-ask burst — is starvation-shaped, not
+/// rate-shaped, and the decoder decoded almost nothing at the nominal rate. Such a window may
+/// still back off (real damage deserves the safe response) but must never be a decode-knee
+/// sample: latching `current_kbps` off a starved window teaches a phantom decoder cap at
+/// whatever rate the stall interrupted (the periodic-capture-stall field case: every 5 s cycle
+/// offers another pair of "backoffs" at the same rate — a bogus latch that then fights the
+/// re-probe ladder for minutes). Deliberately far below the ×¾ utilization bar climbs require:
+/// the band between them is ambiguous and keeps today's behavior.
+const STARVED_DELIVERY_DIV: u32 = 4;
 /// Rolling window (in 750 ms report windows, ~30 s) whose minimum mean is the OWD baseline.
 /// Long enough to remember the uncongested floor, short enough to follow genuine path changes.
 const BASELINE_WINDOWS: usize = 40;
@@ -697,6 +708,10 @@ impl BitrateController {
                 || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
                 || (recovery_kf >= RECOVERY_KF_BAD && loss_ppm < HEAVY_LOSS_PPM)
                 || (flushed && (decode_bad || decode_mean_us.is_none()));
+            // Starved deciding window (see [`STARVED_DELIVERY_DIV`]): the stream barely flowed,
+            // so the window says nothing about what the decoder can hold at this rate.
+            let starved =
+                (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
             if !self.climb_since_backoff {
                 // Still draining the previous backoff: the host acks a ×0.7 request in ~100 ms,
                 // so this window's rate is one the decoder never choked at while keeping up —
@@ -707,6 +722,17 @@ impl BitrateController {
                     reference_kbps = self.decode_backoff_kbps,
                     "adaptive bitrate: backoff without an intervening climb — draining the \
                      previous choke, not a knee sample"
+                );
+            } else if starved {
+                // Same "not a knee sample either way" treatment as the draining arm: neither
+                // latch against a starved window nor let it erase the reference a real knee
+                // set — the next genuine choke at that rate must still find its pair.
+                tracing::debug!(
+                    at_kbps = self.current_kbps,
+                    actual_kbps,
+                    reference_kbps = self.decode_backoff_kbps,
+                    "adaptive bitrate: backoff in a starved window (delivery a fraction of \
+                     the target) — starvation-shaped distress, not a knee sample"
                 );
             } else if decode_evidence {
                 let rate = self.current_kbps;
@@ -2082,6 +2108,100 @@ mod tests {
         assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
         c.on_ack(r2);
         rate - rate / 16
+    }
+
+    /// One capture-stall-shaped window at the current rate: almost nothing delivered
+    /// (current/10), nothing decoded, no loss — but a jump-to-live flush and a keyframe-ask
+    /// storm (the stall edge's damage signature). SEVERE, so it backs off; STARVED, so it must
+    /// never be a knee sample.
+    fn stall_choke(c: &mut BitrateController, start: Instant, tick: &mut u32) -> Option<u32> {
+        *tick += 2;
+        let r = c.on_window(
+            ticks(start, *tick),
+            0,
+            0,
+            None,
+            None,
+            None,
+            c.current_kbps / 10,
+            true,
+            RECOVERY_KF_SEVERE,
+        );
+        *tick += 1;
+        r
+    }
+
+    #[test]
+    fn capture_stall_windows_never_latch_a_decode_cap() {
+        // The periodic-capture-stall field case (RDNA4 standby-sink, 5 s cycle): every stall
+        // edge offers another flush + kf-storm "backoff" at the SAME rate — without the starved
+        // guard that pair latches a phantom decoder knee at whatever rate the display driver
+        // happened to interrupt, and the session then fights the re-probe ladder for minutes.
+        let mut c = BitrateController::new(240_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        climb_to(&mut c, start, &mut t, 400_000);
+        let at = c.current_kbps;
+        let r1 = stall_choke(&mut c, start, &mut t).expect("stall damage still backs off");
+        assert!(
+            c.decode_cap_kbps.is_none(),
+            "one starved window must not latch"
+        );
+        assert_eq!(
+            c.decode_backoff_kbps, 0,
+            "a starved window is not a knee sample — no reference recorded"
+        );
+        c.on_ack(r1);
+        climb_to(&mut c, start, &mut t, at - at / DECODE_CAP_SIMILAR_DIV);
+        let r2 = stall_choke(&mut c, start, &mut t).expect("second stall edge backs off too");
+        c.on_ack(r2);
+        assert!(
+            c.decode_cap_kbps.is_none(),
+            "a starved pair at the same rate must not latch a phantom knee"
+        );
+    }
+
+    #[test]
+    fn starved_window_preserves_the_knee_reference() {
+        // A REAL knee sample, then a stall edge, then the genuine re-climb choke: the starved
+        // window in the middle must neither latch nor ERASE the reference the real choke set —
+        // the genuine pair must still find each other around it.
+        let mut c = BitrateController::new(500_000);
+        c.set_ceiling(900_000);
+        let start = Instant::now();
+        let mut t = 0;
+        for _ in 0..4 {
+            calm_window(&mut c, ticks(start, t));
+            t += 1;
+        }
+        let knee = c.current_kbps;
+        let r1 = choke(&mut c, start, &mut t).expect("real choke backs off");
+        assert_eq!(
+            c.decode_backoff_kbps, knee,
+            "real choke records the reference"
+        );
+        c.on_ack(r1);
+        climb_to(&mut c, start, &mut t, knee - knee / DECODE_CAP_SIMILAR_DIV);
+        let r2 = stall_choke(&mut c, start, &mut t).expect("stall edge backs off");
+        assert_eq!(
+            c.decode_backoff_kbps, knee,
+            "the starved window must not erase the real reference"
+        );
+        assert!(c.decode_cap_kbps.is_none(), "and must not latch against it");
+        c.on_ack(r2);
+        climb_to(&mut c, start, &mut t, knee - knee / DECODE_CAP_SIMILAR_DIV);
+        let rate = c.current_kbps;
+        choke(&mut c, start, &mut t).expect("genuine re-climb choke backs off");
+        assert_eq!(
+            c.decode_cap_kbps,
+            Some(rate - rate / 16),
+            "the genuine pair still latches around the starved interruption"
+        );
     }
 
     #[test]

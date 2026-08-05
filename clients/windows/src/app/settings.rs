@@ -1911,10 +1911,35 @@ pub(crate) fn settings_page(
     } else {
         border(vstack(Vec::<Element>::new())).into()
     };
+    // Every save on this page is fire-and-forget by design — a failed settings write must
+    // never take a stream down — so a client whose config store rejects writes looks entirely
+    // normal: toggles move, profiles appear, and NOTHING survives a restart. That is exactly
+    // how it reached us from the field ("it's in read-only mode"), with no log file to send
+    // either. When the store is refusing writes, say so, name the path, and stop pretending.
+    //
+    // Same always-mounted-slot discipline as `sheet_slot`: one child in both states, and the
+    // SAME KIND in both (a Border wrapping the bar, versus an empty background-less Border —
+    // which per style.rs is not hit-testable, so it swallows no clicks). Neither a grid child
+    // nor a vstack child is ever added or removed, which is where this reconciler's phantom
+    // bookkeeping breaks.
+    let store_slot: Element = match pf_client_core::trust::store_health::last_error() {
+        Some(err) => border(
+            InfoBar::new("Your changes aren\u{2019}t being saved")
+                .message(format!(
+                    "Punktfunk can\u{2019}t write to its settings folder, so nothing on this \
+                     page will survive a restart. {err}"
+                ))
+                .error()
+                .is_closable(false),
+        )
+        .margin(edges(24.0, 12.0, 28.0, 0.0))
+        .into(),
+        None => border(vstack(Vec::<Element>::new())).into(),
+    };
     // The bar rides an Auto row above the nav's Star row, so the nav (and the sheet's scrim
     // over it) still fills the rest of the window.
     grid(vec![
-        scope_bar.grid_row(0),
+        Element::from(vstack(vec![store_slot, scope_bar])).grid_row(0),
         Element::from(grid(vec![nav.into(), sheet_slot, confirm])).grid_row(1),
     ])
     .rows([GridLength::Auto, GridLength::STAR])

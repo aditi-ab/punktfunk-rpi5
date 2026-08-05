@@ -329,9 +329,8 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParam
 ; converges tasks an older installer registered as SYSTEM.
 ; Best-effort (-ErrorAction SilentlyContinue): a task hiccup never fails the whole install. No braces
 ; in the command, so no Inno {{ }} escaping needed.
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
-  StatusMsg: "Registering the Punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "{code:ScriptingRegisterParams}"; \
+  StatusMsg: "Registering the Punktfunk script runner..."; Flags: runhidden waituntilterminated
 #endif
 #if defined(WithWeb) || defined(WithScripting)
 ; Put back what StopBunRuntimes disabled to unlock bun.exe. Deliberately the LAST [Run] entry that
@@ -619,6 +618,12 @@ end;
   it disabled would switch it off for everyone who had it on. }
 var
   WebTaskWasEnabled, ScriptingTaskWasEnabled: Boolean;
+  { Did PunktfunkScripting exist AT ALL before this install (enabled or not)? That is what
+    distinguishes a FRESH scripting install — where the runner is now registered enabled by default
+    (design D9: the library moves into plugins, and a flagship surface cannot depend on an opt-in
+    subsystem, or a fresh box would come up with an empty library) — from an UPGRADE, where the
+    operator's own choice is the only thing that may decide it. }
+  ScriptingTaskExisted: Boolean;
 
 { Escape a value for embedding in a single-quoted PowerShell literal ('' is PS's escaped quote).
   The install dir is user-chosen, so it can legitimately contain an apostrophe. }
@@ -639,6 +644,22 @@ begin
     '-NoProfile -ExecutionPolicy Bypass -Command "' +
     '$t=Get-ScheduledTask -TaskName ''' + PsLiteral(TaskName) + ''' -ErrorAction SilentlyContinue; ' +
     'if($t -and $t.State -ne ''Disabled''){exit 1}; exit 0"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := ResultCode = 1;
+end;
+
+{ Is the task registered at all, whatever its state? Distinct from TaskEnabled: an operator who
+  deliberately DISABLED the runner must keep it disabled across an upgrade, which is indistinguishable
+  from a fresh install if you only ask "was it enabled". }
+function TaskExists(TaskName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := False;
+  if Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$t=Get-ScheduledTask -TaskName ''' + PsLiteral(TaskName) + ''' -ErrorAction SilentlyContinue; ' +
+    'if($t){exit 1}; exit 0"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     Result := ResultCode = 1;
 end;
@@ -664,6 +685,9 @@ var
 begin
   WebTaskWasEnabled := TaskEnabled('PunktfunkWeb');
   ScriptingTaskWasEnabled := TaskEnabled('PunktfunkScripting');
+  { Probed BEFORE the Disable below, which would otherwise make every upgrade look like a fresh
+    install to the registration entry. }
+  ScriptingTaskExisted := TaskExists('PunktfunkScripting');
   Exec('powershell.exe',
     '-NoProfile -ExecutionPolicy Bypass -Command "' +
     '$ErrorActionPreference=''SilentlyContinue''; ' +
@@ -689,6 +713,35 @@ end;
   DELETED the legacy task (the console runs under the host service now), so Enable-ScheduledTask
   hits nothing and no-ops under SilentlyContinue. If the user cancels mid-install, though,
   DeinitializeSetup runs this same restore and puts the old (task-owned) world back intact. }
+{ Register PunktfunkScripting, and decide whether it comes up ENABLED.
+  `Register-ScheduledTask` registers enabled, so the state is decided by what follows:
+    * FRESH install (the task did not exist) -> leave it enabled and start it now, so the runner is
+      live without waiting for a reboot. Since the library's scanners become plugins (design D9),
+      shipping this opt-in would mean a fresh box comes up with an empty library and no obvious
+      reason why.
+    * UPGRADE (the task existed) -> disable here and let RestoreTasksParams put the operator's own
+      state back. That order is deliberate: this entry cannot know what they chose, and defaulting
+      to "on" here would silently switch the runner on for everyone who had turned it off.
+  It remains opt-OUT: `punktfunk-host plugins disable`, or the task's own Disable, still wins and
+  survives every later upgrade through exactly this path. }
+function ScriptingRegisterParams(Param: String): String;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$ErrorActionPreference=''SilentlyContinue''; ' +
+    '$a=New-ScheduledTaskAction -Execute ''' +
+      PsLiteral(ExpandConstant('{app}\scripting\scripting-run.cmd')) + '''; ' +
+    '$t=New-ScheduledTaskTrigger -AtStartup; ' +
+    '$p=New-ScheduledTaskPrincipal -UserId ''LocalService'' -LogonType ServiceAccount; ' +
+    '$s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) ' +
+      '-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; ' +
+    'Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p ' +
+      '-Settings $s -Force | Out-Null; ';
+  if ScriptingTaskExisted then
+    Result := Result + 'Disable-ScheduledTask -TaskName PunktfunkScripting | Out-Null"'
+  else
+    Result := Result + 'Start-ScheduledTask -TaskName PunktfunkScripting | Out-Null"';
+end;
+
 function RestoreTasksParams(Param: String): String;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference=''SilentlyContinue''; ';

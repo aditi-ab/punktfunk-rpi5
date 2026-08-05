@@ -70,9 +70,18 @@ declare const appStore:
  *  entry from a false "missing". A confident null means the shortcut was deleted → recreate. */
 function shortcutStillExists(appId: number): boolean {
   try {
-    const get = appStore?.GetAppOverviewByAppID;
-    if (!get) return true; // no way to verify — preserve the reuse path
-    return get(appId) != null;
+    // Call it as a METHOD on appStore — NEVER as an extracted function. Its implementation
+    // reads the store's own state (`this.m_mapApps`), so `const get = appStore.GetAppOverview…;
+    // get(id)` throws on the lost `this`, and the catch below turns that into a permanent
+    // "true". That is not a stale-data bug but a total one: the guard then answers "still
+    // exists" for EVERY appId, so a dangling id is never dropped, the reuse path repoints a
+    // dead shortcut (silent no-ops), and "recreate" reports success having done nothing.
+    // `typeof` first: `appStore` is a Steam-injected global, and a bare reference to a missing
+    // one is a ReferenceError that optional chaining does NOT prevent.
+    if (typeof appStore === "undefined" || !appStore?.GetAppOverviewByAppID) {
+      return true; // no way to verify — preserve the reuse path
+    }
+    return appStore.GetAppOverviewByAppID(appId) != null;
   } catch {
     return true;
   }

@@ -53,6 +53,41 @@ export default definePluginKit({
 | `loggingLayer` | runner-journal line format |
 | `@punktfunk/plugin-kit/react` | browser glue: `createPluginRouter` (path→hash→fallback deep-link restore + `pf-ui:navigate`), `resolvePluginBase`, `useIsEmbedded`, `ResultGate`, `sseAtom` |
 | `@punktfunk/plugin-kit/theme.css` | the console's violet identity for plugin UIs (import first in your Tailwind entry) |
+| `@punktfunk/plugin-kit/library` | everything a **game-library scanner** plugin needs — see below |
+
+## Library-scanner plugins (`@punktfunk/plugin-kit/library`)
+
+The six first-party scanners (steam, lutris, heroic, epic, gog, xbox) each live in **their own
+repo**, like every other punktfunk plugin. Nothing is lost by that split because everything they
+share is published here rather than sitting adjacent to them:
+
+| Export | What it saves you writing |
+| --- | --- |
+| `defineLibraryPlugin` | the whole plugin except the scan: store claim, sync engine (poll + fs-watch + debounce), launcher entries, `__config`, `category: "library"` registration, and the `detect` / `scan` / `parity` / `uninstall` CLI verbs |
+| `parsers/*` | text VDF + `.acf`, binary `shortcuts.vdf` (with the CRC-32 appid and the 64-bit `rungameid` composition), read-only SQLite, `reg.exe`, capped readers, a confined path join, Steam root/library discovery, art location helpers, an anti-SSRF fetch |
+| `diffParity` + the `parity` verb | the acceptance gate below |
+
+A first-party scanner is therefore **its parsers and a `scan` function** — a few hundred lines.
+
+### The parity gate
+
+Ported unit tests pin the parsers; they do not prove the plugin reproduces the scanner it replaces.
+A plugin that parses perfectly and emits `steam:440.0` instead of `steam:440` breaks every Moonlight
+pin on the host, and no parser test notices. So, on a box with that launcher installed:
+
+```sh
+# 1. while the host is still using its BUILT-IN scanner:
+punktfunk-plugin-steam parity --snapshot before.json
+# 2. offline — runs this plugin's own scan and diffs:
+punktfunk-plugin-steam parity --compare before.json
+```
+
+`--compare` exits non-zero on any difference, so it works as a release gate. It compares ids,
+titles, launch recipes, roles and metadata exactly; **art by presence, not value** (the
+representation legitimately changes — a host-relative proxy path or inlined `data:` URL becomes a
+`file://` path or a CDN URL), so spot-check a few covers by eye once. Launcher entries the plugin
+adds are reported separately rather than failing the run; an ordinary title the scanner never had
+still fails.
 
 ## Telling the host how to recognize a running title (`detect`)
 

@@ -5,9 +5,13 @@
 #                                                  package.json,decky.pyi,LICENSE,README.md}
 #   out/punktfunk/                 (the same tree, unzipped — rsync this with scripts/deploy.sh)
 #
-# Decky extracts the zip with --strip-components=1, so the single top-level dir MUST equal
-# plugin.json "name". Run after `pnpm build` (or use `pnpm run package`). Host-agnostic: needs
-# only bash, python3 and zip.
+# The single top-level dir is the plugin's ON-DISK folder name (Decky extracts the zip as-is,
+# so the dir in the zip becomes ~/homebrew/plugins/<dir>). It is deliberately NOT read from
+# plugin.json "name": that field is the user-visible label ("Punktfunk", brand-cased, shown in
+# Decky's plugin list) and Decky locates an installed plugin by MATCHING it, never by the folder
+# name. Keeping the folder lowercase means a rename of the label can't strand the old directory
+# next to a new one (which would show up as two plugins).
+# Run after `pnpm build` (or use `pnpm run package`). Host-agnostic: needs only bash, python3 and zip.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HERE"
@@ -15,7 +19,7 @@ cd "$HERE"
 [ -f dist/index.js ] || { echo "dist/index.js missing — run 'pnpm build' first" >&2; exit 1; }
 [ -f LICENSE ]       || { echo "LICENSE missing (required by the Decky store)" >&2; exit 1; }
 
-NAME="$(python3 -c 'import json;print(json.load(open("plugin.json"))["name"])')"
+NAME=punktfunk   # the on-disk plugin dir (see the header) — NOT plugin.json "name"
 VER="$(python3 -c 'import json;print(json.load(open("package.json"))["version"])')"
 
 STAGE="$(mktemp -d)"

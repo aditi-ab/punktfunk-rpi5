@@ -108,10 +108,16 @@ the full path: `& "$env:ProgramFiles\punktfunk\punktfunk-host.exe" plugins add p
 Open the [web console](/docs/web-console) and the plugin's page appears in the nav automatically —
 that's the whole install.
 
-The runner is **opt-in**: `plugins add` installs, `plugins enable` turns it on. You only need
-`enable` once. The runner discovers plugins when it starts, so one installed later needs a restart
-to come up (`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting`
-task) — the console does that restart for you as part of installing.
+The runner is **on by default** on a new install — your game sources are plugins, so a host without
+it would show an empty library. (On a host that predates this, it stays however you left it; turn it
+on with `punktfunk-host plugins enable`, which you only need once.) The runner discovers plugins
+when it starts, so one installed later needs a restart to come up
+(`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting` task) — the
+console does that restart for you as part of installing.
+
+Don't want it? It is a normal service you can switch off: `systemctl --user mask punktfunk-scripting`
+on Linux, or disable the `PunktfunkScripting` scheduled task on Windows. Your host keeps streaming;
+you just lose plugin-provided game sources and any automation.
 
 A plugin installed from the CLI shows up in the console as **Installed via CLI**: the console knows
 what is installed, but not who vouched for it. Install the same plugin from the store's Browse tab
@@ -301,8 +307,8 @@ host's, on one timeline, with the same search and download. Each is tagged `plug
 plugin's own name for lines it logged itself, `plugin:runner` for the supervisor's (starting a
 plugin, restarting a crashed one, refusing an unsafe file).
 
-An empty Plugins view almost always means the runner isn't running — it is a separate service, and
-opt-in on Linux. Check with `punktfunk-host plugins status`.
+An empty Plugins view almost always means the runner isn't running — it is a separate service. Check
+with `punktfunk-host plugins status`.
 
 <Callout>
 Nothing is lost if the host is down: the runner keeps buffering and sends the backlog when the host

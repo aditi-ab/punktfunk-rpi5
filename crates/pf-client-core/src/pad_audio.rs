@@ -921,10 +921,10 @@ fn pad_render_thread(
         const BLOCK_ALIGN: usize = PAD_CHANNELS * 4; // f32 interleaved
         let enumerator = wasapi::DeviceEnumerator::new().context("DeviceEnumerator")?;
         // Not `get_device`: that helper resolves through a freed string — see
-        // [`crate::audio_wasapi::device_by_id`].
-        let device =
-            crate::audio_wasapi::device_by_id(&enumerator, &Direction::Render, endpoint_id)
-                .map_err(|e| anyhow!("correlated endpoint not found: {e:#}"))?;
+        // [`crate::audio::device_by_id`] (audio_wasapi.rs, mounted as `crate::audio` on
+        // Windows by lib.rs's `#[path]` swap — there is no `audio_wasapi` module name).
+        let device = crate::audio::device_by_id(&enumerator, &Direction::Render, endpoint_id)
+            .map_err(|e| anyhow!("correlated endpoint not found: {e:#}"))?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // FL|FR|BL|BR: front pair = the pad's speaker, back pair = the voice coils.
         let desired = WaveFormat::new(32, 32, &SampleType::Float, 48_000, PAD_CHANNELS, Some(0x33));

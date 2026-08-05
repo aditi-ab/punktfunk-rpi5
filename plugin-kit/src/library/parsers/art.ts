@@ -1,0 +1,120 @@
+// Where a title's cover art lives: Steam's local caches, its per-account `grid/` overrides, and the
+// public CDN. Ported from the host scanner's art resolution (steam.rs).
+//
+// After extraction a plugin emits art VALUES and the host serves them: a `file://` URL for anything
+// on disk (the documented local-art contract — the host proxies the bytes), or an absolute CDN URL
+// the client fetches itself. `data:` URLs remain legal but are small-logo-only: inlining covers is
+// what blew the host's 2 MB body limit at 49 titles during the playnite work.
+import * as path from "node:path";
+import { isFile, listDir } from "./fs.js";
+
+/** The four art slots the library model carries. */
+export type ArtKind = "portrait" | "hero" | "logo" | "header";
+
+export const ART_KINDS: readonly ArtKind[] = [
+	"portrait",
+	"hero",
+	"logo",
+	"header",
+];
+
+/** A `file://` URL for a local path — the shape the host's art proxy understands. */
+export const fileUrl = (p: string): string => {
+	// Percent-encode, but keep the separators: the host converts this back to a path and expects the
+	// structure intact. Windows drive paths become `file:///C:/…`.
+	const abs = path.resolve(p);
+	const posix = abs.replace(/\\/g, "/");
+	const encoded = posix
+		.split("/")
+		.map((seg) => encodeURIComponent(seg))
+		.join("/");
+	return posix.startsWith("/") ? `file://${encoded}` : `file:///${encoded}`;
+};
+
+/**
+ * The legacy flat CDN URL for a Steam appid's art kind. Correct for the many titles Valve hasn't
+ * re-hashed; newer ones serve from an unpredictable per-asset-hash path, where this 404s and the
+ * client falls through to its next candidate. That degradation is intentional and pre-existing.
+ */
+export const steamCdnUrl = (appid: number, kind: ArtKind): string | undefined => {
+	// A non-Steam shortcut's appid has the high bit set and is never a real store appid — the CDN
+	// would only 404, so don't emit a URL that is guaranteed to fail.
+	if ((appid & 0x8000_0000) !== 0) return undefined;
+	const file =
+		kind === "portrait"
+			? "library_600x900.jpg"
+			: kind === "hero"
+				? "library_hero.jpg"
+				: kind === "logo"
+					? "logo.png"
+					: "header.jpg";
+	return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/${file}`;
+};
+
+/** Filenames Steam's local `librarycache` uses per kind, in preference order (2x is sharper). */
+const localFilenames = (kind: ArtKind): string[] =>
+	kind === "portrait"
+		? ["library_600x900_2x.jpg", "library_600x900.jpg"]
+		: kind === "hero"
+			? ["library_hero.jpg"]
+			: kind === "logo"
+				? ["logo.png"]
+				: // Steam's local cache names the header asset differently from the store CDN's
+					// `header.jpg` — this trips everyone once.
+					["library_header.jpg"];
+
+/**
+ * This kind's file under one Steam root's `appcache/librarycache/<appid>/<hash>/`, or `undefined`.
+ * Steam reuses one hash dir per asset version, so there is normally exactly one candidate.
+ */
+export const findLocalArtFile = (
+	root: string,
+	appid: number,
+	kind: ArtKind,
+): string | undefined => {
+	const base = path.join(root, "appcache", "librarycache", String(appid));
+	for (const hash of listDir(base)) {
+		for (const name of localFilenames(kind)) {
+			const p = path.join(base, hash, name);
+			if (isFile(p)) return p;
+		}
+	}
+	// Older Steam wrote the files directly under `librarycache/` with the appid in the name.
+	for (const name of localFilenames(kind)) {
+		const flat = path.join(root, "appcache", "librarycache", `${appid}_${name}`);
+		if (isFile(flat)) return flat;
+	}
+	return undefined;
+};
+
+/**
+ * The `grid/` basenames Steam names each art kind under for an appid: portrait `<A>p`, hero
+ * `<A>_hero`, logo `<A>_logo`, wide capsule `<A>` — each as `.png` then `.jpg`.
+ *
+ * These overrides are the **only** art a non-Steam shortcut ever has.
+ */
+export const gridFilenames = (appid: number, kind: ArtKind): string[] => {
+	const base =
+		kind === "portrait"
+			? `${appid}p`
+			: kind === "hero"
+				? `${appid}_hero`
+				: kind === "logo"
+					? `${appid}_logo`
+					: `${appid}`;
+	return [`${base}.png`, `${base}.jpg`];
+};
+
+/** This kind's user override under a `userdata/<id>/config/grid/` dir, or `undefined`. */
+export const findGridArtFile = (
+	configDir: string,
+	appid: number,
+	kind: ArtKind,
+): string | undefined => {
+	const grid = path.join(configDir, "grid");
+	for (const name of gridFilenames(appid, kind)) {
+		const p = path.join(grid, name);
+		if (isFile(p)) return p;
+	}
+	return undefined;
+};

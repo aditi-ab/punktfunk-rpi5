@@ -64,11 +64,11 @@
     "dompurify": "^3.4.12",
     "linkify-it": "^5.0.2",
     "sharp": "^0.35.3",
-    "fast-uri": "^3.1.4",
+    "fast-uri": "^3.1.5",
     "immutable": "^4.3.9",
-    "undici": "^7.28.0",
-    "postcss": "^8.5.10",
+    "undici": "^7.29.0",
+    "postcss": "^8.5.25",
     "js-yaml": "^4.3.0",
-    "brace-expansion": "^5.0.8"
+    "brace-expansion": "^5.0.9"
   }
 }

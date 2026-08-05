@@ -108,6 +108,14 @@ pub(crate) struct CatalogEntry {
     /// A revocation covering the catalogued version — do not offer this without shouting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// What kind of plugin this is — the console filters Browse by these, and the Game sources
+    /// surface's "Add a source" rail shows exactly the `library` ones (design D5/D6).
+    pub categories: Vec<String>,
+    /// Whether the launcher this plugin scans looks **installed on this host** (design D8), from the
+    /// index's own existence probes. `null` = the entry declares no probes for this platform, which
+    /// the console renders as "unknown" rather than "not installed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -277,6 +285,8 @@ fn build_catalog(force: bool) -> CatalogResponse {
                 update_available: installed_version.as_deref().is_some_and(|v| v != e.version),
                 installed_version,
                 blocked: store::advisory_for(&e.pkg, Some(&e.version)).map(|a| a.reason),
+                categories: e.categories.clone(),
+                detected: e.detected(),
             });
         }
     }

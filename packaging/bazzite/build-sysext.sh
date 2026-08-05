@@ -98,6 +98,23 @@ if [ -n "$GAMESCOPE" ]; then
   install -Dm0755 "$GAMESCOPE" "$STAGE/usr/bin/punktfunk-gamescope"
 fi
 
+# Enable the plugin/script runner for every user, by baking its `[Install] WantedBy=default.target`
+# symlink straight into the image.
+#
+# A sysext carries only /usr, and RPM scriptlets never run from one — so the `systemctl --global
+# enable` the .rpm/.deb do at install time has no equivalent here, and without this the runner would
+# ship present-but-off on exactly the platform (Bazzite / Fedora Atomic) where an operator is least
+# likely to go hunting for it. The game-library scanners are plugins now (design D9), so an
+# unenabled runner means an empty library.
+#
+# Opt-out is unchanged and still wins: `systemctl --user mask punktfunk-scripting` in the user's own
+# ~/.config/systemd/user takes precedence over anything under /usr.
+if [ -f "$STAGE/usr/lib/systemd/user/punktfunk-scripting.service" ]; then
+  install -d "$STAGE/usr/lib/systemd/user/default.target.wants"
+  ln -sf ../punktfunk-scripting.service \
+    "$STAGE/usr/lib/systemd/user/default.target.wants/punktfunk-scripting.service"
+fi
+
 # Self-update: the helper rides inside the image.
 install -Dm0755 "$HERE/punktfunk-sysext.sh" "$STAGE/usr/bin/punktfunk-sysext"
 

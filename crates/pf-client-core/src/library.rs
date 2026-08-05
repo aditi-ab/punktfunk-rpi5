@@ -66,6 +66,20 @@ pub struct GameEntry {
     /// host's flattened `GameMeta`; the rest of the metadata is not decoded until a UI needs it.
     #[serde(default)]
     pub platform: Option<String>,
+    /// `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that opens
+    /// the launcher itself (Steam Big Picture, Heroic) rather than a title. A UI may group these
+    /// separately; one that doesn't renders them as ordinary tiles, which is the intended
+    /// degradation (design D4). Kept a plain string: the host owns the vocabulary, and an unknown
+    /// future value must never fail the whole library decode.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+impl GameEntry {
+    /// Whether this entry opens a launcher rather than a game.
+    pub fn is_launcher(&self) -> bool {
+        self.role.as_deref() == Some("launcher")
+    }
 }
 
 /// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").

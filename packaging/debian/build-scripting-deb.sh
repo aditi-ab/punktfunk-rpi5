@@ -114,20 +114,36 @@ Description: punktfunk plugin/script runner (Effect SDK on bun)
  capped-jittered restart; SIGTERM shuts the whole tree down structurally so plugin finalizers run).
  Bundles its own bun runtime (no system nodejs/bun dependency).
  .
- OPT-IN: the systemd --user unit is installed but not auto-enabled (the runner is inert until you add
- scripts or plugins). A plugin auto-wires to the host's mgmt token + identity cert on the same box —
- no env editing. Enable it with: systemctl --user enable --now punktfunk-scripting
+ ON BY DEFAULT: the systemd --user unit is enabled for every user (systemctl --global). The runner is
+ inert until you add scripts or plugins, and the game-library scanners now ship AS plugins — so a
+ host without the runner has an empty library and no obvious reason why. A plugin auto-wires to the
+ host's mgmt token + identity cert on the same box — no env editing.
+ Opt out per user with: systemctl --user mask punktfunk-scripting
 EOF
 
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-    echo "punktfunk-scripting installed. It runs your automation — add scripts to"
+    # `--global`, not `--user`: a maintainer script has no user session to act on, and this is the
+    # only mechanism that makes a `--user` unit on-by-default for everyone (it symlinks into
+    # /etc/systemd/user/…wants/). The library's scanners are plugins now, so the runner is a default
+    # component rather than an add-on (design D9) — but installing it stays opt-OUT, and the opt-out
+    # is `systemctl --user mask punktfunk-scripting`, since a plain `--user disable` cannot remove a
+    # global symlink.
+    #
+    # Only on FIRST configure ($2 empty): re-running it on every upgrade would silently undo the
+    # mask of anyone who turned it off.
+    if [ -z "$2" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || true
+    fi
+    echo "punktfunk-scripting installed and enabled for all users."
+    echo "It runs your automation — game-library sources, scripts in"
     echo "    ~/.config/punktfunk/scripts/  (loose .ts/.js files)"
-    echo "or install plugins into ~/.config/punktfunk/plugins/ (bun add punktfunk-plugin-<name>),"
-    echo "then enable the runner for your user:"
-    echo "    systemctl --user enable --now punktfunk-scripting"
+    echo "and plugins under ~/.config/punktfunk/plugins/."
+    echo "It starts with your next login; start it now with:"
+    echo "    systemctl --user start punktfunk-scripting"
+    echo "Don't want it? systemctl --user mask punktfunk-scripting"
 fi
 exit 0
 EOF
