@@ -29,6 +29,7 @@ impl LibraryProvider for SteamProvider {
             .filter(|app| !is_steam_tool(app.appid, &app.name))
             .map(|app| GameEntry {
                 provider: None,
+                role: GameRole::Game,
                 meta: GameMeta::pc(),
                 id: format!("steam:{}", app.appid),
                 store: "steam".into(),
@@ -383,6 +384,7 @@ fn shortcut_entry(sc: Shortcut) -> Option<GameEntry> {
     }
     Some(GameEntry {
         provider: None,
+        role: GameRole::Game,
         meta: GameMeta::pc(),
         id: format!("steam:{}", sc.appid),
         store: "steam".into(),

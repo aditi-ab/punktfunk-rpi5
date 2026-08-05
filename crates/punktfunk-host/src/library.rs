@@ -15,7 +15,7 @@
 pub(crate) use anyhow::{Context, Result};
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use sha2::{Digest, Sha256};
-pub(crate) use std::collections::HashSet;
+pub(crate) use std::collections::{BTreeMap, HashSet};
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) use utoipa::ToSchema;
@@ -136,6 +136,29 @@ impl GameMeta {
     }
 }
 
+/// What a library entry *is* — an ordinary title, or the launcher application itself (Steam Big
+/// Picture, Heroic, Playnite fullscreen). Purely a presentation hint: a launcher entry launches,
+/// leases and lists exactly like a game (design D4), and clients that don't know the field render it
+/// as a plain tile. Serde-default `game` and skip-serialized when default, so the wire is unchanged
+/// for every entry that doesn't opt in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GameRole {
+    /// An ordinary title.
+    #[default]
+    Game,
+    /// The launcher application itself.
+    Launcher,
+}
+
+impl GameRole {
+    /// Whether this is the serde default (`game`) — the `skip_serializing_if` predicate that keeps
+    /// the field off the wire for the overwhelming majority of entries.
+    pub(crate) fn is_game(&self) -> bool {
+        matches!(self, Self::Game)
+    }
+}
+
 /// One title in the unified library, regardless of which store it came from.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct GameEntry {
@@ -147,6 +170,9 @@ pub struct GameEntry {
     pub store: String,
     pub title: String,
     pub art: Artwork,
+    /// Whether this entry is a game or the launcher itself — see [`GameRole`].
+    #[serde(default, skip_serializing_if = "GameRole::is_game")]
+    pub role: GameRole,
     /// How the host would launch it, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
@@ -228,12 +254,26 @@ impl ArtKind {
     }
 }
 
-/// The full library: every *enabled* store's titles merged + the custom entries, sorted by title.
-/// The operator's scanner toggles (`scanners.rs`) gate each installed-store provider; the custom
-/// store is not a scanner and always contributes.
+/// The full library: every *enabled* source's titles merged + the custom entries, sorted by title.
+///
+/// Two independent gates run here, both at READ time so neither ever mutates stored state:
+///
+/// * **The operator's source toggles** (`scanners.rs`, persisted as a disabled-set in
+///   `library-scanners.json`) hide a source's titles from every surface — this grid, native clients,
+///   `/applist`, and launch resolution. They apply to built-in scanners *and* to plugin sources,
+///   which is what lets one toggle keep working verbatim across the whole migration: the ids match
+///   (provider id = claimed store id = old scanner id).
+/// * **Store claims** (D2): while a library plugin holds a store's claim, the matching built-in
+///   scanner is skipped so the two never double-list the same titles during the bridge releases.
+///   Removing the plugin releases the claim and the built-in comes straight back.
+///
+/// The user-curated custom store is not a source and always contributes.
 pub fn all_games() -> Vec<GameEntry> {
     let off = disabled_scanners();
-    let on = |id: &str| !off.contains(id);
+    let claimed = claimed_stores();
+    // A built-in scanner runs when the operator hasn't disabled it AND no plugin has claimed its
+    // store out from under it.
+    let on = |id: &str| !off.contains(id) && !claimed.contains_key(id);
     let mut games = Vec::new();
     if on("steam") {
         games.extend(SteamProvider.list());
@@ -262,7 +302,15 @@ pub fn all_games() -> Vec<GameEntry> {
             games.extend(XboxProvider.list());
         }
     }
-    games.extend(load_custom().into_iter().map(GameEntry::from));
+    // Stored entries: manual ones always contribute; a provider's are subject to the same source
+    // toggle a built-in scanner is (WP2.6). The plugin may keep reconciling while it is off — the
+    // entries stay stored and simply aren't surfaced, exactly like a disabled scanner's titles.
+    games.extend(
+        load_custom()
+            .into_iter()
+            .filter(|e| !source_id_for(e).is_some_and(|src| off.contains(src)))
+            .map(GameEntry::from),
+    );
     games.sort_by_key(|g| g.title.to_lowercase());
     games
 }

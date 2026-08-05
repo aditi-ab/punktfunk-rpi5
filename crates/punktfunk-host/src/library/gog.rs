@@ -57,6 +57,7 @@ fn gog_games() -> Vec<GameEntry> {
         let detect = DetectSpec::exe(&exe).with_dir(&path);
         out.push(GameEntry {
             provider: None,
+            role: GameRole::Game,
             meta: GameMeta::pc(),
             id,
             store: "gog".into(),

@@ -2465,11 +2465,18 @@ pub fn ei_socket_file() -> std::path::PathBuf {
     crate::with_env_lock(pf_paths::gamescope_ei_socket_file)
 }
 
-/// Does this resolved launch command start Steam (`steam … steam://…`)? Such a launch needs Steam's
-/// single instance free before a dedicated spawn (B1). Pure + unit-tested.
+/// Does this resolved launch command start the Steam **client**? Such a launch needs Steam's single
+/// instance free before a dedicated spawn (B1), and wants gamescope's `--steam` integration on.
+/// Pure + unit-tested.
+///
+/// The test is the first token, NOT the presence of a `steam://` URI. A `steam_ui` launcher entry
+/// (design D4) resolves to a bare `steam -gamepadui` / `steam` with no URI at all, and it is *more*
+/// exposed to the single-instance problem than a game launch is, not less: on a box that autologged
+/// into game mode, the nested second Steam would see the first and exit, taking the spawn down with
+/// it. A URI-gated check would silently skip both the instance free and `--steam` for exactly the
+/// launch that most needs them.
 fn is_steam_launch(cmd: &str) -> bool {
-    let mut it = cmd.split_whitespace();
-    it.next() == Some("steam") && cmd.contains("steam://")
+    cmd.split_whitespace().next() == Some("steam")
 }
 
 /// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
@@ -2865,7 +2872,13 @@ mod tests {
         assert!(is_steam_launch("steam -silent steam://rungameid/570"));
         assert!(!is_steam_launch("vkcube"));
         assert!(!is_steam_launch("lutris lutris:rungameid/42"));
-        assert!(!is_steam_launch("steam -bigpicture")); // no URI = not a game launch
+        // A `steam_ui` LAUNCHER entry (design D4) carries no URI, and must still count: it needs the
+        // single instance freed (B1) and gamescope's `--steam` mode on. Gating on `steam://` would
+        // have skipped both for the one launch that is Big Picture itself.
+        assert!(is_steam_launch("steam -gamepadui"));
+        assert!(is_steam_launch("steam"));
+        // A command that merely mentions steam elsewhere is not a Steam client launch.
+        assert!(!is_steam_launch("mygame --steam-overlay"));
     }
 
     #[test]
@@ -2891,6 +2904,13 @@ mod tests {
             shape_dedicated_command("steam -bigpicture"),
             "steam -bigpicture"
         );
+        // The `steam_ui` launcher entries (design D4) pass through untouched — the shaping only ever
+        // fires on a `steam://` game launch, so there is no way to end up with `-gamepadui` twice.
+        assert_eq!(
+            shape_dedicated_command("steam -gamepadui"),
+            "steam -gamepadui"
+        );
+        assert_eq!(shape_dedicated_command("steam"), "steam");
     }
 
     #[test]

@@ -1307,7 +1307,7 @@
           "library"
         ],
         "summary": "Replace a provider's library entries (declarative reconcile)",
-        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.",
+        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.\n\n`?store=` additionally **claims** that store for the provider: its entries then surface with\ndeterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque\n`custom:<id>` ones — which is what lets a library plugin reproduce the entries an in-host scanner\nused to produce, right down to the GameStream app ids and client-side art caches. One provider\nper store; a second claimant gets 409. While a claim is held the matching built-in scanner is\nsuppressed, so the two never double-list. The claim is released by `DELETE`, not by an empty\nreconcile (a store can legitimately have zero installed titles).",
         "operationId": "reconcileProviderEntries",
         "parameters": [
           {
@@ -1315,6 +1315,15 @@
             "in": "path",
             "description": "The provider id ([a-z0-9._-], `manual` reserved)",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "store",
+            "in": "query",
+            "description": "Claim this store for the provider ([a-z0-9_-], `custom`/`manual` reserved)",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1348,7 +1357,7 @@
             }
           },
           "400": {
-            "description": "Invalid provider id or payload",
+            "description": "Invalid provider id, store id, or payload",
             "content": {
               "application/json": {
                 "schema": {
@@ -1359,6 +1368,16 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That store is already claimed by another provider",
             "content": {
               "application/json": {
                 "schema": {
@@ -4159,7 +4178,8 @@
           "tier",
           "platforms",
           "compatible",
-          "update_available"
+          "update_available",
+          "categories"
         ],
         "properties": {
           "author": {
@@ -4172,12 +4192,26 @@
             ],
             "description": "A revocation covering the catalogued version — do not offer this without shouting."
           },
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What kind of plugin this is — the console filters Browse by these, and the Game sources\nsurface's \"Add a source\" rail shows exactly the `library` ones (design D5/D6)."
+          },
           "compatible": {
             "type": "boolean",
             "description": "Can this host install it?"
           },
           "description": {
             "type": "string"
+          },
+          "detected": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the launcher this plugin scans looks **installed on this host** (design D8), from the\nindex's own existence probes. `null` = the entry declares no probes for this platform, which\nthe console renders as \"unknown\" rather than \"not installed\"."
           },
           "homepage": {
             "type": [
@@ -4365,6 +4399,17 @@
                 ],
                 "description": "The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous)."
               },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]."
+              },
+              "store": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The **store this entry was claimed under** (D2), stamped by a `?store=`-qualified reconcile.\n`None` = an unclaimed provider entry or a manual one, both of which surface as `custom`.\n\nMaterialized onto the entry rather than looked up in [`Catalog::claims`] on every read so an\nentry is self-describing: its id and its `store` badge derive from the entry alone, and stay\ncorrect even while the claim map is being rewritten."
+              },
               "title": {
                 "type": "string"
               }
@@ -4408,6 +4453,10 @@
                   "$ref": "#/components/schemas/PrepCmd"
                 },
                 "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+              },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]. A hand-added launcher\nentry is legal (an operator may want a \"Steam\" tile without installing the steam plugin)."
               },
               "title": {
                 "type": "string"
@@ -4467,6 +4516,17 @@
         "type": "object",
         "description": "What an operator (or a provider plugin) can tell the host about recognizing a title — the wire\nhalf of [`DetectSpec`], and the only part of it that is ever accepted from outside.\n\nDeliberately a **subset**: the store-derived signals (a Steam appid, a launcher's environment\nmarker) are things the host discovers for itself and would be meaningless — or dangerous — to take\non someone's word. What is left is what a provider genuinely knows and the host cannot guess: where\nthe title is installed, which executable is the game, what the process is called. All three are\noptional; supplying none is the same as supplying no hint at all.\n\nNever returned by the catalog API — see the module docs on why detect data does not cross the wire\noutbound.",
         "properties": {
+          "env_marker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvMarker",
+                "description": "A launcher-stamped environment marker (D3) — see [`EnvMarker`]."
+              }
+            ]
+          },
           "exe": {
             "type": [
               "string",
@@ -4487,6 +4547,15 @@
               "null"
             ],
             "description": "The executable's file name (`Hades.exe`), when its location isn't fixed. Weakest of the three\n— see [`DetectSpec::process_name`]."
+          },
+          "steam_appid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The Steam appid, for a title Steam itself installed (D3). On Linux this is the **sharpest**\nsignal that exists — Steam wraps every launch, native or Proton, in\n`reaper SteamLaunch AppId=<appid>`, whose lifetime is exactly the game's — so without it a\nsteam plugin's lease tracking would degrade from reaper-exact to install-dir prefix matching.",
+            "minimum": 0
           }
         }
       },
@@ -4712,6 +4781,27 @@
             "type": "integer",
             "description": "How many waiting games were ended.",
             "minimum": 0
+          }
+        }
+      },
+      "EnvMarker": {
+        "type": "object",
+        "description": "An environment variable a launcher stamps onto the game's process, identifying it.\n\nSerializable because it is now half of the inbound [`DetectHint`] too (D3) — a library plugin\nthat knows its launcher's marker (Heroic's `HEROIC_APP_NAME`, load-bearing under Proton) has to\nbe able to say so, since after extraction the host no longer reads that launcher's files itself.",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The variable name (e.g. `HEROIC_GAME_ID`).",
+            "example": "HEROIC_APP_NAME"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The exact value to require, when the launcher's value identifies *this* title. `None` matches\nthe key's mere presence — only safe for launchers that run one game at a time."
           }
         }
       },
@@ -5165,6 +5255,10 @@
                 ],
                 "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
               },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]."
+              },
               "store": {
                 "type": "string",
                 "description": "Which store surfaced it: `\"steam\"` or `\"custom\"`.",
@@ -5295,6 +5389,14 @@
             "description": "Display title."
           }
         }
+      },
+      "GameRole": {
+        "type": "string",
+        "description": "What a library entry *is* — an ordinary title, or the launcher application itself (Steam Big\nPicture, Heroic, Playnite fullscreen). Purely a presentation hint: a launcher entry launches,\nleases and lists exactly like a game (design D4), and clients that don't know the field render it\nas a plain tile. Serde-default `game` and skip-serialized when default, so the wire is unchanged\nfor every entry that doesn't opt in.",
+        "enum": [
+          "game",
+          "launcher"
+        ]
       },
       "GameSession": {
         "type": "string",
@@ -6334,6 +6436,13 @@
           "title"
         ],
         "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What KIND of plugin this is (`^[a-z][a-z0-9-]{0,31}$`), top-level rather than under `ui`\nbecause it describes the plugin, not its surface. The console knows one value today —\n`library` — which it filters **out of the nav**: six installed scanner plugins would otherwise\nflood the sidebar, and their real entry point is the Game sources surface (design D5). A\nlibrary plugin that genuinely wants its own page (rom-manager, which is much more than a\nscanner) simply omits the category."
+          },
           "title": {
             "type": "string",
             "description": "Human-readable title for the console nav entry (1–64 chars; control chars stripped)."
@@ -6366,6 +6475,13 @@
           "title"
         ],
         "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The plugin's kind — see [`PluginRegistration::category`]."
+          },
           "id": {
             "type": "string"
           },
@@ -6604,6 +6720,10 @@
                 },
                 "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
               },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]. A library plugin\nemits its `launchers(cfg)` entries with `role: \"launcher\"`."
+              },
               "title": {
                 "type": "string"
               }
@@ -6780,26 +6900,46 @@
       },
       "ScannerInfo": {
         "type": "object",
-        "description": "One installed-store scanner this host build supports, with its enable state — the unit the\nconsole renders a toggle for. The list is platform-gated at compile time (the scanners are),\nso the console never shows a toggle that cannot do anything on this host.",
+        "description": "One **game source** on this host, with its enable state — the unit the console renders a toggle\nfor. A source is either a scanner compiled into this build or a plugin that reconciles entries in\n(WP2.6); the console treats them identically, which is what makes the extraction invisible.",
         "required": [
           "id",
           "label",
-          "enabled"
+          "enabled",
+          "origin"
         ],
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether this host runs the scanner (default true)."
+            "description": "Whether this host runs the source (default true)."
+          },
+          "entries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many entries this source currently contributes. `None` for a built-in scanner, whose\ncount would mean walking every launcher's files just to render a toggle.",
+            "minimum": 0
           },
           "id": {
             "type": "string",
-            "description": "Stable scanner id — the same string the scanner's entries carry in their `store` field.",
+            "description": "Stable source id — the same string this source's entries carry in their `store` field. For a\nplugin source it is also its provider id and its store claim: one string, by construction, so\na user's disabled state survives a built-in scanner being replaced by its plugin.",
             "example": "steam"
           },
           "label": {
             "type": "string",
             "description": "Human-facing name for the console toggle.",
             "example": "Steam"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SourceOrigin",
+            "description": "Where the source comes from: `builtin` (a scanner in this host build) or `plugin`."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider id backing a `plugin` source — absent for a built-in scanner."
           }
         }
       },
@@ -6961,6 +7101,14 @@
             "type": "string"
           }
         }
+      },
+      "SourceOrigin": {
+        "type": "string",
+        "description": "Where a [`ScannerInfo`] comes from.",
+        "enum": [
+          "builtin",
+          "plugin"
+        ]
       },
       "SourceView": {
         "type": "object",

@@ -86,6 +86,13 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
         // Heroic: `<runner>:<appName>` → the validated heroic://launch command (see heroic_command).
         #[cfg(target_os = "linux")]
         "heroic" => heroic_command(&spec.value),
+        // A launcher entry (D4): open the Steam client itself, in Big Picture or on the desktop.
+        // Nested in gamescope this is the SteamOS game-mode shape.
+        "steam_ui" => match spec.value.as_str() {
+            "bigpicture" => Some("steam -gamepadui".into()),
+            "desktop" => Some("steam".into()),
+            _ => None,
+        },
         // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
@@ -134,6 +141,21 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
             // Prefer launching Steam.exe with the URI as an argument; fall back to explorer.exe, which
             // resolves the steam:// handler from the user hive. (The appid is digits-validated, so the
             // only variable part of the line is a number either way.)
+            let cmdline = match steam_exe() {
+                Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
+                None => format!("explorer.exe \"{uri}\""),
+            };
+            Some((cmdline, None))
+        }
+        // A launcher entry (D4): open the Steam client's own UI. Same Steam.exe-then-explorer ladder
+        // as `steam_appid`, and the URI is one of exactly two host-owned literals — nothing from the
+        // entry is interpolated at all.
+        "steam_ui" => {
+            let uri = match spec.value.as_str() {
+                "bigpicture" => "steam://open/bigpicture",
+                "desktop" => "steam://open/main",
+                _ => return None,
+            };
             let cmdline = match steam_exe() {
                 Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
                 None => format!("explorer.exe \"{uri}\""),
@@ -217,6 +239,13 @@ pub(crate) fn valid_steam_appid(value: &str) -> bool {
 /// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
 pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
     ((appid as u64) << 32) | 0x0200_0000
+}
+
+/// The `steam_ui` launch values (D4) — which Steam UI a launcher entry opens. A closed two-value
+/// enum, validated on the way IN (the reconcile payload) as well as on the way out, so an entry can
+/// never carry a third value that silently resolves to nothing at launch time.
+pub(crate) fn valid_steam_ui(value: &str) -> bool {
+    matches!(value, "bigpicture" | "desktop")
 }
 
 /// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
@@ -466,6 +495,53 @@ mod tests {
             assert!(cmd.contains("heroic://launch?appName=Quail-1.2_x&runner=legendary"));
             assert!(cmd.contains("--no-gui"));
         }
+    }
+
+    /// The `steam_ui` launcher kind (D4): a closed two-value enum, mapped to the Steam client's own
+    /// UI on each OS. Nothing from the entry is interpolated — the value only SELECTS between two
+    /// host-owned literals — so there is no injection surface at all here.
+    #[test]
+    fn steam_ui_is_a_closed_two_value_enum() {
+        assert!(valid_steam_ui("bigpicture"));
+        assert!(valid_steam_ui("desktop"));
+        assert!(!valid_steam_ui("gamepadui"));
+        assert!(!valid_steam_ui(""));
+        assert!(!valid_steam_ui("bigpicture; rm -rf ~"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn steam_ui_resolves_to_the_client_ui_on_linux() {
+        let ui = |v: &str| {
+            command_for(&LaunchSpec {
+                kind: "steam_ui".into(),
+                value: v.into(),
+            })
+        };
+        // Big Picture is the SteamOS game-mode shape; nested in gamescope this is what `--steam`
+        // integration is built around.
+        assert_eq!(ui("bigpicture").as_deref(), Some("steam -gamepadui"));
+        assert_eq!(ui("desktop").as_deref(), Some("steam"));
+        assert_eq!(ui("nonsense"), None);
+        assert_eq!(ui(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn steam_ui_resolves_to_the_client_ui_on_windows() {
+        let ui = |v: &str| {
+            windows_launch_for(&LaunchSpec {
+                kind: "steam_ui".into(),
+                value: v.into(),
+            })
+        };
+        let (bp, wd) = ui("bigpicture").expect("bigpicture recipe");
+        assert!(bp.contains("steam://open/bigpicture"), "line was {bp:?}");
+        assert!(wd.is_none());
+        let (desk, _) = ui("desktop").expect("desktop recipe");
+        assert!(desk.contains("steam://open/main"), "line was {desk:?}");
+        assert!(ui("nonsense").is_none());
+        assert!(ui("").is_none());
     }
 
     #[test]

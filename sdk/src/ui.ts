@@ -45,6 +45,17 @@ export interface PluginUiOptions {
 	/** Optional lucide icon name for the nav entry (`[a-z0-9-]`, e.g. `"gamepad-2"`). */
 	icon?: string;
 	/**
+	 * What KIND of plugin this is (`[a-z][a-z0-9-]{0,31}`). The console groups and filters on it —
+	 * and notably keeps `"library"` plugins **out of the nav**, because a scanner's entry point is
+	 * the Library section's Game sources surface, not a sidebar item of its own. Six installed
+	 * scanners would otherwise flood the sidebar.
+	 *
+	 * `@punktfunk/plugin-kit`'s `defineLibraryPlugin` sets this for you. Set it by hand only if you
+	 * are building a library plugin without the kit — and omit it if your plugin wants a full page
+	 * despite also syncing a library (rom-manager does).
+	 */
+	category?: string;
+	/**
 	 * Directory of the built SPA. Requests are served from here first (with an `index.html` SPA
 	 * fallback for navigations); a static miss falls through to [`fetch`]. Accepts a filesystem
 	 * path or a `file:` URL (`new URL("../dist/ui", import.meta.url)`).
@@ -182,6 +193,9 @@ export const servePluginUi = async (
 			secret,
 			...(opts.icon !== undefined ? { icon: opts.icon } : {}),
 		},
+		// Sent through the UNTYPED `pf.request` below, so an older host simply ignores the unknown
+		// field rather than rejecting the registration — no runner flag, no version gate.
+		...(opts.category !== undefined ? { category: opts.category } : {}),
 	};
 
 	const register = () => pf.request("PUT", `/plugins/${opts.id}`, body);

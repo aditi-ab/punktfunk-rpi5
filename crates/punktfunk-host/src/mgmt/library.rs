@@ -185,6 +185,11 @@ pub(crate) async fn update_custom_game(
             StatusCode::CONFLICT,
             &format!("entry is owned by provider `{p}` — update it through its reconcile"),
         ),
+        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected claim outcome",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -216,6 +221,11 @@ pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
                 "entry is owned by provider `{p}` — remove it there, or DELETE the provider set"
             ),
         ),
+        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected claim outcome",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -227,6 +237,13 @@ pub(crate) struct ProviderRemoved {
     removed: usize,
 }
 
+/// Query for `reconcileProviderEntries` — the optional store claim (D2).
+#[derive(Deserialize)]
+pub(crate) struct ReconcileQuery {
+    /// Claim this store for the provider, so its entries take the store's own identity.
+    store: Option<String>,
+}
+
 /// Replace a provider's library entries (declarative reconcile)
 ///
 /// Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the
@@ -234,39 +251,67 @@ pub(crate) struct ProviderRemoved {
 /// surviving title's host id stable across reconciles, drops orphans, and never touches manual
 /// entries or other providers'. An empty array removes everything the provider owns. Emits
 /// `library.changed` with the provider as `source`.
+///
+/// `?store=` additionally **claims** that store for the provider: its entries then surface with
+/// deterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque
+/// `custom:<id>` ones — which is what lets a library plugin reproduce the entries an in-host scanner
+/// used to produce, right down to the GameStream app ids and client-side art caches. One provider
+/// per store; a second claimant gets 409. While a claim is held the matching built-in scanner is
+/// suppressed, so the two never double-list. The claim is released by `DELETE`, not by an empty
+/// reconcile (a store can legitimately have zero installed titles).
 #[utoipa::path(
     put,
     path = "/library/provider/{provider}",
     tag = "library",
     operation_id = "reconcileProviderEntries",
-    params(("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)")),
+    params(
+        ("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)"),
+        ("store" = Option<String>, Query, description = "Claim this store for the provider ([a-z0-9_-], `custom`/`manual` reserved)"),
+    ),
     request_body = Vec<crate::library::ProviderEntryInput>,
     responses(
         (status = OK, description = "The provider's resulting entries (host ids assigned/kept)", body = [crate::library::CustomEntry]),
-        (status = BAD_REQUEST, description = "Invalid provider id or payload", body = ApiError),
+        (status = BAD_REQUEST, description = "Invalid provider id, store id, or payload", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = CONFLICT, description = "That store is already claimed by another provider", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
     )
 )]
 pub(crate) async fn reconcile_provider_entries(
     Path(provider): Path<String>,
+    Query(q): Query<ReconcileQuery>,
     ApiJson(inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
 ) -> Response {
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
+    let store = q.store.filter(|s| !s.is_empty());
+    if let Some(store) = &store {
+        if let Err(e) = crate::library::validate_store_claim(store) {
+            return api_error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     if let Err(e) = crate::library::validate_provider_payload(&inputs) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
-    match crate::library::reconcile_provider(&provider, inputs) {
-        Ok(entries) => {
+    match crate::library::reconcile_provider(&provider, store.as_deref(), inputs) {
+        Ok(crate::library::MutateOutcome::Done(entries)) => {
             tracing::info!(
                 provider,
+                store = store.as_deref().unwrap_or("-"),
                 count = entries.len(),
                 "library provider reconciled"
             );
             Json(entries).into_response()
         }
+        Ok(crate::library::MutateOutcome::StoreClaimed { store, provider }) => api_error(
+            StatusCode::CONFLICT,
+            &format!("store `{store}` is already claimed by provider `{provider}`"),
+        ),
+        Ok(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected reconcile outcome",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

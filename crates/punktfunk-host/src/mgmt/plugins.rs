@@ -64,6 +64,14 @@ pub(crate) struct PluginRegistration {
     /// entry only (e.g. a future runner-management listing) and grows no nav entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<PluginUi>,
+    /// What KIND of plugin this is (`^[a-z][a-z0-9-]{0,31}$`), top-level rather than under `ui`
+    /// because it describes the plugin, not its surface. The console knows one value today —
+    /// `library` — which it filters **out of the nav**: six installed scanner plugins would otherwise
+    /// flood the sidebar, and their real entry point is the Game sources surface (design D5). A
+    /// library plugin that genuinely wants its own page (rom-manager, which is much more than a
+    /// scanner) simply omits the category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 /// One log line produced by the runner or a plugin inside it (`POST /plugins/logs`).
@@ -104,6 +112,9 @@ pub(crate) struct PluginSummary {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui: Option<PluginUiPublic>,
+    /// The plugin's kind — see [`PluginRegistration::category`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 /// `GET /plugins/{id}/ui-credential` — the console proxy's server-side lookup (bearer + loopback).
@@ -129,14 +140,19 @@ struct Stored {
     title: String,
     version: Option<String>,
     ui: Option<StoredUi>,
+    category: Option<String>,
     expires_at: Instant,
 }
 
 impl Stored {
     /// Do the operator-visible fields match (ignoring the lease clock)? A pure lease renewal leaves
-    /// these unchanged and emits no event; a restart (new secret) or a re-scan (new title/icon) does.
-    fn public_eq(&self, title: &str, version: &Option<String>, ui: &Option<StoredUi>) -> bool {
-        self.title == title && self.version == *version && self.ui == *ui
+    /// these unchanged and emits no event; a restart (new secret) or a re-scan (new title/icon/
+    /// category) does.
+    fn public_eq(&self, v: &Valid) -> bool {
+        self.title == v.title
+            && self.version == v.version
+            && self.ui == v.ui
+            && self.category == v.category
     }
 }
 
@@ -150,6 +166,7 @@ struct Valid {
     title: String,
     version: Option<String>,
     ui: Option<StoredUi>,
+    category: Option<String>,
 }
 
 impl PluginRegistry {
@@ -167,7 +184,7 @@ impl PluginRegistry {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let changed = match map.get(id) {
             // An *expired* prior entry counts as a change (it had stopped listing).
-            Some(prev) => !prev.is_live() || !prev.public_eq(&v.title, &v.version, &v.ui),
+            Some(prev) => !prev.is_live() || !prev.public_eq(&v),
             None => true,
         };
         map.insert(
@@ -176,6 +193,7 @@ impl PluginRegistry {
                 title: v.title,
                 version: v.version,
                 ui: v.ui,
+                category: v.category,
                 expires_at,
             },
         );
@@ -207,6 +225,7 @@ impl PluginRegistry {
                     port: u.port,
                     icon: u.icon.clone(),
                 }),
+                category: s.category.clone(),
             })
             .collect();
         live.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
@@ -333,7 +352,31 @@ fn validate(reg: PluginRegistration) -> Result<Valid, String> {
         Some(u) => Some(validate_ui(u)?),
         None => None,
     };
-    Ok(Valid { title, version, ui })
+    // Categories are grouping keys the console switches on — a closed charset, but deliberately not
+    // a closed VOCABULARY: an unknown category is stored and simply matches no console rule, so a
+    // newer plugin registering against an older host degrades to "shows in the nav", never to a
+    // failed registration.
+    let category = match reg.category {
+        Some(c) => {
+            let ok = (1..=32).contains(&c.len())
+                && c.starts_with(|ch: char| ch.is_ascii_lowercase())
+                && c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !ok {
+                return Err(
+                    "category must be 1–32 chars of [a-z0-9-], starting with a letter".into(),
+                );
+            }
+            Some(c)
+        }
+        None => None,
+    };
+    Ok(Valid {
+        title,
+        version,
+        ui,
+        category,
+    })
 }
 
 fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
@@ -558,6 +601,7 @@ mod tests {
                 secret: secret.into(),
                 icon: Some("gamepad-2".into()),
             }),
+            category: None,
         }
     }
 
@@ -584,10 +628,30 @@ mod tests {
             title: "Ro\u{7}m\n".into(),
             version: None,
             ui: None,
+            category: None,
         })
         .unwrap();
         assert_eq!(v.title, "Rom");
-        // privileged port rejected
+        // Category charset (WP2.7): the console's one known value passes; the shapes that would
+        // break a grouping key don't. An UNKNOWN-but-well-formed category is accepted on purpose —
+        // a newer plugin must not fail to register against an older host.
+        let lib = |c: &str| PluginRegistration {
+            title: "X".into(),
+            version: None,
+            ui: None,
+            category: Some(c.into()),
+        };
+        assert_eq!(
+            validate(lib("library")).unwrap().category.as_deref(),
+            Some("library")
+        );
+        assert!(validate(lib("some-future-kind")).is_ok());
+        assert!(validate(lib("")).is_err());
+        assert!(validate(lib("Library")).is_err()); // no uppercase
+        assert!(validate(lib("9lives")).is_err()); // must start with a letter
+        assert!(validate(lib("lib_rary")).is_err()); // no underscore
+        assert!(validate(lib(&"a".repeat(33))).is_err()); // too long
+                                                          // privileged port rejected
         assert!(validate(reg("x", 80, SECRET)).is_err());
         // short secret rejected
         assert!(validate(reg("x", 49321, "tooshort")).is_err());
@@ -641,6 +705,7 @@ mod tests {
                 title: "Headless".into(),
                 version: None,
                 ui: None,
+                category: None,
             })
             .unwrap(),
         );
