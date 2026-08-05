@@ -23,7 +23,7 @@ use crate::overlay::SharedDevice;
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
-use pf_client_core::video::{CpuFrame, VkVideoFrame};
+use pf_client_core::video::{CpuFrame, NativeVkFrame, VkVideoFrame};
 
 mod gpu;
 mod overlay_pipe;
@@ -51,6 +51,12 @@ pub enum FrameInput<'a> {
     /// fence-complete, GENERAL layout (`pf_client_core::video_pyrowave`).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
+    /// Native Vulkan Video output (pf-vkdecode) — an NV12 image + plane views already
+    /// on THIS device: wait the frame's timeline pair on the submit, transition its
+    /// layer for sampling and BACK to its decode layout, CSC with the coded-vs-display
+    /// UV scale. Dropping the frame (after the sampling fence) releases the decoder's
+    /// slot via its guard.
+    NativeVk(NativeVkFrame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
@@ -78,6 +84,10 @@ enum Retired {
         frame: VkVideoFrame,
         views: [vk::ImageView; 2],
     },
+    /// A native (pf-vkdecode) frame: image + views are the DECODER's — nothing to
+    /// destroy here; dropping the frame after the fence wait sends its release token,
+    /// which is what returns the decode slot (the release-after-fence contract).
+    NativeVk(NativeVkFrame),
 }
 
 /// The overlay composite: one premultiplied-alpha quad blended over the swapchain image

@@ -77,6 +77,11 @@ mod video_software;
 mod video_libav;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
+// Native Vulkan Video H.264 decode (WP-C of the native-decode program): pf-vkdecode's
+// decoder on the presenter's shared device, behind the `PUNKTFUNK_DECODER=native-vulkan`
+// runtime opt-in only.
+#[cfg(any(target_os = "linux", windows))]
+mod video_vk_native;
 #[cfg(any(target_os = "linux", windows))]
 mod video_vulkan;
 // The OS-clipboard bridge for the shared clipboard (design/clipboard-and-file-transfer.md §5).

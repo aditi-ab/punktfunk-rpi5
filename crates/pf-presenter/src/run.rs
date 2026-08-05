@@ -1767,6 +1767,41 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                     }
                     DecodedImage::VkFrame(_) => false, // demoted — drain until rebuild
+                    // Native (pf-vkdecode) frames: decoded on the presenter's own
+                    // device, same present shape and the same failure-streak demotion
+                    // contract as the VkFrame arm. A drained/demoted frame drops here
+                    // — its guard still returns the decoder's slot.
+                    DecodedImage::NativeVk(v) if !st.dmabuf_demoted => {
+                        st.hdr = v.color.is_pq();
+                        st.hdr_untonemapped = false;
+                        match presenter.present(
+                            &window,
+                            FrameInput::NativeVk(v),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.hw_fails = 0;
+                                p
+                            }
+                            Err(e) => {
+                                // Lost device ⇒ unrecoverable, never demote ([`device_lost`]).
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
+                                st.hw_fails += 1;
+                                tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
+                                    "native vulkan present failed");
+                                if st.hw_fails >= 3 {
+                                    st.dmabuf_demoted = true;
+                                    tracing::warn!("demoting the decoder to software");
+                                    st.force_software.store(true, Ordering::Relaxed);
+                                }
+                                false
+                            }
+                        }
+                    }
+                    DecodedImage::NativeVk(_) => false, // demoted — drain until rebuild
                 };
                 if did_present {
                     presented_video = true;

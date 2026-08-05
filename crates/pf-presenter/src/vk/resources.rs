@@ -24,6 +24,10 @@ impl Retired {
                 }
                 drop(frame); // guard drops here — AVFrame (and the VkImage) released
             }
+            // The image and plane views belong to the DECODER's pools — nothing of ours
+            // to destroy. The drop sends the release token (the caller reaches here only
+            // after the sampling fence, so the token honestly means "GPU reads done").
+            Retired::NativeVk(frame) => drop(frame),
         }
     }
 }

@@ -2994,6 +2994,7 @@ dependencies = [
  "opus",
  "pf-ffvk",
  "pf-update-check",
+ "pf-vkdecode",
  "pipewire",
  "punktfunk-core",
  "pyrowave-sys",

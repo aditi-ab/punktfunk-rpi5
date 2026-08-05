@@ -771,6 +771,7 @@ fn pump(
                             DecodedImage::D3d11(_) => "d3d11va",
                             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                             DecodedImage::PyroWave(_) => "pyrowave",
+                            DecodedImage::NativeVk(_) => "native-vulkan",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
@@ -785,6 +786,7 @@ fn pump(
                                     feature = "pyrowave"
                                 ))]
                                 DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
+                                DecodedImage::NativeVk(f) => (f.width, f.height, "native-vulkan"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }

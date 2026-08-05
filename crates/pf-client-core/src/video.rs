@@ -4,7 +4,10 @@
 //! see [`VulkanDecodeDevice::prefer_vulkan_first`]. Linux: vaapi → vulkan → software on
 //! desktop Mesa, vulkan first on NVIDIA/VanGogh. Windows: d3d11va → vulkan → software on
 //! Intel/unknown, vulkan first on NVIDIA/AMD.
-//! Override: `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software`):
+//! Override: `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software`; additionally
+//! `native-vulkan` — the pf-vkdecode H.264 decoder on the presenter's device
+//! (`video_vk_native`), runtime-opt-in ONLY until WP-D's A/B verdict admits it to the
+//! ladder — see [`native_vulkan_gate`]):
 //!
 //! * **Vulkan Video**: FFmpeg's Vulkan decoder running on the PRESENTER's own VkDevice
 //!   (its handles arrive via [`VulkanDecodeDevice`]) — the decoded VkImage feeds the
@@ -44,6 +47,7 @@ pub use crate::video_color::{csc_rows, ColorDesc};
 use crate::video_software::SoftwareDecoder;
 #[cfg(target_os = "linux")]
 use crate::video_vaapi::VaapiDecoder;
+use crate::video_vk_native::NativeVulkanDecoder;
 use crate::video_vulkan::VulkanDecoder;
 
 /// One decoded frame headed for the presenter, carrying the host capture timestamp so the
@@ -79,6 +83,13 @@ pub enum DecodedImage {
     /// samples them directly (BT.709 limited, the codec's fixed colour contract).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
+    /// Native Vulkan Video output (pf-vkdecode, `PUNKTFUNK_DECODER=native-vulkan`):
+    /// an NV12 image + per-plane views already on the PRESENTER's device — same
+    /// zero-copy contract as [`DecodedImage::VkFrame`], no FFmpeg involved. The
+    /// presenter waits the frame's timeline pair, transitions the layer for sampling
+    /// and BACK to [`NativeVkFrame::layout`], and releases the decoder's slot by
+    /// dropping the frame (its guard sends the release token).
+    NativeVk(NativeVkFrame),
 }
 
 /// One Vulkan-decoded frame. The image lives on the presenter's own VkDevice (the
@@ -136,6 +147,109 @@ pub struct VkVideoFrame {
     pub guard: DrmFrameGuard,
 }
 
+/// The layout a [`NativeVkFrame`]'s image layer is in when its semaphore signals —
+/// pf-client-core's ash-free mirror of the two decode layouts, so the presenter can
+/// transition for sampling and back without this crate naming `vk::ImageLayout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeVkLayout {
+    /// `VIDEO_DECODE_DST_KHR` — distinct-mode output; the layer holds ONLY this
+    /// picture and the next decode into the slot discards it (UNDEFINED-old-layout).
+    DecodeDst,
+    /// `VIDEO_DECODE_DPB_KHR` — coincide-mode output: the picture IS a DPB slot and
+    /// may still be a live reference, so a consumer that transitions it for sampling
+    /// MUST transition it back to this layout in the same submission.
+    DecodeDpb,
+}
+
+/// The release token a presented/dropped [`NativeVkFrame`] hands back to the native
+/// decode backend: `seq` names the shipped frame, `generation` the decoder session it
+/// belongs to (a stale generation releases nothing — the pools it indexed are gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeReleaseToken {
+    pub seq: u64,
+    pub generation: u64,
+}
+
+/// Sends the frame's [`NativeReleaseToken`] exactly once, on drop — the native path's
+/// analog of the VAAPI/VkFrame `DrmFrameGuard`s. The presenter holds the frame (and so
+/// this guard) until its sampling submission's fence has been waited, which makes
+/// "guard dropped" equal "the GPU is done with the image"; a frame dropped UNPRESENTED
+/// (newest-wins displacement, demotion drain) releases through the very same drop. A
+/// dead channel (the backend was demoted/rebuilt) is ignored — the decoder that owned
+/// the slot is gone.
+pub struct NativeReleaseGuard {
+    tx: std::sync::mpsc::Sender<NativeReleaseToken>,
+    token: Option<NativeReleaseToken>,
+}
+
+impl NativeReleaseGuard {
+    pub(crate) fn new(
+        tx: std::sync::mpsc::Sender<NativeReleaseToken>,
+        token: NativeReleaseToken,
+    ) -> Self {
+        Self {
+            tx,
+            token: Some(token),
+        }
+    }
+}
+
+impl Drop for NativeReleaseGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.tx.send(token);
+        }
+    }
+}
+
+/// One natively decoded frame (pf-vkdecode). Everything is raw `u64`/plain data — this
+/// crate stays ash-free, exactly like [`VulkanDecodeDevice`]. The handles BORROW the
+/// decoder's pools: valid until the frame is released (the guard's drop) AND the
+/// decoder generation they carry is current — the backend keeps the decoder alive
+/// until every shipped frame's token has come back (bounded), so the presenter never
+/// has to validate liveness itself.
+pub struct NativeVkFrame {
+    /// The decode image (raw `VkImage`); the picture occupies array layer [`Self::layer`].
+    pub image: u64,
+    /// `R8`/`R8G8` per-plane views (raw `VkImageView`s) — the presenter's planar CSC
+    /// sampling contract, same shape as the FFmpeg path's derived plane views.
+    pub plane_views: [u64; 2],
+    pub layer: u32,
+    /// The layout the layer is in when the semaphore signals; the presenter must
+    /// return it there after sampling (see [`NativeVkLayout`]).
+    pub layout: NativeVkLayout,
+    /// Timeline pair (raw `VkSemaphore` + value): pixels are ready when the semaphore
+    /// reaches the value — the presenter waits it on the GPU (submit wait list, like
+    /// the AVVkFrame path), never on the host.
+    pub semaphore: u64,
+    pub semaphore_value: u64,
+    /// The decoder session generation the handles belong to (rides the release token).
+    pub generation: u64,
+    /// Display size (the conformance-window crop) — what [`DecodedImage::dimensions`]
+    /// reports and what the presenter shows.
+    pub width: u32,
+    pub height: u32,
+    /// The image's allocated/coded extent (`>=` display) — the presenter scales its
+    /// sampling UVs by display/coded per axis or the alignment padding smears into
+    /// view (the 1088-row lesson; same contract as [`VkVideoFrame::coded_width`]).
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// Crop origin within the coded picture. Punktfunk hosts emit origin crops only;
+    /// the presenter's UV-scale path assumes (0,0) and a nonzero origin would show the
+    /// wrong window — carried so that assumption is checkable, not silent.
+    pub crop_x: u32,
+    pub crop_y: u32,
+    /// Colour signalling. The native H.264 path serves the SDR envelope; the backend
+    /// fills H.273 "unspecified" code points, which every consumer already resolves to
+    /// the BT.709-limited SDR default (`csc_rows`' documented fallback).
+    pub color: ColorDesc,
+    /// IDR — the stream's re-anchor point (the pump's post-loss resume signal).
+    pub keyframe: bool,
+    pub poc: i32,
+    /// Sends the release token on drop — see [`NativeReleaseGuard`].
+    pub guard: NativeReleaseGuard,
+}
+
 /// True if the decoder tagged this frame as a full IDR keyframe — a guaranteed clean re-anchor
 /// after which the picture is loss-free, so the pump can lift a post-loss display freeze here.
 ///
@@ -172,6 +286,7 @@ impl DecodedImage {
             DecodedImage::D3d11(f) => f.keyframe,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
+            DecodedImage::NativeVk(f) => f.keyframe,
         }
     }
 
@@ -188,6 +303,7 @@ impl DecodedImage {
             DecodedImage::D3d11(f) => (f.width, f.height),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
+            DecodedImage::NativeVk(f) => (f.width, f.height),
         }
     }
 }
@@ -254,6 +370,13 @@ impl Drop for DrmFrameGuard {
 
 enum Backend {
     Vulkan(VulkanDecoder),
+    /// Native Vulkan Video H.264 (pf-vkdecode) on the presenter's device — runtime
+    /// opt-in only (`PUNKTFUNK_DECODER=native-vulkan`, see [`native_vulkan_gate`]);
+    /// not in the automatic ladder until WP-D's A/B verdict. Errors ride the SAME
+    /// streak/demotion machinery as the FFmpeg-Vulkan rung.
+    /// Boxed: the decoder (planner + shipped-frame ledger) dwarfs the other variants,
+    /// same as PyroWave below.
+    NativeVulkan(Box<NativeVulkanDecoder>),
     #[cfg(target_os = "linux")]
     Vaapi(VaapiDecoder),
     #[cfg(windows)]
@@ -311,6 +434,17 @@ const VAAPI_DEMOTE_AFTER: u32 = 3;
 /// consecutive bad AUs from a single loss event no longer strands the session on
 /// software before the first requested IDR could even arrive.
 const HW_DEMOTE_MIN_STREAK: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The native Vulkan Video opt-in gate (WP-C of the native-decode program): the
+/// pf-vkdecode backend engages ONLY when the operator asked for it by name
+/// (`PUNKTFUNK_DECODER=native-vulkan` — `choice` is env-first, so that's what carries
+/// it), the negotiated wire codec is H.264 (the one codec pf-vkdecode speaks), and the
+/// presenter's device actually advertises Vulkan Video decode. Deliberately NOT an
+/// `auto` rung: entering the automatic ladder is WP-D's A/B verdict. Pure so the
+/// decision is CPU-testable.
+fn native_vulkan_gate(choice: &str, codec_id: ffmpeg::codec::Id, video_decode: bool) -> bool {
+    choice == "native-vulkan" && codec_id == ffmpeg::codec::Id::H264 && video_decode
+}
 
 /// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
 pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
@@ -500,6 +634,38 @@ impl Decoder {
                 d3d11_hdr10,
             })
         };
+        // Native Vulkan Video (pf-vkdecode) — strictly the runtime opt-in
+        // (`PUNKTFUNK_DECODER=native-vulkan`); [`native_vulkan_gate`] is the whole
+        // decision. Any refusal or init failure logs and DEMOTES to the standard
+        // ladder below exactly as if the native rung errored (choice reads as `auto`
+        // from here on) — a native failure must never be quieter, or land somewhere
+        // other, than the FFmpeg rungs' failures do.
+        let mut choice = choice;
+        if choice == "native-vulkan" {
+            if native_vulkan_gate(&choice, codec_id, vk.is_some_and(|v| v.video_decode)) {
+                let vk = vk.expect("gate demands video_decode, so vk is Some");
+                match NativeVulkanDecoder::new(vk) {
+                    Ok(n) => {
+                        tracing::info!(
+                            ?codec_id,
+                            "native Vulkan Video hardware decode active \
+                             (pf-vkdecode, presenter-shared device)"
+                        );
+                        return done(Backend::NativeVulkan(Box::new(n)));
+                    }
+                    Err(e) => tracing::warn!(reason = %format!("{e:#}"),
+                        "native Vulkan decode init failed — demoting to the standard ladder"),
+                }
+            } else {
+                tracing::warn!(
+                    ?codec_id,
+                    video_decode = vk.is_some_and(|v| v.video_decode),
+                    "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264 session and a \
+                     Vulkan-Video-capable presenter device) — standard ladder"
+                );
+            }
+            choice = "auto".to_string();
+        }
         // Linux `auto`: try VAAPI FIRST unless this device is one where Vulkan Video is
         // the established right answer (NVIDIA — no usable VAAPI; VanGogh — VAAPI
         // chroma-fringes). Mesa now exposes decode queues by default (and the session
@@ -774,6 +940,10 @@ impl Decoder {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
                 v.decode(au).map(|f| f.map(DecodedImage::VkFrame))
             }
+            Backend::NativeVulkan(n) => {
+                debug_assert!(complete, "partial AUs are pyrowave-only");
+                n.decode(au).map(|f| f.map(DecodedImage::NativeVk))
+            }
             #[cfg(target_os = "linux")]
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             #[cfg(windows)]
@@ -799,6 +969,7 @@ impl Decoder {
             Err(e) => {
                 let which = match self.backend {
                     Backend::Vulkan(_) => "Vulkan Video",
+                    Backend::NativeVulkan(_) => "native Vulkan Video",
                     #[cfg(windows)]
                     Backend::D3d11va(_) => "D3D11VA",
                     _ => "VAAPI",
@@ -808,12 +979,14 @@ impl Decoder {
                 let first = *self.first_fail.get_or_insert_with(std::time::Instant::now);
                 if self.vaapi_fails >= VAAPI_DEMOTE_AFTER && first.elapsed() >= HW_DEMOTE_MIN_STREAK
                 {
-                    // A failing Vulkan backend still has a hardware rung below it on
-                    // Linux — demote to VAAPI first (user-reported: FFmpeg-Vulkan-on-Mesa
-                    // error-streaking where VAAPI streams perfectly); only when that
-                    // can't be built either does the session land on software.
+                    // A failing Vulkan backend (FFmpeg or native — the native rung
+                    // demotes exactly like the FFmpeg one) still has a hardware rung
+                    // below it on Linux — demote to VAAPI first (user-reported:
+                    // FFmpeg-Vulkan-on-Mesa error-streaking where VAAPI streams
+                    // perfectly); only when that can't be built either does the
+                    // session land on software.
                     #[cfg(target_os = "linux")]
-                    if matches!(self.backend, Backend::Vulkan(_)) {
+                    if matches!(self.backend, Backend::Vulkan(_) | Backend::NativeVulkan(_)) {
                         match VaapiDecoder::new(self.codec_id) {
                             Ok(v) => {
                                 tracing::warn!(error = %e, fails = self.vaapi_fails,
@@ -828,10 +1001,13 @@ impl Decoder {
                                 "VAAPI unavailable for demotion — software decode"),
                         }
                     }
-                    // Windows' hardware rung below Vulkan is D3D11VA (a 4K120 stream is
-                    // not survivable on software) — same-GPU rebuild via the stashed LUID.
+                    // Windows' hardware rung below Vulkan (FFmpeg or native) is D3D11VA
+                    // (a 4K120 stream is not survivable on software) — same-GPU rebuild
+                    // via the stashed LUID.
                     #[cfg(windows)]
-                    if matches!(self.backend, Backend::Vulkan(_)) && self.d3d11_import {
+                    if matches!(self.backend, Backend::Vulkan(_) | Backend::NativeVulkan(_))
+                        && self.d3d11_import
+                    {
                         match crate::video_d3d11::D3d11vaDecoder::new(
                             self.codec_id,
                             self.adapter_luid,
@@ -1130,6 +1306,24 @@ mod tests {
         // still land on D3D11VA in auto.
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) B580 Graphics").prefer_vulkan_first());
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) Pro Graphics").prefer_vulkan_first());
+    }
+
+    /// The native-Vulkan opt-in gate (WP-C): by name only, H.264 only, and only on a
+    /// device that really decodes — every other combination takes the standard ladder.
+    /// Pinned so "native enters auto" can only ever be a deliberate WP-D change.
+    #[test]
+    fn native_vulkan_gate_is_by_name_h264_and_capable_device_only() {
+        use ffmpeg::codec::Id;
+        assert!(native_vulkan_gate("native-vulkan", Id::H264, true));
+        // Never by any other preference — it is not an auto rung yet.
+        for choice in ["auto", "", "hardware", "vulkan", "software"] {
+            assert!(!native_vulkan_gate(choice, Id::H264, true), "{choice:?}");
+        }
+        // The one codec pf-vkdecode speaks.
+        assert!(!native_vulkan_gate("native-vulkan", Id::HEVC, true));
+        assert!(!native_vulkan_gate("native-vulkan", Id::AV1, true));
+        // No Vulkan-Video-capable presenter device.
+        assert!(!native_vulkan_gate("native-vulkan", Id::H264, false));
     }
 
     /// Lock the DRM FourCC magic numbers against typos — these are the exact values

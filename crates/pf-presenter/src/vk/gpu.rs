@@ -132,6 +132,56 @@ pub(super) fn vkframe_acquire_barrier(
     }
 }
 
+/// Layout round-trip for one LAYER of a native (pf-vkdecode) decode image: decode
+/// layout → SHADER_READ_ONLY before the CSC pass, and back after it. Layer-scoped —
+/// the pool is an image array and the other layers are live DPB state that must not
+/// be touched. No queue-family transfer: the pool is created CONCURRENT across the
+/// graphics+decode families.
+///
+/// Both scopes are FRAGMENT_SHADER for the same dependency-chain reason as
+/// [`vkframe_acquire_barrier`]: the submit waits the frame's decode-complete timeline
+/// with `wait_dst_stage_mask = FRAGMENT_SHADER`, and only a barrier whose first sync
+/// scope intersects that mask chains with the wait — with TOP_OF_PIPE the transition
+/// could execute while the decode queue still writes (the RADV green-block class).
+pub(super) fn native_layer_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    layer: u32,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+) {
+    let b = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(from)
+        .new_layout(to)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .base_array_layer(layer)
+                .layer_count(1),
+        );
+    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
+    // has begun, referencing handles it also owns; nothing is submitted until the recording is
+    // ended.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[b],
+        );
+    }
+}
+
 /// Acquire an imported D3D11 texture from the EXTERNAL queue family as a copy source.
 /// The keyed mutex on the submit is the actual cross-API ordering; per the
 /// external-memory rules an UNDEFINED-old-layout transition on externally-bound memory

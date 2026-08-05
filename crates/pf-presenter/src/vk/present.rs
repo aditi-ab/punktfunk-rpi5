@@ -9,7 +9,7 @@ use crate::overlay::OverlayFrame;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
-use pf_client_core::video::VkVideoFrame;
+use pf_client_core::video::{NativeVkFrame, NativeVkLayout, VkVideoFrame};
 
 impl Presenter {
     /// Present one frame: route `input` into the video image (staging upload or dmabuf
@@ -68,6 +68,7 @@ impl Presenter {
             FrameInput::D3d11(d) => Some(d.color.is_pq()),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => Some(f.color.is_pq()),
+            FrameInput::NativeVk(f) => Some(f.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
             // A PQ stream we can only tone-map (no HDR10 surface) is the silent failure behind
@@ -96,6 +97,7 @@ impl Presenter {
         #[cfg(windows)]
         let mut win_frame: Option<crate::d3d11::HwFrame> = None;
         let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
+        let mut native_frame: Option<NativeVkFrame> = None;
         #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         let mut pyro_frame: Option<pf_client_core::video_pyrowave::PyroWavePlanarFrame> = None;
         let cpu_frame = match input {
@@ -127,6 +129,12 @@ impl Presenter {
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => {
                 pyro_frame = Some(f);
+                None
+            }
+            // Same device, and the decoder already made the per-plane views — no
+            // import, no view creation, nothing that can fail out here.
+            FrameInput::NativeVk(f) => {
+                native_frame = Some(f);
                 None
             }
         };
@@ -184,6 +192,38 @@ impl Presenter {
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
             self.csc.bind_planes(&self.device, views[0], views[1]);
+        }
+        if let Some(f) = &native_frame {
+            if self
+                .video
+                .as_ref()
+                .is_none_or(|v| v.width != f.width || v.height != f.height)
+            {
+                self.rebuild_video_image(f.width, f.height)?;
+                tracing::info!(width = f.width, height = f.height, "video image (re)built");
+            }
+            // The UV-scale crop below assumes an origin crop (punktfunk hosts emit
+            // nothing else); a nonzero origin would display the wrong window — say so
+            // rather than be silently wrong.
+            if f.crop_x != 0 || f.crop_y != 0 {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        crop_x = f.crop_x,
+                        crop_y = f.crop_y,
+                        "native frame carries a non-origin conformance crop — the UV \
+                         scale only handles origin crops; picture offset expected"
+                    );
+                }
+            }
+            // Decoder-owned plane views (R8 + R8G8), fence-wait above makes the set
+            // rebindable — same contract as the AVVkFrame arm.
+            self.csc.bind_planes(
+                &self.device,
+                vk::ImageView::from_raw(f.plane_views[0]),
+                vk::ImageView::from_raw(f.plane_views[1]),
+            );
         }
         #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         if let Some(f) = &pyro_frame {
@@ -361,6 +401,60 @@ impl Presenter {
                     ten_bit,
                 );
                 vk_sync = Some(sync);
+            }
+
+            // Native (pf-vkdecode) frame: same-device sampling like the AVVkFrame path,
+            // but the sync facts ride the frame itself (no frames lock — the decoder
+            // stamped layout/semaphore/value at delivery and nothing mutates them).
+            // Transition the picture's LAYER for sampling, run the same CSC pass with
+            // the coded-vs-display UV scale (the 1088-row lesson), then transition BACK
+            // to the decode layout: a coincide-mode picture is a live DPB slot the next
+            // decode must find in VIDEO_DECODE_DPB_KHR (distinct-mode DST images get the
+            // same round-trip — the decoder's reuse barrier discards via UNDEFINED, so
+            // the restore costs nothing and keeps one rule). The pool images are created
+            // CONCURRENT across the graphics+decode families, so these are plain layout
+            // transitions — no queue-family ownership transfer.
+            let mut native_wait: Option<(vk::Semaphore, u64)> = None;
+            if let (Some(f), Some(v)) = (&native_frame, &self.video) {
+                let image = vk::Image::from_raw(f.image);
+                let decode_layout = match f.layout {
+                    NativeVkLayout::DecodeDst => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
+                    NativeVkLayout::DecodeDpb => vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+                };
+                native_layer_barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    image,
+                    f.layer,
+                    decode_layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+                let extent = vk::Extent2D {
+                    width: v.width,
+                    height: v.height,
+                };
+                // The native path is the 8-bit H.264 envelope (NV12) — depth 8, no
+                // MSB packing; colour rides the frame (BT.709-limited SDR default).
+                self.record_csc(
+                    v.framebuffer,
+                    extent,
+                    [
+                        f.width as f32 / f.coded_width as f32,
+                        f.height as f32 / f.coded_height as f32,
+                    ],
+                    f.color,
+                    8,
+                    false,
+                );
+                native_layer_barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    image,
+                    f.layer,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    decode_layout,
+                );
+                native_wait = Some((vk::Semaphore::from_raw(f.semaphore), f.semaphore_value));
             }
 
             // PyroWave frame: the planes are already on THIS device, decode
@@ -542,6 +636,18 @@ impl Presenter {
                 signal_sems.push(sem);
                 signal_values.push(sync.sem_value + 1);
             }
+            // The native frame's decode-complete timeline: wait it at FRAGMENT_SHADER
+            // (chaining with the acquire barrier — the same dependency-chain rule as
+            // `vkframe_acquire_barrier`). Deliberately NO signal back on the decoder's
+            // timeline: its per-slot values are the DECODER's counter (a foreign signal
+            // would collide with its next decode's value) — the slot-return contract is
+            // the release token the frame's guard sends once our fence proves the reads
+            // done.
+            if let Some((sem, value)) = &native_wait {
+                wait_sems.push(*sem);
+                wait_stages.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
+                wait_values.push(*value);
+            }
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
                 .signal_semaphore_values(&signal_values);
@@ -550,7 +656,7 @@ impl Presenter {
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmd_bufs)
                 .signal_semaphores(&signal_sems);
-            if vk_sync.is_some() {
+            if vk_sync.is_some() || native_wait.is_some() {
                 submit = submit.push_next(&mut timeline);
             }
             // D3D11 frame: bracket the submit in the shared texture's keyed mutex, key 0
@@ -614,6 +720,11 @@ impl Presenter {
             #[cfg(windows)]
             if let Some(f) = win_frame.take() {
                 self.retired_hw = Some(Retired::D3d11(f));
+            }
+            // Native frame: parked until the fence proves the sampling reads done — its
+            // drop THEN sends the decoder's release token (never at record time).
+            if let Some(f) = native_frame.take() {
+                self.retired_hw = Some(Retired::NativeVk(f));
             }
 
             let swapchains = [self.swapchain];

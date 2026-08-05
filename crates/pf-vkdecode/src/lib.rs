@@ -53,6 +53,17 @@ pub mod ring;
 pub mod session;
 pub mod slots;
 
+/// Re-exported for the integration layer (WP-C): [`DecodedVkFrame`]'s handle fields are
+/// ash types, and the consumer (pf-client-core, whose own `ash` is optional/feature-gated)
+/// flattens them to raw `u64`s through `ash::vk::Handle` — via THIS instance of ash, so
+/// the versions can never skew.
+pub use ash;
+/// Re-exported so [`VkH264Decoder::take_warnings`] consumers name the warning type —
+/// and [`DecodedVkFrame::crop`]'s type — without growing a pf-bitstream dependency of
+/// their own.
+pub use pf_bitstream::h264::DisplayCrop;
+pub use pf_bitstream::h264::PlanWarning;
+
 pub use caps::derive_caps;
 pub use caps::CapsError;
 pub use caps::DecodeCaps;

@@ -29,6 +29,7 @@ use pf_bitstream::h264::DpbUpdate;
 use pf_bitstream::h264::H264Planner;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::PlanError;
+use pf_bitstream::h264::PlanWarning;
 use tracing::debug;
 use tracing::trace;
 
@@ -424,6 +425,10 @@ pub struct VkH264Decoder {
     /// ones are detectable ([`DecodedVkFrame::generation`]).
     generation: u64,
     device_lost: bool,
+    /// The last `decode` call's plan warnings (concealment signals), held for
+    /// [`Self::take_warnings`] — the integration layer's recovery hook. Cleared at
+    /// every `decode` entry so a warning is never attributed to the wrong AU.
+    last_warnings: Vec<PlanWarning>,
 }
 
 impl VkH264Decoder {
@@ -451,6 +456,7 @@ impl VkH264Decoder {
             ready: VecDeque::new(),
             generation: 0,
             device_lost: false,
+            last_warnings: Vec::new(),
         })
     }
 
@@ -460,6 +466,7 @@ impl VkH264Decoder {
     /// Never panics. `VkDecodeError::DeviceLost` latches: every later call fails
     /// fast until the owner rebuilds the decoder on fresh handles.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
+        self.last_warnings.clear();
         if self.device_lost {
             return Err(VkDecodeError::DeviceLost);
         }
@@ -470,12 +477,31 @@ impl VkH264Decoder {
         result
     }
 
+    /// The plan warnings (concealment signals) of the most recent [`Self::decode`]
+    /// call, taken. Non-empty means the AU was planned around missing/damaged
+    /// references — the picture decodes but its content is concealed, and the caller
+    /// should request a re-anchor (the recovery wiring the module doc reserves for
+    /// the integration layer).
+    pub fn take_warnings(&mut self) -> Vec<PlanWarning> {
+        std::mem::take(&mut self.last_warnings)
+    }
+
+    /// The current session generation ([`DecodedVkFrame::generation`]'s counterpart):
+    /// lets a caller holding delivered frames tell a STALE frame (its session was
+    /// rebuilt — every decoder entry point would report it so) apart from a live one,
+    /// without tripping the conservative `Failed` a stale status poll returns.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn decode_inner(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         let plan = self.planner.plan_au(au)?;
         for warning in &plan.warnings {
-            // Concealment wiring (want_keyframe) is WP-C's; never silent though.
+            // The recovery verdict is the integration layer's ([`Self::take_warnings`]);
+            // never silent here though.
             trace!(?warning, "plan warning");
         }
+        self.last_warnings = plan.warnings.clone();
 
         self.ensure_state(&plan)?;
         let sps_id = plan.sps.seq_parameter_set_id;
