@@ -20,12 +20,20 @@ use ash::vk::Handle;
 /// - All four handles are live, and stay live for the lifetime of every object this
 ///   crate builds from them (the presenter outlives every session pump).
 /// - The instance/device were created with the Vulkan Video decode stack enabled:
-///   `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, `VK_KHR_video_decode_h264`,
-///   plus the `synchronization2` and `timelineSemaphore` features (the presenter's
-///   device meets all of this when it advertises `video_decode`).
-/// - `decode_qf`/`decode_queue_index` name a queue with `VIDEO_DECODE_KHR` ops whose
-///   family advertises H.264 decode; `graphics_qf` is the family the presenter
-///   samples on (image sharing crosses the two when they differ).
+///   `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, and the per-codec extension
+///   of every decoder that will be built on the bundle
+///   (`VK_KHR_video_decode_h264` for [`crate::VkH264Decoder`],
+///   `VK_KHR_video_decode_h265` for [`crate::VkH265Decoder`]), plus the
+///   `synchronization2` and `timelineSemaphore` features (the presenter's device
+///   meets all of this when it advertises `video_decode`).
+/// - `decode_qf`/`decode_queue_index` name a queue with `VIDEO_DECODE_KHR` ops.
+///   Which CODEC operations that family advertises is not trusted but READ
+///   ([`DecodeDevice::decode_codec_ops`]) and each decoder refuses up front when
+///   its own is missing — a physical-device caps query answers for hardware
+///   regardless of which extensions the device was created with, so this is the
+///   only thing standing between a wrong bundle and `vkCreateVideoSessionKHR` on
+///   an unenabled codec. `graphics_qf` is the family the presenter samples on
+///   (image sharing crosses the two when they differ).
 #[derive(Debug, Clone)]
 pub struct DeviceHandles {
     /// `PFN_vkGetInstanceProcAddr` from the loader; everything else is resolved
@@ -86,12 +94,25 @@ impl Drop for QueueSubmitGuard<'_> {
     }
 }
 
-/// A [`DeviceHandles`] bundle that cannot be wrapped. Every variant is a caller
-/// bug (a half-filled bundle), not a runtime condition.
+/// A [`DeviceHandles`] bundle that cannot host the decoder being built. Caller
+/// bugs (a half-filled bundle) and device gaps (a decode family that does not run
+/// this codec) — never stream conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
     /// One of the four raw handles is zero/null.
     NullHandle(&'static str),
+    /// The decode queue family advertises no decode operation for the codec the
+    /// decoder needs — either the device was created without that codec's
+    /// extension, or `decode_qf` names the wrong family. Refusing here is what
+    /// keeps `vkCreateVideoSessionKHR` from being called with a profile the
+    /// device never enabled (the caps query alone would not catch it: it asks the
+    /// PHYSICAL device, which answers for the hardware).
+    NoCodecOperation {
+        family: u32,
+        /// The codec, spelled the way the caller would recognize it
+        /// (`"H.264 decode"` / `"H.265 decode"`).
+        wanted: &'static str,
+    },
 }
 
 /// A device allocation that cannot proceed. Wraps the raw Vulkan failure OR the
@@ -159,6 +180,13 @@ impl std::fmt::Display for DeviceError {
             DeviceError::NullHandle(which) => {
                 write!(f, "DeviceHandles.{which} is null — a half-filled bundle")
             }
+            DeviceError::NoCodecOperation { family, wanted } => {
+                write!(
+                    f,
+                    "decode queue family {family} advertises no {wanted} operation \
+                     (extension not enabled on the device, or the wrong family)"
+                )
+            }
         }
     }
 }
@@ -187,6 +215,24 @@ pub struct DecodeDevice {
     /// must skip queries entirely there and fall back to timeline-completion
     /// verdicts.
     result_status_queries: bool,
+    /// `VkQueueFamilyVideoPropertiesKHR::videoCodecOperations` of the decode
+    /// family — which codecs this queue can actually run decode ops for.
+    ///
+    /// Read from the SAME `vkGetPhysicalDeviceQueueFamilyProperties2` call as the
+    /// status-query support (one extra chained struct, no extra round trip). It
+    /// is the only honest answer to "may I create a DECODE_H265 session here?":
+    /// `vkGetPhysicalDeviceVideoCapabilitiesKHR` is a PHYSICAL-device query and
+    /// succeeds on capable hardware whether or not the VkDevice was created with
+    /// `VK_KHR_video_decode_h265` enabled, so caps derivation alone would happily
+    /// lead into `vkCreateVideoSessionKHR` on an unenabled codec — undefined
+    /// behaviour instead of a clean demote to the next decoder rung.
+    ///
+    /// Empty (no bits) is treated as "this family decodes nothing" and refuses.
+    /// That is safe to rely on because every driver hosting Vulkan Video fills
+    /// this struct — it is how applications pick a decode queue in the first
+    /// place (FFmpeg's own `vulkan_video.c` selects its family by exactly this
+    /// field, on the very drivers the shipping FFmpeg-Vulkan rung runs on).
+    decode_codec_ops: vk::VideoCodecOperationFlagsKHR,
 }
 
 impl DecodeDevice {
@@ -252,19 +298,30 @@ impl DecodeDevice {
         let decode_queue =
             unsafe { device.get_device_queue(handles.decode_qf, handles.decode_queue_index) };
 
-        // Whether the decode family supports RESULT_STATUS queries (per-family
-        // cap; struct field docs).
+        // The two per-family video facts, from ONE query: whether RESULT_STATUS
+        // queries are legal here, and which codec operations this family can run
+        // (struct field docs for both). An out-of-range decode family — a bundle
+        // naming a queue this physical device does not have — answers "no" to
+        // both, and the codec check then refuses the decoder outright.
         let physical_device = vk::PhysicalDevice::from_raw(handles.physical_device as u64);
         // SAFETY: live physical device (caller contract); the two-call form fills
-        // the chained per-family status-support structs.
+        // the chained per-family structs.
         let family_count =
             unsafe { instance.get_physical_device_queue_family_properties2_len(physical_device) };
-        let result_status_queries = if (handles.decode_qf as usize) < family_count {
+        let (result_status_queries, decode_codec_ops) = if (handles.decode_qf as usize)
+            < family_count
+        {
             let mut status_props =
                 vec![vk::QueueFamilyQueryResultStatusPropertiesKHR::default(); family_count];
+            let mut video_props = vec![vk::QueueFamilyVideoPropertiesKHR::default(); family_count];
             let mut families: Vec<vk::QueueFamilyProperties2<'_>> = status_props
                 .iter_mut()
-                .map(|s| vk::QueueFamilyProperties2::default().push_next(s))
+                .zip(video_props.iter_mut())
+                .map(|(status, video)| {
+                    vk::QueueFamilyProperties2::default()
+                        .push_next(status)
+                        .push_next(video)
+                })
                 .collect();
             // SAFETY: as above, arrays sized to the reported count.
             unsafe {
@@ -272,9 +329,13 @@ impl DecodeDevice {
                     .get_physical_device_queue_family_properties2(physical_device, &mut families)
             };
             drop(families);
-            status_props[handles.decode_qf as usize].query_result_status_support != vk::FALSE
+            let family = handles.decode_qf as usize;
+            (
+                status_props[family].query_result_status_support != vk::FALSE,
+                video_props[family].video_codec_operations,
+            )
         } else {
-            false
+            (false, vk::VideoCodecOperationFlagsKHR::NONE)
         };
 
         // `entry` is only the ladder the tables above were loaded through; nothing
@@ -292,6 +353,7 @@ impl DecodeDevice {
             decode_qf: handles.decode_qf,
             graphics_qf: handles.graphics_qf,
             result_status_queries,
+            decode_codec_ops,
         })
     }
 
@@ -303,6 +365,33 @@ impl DecodeDevice {
     /// field docs — FALSE on RADV, where recording one hangs the VCN).
     pub(crate) fn result_status_queries(&self) -> bool {
         self.result_status_queries
+    }
+
+    /// The codec operations the decode family advertises (struct field docs).
+    pub fn decode_codec_ops(&self) -> vk::VideoCodecOperationFlagsKHR {
+        self.decode_codec_ops
+    }
+
+    /// Refuse unless the decode family advertises `op`.
+    ///
+    /// The decoders' first act, before any caps query: a physical-device caps
+    /// query answers for the HARDWARE and would happily green-light a codec the
+    /// VkDevice never enabled the extension for, at which point
+    /// `vkCreateVideoSessionKHR` is undefined behaviour. This turns that into the
+    /// ladder's clean, named demote.
+    pub(crate) fn require_codec_op(
+        &self,
+        op: vk::VideoCodecOperationFlagsKHR,
+        what: &'static str,
+    ) -> Result<(), DeviceError> {
+        if self.decode_codec_ops.contains(op) {
+            Ok(())
+        } else {
+            Err(DeviceError::NoCodecOperation {
+                family: self.decode_qf,
+                wanted: what,
+            })
+        }
     }
 
     pub(crate) fn physical_device(&self) -> vk::PhysicalDevice {

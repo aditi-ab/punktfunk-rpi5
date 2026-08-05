@@ -57,7 +57,10 @@ pub struct DecodePlanVkH265 {
     /// Vulkan defines these arrays as indices into that array.
     pub std_pic: hh::StdVideoDecodeH265PictureInfo,
     /// Byte offset of each slice segment NALU in the AU as planned, START CODE
-    /// INCLUDED. AU-relative, NOT submission-final: the recording layer must
+    /// INCLUDED — exactly one entry per slice segment of the AU, in plan order
+    /// (so the recording layer's own rebased array, built by walking the same
+    /// slices, matches this length by construction).
+    /// AU-relative, NOT submission-final: the recording layer must
     /// pack the SLICE NALUs alone into the bitstream buffer and rebase these
     /// offsets while doing so — non-VCL NALUs inside the decode range hang VCN
     /// firmware (the H.264 decoder's slices-only packing exists for exactly

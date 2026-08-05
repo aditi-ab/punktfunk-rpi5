@@ -33,6 +33,7 @@ use crate::device::DecodeDevice;
 use crate::params::pps_to_std;
 use crate::params::sps_to_std;
 use crate::params::ParamsError;
+use crate::params_h265::H265ParamsError;
 
 /// Parameter-object capacity. Punktfunk hosts emit one SPS + one PPS per stream;
 /// the headroom absorbs id churn across renegotiations without recreation, and an
@@ -147,6 +148,9 @@ pub struct SessionConfig {
 pub(crate) enum SessionError {
     Vk(vk::Result),
     Params(ParamsError),
+    /// An H.265 parameter set has no Std representation (the H.265 session's
+    /// counterpart of [`SessionError::Params`]).
+    ParamsH265(H265ParamsError),
     /// Session memory binding found no matching memory type (never a fallback).
     NoMemoryType {
         type_bits: u32,
@@ -166,6 +170,12 @@ impl From<ParamsError> for SessionError {
     }
 }
 
+impl From<H265ParamsError> for SessionError {
+    fn from(e: H265ParamsError) -> Self {
+        SessionError::ParamsH265(e)
+    }
+}
+
 impl From<AllocError> for SessionError {
     fn from(e: AllocError) -> Self {
         match e {
@@ -175,6 +185,136 @@ impl From<AllocError> for SessionError {
             }
         }
     }
+}
+
+/// A [`bind_session_memory`] failure and whatever allocations the CALLER must now
+/// take over.
+///
+/// The distinction is a lifetime rule, not bookkeeping taste. Vulkan defines no
+/// partial-bind rollback: once `vkBindVideoSessionMemoryKHR` has been called, some
+/// bind indices may have taken, and memory bound into a live session may NOT be
+/// freed while that session exists. So:
+///
+/// - an ALLOCATE failure happens before any bind — nothing is attached to the
+///   session, the function frees everything itself, and `allocations` is empty;
+/// - a BIND failure hands the allocations back UNFREED, because the caller's
+///   session object must be destroyed FIRST. The caller parks them where its own
+///   `Drop` frees them after the destroy (that is exactly [`VideoSession`]'s and
+///   [`crate::session_h265::VideoSessionH265`]'s field order).
+pub(crate) struct BindFailure {
+    /// Allocations that may be bound into the session — free them only AFTER the
+    /// session is destroyed. Empty when the failure preceded any bind.
+    pub(crate) allocations: Vec<vk::DeviceMemory>,
+    pub(crate) error: SessionError,
+}
+
+/// Query and bind one video session's memory requirements (the encoder's exact
+/// shape), returning the allocations the session now owns. Codec-agnostic —
+/// `VkVideoSessionKHR` memory binding says nothing about H.264 vs H.265 — so both
+/// session types call this, and the NVIDIA placement rationale below lives once.
+///
+/// Failure hands back a [`BindFailure`] whose `allocations` the caller must adopt
+/// (see its docs for the destroy-before-free rule); an allocate-stage failure
+/// frees eagerly and hands back none.
+///
+/// # Safety
+///
+/// `dev` wraps live handles ([`crate::DeviceHandles`] contract) and `session` is a
+/// live, not-yet-memory-bound session created on it.
+pub(crate) unsafe fn bind_session_memory(
+    dev: &DecodeDevice,
+    session: vk::VideoSessionKHR,
+) -> Result<Vec<vk::DeviceMemory>, BindFailure> {
+    let device = dev.ash();
+    let get = dev
+        .video_queue()
+        .fp()
+        .get_video_session_memory_requirements_khr;
+    let mut count = 0u32;
+    // SAFETY: live device + session (fn contract); null pointer is the
+    // count-query form.
+    let _ = unsafe { get(device.handle(), session, &mut count, std::ptr::null_mut()) };
+    let mut reqs = vec![vk::VideoSessionMemoryRequirementsKHR::default(); count as usize];
+    // SAFETY: as above with an array of the reported count.
+    let _ = unsafe { get(device.handle(), session, &mut count, reqs.as_mut_ptr()) };
+
+    let props = dev.memory_properties();
+    let mut allocated: Vec<vk::DeviceMemory> = Vec::with_capacity(reqs.len());
+    let mut binds = Vec::with_capacity(reqs.len());
+    // Free everything allocated so far — for the ALLOCATE-stage exits only, which
+    // are reached before `vkBindVideoSessionMemoryKHR` is ever called. The
+    // BIND-stage exit must NOT come through here (BindFailure docs).
+    let unwind = |device: &ash::Device, allocated: &[vk::DeviceMemory]| {
+        for &memory in allocated {
+            // SAFETY: allocations made in this function on this live device, none
+            // of which the bind call has been reached for — so none can be bound
+            // into any session, and freeing them here cannot outlive-order a
+            // session destroy.
+            unsafe { device.free_memory(memory, None) };
+        }
+    };
+    for rq in &reqs {
+        let mr = rq.memory_requirements;
+        // DEVICE_LOCAL preferred, any type from `memoryTypeBits` accepted:
+        // NVIDIA (610.88) constrains some session bindings to host-visible-only
+        // types, and the driver knows where its own session state belongs. NEVER
+        // a hard DEVICE_LOCAL requirement — that shape is unsatisfiable there.
+        let type_index = match find_memory_type_preferring(
+            &props,
+            mr.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(index) => index,
+            Err(e) => {
+                unwind(device, &allocated);
+                return Err(BindFailure {
+                    allocations: Vec::new(),
+                    error: e.into(),
+                });
+            }
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(mr.size)
+            .memory_type_index(type_index);
+        // SAFETY: live device (fn contract).
+        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                unwind(device, &allocated);
+                return Err(BindFailure {
+                    allocations: Vec::new(),
+                    error: SessionError::Vk(e),
+                });
+            }
+        };
+        allocated.push(memory);
+        binds.push(
+            vk::BindVideoSessionMemoryInfoKHR::default()
+                .memory_bind_index(rq.memory_bind_index)
+                .memory(memory)
+                .memory_offset(0)
+                .memory_size(mr.size),
+        );
+    }
+    // SAFETY: session + freshly allocated memory, one bind per requirement.
+    let r = unsafe {
+        (dev.video_queue().fp().bind_video_session_memory_khr)(
+            device.handle(),
+            session,
+            binds.len() as u32,
+            binds.as_ptr(),
+        )
+    };
+    if r != vk::Result::SUCCESS {
+        // NOT freed here: a partial bind may have attached some of these to
+        // `session`, and Vulkan has no rollback for that. They go back to the
+        // caller, whose session object destroys BEFORE freeing them.
+        return Err(BindFailure {
+            allocations: allocated,
+            error: SessionError::Vk(r),
+        });
+    }
+    Ok(allocated)
 }
 
 /// The Vulkan half: session + bound memory + parameters object.
@@ -246,84 +386,19 @@ impl VideoSession {
         // SAFETY: fn contract; on error `built` drops and unwinds the session +
         // whatever memory was bound.
         unsafe {
-            built.bind_memory(dev)?;
+            // A bind failure hands its allocations BACK: parking them in `built`
+            // is what makes the early return destroy the session before freeing
+            // them (BindFailure docs — Vulkan defines no partial-bind rollback).
+            match bind_session_memory(dev, session) {
+                Ok(memory) => built.memory = memory,
+                Err(failure) => {
+                    built.memory = failure.allocations;
+                    return Err(failure.error);
+                }
+            }
             built.parameters = built.create_parameters_object(&[], &[])?;
         }
         Ok(built)
-    }
-
-    /// Query and bind the session's memory requirements (the encoder's exact shape).
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::create`].
-    unsafe fn bind_memory(&mut self, dev: &DecodeDevice) -> Result<(), SessionError> {
-        let get = dev
-            .video_queue()
-            .fp()
-            .get_video_session_memory_requirements_khr;
-        let mut count = 0u32;
-        // SAFETY: live device + the session created above; null pointer is the
-        // count-query form.
-        let _ = unsafe {
-            get(
-                self.device.handle(),
-                self.session,
-                &mut count,
-                std::ptr::null_mut(),
-            )
-        };
-        let mut reqs = vec![vk::VideoSessionMemoryRequirementsKHR::default(); count as usize];
-        // SAFETY: as above with an array of the reported count.
-        let _ = unsafe {
-            get(
-                self.device.handle(),
-                self.session,
-                &mut count,
-                reqs.as_mut_ptr(),
-            )
-        };
-
-        let props = dev.memory_properties();
-        let mut binds = Vec::with_capacity(reqs.len());
-        for rq in &reqs {
-            let mr = rq.memory_requirements;
-            // DEVICE_LOCAL preferred, any type from `memoryTypeBits` accepted:
-            // NVIDIA (610.88) constrains some session bindings to host-visible-only
-            // types, and the driver knows where its own session state belongs.
-            let type_index = find_memory_type_preferring(
-                &props,
-                mr.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )?;
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(mr.size)
-                .memory_type_index(type_index);
-            // SAFETY: live device; the allocation is parked in `self.memory` so the
-            // Drop unwind owns it from the moment it exists.
-            let memory = unsafe { self.device.allocate_memory(&alloc, None)? };
-            self.memory.push(memory);
-            binds.push(
-                vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(rq.memory_bind_index)
-                    .memory(memory)
-                    .memory_offset(0)
-                    .memory_size(mr.size),
-            );
-        }
-        // SAFETY: session + freshly allocated memory, one bind per requirement.
-        let r = unsafe {
-            (self.video_queue.fp().bind_video_session_memory_khr)(
-                self.device.handle(),
-                self.session,
-                binds.len() as u32,
-                binds.as_ptr(),
-            )
-        };
-        if r != vk::Result::SUCCESS {
-            return Err(SessionError::Vk(r));
-        }
-        Ok(())
     }
 
     /// Create a parameters object holding exactly `sps`/`pps` (either may be empty).
@@ -512,7 +587,11 @@ impl Drop for VideoSession {
     fn drop(&mut self) {
         // SAFETY: all handles are this session's own on the (contract-live) device;
         // the owning decoder drains GPU work before dropping state. The destroy
-        // entry points ignore NULL handles, covering half-built sessions.
+        // entry points ignore NULL handles, covering half-built sessions. The
+        // ORDER is load-bearing, not stylistic: memory bound into a session may
+        // not be freed while the session lives, so the session is destroyed first
+        // — which is also why a failed bind hands its allocations back here
+        // instead of freeing them itself ([`BindFailure`]).
         unsafe {
             (self.video_queue.fp().destroy_video_session_parameters_khr)(
                 self.device.handle(),

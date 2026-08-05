@@ -14,7 +14,7 @@
 use ash::vk;
 use tracing::debug;
 
-use crate::caps::H264ProfileChain;
+use crate::caps::DecodeProfile;
 use crate::device::find_memory_type;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
@@ -93,6 +93,32 @@ impl RingLayout {
         }
         Self::new(slot, self.slots, self.offset_alignment, self.size_alignment)
     }
+}
+
+/// The offsets of `segments` after they are CONCATENATED into a ring slot — i.e.
+/// the `pSliceOffsets` / `pSliceSegmentOffsets` a decode op must record, rebased
+/// out of AU coordinates.
+///
+/// This exists because the bitstream buffer carries the SLICE NALUs ONLY (module
+/// docs: non-VCL NALUs in the submitted range hang VCN firmware), while both
+/// planners hand out AU-RELATIVE, start-code-inclusive offsets. Submitting the
+/// plan's offsets unchanged would point the hardware at bytes that were never
+/// uploaded — for H.265 that is the whole reason
+/// [`crate::DecodePlanVkH265::slice_offsets`] documents itself as
+/// "NOT submission-final". Both codecs' recording paths call this, so the rebase
+/// is written (and tested) once.
+///
+/// Offsets are `u32` because Vulkan's are; a packed AU large enough to overflow
+/// one cannot fit any ring slot this crate allocates (4 GiB of slice data), and
+/// the sum is taken in `u64` so the check is real rather than a wrapped compare.
+pub(crate) fn rebased_offsets(segments: &[std::ops::Range<usize>]) -> Option<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(segments.len());
+    let mut cursor: u64 = 0;
+    for segment in segments {
+        offsets.push(u32::try_from(cursor).ok()?);
+        cursor += segment.len() as u64;
+    }
+    Some(offsets)
 }
 
 /// Pure recycle bookkeeping: which slots are free, which carry an in-flight token.
@@ -179,7 +205,7 @@ pub(crate) type Token = (vk::Semaphore, u64);
 pub(crate) struct BitstreamRing {
     device: ash::Device,
     layout: RingLayout,
-    std_profile_idc: ash::vk::native::StdVideoH264ProfileIdc,
+    profile: DecodeProfile,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
@@ -195,15 +221,14 @@ impl BitstreamRing {
     pub(crate) unsafe fn create(
         dev: &DecodeDevice,
         layout: RingLayout,
-        std_profile_idc: ash::vk::native::StdVideoH264ProfileIdc,
+        profile: DecodeProfile,
     ) -> Result<Self, AllocError> {
         // SAFETY: live device; allocate_backing only creates objects it returns.
-        let (buffer, memory, ptr) =
-            unsafe { Self::allocate_backing(dev, &layout, std_profile_idc)? };
+        let (buffer, memory, ptr) = unsafe { Self::allocate_backing(dev, &layout, profile)? };
         Ok(Self {
             device: dev.ash().clone(),
             layout,
-            std_profile_idc,
+            profile,
             buffer,
             memory,
             ptr,
@@ -221,9 +246,9 @@ impl BitstreamRing {
     unsafe fn allocate_backing(
         dev: &DecodeDevice,
         layout: &RingLayout,
-        std_profile_idc: ash::vk::native::StdVideoH264ProfileIdc,
+        decode_profile: DecodeProfile,
     ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), AllocError> {
-        let mut chain = H264ProfileChain::new(std_profile_idc);
+        let mut chain = decode_profile.chain();
         let profile = chain.wire();
         let mut profile_list =
             vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(profile));
@@ -339,7 +364,7 @@ impl BitstreamRing {
             unsafe { self.destroy_backing() };
             // SAFETY: caller's live-device contract.
             let (buffer, memory, ptr) =
-                unsafe { Self::allocate_backing(dev, &grown, self.std_profile_idc)? };
+                unsafe { Self::allocate_backing(dev, &grown, self.profile)? };
             self.layout = grown;
             self.buffer = buffer;
             self.memory = memory;
@@ -488,6 +513,31 @@ mod tests {
         // Errors from the completion probe pass through untouched.
         states.set_pending(s2, 12);
         assert_eq!(states.acquire(|_| Err("gpu gone")).unwrap_err(), "gpu gone");
+    }
+
+    #[test]
+    fn slice_offsets_rebase_out_of_au_coordinates_into_the_packed_slot() {
+        // A realistic AU: AUD at 0, SPS/PPS, then two slice NALUs at 40 and 900.
+        // Only the slices are uploaded, so their PACKED offsets are 0 and (900 -
+        // 40) = 860's worth of the first slice's own length — never the AU ones.
+        let segments = [40..900, 900..1500];
+        assert_eq!(rebased_offsets(&segments), Some(vec![0, 860]));
+
+        // A single-slice AU always records offset 0, whatever the AU offset was.
+        // (Via `from_ref`: a one-element array literal of a range reads to clippy
+        // as a mis-typed range-fill, and the lint is right to say so.)
+        let single = 4096usize..8192;
+        assert_eq!(
+            rebased_offsets(std::slice::from_ref(&single)),
+            Some(vec![0])
+        );
+        // No slices, no offsets (the callers reject empty plans before this).
+        assert_eq!(rebased_offsets(&[]), Some(vec![]));
+
+        // Three segments accumulate by LENGTH, not by AU position (a gap between
+        // slice 1 and 2 — an SEI mid-AU — must not shift the third offset).
+        let segments = [0..100, 500..600, 1000..1100];
+        assert_eq!(rebased_offsets(&segments), Some(vec![0, 100, 200]));
     }
 
     #[test]

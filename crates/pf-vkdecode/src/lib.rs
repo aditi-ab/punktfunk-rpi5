@@ -48,8 +48,22 @@
 //! - [`pic_h265`]: [`plan_to_vk_h265`], one [`pf_bitstream::h265::AuPlan`] into
 //!   `StdVideoDecodeH265PictureInfo`/`StdVideoDecodeH265ReferenceInfo` plus the
 //!   RPS index arrays, slice offsets and slot bindings — over the SAME
-//!   [`SlotMap`] (H.265's DPB ceiling is H.264's: 16 references + 1 setup). The
-//!   GPU half (session/images/recording for HEVC) is a later WP.
+//!   [`SlotMap`] (H.265's DPB ceiling is H.264's: 16 references + 1 setup).
+//!
+//! M3 (HEVC) — the GPU half, sharing every codec-agnostic piece with H.264
+//! (picture pool, bitstream ring, op ring, DPB settling, frame delivery) rather
+//! than re-implementing them:
+//!
+//! - [`caps_h265`]: [`H265ProfileKey`] (the stream's profile idc, chroma format
+//!   and bit depths, which Vulkan wants stated on every object) and
+//!   [`derive_caps_h265`] — Main → NV12, Main 10 → P010, RExt 4:4:4 → the
+//!   two-plane 4:4:4 formats, with a device that cannot host the combination
+//!   refused BEFORE a session exists ([`CapsError::NoFormat`]).
+//! - [`session_h265`]: the H.265 session and its THREE-array parameters ledger —
+//!   VPS included, with [`fallback_vps_from_sps`] standing in (and deduping
+//!   correctly) for streams joined after their VPS NALU.
+//! - [`decoder_h265`]: [`VkH265Decoder`], mirroring [`VkH264Decoder`]'s public
+//!   surface method-for-method. Codec DISPATCH is the client wiring's job.
 //!
 //! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
 //! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
@@ -60,7 +74,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod caps;
+pub mod caps_h265;
 pub mod decoder;
+pub mod decoder_h265;
 pub mod device;
 pub mod images;
 pub mod params;
@@ -69,6 +85,7 @@ pub mod pic;
 pub mod pic_h265;
 pub mod ring;
 pub mod session;
+pub mod session_h265;
 pub mod slots;
 
 /// Re-exported for the integration layer (WP-C): [`DecodedVkFrame`]'s handle fields are
@@ -86,14 +103,25 @@ pub use pf_bitstream::h264::DisplayCrop;
 pub use pf_bitstream::h264::PlanWarning;
 
 pub use caps::derive_caps;
+pub use caps::plane_formats;
 pub use caps::CapsError;
 pub use caps::DecodeCaps;
+pub use caps::MaxLevelIdc;
 pub use caps::RawH264Caps;
 pub use caps::VideoFormat;
+pub use caps::NV12;
+pub use caps::P010;
+pub use caps::YUV444_10;
+pub use caps::YUV444_8;
+pub use caps_h265::derive_caps_h265;
+pub use caps_h265::output_format_for;
+pub use caps_h265::H265ProfileKey;
+pub use caps_h265::RawH265Caps;
 pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;
 pub use decoder::VkH264Decoder;
+pub use decoder_h265::VkH265Decoder;
 pub use device::DecodeDevice;
 pub use device::DeviceHandles;
 pub use device::NoopQueueLock;
@@ -127,5 +155,7 @@ pub use pic_h265::H265_RPS_LIST_SIZE;
 pub use ring::RingLayout;
 pub use session::ParamsAction;
 pub use session::SessionConfig;
+pub use session_h265::ParamsActionH265;
+pub use session_h265::SessionConfigH265;
 pub use slots::SlotError;
 pub use slots::SlotMap;

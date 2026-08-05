@@ -521,6 +521,9 @@ mod tests {
             seq,
             frame: DecodedVkFrame {
                 image: vk::Image::null(),
+                // The H.264 envelope's picture format (this decoder is H.264-only);
+                // the ledger under test never reads it.
+                format: pf_vkdecode::NV12,
                 view: vk::ImageView::null(),
                 plane_views: [vk::ImageView::null(); 2],
                 layer: 0,

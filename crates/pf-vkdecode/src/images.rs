@@ -22,10 +22,9 @@
 //! `release_frame` and waits it before the image's next use.
 
 use ash::vk;
-use ash::vk::native as hh;
 
 use crate::caps::DecodeCaps;
-use crate::caps::H264ProfileChain;
+use crate::caps::DecodeProfile;
 use crate::caps::COINCIDE_USAGE;
 use crate::caps::DPB_USAGE;
 use crate::caps::OUTPUT_USAGE;
@@ -98,9 +97,12 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
 /// One picture-pool image with its sync + occupancy ledger.
 pub(crate) struct Picture {
     pub image: vk::Image,
-    /// Full-picture NV12 view (decode dst / DPB binding).
+    /// Full-picture view in the session's picture format (decode dst / DPB
+    /// binding).
     pub view: vk::ImageView,
-    /// `R8`/`R8G8` plane views for the presenter's sampler path.
+    /// Per-plane views for the presenter's sampler path, in the formats
+    /// [`crate::caps::plane_formats`] resolved for the picture format (`R8`/`R8G8`
+    /// at 8 bits, the `R10X6` pair at 10).
     pub plane_views: [vk::ImageView; 2],
     /// The image's own timeline semaphore (AVVkFrame contract).
     pub semaphore: vk::Semaphore,
@@ -130,6 +132,15 @@ impl Picture {
 pub(crate) struct PicturePool {
     device: ash::Device,
     memory: Vec<vk::DeviceMemory>,
+    /// The picture format every image in this pool was created with (the
+    /// caps-resolved `output_format`). Stashed here because it is the ONLY place
+    /// that knows it by the time a frame is built: the session's caps are keyed
+    /// by profile and a delivered frame outlives its generation's caps entry.
+    /// [`crate::decoder::build_frame`] stamps it into every
+    /// [`crate::decoder::DecodedVkFrame`] so the consumer can tell an NV12
+    /// picture from a P010 or 4:4:4 one — the H.265 path makes the format the
+    /// STREAM's, not a constant.
+    pub(crate) format: vk::Format,
     pub(crate) pictures: Vec<Picture>,
 }
 
@@ -145,11 +156,12 @@ impl PicturePool {
         caps: &DecodeCaps,
         plan: &PoolPlan,
         extent: vk::Extent2D,
-        std_profile_idc: hh::StdVideoH264ProfileIdc,
+        profile: DecodeProfile,
     ) -> Result<Self, AllocError> {
         let mut pool = Self {
             device: dev.ash().clone(),
             memory: Vec::new(),
+            format: caps.output_format,
             pictures: Vec::new(),
         };
         let families = dev.sharing_families();
@@ -165,7 +177,7 @@ impl PicturePool {
                     plan.picture_usage,
                     plan.picture_flags,
                     &families,
-                    std_profile_idc,
+                    profile,
                 )?
             };
             pool.memory.push(memory);
@@ -184,8 +196,9 @@ impl PicturePool {
             });
             let picture = pool.pictures.len() - 1;
             // SAFETY: `image` was just created with layer 0 in range (holds for
-            // all three creates in this block); plane formats are
-            // NV12-compatible under MUTABLE_FORMAT (caps-gated by derive_caps).
+            // all three creates in this block); the plane formats are the ones
+            // derive_caps/derive_caps_h265 resolved for THIS picture format and
+            // are plane-compatible with it under MUTABLE_FORMAT (caps-gated).
             unsafe {
                 pool.pictures[picture].view = create_view(
                     &pool.device,
@@ -197,14 +210,14 @@ impl PicturePool {
                 pool.pictures[picture].plane_views[0] = create_view(
                     &pool.device,
                     image,
-                    vk::Format::R8_UNORM,
+                    caps.plane_view_formats[0],
                     vk::ImageAspectFlags::PLANE_0,
                     0,
                 )?;
                 pool.pictures[picture].plane_views[1] = create_view(
                     &pool.device,
                     image,
-                    vk::Format::R8G8_UNORM,
+                    caps.plane_view_formats[1],
                     vk::ImageAspectFlags::PLANE_1,
                     0,
                 )?;
@@ -272,7 +285,7 @@ impl DpbPool {
         caps: &DecodeCaps,
         plan: &PoolPlan,
         extent: vk::Extent2D,
-        std_profile_idc: hh::StdVideoH264ProfileIdc,
+        profile: DecodeProfile,
     ) -> Result<Self, AllocError> {
         let mut pool = Self {
             device: dev.ash().clone(),
@@ -293,7 +306,7 @@ impl DpbPool {
                     plan.dpb_usage,
                     vk::ImageCreateFlags::empty(),
                     &families,
-                    std_profile_idc,
+                    profile,
                 )?
             };
             pool.images.push(image);
@@ -368,9 +381,9 @@ unsafe fn create_video_image(
     usage: vk::ImageUsageFlags,
     flags: vk::ImageCreateFlags,
     families: &[u32],
-    std_profile_idc: hh::StdVideoH264ProfileIdc,
+    decode_profile: DecodeProfile,
 ) -> Result<(vk::Image, vk::DeviceMemory), AllocError> {
-    let mut chain = H264ProfileChain::new(std_profile_idc);
+    let mut chain = decode_profile.chain();
     let profile = chain.wire();
     let mut profile_list =
         vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(profile));

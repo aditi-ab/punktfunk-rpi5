@@ -266,7 +266,12 @@ pub(crate) const fn level_to_std(level: Level) -> hh::StdVideoH265LevelIdc {
 
 /// `general_profile_idc` to `StdVideoH265ProfileIdc` — the code points equal the
 /// profile_idc values they name, so recognised ones pass through.
-fn profile_to_std(idc: u8) -> Result<hh::StdVideoH265ProfileIdc, H265ParamsError> {
+///
+/// (Visible to the crate because the GPU half's profile key
+/// [`crate::caps_h265::H265ProfileKey`] must be built from the PICTURE's profile
+/// idc before any parameter-set conversion runs — the caps query needs it — and
+/// both must agree on the mapping.)
+pub(crate) fn profile_to_std(idc: u8) -> Result<hh::StdVideoH265ProfileIdc, H265ParamsError> {
     match u32::from(idc) {
         p @ 1..=4 => Ok(p),
         _ => Err(H265ParamsError::UnmappableProfileIdc(idc)),

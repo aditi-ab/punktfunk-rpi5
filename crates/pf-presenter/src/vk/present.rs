@@ -434,8 +434,16 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                // The native path is the 8-bit H.264 envelope (NV12) — depth 8, no
-                // MSB packing; colour rides the frame (BT.709-limited SDR default).
+                // Depth 8 / 4:2:0 because only H.264 is WIRED to the native decoder
+                // today, and H.264 in this program is the 8-bit 4:2:0 envelope
+                // (NV12) — NOT because pf-vkdecode can only produce that. An HEVC
+                // wiring must carry `pf_vkdecode::DecodedVkFrame::format` through
+                // to NativeVkFrame and pick depth + MSB packing from it, exactly
+                // as the FFmpeg-Vulkan arm above does from `f.vk_format`: Main 10
+                // decodes to P010 and RExt 4:4:4 to the two-plane 4:4:4 formats,
+                // and 8-bit transfer/range math over a P010 surface (or 4:2:0 UV
+                // scaling over a 4:4:4 one) is the plausible-looking-and-wrong
+                // class. Colour rides the frame (BT.709-limited SDR default).
                 self.record_csc(
                     v.framebuffer,
                     extent,
