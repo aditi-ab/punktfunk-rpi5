@@ -123,6 +123,25 @@ function advertMatchesSaved(a: DiscoveredHost, s: SavedHost): boolean {
 }
 
 /**
+ * The label a saved row shows.
+ *
+ * A saved record whose name IS its own address is a PLACEHOLDER, not a choice: `hosts add`
+ * falls back to the address when the pairing path had nothing better, so the row ends up
+ * captioned with the same string it already prints underneath. When the box is on the air it
+ * is advertising its actual hostname — prefer that, and the row reads "home-worker-5" instead
+ * of "192.168.1.21".
+ *
+ * A real saved name always wins over the advert, even a stale one: it may be a name the user
+ * chose, and a live advert must never quietly overwrite that. Compared against the SAVED
+ * address, so a host that moved DHCP lease still recognises its old address as a placeholder.
+ */
+function hostLabel(s: SavedHost, advert?: DiscoveredHost): string {
+  const placeholder = !s.name || s.name === s.addr || s.name === `${s.addr}:${s.port}`;
+  if (!placeholder) return s.name;
+  return advert?.name || s.name || s.addr;
+}
+
+/**
  * Join the saved store and the live browse into the rows the panel draws.
  *
  * Fingerprint first, address second — a host that moved DHCP lease still matches its record,
@@ -134,7 +153,7 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
     // Prefer a live advert's address: the host may have moved since it was last saved.
     const advert = discovered.find((a) => advertMatchesSaved(a, s));
     return {
-      name: s.name || s.addr,
+      name: hostLabel(s, advert),
       addr: advert?.addr ?? s.addr,
       port: advert?.port ?? s.port,
       fp: s.fp_hex,
