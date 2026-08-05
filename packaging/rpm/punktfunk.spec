@@ -191,9 +191,10 @@ The plugin/script runner for a punktfunk streaming host: it discovers loose scri
 ~/.config/punktfunk/scripts and installed punktfunk-plugin-* packages under ~/.config/punktfunk/
 plugins, and supervises each as an Effect fiber (capped-jittered restart; SIGTERM shuts the whole
 tree down structurally so plugin finalizers run). A plugin auto-wires to the host's mgmt token +
-identity cert on the same box — no env editing. Bundles its own bun runtime. OPT-IN: the systemd
---user unit ships disabled (the runner is inert until you add scripts/plugins). Enable with
-`systemctl --user enable --now punktfunk-scripting`.
+identity cert on the same box — no env editing. Bundles its own bun runtime. ON BY DEFAULT: the
+systemd --user unit is enabled for every user (systemctl --global). The game-library scanners ship
+as plugins, so a host without the runner has an empty library. Opt out per user with
+`systemctl --user mask punktfunk-scripting`.
 %endif
 
 %prep
@@ -590,10 +591,22 @@ echo "Then open https://<host-ip>:47992"
 
 %if %{with scripting}
 %post scripting
-echo "punktfunk-scripting installed. It runs your automation — add scripts to"
+# `--global`, not `--user`: a scriptlet has no user session to act on, and this is the only
+# mechanism that makes a `--user` unit on-by-default for everyone (it symlinks into
+# /etc/systemd/user/…wants/). The game-library scanners are plugins now, so the runner is a default
+# component rather than an add-on (design D9); it stays opt-OUT via
+# `systemctl --user mask punktfunk-scripting`, since a plain `--user disable` cannot remove a global
+# symlink. $1 == 1 is a first INSTALL — on an upgrade ($1 > 1) this must not undo an operator's mask.
+if [ "$1" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || :
+fi
+echo "punktfunk-scripting installed and enabled for all users."
+echo "It runs your automation — game-library sources, scripts in"
 echo "    ~/.config/punktfunk/scripts/  (loose .ts/.js files)"
-echo "or install plugins into ~/.config/punktfunk/plugins/ (bun add punktfunk-plugin-<name>),"
-echo "then enable the runner: systemctl --user enable --now punktfunk-scripting"
+echo "and plugins under ~/.config/punktfunk/plugins/."
+echo "It starts with your next login; start it now with:"
+echo "    systemctl --user start punktfunk-scripting"
+echo "Don't want it? systemctl --user mask punktfunk-scripting"
 %endif
 
 %changelog

@@ -6,9 +6,16 @@
 # SIGTERM interrupts the whole tree STRUCTURALLY, so every plugin's scoped finalizers run before
 # exit (clean deregister / preset release) — hence the generous stop timeout below.
 #
-# OPT-IN — unlike punktfunk-web, the package does NOT auto-enable this: the runner does nothing until
-# you add scripts or install plugins. Turn it on once you have automation to run:
-#   systemctl --user enable --now punktfunk-scripting
+# ON BY DEFAULT — the packages enable this for every user (`systemctl --global enable` from the
+# .deb/.rpm scriptlets; a baked-in default.target.wants symlink in the sysext image). It used to be
+# opt-in, on the reasoning that the runner does nothing until you add scripts or plugins. That
+# stopped being true when the game-library scanners became plugins: the library is a flagship
+# surface, and a host whose runner is off now comes up with an empty library and no obvious reason
+# why (design/library-scanner-plugins.md D9).
+#
+# It remains opt-OUT, per user:
+#   systemctl --user mask punktfunk-scripting
+# (`mask`, not `disable` — a plain disable cannot remove a symlink that lives in /etc or /usr.)
 #
 # Auto-wired like the console: a plugin's connect() reads the host's SCOPED plugin token + identity
 # cert from ~/.config/punktfunk/{plugin-token,cert.pem} (written by the host's `serve`) — no env
