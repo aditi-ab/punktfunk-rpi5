@@ -893,8 +893,19 @@ fn pump(
                             #[cfg(target_os = "linux")]
                             DecodedImage::Dmabuf(_) => "vaapi",
                             DecodedImage::VkFrame(_) => "vulkan",
+                            // Both D3D11VA rungs deliver this variant — they share the
+                            // hand-off ring on purpose — so the frame carries which one
+                            // wrote it. Without that, a native session and an FFmpeg
+                            // session emit the same tag and no soak log can tell them
+                            // apart (`D3d11Frame::native`).
                             #[cfg(windows)]
-                            DecodedImage::D3d11(_) => "d3d11va",
+                            DecodedImage::D3d11(f) => {
+                                if f.native {
+                                    "native-d3d11va"
+                                } else {
+                                    "d3d11va"
+                                }
+                            }
                             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                             DecodedImage::PyroWave(_) => "pyrowave",
                             DecodedImage::NativeVk(_) => "native-vulkan",

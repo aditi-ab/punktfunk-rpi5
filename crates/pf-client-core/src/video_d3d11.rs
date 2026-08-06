@@ -127,6 +127,22 @@ pub struct D3d11Frame {
     /// presenter-side import cache could never alias a stale handle. Informational today
     /// (the presenter imports per frame).
     pub generation: u32,
+    /// Which D3D11VA rung wrote the surface this ring slot was converted from:
+    /// [`crate::video_d3d11_native`] (`true`) or this module's libavcodec one (`false`).
+    ///
+    /// Both rungs deliver `DecodedImage::D3d11`, because they deliberately share this
+    /// hand-off ring — so without this flag the `stats:` line's decode-path tag reads
+    /// `d3d11va` for both and nothing downstream can tell them apart. The native Vulkan
+    /// rung never had that problem: it has its own `DecodedImage` variant, hence its own
+    /// `native-vulkan` tag.
+    ///
+    /// That gap is not cosmetic. A native pin that fails to initialise falls through to
+    /// the FFmpeg rung by design, and the line it then emits is byte-identical to the one
+    /// the native rung would have emitted — so a soak or a vendor-matrix bake could
+    /// attribute an entire session to a rung that never ran. This program has already
+    /// shipped one measurement that could not tell "clean" from "unmeasured"; this is the
+    /// same shape and it is closed here rather than in the analysis of a soak log.
+    pub native: bool,
 }
 
 // --- FFmpeg hwcontext_d3d11va ABI (repr(C) mirrors, same as the legacy decoder) --------------
@@ -794,6 +810,10 @@ impl HandoffRing {
                 keyframe,
                 handle,
                 generation,
+                // Identity by the pin constant itself, not by a second field the two rungs
+                // could set inconsistently: the native rung passes `DECODER_PIN` here and
+                // nothing else does.
+                native: decoder == crate::video_d3d11_native::DECODER_PIN,
             })
         }
     }
