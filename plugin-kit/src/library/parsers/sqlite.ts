@@ -4,8 +4,21 @@
 // opened it read-write could take a write lock, create `-wal`/`-shm` sidecars next to it, or (worst
 // case) be blamed for a corrupted library. `immutable=1` promises the file will not change while
 // open, which makes Bun skip locking entirely — the strictest possible "look, don't touch".
-import { Database } from "bun:sqlite";
+import { constants, Database } from "bun:sqlite";
 import { isFile } from "./fs.js";
+
+/**
+ * READONLY | URI, passed as raw open flags.
+ *
+ * The `{ readonly: true }` options object does NOT enable SQLite's URI filename parsing, so a
+ * `file:…?immutable=1` name is taken literally, no such file exists, and the open throws
+ * `SQLiteError: unable to open database file`. Every caller here degrades an open failure to
+ * "launcher not installed", so that turned into a silent, total "0 games" on every box — see the
+ * regression test in test/library-parsers.test.ts. SQLITE_OPEN_URI is what makes the query string
+ * mean anything. (`{ readonly: true, uri: true }` is not a thing — measured on bun 1.3.14.)
+ */
+const OPEN_READONLY_URI =
+	constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI;
 
 export interface ReadOnlyDb {
 	/** Run a query and return its rows. Returns `[]` rather than throwing on a bad query. */
@@ -29,7 +42,9 @@ export const openReadOnly = (file: string): ReadOnlyDb | undefined => {
 		// `readonly` alone still takes locks and can spawn WAL sidecars; `immutable=1` is what makes
 		// this a pure read. It is safe here precisely because a scan is a point-in-time snapshot —
 		// if the launcher writes mid-scan we simply pick it up on the next sync.
-		db = new Database(`file:${encodeURI(file)}?immutable=1`, { readonly: true });
+		// The flags (not `{ readonly: true }`) are load-bearing: without SQLITE_OPEN_URI the name
+		// below is not parsed as a URI and the open always fails. See OPEN_READONLY_URI.
+		db = new Database(`file:${encodeURI(file)}?immutable=1`, OPEN_READONLY_URI);
 	} catch {
 		return undefined;
 	}

@@ -73,7 +73,13 @@ export const runPluginCli = async <E, R>(opts: {
 	const rt = ManagedRuntime.make(Layer.provideMerge(opts.def.layer, base));
 	try {
 		await rt.runPromise(Effect.scoped(command.run(rest)));
-		process.exitCode = 0;
+		// Do NOT clobber a non-zero code the command set deliberately. `parity --compare` reports a
+		// mismatch by setting `process.exitCode = 1` and then RETURNING normally — a red parity is a
+		// finished comparison, not a crashed command. Assigning 0 here unconditionally overwrote it,
+		// so the one verb documented as a release gate ("exits non-zero on any difference", "do not
+		// publish a version whose parity run is red") always exited 0, and any scripted use of it
+		// passed. MEASURED against a live host on 2026-08-06: `parity FAILED — 1 missing`, exit 0.
+		process.exitCode ??= 0;
 	} catch (e) {
 		const hint =
 			e instanceof HostRequestError
