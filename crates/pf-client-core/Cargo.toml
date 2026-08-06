@@ -18,9 +18,10 @@ punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 # FFmpeg's Vulkan hwcontext surface (Vulkan Video decode on the presenter's device).
 pf-ffvk = { path = "../pf-ffvk" }
 # Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
-# WP-2): auto's rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision), also
-# pinnable via `PUNKTFUNK_DECODER=native-vulkan` — video_vk_native.rs, running
-# pf-vkdecode's VkH264Decoder/VkH265Decoder on the presenter's shared device.
+# WP-2, AV1 by M7 — pin only): auto's rung immediately above FFmpeg-Vulkan (2026-08-05
+# ladder decision), also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
+# video_vk_native.rs, running pf-vkdecode's VkH264Decoder/VkH265Decoder/VkAv1Decoder on
+# the presenter's shared device.
 pf-vkdecode = { path = "../pf-vkdecode" }
 async-channel = "2"
 

@@ -1,7 +1,7 @@
 //! Which planner warnings mean the PICTURE is damaged (M4 of the native-decode
 //! program).
 //!
-//! Both planners emit two very different kinds of thing through one warning
+//! The planners emit two very different kinds of thing through one warning
 //! channel, and the split is what a consumer must branch on:
 //!
 //! * **Integrity** — a reference the DPB does not hold, a `frame_num` gap, an AU
@@ -24,7 +24,7 @@
 //! does not actually perform — the exact shape of the `nb_queries = 0` failure the
 //! program exists to end.
 
-use crate::{H265PlanWarning, PlanWarning};
+use crate::{Av1PlanWarning, H265PlanWarning, PlanWarning};
 
 /// Does this H.264 planner warning mean the PICTURE is damaged?
 ///
@@ -56,6 +56,41 @@ pub fn is_integrity_warning_h265(w: &H265PlanWarning) -> bool {
     match w {
         H265PlanWarning::MissingReference { .. } | H265PlanWarning::TruncatedAu { .. } => true,
         H265PlanWarning::NonZeroReorder { .. } => false,
+    }
+}
+
+/// The AV1 twin (M7). Every variant the AV1 planner has today IS damage, and that
+/// is a fact about the codec rather than an oversight: AV1 puts nothing in this
+/// channel that resembles h265's `NonZeroReorder` or h264's `Mmco5Rebase`. It has
+/// no reorder envelope to report (no bumping process, no `max_num_reorder_pics`)
+/// and no MMCO to rebase — the frame header states the whole reference update
+/// outright — so the only things left to warn about are pictures that went
+/// missing and an OBU walk that stopped early.
+///
+/// `MissingShowExisting` is the one that could be argued, and it is damage: a
+/// `show_existing_frame` naming an empty slot means the picture the STREAM chose
+/// to display was lost upstream. Nothing is displayed for that frame, so the
+/// screen keeps the previous one — exactly the "silently stale picture" state a
+/// re-anchor exists to end.
+///
+/// ⚠ `MissingReference` is classified here for completeness and does NOT normally
+/// reach a consumer through this predicate: [`crate::VkAv1Decoder`] refuses the
+/// whole access unit for it ([`crate::VkDecodeError::MissingReferenceAv1`]),
+/// because AV1's `refs` array is indexed by reference NAME and there is no legal
+/// substitute to write into a hole — a `-1` for a name the frame really references
+/// is a spec violation whose firmware behaviour is undefined. So the AV1 rung
+/// answers a lost reference as a REFUSAL, not as concealment, and it is the
+/// refusal counter that moves. Classifying it as damage here anyway keeps the two
+/// statements consistent for any consumer that does see the warning (and for the
+/// fault harness, which asserts detection against exactly this list).
+///
+/// Exhaustive for the same reason as [`is_integrity_warning`]: a new AV1 warning
+/// must not be able to mean "damaged" and read as clean.
+pub fn is_integrity_warning_av1(w: &Av1PlanWarning) -> bool {
+    match w {
+        Av1PlanWarning::MissingReference { .. }
+        | Av1PlanWarning::MissingShowExisting { .. }
+        | Av1PlanWarning::TruncatedAu { .. } => true,
     }
 }
 
@@ -104,5 +139,33 @@ mod tests {
             "SPS activation is not damage — it fires on the opening IDR and on \
              every ABR renegotiation's IDR"
         );
+    }
+
+    /// AV1's whole warning vocabulary is damage. Note plainly what this test does
+    /// and does not guard, because the two are easy to confuse:
+    ///
+    /// * A NEW variant is caught by the EXHAUSTIVE MATCH in
+    ///   [`is_integrity_warning_av1`], not here — this loop enumerates the variants
+    ///   by hand, so a fourth one would simply not appear in it. That is the whole
+    ///   reason the function is written as a match with no `_` arm.
+    /// * What this test does guard is a RECLASSIFICATION: split one of these names
+    ///   out of the `|` chain and give it a `false` arm — the shape a future
+    ///   "spec-legal AV1 signal" would arrive in — and the assertion below fires.
+    ///   `MissingShowExisting` is the one most likely to be argued down that way (a
+    ///   frame that decoded nothing and displayed nothing reads as harmless), and
+    ///   reading it as clean would leave the previous picture on the screen with no
+    ///   re-anchor asked for.
+    #[test]
+    fn every_av1_warning_is_damage_because_av1_has_no_envelope_signal() {
+        for w in [
+            Av1PlanWarning::MissingReference {
+                slot: 3,
+                ref_index: 1,
+            },
+            Av1PlanWarning::MissingShowExisting { slot: 5 },
+            Av1PlanWarning::TruncatedAu { offset: 900 },
+        ] {
+            assert!(is_integrity_warning_av1(&w), "{w:?} is damage");
+        }
     }
 }

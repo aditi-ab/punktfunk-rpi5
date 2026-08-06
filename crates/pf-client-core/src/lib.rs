@@ -84,10 +84,11 @@ mod video_vaapi;
 #[cfg(target_os = "linux")]
 pub mod video_vaapi_native;
 // Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
-// WP-2): pf-vkdecode's H.264/H.265 decoders on the presenter's shared device — auto's
-// rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision; the program is
-// dropping FFmpeg from the client), also pinnable via
-// `PUNKTFUNK_DECODER=native-vulkan`.
+// WP-2, AV1 by M7): pf-vkdecode's H.264/H.265/AV1 decoders on the presenter's shared
+// device — auto's rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision;
+// the program is dropping FFmpeg from the client), also pinnable via
+// `PUNKTFUNK_DECODER=native-vulkan`. The AV1 leg is PIN ONLY until it has hardware
+// evidence, so an `auto` AV1 session still lands on the FFmpeg rungs.
 #[cfg(any(target_os = "linux", windows))]
 mod video_vk_native;
 #[cfg(any(target_os = "linux", windows))]

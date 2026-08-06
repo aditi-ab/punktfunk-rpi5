@@ -96,10 +96,10 @@
 //!   [`DecodedVkFrame::recovery`]). The only clean point an intra-refresh session
 //!   has — its wave emits no IDR — so without it a client freezes for its full
 //!   backstop and then forces the very IDR the wave exists to avoid.
-//! - [`integrity`]: [`is_integrity_warning`] / [`is_integrity_warning_h265`], the
-//!   one list of warnings that mean the PICTURE is damaged. Here rather than in the
-//!   client so the fault harness asserts against the predicate production conceals
-//!   on.
+//! - [`integrity`]: [`is_integrity_warning`] / [`is_integrity_warning_h265`] /
+//!   [`is_integrity_warning_av1`], the one list of warnings that mean the PICTURE
+//!   is damaged. Here rather than in the client so the fault harness asserts
+//!   against the predicate production conceals on.
 //! - [`fault`]: [`AuFault`], deliberate decoder-input corruption
 //!   (`PUNKTFUNK_AU_FAULT`), inert unless armed. A detector nobody can fire is
 //!   exactly as trustworthy as no detector at all.
@@ -209,6 +209,7 @@ pub use images::plan_pools;
 pub use images::PoolPlan;
 pub use images::HOLD_HEADROOM;
 pub use integrity::is_integrity_warning;
+pub use integrity::is_integrity_warning_av1;
 pub use integrity::is_integrity_warning_h265;
 pub use params::pps_to_std;
 pub use params::sps_to_std;

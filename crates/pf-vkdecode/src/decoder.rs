@@ -234,6 +234,26 @@ pub enum VkDecodeError {
     /// produce. `ref_index` is the AV1 reference name (`LAST_FRAME` = 0 through
     /// `ALTREF_FRAME` = 6), `slot` the reference slot it pointed at.
     MissingReferenceAv1 { slot: u8, ref_index: u8 },
+    /// Every frame of this AV1 temporal unit was SKIPPED because the decoder is
+    /// waiting for the next key frame after a failure — nothing decoded, nothing
+    /// displayed.
+    ///
+    /// AV1's answer to [`pf_bitstream::h264::PlanError::AwaitingIdr`], and
+    /// deliberately the same KIND of answer: an error, once per access unit, for
+    /// as long as the wait lasts. The AV1 planner has no `flush`, so the wait is
+    /// held in [`crate::VkAv1Decoder`] rather than in the planner — but a consumer
+    /// must not be able to tell the two codecs apart here, because the consumer's
+    /// demotion streak is what turns "this rung produces no picture" into "fall
+    /// through to the next rung". Answering the wait with a clean `Ok(None)`
+    /// instead RESETS that streak once per frame, and a rung whose every key frame
+    /// fails (a film-grain sequence on a device without the grain profile, a level
+    /// above `maxLevelIdc`, a sequence header disagreeing with the negotiation)
+    /// then never demotes at all: one error per key frame, cleared by the inter
+    /// frames between them, and a frozen screen for the whole session.
+    ///
+    /// A key frame ANYWHERE in the unit clears the wait and decodes, so this is
+    /// returned only when the unit produced nothing at all.
+    AwaitingKeyAv1,
     /// Plan-to-Vulkan conversion failed (caller/session bugs; `CapacityMismatch`
     /// is consumed internally by the rebuild path and only surfaces if the rebuilt
     /// session STILL mismatches).
@@ -302,6 +322,11 @@ impl std::fmt::Display for VkDecodeError {
                      no picture — the surviving references would renumber"
                 )
             }
+            VkDecodeError::AwaitingKeyAv1 => write!(
+                f,
+                "every frame of this AV1 temporal unit was skipped — the decoder is \
+                 waiting for the next key frame after a failure"
+            ),
             VkDecodeError::Convert(e) => write!(f, "plan conversion failed: {e}"),
             VkDecodeError::ConvertH265(e) => write!(f, "H.265 plan conversion failed: {e}"),
             VkDecodeError::Caps(e) => write!(f, "decode capabilities unusable: {e}"),

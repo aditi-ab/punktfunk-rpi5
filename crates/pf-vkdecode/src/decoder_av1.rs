@@ -539,6 +539,25 @@ pub(crate) fn lost_reference(warnings: &[PlanWarning]) -> Option<(u8, u8)> {
     })
 }
 
+/// What [`VkAv1Decoder::decode_planned`] did with one frame of a temporal unit.
+///
+/// Two outcomes rather than a bare `Ok(())`, because "the plan was honoured" and
+/// "the decoder is waiting for a key frame and did nothing" are opposite
+/// statements about the rung, and the caller has to count the second: a unit in
+/// which EVERY frame was skipped produced no picture at all and comes back as
+/// [`VkDecodeError::AwaitingKeyAv1`], while a unit where a key frame cleared the
+/// wait partway through decoded normally (see [`VkAv1Decoder::awaiting_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameOutcome {
+    /// The plan was carried out: submitted, or (a `show_existing_frame`) settled
+    /// into a display verdict without a submission. Either way the unit produced
+    /// this frame.
+    Decoded,
+    /// Skipped: the decoder is waiting for the next key frame after a failure and
+    /// this frame is undecodable by construction.
+    SkippedAwaitingKey,
+}
+
 /// Everything tied to ONE AV1 session generation. A stream renegotiation (extent
 /// or profile — including a bit-depth, sampling or film-grain switch) retires it
 /// and builds fresh.
@@ -606,21 +625,33 @@ pub struct VkAv1Decoder {
     /// ([`RecoveryLatch`] docs for the whole argument).
     recovery: RecoveryLatch,
     /// Every frame until the next KEY frame is undecodable, and is skipped rather
-    /// than failed.
+    /// than converted.
     ///
     /// This exists because AV1's planner has no `flush`: when a failure forces
     /// [`Self::recover_dpb`] to empty this decoder's slot ledger and image
     /// bindings, the PLANNER's own eight-slot store still believes those pictures
     /// are resident and keeps handing out inter frames that reference them. Each
-    /// would fail in `plan_to_vk_av1` with `UnresolvedReference` — a real error
-    /// per frame, at frame rate, which reads to the integration layer as a decoder
-    /// that has stopped working rather than a stream waiting to re-anchor.
+    /// would fail in `plan_to_vk_av1` with `UnresolvedReference` — a per-frame
+    /// failure whose message describes a phantom reference gap rather than the
+    /// wait that is really in progress, and which would drag every one of those
+    /// frames through a conversion that cannot succeed.
     ///
-    /// So the frames between the failure and the key frame are ANSWERED like the
-    /// H.265 decoder answers a RASL picture after an open-GOP join: `Ok` with
-    /// whatever was already display-ready, planner untouched, no error and no
-    /// second keyframe request. A key frame (which references nothing and refreshes
-    /// all eight slots) clears it and decoding resumes.
+    /// So the frames are skipped. What they are NOT is laundered into a clean
+    /// answer: a temporal unit in which every frame was skipped comes back as
+    /// [`VkDecodeError::AwaitingKeyAv1`], once per access unit, exactly as the
+    /// H.264/H.265 decoders answer the same wait with their planners'
+    /// `PlanError::AwaitingIdr`. The three codecs must be indistinguishable here,
+    /// because the consumer's demotion streak is the only thing that turns "this
+    /// rung produces no picture" into "fall through to the next rung": a clean
+    /// `Ok(None)` RESETS that streak once per frame, so a rung whose every key
+    /// frame fails would never reach the threshold and the session would keep a
+    /// frozen screen with a clean bill of health. During a recovery wait the
+    /// decoder really has stopped working, and that is what the streak must see.
+    ///
+    /// A DECODED key frame (which references nothing and refreshes all eight
+    /// slots) clears it and decoding resumes — including one that arrives partway
+    /// through a temporal unit, which is why the skip is per FRAME while the error
+    /// is per ACCESS UNIT.
     awaiting_key: bool,
 }
 
@@ -704,9 +735,11 @@ impl VkAv1Decoder {
     /// Returns the next display-ready frame, if the planner declared one; drain the
     /// rest with [`Self::take_ready`].
     ///
-    /// A frame skipped while [`Self::awaiting_key`] is set is NOT an error (its
-    /// docs carry the argument); nor is a `show_existing_frame` naming an empty
-    /// slot, which the planner reports as a warning and which simply displays
+    /// A temporal unit whose every frame was skipped while [`Self::awaiting_key`]
+    /// is set comes back as [`VkDecodeError::AwaitingKeyAv1`] — the same kind of
+    /// answer the H.264/H.265 decoders give for the same wait, and for the reason
+    /// [`Self::awaiting_key`]'s docs carry. A `show_existing_frame` naming an empty
+    /// slot is NOT that: the planner reports it as a warning and it simply displays
     /// nothing.
     ///
     /// Never panics. `VkDecodeError::DeviceLost` latches: every later call fails
@@ -746,22 +779,40 @@ impl VkAv1Decoder {
             self.last_warnings.extend(plan.warnings.iter().cloned());
         }
 
+        let mut skipped = 0usize;
         for plan in &plans {
             // From here the PLANNER has already advanced past this frame — its
             // store holds the picture whatever happens next — so any failure below
             // leaves the planner's store and this decoder's ledgers able to
             // disagree. Latch the recovery rather than returning into a permanently
             // wedged state.
-            if let Err(e) = self.decode_planned(plan, au) {
-                self.recovery.latch();
-                return Err(e);
+            match self.decode_planned(plan, au) {
+                Ok(FrameOutcome::Decoded) => {}
+                Ok(FrameOutcome::SkippedAwaitingKey) => skipped += 1,
+                Err(e) => {
+                    self.recovery.latch();
+                    return Err(e);
+                }
             }
+        }
+        // Nothing in this unit decoded and nothing was displayed, because the
+        // decoder is still waiting for a key frame. That is an ERROR per access
+        // unit — [`VkDecodeError::AwaitingKeyAv1`] and [`Self::awaiting_key`] carry
+        // the argument — and deliberately not a latch: `recover_dpb` has already
+        // run, the ledgers are consistent, and re-latching would re-flush an empty
+        // ledger once per frame for the whole wait.
+        //
+        // Counted rather than short-circuited inside the loop, because a key frame
+        // may sit BEHIND a skipped frame in the same temporal unit: returning at
+        // the first skip would never reach it, and the wait would never end.
+        if whole_unit_skipped(plans.len(), skipped) {
+            return Err(VkDecodeError::AwaitingKeyAv1);
         }
         Ok(self.ready.pop_front())
     }
 
     /// One planned frame of a temporal unit.
-    fn decode_planned(&mut self, plan: &AuPlan, au: &[u8]) -> Result<(), VkDecodeError> {
+    fn decode_planned(&mut self, plan: &AuPlan, au: &[u8]) -> Result<FrameOutcome, VkDecodeError> {
         // A key frame re-anchors everything: it references nothing and refreshes
         // all eight slots, so it is decodable no matter what came before.
         //
@@ -779,7 +830,7 @@ impl VkAv1Decoder {
                 show_existing = plan.dpb.stored.is_none(),
                 "frame skipped while awaiting the next AV1 key frame"
             );
-            return Ok(());
+            return Ok(FrameOutcome::SkippedAwaitingKey);
         }
 
         // `show_existing_frame`: no decode at all. It displays a slot's contents —
@@ -792,7 +843,9 @@ impl VkAv1Decoder {
                     state.slots.release(id);
                 }
             }
-            return Ok(());
+            // Decoded: nothing was submitted, but the plan was HONOURED — it
+            // declared a picture displayable, which is a frame the unit produced.
+            return Ok(FrameOutcome::Decoded);
         };
 
         // A reference the planner could not resolve: refuse before anything is
@@ -1031,7 +1084,7 @@ impl VkAv1Decoder {
                 state.pool.pictures[entry.image].pending = false;
             }
         }
-        Ok(())
+        Ok(FrameOutcome::Decoded)
     }
 
     /// Apply one plan's DPB verdicts: outputs become ready frames (their images
@@ -1620,6 +1673,28 @@ fn profile_key_for(plan: &AuPlan) -> Result<Av1ProfileKey, VkDecodeError> {
 /// an empty ledger against a full store and fail on the very next inter frame.
 fn clears_awaiting_key(plan: &AuPlan) -> bool {
     plan.picture.is_key && plan.dpb.stored.is_some()
+}
+
+/// Did a temporal unit of `planned` frames produce NOTHING because every one of
+/// them was skipped waiting for a key frame — the
+/// [`VkDecodeError::AwaitingKeyAv1`] condition?
+///
+/// A named function rather than the expression inlined at the call site because
+/// both of its edges are load-bearing and neither is obvious:
+///
+/// * `planned == 0` is not a skip. A temporal unit can plan no frames at all (one
+///   carrying only metadata or a sequence header), and that is an ordinary
+///   `Ok(None)` — turning it into an error would fail access units on a perfectly
+///   healthy stream.
+/// * `skipped < planned` is not a skip either, and this is the case an early
+///   return inside the loop would have got wrong: a key frame may sit BEHIND a
+///   skipped frame in the same unit, clears the wait when it is reached, and
+///   decodes. Reporting the unit as skipped there would answer an error for an
+///   access unit that really did decode a picture.
+///
+/// Pure, so the aggregation is CPU-testable without a device.
+fn whole_unit_skipped(planned: usize, skipped: usize) -> bool {
+    planned > 0 && skipped == planned
 }
 
 /// The stream's level, as the sequence header's FIRST operating point states it.
@@ -2787,6 +2862,57 @@ mod tests {
             .expect("a frame");
         assert!(!inter.picture.is_key);
         assert!(!clears_awaiting_key(&inter));
+    }
+
+    /// A recovery WAIT must reach the consumer as an ERROR, once per access unit —
+    /// the same answer H.264/H.265 give through their planners'
+    /// `PlanError::AwaitingIdr`, and the reason [`VkAv1Decoder::awaiting_key`]'s
+    /// docs carry: a clean `Ok(None)` resets the consumer's demotion streak once
+    /// per frame, so a rung whose every key frame fails (film grain on a device
+    /// without the grain profile; a level above `maxLevelIdc`; a sequence header
+    /// disagreeing with the negotiation) would never demote and the session would
+    /// hold a frozen screen with a clean bill of health.
+    ///
+    /// What this pins is the AGGREGATION, which is where the naive fix goes wrong:
+    /// the error is per ACCESS UNIT while the skip is per FRAME, because a key
+    /// frame can sit behind a skipped frame in the same temporal unit — the
+    /// vendored vector has 24 units carrying two frames each.
+    #[test]
+    fn a_unit_reports_the_key_frame_wait_only_when_it_decoded_nothing_at_all() {
+        // The wait itself: every frame of the unit skipped.
+        assert!(whole_unit_skipped(1, 1), "a single-frame unit");
+        assert!(whole_unit_skipped(2, 2), "and a two-frame one");
+
+        // A key frame arrived partway through the unit and decoded: NOT the wait,
+        // whatever came before it. An early return at the first skip would have
+        // answered an error here and never reached the key frame at all.
+        assert!(!whole_unit_skipped(2, 1));
+        assert!(!whole_unit_skipped(3, 2));
+        // Nothing was skipped: the ordinary decoding case.
+        assert!(!whole_unit_skipped(2, 0));
+        // A unit that planned no frames (metadata / a sequence header on its own)
+        // is a clean `Ok(None)`, never an error.
+        assert!(!whole_unit_skipped(0, 0));
+    }
+
+    /// The wait's error must be DISTINGUISHABLE from the failure that started it —
+    /// a support engineer reading a field log has to be able to tell "the AU could
+    /// not be decoded" from "the decoder is waiting to re-anchor", and the two ride
+    /// the same `Err` channel.
+    #[test]
+    fn the_key_frame_wait_names_itself_in_the_error_text() {
+        let waiting = format!("{}", VkDecodeError::AwaitingKeyAv1);
+        assert!(waiting.contains("key frame"), "{waiting}");
+        assert!(waiting.contains("skipped"), "{waiting}");
+        // …and it is not the same message as the loss that latched the recovery.
+        let lost = format!(
+            "{}",
+            VkDecodeError::MissingReferenceAv1 {
+                slot: 3,
+                ref_index: 2
+            }
+        );
+        assert_ne!(waiting, lost);
     }
 
     /// The `refresh_frame_flags == 0` leg is real AV1 and this vector has none of
