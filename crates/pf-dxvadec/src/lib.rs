@@ -22,6 +22,10 @@
 //! - [`pic`] / [`pic_h265`]: one [`pf_bitstream`] `AuPlan` into
 //!   `DXVA_PicParams_*`, `DXVA_Qmatrix_*` and the slice-control records, with the
 //!   reference lists resolved through a DPB slot map.
+//! - [`descriptors`]: which buffers one `SubmitDecoderBuffers` call carries and
+//!   the four `D3D11_VIDEO_DECODER_BUFFER_DESC` fields that are a decision —
+//!   where two of review 13's three structural defects lived, and the reason
+//!   they are now a CPU test rather than a Windows-only code path.
 //!
 //! # Why the slot map comes from pf-vkdecode
 //!
@@ -46,6 +50,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod config;
+pub mod descriptors;
 pub mod dxva;
 pub mod pack;
 pub mod pic;
@@ -95,6 +100,13 @@ pub use config::DXGI_FORMAT_P010;
 pub use config::H264_VLD_NOFGT;
 pub use config::HEVC_VLD_MAIN;
 pub use config::HEVC_VLD_MAIN10;
+pub use descriptors::descriptors_h264;
+pub use descriptors::descriptors_h265;
+pub use descriptors::BufferDescriptor;
+pub use descriptors::BUFFER_BITSTREAM;
+pub use descriptors::BUFFER_INVERSE_QUANTIZATION_MATRIX;
+pub use descriptors::BUFFER_PICTURE_PARAMETERS;
+pub use descriptors::BUFFER_SLICE_CONTROL;
 pub use dxva::as_bytes;
 pub use dxva::slice_bytes;
 pub use dxva::PicParamsH264;

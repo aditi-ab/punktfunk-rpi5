@@ -1298,14 +1298,31 @@ mod tests {
 
     #[test]
     fn slice_control_records_carry_the_packers_locations_verbatim() {
-        let records = [crate::pack::SliceRecord {
-            location: 0,
-            bytes: 128,
-        }];
+        let records = [
+            crate::pack::SliceRecord {
+                location: 0,
+                bytes: 128,
+            },
+            crate::pack::SliceRecord {
+                location: 128,
+                bytes: 256,
+            },
+        ];
         let control = slice_control_h265(&records);
-        assert_eq!(control[0].BSNALunitDataLocation, 0);
-        assert_eq!(control[0].SliceBytesInBuffer, 128);
-        assert_eq!(control[0].wBadSliceChopping, 0);
+        // Read by VALUE, in braces: the record is `#[repr(C, packed)]` (ten bytes),
+        // so a reference to a `u32` member would be unaligned — and `assert_eq!`
+        // takes references. See `dxva.rs`'s alignment section.
+        assert_eq!({ control[0].BSNALunitDataLocation }, 0);
+        assert_eq!({ control[0].SliceBytesInBuffer }, 128);
+        assert_eq!({ control[0].wBadSliceChopping }, 0);
+        // A SECOND record, because the ten-vs-twelve byte defect is invisible on a
+        // single-record buffer — the vendored HEVC vector is one slice segment per
+        // picture, which is precisely the shape that hid it.
+        assert_eq!({ control[1].BSNALunitDataLocation }, 128);
+        let bytes = crate::dxva::slice_bytes(&control);
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[10..14], &128u32.to_le_bytes());
+        assert_eq!(&bytes[14..18], &256u32.to_le_bytes());
     }
 
     #[test]

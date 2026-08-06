@@ -1084,11 +1084,21 @@ mod tests {
         ];
         let control = slice_control(&records);
         assert_eq!(control.len(), 2);
-        assert_eq!(control[0].BSNALunitDataLocation, 0);
-        assert_eq!(control[0].SliceBytesInBuffer, 40);
-        assert_eq!(control[1].BSNALunitDataLocation, 40);
-        assert_eq!(control[1].SliceBytesInBuffer, 216);
-        assert!(control.iter().all(|c| c.wBadSliceChopping == 0));
+        // Read by VALUE, in braces: `DXVA_Slice_H264_Short` is `#[repr(C, packed)]`
+        // (ten bytes, see `dxva.rs`'s alignment section), so a reference to one of
+        // its `u32` members would be unaligned and is a compile error — `assert_eq!`
+        // takes references to its operands.
+        assert_eq!({ control[0].BSNALunitDataLocation }, 0);
+        assert_eq!({ control[0].SliceBytesInBuffer }, 40);
+        assert_eq!({ control[1].BSNALunitDataLocation }, 40);
+        assert_eq!({ control[1].SliceBytesInBuffer }, 216);
+        assert!(control.iter().all(|c| { c.wBadSliceChopping } == 0));
+        // …and the records reach the driver ten bytes apart, which is the fact the
+        // whole submission depends on: the second record's location is at byte 10,
+        // not 12.
+        let bytes = crate::dxva::slice_bytes(&control);
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[10..14], &40u32.to_le_bytes());
     }
 
     #[test]

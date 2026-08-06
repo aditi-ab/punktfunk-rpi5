@@ -41,12 +41,37 @@
 //!    The one unsafe in the crate is [`as_bytes`], and it is fenced behind a
 //!    sealed trait that only these `#[repr(C)]` PODs implement.
 //!
-//! # Alignment
+//! # Alignment — and the one place natural alignment is WRONG
 //!
-//! Every member is 1/2/4 bytes, so the natural alignment of all of these is 4 and
-//! no member ever needs the x86-64 8-byte rules. `#[repr(C)]` reproduces MSVC's
-//! default (`/Zp8`) packing exactly for that shape; the offset assertions are what
-//! proves it rather than assumes it.
+//! `dxva.h` declares these as wire-format structures under **1-byte packing**, not
+//! under MSVC's default. For five of the six that is indistinguishable from natural
+//! alignment, because every member happens to sit at a naturally-aligned offset and
+//! every total is already a multiple of 4: `DXVA_PicParams_H264` is 1040,
+//! `DXVA_PicParams_HEVC` 232, the two quantization matrices 224 and 1000 — all
+//! confirmed against libavcodec's runtime `sizeof` in the n8.1 capture described in
+//! `tests/libav_picparams_parity.rs`.
+//!
+//! The slice-control records are the exception and the reason this section exists.
+//! `{UINT, UINT, USHORT}` is **10 bytes packed and 12 under natural alignment**, and
+//! an earlier revision of this file declared them plain `#[repr(C)]` — asserting 12
+//! with "2 bytes tail padding" in the comment, which was a guess dressed as a proof.
+//! Measured on hardware (RTX 4090, patched FFmpeg n8.1, both vendored vectors, 250
+//! AUs each): the H.264 slice-control buffer's `DataSize` is 20 on a stream with two
+//! slices per picture, and the HEVC one's is 10 on a stream with one slice segment
+//! per picture. Two codecs, two slice counts, one answer — 10.
+//!
+//! What the mistake costs, so it is never re-introduced: record 0's fields land at
+//! 0/4/8 either way, so a SINGLE-slice stream decodes correctly and the two extra
+//! bytes are trailing slop nobody reads. From the second record on, every field is
+//! displaced by two bytes per preceding record, so the driver reads a slice offset
+//! built from half of one field and half of the next. punktfunk hosts do emit
+//! multi-slice streams.
+//!
+//! Hence: **the packed structs carry `#[repr(C, packed)]`** and the proofs below
+//! pin `align_of` as well as `size_of`, plus — for every struct — that its size is
+//! exactly its last member's offset plus that member's size, which is the assertion
+//! that would have caught this one. Interior padding was already impossible (the
+//! per-field offset asserts see it); it was TAIL padding that got in.
 //!
 //! Sources: the DXVA specifications "DirectX Video Acceleration Specification for
 //! H.264/AVC Decoding" (§4.2 `DXVA_PicParams_H264`, §4.4 `DXVA_Qmatrix_H264`, §4.6
@@ -62,6 +87,7 @@
 // every generated Win32 struct.
 #![allow(non_snake_case)]
 
+use std::mem::align_of;
 use std::mem::offset_of;
 use std::mem::size_of;
 
@@ -388,8 +414,13 @@ impl QmatrixH264 {
 ///     UINT   BSNALunitDataLocation;   /* 0 */
 ///     UINT   SliceBytesInBuffer;      /* 4 */
 ///     USHORT wBadSliceChopping;       /* 8 */
-/// } DXVA_Slice_H264_Short;            /* 12 bytes (2 bytes tail padding) */
+/// } DXVA_Slice_H264_Short;            /* 10 bytes — PACKED, no tail padding */
 /// ```
+///
+/// **Ten bytes, not twelve** — `#[repr(C, packed)]`, and the single most important
+/// number in this file after the picture-parameters offsets. See the module docs'
+/// alignment section for the hardware measurement it comes from and for what
+/// getting it wrong does to every record after the first.
 ///
 /// Short format only. The long format (`DXVA_Slice_H264_Long`) additionally
 /// carries the derived reference lists and the prediction weight tables, which
@@ -397,7 +428,7 @@ impl QmatrixH264 {
 /// refused at decoder creation and the ladder answers with the FFmpeg rung, which
 /// does implement both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct SliceH264Short {
     /// Byte offset of the slice's **start code** within the bitstream buffer.
     pub BSNALunitDataLocation: u32,
@@ -787,10 +818,14 @@ impl QmatrixHevc {
 ///     UINT   BSNALunitDataLocation;   /* 0 */
 ///     UINT   SliceBytesInBuffer;      /* 4 */
 ///     USHORT wBadSliceChopping;       /* 8 */
-/// } DXVA_Slice_HEVC_Short;            /* 12 bytes */
+/// } DXVA_Slice_HEVC_Short;            /* 10 bytes — PACKED, no tail padding */
 /// ```
+///
+/// Ten bytes for the same reason as [`SliceH264Short`], and measured independently:
+/// the HEVC capture's slice-control `DataSize` is 10 on a vector with exactly one
+/// slice segment per picture.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct SliceHevcShort {
     pub BSNALunitDataLocation: u32,
     pub SliceBytesInBuffer: u32,
@@ -805,6 +840,18 @@ pub struct SliceHevcShort {
 // reproduced above. This is the whole defence against a silently mis-declared
 // buffer: nothing else in the pipeline can tell a wrong offset from a right one,
 // because the driver accepts either and only the picture differs.
+//
+// Three kinds of assertion, and the third is new because the first two missed a
+// real defect (the slice records' 12-vs-10; see the module docs):
+//
+// 1. `size_of` per struct, against the C total.
+// 2. `offset_of` per FIELD, which is what makes interior padding or a reordering
+//    impossible.
+// 3. **size == last field's offset + last field's own size**, per struct — the
+//    assertion that catches TAIL padding, which is exactly what (1) and (2) cannot
+//    see: a struct whose declared total is itself wrong satisfies both. Every one of
+//    these buffers is a wire format with no padding anywhere, and this is where that
+//    is stated as a proof rather than a comment.
 const _: () = {
     assert!(size_of::<PicEntry>() == 1);
 
@@ -852,7 +899,8 @@ const _: () = {
     assert!(offset_of!(QmatrixH264, bScalingLists4x4) == 0);
     assert!(offset_of!(QmatrixH264, bScalingLists8x8) == 96);
 
-    assert!(size_of::<SliceH264Short>() == 12);
+    assert!(size_of::<SliceH264Short>() == 10);
+    assert!(align_of::<SliceH264Short>() == 1);
     assert!(offset_of!(SliceH264Short, BSNALunitDataLocation) == 0);
     assert!(offset_of!(SliceH264Short, SliceBytesInBuffer) == 4);
     assert!(offset_of!(SliceH264Short, wBadSliceChopping) == 8);
@@ -908,10 +956,25 @@ const _: () = {
     assert!(offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID2) == 992);
     assert!(offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID3) == 998);
 
-    assert!(size_of::<SliceHevcShort>() == 12);
+    assert!(size_of::<SliceHevcShort>() == 10);
+    assert!(align_of::<SliceHevcShort>() == 1);
     assert!(offset_of!(SliceHevcShort, BSNALunitDataLocation) == 0);
     assert!(offset_of!(SliceHevcShort, SliceBytesInBuffer) == 4);
     assert!(offset_of!(SliceHevcShort, wBadSliceChopping) == 8);
+
+    // NO TAIL PADDING, per struct: the size is the last member's offset plus the
+    // last member's own size, nothing more. The right-hand sizes are the C
+    // declarations' (`UCHAR SliceGroupMap[810]`, `UINT StatusReportFeedbackNumber`,
+    // …), so each line is an independent statement of the total rather than a
+    // restatement of `size_of`.
+    assert!(size_of::<PicParamsH264>() == offset_of!(PicParamsH264, SliceGroupMap) + 810);
+    assert!(size_of::<QmatrixH264>() == offset_of!(QmatrixH264, bScalingLists8x8) + 2 * 64);
+    assert!(size_of::<SliceH264Short>() == offset_of!(SliceH264Short, wBadSliceChopping) + 2);
+    assert!(
+        size_of::<PicParamsHevc>() == offset_of!(PicParamsHevc, StatusReportFeedbackNumber) + 4
+    );
+    assert!(size_of::<QmatrixHevc>() == offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID3) + 2);
+    assert!(size_of::<SliceHevcShort>() == offset_of!(SliceHevcShort, wBadSliceChopping) + 2);
 };
 
 // ---------------------------------------------------------------------------
@@ -1164,11 +1227,18 @@ mod tests {
         // reader who distrusts a `const _` finds the same claim executable.
         assert_eq!(size_of::<PicParamsH264>(), 1040);
         assert_eq!(size_of::<QmatrixH264>(), 224);
-        assert_eq!(size_of::<SliceH264Short>(), 12);
         assert_eq!(size_of::<PicParamsHevc>(), 232);
         assert_eq!(size_of::<QmatrixHevc>(), 1000);
-        assert_eq!(size_of::<SliceHevcShort>(), 12);
         assert_eq!(size_of::<PicEntry>(), 1);
+        // TEN, not twelve. Measured against libavcodec on hardware: the H.264
+        // slice-control buffer is 20 bytes for a two-slice picture and the HEVC one
+        // 10 bytes for a one-slice-segment picture (module docs). A `#[repr(C)]`
+        // `{u32, u32, u16}` is 12, and every record after the first would then be
+        // displaced by two bytes per preceding record.
+        assert_eq!(size_of::<SliceH264Short>(), 10);
+        assert_eq!(size_of::<SliceHevcShort>(), 10);
+        assert_eq!(align_of::<SliceH264Short>(), 1);
+        assert_eq!(align_of::<SliceHevcShort>(), 1);
     }
 
     #[test]
@@ -1207,10 +1277,16 @@ mod tests {
             },
         ];
         let bytes = slice_bytes(&records);
-        assert_eq!(bytes.len(), 24);
+        // TEN bytes per record, so the second record starts at byte 10 — this is the
+        // test that fails if the packing is ever relaxed back to natural alignment,
+        // and it fails on the SECOND record, which is exactly where the driver
+        // would have started misreading.
+        assert_eq!(bytes.len(), 20);
         assert_eq!(&bytes[0..4], &0u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &100u32.to_le_bytes());
-        assert_eq!(&bytes[12..16], &100u32.to_le_bytes());
-        assert_eq!(&bytes[16..20], &250u32.to_le_bytes());
+        assert_eq!(&bytes[8..10], &0u16.to_le_bytes());
+        assert_eq!(&bytes[10..14], &100u32.to_le_bytes());
+        assert_eq!(&bytes[14..18], &250u32.to_le_bytes());
+        assert_eq!(&bytes[18..20], &0u16.to_le_bytes());
     }
 }
