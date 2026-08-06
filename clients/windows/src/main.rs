@@ -245,7 +245,7 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
 fn discover_and_print() {
     use std::time::{Duration, Instant};
     println!("Browsing the LAN for punktfunk hosts (~5 s)…");
-    let rx = discovery::browse();
+    let (rx, _rescan) = discovery::browse();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = std::collections::HashSet::new();
     while Instant::now() < deadline {

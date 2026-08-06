@@ -206,6 +206,20 @@ struct ContentView: View {
             model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
         }
         #if os(iOS) || os(tvOS)
+        // Coming back to the app re-arms the LAN browse. The home's `onAppear`/`onDisappear` do
+        // NOT fire across background/foreground, and a browse the system suspended while we were
+        // away does not resume on its own — so the host grid came back empty and stayed empty
+        // until the app was relaunched. No-op unless the browse is already running (mid-session
+        // the home has deliberately torn it down).
+        //
+        // Mobile only: macOS never suspends the process, and its `scenePhase` flips on every
+        // window focus change — re-arming there would rebuild the browser each time you alt-tab.
+        // A Mac browse that genuinely breaks is caught by `HostDiscovery`'s own sweep instead.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { discovery.refreshIfRunning() }
+        }
+        #endif
+        #if os(iOS) || os(tvOS)
         // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
         // ignored so neither branch fires for a Control-Center pull.
         //
