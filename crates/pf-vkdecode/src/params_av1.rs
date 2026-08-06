@@ -62,6 +62,13 @@ impl std::fmt::Display for ParamsAv1Error {
 impl std::error::Error for ParamsAv1Error {}
 
 /// The converted sequence header plus the heap allocations its pointers target.
+///
+/// ⚠⚠ **This must outlive the `VkVideoSessionParametersKHR` it is handed to, not
+/// merely the create call.** A driver in this fleet keeps `pColorConfig` and reads
+/// it at every decode; `session_av1::StoredParamsAv1` is where that is enforced and
+/// where the measurement lives. Boxed backing (rather than inline arrays) is what
+/// makes storing the wrapper enough — moving it does not move the blocks, which
+/// `moving_the_wrapper_leaves_the_driver_s_pointers_put` pins.
 #[derive(Debug)]
 pub struct OwnedStdAv1SequenceHeader {
     std: hh::StdVideoAV1SequenceHeader,
@@ -210,4 +217,71 @@ pub fn sequence_to_std(
         _color_backing: color_backing,
         _timing_backing: timing_backing,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wrapper may be MOVED — into the session's stored parameters, out of a
+    /// `Result`, into a struct literal — without disturbing the addresses a driver
+    /// has already been given.
+    ///
+    /// Not a Rust triviality worth skipping: it is the whole reason
+    /// [`crate::session_av1`] can fix its use-after-free by storing this value
+    /// rather than by boxing it or pinning it. It holds because the two blocks are
+    /// `Box`ed; an "optimisation" that inlined either one as a field would keep
+    /// every other test in this crate green, keep compiling, and hand the driver a
+    /// pointer into a moved-from stack slot. The AV1 parity leg would catch it on
+    /// hardware — this catches it in ordinary CI.
+    #[test]
+    fn moving_the_wrapper_leaves_the_driver_s_pointers_put() {
+        let seq = SequenceHeaderObu {
+            max_frame_width_minus_1: 319,
+            max_frame_height_minus_1: 239,
+            timing_info_present_flag: true,
+            ..Default::default()
+        };
+        let owned = sequence_to_std(&seq).expect("a plain 8-bit header converts");
+        let (colour, timing) = (owned.std().pColorConfig, owned.std().pTimingInfo);
+        assert!(!colour.is_null(), "pColorConfig is always attached");
+        assert!(!timing.is_null(), "this header states timing info");
+
+        // Every move a session parameters object's creation puts it through.
+        let moved = owned;
+        let boxed = Box::new(moved);
+        let stored = (*boxed, 0u8);
+        let owned = stored.0;
+
+        assert_eq!(owned.std().pColorConfig, colour);
+        assert_eq!(owned.std().pTimingInfo, timing);
+        // And they still address the wrapper's own live blocks, not stale copies.
+        // SAFETY: `owned` is alive here and owns both blocks.
+        let subsampling = unsafe { ((*colour).subsampling_x, (*colour).subsampling_y) };
+        assert_eq!(
+            subsampling,
+            (0, 0),
+            "the fixture's colour config, read back"
+        );
+    }
+
+    /// A stream without timing info gets a NULL `pTimingInfo`, and that is a
+    /// deliberate statement rather than an omission.
+    ///
+    /// Measured on NVIDIA 610.57.04: with the backing held for the parameters
+    /// object's life, all 250 frames of the vendored vector are bit-identical to
+    /// libavcodec with this pointer NULL. libavcodec always attaches a zeroed block
+    /// instead; both work. Attaching one here would claim a frame rate the stream
+    /// never stated, so the null stays — but if a future driver refuses it, this is
+    /// the line to change and the sentence to delete.
+    #[test]
+    fn a_stream_without_timing_info_sends_no_timing_block() {
+        let seq = SequenceHeaderObu {
+            timing_info_present_flag: false,
+            ..Default::default()
+        };
+        let owned = sequence_to_std(&seq).expect("converts");
+        assert!(owned.std().pTimingInfo.is_null());
+        assert_eq!(owned.std().flags.timing_info_present_flag(), 0);
+    }
 }

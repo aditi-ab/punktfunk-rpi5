@@ -24,6 +24,19 @@
 //! `ensure_parameters` before every submission and nothing else may create the
 //! session's coding scope.
 //!
+//! ⚠⚠⚠ **The Std sequence header's heap blocks must outlive the parameters
+//! OBJECT, not just the create call.** Vulkan reads as though parameter data were
+//! captured by `vkCreateVideoSessionParametersKHR`, and this module assumed it —
+//! [`sequence_to_std`]'s wrapper was a local, dropped the moment the call
+//! returned. NVIDIA 610.57.04 keeps the pointer instead and dereferences
+//! `pColorConfig` when a decode is RECORDED, so every AV1 frame was decoded
+//! against whatever the allocator had since put in those 24 bytes. Measured on an
+//! RTX 5070 Ti: correct at create, `23 00 00 00 00 00 00 00 77 29 …` by the first
+//! `vkCmdDecodeVideoKHR` — which reads as `mono_chrome = 1`, so the driver
+//! deblocked the frame as monochrome and skipped `loop_filter_level[2..3]`
+//! entirely. That is the whole of the AV1 rung's parity gap (250/250 frames
+//! divergent; 0/250 with the backing held, [`StoredParamsAv1`]).
+//!
 //! `ParamsLedgerAv1` is the pure half of the decision (unit-tested);
 //! [`VideoSessionAv1`] is the thin Vulkan half.
 
@@ -38,6 +51,7 @@ use crate::caps_av1::Av1ProfileChain;
 use crate::caps_av1::Av1ProfileKey;
 use crate::device::DecodeDevice;
 use crate::params_av1::sequence_to_std;
+use crate::params_av1::OwnedStdAv1SequenceHeader;
 use crate::session::bind_session_memory;
 use crate::session::ResetArm;
 use crate::session::SessionError;
@@ -99,15 +113,30 @@ pub struct SessionConfigAv1 {
     pub profile: Av1ProfileKey,
 }
 
+/// A live parameters object **and the Std sequence header it was created from**,
+/// in one field — because the two may not drift apart.
+///
+/// The wrapper is not decoration and not defensive: the driver dereferences the
+/// header's `pColorConfig` long after the create call returned (module docs), so
+/// dropping the backing early hands it freed memory. One field rather than two
+/// makes "an object whose backing is gone" unrepresentable, which is the only
+/// shape of this bug — and the shape a `let owned = …;` local silently had.
+struct StoredParamsAv1 {
+    object: vk::VideoSessionParametersKHR,
+    /// Held for the OBJECT's whole life. Never read by this crate after the
+    /// create call; the DRIVER reads it.
+    _sequence: OwnedStdAv1SequenceHeader,
+}
+
 /// The Vulkan half: session + bound memory + parameters object.
 pub(crate) struct VideoSessionAv1 {
     device: ash::Device,
     video_queue: ash::khr::video_queue::Device,
     session: vk::VideoSessionKHR,
     memory: Vec<vk::DeviceMemory>,
-    /// NULL until the first [`Self::ensure_parameters`] — an AV1 parameters object
-    /// has no empty form (module docs).
-    parameters: vk::VideoSessionParametersKHR,
+    /// `None` until the first [`Self::ensure_parameters`] — an AV1 parameters
+    /// object has no empty form (module docs).
+    parameters: Option<StoredParamsAv1>,
     ledger: ParamsLedgerAv1,
     pub(crate) config: SessionConfigAv1,
     /// The session has never run a coding scope: the first one records a
@@ -159,7 +188,7 @@ impl VideoSessionAv1 {
             video_queue: dev.video_queue().clone(),
             session,
             memory: Vec::new(),
-            parameters: vk::VideoSessionParametersKHR::null(),
+            parameters: None,
             ledger: ParamsLedgerAv1::default(),
             config,
             needs_reset: ResetArm::armed(),
@@ -194,7 +223,7 @@ impl VideoSessionAv1 {
     /// [`Self::parameters_action`]: the FIRST `Recreate` of a session's life
     /// destroys nothing and needs no drain, every later one does.
     pub(crate) fn has_parameters(&self) -> bool {
-        self.parameters != vk::VideoSessionParametersKHR::null()
+        self.parameters.is_some()
     }
 
     /// Make the parameters object hold this frame's active sequence header.
@@ -219,9 +248,12 @@ impl VideoSessionAv1 {
                     "creating AV1 session parameters (first activation or a \
                      sequence-header content change)"
                 );
-                // The owned wrapper stays alive until after the create call: the
-                // Std struct embeds pointers into its heap blocks (the colour
-                // config, and the timing info when present).
+                // ⚠ The owned wrapper is MOVED INTO the stored parameters below
+                // and lives as long as the object does — not merely across the
+                // create call. Module docs carry the measurement; the short of it
+                // is that a driver in this fleet dereferences `pColorConfig` at
+                // every `vkCmdDecodeVideoKHR`, so an early drop decodes the whole
+                // stream against recycled heap.
                 let owned = sequence_to_std(sequence).map_err(SessionError::ParamsAv1)?;
                 let mut av1 = vk::VideoDecodeAV1SessionParametersCreateInfoKHR::default()
                     .std_sequence_header(owned.std());
@@ -230,8 +262,8 @@ impl VideoSessionAv1 {
                     .push_next(&mut av1);
                 let mut fresh = vk::VideoSessionParametersKHR::null();
                 // SAFETY: live device + live session; `ci` roots locals (incl. the
-                // OwnedStd backing) outliving the call, and Vulkan copies all
-                // parameter data before returning.
+                // OwnedStd backing, which outlives the call AND the object it
+                // creates — see the module docs on why the second half matters).
                 let r = unsafe {
                     (self.video_queue.fp().create_video_session_parameters_khr)(
                         self.device.handle(),
@@ -243,22 +275,29 @@ impl VideoSessionAv1 {
                 if r != vk::Result::SUCCESS {
                     return Err(SessionError::Vk(r));
                 }
-                // Destroying NULL is defined as a no-op, so the first activation
-                // falls through here without a special case.
-                //
-                // SAFETY: the fn-level contract — the caller drained every
-                // in-flight decode before a Recreate over an existing object
-                // reached here (checked via parameters_action + has_parameters),
-                // so no submitted work reads the old object; it is this session's
-                // own handle.
-                unsafe {
-                    (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                        self.device.handle(),
-                        self.parameters,
-                        std::ptr::null(),
-                    );
+                // The old object goes FIRST and its backing with it — taking the
+                // whole `StoredParamsAv1` keeps the destroy ahead of the free,
+                // which is the order a driver holding the pointer needs.
+                if let Some(old) = self.parameters.take() {
+                    // SAFETY: the fn-level contract — the caller drained every
+                    // in-flight decode before a Recreate over an existing object
+                    // reached here (checked via parameters_action +
+                    // has_parameters), so no submitted work reads the old object;
+                    // it is this session's own handle, on a live device.
+                    unsafe {
+                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                            self.device.handle(),
+                            old.object,
+                            std::ptr::null(),
+                        );
+                    }
+                    // `old` (and its sequence-header blocks) drops here, after the
+                    // object that pointed at them is gone.
                 }
-                self.parameters = fresh;
+                self.parameters = Some(StoredParamsAv1 {
+                    object: fresh,
+                    _sequence: owned,
+                });
                 self.ledger.commit(action, sequence);
                 Ok(())
             }
@@ -271,6 +310,8 @@ impl VideoSessionAv1 {
 
     pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters
+            .as_ref()
+            .map_or(vk::VideoSessionParametersKHR::null(), |p| p.object)
     }
 
     /// Whether the next coding scope must record the initialization RESET —
@@ -298,11 +339,13 @@ impl Drop for VideoSessionAv1 {
         // not stylistic: memory bound into a session may not be freed while the
         // session lives, so the session is destroyed first — which is also why a
         // failed bind hands its allocations back here instead of freeing them
-        // itself (`crate::session::BindFailure`).
+        // itself (`crate::session::BindFailure`). The sequence-header backing is
+        // freed after both, by the field's own drop, for the same reason
+        // `ensure_parameters` destroys before it replaces.
         unsafe {
             (self.video_queue.fp().destroy_video_session_parameters_khr)(
                 self.device.handle(),
-                self.parameters,
+                self.parameters(),
                 std::ptr::null(),
             );
             (self.video_queue.fp().destroy_video_session_khr)(

@@ -158,6 +158,47 @@ impl RefState {
     }
 }
 
+/// One CDEF secondary strength as every hardware API wants it: the **coded
+/// two-bit syntax element**, `0..=3`.
+///
+/// ⚠⚠ The parser does not hold that value. AV1 5.9.19 reads `cdef_y_sec_strength[i]`
+/// as `f(2)` and then mutates the variable of the same name in place —
+/// `if (cdef_y_sec_strength[i] == 3) cdef_y_sec_strength[i] += 1` — so the spec's
+/// own `cdef_y_sec_strength` afterwards holds `0, 1, 2` or **`4`**, and cros-codecs
+/// follows the spec literally (`parser.rs`, `parse_cdef_params`). Every decode API
+/// wants the value BEFORE that fixup, and applies the expansion itself:
+///
+/// * **Vulkan** — libavcodec's `vulkan_av1.c` sends `frame_header->cdef_y_sec_strength[i]`
+///   straight out of CBS, and `cbs_av1_syntax_template.c` reads it as a bare
+///   `fbs(2, …)` with no fixup. Vulkan's `StdVideoAV1CDEF` therefore carries the
+///   coded value, because libavcodec is what every driver was validated against;
+/// * **VA-API** — `vaapi_av1.c` packs `(pri << 2) + sec`, two bits for `sec`;
+/// * **NVDEC** — `nvdec_av1.c` packs `(pri & 0x0F) | (sec << 4)`, two bits again;
+/// * **DXVA** — `DXVA_PicParams_AV1`'s `cdef_y_strength[i].secondary` IS a two-bit
+///   bitfield.
+///
+/// So sending `4` is not "a bigger number": on three of those four it overflows a
+/// two-bit field and the strength reads back as **0** — no secondary CDEF filtering
+/// at all, on exactly the blocks that asked for the strongest. That is a small,
+/// everywhere, in-loop pixel difference, which is the hardest kind to see and the
+/// easiest kind to propagate: CDEF runs before the frame is stored as a reference.
+///
+/// Frame 0 of the vendored 25fps vector codes it (`cdef_y_sec_strength[3]` and
+/// `cdef_uv_sec_strength[0]` are both 4), as do 68 of its 274 frames —
+/// [`crate::av1::tests::the_cdef_secondary_strength_is_the_coded_value`] pins both
+/// numbers.
+///
+/// Values `0..=2` are untouched by the fixup and pass through; a hand-built header
+/// carrying the coded `3` passes through too. Anything wider is CLAMPED rather than
+/// masked, because `& 3` is precisely the truncation this function exists to
+/// prevent.
+pub fn coded_cdef_sec_strength(parsed: u32) -> u8 {
+    match parsed {
+        0..=2 => parsed as u8,
+        _ => 3,
+    }
+}
+
 /// What this access unit does to the decoded-picture store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DpbUpdate {
@@ -935,6 +976,86 @@ mod tests {
             "no frame of the vector ever referenced a picture of a DIFFERENT frame \
              type, so nothing here can tell the reference's own type from the \
              current frame's — the exact substitution this field exists to prevent"
+        );
+    }
+
+    /// [`coded_cdef_sec_strength`] inverts the spec's in-place fixup — and the
+    /// vendored vector really does code the value that needs it, on frame 0.
+    ///
+    /// Both halves matter. The mapping is three lines and could be asserted against
+    /// itself forever; what makes it load-bearing is that the parser DOES hand out
+    /// `4`, on the very first frame the parity leg compares, and on 68 of 274
+    /// frames overall. If a re-synced vector ever stopped coding a secondary
+    /// strength of 3, this test would be comparing a correction against a stream
+    /// that never needs it, and the four hardware APIs' two-bit fields would be
+    /// untested again.
+    #[test]
+    fn the_cdef_secondary_strength_is_the_coded_value() {
+        // The fixup's inverse, and the identity everywhere else.
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(coded_cdef_sec_strength),
+            [0, 1, 2, 3, 3],
+            "0..=2 pass through, the spec's 4 is the coded 3, and a hand-built 3 is \
+             already coded"
+        );
+
+        let mut planner = Av1Planner::new();
+        let (mut frames, mut needing_fixup, mut strengths) = (0u32, 0u32, 0u32);
+        let mut frame0_raw: Vec<u32> = Vec::new();
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                frames += 1;
+                let cdef = &plan.header.cdef_params;
+                let coded = 1usize << cdef.cdef_bits;
+                let mut any = false;
+                for i in 0..coded {
+                    for raw in [cdef.cdef_y_sec_strength[i], cdef.cdef_uv_sec_strength[i]] {
+                        assert!(
+                            raw <= 2 || raw == 4,
+                            "frame {frames}: the parser can only hold 0, 1, 2 or the \
+                             fixed-up 4 — {raw} means the vendored parse changed"
+                        );
+                        assert!(
+                            coded_cdef_sec_strength(raw) <= 3,
+                            "the corrected value must fit the two bits every hardware \
+                             API gives it"
+                        );
+                        if raw == 4 {
+                            any = true;
+                            strengths += 1;
+                        }
+                    }
+                }
+                if any {
+                    needing_fixup += 1;
+                }
+                if frames == 1 {
+                    frame0_raw = cdef.cdef_y_sec_strength[..coded]
+                        .iter()
+                        .chain(cdef.cdef_uv_sec_strength[..coded].iter())
+                        .copied()
+                        .collect();
+                }
+            }
+        }
+        assert_eq!(frames, 274);
+        assert_eq!(
+            frame0_raw,
+            vec![1, 2, 0, 4, 4, 0, 0, 0],
+            "frame 0's four luma then four chroma secondary strengths — the first \
+             frame the parity leg hashes, and it needs the correction"
+        );
+        assert_eq!(
+            needing_fixup, 68,
+            "68 of 274 frames of this vector carry a secondary strength the spec \
+             fixed up; at zero the correction above is untested by any real stream"
+        );
+        eprintln!(
+            "frames {frames} · frames needing the fixup {needing_fixup} · strengths \
+             corrected {strengths}"
         );
     }
 

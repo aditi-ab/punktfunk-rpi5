@@ -416,8 +416,18 @@ impl VideoSession {
     /// # Safety
     ///
     /// Live device + live session; the Std slices' backing (the `OwnedStd*`
-    /// wrappers) outlives this call — Vulkan copies all parameter data before
-    /// returning.
+    /// wrappers) outlives this call.
+    ///
+    /// ⚠ "Vulkan copies all parameter data before returning" is what this used to
+    /// say, and it is **not universally true**: NVIDIA 610.57.04 was measured
+    /// retaining `StdVideoAV1SequenceHeader::pColorConfig` and dereferencing it at
+    /// every `vkCmdDecodeVideoKHR` ([`crate::session_av1`]). The H.26x rungs are
+    /// bit-exact on four drivers with the backings dropped here, so nothing is
+    /// known to be wrong — but the H.264 and H.265 Std sets carry embedded pointers
+    /// too (`pScalingLists`, `pSequenceParameterSetVui`, `pOffsetForRefFrame`, and
+    /// H.265's seven), and this contract rests on a driver behaviour rather than on
+    /// ownership. Holding them for the object's life, as AV1 now does, is the
+    /// version of this that cannot rot.
     unsafe fn create_parameters_object(
         &self,
         sps: &[hh::StdVideoH264SequenceParameterSet],
@@ -502,8 +512,9 @@ impl VideoSession {
                     .update_sequence_count(self.ledger.next_update_seq())
                     .push_next(&mut add);
                 // SAFETY: live device + parameters object; `update` roots locals
-                // (incl. the OwnedStd backings) outliving the call, and Vulkan
-                // copies parameter data before returning.
+                // (incl. the OwnedStd backings) outliving the call. See
+                // `create_parameters_object` on why "and the driver copies them"
+                // is an observation about this fleet rather than a guarantee.
                 let r = unsafe {
                     (self.video_queue.fp().update_video_session_parameters_khr)(
                         self.device.handle(),

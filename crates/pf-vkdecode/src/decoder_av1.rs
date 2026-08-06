@@ -29,6 +29,14 @@
 //!   `pReferenceSlots` out in [`DecodePlanVkAv1::refs`] order INDEPENDENTLY, and
 //!   [`build_scope_av1`] fails closed when the two disagree about a slot the op
 //!   binds.
+//! - **A DPB slot this frame READS may not be recycled until its decode op is
+//!   recorded.** `refresh_frame_flags` applies AFTER the frame decodes (7.20), so
+//!   almost every inter frame of a low-delay stream overwrites a slot it is
+//!   reading — 268 of the vendored vector's 274 frames. Releasing that slot inside
+//!   the conversion, which is what H.264 and H.265 do with their whole `removed`
+//!   list, gives it to this frame's own decode target: the reference then names
+//!   the slot being written. [`DecodePlanVkAv1::release_after_decode`] carries
+//!   those ids and this module releases them after the submission.
 //! - **A lost reference is fatal, not degraded.** `AuPlan::refs` is indexed by
 //!   reference NAME and a lost reference leaves a HOLE there, so nothing is
 //!   renumbered and the conversion could in principle write
@@ -902,17 +910,10 @@ impl VkAv1Decoder {
         // setup slot's PREVIOUS binding is cleared before it binds fresh.
         let setup = usize::from(vk_plan.setup_slot);
         if state.dpb.is_none() {
-            let mut held = vec![false; state.slot_image.len()];
-            for (slot, _id) in state.slots.held() {
-                held[usize::from(slot)] = true;
-            }
-            for (slot, binding) in state.slot_image.iter_mut().enumerate() {
-                if let Some(picture) = *binding {
-                    if !held[slot] || slot == setup {
-                        state.pool.pictures[picture].bound = false;
-                        *binding = None;
-                    }
-                }
+            let unbound =
+                sync_slot_bindings(&state.slots, &mut state.slot_image, vk_plan.setup_slot);
+            for picture in unbound {
+                state.pool.pictures[picture].bound = false;
             }
         }
 
@@ -1029,6 +1030,19 @@ impl VkAv1Decoder {
         state.slot_refs[setup] = Some(vk_plan.setup_ref);
         for r in &vk_plan.refs {
             state.slot_refs[usize::from(r.slot)] = Some(r.std);
+        }
+
+        // The slots this frame's own refresh displaced while it was still READING
+        // them. Held through the conversion and the submission above so neither the
+        // setup assignment nor the binding sync could take them
+        // (`DecodePlanVkAv1::release_after_decode`); free now that the decode op is
+        // recorded, so the next frame may have them. Their pool images stay pinned
+        // by `bound` until that frame's sync, which is the same one-frame grace
+        // every other released slot's image gets.
+        for &id in &vk_plan.release_after_decode {
+            if !state.slots.release(id) {
+                trace!(id, "deferred release of an id the slot map no longer holds");
+            }
         }
 
         self.pending.insert(
@@ -1754,6 +1768,40 @@ fn reset_slot_bindings(
     let unbound = slot_image.iter_mut().filter_map(Option::take).collect();
     for cached in slot_refs.iter_mut() {
         *cached = None;
+    }
+    unbound
+}
+
+/// Coincide-mode binding sync, run once per frame between the plan conversion and
+/// the decode target's allocation: a slot the ledger no longer holds stops binding
+/// its pool image, and the setup slot's PREVIOUS binding is cleared before it binds
+/// fresh. Returns the pool images that lost a binding — the caller clears their
+/// `bound` flag, which is what puts them back in reach of the free list.
+///
+/// The pictures themselves are untouched: one still `pending` or held by a consumer
+/// stays off the free list on those flags alone (the decoupled-pool contract in
+/// [`crate::images`]).
+///
+/// A free function rather than four lines inline, because it is half of the
+/// invariant `build_scope_av1` refuses on: a slot this frame REFERENCES must still
+/// bind an image once this has run. Driving the two together over the vendored
+/// vector is what `slot_recycling_waits_for_the_decode_op` does, and what no
+/// hardware-free test could do while this lived inside `decode_planned`.
+fn sync_slot_bindings(
+    slots: &SlotMap,
+    slot_image: &mut [Option<usize>],
+    setup_slot: u8,
+) -> Vec<usize> {
+    let mut held = vec![false; slot_image.len()];
+    for (slot, _id) in slots.held() {
+        held[usize::from(slot)] = true;
+    }
+    let setup = usize::from(setup_slot);
+    let mut unbound = Vec::new();
+    for (slot, binding) in slot_image.iter_mut().enumerate() {
+        if binding.is_some() && (!held[slot] || slot == setup) {
+            unbound.extend(binding.take());
+        }
     }
     unbound
 }
@@ -3000,5 +3048,221 @@ mod tests {
             }
         }
         assert_eq!(frames, 274);
+    }
+
+    /// The whole vendored vector through the DPB bookkeeping `decode_planned`
+    /// runs — conversion, [`sync_slot_bindings`], [`build_scope_av1`] — with no
+    /// GPU anywhere.
+    ///
+    /// This is the test that was missing, and the defect it closes reached an
+    /// RTX 5070 Ti before anything on this machine noticed: 172 unit tests, clippy
+    /// clean, and `AU 4: DPB slot 2 is referenced by this AU but binds no image`
+    /// on the first hardware contact. Everything needed to see it was on the CPU.
+    /// What was not on the CPU was a test that ran the three pieces TOGETHER: the
+    /// conversion was tested against a `SlotMap`, the scope builder against
+    /// hand-made reference lists, and the binding sync against nothing at all (it
+    /// was four lines inline in `decode_planned`). Each was right about its own
+    /// half and the seam between them was where the picture went missing.
+    ///
+    /// So this walks the real vector through the real functions and asserts what
+    /// the hardware asserts:
+    ///
+    /// * every slot this frame references still binds an image when the scope is
+    ///   built (the refusal that fired on the driver);
+    /// * the image it binds is the one that reference was DECODED into — the
+    ///   assertion that matters more, because a slot recycled into the setup
+    ///   picture is *bound*, just to the wrong picture, and the hardware would
+    ///   have predicted from the frame it was in the middle of writing without
+    ///   ever reporting an error;
+    /// * no held slot is left without a binding, which `build_scope_av1` only
+    ///   traces as "unreachable in practice".
+    #[test]
+    fn slot_recycling_waits_for_the_decode_op() {
+        #[derive(Clone, Default)]
+        struct SimPicture {
+            bound: bool,
+            pending: bool,
+            held: u32,
+        }
+        // A distinguishable view per POOL IMAGE (never dereferenced), so a scope
+        // entry can be traced back to the picture that image holds.
+        let image_view = |picture: usize| vk::ImageView::from_raw(picture as u64 + 1);
+
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let mut slot_image: Vec<Option<usize>> = vec![None; REQUIRED_SLOTS as usize];
+        let mut slot_refs: Vec<Option<hh::StdVideoDecodeAV1ReferenceInfo>> =
+            vec![None; REQUIRED_SLOTS as usize];
+        let mut pictures =
+            vec![SimPicture::default(); (REQUIRED_SLOTS + crate::images::HOLD_HEADROOM) as usize];
+        // Decoded pictures awaiting an output verdict, and the pool image each
+        // picture was decoded into (for as long as anything can reference it).
+        let mut pending: BTreeMap<PicId, usize> = BTreeMap::new();
+        let mut image_of: BTreeMap<PicId, usize> = BTreeMap::new();
+
+        let (mut frames, mut deferring, mut scope_refs) = (0u32, 0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                let Some(setup_id) = plan.dpb.stored else {
+                    // show_existing_frame decodes nothing; `decode_planned`
+                    // settles it and releases its removals directly.
+                    let (ready, dropped) =
+                        settle_dpb_ids(&mut pending, &plan.dpb.outputs, &plan.dpb.removed);
+                    for image in ready.into_iter().chain(dropped) {
+                        pictures[image].pending = false;
+                    }
+                    for &id in &plan.dpb.removed {
+                        slots.release(id);
+                        image_of.remove(&id);
+                    }
+                    continue;
+                };
+                frames += 1;
+
+                let vk = plan_to_vk_av1(&plan, &mut slots).expect("the clean vector converts");
+                let setup = usize::from(vk.setup_slot);
+                if !vk.release_after_decode.is_empty() {
+                    deferring += 1;
+                }
+
+                for picture in sync_slot_bindings(&slots, &mut slot_image, vk.setup_slot) {
+                    pictures[picture].bound = false;
+                }
+                let dst = pictures
+                    .iter()
+                    .position(|p| !p.bound && !p.pending && p.held == 0)
+                    .unwrap_or_else(|| panic!("frame {frames}: picture pool exhausted"));
+
+                // Every held slot but the setup one must bind an image, or
+                // `build_scope_av1` silently drops it from the coding scope.
+                for (slot, _id) in slots.held() {
+                    if usize::from(slot) == setup {
+                        continue;
+                    }
+                    assert!(
+                        slot_image[usize::from(slot)].is_some(),
+                        "frame {frames}: held slot {slot} binds no image"
+                    );
+                }
+
+                let held_slots: Vec<u8> = slots.held().map(|(slot, _id)| slot).collect();
+                let (scope, reference_count) = build_scope_av1(
+                    &vk.refs,
+                    &vk.reference_name_slot_indices,
+                    held_slots.iter().copied(),
+                    vk.setup_slot,
+                    image_view(dst),
+                    vk.setup_ref,
+                    &slot_refs,
+                    |slot| slot_image[usize::from(slot)].map(image_view),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "frame {frames}: {e}\n  setup_slot={setup} setup_id={setup_id}\n  \
+                         refs={:?}\n  names={:?}\n  bindings={slot_image:?}",
+                        vk.refs.iter().map(|r| (r.slot, r.id)).collect::<Vec<_>>(),
+                        vk.reference_name_slot_indices,
+                    )
+                });
+
+                // The scope binds every held slot but the setup one exactly once,
+                // plus the setup slot as the `-1` activation entry — nothing
+                // dropped, nothing duplicated. (The setup slot is always held by
+                // now: `plan_to_vk_av1` assigned it.)
+                assert_eq!(reference_count, vk.refs.len());
+                let mut bound: Vec<i32> = scope.iter().map(|e| e.slot_index).collect();
+                assert_eq!(bound.pop(), Some(-1), "frame {frames}: no activation entry");
+                bound.sort_unstable();
+                let mut expected: Vec<i32> = held_slots
+                    .iter()
+                    .filter(|slot| usize::from(**slot) != setup)
+                    .map(|slot| i32::from(*slot))
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(
+                    bound, expected,
+                    "frame {frames}: the coding scope must bind exactly the held \
+                     slots, once each"
+                );
+
+                // THE assertion: each reference's scope entry must carry the image
+                // that reference was decoded into. A slot recycled into the setup
+                // picture binds an image too — the wrong one — and nothing but this
+                // would say so.
+                for (entry, r) in scope[..reference_count].iter().zip(&vk.refs) {
+                    let decoded_into = image_of[&r.id];
+                    assert_eq!(
+                        entry.view,
+                        image_view(decoded_into),
+                        "frame {frames}: reference picture {} (slot {}) binds pool \
+                         image {:?}, but it was decoded into image {decoded_into}",
+                        r.id,
+                        r.slot,
+                        slot_image[usize::from(r.slot)]
+                    );
+                    assert_ne!(
+                        decoded_into, dst,
+                        "frame {frames}: reference picture {} resolves to the image \
+                         this very frame is decoding into",
+                        r.id
+                    );
+                    scope_refs += 1;
+                }
+
+                // Post-submit bookkeeping, in `decode_planned`'s order.
+                pictures[dst].pending = true;
+                pictures[dst].bound = true;
+                slot_image[setup] = Some(dst);
+                slot_refs[setup] = Some(vk.setup_ref);
+                for r in &vk.refs {
+                    slot_refs[usize::from(r.slot)] = Some(r.std);
+                }
+                for &id in &vk.release_after_decode {
+                    assert!(slots.release(id), "frame {frames}: deferred release missed");
+                }
+                pending.insert(setup_id, dst);
+                image_of.insert(setup_id, dst);
+
+                let (ready, dropped) =
+                    settle_dpb_ids(&mut pending, &plan.dpb.outputs, &plan.dpb.removed);
+                for image in ready.into_iter().chain(dropped) {
+                    // A consumer that displays and releases at once: the harshest
+                    // case for the pool, because an image comes back free the
+                    // instant nothing else pins it.
+                    pictures[image].pending = false;
+                }
+                for &id in &plan.dpb.removed {
+                    image_of.remove(&id);
+                }
+                if plan.header.refresh_frame_flags == 0 {
+                    slots.release(setup_id);
+                    if let Some(image) = pending.remove(&setup_id) {
+                        pictures[image].pending = false;
+                    }
+                    image_of.remove(&setup_id);
+                }
+            }
+        }
+
+        assert_eq!(frames, 274, "every frame of the vector must decode");
+        // Anti-vacuity. Releasing a displaced reference eagerly — the shape every
+        // codec in this crate shipped with — gave its slot to the decode target on
+        // 268 of these 274 frames, measured, the first at frame 6 (AU 4 of the
+        // stream, which is the AU the driver refused). So if this count ever
+        // reaches 0 the vector stopped exercising the case and the assertions above
+        // are comparing empty lists.
+        assert_eq!(
+            deferring, 268,
+            "268 of 274 frames displace a picture they are reading; at zero, \
+             `release_after_decode` could be deleted and nothing here would fail"
+        );
+        assert_eq!(
+            scope_refs, 1616,
+            "the references actually bound into a coding scope across the vector"
+        );
+        eprintln!(
+            "frames {frames} · scope references {scope_refs} · deferred releases {deferring}"
+        );
     }
 }

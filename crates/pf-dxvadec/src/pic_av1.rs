@@ -34,6 +34,7 @@
 
 use std::ops::Range;
 
+use pf_bitstream::av1::coded_cdef_sec_strength;
 use pf_bitstream::av1::AuPlan;
 use pf_bitstream::av1::FrameType;
 use pf_bitstream::av1::PicId;
@@ -65,6 +66,15 @@ use crate::SlotMap;
 
 /// `DXVA_PicParams_AV1::tiles` holds at most 64 column and 64 row sizes.
 pub const MAX_TILE_DIM: usize = 64;
+
+/// `log2_restoration_unit_size` on a frame that restores nothing.
+///
+/// Not a meaningful size — every plane's `frame_restoration_type` is NONE and a
+/// driver reading the field at all has nothing to apply it to. It is 8 because
+/// that is what libavcodec's `dxva2_av1.c` writes, and 8 is the top of the range
+/// `dxva.h` documents (6..8); the parser's own array is still zero here, whose
+/// `trailing_zeros` would be 16.
+const LOG2_RESTORATION_UNIT_SIZE_UNUSED: u16 = 8;
 
 /// `LAST_FRAME` (AV1 spec): the first reference NAME, and the offset between a
 /// position in `ref_frame_idx` and the index the spec's per-reference arrays
@@ -278,12 +288,31 @@ pub fn plan_to_dxva_av1(
     loop_filter.ref_deltas = lf.loop_filter_ref_deltas;
     loop_filter.mode_deltas = lf.loop_filter_mode_deltas;
     loop_filter.delta_lf_res = lf.delta_lf_res;
+    // Loop restoration.
+    //
+    // ⚠ DXVA wants the LOG2 of the unit size where the parser records the size
+    // itself — and the parser records NOTHING when restoration is off. AV1 5.9.20
+    // only computes `LoopRestorationSize` inside `if ( UsesLr )`, so on a frame with
+    // every plane's restoration type NONE the vendored parser's array is still
+    // `[0, 0, 0]`, and `0u16.trailing_zeros()` is **16** — a restoration unit of
+    // 65536 samples, in a field `dxva.h` documents as 6, 7 or 8. That is 271 of the
+    // vendored vector's 274 frames.
+    //
+    // libavcodec's `dxva2_av1.c` sends `uses_lr ? 6 + lr_unit_shift : 8` for luma
+    // and `uses_lr ? 6 + lr_unit_shift - lr_uv_shift : 8` for the two chroma planes,
+    // and libavcodec is the implementation every driver was validated against, so
+    // the OFF value is 8 rather than 0 or 16. With restoration on, the parser's own
+    // `loop_restoration_size[i]` already carries the per-plane `>> lr_uv_shift`, so
+    // its `trailing_zeros` IS `6 + lr_unit_shift - lr_uv_shift` — the two agree
+    // wherever the field is read at all.
     let lr = &h.loop_restoration_params;
     for i in 0..3 {
         loop_filter.frame_restoration_type[i] = lr.frame_restoration_type[i] as u8;
-        // DXVA wants the LOG2 of the unit size; the parser records the size itself.
-        loop_filter.log2_restoration_unit_size[i] =
-            lr.loop_restoration_size[i].trailing_zeros() as u16;
+        loop_filter.log2_restoration_unit_size[i] = if lr.uses_lr {
+            lr.loop_restoration_size[i].trailing_zeros() as u16
+        } else {
+            LOG2_RESTORATION_UNIT_SIZE_UNUSED
+        };
     }
 
     let q = &h.quantization_params;
@@ -312,15 +341,24 @@ pub fn plan_to_dxva_av1(
     .pack();
     // Two fields to a byte (module docs) — not the parallel arrays AV1's syntax
     // and Vulkan's Std block use.
+    //
+    // ⚠ `secondary` gets TWO bits here, and the parser's value does not fit them:
+    // AV1 5.9.19 rewrites the syntax element in place (a coded 3 becomes 4) and
+    // cros-codecs follows the spec, while `DXVA_PicParams_AV1` — like VA-API,
+    // NVDEC and Vulkan — wants the coded two-bit read, which is what libavcodec's
+    // `dxva2_av1.c` sends. Passing the parser's 4 through `pack`'s `& 0x3` would
+    // turn the STRONGEST secondary filter into NO filter, silently, on every frame
+    // that codes one. `coded_cdef_sec_strength` is the inverse; its docs carry the
+    // evidence.
     for i in 0..8 {
         cdef.y_strengths[i] = CdefStrength {
             primary: c.cdef_y_pri_strength[i] as u8,
-            secondary: c.cdef_y_sec_strength[i] as u8,
+            secondary: coded_cdef_sec_strength(c.cdef_y_sec_strength[i]),
         }
         .pack();
         cdef.uv_strengths[i] = CdefStrength {
             primary: c.cdef_uv_pri_strength[i] as u8,
-            secondary: c.cdef_uv_sec_strength[i] as u8,
+            secondary: coded_cdef_sec_strength(c.cdef_uv_sec_strength[i]),
         }
         .pack();
     }
@@ -663,6 +701,183 @@ mod tests {
              this run never exercised the difference between RefFrameMapTextureIndex \
              (the whole store) and frame_refs (what this frame uses), which is the \
              distinction the Ally X class of bug lives in"
+        );
+    }
+
+    /// The CHROMA deblocking levels reach `filter_level_u` / `filter_level_v`, and
+    /// `log2_restoration_unit_size` is never the parser's silence.
+    ///
+    /// Two halves of the same block, both measured on hardware rather than argued.
+    ///
+    /// The levels first. ⚠ The AV1 Vulkan rung's frame-0 parity leg came back `luma
+    /// IDENTICAL, chroma 319/38400 bytes differ` and that signature was reproduced
+    /// EXACTLY — count, `|delta|` histogram and the first six differing bytes with
+    /// their values — by decoding the vector's frame 0 with `loop_filter_level[2]`
+    /// and `[3]` forced to zero in the bitstream. **That divergence turned out NOT
+    /// to be a levels bug** (it was a freed sequence header making the driver treat
+    /// the frame as monochrome — `pf_vkdecode::session_av1`), so do not cite it as
+    /// evidence that a rung got the pair wrong. What it does establish, and what
+    /// keeps this test, is the SIGNATURE: frame 0 codes `[1, 7, 8, 12]`, two luma
+    /// levels and two chroma ones, and dropping only the chroma pair is invisible
+    /// to luma and to every other plane statistic. A rung that lost the pair would
+    /// fail Windows parity in a way nothing else here would notice, and this rung's
+    /// `[2]` and `[3]` reads are four characters from `[0]` and `[1]`.
+    ///
+    /// Then the restoration unit size, which is a units defect the vendored parser
+    /// invites: `LoopRestorationSize` is only computed inside `if ( UsesLr )`
+    /// (5.9.20), so the array is `[0, 0, 0]` on a frame that restores nothing and
+    /// `trailing_zeros` turns that into **16** — 271 of these 274 frames, in a field
+    /// `dxva.h` documents as 6..8. libavcodec sends 8.
+    #[test]
+    fn the_chroma_loop_filter_levels_and_the_restoration_unit_size_reach_the_driver() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let (mut frames, mut with_chroma_lf, mut with_lr) = (0u32, 0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let dx = plan_to_dxva_av1(&plan, &mut slots, frames).expect("converts");
+                frames += 1;
+                let lf = &plan.header.loop_filter_params;
+                // `#[repr(packed)]` — copy the block out before reading its fields.
+                let sent = dx.pic_params.loop_filter;
+                assert_eq!(
+                    (
+                        sent.filter_level[0],
+                        sent.filter_level[1],
+                        sent.filter_level_u,
+                        sent.filter_level_v
+                    ),
+                    (
+                        lf.loop_filter_level[0],
+                        lf.loop_filter_level[1],
+                        lf.loop_filter_level[2],
+                        lf.loop_filter_level[3]
+                    ),
+                    "frame {frames}: DXVA splits AV1's four levels into a luma PAIR \
+                     plus two named chroma fields — U is index 2 and V is index 3"
+                );
+                if lf.loop_filter_level[2] != 0 || lf.loop_filter_level[3] != 0 {
+                    with_chroma_lf += 1;
+                }
+                if frames == 1 {
+                    assert_eq!(
+                        (sent.filter_level, sent.filter_level_u, sent.filter_level_v),
+                        ([1, 7], 8, 12),
+                        "frame 0's levels, and the pair whose loss the Vulkan rung's \
+                         frame-0 divergence was reproduced from"
+                    );
+                }
+
+                let lr = &plan.header.loop_restoration_params;
+                let sizes = sent.log2_restoration_unit_size;
+                if lr.uses_lr {
+                    with_lr += 1;
+                    assert_eq!(lr.loop_restoration_size, [128, 128, 128]);
+                    assert_eq!(sizes, [7, 7, 7], "6 + lr_unit_shift, per plane");
+                } else {
+                    assert_eq!(
+                        sizes, [LOG2_RESTORATION_UNIT_SIZE_UNUSED; 3],
+                        "frame {frames}: restores nothing, so the size is \
+                         libavcodec's 8 — never the parser's zero read as 16"
+                    );
+                }
+                assert!(
+                    sizes.iter().all(|s| (6..=8).contains(s)),
+                    "frame {frames}: log2_restoration_unit_size is 6, 7 or 8"
+                );
+            }
+        }
+
+        assert_eq!(frames, 274);
+        assert_eq!(
+            with_chroma_lf, 123,
+            "123 of 274 frames of this vector deblock chroma; at zero the levels \
+             above are all zero anyway and this test could not tell a dropped pair \
+             from a carried one"
+        );
+        assert_eq!(
+            with_lr, 3,
+            "three frames use loop restoration, so both branches of the size are \
+             exercised"
+        );
+    }
+
+    /// The packed CDEF strength bytes carry the CODED secondary strength.
+    ///
+    /// `CdefStrength::pack` gives `secondary` TWO bits, and the vendored parser
+    /// holds the AV1 spec's post-fixup value — 4 where the stream coded 3 (5.9.19
+    /// rewrites the syntax element in place). `& 0x3` then turns the STRONGEST
+    /// secondary filter into no filter at all, silently, on 68 of this vector's 274
+    /// frames including the first. libavcodec's `dxva2_av1.c` assigns CBS's
+    /// unmodified two-bit read into the same bitfield, which is the convention every
+    /// driver was validated against.
+    ///
+    /// Asserted against the packed BYTE rather than the intermediate struct,
+    /// because the truncation is what `pack` does and a test that stopped at the
+    /// struct would not have seen it.
+    #[test]
+    fn cdef_secondary_strengths_survive_the_two_bit_pack() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let (mut frames, mut corrected_frames) = (0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let dx = plan_to_dxva_av1(&plan, &mut slots, frames).expect("converts");
+                frames += 1;
+                let raw = &plan.header.cdef_params;
+                // `#[repr(packed)]` — copy the arrays out before indexing them.
+                let cdef = dx.pic_params.cdef;
+                let (y, uv) = (cdef.y_strengths, cdef.uv_strengths);
+                let mut corrected = false;
+                for i in 0..8 {
+                    let want_y = coded_cdef_sec_strength(raw.cdef_y_sec_strength[i]);
+                    let want_uv = coded_cdef_sec_strength(raw.cdef_uv_sec_strength[i]);
+                    assert_eq!(
+                        (y[i] >> 6, uv[i] >> 6),
+                        (want_y, want_uv),
+                        "frame {frames}: the secondary strength must survive the \
+                         two-bit field — the parser's 4 packs to 0"
+                    );
+                    assert_eq!(
+                        (y[i] & 0x3f, uv[i] & 0x3f),
+                        (
+                            raw.cdef_y_pri_strength[i] as u8,
+                            raw.cdef_uv_pri_strength[i] as u8
+                        ),
+                        "the PRIMARY strengths are not fixed up by the spec and must \
+                         reach the driver untouched"
+                    );
+                    if raw.cdef_y_sec_strength[i] == 4 || raw.cdef_uv_sec_strength[i] == 4 {
+                        corrected = true;
+                    }
+                }
+                if corrected {
+                    corrected_frames += 1;
+                }
+                if frames == 1 {
+                    assert_eq!(
+                        (y[3] >> 6, uv[0] >> 6),
+                        (3, 3),
+                        "frame 0 codes the strongest secondary strength twice, and \
+                         the uncorrected conversion packed both as 0"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(frames, 274);
+        assert_eq!(
+            corrected_frames, 68,
+            "68 of 274 frames of this vector need the correction; at zero this test \
+             compares an untouched conversion against itself"
         );
     }
 

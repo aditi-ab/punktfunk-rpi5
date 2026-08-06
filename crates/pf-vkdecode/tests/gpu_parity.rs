@@ -93,6 +93,22 @@ const GOLDENS_H265: &str = include_str!("data/test-25fps-h265.nv12.sha256");
 /// file's header — it is the only golden here with a third-party corroboration).
 const GOLDENS_AV1: &str = include_str!("data/test-25fps-av1.nv12.sha256");
 
+/// The AV1 vector's FIRST frame, as libavcodec decodes it: the 320x240 render
+/// region, tightly packed NV12, 115200 bytes — the same bytes
+/// [`GOLDENS_AV1`]'s first line hashes.
+///
+/// Hashes tell you a frame is wrong; only pixels tell you HOW. This exists for
+/// [`av1_frame0_pixels_say_which_plane_and_how_badly`], whose whole job is to turn
+/// "FIRST DIVERGENT FRAME = 0" into a class: luma or chroma, a shift or a
+/// difference, a filter's worth of error or a structural one. Frame 0 earns the
+/// 113 KiB because it is intra-only — nothing upstream of it can be blamed — and
+/// because on this rung it is where a divergence appears first.
+///
+/// It cannot drift from the golden set it was cut out of:
+/// [`the_av1_frame0_reference_is_the_first_golden`] re-derives its SHA-256 and
+/// compares, in ordinary CI, with no GPU.
+const AV1_FRAME0: &[u8] = include_bytes!("data/test-25fps-av1.frame0.nv12");
+
 /// The ten-bit vector and its goldens. No hardware leg in this file consumes them
 /// yet — the D3D11VA rung is where the ten-bit parity leg currently runs — but the
 /// files live here, beside the other goldens, so the guard that keeps them honest
@@ -985,6 +1001,464 @@ fn av1_every_frame_hashes_bit_identical_to_libavcodec() {
     av1_parity_run(&common::split_av1_aus(common::TEST_25FPS_AV1), "AV1");
 }
 
+/// Frame 0's pixels against libavcodec's, byte for byte — the diagnostic leg.
+///
+/// [`av1_every_frame_hashes_bit_identical_to_libavcodec`] is the verdict; this is
+/// the microscope, and it decodes only as far as the first delivered frame. A hash
+/// mismatch names no cause, and the four causes the parity leg's own message ranks
+/// for a frame-0 divergence produce *completely different* pixel signatures:
+///
+/// | printed here | what it means |
+/// |---|---|
+/// | `luma IDENTICAL`, chroma differs | the chroma plane's layout — `PLANE_1`'s copy region, or a pool whose chroma plane starts somewhere other than where the readback reads it. NOT a decode problem |
+/// | both differ, and a **shift** matches | readback geometry: the crop origin, or a copy extent taken from the pool rather than the render region. The printed `dy`/`dx` IS the error |
+/// | both differ, deltas ≤ ~8 over most of the plane | an in-loop filter parameter — CDEF, loop restoration, the deblocking levels. Small and everywhere is what a filter does, and it is why the whole 250 frames go with it: CDEF runs before the frame is stored as a reference |
+/// | both differ, deltas large and structured | quantisation, tile geometry, or the tile payloads themselves — the frame was reconstructed from the wrong data rather than filtered wrongly |
+/// | ours is CONSTANT | nothing was decoded into the image the readback read |
+///
+/// It asserts equality last, so a failure prints the whole report above the panic.
+#[test]
+#[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
+fn av1_frame0_pixels_say_which_plane_and_how_badly() {
+    let _gpu = common::gpu_lock();
+    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+
+    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    assert_eq!(
+        aus.len(),
+        FRAME_COUNT,
+        "the vector must split into 250 units"
+    );
+    let ours = av1_first_frame(&aus);
+
+    report_nv12_divergence(&ours, AV1_FRAME0, DISPLAY_AV1);
+    assert_eq!(
+        sha256_hex(&ours),
+        golden_hashes(GOLDENS_AV1)[0],
+        "AV1 frame 0 is not libavcodec's — read the report above for the class"
+    );
+    eprintln!("AV1 frame 0 is byte-identical to libavcodec");
+}
+
+/// `loop_filter_level[2]` and `[3]` — the U and V deblocking levels — as BIT
+/// offsets from the start of the vector's FIRST access unit.
+///
+/// Derived rather than found: the IVF packet holds a temporal-delimiter OBU (2
+/// bytes), a sequence-header OBU (2 + 11) and an `OBU_FRAME` header (1 + a 2-byte
+/// leb128 size), so the uncompressed frame header starts at byte 18. Inside it
+/// `loop_filter_level[0]` begins at bit 35 and the four levels are `f(6)` back to
+/// back (5.9.11), which puts U at bit 47 and V at bit 53.
+///
+/// [`av1_frame0_probes_whether_the_driver_reads_the_chroma_deblocking_levels`]
+/// re-parses the mutated unit before it decodes anything, so a re-synced vector
+/// makes this fail loudly instead of poking an unrelated field.
+const AV1_FRAME0_FILTER_LEVEL_U_BIT: usize = 18 * 8 + 47;
+const AV1_FRAME0_FILTER_LEVEL_V_BIT: usize = 18 * 8 + 53;
+
+/// The strongest deblocking level AV1 can code (`f(6)`), and the value the probe
+/// rewrites both chroma levels to.
+const MAX_LOOP_FILTER_LEVEL: u8 = 63;
+
+/// The driver DOES read the chroma deblocking levels — and this is the test that
+/// says so, after a pass of this program's history said the opposite.
+///
+/// ⚠⚠ **The claim "NVIDIA ignores `StdVideoAV1LoopFilter::loop_filter_level[2..3]`"
+/// is refuted. Do not reintroduce it.** It was an honest reading of a real
+/// measurement: the AV1 frame-0 parity leg came back `luma IDENTICAL, chroma
+/// 319/38400 bytes differ, max |delta| 4`, software re-decode with both chroma
+/// levels forced to zero reproduced that signature byte for byte, and this very
+/// probe then came back IDENTICAL for `[8, 12]` and `[63, 63]`. Every step was
+/// sound; the inference was not. The levels were reaching the driver intact — what
+/// was NOT intact was the sequence header, whose `pColorConfig` block this crate
+/// freed the instant `vkCreateVideoSessionParametersKHR` returned while the driver
+/// went on dereferencing it at every decode. The recycled bytes read as
+/// `mono_chrome = 1`, and a monochrome frame skips exactly `loop_filter_level[2..3]`
+/// (AV1 7.14) — which is why rewriting them changed nothing, and why the
+/// fingerprint was a perfect match for levels that were never applied.
+/// `pf-vkdecode`'s `session_av1` module docs carry the capture and the fix.
+///
+/// So the probe survives its own refutation, with its verdict inverted: it now
+/// PASSES, and it is the cheapest guard there is against that whole class coming
+/// back. It decodes frame 0 twice — once from the vector as it sits, once from the
+/// same unit with both chroma levels rewritten to the strongest AV1 can code — and
+/// requires the pixels to differ. In software that rewrite moves 793 chroma bytes
+/// with `max |delta| 29`, which no readback or crop error could hide, and it leaves
+/// luma bit-identical, which is the control: a mutation that changed luma would
+/// have desynchronised the header rather than changed the field.
+///
+/// If the two decodes are ever IDENTICAL again, the message below is the one to
+/// act on — and the FIRST thing to check is not the driver but whether some block
+/// the decode op points at is being freed before the op is recorded. That is what
+/// it was last time, on a bug this test could not see.
+#[test]
+#[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
+fn av1_frame0_probes_whether_the_driver_reads_the_chroma_deblocking_levels() {
+    let _gpu = common::gpu_lock();
+    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+
+    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    assert_eq!(aus.len(), FRAME_COUNT);
+
+    let mutated_au = av1_frame0_with_max_chroma_deblocking(aus[0]);
+    let mut units: Vec<&[u8]> = aus.clone();
+    units[0] = &mutated_au;
+
+    let coded = av1_first_frame(&aus);
+    let maxed = av1_first_frame(&units);
+
+    let luma = (DISPLAY_AV1.0 * DISPLAY_AV1.1) as usize;
+    eprintln!("  coded chroma levels [8, 12]  {}", sha256_hex(&coded));
+    eprintln!("  chroma levels [63, 63]       {}", sha256_hex(&maxed));
+    eprintln!("  libavcodec's frame 0         {}", sha256_hex(AV1_FRAME0));
+    assert_eq!(
+        coded[..luma],
+        maxed[..luma],
+        "the chroma deblocking levels must not move a luma sample — if they did, \
+         the mutation desynchronised the frame header and the chroma comparison \
+         below means nothing"
+    );
+    assert_ne!(
+        coded[luma..],
+        maxed[luma..],
+        "the driver produced the SAME chroma from loop_filter_level[2..3] = [8, 12] \
+         and from [63, 63]. This happened once before and the driver was INNOCENT: \
+         a monochrome-looking sequence header makes it skip both levels, and ours \
+         looked monochrome because its `pColorConfig` block had been freed and \
+         reused before the decode op was recorded (see this test's docs). So audit \
+         the LIFETIME of everything the submission points at — the Std sequence \
+         header behind the parameters object first — before blaming the vendor"
+    );
+    eprintln!("the driver reads the chroma deblocking levels — the two decodes differ");
+}
+
+/// The vector's first access unit with both CHROMA deblocking levels rewritten to
+/// [`MAX_LOOP_FILTER_LEVEL`] — and the proof, through the real parser, that this is
+/// the only thing it changed.
+///
+/// The proof is not decoration. The offsets are derived from the spec's syntax
+/// order rather than searched for, and a rewrite landing one field over would
+/// desynchronise nothing (both neighbours are fixed-width) while silently probing
+/// the wrong parameter. So every block the conversion reads is compared before and
+/// after, and [`the_av1_chroma_deblocking_mutation_changes_only_those_two_levels`]
+/// runs this on CPU in ordinary CI — the hardware run cannot be spent discovering
+/// that the mutation was wrong.
+fn av1_frame0_with_max_chroma_deblocking(au: &[u8]) -> Vec<u8> {
+    let mut mutated = au.to_vec();
+    for bit in [AV1_FRAME0_FILTER_LEVEL_U_BIT, AV1_FRAME0_FILTER_LEVEL_V_BIT] {
+        set_bits(&mut mutated, bit, 6, MAX_LOOP_FILTER_LEVEL);
+    }
+
+    let before = av1_first_header(au);
+    let after = av1_first_header(&mutated);
+    assert_eq!(
+        before.loop_filter_params.loop_filter_level,
+        [1, 7, 8, 12],
+        "the vendored vector's frame 0 codes these levels, and the whole probe is \
+         built around the last two of them"
+    );
+    assert_eq!(
+        after.loop_filter_params.loop_filter_level,
+        [1, 7, MAX_LOOP_FILTER_LEVEL, MAX_LOOP_FILTER_LEVEL],
+        "the rewrite must land on the two CHROMA levels and leave the luma pair \
+         alone — a luma change would make the probe's control meaningless"
+    );
+    // Everything else the conversion reads, unchanged: a rewrite that shifted the
+    // header would show up in one of these long before it showed up in pixels.
+    assert_eq!(
+        after.cdef_params, before.cdef_params,
+        "the CDEF block follows the loop filter block and is what a shifted rewrite \
+         would corrupt first"
+    );
+    assert_eq!(after.quantization_params, before.quantization_params);
+    assert_eq!(after.tile_info, before.tile_info);
+    assert_eq!(
+        after.loop_restoration_params,
+        before.loop_restoration_params
+    );
+    assert_eq!(after.segmentation_params, before.segmentation_params);
+    assert_eq!(
+        (
+            after.loop_filter_params.loop_filter_sharpness,
+            after.loop_filter_params.loop_filter_ref_deltas,
+            after.loop_filter_params.loop_filter_mode_deltas,
+        ),
+        (
+            before.loop_filter_params.loop_filter_sharpness,
+            before.loop_filter_params.loop_filter_ref_deltas,
+            before.loop_filter_params.loop_filter_mode_deltas,
+        ),
+        "the rest of the loop filter block rides after the levels and must survive"
+    );
+    assert_ne!(mutated, au, "the rewrite must actually change bytes");
+    mutated
+}
+
+/// [`av1_frame0_with_max_chroma_deblocking`] on CPU, so the GPU probe's mutation is
+/// known-good before any device time is spent on it.
+#[test]
+fn the_av1_chroma_deblocking_mutation_changes_only_those_two_levels() {
+    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    let mutated = av1_frame0_with_max_chroma_deblocking(aus[0]);
+    // One byte may carry bits of both fields (U ends mid-byte), so the rewrite
+    // touches two or three bytes and no more — a whole-unit difference would mean
+    // `set_bits` walked off its field.
+    let changed = aus[0].iter().zip(&mutated).filter(|(a, b)| a != b).count();
+    assert!(
+        (1..=3).contains(&changed),
+        "twelve bits spanning at most three bytes, and {changed} bytes changed"
+    );
+}
+
+/// Overwrite the `bits`-wide big-endian bitfield at `bit` in `data`.
+///
+/// AV1's `f(n)` is MSB-first from the start of the OBU payload, which is what the
+/// probe above needs to rewrite a syntax element in place: same width, same
+/// position, so nothing after it shifts.
+fn set_bits(data: &mut [u8], bit: usize, bits: usize, value: u8) {
+    for i in 0..bits {
+        let at = bit + i;
+        let mask = 1u8 << (7 - (at % 8));
+        let set = (value >> (bits - 1 - i)) & 1 == 1;
+        if set {
+            data[at / 8] |= mask;
+        } else {
+            data[at / 8] &= !mask;
+        }
+    }
+}
+
+/// The parsed frame header of the FIRST frame in one access unit.
+fn av1_first_header(au: &[u8]) -> pf_bitstream::av1::ParsedFrameHeader {
+    let mut planner = pf_bitstream::av1::Av1Planner::new();
+    let plans = planner.plan_au(au).expect("the unit plans");
+    let plan = plans.first().expect("the unit carries a frame");
+    (*plan.header).clone()
+}
+
+/// Decode `aus` only as far as the FIRST delivered frame, and read it back as
+/// tightly packed NV12 — the device half of both frame-0 legs.
+///
+/// Brings its own device up and tears it down, so one test may call it more than
+/// once; the GPU lock and the readback hook are the caller's.
+fn av1_first_frame(aus: &[&[u8]]) -> Vec<u8> {
+    let setup = common::bring_up(&common::Request {
+        codec: common::AV1,
+        graphics: common::Graphics::Required,
+        report_families: true,
+    });
+    let handles = setup.handles();
+
+    let ours = {
+        // SAFETY: as the parity legs — `setup` outlives this block and was created
+        // with the AV1 decode extension + timeline/sync2 features.
+        let mut decoder = unsafe { VkAv1Decoder::new(&handles, Box::new(NoopQueueLock)) }
+            .expect("wrap the device");
+        decoder
+            .probe_stream_support(1, 8, false)
+            .expect("the box must host AV1 Main 4:2:0 8-bit, no film grain");
+        // SAFETY: as the parity legs — live instance/device, queue 0 of `graphics_qf`.
+        let readback = unsafe {
+            Readback::new(
+                &setup.instance,
+                setup.pd,
+                &setup.device,
+                setup.graphics_qf,
+                DISPLAY_AV1,
+                EXPECTED_FORMAT,
+            )
+        };
+
+        // The FIRST delivered frame and no further: the first temporal unit is a
+        // key frame that shows, so this is one decode.
+        let mut first: Option<Vec<u8>> = None;
+        for (index, au) in aus.iter().enumerate() {
+            let frame = decoder
+                .decode(au)
+                .unwrap_or_else(|e| panic!("AU {index}: decode failed: {e}"));
+            if let Some(frame) = frame {
+                assert_eq!(
+                    decoder.wait_status(&frame),
+                    DecodeStatus::Ok,
+                    "frame 0: decode op not COMPLETE\n  state: {}",
+                    decoder.debug_snapshot()
+                );
+                assert_eq!(frame.format, EXPECTED_FORMAT, "frame 0: pool format");
+                // SAFETY: the frame is delivered and unreleased on the readback's
+                // device, the pool carries TRANSFER_SRC, and the test is serialized.
+                first = Some(unsafe { readback.read_nv12(&frame) });
+                decoder
+                    .release_frame(&frame, true)
+                    .expect("frame 0: release");
+                // A temporal unit may carry more than one frame, and this leg stops
+                // at the first. Anything else the unit made ready is handed straight
+                // back — with `false`, because no presenter signalled its timeline
+                // (nothing read it) — rather than left held while the decoder drops.
+                while let Some(spare) = decoder.take_ready() {
+                    decoder
+                        .release_frame(&spare, false)
+                        .expect("release an unread frame of the same temporal unit");
+                }
+                break;
+            }
+        }
+        // SAFETY: every readback was fence-waited inside `read_nv12`.
+        unsafe { readback.destroy() };
+        first.expect("the vector's first temporal unit shows a frame")
+    };
+
+    // SAFETY: as the parity legs — the decoder and readback are gone.
+    unsafe { setup.destroy() };
+    ours
+}
+
+/// Per-plane statistics of `ours` against `want`, printed rather than asserted.
+///
+/// Everything here answers a question a hash cannot: WHICH plane, whether the
+/// difference is a displacement or a value error, and how big. See
+/// [`av1_frame0_pixels_say_which_plane_and_how_badly`] for how to read it.
+fn report_nv12_divergence(ours: &[u8], want: &[u8], display: (u32, u32)) {
+    let (width, height) = (display.0 as usize, display.1 as usize);
+    let luma = width * height;
+    assert_eq!(ours.len(), want.len(), "both frames are the same layout");
+    assert_eq!(ours.len(), luma * 3 / 2, "tightly packed NV12");
+
+    eprintln!(
+        "--- AV1 frame 0: {width}x{height} NV12, {} bytes ---",
+        ours.len()
+    );
+    eprintln!("  ours   {}", sha256_hex(ours));
+    eprintln!("  golden {}", sha256_hex(want));
+
+    // A plane that never varies means nothing was decoded into the image at all,
+    // which is a different failure from decoding it wrongly.
+    let flat = |plane: &[u8]| plane.iter().all(|b| *b == plane[0]);
+    if flat(&ours[..luma]) {
+        eprintln!(
+            "  ⚠ our LUMA is constant ({}) — nothing decoded here",
+            ours[0]
+        );
+    }
+    if flat(&ours[luma..]) {
+        eprintln!(
+            "  ⚠ our CHROMA is constant ({}) — nothing decoded here",
+            ours[luma]
+        );
+    }
+
+    for (name, ours, want) in [
+        ("luma  ", &ours[..luma], &want[..luma]),
+        ("chroma", &ours[luma..], &want[luma..]),
+    ] {
+        if ours == want {
+            eprintln!("  {name}: IDENTICAL ({} bytes)", ours.len());
+            continue;
+        }
+        let mut differing = 0usize;
+        let mut max_delta = 0u32;
+        let mut total_delta = 0u64;
+        // |delta| buckets: 1, 2, 3-4, 5-8, 9-16, 17-64, 65+.
+        let mut buckets = [0usize; 7];
+        let mut first: Vec<(usize, u8, u8)> = Vec::new();
+        for (i, (a, b)) in ours.iter().zip(want.iter()).enumerate() {
+            if a == b {
+                continue;
+            }
+            let delta = u32::from(a.abs_diff(*b));
+            differing += 1;
+            max_delta = max_delta.max(delta);
+            total_delta += u64::from(delta);
+            let bucket = match delta {
+                1 => 0,
+                2 => 1,
+                3..=4 => 2,
+                5..=8 => 3,
+                9..=16 => 4,
+                17..=64 => 5,
+                _ => 6,
+            };
+            buckets[bucket] += 1;
+            if first.len() < 8 {
+                first.push((i, *a, *b));
+            }
+        }
+        let percent = 100.0 * differing as f64 / ours.len() as f64;
+        eprintln!(
+            "  {name}: {differing}/{} bytes differ ({percent:.2}%), max |delta| {max_delta}, \
+             mean |delta| over the differing bytes {:.2}",
+            ours.len(),
+            total_delta as f64 / differing as f64
+        );
+        eprintln!(
+            "    |delta| histogram  1:{} 2:{} 3-4:{} 5-8:{} 9-16:{} 17-64:{} 65+:{}",
+            buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6]
+        );
+        // One ROW is `width` bytes in both planes — luma because it is `width`
+        // samples wide, interleaved chroma because it is `width / 2` samples wide
+        // and two bytes per sample. So one formula serves both, and the chroma
+        // coordinates it prints are in chroma units.
+        let positions: Vec<String> = first
+            .iter()
+            .map(|(i, a, b)| format!("(x{},y{}) {a}≠{b}", i % width, i / width))
+            .collect();
+        eprintln!("    first differing: {}", positions.join("  "));
+    }
+
+    // A displacement, not a difference: does our luma equal the reference read a
+    // few rows or columns over? That is what a wrong crop origin or a copy extent
+    // taken from the pool rather than the render region looks like, and the shift
+    // that matches IS the error.
+    if ours[..luma] != want[..luma] {
+        let mut best: Option<(i32, i32, f64)> = None;
+        for dy in -4i32..=4 {
+            for dx in -8i32..=8 {
+                if (dy, dx) == (0, 0) {
+                    continue;
+                }
+                let (mut hit, mut seen) = (0usize, 0usize);
+                for y in 8..height - 8 {
+                    for x in 8..width - 8 {
+                        let sy = (y as i32 + dy) as usize;
+                        let sx = (x as i32 + dx) as usize;
+                        seen += 1;
+                        if ours[y * width + x] == want[sy * width + sx] {
+                            hit += 1;
+                        }
+                    }
+                }
+                let score = hit as f64 / seen as f64;
+                if best.is_none_or(|(_, _, b)| score > b) {
+                    best = Some((dy, dx, score));
+                }
+            }
+        }
+        // The identity's own score, for scale: a decode that is merely slightly
+        // wrong still matches most bytes in place, so a shift only means something
+        // when it beats staying put.
+        let (mut hit, mut seen) = (0usize, 0usize);
+        for y in 8..height - 8 {
+            for x in 8..width - 8 {
+                seen += 1;
+                if ours[y * width + x] == want[y * width + x] {
+                    hit += 1;
+                }
+            }
+        }
+        let identity = hit as f64 / seen as f64;
+        if let Some((dy, dx, score)) = best {
+            eprintln!(
+                "  luma shift probe: in place {:.3} · best shift dy{dy:+} dx{dx:+} {score:.3}{}",
+                identity,
+                if score > identity + 0.05 {
+                    "  ⚠ A SHIFT FITS BETTER — this is readback geometry, not decode"
+                } else {
+                    "  (no shift fits better: the pixels are in the right place and \
+                     carry the wrong values)"
+                }
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CPU coherence guards — NOT `#[ignore]`d.
 //
@@ -1312,6 +1786,48 @@ fn av1_goldens_and_the_ivf_split_agree_with_the_planner() {
         "a clean conformance vector must plan without concealment — any warning here \
          means the parity leg would be hashing concealed pixels against a clean \
          reference"
+    );
+}
+
+/// The vendored frame-0 pixels ARE the first golden — not a second opinion about it.
+///
+/// [`AV1_FRAME0`] is the one place in this file where reference PIXELS live rather
+/// than hashes, and pixels are exactly the kind of file that rots: regenerate the
+/// goldens from a re-synced vector and this blob keeps describing the old one, while
+/// the diagnostic leg that reads it goes on confidently naming the wrong cause. So
+/// its digest is re-derived here and compared against `GOLDENS_AV1`'s first line —
+/// the trusted, three-way cross-checked set — on every platform, with no GPU.
+///
+/// It also pins the layout the diagnostic's arithmetic assumes: 320x240 tightly
+/// packed NV12 is 115200 bytes, luma first.
+#[test]
+fn the_av1_frame0_reference_is_the_first_golden() {
+    let (width, height) = (DISPLAY_AV1.0 as usize, DISPLAY_AV1.1 as usize);
+    assert_eq!(
+        AV1_FRAME0.len(),
+        width * height * 3 / 2,
+        "data/test-25fps-av1.frame0.nv12 must be one tightly packed NV12 frame of \
+         the vector's render region"
+    );
+    let goldens = golden_hashes(GOLDENS_AV1);
+    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps-av1.nv12.sha256");
+    assert_eq!(
+        sha256_hex(AV1_FRAME0),
+        goldens[0],
+        "the vendored frame-0 pixels must hash to the AV1 golden set's FIRST entry — \
+         if they no longer do, the blob is from a different decode than the goldens \
+         and `av1_frame0_pixels_say_which_plane_and_how_badly` would attribute a \
+         divergence to the wrong cause. Regenerate it alongside the goldens: decode \
+         the vector with `-f rawvideo -pix_fmt nv12 -fps_mode passthrough` and take \
+         the first 115200 bytes (the golden file's header carries the full command)"
+    );
+    // Not a flat blob: a frame of one repeated byte would satisfy a length check and
+    // make every per-plane statistic in the diagnostic meaningless.
+    let luma = &AV1_FRAME0[..width * height];
+    let chroma = &AV1_FRAME0[width * height..];
+    assert!(
+        luma.iter().any(|b| *b != luma[0]) && chroma.iter().any(|b| *b != chroma[0]),
+        "both planes must carry real picture content"
     );
 }
 

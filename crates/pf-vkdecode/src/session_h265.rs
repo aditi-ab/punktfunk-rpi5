@@ -336,7 +336,13 @@ impl VideoSessionH265 {
     ///
     /// Live device + live session; the Std slices' backing (the `OwnedStd*`
     /// wrappers, INCLUDING the heap blocks their embedded pointers target)
-    /// outlives this call — Vulkan copies all parameter data before returning.
+    /// outlives this call.
+    ///
+    /// ⚠ This used to end "— Vulkan copies all parameter data before returning",
+    /// and that is **not universally true**: see [`crate::session::VideoSession`]'s
+    /// twin of this comment and [`crate::session_av1`], where a driver was measured
+    /// dereferencing a retained pointer long after the create call. H.265's Std SPS
+    /// carries SEVEN embedded pointers, more than any other set in this crate.
     unsafe fn create_parameters_object(
         &self,
         vps: &[hh::StdVideoH265VideoParameterSet],
@@ -441,8 +447,9 @@ impl VideoSessionH265 {
                     .update_sequence_count(self.ledger.next_update_seq())
                     .push_next(&mut add);
                 // SAFETY: live device + parameters object; `update` roots locals
-                // (incl. the OwnedStd backings) outliving the call, and Vulkan
-                // copies parameter data before returning.
+                // (incl. the OwnedStd backings) outliving the call. See
+                // `create_parameters_object` on why "and the driver copies them"
+                // is an observation about this fleet rather than a guarantee.
                 let r = unsafe {
                     (self.video_queue.fp().update_video_session_parameters_khr)(
                         self.device.handle(),
