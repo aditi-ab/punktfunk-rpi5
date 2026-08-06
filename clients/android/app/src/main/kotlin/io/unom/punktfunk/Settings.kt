@@ -438,6 +438,96 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
 }
 
 /**
+ * Sentinel [Settings.width]/[Settings.height] meaning "the native mode, narrowed so the picture
+ * clears the display cutout and the rounded corners" — resolved at connect by [safeDisplayMode],
+ * exactly as `0` is resolved by [nativeDisplayMode]. Negative, so it can never collide with a real
+ * size; distinct from the UI's `-1` "Custom…" sentinel.
+ */
+const val SAFE_AREA_MODE = -2
+
+/**
+ * Safe-area stream geometry — the pure part, so it is unit-testable without a Display.
+ *
+ * The phone clips the picture in HARDWARE: the cutout (notch / punch-hole) and the four rounded
+ * corners eat whatever the stream draws under them. [StreamScreen] deliberately draws edge-to-edge
+ * (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`) and centres the video at its own aspect ratio
+ * (`Modifier.aspectRatio`), so which pixels survive is decided purely by the mode's aspect:
+ *
+ *  * A 16:9 mode on a 20:9 phone pillarboxes, and those black bars land exactly on the unsafe
+ *    regions — which is why the presets have always "just worked".
+ *  * The NATIVE mode has the panel's own aspect, so it fills every pixel, cutout and corners
+ *    included. That is the mode that loses its corners.
+ *
+ * So asking the host for a mode narrower by the unsafe inset is the entire fix: the existing
+ * aspect-fit centres it inside the safe region, and pointer mapping follows for free (MouseInput
+ * derives the picture rect from the live video size, not from the window).
+ */
+object SafeArea {
+    /** The host rejects odd dimensions and anything under 320 px wide (`validate_dimensions`). */
+    const val MIN_WIDTH = 320
+
+    /**
+     * [nativeWidth] reduced by [perSideInsetPx] on each side, even-floored and clamped to the
+     * host's floor. Height is deliberately untouched: under aspect-fit only one axis can bind, and
+     * on a landscape phone that axis is always the horizontal one — insetting height as well would
+     * shrink the picture without uncovering anything.
+     */
+    fun insetWidth(nativeWidth: Int, perSideInsetPx: Int): Int {
+        val inset = perSideInsetPx.coerceAtLeast(0)
+        return (nativeWidth - inset * 2).coerceAtLeast(MIN_WIDTH) / 2 * 2
+    }
+}
+
+/**
+ * The per-side inset, in pixels, that the **landscape** stream must clear on this display.
+ *
+ * Two contributions, and the larger wins:
+ *  * **The cutout.** [DisplayCutout] is rotation-aware, so in landscape the housing shows up on
+ *    `left`/`right`. The settings screen may be portrait though, where the very same housing is
+ *    reported on `top`/`bottom` and the horizontal insets read zero — which would compute "no inset
+ *    needed" for exactly the devices that need one. The stream is always landscape, so a vertical
+ *    inset now becomes a horizontal one then: fall back to it.
+ *  * **The rounded corners.** These are NOT part of the cutout insets. For a FULL-HEIGHT picture the
+ *    horizontal clearance a corner of radius `r` needs is exactly `r`: at the topmost row the
+ *    display boundary sits at `x = r`, so anything left of that is clipped. Not conservative — it is
+ *    the precise requirement for a picture that spans the full height.
+ *
+ * `0` when the display has neither, which makes the safe mode identical to the native one.
+ */
+private fun displaySideInsetPx(context: Context): Int {
+    val display = probeDisplay(context) ?: return 0
+    var inset = 0
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        display.cutout?.let { cut ->
+            val horizontal = maxOf(cut.safeInsetLeft, cut.safeInsetRight)
+            val vertical = maxOf(cut.safeInsetTop, cut.safeInsetBottom)
+            inset = maxOf(inset, if (horizontal > 0) horizontal else vertical)
+        }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        for (position in intArrayOf(
+            android.view.RoundedCorner.POSITION_TOP_LEFT,
+            android.view.RoundedCorner.POSITION_TOP_RIGHT,
+            android.view.RoundedCorner.POSITION_BOTTOM_LEFT,
+            android.view.RoundedCorner.POSITION_BOTTOM_RIGHT,
+        )) {
+            display.getRoundedCorner(position)?.let { inset = maxOf(inset, it.radius) }
+        }
+    }
+    return inset
+}
+
+/**
+ * The native mode narrowed to clear the cutout and the rounded corners — the [SAFE_AREA_MODE]
+ * resolution, as a landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode];
+ * only the width moves.
+ */
+fun safeDisplayMode(context: Context): Triple<Int, Int, Int> {
+    val (w, h, hz) = nativeDisplayMode(context)
+    return Triple(SafeArea.insetWidth(w, displaySideInsetPx(context)), h, hz)
+}
+
+/**
  * True when this device's display can actually present HDR10, so we should advertise HDR to the
  * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
  * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
@@ -471,12 +561,21 @@ fun displaySupportsHdr(context: Context): Boolean {
     return supported
 }
 
-/** Resolve [Settings] (with its 0=native placeholders) to the concrete mode to request. */
+/**
+ * Resolve [Settings] (with its `0`=native and [SAFE_AREA_MODE] placeholders) to the concrete mode to
+ * request. The safe-area sentinel is checked first because it resolves BOTH axes together — it is one
+ * mode, not an independent width and height, and mixing half of it with a native height would ask
+ * for a size neither sentinel means.
+ */
 fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
-    val native = nativeDisplayMode(context)
-    val w = if (width > 0) width else native.first
-    val h = if (height > 0) height else native.second
-    val hz = if (hz > 0) hz else native.third
+    val base = if (width == SAFE_AREA_MODE && height == SAFE_AREA_MODE) {
+        safeDisplayMode(context)
+    } else {
+        nativeDisplayMode(context)
+    }
+    val w = if (width > 0) width else base.first
+    val h = if (height > 0) height else base.second
+    val hz = if (hz > 0) hz else base.third
     return Triple(w, h, hz)
 }
 
@@ -530,9 +629,10 @@ val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it)
 
 // ---- UI option tables (value, label). The first entry is always the "auto/native" default. ----
 
-/** (width, height, label). `(0,0)` = native display. */
+/** (width, height, label). `(0,0)` = native display; [SAFE_AREA_MODE] = native minus the cutout. */
 val RESOLUTION_OPTIONS = listOf(
     Triple(0, 0, "Native display"),
+    Triple(SAFE_AREA_MODE, SAFE_AREA_MODE, "Native display (safe area)"),
     Triple(1280, 720, "1280 × 720"),
     Triple(1920, 1080, "1920 × 1080"),
     Triple(2560, 1440, "2560 × 1440"),

@@ -171,14 +171,26 @@ enum SettingsOptions {
 
     /// This device's native mode first, then the presets, deduped by dimensions (native wins a
     /// tie).
+    ///
+    /// On iOS the native row is followed by its **safe-area** variant, which is the same mode
+    /// narrowed so the picture clears the sensor housing and the rounded corners — see
+    /// [`SafeDisplay`] for why a narrower mode is the whole fix. It is emitted unconditionally and
+    /// left to the dedup below: on a device with no housing the two modes are identical, the
+    /// duplicate is dropped, and no pointless row appears.
     @MainActor
     static func resolutionModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
         #if os(iOS) || os(tvOS)
         let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
-        native = [("This device",
-                   Int(max(bounds.width, bounds.height)),
-                   Int(min(bounds.width, bounds.height)))]
+        let nativeW = Int(max(bounds.width, bounds.height))
+        let nativeH = Int(min(bounds.width, bounds.height))
+        native = [("This device", nativeW, nativeH)]
+        #if os(iOS)
+        let safe = SafeDisplay.mode(
+            nativeWidth: nativeW, nativeHeight: nativeH,
+            sideInsetPoints: mainWindowSideInset(), scale: UIScreen.main.nativeScale)
+        native.append(("This device (safe area)", safe.width, safe.height))
+        #endif
         #else
         if let screen = NSScreen.main {
             let scale = screen.backingScaleFactor
@@ -190,6 +202,26 @@ enum SettingsOptions {
         var seen = Set<String>()
         return (native + resolutionPresets).filter { seen.insert("\($0.w)x\($0.h)").inserted }
     }
+
+    #if os(iOS)
+    /// The key window's per-side safe-area inset in points, resolved for the LANDSCAPE stream even
+    /// when this settings screen is currently portrait (see `SafeDisplay.sideInsetPoints`).
+    ///
+    /// Zero when no window is up yet — the safe mode then equals the native one and `resolutionModes`
+    /// dedups the row away, which is the right answer for a device we can't measure.
+    @MainActor
+    private static func mainWindowSideInset() -> Double {
+        let insets = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first { $0.isKeyWindow }?
+            .safeAreaInsets
+        guard let insets else { return 0 }
+        return SafeDisplay.sideInsetPoints(
+            left: Double(insets.left), right: Double(insets.right), top: Double(insets.top),
+            isPhone: UIDevice.current.userInterfaceIdiom == .phone)
+    }
+    #endif
 
     /// Refresh rates the device can actually display (no point asking the host to render frames
     /// the screen can't show), plus any stored custom value so it stays selectable.
