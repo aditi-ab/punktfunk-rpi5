@@ -349,6 +349,16 @@ struct ContentView: View {
             active: fullscreenForSession && model.connection != nil,
             isFullscreen: $isFullscreen))
         #endif
+        // A game launched from the library just exited, so the session ended on purpose: put the
+        // player back in that host's library rather than on host selection. Set on the outer Group
+        // (like the sheets below) so it survives the streaming → home transition the disconnect
+        // drives, and consumed here — the model hands the host over once and we clear it, so a
+        // later manual dismiss of the library can't be undone by a stale value.
+        .onChange(of: model.returnToLibrary) { _, host in
+            guard let host else { return }
+            model.returnToLibrary = nil
+            libraryTarget = host
+        }
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).

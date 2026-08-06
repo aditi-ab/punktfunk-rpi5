@@ -225,6 +225,15 @@ public final class StreamViewController: StreamViewControllerBase {
     /// How long an escalated attempt reports `prefersPointerLocked == false` before flipping back,
     /// so the system observes a real transition instead of coalescing the flip away.
     private static let pointerLockForcedOffHold: TimeInterval = 0.05
+    /// Attempts spent in the QUIET tail (see `scheduleQuietRelock()`), reset with the burst.
+    private var pointerRelockQuietAttempt = 0
+    /// When the quiet tail re-asks, measured from the drop. The visible burst above spends its whole
+    /// budget inside ~0.6 s — and the pointer-lock cooldown the platform applies right after its own
+    /// Escape gesture is about a second, so every one of those attempts asks while the answer can
+    /// only be no. These land AFTER it. They are "quiet" because unlike the burst they do not hide
+    /// the cursor or mute motion: the pointer behaves exactly as it does today while they run, so
+    /// stretching the recovery costs the user nothing if it also fails.
+    private static let pointerRelockQuietDelays: [TimeInterval] = [1.2, 2.4]
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -340,11 +349,79 @@ public final class StreamViewController: StreamViewControllerBase {
         // SwiftUI places us in the hierarchy AFTER start()'s setCaptured(true), and may reparent us
         // later — re-anchor the chain here so a lock requested before we had a parent still lands.
         updatePointerLockChain()
+        anchorKeyResponder()
     }
 
     public override func didMove(toParent parent: UIViewController?) {
         super.didMove(toParent: parent)
         updatePointerLockChain() // chain shape changed — re-anchor (or no-op if not yet in a window)
+    }
+
+    /// Put THIS controller on the responder chain for hardware key presses.
+    ///
+    /// Nothing of ours is otherwise a first responder during a normal stream: keys arrive on the
+    /// GameController (`GCKeyboard`) path, which is a parallel HID feed that does not consume the
+    /// UIKit event, and `StreamLayerUIView` only becomes first responder to summon the SOFT
+    /// keyboard (it is `UIKeyInput`, so making it one for any other reason would raise the on-screen
+    /// keyboard mid-game). With no responder of ours in the chain, every hardware key press reaches
+    /// UIKit unclaimed — and an unclaimed press is what lets the system apply its own default for
+    /// that key. `pressesBegan` below is where we claim Escape; this is what gets it delivered.
+    ///
+    /// A controller is not `UIKeyInput`, so being first responder raises no keyboard. Deferred to
+    /// the soft keyboard whenever the view has taken over, so the three-finger-swipe keyboard is
+    /// unaffected.
+    ///
+    /// Only while captured — the whole claim is scoped to "the stream owns the keyboard", and
+    /// holding the chain outside that would sit in front of SwiftUI's focus for no reason. Safe to
+    /// call from anywhere: `start()` engages capture BEFORE SwiftUI puts us in a window (where
+    /// `becomeFirstResponder` cannot succeed), so `viewDidAppear` calls it again to catch up.
+    private func anchorKeyResponder() {
+        guard captured, !streamView.isFirstResponder, !isFirstResponder else { return }
+        becomeFirstResponder()
+    }
+
+    public override var canBecomeFirstResponder: Bool { true }
+
+    /// Claim Escape while the stream owns the keyboard, so the SYSTEM never gets to act on it.
+    ///
+    /// This is the fix for "Escape hands the mouse back to iPadOS": the platform releases the
+    /// scene's pointer lock on an Escape that nothing claimed — the same "let me out" the web
+    /// Pointer Lock API mandates. Every recovery attempt before this one fought that release AFTER
+    /// the fact (a re-lock burst, then a click), and the platform's post-Escape cooldown means the
+    /// burst is refused by construction. Claiming the press means there is nothing to recover from.
+    ///
+    /// Escape is forwarded to the host on the GCKeyboard path, which is untouched by this — that
+    /// path never sees the UIKit responder chain, so the host still receives the keystroke and
+    /// in-game menus still open. Only the system's own interpretation is suppressed.
+    ///
+    /// Strictly scoped: only while `captured` (the stream owns input), and only Escape. Anything
+    /// else — including every key while the pointer is released — goes to `super` untouched, so
+    /// Escape still dismisses sheets, exits full screen and does everything else it should whenever
+    /// we are not holding the keyboard. The deliberate ways out are unaffected: ⌘⎋ and ⌃⌥⇧Q are
+    /// recognized on the GCKeyboard path and clear `captured` themselves.
+    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let unclaimed = presses.filter { !claimsPress($0) }
+        if !unclaimed.isEmpty || presses.isEmpty {
+            super.pressesBegan(unclaimed, with: event)
+        }
+    }
+
+    public override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let unclaimed = presses.filter { !claimsPress($0) }
+        if !unclaimed.isEmpty || presses.isEmpty {
+            super.pressesEnded(unclaimed, with: event)
+        }
+    }
+
+    public override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Never swallowed: a cancelled press is the system taking the key away from us, and
+        // dropping it here would strand UIKit's own bookkeeping for a press we did claim.
+        super.pressesCancelled(presses, with: event)
+    }
+
+    /// Is this press one the stream owns outright (Escape while captured)?
+    private func claimsPress(_ press: UIPress) -> Bool {
+        captured && press.key?.keyCode == .keyboardEscape
     }
     #endif
 
@@ -478,6 +555,7 @@ public final class StreamViewController: StreamViewControllerBase {
             if !down, self.wantsPointerLock, self.pointerLockWasEngaged,
                 !self.pointerRelockPending, self.pointerLockEngaged() != true {
                 self.pointerRelockAttempt = 0
+                self.pointerRelockQuietAttempt = 0 // a real gesture buys a fresh tail too
                 self.updatePointerLockChain() // a reparent since the drop would break the walk to us
                 self.requestPointerRelock()
             }
@@ -749,10 +827,16 @@ public final class StreamViewController: StreamViewControllerBase {
             guard captureEnabled, !captured, connection != nil else { return }
             inputCapture?.setForwarding(true, suppressClick: fromClick)
             captured = true
+            // Claim the responder chain for as long as we own the keyboard — `pressesBegan` has to
+            // be delivered to us before it can keep Escape away from the system.
+            anchorKeyResponder()
         } else {
             guard captured else { return }
             inputCapture?.setForwarding(false)
             captured = false
+            // Hand the chain back: released means Escape is the system's again, and staying first
+            // responder for a stream that no longer owns input would sit in front of SwiftUI focus.
+            if isFirstResponder { resignFirstResponder() }
         }
         setNeedsUpdateOfPrefersPointerLocked()
         updatePointerLockChain() // (re)anchor the SwiftUI ancestors so the lock actually resolves
@@ -782,6 +866,7 @@ public final class StreamViewController: StreamViewControllerBase {
             pointerLockWasEngaged = true
             pointerRelockPending = false
             pointerRelockAttempt = 0
+            pointerRelockQuietAttempt = 0 // granted — any scheduled tail finds nothing to do
         } else if wantsPointerLock, pointerLockWasEngaged {
             requestPointerRelock()
         } else {
@@ -790,6 +875,7 @@ public final class StreamViewController: StreamViewControllerBase {
             if !wantsPointerLock { pointerLockWasEngaged = false }
             pointerRelockPending = false
             pointerRelockAttempt = 0
+            pointerRelockQuietAttempt = 0
         }
         let useGCMouse = captured && locked
         // Lock dropped (or capture ended) while the GCMouse path held a button down: once
@@ -830,10 +916,12 @@ public final class StreamViewController: StreamViewControllerBase {
             pointerRelockAttempt = 0
         }
         guard pointerRelockAttempt < Self.pointerRelockAttemptLimit else {
-            // Out of budget: fall back to exactly today's behavior — the iPadOS cursor comes back
-            // and a click into the video re-captures. The caller invalidates the interaction, so
-            // the cursor can never stay hidden on a lock the system won't grant.
+            // Out of VISIBLE budget: give the cursor straight back (the caller invalidates the
+            // interaction, so it can never stay hidden on a lock the system won't grant) and hand
+            // off to the quiet tail, which keeps asking after the platform's post-Escape cooldown
+            // without costing the user anything while it does.
             pointerRelockPending = false
+            scheduleQuietRelock()
             return
         }
         pointerRelockAttempt += 1
@@ -878,6 +966,43 @@ public final class StreamViewController: StreamViewControllerBase {
                 [weak self] in
                 guard let self, self.pointerRelockPending else { return }
                 self.syncPointerLock()
+            }
+        }
+    }
+
+    /// Keep asking for the lock after the visible burst has given up — past the cooldown the
+    /// platform applies to its own Escape gesture, which is the window the burst spends entirely.
+    ///
+    /// Deliberately NOT a longer burst. `pointerRelockPending` hides the cursor and mutes absolute
+    /// motion, which is only tolerable for the couple of frames a fast re-grab takes; holding that
+    /// for seconds would trade a released pointer for a frozen one. These attempts leave the
+    /// pointer fully usable — if they all fail the user sees exactly today's behaviour, and a click
+    /// is still the immediate way back.
+    ///
+    /// Each attempt presents a real false→true transition (the same escalation the burst uses on
+    /// its later tries) because re-asserting a value the system already holds is what didn't take.
+    /// A grant arrives as a `didChange` → `syncPointerLock`, which resets the counters, so a
+    /// successful attempt silently ends the tail.
+    private func scheduleQuietRelock() {
+        guard pointerRelockQuietAttempt < Self.pointerRelockQuietDelays.count else { return }
+        let delay = Self.pointerRelockQuietDelays[pointerRelockQuietAttempt]
+        pointerRelockQuietAttempt += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            // Still wanted, still ours to want, and still not held — otherwise the tail is moot.
+            guard self.wantsPointerLock, self.pointerLockWasEngaged,
+                self.pointerLockEngaged() != true,
+                self.view.window?.windowScene?.activationState == .foregroundActive
+            else { return }
+            self.pointerLockForcedOff = true
+            self.setNeedsUpdateOfPrefersPointerLocked()
+            self.updatePointerLockChain()
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockForcedOffHold) {
+                [weak self] in
+                guard let self else { return }
+                self.pointerLockForcedOff = false
+                self.setNeedsUpdateOfPrefersPointerLocked()
+                self.scheduleQuietRelock() // no-op once the delays are spent, or once granted
             }
         }
     }

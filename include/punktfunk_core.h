@@ -76,7 +76,14 @@
 // capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
 // receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
 // arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 16
+// v17: added `punktfunk_connection_end_reason` + the `PUNKTFUNK_END_REASON_*` vocabulary — asks,
+// once a session has ended, WHY: this client closed it, the host's launched game exited (its close
+// carried [`quic::APP_EXITED_CLOSE_CODE`], which the host has sent since long before this bump
+// with nothing consuming it), the host ended it cleanly, the host reported a failure, or the
+// connection was simply lost. Purely a read of state the core already had: no new call is required
+// of an embedder, a client that never calls it is unchanged, and the host sends exactly the same
+// bytes either way, so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 17
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -1617,6 +1624,63 @@ typedef uint8_t PunktfunkInputKind;
 #endif // __cplusplus
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Why a session ended — [`NativeClient::end_reason`], and `punktfunk_connection_end_reason` on the
+// C surface.
+//
+// The distinction that matters to a UI is **normal vs alarming**, and it is not a spectrum: a
+// player quitting their game and a host falling off the network both arrive as "the session
+// ended", and a client with no way to separate them has to word all of them the same. Every client
+// worded them as failures.
+//
+// Ordered loosely from "the user did this on purpose" to "something went wrong". Values are part
+// of the C ABI: append only, never renumber.
+enum PunktfunkEndReason
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // Not ended (or ended before a reason could be observed). Also what an unknown future value
+    // decodes to, so an older client reading a newer core degrades to "no opinion".
+    PUNKTFUNK_END_REASON_NONE = 0,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // **This client** closed the session — the user pressed stop, or the handle was dropped.
+    // Nothing to report: the UI already knows, it initiated it.
+    PUNKTFUNK_END_REASON_LOCAL = 1,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host's launched game exited ([`crate::quic::APP_EXITED_CLOSE_CODE`]). A normal finish,
+    // and the one reason a launcher client can act on: go back to the library the title was
+    // launched from rather than all the way out to host selection.
+    PUNKTFUNK_END_REASON_GAME_EXITED = 2,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host ended the session cleanly and deliberately — an operator "End" in the console, or
+    // the session simply finishing. Normal; say so plainly or say nothing.
+    PUNKTFUNK_END_REASON_HOST_ENDED = 3,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host closed reporting a failure of its own. Worth showing, and the host's log has the
+    // detail.
+    PUNKTFUNK_END_REASON_HOST_ERROR = 4,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The connection died rather than being closed: idle timeout, reset, the network going away.
+    // This — and only this — is the "the host may be asleep, wake it" case.
+    PUNKTFUNK_END_REASON_LOST = 5,
+#endif
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum PunktfunkEndReason PunktfunkEndReason;
+#else
+typedef uint8_t PunktfunkEndReason;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
 // encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
 // instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
@@ -2496,6 +2560,28 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
+// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
+//
+// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
+// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
+// while the connection is torn down, and a client that never calls it behaves exactly as it did
+// before this existed.
+//
+// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
+// their game from a host falling off the network, so every client wrote one message for all of
+// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
+// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
+// for `HOST_ERROR` and `LOST`.
+//
+// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

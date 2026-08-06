@@ -73,6 +73,7 @@ import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.Sc2Capture
+import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.atomic.AtomicBoolean
@@ -86,7 +87,7 @@ import kotlinx.coroutines.delay
  * the connect that produced this handle.
  */
 @Composable
-fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
+fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> Unit) {
     val handle = session.handle
     val initialSettings = session.settings
     val micEnabled = initialSettings.micEnabled
@@ -200,12 +201,32 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         while (true) {
             delay(1000)
             if (NativeBridge.nativeSessionEnded(handle)) {
-                Toast.makeText(
-                    context,
-                    "Connection lost — the host may be asleep. Wake it to reconnect.",
-                    Toast.LENGTH_LONG,
-                ).show()
-                onDisconnect()
+                // WHY it ended decides what the user is told. This used to show the "host may be
+                // asleep" line for EVERY ending — including a game the player had just quit and a
+                // session the host ended on purpose — which reads as a failure report for
+                // something nobody did wrong. Only a connection that actually died says that now.
+                val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
+                when (reason) {
+                    SessionEndReason.LOST ->
+                        Toast.makeText(
+                            context,
+                            "Connection lost — the host may be asleep. Wake it to reconnect.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    SessionEndReason.HOST_ERROR ->
+                        Toast.makeText(
+                            context,
+                            "The host ended the session with an error.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    // Deliberate endings — the player quit the game, the host was stopped, or we
+                    // closed it. Leaving the stream IS the feedback; a toast would only add noise.
+                    SessionEndReason.GAME_EXITED,
+                    SessionEndReason.HOST_ENDED,
+                    SessionEndReason.LOCAL,
+                    SessionEndReason.NONE -> {}
+                }
+                onSessionEnded(reason)
                 return@LaunchedEffect
             }
         }
@@ -330,7 +351,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
         // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
         // (must be held ~1.5 s) and fires onExitChord on its main-thread timer, so leave the stream
         // the same way the Back gesture does.
-        activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
+        activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) }
         router.onExitChord = { activity?.requestStreamExit?.invoke() }
         // Show a "hold to quit" hint the moment the chord completes (the router debounces the actual
         // exit); it clears when the buttons release early or the hold elapses. Runs on the main thread.
@@ -617,7 +638,7 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     }
 
     // Back gesture = a deliberate exit → signal the quit so the host tears down now (no linger).
-    BackHandler { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
+    BackHandler { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) }
 
     // Leaving the app (Home, task switch, screen off) MUST end the session. Android does not
     // suspend a process for going to background, so without this the native worker kept running and
@@ -625,14 +646,14 @@ fun StreamScreen(session: ActiveSession, onDisconnect: () -> Unit) {
     // host still saw a live client and held the session (and its display + encoder) open until the
     // OS eventually reclaimed the process, which on a TV box is effectively never.
     //
-    // Route it through `onDisconnect()` so the composable's `onDispose` above runs the one real
+    // Route it through `onSessionEnded()` so the composable's `onDispose` above runs the one real
     // teardown path. Deliberately NOT a `nativeDisconnectQuit`: backgrounding isn't a user "quit",
     // so the host should linger the display and make coming straight back a fast reconnect.
     DisposableEffect(handle) {
         val lifecycle = (context as? LifecycleOwner)?.lifecycle
         val obs = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
-                onDisconnect()
+                onSessionEnded(SessionEndReason.LOCAL)
             }
         }
         lifecycle?.addObserver(obs)
