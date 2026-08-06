@@ -3004,6 +3004,7 @@ dependencies = [
  "sdl3",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
  "ureq",
  "wasapi",

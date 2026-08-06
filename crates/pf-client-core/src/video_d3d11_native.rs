@@ -947,3 +947,544 @@ fn copy_into(dst: &mut [u8], src: &[u8]) -> Result<()> {
     dst[..src.len()].copy_from_slice(src);
     Ok(())
 }
+
+#[cfg(test)]
+mod parity {
+    //! Frame-hash parity for this rung — the evidence M5 shipped without.
+    //!
+    //! `#[ignore]`d: it needs a real D3D11 video device. Run it on a Windows box with
+    //!
+    //! ```text
+    //! cargo test -p pf-client-core --lib video_d3d11_native -- --ignored --nocapture
+    //! ```
+    //!
+    //! and pin a GPU on a multi-adapter box with `PF_DXVA_ADAPTER=<substring of the
+    //! adapter description>` — .173 enumerates its AMD iGPU first, not the 4090, so an
+    //! unpinned run there reports the iGPU and that is a fact worth printing rather
+    //! than assuming.
+    //!
+    //! # What it proves, and against what
+    //!
+    //! The same thing `pf-vkdecode`'s `gpu_parity` proves for the Vulkan rung, against
+    //! the same reference: H.264 and H.265 decoding are exactly specified, so a
+    //! conformant decoder must reproduce libavcodec's SOFTWARE output bit for bit. The
+    //! goldens are therefore libavcodec's, not the FFmpeg D3D11VA rung's — ground truth
+    //! rather than a peer implementation, and the identical yardstick M3 was held to,
+    //! which makes the two rungs' verdicts directly comparable. It reads back the
+    //! DECODE surface, before the `VideoProcessorBlt`, so what is hashed is what this
+    //! rung is responsible for: the shared hand-off is the field-proven half.
+    //!
+    //! # Why the harness reorders and the rung does not
+    //!
+    //! This rung presents every picture the instant it decodes: `submit` blits
+    //! `setup_slot` and returns. It never consults `AuPlan::dpb.outputs`, which is
+    //! where display order lives — the native Vulkan rung keeps a display-order queue
+    //! for exactly that reason, and libavcodec's D3D11VA rung reorders internally.
+    //!
+    //! For punktfunk's own streams the two orders coincide (hosts emit zero-reorder
+    //! low-delay output with no B pictures), which is why this has never shown. Both
+    //! vendored conformance vectors DO reorder, though — the H.265 one's first B
+    //! picture at AU 3 is what localised the RPS slot defect — so a harness that hashed
+    //! in decode order would report a permutation against display-order goldens and
+    //! read like a decoder fault.
+    //!
+    //! So the harness hashes each decoded surface against the `PicId` the planner
+    //! assigned it, then emits those hashes in the planner's own output order. The
+    //! reordering is the TEST's, done by the same planner the rung already trusts, and
+    //! the divergence is recorded here rather than papered over: a stream that actually
+    //! reordered would present out of order through this rung today.
+    //!
+    //! # The crop
+    //!
+    //! The decode pool is aligned to the codec's granule and is therefore TALLER than
+    //! the picture, so the chroma plane starts at `RowPitch * texture_height`, not
+    //! `RowPitch * display_height` — reading it at the display height is the 1088-row
+    //! smear this project has already paid for once.
+
+    use std::collections::HashMap;
+
+    use pf_dxvadec::H264Planner;
+    use pf_dxvadec::H265Planner;
+    use sha2::Digest;
+    use windows::Win32::d3d11::ID3D11Resource;
+    use windows::Win32::d3d11::D3D11_CPU_ACCESS_READ;
+    use windows::Win32::d3d11::D3D11_MAPPED_SUBRESOURCE;
+    use windows::Win32::d3d11::D3D11_MAP_READ;
+    use windows::Win32::d3d11::D3D11_USAGE_STAGING;
+    use windows::Win32::dxgi::CreateDXGIFactory1;
+    use windows::Win32::dxgi::IDXGIFactory1;
+    use windows::Win32::dxgi::DXGI_ADAPTER_DESC1;
+
+    use super::*;
+
+    /// The vendored H.264 vector — the same file, at the same relative path, that
+    /// `pf-vkdecode`'s GPU legs decode. 250 access units, two slice NALUs per picture.
+    const TEST_25FPS_H264: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
+    );
+
+    /// The vendored H.265 twin: 250 access units, Main 8-bit 4:2:0, one slice each.
+    const TEST_25FPS_H265: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
+    );
+
+    /// libavcodec's per-display-frame NV12 hashes. Deliberately the SAME files the
+    /// Vulkan rung is held to, read across the crate boundary rather than copied: two
+    /// rungs measured against two copies of a golden set is two measurements, and the
+    /// point of this file is that they are one.
+    const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
+    const GOLDENS_H265: &str =
+        include_str!("../../pf-vkdecode/tests/data/test-25fps-h265.nv12.sha256");
+
+    /// Both vendored vectors are 250 display frames.
+    const FRAME_COUNT: usize = 250;
+
+    /// The golden file's hash lines (comments and blanks skipped).
+    fn golden_hashes(file: &'static str) -> Vec<&'static str> {
+        file.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use std::fmt::Write as _;
+        sha2::Sha256::digest(data)
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+
+    /// Byte offsets of every Annex-B NAL header in `stream`, in order.
+    ///
+    /// Emulation prevention guarantees `00 00 01` cannot appear inside a NAL payload,
+    /// so scanning for it finds start codes and nothing else; the header begins on the
+    /// byte after. Hand-rolled rather than borrowed from the parser because
+    /// `pf-client-core` does not depend on the vendored crate — and kept honest by the
+    /// access-unit count both legs assert, which no plausible splitter bug survives.
+    fn nal_headers(stream: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 3 <= stream.len() {
+            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
+                out.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Split `stream` into access units, given a per-NAL `(is_slice, starts_a_picture)`
+    /// rule. A new AU begins at a non-VCL NALU following slices, or at a slice that
+    /// declares itself the first of a picture when the current AU already has slices —
+    /// the same rule pf-bitstream applies, spelled once for both codecs.
+    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
+        let mut aus = Vec::new();
+        let mut au_start = 0usize;
+        let mut au_has_slice = false;
+        for header in nal_headers(stream) {
+            let (is_slice, first_in_picture) = classify(stream, header);
+            // The start code owning this header: three bytes, plus the optional
+            // leading zero byte of the four-byte form.
+            let mut start = header - 3;
+            if start > 0 && stream[start - 1] == 0x00 {
+                start -= 1;
+            }
+            if au_has_slice && (!is_slice || first_in_picture) {
+                aus.push(&stream[au_start..start]);
+                au_start = start;
+                au_has_slice = false;
+            }
+            au_has_slice |= is_slice;
+        }
+        aus.push(&stream[au_start..]);
+        aus
+    }
+
+    /// H.264: one-byte NAL header, `nal_unit_type` in the low 5 bits (1 = non-IDR
+    /// slice, 5 = IDR slice), and `first_mb_in_slice == 0` is the top bit of the byte
+    /// after it.
+    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
+        split_aus(stream, |s, h| {
+            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
+            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
+            (is_slice, first)
+        })
+    }
+
+    /// H.265: TWO-byte NAL header, `nal_unit_type` in bits 1..7 of the first byte and
+    /// "is a slice" the numeric range `< 32`, so `first_slice_segment_in_pic_flag` is
+    /// the top bit of the byte at `+2` where H.264 reads `+1`.
+    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
+        split_aus(stream, |s, h| {
+            let is_slice = (s[h] >> 1) & 0x3f < 32;
+            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
+            (is_slice, first)
+        })
+    }
+
+    /// The decode order and the display order of a vector's pictures, as `PicId`s.
+    ///
+    /// Both come from a planner run ALONGSIDE the decoder's own, over the same access
+    /// units: the planner is deterministic, so the ids it hands this walk are the ids
+    /// it hands the rung, and no production code has to grow a test accessor.
+    struct Order {
+        /// One id per access unit, in submission order.
+        decode: Vec<u64>,
+        /// The same ids in the planner's output (bumping) order, flush included.
+        display: Vec<u64>,
+    }
+
+    fn order_h264(aus: &[&[u8]]) -> Order {
+        let mut planner = H264Planner::new();
+        let mut order = Order {
+            decode: Vec::new(),
+            display: Vec::new(),
+        };
+        for (index, au) in aus.iter().enumerate() {
+            let plan = planner
+                .plan_au(au)
+                .unwrap_or_else(|e| panic!("AU {index}: the clean vector must plan, got {e:?}"));
+            assert_eq!(
+                (plan.picture.display_crop.x, plan.picture.display_crop.y),
+                (0, 0),
+                "AU {index}: this rung hands the blit a size and no origin, so a \
+                 non-zero conformance-window offset would be cropped from the wrong \
+                 corner — by the rung, not just by this harness"
+            );
+            order.decode.push(
+                plan.dpb.stored.unwrap_or_else(|| {
+                    panic!("AU {index}: every picture of this vector is stored")
+                }),
+            );
+            order.display.extend(plan.dpb.outputs.iter().copied());
+        }
+        order.display.extend(planner.flush().outputs);
+        order
+    }
+
+    fn order_h265(aus: &[&[u8]]) -> Order {
+        let mut planner = H265Planner::new();
+        let mut order = Order {
+            decode: Vec::new(),
+            display: Vec::new(),
+        };
+        for (index, au) in aus.iter().enumerate() {
+            let plan = planner
+                .plan_au(au)
+                .unwrap_or_else(|e| panic!("AU {index}: the clean vector must plan, got {e:?}"));
+            assert_eq!(
+                (plan.picture.display_crop.x, plan.picture.display_crop.y),
+                (0, 0),
+                "AU {index}: a non-zero conformance-window offset is cropped from the \
+                 wrong corner by this rung"
+            );
+            order.decode.push(
+                plan.dpb.stored.unwrap_or_else(|| {
+                    panic!("AU {index}: every picture of this vector is stored")
+                }),
+            );
+            order.display.extend(plan.dpb.outputs.iter().copied());
+        }
+        order.display.extend(planner.flush().outputs);
+        order
+    }
+
+    /// The LUID of the adapter whose description contains `PF_DXVA_ADAPTER`, and the
+    /// descriptions of everything enumerated (printed, so a run always says which GPU
+    /// answered rather than leaving it to be inferred).
+    fn pinned_adapter() -> Option<[u8; 8]> {
+        let want = std::env::var("PF_DXVA_ADAPTER").ok();
+        // SAFETY: DXGI factory creation takes no pointer and returns an owned factory
+        // or an error; the `Ok` binding is what proves one came back.
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            eprintln!("adapters: CreateDXGIFactory1 failed");
+            return None;
+        };
+        let mut chosen = None;
+        for i in 0.. {
+            // SAFETY: a COM call on the live factory; `Ok` proves an adapter came back.
+            let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
+                break;
+            };
+            // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is valid.
+            let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
+            // SAFETY: a COM call on the adapter just enumerated, filling the zeroed
+            // local through the out-param; checked before the descriptor is read.
+            if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
+                continue;
+            }
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let mut luid = [0u8; 8];
+            luid[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_le_bytes());
+            luid[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_le_bytes());
+            let hit = want
+                .as_deref()
+                .is_some_and(|w| name.to_lowercase().contains(&w.to_lowercase()));
+            eprintln!(
+                "adapter {i}: {name}{}",
+                if hit { "  <= pinned" } else { "" }
+            );
+            if hit && chosen.is_none() {
+                chosen = Some(luid);
+            }
+        }
+        if want.is_some() && chosen.is_none() {
+            panic!("PF_DXVA_ADAPTER matched no adapter (see the list above)");
+        }
+        chosen
+    }
+
+    /// GPU→CPU readback of one decode-pool slice, cropped to `display` and packed
+    /// tightly as NV12/P010 — byte-for-byte the layout the goldens hash.
+    struct Readback {
+        ctx: ID3D11DeviceContext,
+        staging: Option<ID3D11Texture2D>,
+    }
+
+    impl Readback {
+        fn read(
+            &mut self,
+            device: &ID3D11Device,
+            pool: &ID3D11Texture2D,
+            slice: u32,
+            display: (u32, u32),
+        ) -> Vec<u8> {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: `GetDesc` fills a plain-old-data descriptor through an out-param
+            // on a live texture and returns nothing to check.
+            unsafe { pool.GetDesc(&mut desc) };
+
+            if self.staging.is_none() {
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: desc.Width,
+                    Height: desc.Height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: desc.Format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ as u32,
+                    MiscFlags: 0,
+                };
+                let mut t: Option<ID3D11Texture2D> = None;
+                // SAFETY: one `?`-checked call on the live device over a fully
+                // initialised stack descriptor and a live `Option` out-param.
+                unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut t)) }
+                    .ok()
+                    .expect("create the readback staging texture");
+                self.staging = t;
+            }
+            let staging = self.staging.clone().expect("staging texture");
+
+            let (width, height) = display;
+            assert!(
+                width <= desc.Width && height <= desc.Height,
+                "the display region {width}x{height} does not fit the {}x{} pool surface",
+                desc.Width,
+                desc.Height
+            );
+            let ten_bit = desc.Format == pf_dxvadec::DXGI_FORMAT_P010;
+            let bytes_per_sample = if ten_bit { 2 } else { 1 };
+            let row_bytes = width as usize * bytes_per_sample;
+
+            // SAFETY: `src` and `dst` are the same device's textures of identical
+            // format and dimensions, so the single-subresource copy on the immediate
+            // context is valid; `slice` is the array slice the decoder just wrote and
+            // `MipLevels == 1` makes it the subresource index. `Map(D3D11_MAP_READ)`
+            // on a STAGING texture blocks until that copy has retired and yields
+            // `pData` valid for the whole resource: for NV12/P010 the luma plane is
+            // `desc.Height` rows at `RowPitch` and the chroma plane follows at byte
+            // offset `RowPitch * desc.Height`, so `total` below is exactly the mapped
+            // extent and every sub-slice read is inside it. `Unmap` pairs the `Map`.
+            let out = unsafe {
+                let src: ID3D11Resource = pool.cast().expect("pool -> resource");
+                let dst: ID3D11Resource = staging.cast().expect("staging -> resource");
+                self.ctx
+                    .CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, slice, None);
+                let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+                self.ctx
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map))
+                    .ok()
+                    .expect("Map the readback staging texture");
+                let pitch = map.RowPitch as usize;
+                let aligned_h = desc.Height as usize;
+                let total = pitch * (aligned_h + aligned_h.div_ceil(2));
+                let mapped = std::slice::from_raw_parts(map.pData as *const u8, total);
+                // The chroma plane starts at the ALIGNED height, never the display
+                // height — the pool surface is taller than the picture.
+                let chroma_off = pitch * aligned_h;
+                let mut out = Vec::with_capacity(row_bytes * (height as usize).div_ceil(2) * 3);
+                for y in 0..height as usize {
+                    out.extend_from_slice(&mapped[y * pitch..y * pitch + row_bytes]);
+                }
+                for y in 0..(height as usize).div_ceil(2) {
+                    let row = chroma_off + y * pitch;
+                    out.extend_from_slice(&mapped[row..row + row_bytes]);
+                }
+                self.ctx.Unmap(&staging, 0);
+                out
+            };
+            out
+        }
+    }
+
+    /// Decode `aus` through a real `NativeD3d11Decoder`, hash every picture, and
+    /// compare the planner's display order against libavcodec's goldens.
+    fn parity_run(codec: Codec, aus: &[&[u8]], order: &Order, goldens: &[&str], label: &str) {
+        assert_eq!(
+            aus.len(),
+            FRAME_COUNT,
+            "{label}: the vector must split into {FRAME_COUNT} access units — a \
+             different count means this file's splitter disagrees with pf-bitstream's, \
+             and nothing below it is meaningful"
+        );
+        assert_eq!(
+            order.display.len(),
+            goldens.len(),
+            "{label}: the planner outputs {} pictures, the goldens carry {}",
+            order.display.len(),
+            goldens.len()
+        );
+
+        let luid = pinned_adapter();
+        let mut decoder = NativeD3d11Decoder::new(codec, StreamFormat::SDR_420_8, luid, false)
+            .unwrap_or_else(|e| panic!("{label}: the box must host this profile — {e:#}"));
+        let mut readback = Readback {
+            ctx: decoder.context.clone(),
+            staging: None,
+        };
+
+        let mut by_id: HashMap<u64, String> = HashMap::new();
+        for (index, au) in aus.iter().enumerate() {
+            let sub = decoder
+                .plan(au)
+                .unwrap_or_else(|e| panic!("AU {index}: plan failed — {e:#}"))
+                .unwrap_or_else(|| panic!("AU {index}: this vector has no skipped pictures"));
+            assert!(
+                !sub.concealed,
+                "AU {index}: a clean vector must need no concealment"
+            );
+            let display = (sub.width, sub.height);
+            let slice = u32::from(sub.setup_slot);
+            decoder
+                .submit(au, &sub)
+                .unwrap_or_else(|e| panic!("AU {index}: submit failed — {e:#}"));
+            let session = decoder.session.as_ref().expect("submit built a session");
+            let pool = session.pool.clone();
+            let bytes = readback.read(&decoder.device, &pool, slice, display);
+            by_id.insert(order.decode[index], sha256_hex(&bytes));
+        }
+
+        let mut mismatches = 0usize;
+        for (n, (id, golden)) in order.display.iter().zip(goldens.iter()).enumerate() {
+            let got = by_id
+                .get(id)
+                .unwrap_or_else(|| panic!("display frame {n} names PicId {id}, never decoded"));
+            if got != golden {
+                if mismatches < 10 {
+                    eprintln!("{label}: display frame {n} (PicId {id}): {got} != {golden}");
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "{label}: {mismatches}/{} frames diverge from libavcodec (first 10 above; \
+             frame 0 is intra-only — if IT mismatches suspect the readback geometry \
+             (pitch/crop/plane offset) rather than the decode)",
+            goldens.len()
+        );
+        eprintln!(
+            "{label}: {} frames bit-identical to libavcodec software decode",
+            goldens.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h264_aus(TEST_25FPS_H264);
+        let order = order_h264(&aus);
+        parity_run(
+            Codec::H264,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_H264),
+            "H.264",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h265_aus(TEST_25FPS_H265);
+        let order = order_h265(&aus);
+        parity_run(
+            Codec::H265,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_H265),
+            "H.265",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // CPU guards — NOT `#[ignore]`d, so ordinary CI notices when this file's
+    // splitter or the goldens drift away from pf-bitstream.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn the_local_splitter_agrees_with_the_planner_on_both_vectors() {
+        let h264 = split_h264_aus(TEST_25FPS_H264);
+        assert_eq!(h264.len(), FRAME_COUNT, "H.264 vector access units");
+        let order = order_h264(&h264);
+        assert_eq!(order.decode.len(), FRAME_COUNT);
+        assert_eq!(
+            order.display.len(),
+            golden_hashes(GOLDENS_H264).len(),
+            "the H.264 planner's output count must match the golden count"
+        );
+
+        let h265 = split_h265_aus(TEST_25FPS_H265);
+        assert_eq!(h265.len(), FRAME_COUNT, "H.265 vector access units");
+        let order = order_h265(&h265);
+        assert_eq!(order.decode.len(), FRAME_COUNT);
+        assert_eq!(
+            order.display.len(),
+            golden_hashes(GOLDENS_H265).len(),
+            "the H.265 planner's output count must match the golden count"
+        );
+    }
+
+    #[test]
+    fn both_vendored_vectors_really_do_reorder() {
+        // The module docs claim the harness must reorder because these vectors do. If
+        // that ever stops being true the claim is stale, and hashing in decode order
+        // would be the simpler harness — so assert the reason, not just the behaviour.
+        for (name, order) in [
+            ("H.264", order_h264(&split_h264_aus(TEST_25FPS_H264))),
+            ("H.265", order_h265(&split_h265_aus(TEST_25FPS_H265))),
+        ] {
+            assert_ne!(
+                order.decode, order.display,
+                "{name}: this vector no longer reorders — the harness's PicId \
+                 indirection is now unnecessary and its docs are wrong"
+            );
+        }
+    }
+}

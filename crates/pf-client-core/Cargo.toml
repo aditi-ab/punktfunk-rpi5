@@ -94,6 +94,12 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "winuser",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# The native D3D11VA rung's frame-hash parity test compares decoded surfaces against
+# libavcodec's goldens — the same SHA-256 list, and the same crate, pf-vkdecode's Vulkan
+# parity legs use (already in the workspace lock).
+sha2 = "0.10"
+
 [features]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
 # vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
