@@ -61,6 +61,16 @@ data class ActiveSession(
      * from "a different host" (a notice; a URL may never preempt a live session).
      */
     val hostId: String? = null,
+    /**
+     * This session was started by launching a title from [hostId]'s library, rather than by
+     * connecting to the host's desktop.
+     *
+     * Decides where the client goes when the session ENDS: a title launched out of a library
+     * belongs back in that library when its game exits — one press from the next one — not on the
+     * host-selection screen. Only meaningful together with a
+     * [io.unom.punktfunk.kit.SessionEndReason.GAME_EXITED] ending.
+     */
+    val launchedFromLibrary: Boolean = false,
 )
 
 /** Trust state of a host, shown as a colored pill on its card. */

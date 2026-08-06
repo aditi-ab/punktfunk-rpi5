@@ -179,6 +179,14 @@ public enum DefaultsKey {
     /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library)
     /// whenever a gamepad is connected. On by default; see `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
+    /// Which colour family the gamepad UI's living backdrop drifts through — a
+    /// `GamepadPalette` id ("violet" = the brand default, then "tide"/"forest"/"ember"/
+    /// "rose"/"graphite"). The cross-client `ui_palette` key: the desktop console and the
+    /// Android client carry the same table under the same names. Presentation only, so it is
+    /// a device preference and never part of a stream profile. An unknown value reads as the
+    /// default rather than failing — a newer client may have shipped a palette this build
+    /// doesn't know.
+    public static let uiPalette = "punktfunk.uiPalette"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
     /// the phone body is the only actuator in the player's hands. Off by default (opt-in); read

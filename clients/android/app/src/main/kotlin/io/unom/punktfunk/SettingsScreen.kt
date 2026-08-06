@@ -603,6 +603,10 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
 @Composable
 private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
     val (nw, nh, nhz) = nativeDisplayMode(context)
+    // The safe-area row carries its resolved size the same way the native row does. On a display with
+    // no cutout and square corners this equals the native mode — the row stays, honestly showing that
+    // it changes nothing here, rather than silently vanishing on some devices and not others.
+    val (sw, sh, _) = safeDisplayMode(context)
     // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
     // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
     // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
@@ -611,7 +615,13 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
     SettingsGroup("Resolution") {
         SettingDropdown(
             label = "Resolution",
-            options = RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to (if (w == 0) "$lbl ($nw × $nh)" else lbl) } +
+            options = RESOLUTION_OPTIONS.map { (w, h, lbl) ->
+                (w to h) to when (w) {
+                    0 -> "$lbl ($nw × $nh)"
+                    SAFE_AREA_MODE -> "$lbl ($sw × $sh)"
+                    else -> lbl
+                }
+            } +
                 // The (-1, -1) sentinel can't collide with a real size; once a custom size is
                 // stored its label carries the live value, like the native row carries ($nw × $nh).
                 ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
@@ -620,7 +630,10 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             caption = "The host makes a display exactly this size — no scaling. Native follows " +
                 "this device's panel.",
         ) { (w, h) ->
-            if (w < 0) {
+            // ONLY -1 is "Custom…". The other negative value is the safe-area sentinel, which is a
+            // stored mode like any preset — a blanket `w < 0` here would open the custom fields for it
+            // and overwrite it with a concrete size.
+            if (w == -1) {
                 // Seed from the current *effective* size so the fields start from something
                 // sensible (the resolved native mode, not the 0 × 0 placeholder).
                 customPicked = true

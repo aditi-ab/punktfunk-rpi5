@@ -203,17 +203,118 @@ pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
     (0.667, 0.667, 0.12, 0.047, 0.061, 5.0),
 ];
 
-/// The mesh gradient as SkSL, palette + motion baked into the source (only time and
-/// resolution are uniforms). A smooth bicubic blend of the 16 colours — a separable
+// --- Background palettes -------------------------------------------------------------------
+
+/// One background colour family for the console's living backdrop. A palette is NOT a second
+/// hand-tuned 16-colour grid: it is a hue rotation + saturation scale applied to
+/// [`MESH_COLORS`], so every palette inherits the field's structure (dark corners, bright
+/// interior pools, warm-left/cool-right) and the brand default is exactly the shipped look —
+/// `violet` is the identity transform. The Apple and Android clients carry the same table and
+/// the same [`tint`] math, so a palette reads as the same colour family on every client.
+pub struct Palette {
+    /// The stored `ui_palette` value (see `trust::Settings::ui_palette`).
+    pub id: &'static str,
+    /// What the settings row shows.
+    pub name: &'static str,
+    /// Hue rotation about the grey axis, degrees — positive runs red → green → blue.
+    pub hue_deg: f64,
+    /// Saturation scale about luminance; `1.0` keeps the source saturation.
+    pub sat: f64,
+}
+
+/// The six shipped palettes, in cycling order (the brand violet first, then cool → warm,
+/// then the neutral). Adding one here adds it to every console settings screen; the Apple
+/// and Android tables must gain the same entry to keep the `ui_palette` key portable.
+pub const PALETTES: [Palette; 6] = [
+    Palette {
+        id: "violet",
+        name: "Violet",
+        hue_deg: 0.0,
+        sat: 1.0,
+    },
+    Palette {
+        id: "tide",
+        name: "Tide",
+        hue_deg: -70.0,
+        sat: 1.0,
+    },
+    Palette {
+        id: "forest",
+        name: "Forest",
+        hue_deg: -130.0,
+        sat: 0.9,
+    },
+    Palette {
+        id: "ember",
+        name: "Ember",
+        hue_deg: 105.0,
+        sat: 1.0,
+    },
+    Palette {
+        id: "rose",
+        name: "Rose",
+        hue_deg: 60.0,
+        sat: 0.95,
+    },
+    Palette {
+        id: "graphite",
+        name: "Graphite",
+        hue_deg: 0.0,
+        sat: 0.12,
+    },
+];
+
+/// The palette stored under `id`, falling back to the brand default — an unknown name is a
+/// palette a newer client shipped, not a reason to draw nothing.
+pub fn palette(id: &str) -> &'static Palette {
+    PALETTES.iter().find(|p| p.id == id).unwrap_or(&PALETTES[0])
+}
+
+/// Rotate `(r, g, b)` about the grey axis by `deg` (Rodrigues — the same rotation the shader
+/// already uses for the ±8° warm/cool sway) and scale its saturation about luminance. Clamped,
+/// because a large rotation can push a channel out of gamut. Ported verbatim to Swift and
+/// Kotlin: keep the three copies in step or the palettes drift apart between clients.
+pub fn tint(c: (f64, f64, f64), deg: f64, sat: f64) -> (f64, f64, f64) {
+    let (r, g, b) = c;
+    let a = deg.to_radians();
+    let (sn, cs) = a.sin_cos();
+    let inv_sqrt3 = 1.0 / 3.0f64.sqrt();
+    let grey = (r + g + b) / 3.0 * (1.0 - cs);
+    // The `sn` term is `cross(k, c)` with k = (1,1,1)/√3 — the SAME orientation the shader's
+    // own `hue()` uses, so a palette rotation and the ±8° sway agree on which way is warmer.
+    let rot = (
+        r * cs + (b - g) * inv_sqrt3 * sn + grey,
+        g * cs + (r - b) * inv_sqrt3 * sn + grey,
+        b * cs + (g - r) * inv_sqrt3 * sn + grey,
+    );
+    let luma = 0.2126 * rot.0 + 0.7152 * rot.1 + 0.0722 * rot.2;
+    let mix = |v: f64| (luma + (v - luma) * sat).clamp(0.0, 1.0);
+    (mix(rot.0), mix(rot.1), mix(rot.2))
+}
+
+impl Palette {
+    /// [`MESH_COLORS`] under this palette's transform.
+    pub fn mesh_colors(&self) -> [(f64, f64, f64); 16] {
+        core::array::from_fn(|i| tint(MESH_COLORS[i], self.hue_deg, self.sat))
+    }
+}
+
+/// The mesh gradient as SkSL, palette + motion baked into the source (resolution, time and
+/// the calm mix are uniforms). A smooth bicubic blend of the 16 colours — a separable
 /// cubic-Bézier basis in x then y, C∞ and edge-to-edge, the fragment-shader analogue of
 /// SwiftUI's `MeshGradient(smoothsColors: true)`. The four interior points drive a
 /// bounded (weighted-average) domain warp so the bright pools drift; then the whole field
 /// gets the ±8°/~5-min hue sway, an elliptical vignette, and the vertical legibility scrim,
 /// all matching the Swift `composite(at:)`. Runs on the GPU at full rate.
-pub fn mesh_sksl() -> String {
+///
+/// `u_tc.y` is the CALM mix, 0 → 1: at 1 the same living field is flattened toward its own
+/// corner colour (`u_lift`), which is how the form screens (settings, add-host, pair) stay
+/// restful while still drifting — the motion never changes speed, only the contrast, so the
+/// crossfade between a launcher screen and a form screen can't make the field jump.
+pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
     // Colours as `float3(r, g, b)` literals, indices 0..15 (row-major 4×4).
     let c = |i: usize| {
-        let (r, g, b) = MESH_COLORS[i];
+        let (r, g, b) = colors[i];
         format!("float3({r}, {g}, {b})")
     };
     // The four interior-point domain-warp accumulators. Displacement matches Swift `wob()`:
@@ -224,14 +325,18 @@ pub fn mesh_sksl() -> String {
         warp.push_str(&format!(
             "    q = uv - float2({bx}, {by});\n\
                  ww = exp(-dot(q, q) / (2.0 * 0.30 * 0.30));\n\
-                 d = float2({amp} * sin(u_t * {sx} + {ph}), \
-                            {amp} * cos(u_t * {sy} + {ph} * 1.3));\n\
+                 d = float2({amp} * sin(tt * {sx} + {ph}), \
+                            {amp} * cos(tt * {sy} + {ph} * 1.3));\n\
                  wsum += d * ww; wtot += ww;\n",
         ));
     }
     format!(
         "uniform float2 u_res;\n\
-         uniform float u_t;\n\
+         // x = seconds since the shell started, y = the calm mix (0 launcher, 1 form).\n\
+         uniform float2 u_tc;\n\
+         // rgb = the palette's corner colour scaled for the calm lift; a is unused (float4\n\
+         // so the uniform block stays 16-byte aligned under any packing rule).\n\
+         uniform float4 u_lift;\n\
          \n\
          // Cubic-Bézier basis over four control values — the smooth 4-point blend per axis.\n\
          float bz(float t, float a, float b, float c, float d) {{\n\
@@ -250,6 +355,7 @@ pub fn mesh_sksl() -> String {
          }}\n\
          \n\
          half4 main(float2 xy) {{\n\
+         \x20   float tt = u_tc.x; float calm = u_tc.y;\n\
          \x20   float2 uv = xy / u_res;\n\
          \x20   // Interior control points wander → bounded domain warp (pools follow them).\n\
          \x20   float2 wsum = float2(0.0); float wtot = 0.0; float2 q; float ww; float2 d;\n\
@@ -263,11 +369,18 @@ pub fn mesh_sksl() -> String {
          \x20   float3 r3 = bz3(uv.x, {c12}, {c13}, {c14}, {c15});\n\
          \x20   float3 col = bz3(uv.y, r0, r1, r2, r3);\n\
          \n\
-         \x20   col = hue(col, sin(u_t * 0.021) * 0.1396263);\n\
+         \x20   col = hue(col, sin(tt * 0.021) * 0.1396263);\n\
+         \n\
+         \x20   // Calm: flatten the field toward its own corner colour — the pools dim and the\n\
+         \x20   // corners lift, so a form screen keeps real colour under its glass rows while\n\
+         \x20   // losing the launcher's contrast. Motion is untouched (see the doc comment).\n\
+         \x20   col = mix(col, col * 0.60 + u_lift.rgb, calm);\n\
          \n\
          \x20   // Elliptical vignette: clear at r=0.25 → black·0.42 at r=1.15 (aspect-fit ellipse).\n\
+         \x20   // Halved under calm: a launcher's cards sit in the pooled centre, but a form\n\
+         \x20   // screen's rows run out toward the edges, where crushing to black just eats them.\n\
          \x20   float2 e = (xy / u_res - 0.5) * 2.0;\n\
-         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0) * 0.42;\n\
+         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0) * mix(0.42, 0.21, calm);\n\
          \x20   col *= 1.0 - vig;\n\
          \n\
          \x20   // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n\
@@ -541,10 +654,56 @@ mod tests {
     /// 16 colours baked in, the five bicubic evals and four interior warp terms present).
     #[test]
     fn mesh_sksl_shape() {
-        let src = mesh_sksl();
+        let src = mesh_sksl(&MESH_COLORS);
         assert!(src.matches("float3(").count() >= 16, "16 colours baked");
         assert_eq!(src.matches("bz3(").count(), 6); // 1 definition + 5 call sites
         assert_eq!(src.matches("wtot +=").count(), 4); // one per interior point
         assert_eq!(src.matches('{').count(), src.matches('}').count());
+    }
+
+    /// The brand default must be the IDENTITY transform — the shipped violet backdrop is
+    /// what every existing install already sees, and a palette table that quietly restyled
+    /// it would be a regression dressed as a feature.
+    #[test]
+    fn violet_is_the_untouched_shipped_field() {
+        assert_eq!(PALETTES[0].id, "violet");
+        for (a, b) in palette("violet").mesh_colors().iter().zip(&MESH_COLORS) {
+            assert!((a.0 - b.0).abs() < 1e-9, "{a:?} vs {b:?}");
+            assert!((a.1 - b.1).abs() < 1e-9, "{a:?} vs {b:?}");
+            assert!((a.2 - b.2).abs() < 1e-9, "{a:?} vs {b:?}");
+        }
+        // An unknown name is a newer client's palette, not an error.
+        assert_eq!(palette("chartreuse").id, "violet");
+        assert_eq!(palette("").id, "violet");
+    }
+
+    /// The transform's two knobs do what they claim: a rotation moves the hue while holding
+    /// roughly the same luminance, and the saturation scale collapses toward grey. These are
+    /// the numbers the Swift and Kotlin ports have to reproduce.
+    #[test]
+    fn tint_rotates_hue_and_scales_saturation() {
+        let violet = MESH_COLORS[5]; // the brightest interior pool: blue dominates
+        assert!(violet.2 > violet.0 && violet.2 > violet.1);
+        // +105° (Ember) turns the blue-dominant pool red-dominant.
+        let ember = tint(violet, 105.0, 1.0);
+        assert!(ember.0 > ember.2, "{ember:?} should be warm");
+        // −130° (Forest) turns it green-dominant.
+        let forest = tint(violet, -130.0, 1.0);
+        assert!(forest.1 > forest.0 && forest.1 > forest.2, "{forest:?}");
+        // Graphite's saturation scale leaves the three channels nearly equal…
+        let grey = tint(violet, 0.0, 0.12);
+        let spread = grey.0.max(grey.1).max(grey.2) - grey.0.min(grey.1).min(grey.2);
+        assert!(spread < 0.08, "{grey:?} spread {spread}");
+        // …at about the source's luminance (it desaturates, it doesn't dim).
+        let luma = 0.2126 * violet.0 + 0.7152 * violet.1 + 0.0722 * violet.2;
+        assert!((grey.1 - luma).abs() < 0.05, "{grey:?} vs luma {luma}");
+        // Every palette stays in gamut on every mesh colour.
+        for p in &PALETTES {
+            for c in p.mesh_colors() {
+                for v in [c.0, c.1, c.2] {
+                    assert!((0.0..=1.0).contains(&v), "{} {c:?}", p.id);
+                }
+            }
+        }
     }
 }

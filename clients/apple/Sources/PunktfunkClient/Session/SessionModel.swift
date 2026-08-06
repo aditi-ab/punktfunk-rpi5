@@ -65,6 +65,14 @@ final class SessionModel: ObservableObject {
     @Published private(set) var connection: PunktfunkConnection?
     /// The host this session is for (a value copy; identity = id).
     @Published private(set) var activeHost: StoredHost?
+    /// The library entry this session was launched with (`connect(launchID:)`), or nil if the user
+    /// just connected to the host's desktop. Kept because where the client should go when the
+    /// session ends depends on where it came FROM: a title launched out of the library belongs back
+    /// in that library when its game exits, not on the host-selection screen.
+    private var launchedTitleID: String?
+    /// Set when a session ended because its game exited and it began as a library launch: the host
+    /// whose library to reopen. The view layer consumes it and sets it back to nil.
+    @Published var returnToLibrary: StoredHost?
     /// The settings THIS session runs on — the globals with its profile overlaid, resolved once at
     /// connect (design/client-settings-profiles.md §4.2). Also mirrored into `SessionSettings` for
     /// the readers that live in PunktfunkKit and can't see this model.
@@ -249,6 +257,7 @@ final class SessionModel: ObservableObject {
         guard phase == .idle else { return }
         phase = .connecting
         activeHost = host
+        launchedTitleID = launchID
         errorMessage = nil
         settings = effective
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
@@ -607,6 +616,8 @@ final class SessionModel: ObservableObject {
         }
         connection = nil
         activeHost = nil
+        // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
+        launchedTitleID = nil
         phase = .idle
         fps = 0
         mbps = 0
@@ -626,10 +637,36 @@ final class SessionModel: ObservableObject {
 
     /// Called (via the main actor) when the pump hits end-of-session.
     func sessionEnded() {
-        guard connection != nil else { return }
+        guard let conn = connection else { return }
         let name = activeHost?.displayName ?? "host"
+        // WHY it ended, asked while the connection is still up — `disconnect` tears it down.
+        let reason = conn.sessionEndReason
+        // Where a game exit sends us: back into the library this title was launched from, so the
+        // next one is a tap away. Only for a launch that CAME from the library — a game exiting in
+        // a plain desktop session has no library to return to.
+        let host = activeHost
+        let cameFromLibrary = launchedTitleID != nil
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
-        errorMessage = "Session ended by \(name)."
+        switch reason {
+        case .gameExited:
+            // The player quit their own game. Not a failure, and they are probably after the next
+            // title — so no banner, and back to the library it came from.
+            if cameFromLibrary, let host {
+                returnToLibrary = host
+            }
+        case .hostEnded, .local:
+            // Someone asked for this: an operator "End" on the host, or our own close racing in.
+            // Say it plainly, without the error framing.
+            errorMessage = "\(name) ended the session."
+        case .hostError:
+            errorMessage = "\(name) ended the session with an error."
+        case .lost:
+            errorMessage = "Lost the connection to \(name)."
+        case .none:
+            // No verdict (an older core, or the close raced the read): keep the wording this path
+            // has always used rather than inventing one.
+            errorMessage = "Session ended by \(name)."
+        }
     }
 
     /// Resize overlay START (main actor — from the Match-window follower's `onResizeTarget`): the

@@ -270,7 +270,11 @@ fn load_floor(path: &Path, channel: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Raise (never lower) the floor; atomic tmp+rename so a power cut can't half-write it.
+/// Raise (never lower) the floor, through the crate's one config writer — this used to
+/// hand-roll its own tmp+rename, which meant it neither cleaned up its temp on a failed
+/// rename nor picked up [`crate::trust::write_atomic`]'s in-place fallback, so on an install
+/// where the rename cannot work the floor silently never rose and a declined update came
+/// back forever.
 fn store_floor(path: &Path, channel: &str, serial: u64) {
     let mut file: FloorFile = std::fs::read(path)
         .ok()
@@ -287,10 +291,7 @@ fn store_floor(path: &Path, channel: &str, serial: u64) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let _ = crate::trust::write_atomic(path, &bytes);
 }
 
 // ---------------------------------------------------------------- check

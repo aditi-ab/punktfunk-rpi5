@@ -167,6 +167,47 @@ fn wake_gates_input_in_the_same_press() {
     assert!(s.handle_menu(MenuEvent::Move(MenuDir::Left)).is_some());
 }
 
+/// Every settings tab actually RASTERS. The eyeball dump below is `#[ignore]`d, so without
+/// this nothing in the normal gate ever ran the tab strip's layout arithmetic or a settings
+/// screen's rows — a bad index there would only surface on a Deck. CPU raster: the SkSL
+/// backdrop, the layers and the text all run without a GPU.
+#[test]
+fn every_settings_tab_rasters() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let (w, h) = (1280u32, 800u32);
+    let pads: Vec<PadInfo> = Vec::new();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+
+    let mut frame = |s: &mut Shell| {
+        s.render(
+            surface.canvas(),
+            w,
+            h,
+            &fonts,
+            Some("Xbox Wireless Controller"),
+            Some(GamepadPref::Xbox360),
+            &pads,
+        );
+    };
+    // One lap of the strip — R1 wraps back to where it started. Every tab's rows fit on an
+    // 800-tall window at once, so ONE frame per tab draws all of them; the cursor is walked to
+    // the end first (input only, no render) so the focused and unfocused row paths both run.
+    // Deliberately frugal: a full-screen SkSL field on the CPU costs the better part of a second
+    // per frame in a debug build, and this test's job is to catch a panic, not to look pretty.
+    for _ in 0..crate::screens::settings::TAB_COUNT {
+        for _ in 0..12 {
+            s.handle_menu(MenuEvent::Move(MenuDir::Down));
+        }
+        frame(&mut s);
+        s.handle_menu(MenuEvent::JumpForward);
+    }
+    // A narrow window is the case the strip has to shrink for (the pills are laid out from
+    // measured text, so a too-small width must clamp rather than lay out off-screen).
+    s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
+}
+
 /// Render every console scene to PNGs for the eyeball pass (ignored; run with
 /// `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`).
 /// CPU raster — the SkSL aurora, layers and text all run without a GPU.
@@ -207,6 +248,26 @@ fn dump_console_screens() {
     s.handle_menu(MenuEvent::Tertiary);
     dump(&mut s, 3, 25, "02-transition", true);
     dump(&mut s, 40, 8, "03-settings", true);
+
+    // The Interface tab (5 shoulder presses along) leads with the Background row, so this frame
+    // shows both the strip mid-list and the palette picker…
+    for _ in 0..5 {
+        s.handle_menu(MenuEvent::JumpForward);
+    }
+    dump(&mut s, 40, 8, "03b-settings-interface", true);
+    // …and cycling it three times lands on Ember, which is the whole point: the CALM backdrop
+    // behind these rows recolours live.
+    for _ in 0..3 {
+        s.handle_menu(MenuEvent::Confirm);
+    }
+    dump(&mut s, 40, 8, "03c-settings-ember", true);
+    // Back to the brand default and the first tab so the later scenes look like they always did.
+    for _ in 0..3 {
+        s.handle_menu(MenuEvent::Confirm);
+    }
+    for _ in 0..5 {
+        s.handle_menu(MenuEvent::JumpBack);
+    }
 
     // Add Host with the keyboard tray up (keyboard glyph style: no pad).
     s.handle_menu(MenuEvent::Back);

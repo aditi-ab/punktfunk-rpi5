@@ -23,14 +23,15 @@ import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
-/// One navigable tile: a saved host, a discovered-but-unsaved one, or the trailing Add Host
-/// action. Hashable so it can be the carousel's scroll-position identity.
+/// One navigable tile: a saved host, a discovered-but-unsaved one, or one of the trailing
+/// actions. Hashable so it can be the carousel's scroll-position identity.
 private enum GamepadHomeTarget: Hashable {
     /// A saved host's own tile, or one of its pinned host+profile cards (§5.2a) — which on a
     /// controller-first surface are THE profile affordance: focus and press, no menus.
     case saved(UUID, profile: String?)
     case discovered(String)
     case addHost
+    case rescan
 }
 
 /// A fully-resolved launcher tile — display fields + the activate action, built fresh each render
@@ -262,10 +263,14 @@ struct GamepadHomeView: View {
 
     private var hints: [GamepadHint] {
         let selected = tiles.first { $0.id == selection }
+        let action: String? = switch selected?.id {
+        case .addHost: "Add Host"
+        case .rescan: "Rescan"
+        default: nil
+        }
         var hints = [GamepadHint(
             glyph: buttonGlyph(\.buttonA, fallback: "a.circle"),
-            text: selected?.id == .addHost ? "Add Host"
-                : (selected?.canWake == true ? "Wake & Connect" : "Connect"))]
+            text: action ?? (selected?.canWake == true ? "Wake & Connect" : "Connect"))]
         if libraryEnabled, selected?.hasLibrary == true {
             hints.append(.init(glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library"))
         }
@@ -325,7 +330,15 @@ struct GamepadHomeView: View {
             subtitle: "Register a host by address",
             icon: "plus",
             activate: { showAddHost = true })
-        return saved + discovered + [add]
+        // A controller surface has no toolbar and no pull-to-refresh, so the rescan the field
+        // asked for is a tile like any other — one press from wherever the stick already is.
+        let rescan = HomeTile(
+            id: .rescan,
+            title: "Rescan",
+            subtitle: discovery.isScanning ? "Scanning…" : "Look for hosts on this network",
+            icon: "arrow.clockwise",
+            activate: { discovery.refresh() })
+        return saved + discovered + [add, rescan]
     }
 
     /// Only saved hosts have a library — matches the touch grid, where "Browse Library…" is a

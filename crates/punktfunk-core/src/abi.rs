@@ -2273,6 +2273,45 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
+/// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
+/// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
+///
+/// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
+/// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
+/// while the connection is torn down, and a client that never calls it behaves exactly as it did
+/// before this existed.
+///
+/// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
+/// their game from a host falling off the network, so every client wrote one message for all of
+/// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
+/// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
+/// for `HOST_ERROR` and `LOST`.
+///
+/// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_end_reason(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = c.inner.end_reason() as u8 };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
 /// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
 /// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows

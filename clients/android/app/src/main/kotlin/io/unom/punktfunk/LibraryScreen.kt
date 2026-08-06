@@ -145,7 +145,14 @@ fun LibraryScreen(
                                     launching = false
                                     if (handle != 0L) {
                                         onLaunched(
-                                            ActiveSession(handle, settings, host.clipboardSync),
+                                            ActiveSession(
+                                                handle,
+                                                settings,
+                                                host.clipboardSync,
+                                                hostId = host.id,
+                                                // Where to come back to when this game exits.
+                                                launchedFromLibrary = true,
+                                            ),
                                         )
                                     }
                                     else Toast.makeText(

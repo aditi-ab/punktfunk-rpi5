@@ -7,13 +7,20 @@ Every Punktfunk client has an in-stream stats overlay. All clients use **the sam
 vocabulary and the same four measurement points**, so a stage name on your phone means
 what the same name means on your desktop.
 
-Two platforms differ in the *math*: on **iOS and tvOS** the headline is **floor-shaved**.
-The fixed depth of Apple's present pipeline — roughly two refresh intervals, which no
-client can pace under — is excluded from it, and the Detailed tier prints the excluded
+Some platforms differ in the *math*: on **iOS, tvOS and Android** the headline is
+**floor-shaved**. The depth of the OS present pipeline — the compositor's own wait, which
+no client can pace under — is excluded from it, and the Detailed tier prints the excluded
 term on its own line as `os present +X.X excluded (display pipeline minimum)`. Add that
-floor back before holding an iPhone, iPad or Apple TV's `capture→on-glass` next to a
-macOS, Linux, Windows or Android one. (The macOS client shaves nothing: it presents
-straight to the display, with no such pipeline depth to measure, so its numbers are raw.)
+floor back before holding an iPhone, iPad, Apple TV or Android device's headline next to a
+macOS, Linux or Windows one. (The macOS client shaves nothing: it presents straight to the
+display, with no such pipeline depth to measure, so its numbers are raw.)
+
+The floor is **measured, not assumed**, and it is not small: it is commonly one to two
+refresh intervals, which on a 60 Hz phone is more than 30 ms — enough on its own to dwarf
+everything Moonlight's overlay displays. Charging it to the stream made Punktfunk look
+slower than clients that simply never measure that far (see
+[Comparing with Moonlight / Sunshine](#comparing-with-moonlight--sunshine)), so we report
+it rather than bury it in the total.
 
 ## The four measurement points
 
@@ -47,7 +54,7 @@ captured input, switch mouse mode, disconnect, mute the microphone — are in
 lost). **Normal** adds the stream line and the p50/p95 headline. **Detailed** adds the per-stage
 breakdown everywhere; on Linux/Windows it also adds the encoder's target bitrate, the decode path,
 an HDR tag and a chroma tag, on Android the decoder plus the full codec/bit-depth/colour line, and
-on iOS/tvOS the excluded OS present floor.
+on iOS, tvOS and Android the excluded OS present floor.
 You can also set the level a stream starts at in each client's
 [Settings](/docs/client-settings#overlay). The examples below are the **Detailed** view.
 
@@ -68,14 +75,16 @@ present: mailbox
 lost 3 (2.4%)
 ```
 
-Android:
+Android (headline and `display` both floor-shaved, like the Apple clients — the raw
+end-to-end here is 30.9 ms, the 16.7 ms floor of a 120 Hz panel included):
 
 ```
 1920×1080@120   120 fps   24.3 Mb/s
 c2.qti.hevc.decoder · low-latency
 HEVC · 10-bit · HDR (BT.2020 PQ) · 4:2:0
 end-to-end 14.2 ms p50 · 19.8 p95 · capture→displayed
-= host 3.1 + network 6.7 + decode 2.1 + display 2.3
+= host 3.1 + network 6.7 + decode 2.1 + display 2.3   · presents 119
+os present +16.7 excluded (display pipeline minimum)
 lost 3 (2.4%) · skipped 1 · FEC 12
 ```
 
@@ -131,18 +140,22 @@ lost 3 (2.4%)
     the screen's refresh cycle, not the stream; a large `pace` is us. (`pace` is also the
     fair number to compare against an iPhone or iPad, whose figure already has its
     equivalent of `latch` removed.)
-  - `os present` *(iOS and tvOS)* — the fixed depth of the OS present pipeline, which is
+  - `os present` *(iOS, tvOS and Android)* — the depth of the OS present pipeline, which is
     excluded from both the headline and `display` and printed here so you can add it
-    back.
+    back. On Android it is the measured time SurfaceFlinger took to latch and scan out each
+    frame, so it moves with your panel's rate and with whatever low-latency mode the vendor
+    applied; on Apple it is measured from the display link's own lead.
   - `client queue` *(Apple only)* — how long a received frame waited before the decoder
     pulled it. It's the front part of `decode`, not time on top of it. Hidden below 2 ms;
     a value that persists is a standing receive backlog on the client.
-  - `display X (pace A + latch B)` and `presents N` *(Android only)* — when the timeline presenter
-    is running it splits `display` in two: `pace` is the wait it deliberately holds the frame for
-    its target refresh, `latch` is SurfaceFlinger picking it up and scanning it out. `presents`
-    counts the frames confirmed on glass this second — well below `fps` means the presenter is
-    dropping or serializing frames; an `fps` shortfall with `presents` keeping up is upstream of
-    the client.
+  - `presents N` *(Android only)* — the frames confirmed on glass this second. Well below `fps`
+    means the presenter is dropping or serializing frames; an `fps` shortfall with `presents`
+    keeping up is upstream of the client.
+  - `display X (pace A + latch B)` *(Android, only when the floor couldn't be measured)* — with
+    the floor excluded, Android's `display` term is already just `pace` (the wait the presenter
+    deliberately holds a frame for its target refresh) and `latch` is what the `os present` line
+    reports. On the rare window where no latch sample pairs up, nothing is excluded and `display`
+    reverts to the raw figure with both halves shown.
 
   Against an **older host** that doesn't report its share yet, the first two terms
   merge into a single `host+network` number (`host+net` on Linux/Windows) — same total,
@@ -190,12 +203,13 @@ pretending:
 | Windows, Linux | `capture→on-glass` | present instant available (measured right after the Vulkan swapchain present); published raw |
 | macOS (Metal presenter) | `capture→on-glass` | present instant available (the system's on-glass time for the flip); published raw |
 | iOS/tvOS (Metal presenter) | `capture→on-glass` | present instant available, but the OS present floor is **excluded** from the number and printed separately as `os present +X.X excluded` |
-| Android | `capture→displayed` | MediaCodec's per-frame render callback reports SurfaceFlinger's render timestamp; on the rare window where no callback is delivered (the platform may drop them under load) the HUD falls back to `capture→decoded` |
+| Android | `capture→displayed` | MediaCodec's per-frame render callback reports SurfaceFlinger's render timestamp, and the OS present floor measured from it is **excluded** from the number and printed separately as `os present +X.X excluded`; on the rare window where no callback is delivered (the platform may drop them under load) the HUD falls back to `capture→decoded` |
 | macOS/iOS fallback presenter | `capture→received` | the system video layer hides decode and present timing entirely |
 
 A shorter chain means the number is **smaller because it measures less** — check the
 endpoint before comparing two devices, and add the excluded `os present` floor back to an
-iOS or tvOS client's headline before holding it next to another platform's.
+iOS, tvOS or Android client's headline before holding it next to a macOS, Linux or Windows
+one.
 
 ## Comparing with Moonlight / Sunshine
 
@@ -235,8 +249,8 @@ stands in for a one-way frame flight that Moonlight doesn't measure.)
 | `Frames dropped due to network jitter` | Decoded frames the *client's pacer* chose to drop ÷ decoded frames | `skipped` (line 4, Android only) | Approximately (both are client-side pacing decisions, despite Moonlight's name) |
 | `Average network latency` | The **control connection's round-trip time** (ENet RTT + variance) — not video frame latency | `network` (line 3) is the closest concept, but it's the *actual one-way frame path* (flight + reassembly), not an RTT | **No direct comparison.** Roughly, Punktfunk's `network` ≈ ½ × an idle RTT plus serialization time of the frame |
 | `Average decoding time` | Mean time from decoder enqueue to picture out | `decode` (p50) | Yes (mean vs median; both include decoder queueing) |
-| `Average frame queue delay` | Mean time a decoded frame waits for its vsync slot | inside `display` | Sum the two Moonlight lines → |
-| `Average rendering time (incl. V-sync latency)` | Mean duration of the present call | inside `display` | …and compare against Punktfunk's `display` |
+| `Average frame queue delay` *(desktop only)* | Mean time a decoded frame waits for its vsync slot | inside `display` | Sum the two Moonlight lines → |
+| `Average rendering time (incl. V-sync latency)` *(desktop only)* | Mean duration of the present call | inside `display` | …and compare against Punktfunk's `display` |
 | *(no equivalent)* | — | `end-to-end` — true capture→glass, clock-skew-corrected across machines | **Punktfunk only** |
 | *(no equivalent)* | — | `FEC` recovered shards (loss absorbed invisibly; Android only) | Punktfunk only |
 
@@ -250,6 +264,14 @@ Other differences worth knowing when squinting at both overlays side by side:
 - **Host frame rate.** Moonlight's headline FPS estimates what the *host* produced
   (received + lost). Punktfunk shows what your client actually received, and reports
   loss separately.
+- **On Android, Moonlight's numbers stop at the decoder.** The two lines above that cover
+  presentation are desktop-only: Moonlight's Android overlay measures nothing after the
+  decoder produces the picture, so no part of the wait for the screen appears anywhere in
+  it — and the popular Android forks measure the same slice. Its `Average decoding time` is
+  therefore comparable to Punktfunk's `decode`, and to nothing else; on Android there is no
+  Moonlight number that includes what your screen contributes. That asymmetry is why
+  Punktfunk excludes the `os present` floor on Android too, and why adding that floor back
+  is the right move when you want the whole truth rather than a like-for-like comparison.
 
 ## Recording a capture for a bug report
 

@@ -46,8 +46,13 @@ pub fn wake_and_connect(
     let sender = sender.clone();
     glib::spawn_future_local(async move {
         use std::time::Duration;
-        let events = crate::discovery::browse();
+        let (events, rescan) = crate::discovery::browse();
         let mut wait = WakeWait::new();
+        // A waking host starts advertising at a moment we can't predict, and `mdns-sd`'s own
+        // re-query interval has doubled well past a minute by the time a boot finishes — so ask
+        // again periodically instead of waiting to be told. Every 5th tick: often enough that a
+        // host that came up is noticed promptly, rare enough not to hammer multicast.
+        let mut ticks: u32 = 0;
         loop {
             if cancel.get() {
                 waiting.close();
@@ -99,6 +104,10 @@ pub fn wake_and_connect(
                     return;
                 }
                 None => {}
+            }
+            ticks += 1;
+            if ticks % 5 == 0 {
+                rescan.request();
             }
             glib::timeout_future(Duration::from_secs(1)).await;
         }
