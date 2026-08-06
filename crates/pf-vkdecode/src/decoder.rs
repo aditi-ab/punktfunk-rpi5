@@ -69,7 +69,7 @@ use crate::pic::plan_to_vk;
 use crate::pic::DecodePlanVk;
 use crate::pic::PlanToVkError;
 use crate::pic_h265::PlanToVkH265Error;
-use crate::ring::rebased_offsets;
+use crate::ring::pack_slices;
 use crate::ring::BitstreamRing;
 use crate::ring::RingLayout;
 use crate::ring::UploadedAu;
@@ -809,21 +809,25 @@ impl VkH264Decoder {
         // real AU opens with AUD/SEI (and, at IDRs, SPS/PPS) NALUs, and feeding
         // those to the VCN firmware inside the decode range HANGS it (the .25
         // `vcn_unified_0 ring timeout`; FFmpeg feeds slices-only for the same
-        // reason). Slice offsets are rebased into the packed buffer.
-        let segments: Vec<std::ops::Range<usize>> =
+        // reason). `pack_slices` rebases the offsets into the packed buffer AND
+        // normalises each slice's Annex-B prefix to three bytes — the two go
+        // together by construction, see `crate::ring::three_byte_prefix`.
+        let plan_segments: Vec<std::ops::Range<usize>> =
             plan.slices.iter().map(|s| s.data.clone()).collect();
-        let Some(slice_offsets) = rebased_offsets(&segments) else {
+        let Some(packed) = pack_slices(au, &plan_segments) else {
             return Err(VkDecodeError::Unsupported(
                 "packed slice data exceeds the u32 offsets Vulkan submits".into(),
             ));
         };
+        let slice_offsets = packed.offsets;
         // SAFETY: live device; the segments are the plan's own in-bounds slice
-        // ranges; every pending token is the completion signal of the submission
-        // that consumed the slot.
+        // ranges (narrowed by the prefix normalisation, so still in bounds); every
+        // pending token is the completion signal of the submission that consumed
+        // the slot.
         let upload = unsafe {
             state
                 .ring
-                .upload(&self.dev, au, &segments, &mut poll, &mut wait)?
+                .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
         };
 
         // Record + submit, signalling the dst image's next timeline value.

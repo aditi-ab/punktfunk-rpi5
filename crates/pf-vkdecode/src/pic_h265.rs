@@ -12,6 +12,12 @@
 //! The plan's per-slice lists still exist and are used as a cross-check: every
 //! list entry must be a member of the binding set, or the conversion fails closed.
 //!
+//! Those arrays carry **DPB slot indices**, not positions in the decode op's
+//! reference list — the distinction that
+//! [`DecodePlanVkH265::std_pic`] documents at length, because the two readings
+//! coincide on a freshly anchored stream and diverge a handful of AUs later, which
+//! makes getting it wrong silent corruption rather than an error.
+//!
 //! Concealment note: a lost reference is ABSENT from the plan's RPS sets (flagged
 //! upstream via `PlanWarning::MissingReference`), so the Std index arrays compact
 //! past it — later positions shift by one relative to the damaged stream's
@@ -52,9 +58,30 @@ pub struct VkRefH265 {
 #[derive(Debug, Clone)]
 pub struct DecodePlanVkH265 {
     /// The picture info. Its `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`
-    /// arrays hold INDICES INTO [`Self::refs`] (`0xFF` = unused) — the backend
-    /// MUST lay out `pReferenceSlots` in exactly [`Self::refs`] order, because
-    /// Vulkan defines these arrays as indices into that array.
+    /// arrays hold **DPB SLOT INDICES** (`0xFF` = unused) — the same numbers
+    /// `VkVideoReferenceSlotInfoKHR::slotIndex` carries, NOT positions in
+    /// [`Self::refs`] / `pDecodeInfo->pReferenceSlots`.
+    ///
+    /// This is the one place the two readings can be confused, and confusing
+    /// them is silent corruption rather than an error: they COINCIDE for as long
+    /// as the referenced pictures happen to sit in slots `0..refs.len()` in
+    /// `refs` order, which on a fresh IDR they do, so a stream decodes correctly
+    /// for its first few AUs and then quietly references the wrong pictures.
+    /// (On the vendored 25fps H.265 vector that is exactly AUs 0-2 correct and
+    /// AU 3 onwards wrong — its first B picture with two `StCurrAfter` entries
+    /// binds slots 2 and 1 in that order, so `refs` positions 1,2 and slots 2,1
+    /// disagree.)
+    ///
+    /// The authority is libavcodec's Vulkan H.265 hwaccel, which every driver is
+    /// validated against: it fills these arrays with the index of the picture in
+    /// its own DPB array and hands that SAME index to `slotIndex`, while packing
+    /// `pReferenceSlots` densely over only the USED entries — so the two arrays
+    /// are provably different numberings there, and the RPS one follows the slot.
+    ///
+    /// The backend must still lay `pReferenceSlots` out in [`Self::refs`] order
+    /// and fail closed on a reference with no bound image — not because the
+    /// indices depend on the order any more, but because a slot these arrays
+    /// name that the decode op never binds is unresolvable for the hardware.
     pub std_pic: hh::StdVideoDecodeH265PictureInfo,
     /// Byte offset of each slice segment NALU in the AU as planned, START CODE
     /// INCLUDED — exactly one entry per slice segment of the AU, in plan order
@@ -87,7 +114,9 @@ pub struct DecodePlanVkH265 {
     pub setup_is_reference: bool,
     /// The unique referenced pictures of this AU — the union of the plan's three
     /// current RPS sets in set order (StCurrBefore, StCurrAfter, LtCurr), first
-    /// appearance first. [`Self::std_pic`]'s index arrays point into this Vec.
+    /// appearance first. Every slot [`Self::std_pic`]'s index arrays name appears
+    /// here exactly once, which is what makes those arrays resolvable against the
+    /// decode op's reference list.
     pub refs: Vec<VkRefH265>,
 }
 
@@ -323,7 +352,7 @@ pub fn plan_to_vk_h265(
             });
         }
         for (position, rp) in set.iter().enumerate() {
-            let index = match refs.iter().position(|existing| existing.id == rp.id) {
+            let entry = match refs.iter().position(|existing| existing.id == rp.id) {
                 Some(index) => {
                     // A concealment-resolved duplicate across sets (doc above):
                     // the stored picture binds ONCE, but if ANY occurrence
@@ -334,7 +363,7 @@ pub fn plan_to_vk_h265(
                     if rp.is_long_term {
                         refs[index].std.flags.set_used_for_long_term_reference(1);
                     }
-                    index
+                    refs[index].slot
                 }
                 None => {
                     let slot = slots
@@ -345,12 +374,15 @@ pub fn plan_to_vk_h265(
                         std: ref_info(rp),
                         id: rp.id,
                     });
-                    refs.len() - 1
+                    slot
                 }
             };
-            // refs holds at most 3 x 8 entries, far inside u8 (and below the
-            // 0xFF sentinel).
-            array[position] = index as u8;
+            // A DPB SLOT index, not a position in `refs` — see the
+            // `DecodePlanVkH265::std_pic` docs. Slots are bounded by the session's
+            // `maxDpbSlots` (<= 17 under this crate's envelope), so no real slot
+            // can collide with the 0xFF sentinel.
+            debug_assert_ne!(entry, UNUSED_RPS_ENTRY, "a real DPB slot is never 0xFF");
+            array[position] = entry;
         }
     }
 
@@ -510,6 +542,9 @@ mod tests {
         // PicId -> the slot it was assigned; entries leave only on `removed`.
         let mut held: BTreeMap<PicId, u8> = BTreeMap::new();
         let mut converted = 0usize;
+        // AUs whose `refs` are NOT in slot order — the AUs on which "DPB slot" and
+        // "position in refs" are distinguishable (see the loop body).
+        let mut slot_order_differs = 0usize;
 
         for au in &aus {
             let plan = planner.plan_au(au).expect("the clean vector plans");
@@ -529,7 +564,8 @@ mod tests {
             }
 
             // The Std index arrays resolve exactly the plan's RPS sets, in
-            // order, 0xFF beyond.
+            // order, 0xFF beyond — BY DPB SLOT (struct docs), and every slot they
+            // name is one the decode op will bind, i.e. one of `refs`'.
             for (array, set) in [
                 (&vk.std_pic.RefPicSetStCurrBefore, &plan.rps.st_curr_before),
                 (&vk.std_pic.RefPicSetStCurrAfter, &plan.rps.st_curr_after),
@@ -538,13 +574,37 @@ mod tests {
                 for (position, entry) in array.iter().enumerate() {
                     match set.get(position) {
                         Some(rp) => {
-                            let r = &vk.refs[usize::from(*entry)];
-                            assert_eq!(r.id, rp.id);
+                            let r =
+                                vk.refs
+                                    .iter()
+                                    .find(|r| r.slot == *entry)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "AU {converted}: RPS entry names DPB slot {entry}, \
+                                         which this decode op does not bind ({:?}) — the \
+                                         hardware cannot resolve it",
+                                            vk.refs.iter().map(|r| r.slot).collect::<Vec<_>>()
+                                        )
+                                    });
+                            assert_eq!(r.id, rp.id, "AU {converted}: the slot's picture");
                             assert_eq!(r.std.PicOrderCntVal, rp.pic_order_cnt);
                         }
                         None => assert_eq!(*entry, UNUSED_RPS_ENTRY),
                     }
                 }
+            }
+            // …and the vector genuinely DISCRIMINATES the two readings, so this
+            // assertion can never quietly become vacuous: on a freshly anchored
+            // stream "DPB slot" and "position in refs" agree, and a test that only
+            // ever saw agreeing AUs would pass either way. Count the AUs where
+            // they disagree; the total is asserted below.
+            if vk
+                .refs
+                .iter()
+                .enumerate()
+                .any(|(position, r)| usize::from(r.slot) != position)
+            {
+                slot_order_differs += 1;
             }
 
             // Slice offsets: one per slice, each at a start-code boundary of
@@ -595,6 +655,16 @@ mod tests {
         }
 
         assert_eq!(converted, 250, "the vector's own golden");
+        // The vector's hierarchical-B RPS sets put the references out of slot order
+        // from AU 3 on (its first B picture with two `StCurrAfter` entries binds
+        // slots 2 then 1), so the index-array assertions above are decisive rather
+        // than accidental. 247 of 250: AUs 0-2 agree, which is precisely why the
+        // wrong reading survived to hardware and produced three correct frames
+        // followed by 247 corrupt ones.
+        assert_eq!(
+            slot_order_differs, 247,
+            "the vector must distinguish DPB slots from positions in refs"
+        );
 
         // Teardown: the flush update releases every remaining slot — the
         // codec-neutral DpbUpdate drives the SAME SlotMap H.264 uses.
@@ -620,12 +690,18 @@ mod tests {
             }
             b_pictures_seen += 1;
             // 8.3.2: StCurrBefore entries sit below the picture's POC,
-            // StCurrAfter above — through the index arrays and refs.
-            let before = usize::from(vk.std_pic.RefPicSetStCurrBefore[0]);
-            let after = usize::from(vk.std_pic.RefPicSetStCurrAfter[0]);
-            assert!(vk.refs[before].std.PicOrderCntVal < plan.picture.pic_order_cnt);
-            assert!(vk.refs[after].std.PicOrderCntVal > plan.picture.pic_order_cnt);
-            assert_ne!(before, after, "distinct pictures on the two sides");
+            // StCurrAfter above — resolved through the index arrays' DPB SLOTS.
+            let bound = |slot: u8| {
+                vk.refs
+                    .iter()
+                    .find(|r| r.slot == slot)
+                    .unwrap_or_else(|| panic!("RPS entry names unbound DPB slot {slot}"))
+            };
+            let before = vk.std_pic.RefPicSetStCurrBefore[0];
+            let after = vk.std_pic.RefPicSetStCurrAfter[0];
+            assert!(bound(before).std.PicOrderCntVal < plan.picture.pic_order_cnt);
+            assert!(bound(after).std.PicOrderCntVal > plan.picture.pic_order_cnt);
+            assert_ne!(before, after, "distinct slots on the two sides");
         }
 
         assert!(b_pictures_seen > 0, "the vector must contain B pictures");
@@ -819,10 +895,17 @@ mod tests {
         let vk = plan_to_vk_h265(&plan, &mut slots).unwrap();
 
         assert_eq!(vk.refs.len(), 2);
-        let st = &vk.refs[usize::from(vk.std_pic.RefPicSetStCurrBefore[0])];
+        // The entries are DPB SLOTS: id 11 took slot 1 and id 10 slot 0, while the
+        // RPS set order binds id 11 FIRST — so a positional reading would name slot
+        // 0 for the short-term set and get the long-term anchor instead. That is the
+        // whole M3 field failure in one fixture.
+        assert_eq!(vk.std_pic.RefPicSetStCurrBefore[0], 1, "id 11's DPB slot");
+        assert_eq!(vk.std_pic.RefPicSetLtCurr[0], 0, "id 10's DPB slot");
+        let bound = |slot: u8| vk.refs.iter().find(|r| r.slot == slot).expect("bound");
+        let st = bound(vk.std_pic.RefPicSetStCurrBefore[0]);
         assert_eq!(st.id, 11);
         assert_eq!(st.std.flags.used_for_long_term_reference(), 0);
-        let lt = &vk.refs[usize::from(vk.std_pic.RefPicSetLtCurr[0])];
+        let lt = bound(vk.std_pic.RefPicSetLtCurr[0]);
         assert_eq!(lt.id, 10);
         assert_eq!(lt.std.flags.used_for_long_term_reference(), 1);
         assert_eq!(lt.std.PicOrderCntVal, 0);

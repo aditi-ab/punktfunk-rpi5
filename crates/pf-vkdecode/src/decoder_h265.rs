@@ -19,18 +19,22 @@
 //!   facts shape the Vulkan profile every object is created against
 //!   ([`H265ProfileKey`]). A device that cannot host the combination is refused
 //!   BEFORE a session exists, so the ladder demotes cleanly.
-//! - **`pReferenceSlots` order is load-bearing.**
+//! - **Every referenced slot must be BOUND by this decode op.**
 //!   `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
-//!   `LtCurr` arrays hold INDICES INTO the decode op's reference-slot array
-//!   ([`DecodePlanVkH265::refs`] order), not slot indices. The recording below
-//!   therefore lays the op's references out in exactly `refs` order and FAILS
-//!   CLOSED if any of them has no bound image — dropping one would silently
-//!   re-point every later index at the wrong picture. (H.264 has no such arrays
-//!   and only traces the case.)
-//! - **Slice SEGMENT offsets, rebased.** The plan's offsets are AU-relative and
-//!   start-code-inclusive; the ring carries the slice NALUs ALONE (non-VCL NALUs
-//!   inside the decode range hang VCN firmware — the `vcn_unified_0` ring timeout),
-//!   so `pSliceSegmentOffsets` gets `rebased_offsets`' ([`crate::ring`]) output.
+//!   `LtCurr` arrays name DPB SLOT INDICES ([`crate::pic_h265`] builds them, and
+//!   its `DecodePlanVkH265::std_pic` docs carry the full argument for why they are
+//!   slots rather than positions in the reference list). The recording below lays
+//!   the op's references out in exactly [`DecodePlanVkH265::refs`] order — the set
+//!   of slots those arrays can name — and FAILS CLOSED if any of them has no bound
+//!   image: a named slot the op does not bind is unresolvable for the hardware.
+//!   (H.264 has no such arrays and only traces the case.)
+//! - **Slice SEGMENT offsets, rebased and prefix-normalised.** The plan's offsets
+//!   are AU-relative and start-code-inclusive; the ring carries the slice NALUs
+//!   ALONE (non-VCL NALUs inside the decode range hang VCN firmware — the
+//!   `vcn_unified_0` ring timeout), so `pSliceSegmentOffsets` gets
+//!   [`pack_slices`]' ([`crate::ring`]) output, which also trims each segment to a
+//!   three-byte Annex-B prefix so drivers that reach the slice header by a fixed
+//!   `+3 +2` skip land on it.
 //! - **RASL skips are not failures.** A RASL picture after an open-GOP CRA join is
 //!   undecodable by definition (8.1.3 NOTE); [`VkH265Decoder::decode`] answers it
 //!   like any other decode that produced no new picture — the next frame already
@@ -79,7 +83,7 @@ use crate::params_h265::level_to_std as level_to_std_h265;
 use crate::pic_h265::plan_to_vk_h265;
 use crate::pic_h265::DecodePlanVkH265;
 use crate::pic_h265::PlanToVkH265Error;
-use crate::ring::rebased_offsets;
+use crate::ring::pack_slices;
 use crate::ring::BitstreamRing;
 use crate::ring::RingLayout;
 use crate::ring::UploadedAu;
@@ -545,24 +549,31 @@ impl VkH265Decoder {
         // timeout` the H.264 path was built around; the parameter sets ride the
         // session parameters object instead). The plan's AU-relative offsets are
         // rebased into the packed buffer.
-        let segments: Vec<std::ops::Range<usize>> =
+        let plan_segments: Vec<std::ops::Range<usize>> =
             plan.slices.iter().map(|s| s.data.clone()).collect();
         // One rebased offset per slice segment, in plan order — the same count and
         // order as `vk_plan.slice_offsets` (both are built by walking
         // `plan.slices`), so `pSliceSegmentOffsets` and `sliceSegmentCount` agree
-        // by construction rather than by check.
-        let Some(slice_offsets) = rebased_offsets(&segments) else {
+        // by construction rather than by check. `pack_slices` additionally
+        // normalises each segment's Annex-B prefix to THREE bytes and computes the
+        // offsets from the normalised lengths, in one call, so the bytes and the
+        // offsets cannot drift apart (`crate::ring::three_byte_prefix` — the
+        // four-byte prefix this vector's 249 TRAIL segments carry is what shifted
+        // NVIDIA's slice-header parse by a byte).
+        let Some(packed) = pack_slices(au, &plan_segments) else {
             return Err(VkDecodeError::Unsupported(
                 "packed slice data exceeds the u32 offsets Vulkan submits".into(),
             ));
         };
+        let slice_offsets = packed.offsets;
         // SAFETY: live device; the segments are the plan's own in-bounds slice
-        // ranges; every pending token is the completion signal of the submission
-        // that consumed the slot.
+        // ranges (narrowed by the prefix normalisation, so still in bounds); every
+        // pending token is the completion signal of the submission that consumed
+        // the slot.
         let upload = unsafe {
             state
                 .ring
-                .upload(&self.dev, au, &segments, &mut poll, &mut wait)?
+                .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
         };
 
         // Record + submit, signalling the dst image's next timeline value.
@@ -1261,20 +1272,20 @@ struct ScopeEntry {
 /// Build the coding scope's bound-slot list and say how many leading entries are
 /// THIS AU's references.
 ///
-/// The ordering is the whole point, and it is a Vulkan contract rather than a
-/// preference: `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`,
-/// `RefPicSetStCurrAfter` and `RefPicSetLtCurr` hold indices into the decode op's
-/// `pReferenceSlots` array, and [`crate::pic_h265`] built those indices against
-/// [`DecodePlanVkH265::refs`]. So:
+/// The layout:
 ///
 /// 1. every entry of `refs`, IN ORDER — the decode op takes exactly this prefix;
 /// 2. every other still-held slot, so its association survives the scope (their
 ///    resources must stay bound even when this AU does not reference them);
 /// 3. the setup slot as the activation entry, slot index `-1`.
 ///
-/// A reference whose slot binds no image is a hard error, never a skip: compacting
-/// the array would shift every later index onto the wrong picture and produce
-/// output that looks plausible and is wrong.
+/// A reference whose slot binds no image is a hard error, never a skip:
+/// `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
+/// `LtCurr` arrays name DPB slots, and every slot they name is one of `refs`'
+/// ([`crate::pic_h265`]) — so dropping an entry leaves the hardware with a named
+/// slot this op never bound, which it can only answer by guessing or failing.
+/// Output that looks plausible and is wrong is the outcome this refusal exists to
+/// prevent.
 fn build_scope(
     refs: &[crate::pic_h265::VkRefH265],
     held_slots: impl Iterator<Item = u8>,
@@ -1879,8 +1890,13 @@ mod tests {
         // must be the REBASED array (one entry per slice segment, counted by
         // ash from the slice's length), and the picture info must point at the
         // plan's own Std struct.
-        let segments = [40..900, 900..1500, 1500..2000];
-        let offsets = rebased_offsets(&segments).unwrap();
+        let mut au = vec![0xAAu8; 2000];
+        for start in [40usize, 900, 1500] {
+            au[start..start + 3].copy_from_slice(&[0, 0, 1]);
+        }
+        let offsets = pack_slices(&au, &[40..900, 900..1500, 1500..2000])
+            .unwrap()
+            .offsets;
         assert_eq!(offsets, vec![0, 860, 1460]);
 
         // SAFETY: StdVideoDecodeH265PictureInfo is a plain-C bindgen struct of a
