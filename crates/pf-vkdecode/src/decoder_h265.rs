@@ -200,6 +200,15 @@ pub struct VkH265Decoder {
     graveyard: Vec<RetiredPool>,
     /// The most recent plan's warnings ([`Self::take_warnings`]).
     last_warnings: Vec<PlanWarning>,
+    /// The outstanding recovery point SEI, if any — see [`crate::recovery`].
+    /// Named apart from [`Self::recovery`], which is this decoder's DPB-recovery
+    /// latch: the two are unrelated (one is a fact about the stream's prediction
+    /// structure, the other about this decoder's own wedged state).
+    recovery_watch: crate::recovery::RecoveryWatch,
+    /// Pictures planned so far — stamped onto each one as
+    /// [`DecodedVkFrame::decode_order`]. Survives session rebuilds for the same
+    /// reason the watch does.
+    decoded: u64,
     /// Session generation: bumped on every rebuild, stamped into frames.
     generation: u64,
     device_lost: bool,
@@ -248,6 +257,8 @@ impl VkH265Decoder {
             ready: VecDeque::new(),
             graveyard: Vec::new(),
             last_warnings: Vec::new(),
+            recovery_watch: crate::recovery::RecoveryWatch::new(),
+            decoded: 0,
             generation: 0,
             device_lost: false,
             recovery: RecoveryLatch::default(),
@@ -322,15 +333,17 @@ impl VkH265Decoder {
         if self.recovery.take() {
             self.recover_dpb();
         }
+        // Cleared BEFORE planning for the same reason the RASL arm below clears it:
+        // "cleared by the next decode" must hold for an AU that fails to plan at
+        // all, or the previous AU's warnings could be re-read as fresh damage. The
+        // ledger is drained after every successful decode (`take_warnings` is a
+        // `mem::take`), so the failed-plan case is the only one that could carry
+        // over — a hole closed by construction, not a fix for a field symptom.
+        self.last_warnings.clear();
         let plan = match self.planner.plan_au(au) {
             Ok(plan) => plan,
             Err(PlanError::RaslSkipped { poc }) => {
                 trace!(poc, "RASL picture after a CRA join — skipped, not failed");
-                // take_warnings promises "cleared by the next decode", and this IS
-                // a decode: a caller polling per AU must not see the PREVIOUS AU's
-                // warnings a second time — a `MissingReference` re-reported right
-                // after a CRA join is exactly when the keyframe decision is made.
-                self.last_warnings.clear();
                 return Ok(self.ready.pop_front());
             }
             Err(e) => return Err(VkDecodeError::PlanH265(e)),
@@ -341,6 +354,26 @@ impl VkH265Decoder {
             trace!(?warning, "plan warning");
         }
         self.last_warnings = plan.warnings.clone();
+        // One picture per AU under this envelope: stamp its DECODE-order ordinal
+        // before anything can reorder it (see `DecodedVkFrame::decode_order`).
+        self.decoded = self.decoded.saturating_add(1);
+        let decode_order = self.decoded;
+        // The recovery-point watch, folded ONCE per successfully planned AU and in
+        // DECODE order — the order the SEI's POC delta is measured in. The mark
+        // rides the pending picture into display order (crate::recovery).
+        let recovery = self.recovery_watch.note_h265(
+            plan.picture.pic_order_cnt,
+            plan.picture.is_irap,
+            plan.picture.recovery_point,
+        );
+        if recovery != crate::recovery::RecoveryMark::NONE {
+            trace!(
+                sei = recovery.sei_here,
+                recovery_point = recovery.is_recovery_point,
+                poc = plan.picture.pic_order_cnt,
+                "recovery point SEI"
+            );
+        }
 
         // From here the PLANNER has already advanced past this AU — its DPB holds
         // the picture whatever happens next — so any failure below leaves the
@@ -351,7 +384,7 @@ impl VkH265Decoder {
         // `UnresolvedReference`, an `ensure_state` refusal — strands the picture
         // the other way round, planner-resident with no slot at all, and wedges
         // just as hard. One flush cures both.)
-        let result = self.decode_planned(&plan, au);
+        let result = self.decode_planned(&plan, au, recovery, decode_order);
         if result.is_err() {
             self.recovery.latch();
         }
@@ -361,11 +394,16 @@ impl VkH265Decoder {
     /// The submission half of one decode, from the point the planner has already
     /// advanced. Split out so [`Self::decode_inner`] can latch recovery on ANY
     /// failure past that line without threading a flag through every exit.
-    /// `au` is the same buffer `plan`'s slice ranges index into.
+    /// `au` is the same buffer `plan`'s slice ranges index into; `recovery` is the
+    /// recovery-point verdict already folded for this AU and `decode_order` its
+    /// decode-order ordinal (both advance in decode order, so neither can be
+    /// derived here — this path is not reached for every planned AU).
     fn decode_planned(
         &mut self,
         plan: &AuPlan,
         au: &[u8],
+        recovery: crate::recovery::RecoveryMark,
+        decode_order: u64,
     ) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         self.ensure_state(plan)?;
 
@@ -580,6 +618,8 @@ impl VkH265Decoder {
                 colour: plan.picture.colour,
                 poc: plan.picture.pic_order_cnt,
                 is_idr: plan.picture.is_idr,
+                recovery,
+                decode_order,
             },
         );
 
@@ -690,6 +730,16 @@ impl VkH265Decoder {
         self.generation
     }
 
+    /// The DECODE-order ordinal of the most recently planned picture — the
+    /// watermark a consumer compares [`DecodedVkFrame::decode_order`] against to
+    /// tell a frame decoded before a loss from one decoded after it. Especially
+    /// load-bearing here: [`Self::recover_dpb`] flushes every buffered picture
+    /// into `ready` at once, so a pre-loss picture routinely reaches the consumer
+    /// after the loss that flushed it. 0 before the first AU plans.
+    pub fn decode_order(&self) -> u64 {
+        self.decoded
+    }
+
     /// One-line state snapshot for failure paths and field logs (not a stable
     /// format).
     pub fn debug_snapshot(&self) -> String {
@@ -750,6 +800,14 @@ impl VkH265Decoder {
     /// driver, no worse.
     pub fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, false)
+    }
+
+    /// Does this decode queue family answer per-op `RESULT_STATUS` queries at all?
+    /// See [`crate::VkH264Decoder::status_queries`] — the fact is the DEVICE's, identical
+    /// for both codecs, and it is what tells a clean integrity report apart from
+    /// an undetectable one.
+    pub fn status_queries(&self) -> bool {
+        self.dev.result_status_queries()
     }
 
     /// [`Self::poll_status`], but WAITs for the op to complete first.

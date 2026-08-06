@@ -67,3 +67,22 @@ mailbox|fifo|immediate|fifo_relaxed` (default MAILBOX, FIFO where the surface of
 MAILBOX — AMD on Windows), `PUNKTFUNK_VK_DEVICE=<index>` (multi-GPU), and
 `PUNKTFUNK_HW_FAULT=import` (fault every VAAPI dmabuf import — proves the three-strike
 demotion to software on healthy hardware).
+
+`PUNKTFUNK_AU_FAULT=drop|truncate|flip[:period]` deliberately corrupts decoder input on the
+native Vulkan lane (default period 60 — one AU a second at 60 fps; inert everywhere else, and
+inert entirely if the value doesn't parse). `drop` swallows the AU, so the next one references a
+picture that was never decoded — the bitstream planner catches it immediately. `truncate` delivers
+a picture whose slice data stops mid-frame and `flip` alters one byte deep in the payload: both
+parse perfectly, so only the driver's per-frame decode-status query can see them, and neither is
+visible at all on a driver without `queryResultStatusSupport` or on any FFmpeg lane. Watch the
+result on the Detailed stats line's `integrity:` term (`damaged` = concealment the planner caught,
+`refused` = AUs the decoder rejected outright, `driver-failed` = the hardware's own verdict, `run`
+= consecutive frames with no picture, `worst run` = the longest such stretch of the session — the
+once-a-second `run` sample misses the bad moment almost every time — and `no driver status` = this
+device cannot answer the driver question at all). A session that lands on any other lane says so
+in the log rather than faulting silently.
+
+Note that `PUNKTFUNK_AU_DUMP` records the AU as it arrived from the HOST, while the fault injector
+runs later, at the native decoder's own entry. On a faulted run the dump is therefore the clean
+bitstream — reconstruct the damaged bytes from the spec if you need them (the injector is pure and
+deterministic).

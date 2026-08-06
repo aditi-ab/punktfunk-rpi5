@@ -1635,6 +1635,22 @@ typedef struct ColorInfo ColorInfo;
 // else happened to be using the audio graph that day.
 typedef struct JitterTuning JitterTuning;
 
+// What a client's OWN bitstream parser saw about intra-refresh recovery on one decoded frame — the
+// in-band counterpart of the wire's [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT).
+//
+// Two facts rather than one verdict, because the gate needs both and only the gate knows how to
+// combine them. A recovery point SEI promises: *a decoder that starts at THIS AU has a correct
+// picture N frames later*. That promise covers a decoder which lost references BEFORE the SEI (the
+// wave re-codes every stripe after it, so the stale content is fully overwritten) and says nothing
+// at all about one which lost references AFTER it (the already-swept stripes still reference the
+// lost picture). So a recovery point may only lift a freeze when its SEI was observed at or after
+// the loss — which is the pairing [`ReanchorGate::on_local_recovery`] performs, since the gate is
+// the only party that knows when the loss was.
+//
+// Produced by pf-vkdecode's `RecoveryWatch` on the native decode lane. Every other lane leaves it
+// [`Default`] and nothing changes.
+typedef struct LocalRecovery LocalRecovery;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
 // pumped on internal threads).
@@ -2024,6 +2040,8 @@ typedef struct {
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
+
+
 
 
 

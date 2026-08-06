@@ -157,6 +157,31 @@ pub struct DecodedVkFrame {
     pub value: u64,
     pub poc: i32,
     pub is_idr: bool,
+    /// What the recovery point SEI of this picture's AU (and any outstanding one
+    /// before it) is worth — see [`crate::recovery`]. `RecoveryMark::NONE` on every
+    /// picture of a stream that carries no recovery point SEI, which is every
+    /// punktfunk host today that is not running an NVENC intra-refresh wave.
+    ///
+    /// It exists because [`Self::is_idr`] cannot answer for an intra-refresh
+    /// session: the wave never emits an IDR, so a consumer freezing on loss has no
+    /// decoder-visible clean point and holds the last good picture until its
+    /// backstop forces the very IDR the wave exists to avoid. The mark is the
+    /// stream saying, in-band, where it healed.
+    pub recovery: crate::recovery::RecoveryMark,
+    /// This picture's position in DECODE order: a strictly increasing per-decoder
+    /// ordinal stamped when the AU was planned (1 for the first picture of the
+    /// decoder's life; it survives session rebuilds, because it describes the
+    /// STREAM, not the Vulkan objects).
+    ///
+    /// It exists because delivery order is not decode order, and a consumer
+    /// pairing [`Self::recovery`] against its own loss needs to know which of the
+    /// two a frame belongs to. A post-failure DPB flush hands back every picture
+    /// still buffered — pictures decoded BEFORE the loss — and each carries the
+    /// recovery marks of the wave it was decoded in. Delivered after the
+    /// consumer armed its freeze, those marks read as a heal that happened after
+    /// the loss, and lift a freeze on a wave that completed before it. Comparing
+    /// this ordinal against the one current at the arm is what tells them apart.
+    pub decode_order: u64,
     /// The decode op's slot in the status query pool.
     pub query_slot: u32,
     /// The decode op's submission ordinal (validates the query slot has not been
@@ -479,6 +504,12 @@ pub(crate) struct PendingPic {
     pub(crate) colour: ColourDescription,
     pub(crate) poc: i32,
     pub(crate) is_idr: bool,
+    /// Folded at PLAN time (the only place the codec's counting unit is known) and
+    /// carried here, because a picture's display order is not its decode order —
+    /// see [`DecodedVkFrame::recovery`].
+    pub(crate) recovery: crate::recovery::RecoveryMark,
+    /// See [`DecodedVkFrame::decode_order`].
+    pub(crate) decode_order: u64,
 }
 
 /// A retired generation's picture pool: images the presenter still holds live
@@ -539,6 +570,14 @@ pub struct VkH264Decoder {
     graveyard: Vec<RetiredPool>,
     /// The most recent plan's warnings ([`Self::take_warnings`]).
     last_warnings: Vec<PlanWarning>,
+    /// The outstanding recovery point SEI, if any — see [`crate::recovery`].
+    /// Survives session rebuilds on purpose: it is a fact about the STREAM's
+    /// prediction structure, not about this decoder's Vulkan objects.
+    recovery_watch: crate::recovery::RecoveryWatch,
+    /// Pictures planned so far — stamped onto each one as
+    /// [`DecodedVkFrame::decode_order`]. Survives session rebuilds for the same
+    /// reason the watch does.
+    decoded: u64,
     /// Session generation: bumped on every rebuild, stamped into frames.
     generation: u64,
     device_lost: bool,
@@ -576,6 +615,8 @@ impl VkH264Decoder {
             ready: VecDeque::new(),
             graveyard: Vec::new(),
             last_warnings: Vec::new(),
+            recovery_watch: crate::recovery::RecoveryWatch::new(),
+            decoded: 0,
             generation: 0,
             device_lost: false,
         })
@@ -598,6 +639,14 @@ impl VkH264Decoder {
     }
 
     fn decode_inner(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
+        // `take_warnings` promises "cleared by the next decode", and this IS a
+        // decode: clear BEFORE planning, so an AU that fails to plan at all cannot
+        // leave the previous AU's warnings behind to be re-read as damage on the
+        // next one. That the ledger is drained after every successful decode
+        // (`take_warnings` is a `mem::take`) makes the failed-plan case the only
+        // one where it could carry over — it is a hole closed by construction, not
+        // a fix for anything observed in the field.
+        self.last_warnings.clear();
         let plan = self.planner.plan_au(au)?;
         for warning in &plan.warnings {
             // The recovery verdict is the integration layer's
@@ -605,6 +654,26 @@ impl VkH264Decoder {
             trace!(?warning, "plan warning");
         }
         self.last_warnings = plan.warnings.clone();
+        // One picture per AU under this envelope: stamp its DECODE-order ordinal
+        // before anything can reorder it (see `DecodedVkFrame::decode_order`).
+        self.decoded = self.decoded.saturating_add(1);
+        let decode_order = self.decoded;
+        // The recovery-point watch, folded ONCE per successfully planned AU and in
+        // DECODE order — the order the SEI counts in. The mark rides the pending
+        // picture to display order, which may differ (crate::recovery).
+        let recovery = self.recovery_watch.note_h264(
+            plan.picture.frame_num,
+            plan.picture.is_idr,
+            plan.picture.recovery_point,
+        );
+        if recovery != crate::recovery::RecoveryMark::NONE {
+            trace!(
+                sei = recovery.sei_here,
+                recovery_point = recovery.is_recovery_point,
+                frame_num = plan.picture.frame_num,
+                "recovery point SEI"
+            );
+        }
 
         self.ensure_state(&plan)?;
         let sps_id = plan.sps.seq_parameter_set_id;
@@ -810,6 +879,8 @@ impl VkH264Decoder {
                 colour: plan.picture.colour,
                 poc: plan.picture.pic_order_cnt,
                 is_idr: plan.picture.is_idr,
+                recovery,
+                decode_order,
             },
         );
 
@@ -922,6 +993,14 @@ impl VkH264Decoder {
         self.generation
     }
 
+    /// The DECODE-order ordinal of the most recently planned picture — the
+    /// watermark a consumer compares [`DecodedVkFrame::decode_order`] against to
+    /// tell a frame decoded before a loss from one decoded after it. 0 before the
+    /// first AU plans.
+    pub fn decode_order(&self) -> u64 {
+        self.decoded
+    }
+
     /// One-line state snapshot for failure paths and field logs (not a stable
     /// format).
     pub fn debug_snapshot(&self) -> String {
@@ -974,6 +1053,24 @@ impl VkH264Decoder {
     /// driver can give it (NVIDIA, AMD's Windows driver).
     pub fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, false)
+    }
+
+    /// Does this decode queue family answer per-op `RESULT_STATUS` queries at all
+    /// (`queryResultStatusSupport`)?
+    ///
+    /// The single most important thing a support engineer can know about a
+    /// session's integrity reporting, and the reason this is exposed rather than
+    /// left internal. Where it is TRUE, [`DecodeStatus::Failed`] is the driver's
+    /// own verdict on a decode operation — the signal the Xbox Ally X corruption
+    /// needed and FFmpeg's query-less Vulkan decoder (`nb_queries = 0`) can never
+    /// produce. Where it is FALSE — RADV, whose VCN ring HANGS if a query is
+    /// recorded anyway — `Ok` degrades to "the op completed on the timeline", which
+    /// is exactly as much as FFmpeg knows on every driver: no worse, but a clean
+    /// integrity report from such a session means "nothing was detectable", not
+    /// "nothing was wrong". A telemetry surface that cannot say which of those it
+    /// is repeats the failure this program exists to end.
+    pub fn status_queries(&self) -> bool {
+        self.dev.result_status_queries()
     }
 
     /// [`Self::poll_status`], but WAITs for the op to complete first — the only
@@ -1407,6 +1504,8 @@ pub(crate) fn build_frame(
         value: entry.timeline_value,
         poc: entry.poc,
         is_idr: entry.is_idr,
+        recovery: entry.recovery,
+        decode_order: entry.decode_order,
         query_slot: entry.query_slot,
         submission: entry.submission,
         picture: entry.image as u32,

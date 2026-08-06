@@ -65,6 +65,27 @@
 //! - [`decoder_h265`]: [`VkH265Decoder`], mirroring [`VkH264Decoder`]'s public
 //!   surface method-for-method. Codec DISPATCH is the client wiring's job.
 //!
+//! M4 (status and telemetry) — three pure modules turning the signals above into
+//! something a session, a user and a support engineer can act on:
+//!
+//! - [`recovery`]: [`RecoveryWatch`], the recovery point SEI folded into a
+//!   per-picture "the stream healed HERE" mark ([`RecoveryMark`], carried on
+//!   [`DecodedVkFrame::recovery`]). The only clean point an intra-refresh session
+//!   has — its wave emits no IDR — so without it a client freezes for its full
+//!   backstop and then forces the very IDR the wave exists to avoid.
+//! - [`integrity`]: [`is_integrity_warning`] / [`is_integrity_warning_h265`], the
+//!   one list of warnings that mean the PICTURE is damaged. Here rather than in the
+//!   client so the fault harness asserts against the predicate production conceals
+//!   on.
+//! - [`fault`]: [`AuFault`], deliberate decoder-input corruption
+//!   (`PUNKTFUNK_AU_FAULT`), inert unless armed. A detector nobody can fire is
+//!   exactly as trustworthy as no detector at all.
+//!
+//! Plus [`VkH264Decoder::status_queries`] / [`VkH265Decoder::status_queries`]: does
+//! this device answer per-op `RESULT_STATUS` at all? Without that fact a clean
+//! integrity report cannot be told apart from an unmeasured one — which is the
+//! precise failure the program exists to end.
+//!
 //! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
 //! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
 //! encode side does it (`pf-encode/src/enc/linux/vk_build.rs`), and the GPU half is
@@ -78,11 +99,14 @@ pub mod caps_h265;
 pub mod decoder;
 pub mod decoder_h265;
 pub mod device;
+pub mod fault;
 pub mod images;
+pub mod integrity;
 pub mod params;
 pub mod params_h265;
 pub mod pic;
 pub mod pic_h265;
+pub mod recovery;
 pub mod ring;
 pub mod session;
 pub mod session_h265;
@@ -137,9 +161,15 @@ pub use device::DeviceHandles;
 pub use device::NoopQueueLock;
 pub use device::QueueLock;
 pub use device::QueueSubmitGuard;
+pub use fault::AuFault;
+pub use fault::FaultAction;
+pub use fault::FaultMode;
+pub use fault::DEFAULT_FAULT_PERIOD;
 pub use images::plan_pools;
 pub use images::PoolPlan;
 pub use images::HOLD_HEADROOM;
+pub use integrity::is_integrity_warning;
+pub use integrity::is_integrity_warning_h265;
 pub use params::pps_to_std;
 pub use params::sps_to_std;
 pub use params::OwnedStdPps;
@@ -162,6 +192,8 @@ pub use pic_h265::DecodePlanVkH265;
 pub use pic_h265::PlanToVkH265Error;
 pub use pic_h265::VkRefH265;
 pub use pic_h265::H265_RPS_LIST_SIZE;
+pub use recovery::RecoveryMark;
+pub use recovery::RecoveryWatch;
 pub use ring::RingLayout;
 pub use session::ParamsAction;
 pub use session::SessionConfig;

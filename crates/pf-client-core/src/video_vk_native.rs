@@ -62,6 +62,54 @@
 //! field case. It surfaces as an `Err` from the CURRENT `decode_frame` call so the
 //! existing streak/reanchor machinery fires exactly as it does for FFmpeg errors.
 //!
+//! **The recovery policy** (M4) — what a damaged stream ASKS for, and why it cannot
+//! storm. There are two kinds of damage and they are answered differently:
+//!
+//! - **Concealment** (the plan needed a substitute for something lost: an integrity
+//!   warning). The AU's output is released UNSHOWN, [`DecodeHealth`] records it, and
+//!   `decode` answers `Ok(None)` with [`NativeVulkanDecoder::take_recovery_request`]
+//!   raised. `video::Decoder` turns that into its ordinary `want_keyframe`, which the
+//!   pump drains, arms the freeze on, and asks through the ONE ~100 ms recovery
+//!   throttle every other ask already shares (`session.rs`'s `last_kf_req`: frame-gap
+//!   RFI, dropped-climb, no-output streak, overdue backstop, decoder recovery). It is
+//!   deliberately NOT an `Err`: an error ticks the demotion streak, and three of them
+//!   in a second would demote the native rung on exactly the lossy links it exists to
+//!   diagnose — an FFmpeg rung conceals the same event silently and keeps its job.
+//! - **A driver `Failed` verdict** (and its query-less twin, a decode status that
+//!   could not be established at all — [`StatusVerdicts`]). That is a statement about
+//!   the DECODER, not the stream, so it stays an `Err`: same volume as an FFmpeg
+//!   reference-miss error, streak-eligible, and a driver making it repeatedly is
+//!   precisely what demotion is for.
+//! - **A REFUSED AU** — the decoder answering `Err` outright (a plan error, a
+//!   Vulkan/session failure). Also an error, also streak-eligible, and counted
+//!   separately from concealment in [`DecodeHealth::refused`]: "the stream is
+//!   damaged and I coped" and "I could not run" are opposite statements about the
+//!   rung, and only the second one means the session is looking at a frozen screen.
+//!
+//! Because concealment is not an error, it must not clear the demotion streak
+//! either — `video::Decoder::decode_frame` leaves the streak untouched on a
+//! concealed `Ok(None)` and resets it only on a shipped frame or a clean AU.
+//! Otherwise a driver failing every other AU on a lossy link has its errors zeroed
+//! by the concealment between them, and a rung that conceals FOREVER (a host
+//! framing regression: every AU damaged, no frame ever shipped) has no escape
+//! hatch at all.
+//!
+//! Neither can storm, for two independent reasons. The ask is throttled to one per
+//! 100 ms per session whatever the damage rate; and once the freeze is armed the gate
+//! lifts only on a proven re-anchor, so a run of damaged AUs refreshes an existing
+//! freeze rather than compounding into more requests. A stream that never recovers
+//! therefore costs one keyframe ask per 100 ms, not one per AU.
+//!
+//! **Recovery-point SEI** (M4): pf-vkdecode's `RecoveryWatch` folds the parsed SEI
+//! into a per-picture mark that rides the frame ([`NativeVkFrame::recovery`]) into
+//! the shared gate's `on_local_recovery`. It is the only way a client can see an
+//! intra-refresh session heal on the two backends that run a wave WITHOUT setting the
+//! wire mark (Windows AMF and QSV — only Linux libav-NVENC sets it): the wave emits
+//! no IDR and libavcodec flags none, so without this such a session freezes for the
+//! full 500 ms backstop and then forces the very IDR the wave exists to avoid.
+//! Additional, never a replacement: the wire path is untouched and the FFmpeg rungs
+//! keep exactly the behaviour they had.
+//!
 //! **Teardown:** dropping this backend (demotion, session end) waits — bounded — for
 //! every shipped frame's token before dropping the decoder, because the decoder's Drop
 //! destroys the pool images and its own drain only covers DECODE work, not the
@@ -69,7 +117,7 @@
 //! displace the frames; a presenter wedged past [`TEARDOWN_BUDGET`] forfeits (warned).
 
 use crate::video::{
-    ColorDesc, NativeReleaseGuard, NativeReleaseToken, NativeVkFrame, NativeVkLayout,
+    ColorDesc, DecodeHealth, NativeReleaseGuard, NativeReleaseToken, NativeVkFrame, NativeVkLayout,
     VulkanDecodeDevice,
 };
 use anyhow::{anyhow, bail, Result};
@@ -243,6 +291,57 @@ impl Codec {
             Codec::H265(d) => d.wait_decoded(frame, timeout_ns),
         }
     }
+
+    /// Does this device answer per-op decode-status queries at all? A device
+    /// fact, not a codec one — forwarded per arm only because the decoders own
+    /// the `DecodeDevice`.
+    fn status_queries(&self) -> bool {
+        match self {
+            Codec::H264(d) => d.status_queries(),
+            Codec::H265(d) => d.status_queries(),
+        }
+    }
+
+    /// The newest planned picture's DECODE-order ordinal — the watermark the
+    /// pump stamps when it arms a freeze (see [`NativeVkFrame::decode_order`]).
+    fn decode_order(&self) -> u64 {
+        match self {
+            Codec::H264(d) => d.decode_order(),
+            Codec::H265(d) => d.decode_order(),
+        }
+    }
+}
+
+/// What one pass of [`NativeVulkanDecoder::settle_statuses`] learned about the
+/// decode status of previously shipped frames.
+///
+/// Two numbers, not one, because the SAME `DecodeStatus::Failed` means two
+/// different things depending on the device. Where the decode family answers
+/// `RESULT_STATUS` queries it is the driver's own verdict on its own decode — the
+/// Xbox Ally X signal, and the count `DecodeHealth::failed` reports. Where it does
+/// NOT (RADV, whose VCN ring hangs if a query is recorded anyway), `poll_status`
+/// degrades to reading the decode timeline, and a `Failed` there means the session
+/// generation is gone, the device was lost, or the semaphore could not be read —
+/// none of which the driver ever said anything about. Reporting those as driver
+/// verdicts renders `integrity: driver-failed 1 · no driver status`, which is
+/// self-contradictory and points a support engineer at hardware that never spoke.
+///
+/// Both cost the picture, so both release their frame unshown, both surface as an
+/// error, and both extend the concealed run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StatusVerdicts {
+    /// Frames the DRIVER reported corrupt. Only ever non-zero on a device that
+    /// answers status queries.
+    driver_failed: u32,
+    /// Frames whose status could not be established on a device with no query
+    /// support — the degraded timeline path.
+    unreadable: u32,
+}
+
+impl StatusVerdicts {
+    fn total(&self) -> u32 {
+        self.driver_failed + self.unreadable
+    }
 }
 
 /// The plan warnings one AU produced, still in their codec's own enum.
@@ -270,24 +369,6 @@ enum PlanWarnings {
     H265(Vec<pf_vkdecode::H265PlanWarning>),
 }
 
-/// Does this H.264 warning mean the PICTURE is damaged? `Mmco5Rebase` does not: the
-/// AU carried an MMCO 5 and pf-bitstream planned it in full (the plan holds the
-/// pre-rebase 8.2.1 values, later AUs reference the rebased ones).
-fn h264_is_integrity(w: &pf_vkdecode::PlanWarning) -> bool {
-    use pf_vkdecode::PlanWarning as W;
-    matches!(
-        w,
-        W::FrameNumGap { .. } | W::MissingReference { .. } | W::TruncatedAu { .. }
-    )
-}
-
-/// The H.265 twin — the same set pf-bitstream's `h265` conformance harness calls
-/// integrity, `NonZeroReorder` deliberately excluded (see [`PlanWarnings`]).
-fn h265_is_integrity(w: &pf_vkdecode::H265PlanWarning) -> bool {
-    use pf_vkdecode::H265PlanWarning as W;
-    matches!(w, W::MissingReference { .. } | W::TruncatedAu { .. })
-}
-
 impl PlanWarnings {
     fn is_empty(&self) -> bool {
         match self {
@@ -299,14 +380,26 @@ impl PlanWarnings {
     /// Just the warnings that mean the picture is damaged — the concealment set.
     /// Allocates, but only off the clean path: [`Self::is_empty`] is true for every
     /// AU of a healthy stream.
+    ///
+    /// The predicate itself lives in pf-vkdecode
+    /// ([`pf_vkdecode::is_integrity_warning`]) rather than here, so the
+    /// fault-injection harness asserts detection against the SAME list this
+    /// conceals on. Two copies would let a test prove a detection production does
+    /// not actually perform.
     fn integrity(&self) -> PlanWarnings {
         match self {
-            PlanWarnings::H264(w) => {
-                PlanWarnings::H264(w.iter().filter(|x| h264_is_integrity(x)).cloned().collect())
-            }
-            PlanWarnings::H265(w) => {
-                PlanWarnings::H265(w.iter().filter(|x| h265_is_integrity(x)).cloned().collect())
-            }
+            PlanWarnings::H264(w) => PlanWarnings::H264(
+                w.iter()
+                    .filter(|x| pf_vkdecode::is_integrity_warning(x))
+                    .cloned()
+                    .collect(),
+            ),
+            PlanWarnings::H265(w) => PlanWarnings::H265(
+                w.iter()
+                    .filter(|x| pf_vkdecode::is_integrity_warning_h265(x))
+                    .cloned()
+                    .collect(),
+            ),
         }
     }
 
@@ -321,17 +414,25 @@ impl PlanWarnings {
     /// `warnings=[FrameNumGap { .. }]`, exactly what the hardware-verified H.264
     /// path emitted before dispatch existed (a `Vec<String>` renders
     /// `["FrameNumGap { .. }"]`, and a wrapper enum would prefix the arm).
-    fn warn_concealment(&self) {
+    ///
+    /// `concealed` is how many of the rendered warnings are INTEGRITY warnings —
+    /// the count the frame was actually dropped for. Both numbers are carried
+    /// because they can differ: the list is every warning of the AU (a spec-legal
+    /// companion is context worth having), while the count is the damage. On H.264
+    /// the two coincide for every warning a punktfunk host can produce.
+    fn warn_concealment(&self, concealed: usize) {
         // Spelled out per arm rather than shared through a `const`: this is the
         // H.264 path's PRODUCTION log line, and a literal is what keeps it a static
         // tracing message rather than a formatted one.
         match self {
             PlanWarnings::H264(w) => tracing::warn!(
+                concealed,
                 warnings = ?w,
                 "native decode planned with concealment — dropping the frame, \
                  requesting re-anchor"
             ),
             PlanWarnings::H265(w) => tracing::warn!(
+                concealed,
                 warnings = ?w,
                 "native decode planned with concealment — dropping the frame, \
                  requesting re-anchor"
@@ -439,6 +540,21 @@ fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkF
         },
         keyframe: frame.is_idr,
         poc: frame.poc,
+        // The recovery point SEI's verdict for THIS picture, folded by
+        // pf-vkdecode's `RecoveryWatch` at plan time and translated here into the
+        // shared gate's vocabulary. The two structs are deliberately separate
+        // types with the same shape: pf-vkdecode must not depend on punktfunk-core
+        // to describe a bitstream fact, and punktfunk-core must not depend on
+        // pf-vkdecode to accept one.
+        recovery: punktfunk_core::reanchor::LocalRecovery {
+            sei_here: frame.recovery.sei_here,
+            is_recovery_point: frame.recovery.is_recovery_point,
+        },
+        // Which side of a loss this picture was DECODED on. Carried beside the
+        // recovery mark because the mark is worthless without it: a post-failure
+        // DPB flush delivers pre-loss pictures after the loss, and their marks
+        // describe a wave that completed before it.
+        decode_order: frame.decode_order,
         guard,
     }
 }
@@ -482,6 +598,21 @@ pub(crate) struct NativeVulkanDecoder {
     deliverable: std::collections::VecDeque<DecodedVkFrame>,
     outstanding: Vec<Shipped>,
     next_seq: u64,
+    /// The session's integrity counters (M4). Plain adds on the decode path, read
+    /// once per stats window — no allocation, no per-frame work.
+    health: DecodeHealth,
+    /// Stream damage happened and the host should be asked for a re-anchor.
+    /// Drained by `video::Decoder::decode_frame`, which routes it into the same
+    /// `want_keyframe` every other recovery ask uses (module doc's policy).
+    want_recovery: bool,
+    /// Corrupt the AU on its way into the decoder — `PUNKTFUNK_AU_FAULT`,
+    /// `None` unless armed. Lives at THIS boundary rather than in
+    /// `video::Decoder::decode_frame` on purpose: this is the lane whose detectors
+    /// the injector exists to fire, and putting the knob here means a faulted AU
+    /// is byte-identical to what the decoder would have been handed by a lossy
+    /// network — no other backend's behaviour can be perturbed by a typo'd
+    /// variable.
+    fault: Option<pf_vkdecode::AuFault>,
 }
 
 // SAFETY: the decoder is used strictly serially through `&mut self` from whichever
@@ -602,6 +733,43 @@ impl NativeVulkanDecoder {
             }
         };
         let (release_tx, release_rx) = mpsc::channel();
+        let status_queries = dec.status_queries();
+        if !status_queries {
+            // Said once, loudly, at construction rather than only in the stats
+            // line: on this device a clean integrity report means "nothing was
+            // detectable", not "nothing was wrong" — and a support engineer
+            // reading a log after the fact has no stats window to consult.
+            tracing::warn!(
+                "native decode: this device's decode queue family does not support \
+                 RESULT_STATUS queries — driver-reported corruption is not \
+                 observable on this session (decode status degrades to timeline \
+                 completion, FFmpeg parity)"
+            );
+        }
+        // `PUNKTFUNK_AU_FAULT=<mode>[:<period>]` — the deliberate-corruption knob
+        // (pf_vkdecode::fault). Unset is the only normal state; a spec that does
+        // not parse leaves the injector disarmed and says so rather than half
+        // arming.
+        let fault = std::env::var("PUNKTFUNK_AU_FAULT").ok().and_then(|spec| {
+            match pf_vkdecode::AuFault::from_spec(&spec) {
+                Some(f) => {
+                    tracing::warn!(
+                        mode = ?f.mode(),
+                        period = f.period(),
+                        "PUNKTFUNK_AU_FAULT: deliberately corrupting decoder input"
+                    );
+                    Some(f)
+                }
+                None => {
+                    tracing::warn!(
+                        value = %spec,
+                        "PUNKTFUNK_AU_FAULT not understood (want drop|truncate|flip[:period]) \
+                         — ignored"
+                    );
+                    None
+                }
+            }
+        });
         Ok(NativeVulkanDecoder {
             dec,
             release_tx: Some(release_tx),
@@ -609,21 +777,57 @@ impl NativeVulkanDecoder {
             deliverable: std::collections::VecDeque::new(),
             outstanding: Vec::new(),
             next_seq: 0,
+            health: DecodeHealth {
+                status_queries,
+                ..DecodeHealth::default()
+            },
+            want_recovery: false,
+            fault,
         })
     }
 
-    /// Feed one complete access unit. `Ok(None)` = no display-ready picture (the pump's
-    /// no-output/reanchor machinery reads that exactly as it does for FFmpeg). `Err` =
-    /// decode trouble — a decoder error, a plan that needed concealment, or a
-    /// driver-reported corrupt PREVIOUS frame — routed through the caller's shared
-    /// streak/demotion machinery.
+    /// This session's integrity counters — see [`DecodeHealth`].
+    pub(crate) fn health(&self) -> DecodeHealth {
+        self.health
+    }
+
+    /// The newest planned picture's DECODE-order ordinal — see
+    /// [`NativeVkFrame::decode_order`].
+    pub(crate) fn decode_order(&self) -> u64 {
+        self.dec.decode_order()
+    }
+
+    /// Drain the "the stream was damaged; please ask the host to re-anchor" flag.
+    /// Deliberately separate from an `Err` return — see the module doc's recovery
+    /// policy: concealment is a fact about the STREAM and must not tick the
+    /// decoder-demotion streak.
+    pub(crate) fn take_recovery_request(&mut self) -> bool {
+        std::mem::take(&mut self.want_recovery)
+    }
+
+    /// Feed one complete access unit.
     ///
-    /// The one thing `Ok(None)` deliberately does NOT mean is trouble. An H.265 RASL
-    /// picture skipped after an open-GOP join arrives here as exactly that — the
-    /// decoder never turns `h265::PlanError::RaslSkipped` into a `VkDecodeError`, and
-    /// it clears the warning ledger on its way out, so the concealment branch below
-    /// cannot fire on it either. Nothing is released unshown, no re-anchor is asked
-    /// for, and the next AU decodes normally (module doc; pf-bitstream `h265`).
+    /// `Ok(Some)` = a display-ready picture. `Ok(None)` = no picture this AU, which
+    /// covers three unrelated things and the caller treats all three the same
+    /// (its no-output/re-anchor machinery, exactly as for FFmpeg): the decoder
+    /// buffered without output, an H.265 RASL picture was skipped after an open-GOP
+    /// join, or the AU's plan needed CONCEALMENT and its output was released
+    /// unshown. `Err` = the DECODER is in trouble — a Vulkan/session error, or a
+    /// driver `RESULT_STATUS` verdict of Failed on a prior frame — which the
+    /// caller's streak/demotion machinery is entitled to act on.
+    ///
+    /// That split is the M4 recovery policy and it is deliberate (module doc):
+    /// concealment says the STREAM lost data, not that this decoder is failing, so
+    /// it raises [`Self::take_recovery_request`] instead of an error. The ask
+    /// reaches the host at the same moment and through the same 100 ms throttle it
+    /// always did; what it no longer does is spend a life on the demotion streak
+    /// and cost the session its hardware rung on a lossy link.
+    ///
+    /// A skipped RASL picture is not trouble at all: the decoder never turns
+    /// `h265::PlanError::RaslSkipped` into a `VkDecodeError` and clears the warning
+    /// ledger on its way out, so the concealment branch cannot fire on it either.
+    /// Nothing is released unshown and no re-anchor is asked for (module doc;
+    /// pf-bitstream `h265`).
     ///
     /// Ordering: the CURRENT AU decodes FIRST — the planner's reference state must
     /// advance even when a PRIOR frame's status turns out Failed, or the recovery
@@ -633,7 +837,71 @@ impl NativeVulkanDecoder {
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<NativeVkFrame>> {
         self.drain_releases();
 
-        let delivered = self.dec.decode(au).map_err(|e| anyhow!("decode: {e}"))?;
+        // Fault injection, at the last possible moment before the decoder: a
+        // faulted AU is byte-for-byte what a lossy network would have delivered,
+        // so every detector below sees the real thing rather than a special case.
+        // Inert (and free — no branch cost worth naming, no copy) unless armed.
+        let faulted;
+        let au = match self.fault.as_mut().map(|f| f.apply(au)) {
+            None | Some(pf_vkdecode::FaultAction::Pass) => au,
+            Some(pf_vkdecode::FaultAction::Drop) => {
+                tracing::warn!(len = au.len(), "PUNKTFUNK_AU_FAULT: dropping this AU");
+                // Never fed, so nothing decodes and nothing is display-ready —
+                // the same observable state a lost AU produces. The NEXT AU is
+                // where detection happens.
+                //
+                // Prior frames' verdicts still have to SETTLE here, though, or a
+                // fault run defers every one of them by an AU and the query slots
+                // sit unread meanwhile. What is deliberately NOT folded is a
+                // clean verdict: the health ledger holds one entry per AU the
+                // decoder was FED, and an AU that never reached it is no evidence
+                // that anything is healthy — folding `note(false, false, 0)` here
+                // would reset the concealed run on the very AU that was lost.
+                let verdicts = self.settle_statuses();
+                if verdicts.total() > 0 {
+                    self.health.note(false, false, verdicts.total());
+                    return Err(self.status_error(verdicts));
+                }
+                return Ok(None);
+            }
+            Some(pf_vkdecode::FaultAction::Corrupt(bytes)) => {
+                tracing::warn!(
+                    len = au.len(),
+                    corrupted_len = bytes.len(),
+                    "PUNKTFUNK_AU_FAULT: corrupting this AU"
+                );
+                faulted = bytes;
+                &faulted[..]
+            }
+        };
+
+        // A REFUSAL is the loudest thing this lane can say, and it has to reach
+        // the health ledger before it reaches the caller. Folded here rather than
+        // after the `?` because there is no after: a `PlanError`
+        // (`Parse`/`OutsideEnvelope`/`AwaitingIdr`/`NoActiveParamSet`) or a
+        // Vulkan/session failure returns straight out, and until M4's review this
+        // path incremented nothing at all — so a rung refusing EVERY AU (a host
+        // renegotiating outside the envelope: a frozen screen) reported
+        // `damaged 0 · failed 0 · run 0` and printed no integrity line whatsoever.
+        // A clean bill of health on a decoder that decoded nothing is the exact
+        // failure this program exists to end.
+        //
+        // Prior frames' status verdicts settle first, for the same reason the
+        // clean path settles before it folds: the refusal costs this AU, and the
+        // frames already shipped still owe their verdicts.
+        let delivered = match self.dec.decode(au) {
+            Ok(delivered) => delivered,
+            Err(e) => {
+                let verdicts = self.settle_statuses();
+                self.health.note(false, true, verdicts.total());
+                tracing::warn!(
+                    error = %e,
+                    driver_failed = verdicts.driver_failed,
+                    "native decode refused the access unit"
+                );
+                return Err(anyhow!("decode: {e}"));
+            }
+        };
         let warnings = self.dec.take_warnings();
         // Everything this AU made display-ready, oldest first (`take_ready` drained
         // so burst outputs are never stranded inside the decoder).
@@ -645,38 +913,37 @@ impl NativeVulkanDecoder {
             fresh.push(frame);
         }
 
-        let corrupt = self.settle_statuses();
+        let verdicts = self.settle_statuses();
         // ONLY integrity warnings are concealment (see [`PlanWarnings`]): a
         // spec-legal envelope signal — h265's `NonZeroReorder` on every SPS
         // activation, h264's `Mmco5Rebase` — is an AU the planner planned in FULL,
         // and dropping its frame would hitch the picture at every renegotiation.
         let integrity = warnings.integrity();
-        if !integrity.is_empty() || corrupt > 0 {
-            // Concealment planned into THIS AU, or driver-reported corruption on a
-            // PRIOR frame (the Ally X class, invisible to FFmpeg's query-less
-            // decoder): this call's output is released unshown and the call errors,
-            // arming the reanchor gate — same path, same volume as an FFmpeg
-            // reference-miss error (never quieter).
+        let concealed = !integrity.is_empty();
+        // One fold per AU, whatever the verdict: a clean AU is what ENDS a run,
+        // and a counter that only ever counts damage cannot tell a lossy link
+        // apart from a stream that never came back.
+        self.health.note(concealed, false, verdicts.total());
+        if concealed || verdicts.total() > 0 {
+            // Concealment planned into THIS AU, or a bad status verdict on a
+            // PRIOR frame (driver-reported corruption — the Ally X class,
+            // invisible to FFmpeg's query-less decoder — or a status that could
+            // not be established at all): this call's output is released unshown
+            // either way, because the picture is not fit to present.
             for frame in fresh {
                 if let Err(e) = self.dec.release_frame(&frame, false) {
                     tracing::debug!(error = %e, "releasing an unshown frame failed");
                 }
             }
-            if corrupt > 0 {
-                return Err(anyhow!(
-                    "driver reported decode corruption on {corrupt} prior frame(s) \
-                     (RESULT_STATUS_ONLY query) — re-anchor needed"
-                ));
+            if verdicts.total() > 0 {
+                // A verdict about the DECODER rather than the stream: an error,
+                // streak-eligible, same volume as an FFmpeg reference-miss error
+                // (never quieter).
+                return Err(self.status_error(verdicts));
             }
-            // The log carries EVERY warning of the AU (the spec-legal ones are
-            // context); the count is the concealment count, which is what the
-            // frame was dropped for. On H.264 the two coincide for every warning
-            // a punktfunk host can produce.
-            warnings.warn_concealment();
-            bail!(
-                "AU planned with concealment ({} warning(s))",
-                integrity.len()
-            );
+            warnings.warn_concealment(integrity.len());
+            self.want_recovery = true;
+            return Ok(None);
         }
         if !warnings.is_empty() {
             warnings.warn_planned_in_full();
@@ -745,15 +1012,39 @@ impl NativeVulkanDecoder {
         }
     }
 
+    /// The error a bad status verdict surfaces as, worded for the device it came
+    /// from: a driver that reported corruption is named as such, a device that
+    /// cannot report one is not blamed for a verdict it never gave.
+    fn status_error(&self, verdicts: StatusVerdicts) -> anyhow::Error {
+        if verdicts.driver_failed > 0 {
+            anyhow!(
+                "driver reported decode corruption on {} prior frame(s) \
+                 (RESULT_STATUS_ONLY query) — re-anchor needed",
+                verdicts.driver_failed
+            )
+        } else {
+            anyhow!(
+                "decode status unreadable on {} prior frame(s) (this device answers \
+                 no RESULT_STATUS queries — the verdict degraded to the decode \
+                 timeline) — re-anchor needed",
+                verdicts.unreadable
+            )
+        }
+    }
+
     /// Poll the status query of every unresolved shipped frame (non-blocking) and
-    /// release the ones that are both status-settled and token-returned. Returns how
-    /// many frames NEWLY read `Failed` — driver-reported corruption.
+    /// release the ones that are both status-settled and token-returned. Returns the
+    /// frames that NEWLY read `Failed`, split by whether this device can produce a
+    /// driver verdict at all — see [`StatusVerdicts`].
     ///
     /// Polling an unreleased frame is always sound: its slot is pinned until
     /// `release_frame`, so the query slot it names cannot have been recycled under it
     /// (the false-`Failed` a recycled slot would read).
-    fn settle_statuses(&mut self) -> u32 {
-        let mut corrupt = 0u32;
+    fn settle_statuses(&mut self) -> StatusVerdicts {
+        let mut verdicts = StatusVerdicts::default();
+        // A device fact, read once: it decides which KIND of verdict a `Failed`
+        // read below is (`StatusVerdicts`), never whether the frame is dropped.
+        let status_queries = self.dec.status_queries();
         let Self {
             dec, outstanding, ..
         } = self;
@@ -781,12 +1072,28 @@ impl NativeVulkanDecoder {
                 DecodeStatus::Ok => s.resolved = true,
                 DecodeStatus::Failed => {
                     s.resolved = true;
-                    corrupt += 1;
-                    tracing::warn!(
-                        poc = s.frame.poc,
-                        slot = s.frame.query_slot,
-                        "decode status query: Failed (driver-reported corruption)"
-                    );
+                    if status_queries {
+                        verdicts.driver_failed += 1;
+                        tracing::warn!(
+                            poc = s.frame.poc,
+                            slot = s.frame.query_slot,
+                            "decode status query: Failed (driver-reported corruption)"
+                        );
+                    } else {
+                        // No query pool on this device, so nothing here is the
+                        // driver's opinion of the decode: `poll_status` degraded
+                        // to reading the decode timeline and could not establish
+                        // completion (a lost device, an unreadable semaphore).
+                        // The picture is dropped exactly the same way — it is the
+                        // ATTRIBUTION that must not be invented (`StatusVerdicts`).
+                        verdicts.unreadable += 1;
+                        tracing::warn!(
+                            poc = s.frame.poc,
+                            "decode status unreadable — this device answers no \
+                             RESULT_STATUS queries, so this is a timeline failure, \
+                             not a driver verdict"
+                        );
+                    }
                 }
                 DecodeStatus::Pending => {
                     if s.released {
@@ -820,7 +1127,7 @@ impl NativeVulkanDecoder {
             }
             false
         });
-        corrupt
+        verdicts
     }
 }
 
@@ -952,6 +1259,18 @@ mod tests {
             value: 7,
             poc: 5,
             is_idr: true,
+            // Both facts SET and distinct from the defaults, for the same reason
+            // every other field here is: a projection that dropped the recovery
+            // mark would silently reinstate the 500 ms freeze on every
+            // intra-refresh session, and against `false` that passes.
+            recovery: pf_vkdecode::RecoveryMark {
+                sei_here: true,
+                is_recovery_point: true,
+            },
+            // Distinct from every other number here for the same reason: a
+            // projection that dropped the decode ordinal would make every frame
+            // look pre-loss (0) and silently disable the local-recovery path.
+            decode_order: 17,
             query_slot: 2,
             submission: 11,
             picture: 6,
@@ -1049,6 +1368,8 @@ mod tests {
             color,
             keyframe,
             poc,
+            recovery,
+            decode_order,
             guard: _,
         } = p;
         assert_eq!(image, 0x1001);
@@ -1085,6 +1406,20 @@ mod tests {
             "is_idr rides through as the pump's re-anchor signal"
         );
         assert_eq!(poc, 5);
+        assert_eq!(
+            recovery,
+            punktfunk_core::reanchor::LocalRecovery {
+                sei_here: true,
+                is_recovery_point: true,
+            },
+            "the recovery point SEI's verdict reaches the gate — it is the ONLY \
+             clean point an intra-refresh session has"
+        );
+        assert_eq!(
+            decode_order, 17,
+            "the decode ordinal rides along — without it the pump cannot tell a \
+             frame decoded before a loss from one decoded after it"
+        );
 
         // Coincide mode: the picture IS a DPB slot, so the presenter must put the
         // layer back in DPB layout after sampling.
@@ -1211,6 +1546,8 @@ mod tests {
             },
             keyframe: true,
             poc: 0,
+            recovery: punktfunk_core::reanchor::LocalRecovery::NONE,
+            decode_order: 1,
             guard: NativeReleaseGuard::new(
                 tx,
                 NativeReleaseToken {
@@ -1317,6 +1654,150 @@ mod tests {
         ]);
         assert_eq!(mixed.len(), 2);
         assert_eq!(mixed.integrity().len(), 1);
+    }
+
+    /// The counter a support engineer reads first. A total alone cannot tell a
+    /// lossy link that keeps recovering apart from a stream that went down and
+    /// stayed down — `damaged 40 · run 0` and `damaged 40 · run 40` are the same
+    /// number and completely different problems. So the run must climb only while
+    /// damage is CONSECUTIVE, and the worst run must survive the recovery that
+    /// clears it (a once-per-second sample of `run` misses the bad moment almost
+    /// every time).
+    #[test]
+    fn the_concealed_run_separates_a_lossy_link_from_a_stream_that_never_came_back() {
+        let mut h = DecodeHealth::default();
+        // A lossy link: single damaged AUs with clean stretches between.
+        for _ in 0..3 {
+            h.note(true, false, 0);
+            h.note(false, false, 0);
+            h.note(false, false, 0);
+        }
+        assert_eq!(h.damaged, 3);
+        assert_eq!(h.run, 0, "the last AU was clean");
+        assert_eq!(h.worst_run, 1, "…and no two damaged AUs were adjacent");
+
+        // A stream that stopped recovering.
+        let mut h = DecodeHealth::default();
+        for _ in 0..7 {
+            h.note(true, false, 0);
+        }
+        assert_eq!((h.damaged, h.run, h.worst_run), (7, 7, 7));
+        // One clean AU ends the run but never the record.
+        h.note(false, false, 0);
+        assert_eq!((h.damaged, h.run, h.worst_run), (7, 0, 7));
+    }
+
+    /// A REFUSED AU — the decoder answering `Err` rather than concealing — has to
+    /// reach the ledger, and has to be told apart from concealment.
+    ///
+    /// This is the shape the M4 review found reporting a clean bill of health: a
+    /// host renegotiating outside the decode envelope makes every `plan_au` fail,
+    /// the picture freezes, and before this counter existed the stats surface read
+    /// `damaged 0 · failed 0 · run 0` and printed no integrity line at all. The
+    /// two counts must stay separate because they say opposite things about the
+    /// RUNG: concealment means the decoder coped with a damaged stream, refusal
+    /// means it could not run.
+    #[test]
+    fn a_rung_refusing_every_au_cannot_report_a_clean_bill_of_health() {
+        let mut h = DecodeHealth {
+            status_queries: true,
+            ..DecodeHealth::default()
+        };
+        for _ in 0..5 {
+            h.note(false, true, 0);
+        }
+        assert_eq!(h.refused, 5, "every refusal is counted");
+        assert_eq!(h.damaged, 0, "and none of them is concealment");
+        assert_eq!(h.failed, 0, "nor a driver verdict — the driver never ran");
+        assert_eq!(
+            (h.run, h.worst_run),
+            (5, 5),
+            "a refused AU is as absent from the screen as a concealed one"
+        );
+        // A single good AU ends the run; the totals stand.
+        h.note(false, false, 0);
+        assert_eq!((h.refused, h.run, h.worst_run), (5, 0, 5));
+    }
+
+    /// The three verdicts count apart and share one run — because "the bitstream
+    /// arrived incomplete", "the decoder refused it" and "the hardware failed the
+    /// decode" have three different causes and three different fixes, while "did
+    /// the picture ever come back" has one answer.
+    #[test]
+    fn concealment_refusal_and_driver_failure_are_three_separate_counts() {
+        let mut h = DecodeHealth {
+            status_queries: true,
+            ..DecodeHealth::default()
+        };
+        h.note(true, false, 0);
+        h.note(false, true, 0);
+        h.note(false, false, 2);
+        assert_eq!((h.damaged, h.refused, h.failed), (1, 1, 2));
+        assert_eq!((h.run, h.worst_run), (3, 3), "one unbroken run of three");
+    }
+
+    /// A driver `Failed` verdict counts apart from concealment and extends the same
+    /// run. Apart, because "the bitstream arrived incomplete" and "the hardware
+    /// could not decode what arrived" have different causes and different fixes,
+    /// and collapsing them is how "the stream is fine, it's your GPU" arguments
+    /// start. Same run, because a frame the driver failed is as absent from the
+    /// screen as a concealed one — and "did the picture ever come back" is what the
+    /// run answers.
+    #[test]
+    fn driver_failures_count_separately_but_share_the_run() {
+        let mut h = DecodeHealth {
+            status_queries: true,
+            ..DecodeHealth::default()
+        };
+        h.note(false, false, 2); // two prior frames reported corrupt at once
+        assert_eq!((h.damaged, h.failed, h.run), (0, 2, 1));
+        h.note(true, false, 1); // and an AU that ALSO needed concealment
+        assert_eq!((h.damaged, h.failed, h.run), (1, 3, 2));
+        h.note(false, false, 0);
+        assert_eq!((h.run, h.worst_run), (0, 2));
+    }
+
+    /// `status_queries` is set once from the device and never touched by the
+    /// per-AU fold — a counter update must not be able to turn "this driver cannot
+    /// report corruption" into "it reported none".
+    ///
+    /// And, the invariant the doc contracts on both sides of this boundary state:
+    /// where the device answers no status queries, `failed` can only ever read 0.
+    /// It is not a hypothetical. `read_status` returns `Failed` on such a device
+    /// for a lost device, a retired session generation or an unreadable semaphore,
+    /// and counting those would render `integrity: driver-failed 1 · no driver
+    /// status` — one line contradicting itself, pointing a support engineer at a
+    /// verdict the hardware cannot give. So this feeds `note` a real failure and
+    /// pins the zero; a test that only ever passed `0` would assert nothing.
+    #[test]
+    fn the_status_query_capability_survives_every_fold() {
+        let mut h = DecodeHealth {
+            status_queries: false,
+            ..DecodeHealth::default()
+        };
+        h.note(true, false, 0);
+        h.note(false, false, 0);
+        assert!(!h.status_queries);
+        h.note(false, false, 1);
+        assert_eq!(
+            h.failed, 0,
+            "a device that answers no status queries can produce no driver \
+             verdict — `failed` must stay 0 whatever `read_status` returned"
+        );
+        assert_eq!(
+            h.run, 1,
+            "…but the frame was still dropped, so the run still counts it: the \
+             ATTRIBUTION is what must not be invented, not the damage"
+        );
+        assert_eq!(h.worst_run, 1);
+
+        // The same fold on a device that CAN answer does count it.
+        let mut h = DecodeHealth {
+            status_queries: true,
+            ..DecodeHealth::default()
+        };
+        h.note(false, false, 1);
+        assert_eq!((h.failed, h.run), (1, 1));
     }
 
     #[test]

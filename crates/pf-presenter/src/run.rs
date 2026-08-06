@@ -2565,6 +2565,57 @@ fn stats_text(
             text.push_str(&format!(" · dropped {}", s.mic_dropped));
         }
     }
+    // Decode integrity (M4) — the native lane's answer to "was that stream actually
+    // clean?". Appended LAST and only when it has something to say, which keeps it
+    // additive for the stdout `stats:` line's parsers (a machine interface: every
+    // existing segment stays where it was) and keeps a healthy session's OSD exactly
+    // as quiet as it is today.
+    //
+    // "Something to say" deliberately includes a device with no `RESULT_STATUS`
+    // support (RADV), even with zero damage: there the counters cover the parser's
+    // half only, and a silent integrity line would read as a clean bill of health on
+    // the one configuration that cannot give one. Saying "no driver status" once a
+    // second is the whole lesson of `nb_queries = 0` — an unmeasured session must
+    // never look like a measured one. A lane that cannot report integrity at all (any
+    // FFmpeg rung) prints nothing rather than zeros, for the same reason.
+    if detailed && s.decode_integrity {
+        let mut parts: Vec<String> = Vec::new();
+        if s.decode_damaged > 0 {
+            parts.push(format!("damaged {}", s.decode_damaged));
+        }
+        if s.decode_refused > 0 {
+            // The decoder could not run at all — a different diagnosis from
+            // `damaged`, and the one that means the screen is frozen rather than
+            // occasionally glitching. Without it a rung refusing every AU printed
+            // no integrity line whatsoever.
+            parts.push(format!("refused {}", s.decode_refused));
+        }
+        if s.decode_failed > 0 {
+            parts.push(format!("driver-failed {}", s.decode_failed));
+        }
+        if s.concealed_run > 0 {
+            // The figure that says "and it has not recovered" — a run still climbing
+            // at the end of the window is a different problem from the same count of
+            // isolated damaged AUs.
+            parts.push(format!("run {}", s.concealed_run));
+        }
+        if s.worst_concealed_run > s.concealed_run {
+            // Only when it says something the instantaneous run does not: this is
+            // sampled once a second and the worst moment lasts a handful of frames,
+            // so a window that reads `damaged 40` with no run at all is either forty
+            // isolated glitches or one 40-AU freeze that recovered — and until this
+            // figure was surfaced, nothing on the OSD could tell those apart.
+            // Session-cumulative, unlike everything before it on this line, which is
+            // why it is labelled rather than folded into `run`.
+            parts.push(format!("worst run {}", s.worst_concealed_run));
+        }
+        if !s.decode_status_queries {
+            parts.push("no driver status".into());
+        }
+        if !parts.is_empty() {
+            text.push_str(&format!("\nintegrity: {}", parts.join(" · ")));
+        }
+    }
     text
 }
 
@@ -2819,6 +2870,15 @@ mod tests {
                 auto_rate: false,
                 chroma_444: false,
                 asked_444: false,
+                // An FFmpeg rung: it cannot answer integrity questions at all, so
+                // every existing tier text below must be unchanged by M4's line.
+                decode_integrity: false,
+                decode_damaged: 0,
+                decode_failed: 0,
+                decode_refused: 0,
+                concealed_run: 0,
+                worst_concealed_run: 0,
+                decode_status_queries: false,
             },
             PresentedWindow {
                 e2e_p50_ms: 6.4,
@@ -2926,6 +2986,138 @@ mod tests {
             None,
         );
         assert!(!normal.contains("present:") && !normal.contains("pace"));
+    }
+
+    /// The decode-integrity line (M4) — the whole point of which is that it can tell
+    /// three states apart that all look identical as "no complaints today":
+    ///
+    /// * a lane that CANNOT see corruption (any FFmpeg rung — `nb_queries = 0`, no
+    ///   `AV_FRAME_FLAG_CORRUPT`): silent, never zeros, because printing zeros would
+    ///   assert a cleanliness nothing checked;
+    /// * a lane that looked and saw nothing: also silent, but it earned it;
+    /// * a lane that looked with only half its detectors — a device without
+    ///   `queryResultStatusSupport` — which says so EVERY window, damage or not.
+    ///
+    /// Plus the shape a support engineer actually needs when there IS damage: how
+    /// much, whose fault (stream vs driver), and whether it ever recovered.
+    #[test]
+    fn the_integrity_line_distinguishes_clean_from_unmeasurable() {
+        let (base, p) = sample();
+        let line = |s: &Stats| {
+            stats_text(
+                StatsVerbosity::Detailed,
+                "m",
+                s,
+                &p,
+                false,
+                false,
+                false,
+                None,
+            )
+            .lines()
+            .find(|l| l.starts_with("integrity:"))
+            .map(str::to_string)
+        };
+
+        // An FFmpeg rung cannot answer at all — nothing is printed. (The fixture is
+        // one, so this also pins that every other tier text is untouched by M4.)
+        assert_eq!(line(&base), None, "a lane with no detectors says nothing");
+
+        // The native rung on a device with full status support, decoding clean:
+        // also nothing — a healthy session's OSD stays exactly as quiet as it was.
+        let clean = Stats {
+            decode_integrity: true,
+            decode_status_queries: true,
+            ..base
+        };
+        assert_eq!(line(&clean), None);
+
+        // The same rung on RADV, where a RESULT_STATUS query would hang the VCN ring:
+        // clean counters, but only the parser's half was ever measured, and the line
+        // says so rather than implying a full bill of health.
+        let unmeasured = Stats {
+            decode_status_queries: false,
+            ..clean
+        };
+        assert_eq!(
+            line(&unmeasured).as_deref(),
+            Some("integrity: no driver status")
+        );
+
+        // Damage, attributed: concealment is the stream's, `driver-failed` is the
+        // hardware's, and `run` answers "did it come back?".
+        let damaged = Stats {
+            decode_damaged: 4,
+            decode_failed: 2,
+            concealed_run: 3,
+            worst_concealed_run: 3,
+            ..clean
+        };
+        assert_eq!(
+            line(&damaged).as_deref(),
+            Some("integrity: damaged 4 · driver-failed 2 · run 3")
+        );
+
+        // A lossy window the stream recovered from: the run is 0 and simply drops out.
+        let recovered = Stats {
+            decode_damaged: 4,
+            concealed_run: 0,
+            ..clean
+        };
+        assert_eq!(line(&recovered).as_deref(), Some("integrity: damaged 4"));
+
+        // …and the reason that window is not the whole story. `concealed_run` is an
+        // INSTANT sampled once a second; the freeze it missed lasted 40 AUs. Forty
+        // isolated glitches and one 40-AU freeze that recovered render identically
+        // without the session's worst run, and they are completely different bugs.
+        let recovered_hard = Stats {
+            worst_concealed_run: 40,
+            ..recovered
+        };
+        assert_eq!(
+            line(&recovered_hard).as_deref(),
+            Some("integrity: damaged 4 · worst run 40")
+        );
+        // It stays quiet whenever it adds nothing — a run still climbing at the end
+        // of the window already IS the worst one.
+        let still_broken = Stats {
+            concealed_run: 40,
+            worst_concealed_run: 40,
+            ..recovered
+        };
+        assert_eq!(
+            line(&still_broken).as_deref(),
+            Some("integrity: damaged 4 · run 40")
+        );
+
+        // A rung that REFUSED every AU — a host renegotiating outside the decode
+        // envelope. The screen is frozen, nothing was concealed, no driver verdict
+        // exists, and before M4's review this printed no integrity line at all: a
+        // decoder that decoded nothing, reported as a clean session.
+        let refusing = Stats {
+            decode_refused: 60,
+            concealed_run: 60,
+            worst_concealed_run: 60,
+            ..clean
+        };
+        assert_eq!(
+            line(&refusing).as_deref(),
+            Some("integrity: refused 60 · run 60")
+        );
+
+        // Never below Detailed — the tier ladder is a strict superset chain and this
+        // is diagnostic detail, not a glanceable number.
+        for tier in [
+            StatsVerbosity::Compact,
+            StatsVerbosity::Normal,
+            StatsVerbosity::Off,
+        ] {
+            assert!(
+                !stats_text(tier, "m", &damaged, &p, false, false, false, None)
+                    .contains("integrity:"),
+                "{tier:?}"
+            );
+        }
     }
 
     /// The honest HDR badges: a PQ stream on the software-decode lane is shown WITHOUT

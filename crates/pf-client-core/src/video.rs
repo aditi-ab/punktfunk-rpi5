@@ -102,6 +102,112 @@ pub enum DecodedImage {
     NativeVk(NativeVkFrame),
 }
 
+/// What the decode lane knows about this session's INTEGRITY — M4's telemetry
+/// surface, and the answer to the question that started the whole native-decode
+/// program: "was that stream actually clean, or could nothing here have told us?"
+///
+/// Only the native rung fills it in ([`Decoder::decode_health`] answers `None`
+/// everywhere else), because only the native rung has the two detectors: a
+/// bitstream planner that reports lost references, and a per-op `RESULT_STATUS`
+/// query that reports what the DRIVER thought of the decode. FFmpeg's Vulkan
+/// decoder creates no queries at all (`nb_queries = 0`), never sets
+/// `AV_FRAME_FLAG_CORRUPT`, and reports trouble only as log lines — which is why
+/// the Xbox Ally X corruption was undetectable rather than merely undetected.
+///
+/// Counters are session-cumulative and monotonic; the stats window diffs them the
+/// way it already diffs `frames_dropped`. Nothing here allocates, and nothing here
+/// is computed per frame beyond an add — the whole struct is read once per stats
+/// window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeHealth {
+    /// AUs whose plan needed CONCEALMENT: a reference the DPB no longer held, a
+    /// `frame_num` gap, a NALU walk that stopped early. The picture would have
+    /// been decoded from a substitute, so its output was released unshown.
+    pub damaged: u64,
+    /// Frames the DRIVER reported corrupt through their `RESULT_STATUS_ONLY`
+    /// query. Distinct from [`Self::damaged`] on purpose: damaged means the
+    /// bitstream arrived incomplete, failed means the hardware could not decode
+    /// what did arrive. They have different causes and different fixes, and
+    /// collapsing them is how "the stream is fine, it's your GPU" arguments start.
+    ///
+    /// **Structurally 0 where [`Self::status_queries`] is false**, and
+    /// [`Self::note`] enforces that rather than trusting its callers: on such a
+    /// device `poll_status` still answers `Failed` for a lost device or an
+    /// unreadable timeline, and reporting THAT as a driver verdict would point a
+    /// support engineer at a verdict the hardware cannot produce ("driver-failed 1
+    /// · no driver status" on one line). Those frames still cost a picture, so
+    /// they still extend [`Self::run`] — they are just not attributed to a driver
+    /// that never spoke.
+    pub failed: u64,
+    /// AUs the decoder REFUSED outright: a plan error (a parse failure, an AU
+    /// outside the punktfunk envelope, a slice against a parameter set never
+    /// seen), or a Vulkan/session failure. The decoder produced no picture and
+    /// said so with an error.
+    ///
+    /// Counted apart from [`Self::damaged`] because the two mean opposite things
+    /// about the RUNG: concealment says the decoder coped with a damaged stream,
+    /// refusal says the decoder could not run at all. A rung refusing every AU is
+    /// the shape of a host renegotiating outside the envelope — a frozen screen —
+    /// and without this counter its stats surface reads exactly like a clean
+    /// session, which is the founding failure mode of this whole program.
+    pub refused: u64,
+    /// Consecutive AUs that produced no showable picture, ending at the latest one
+    /// — 0 the moment a clean AU decodes.
+    ///
+    /// This is the field a support engineer reads first, because it separates the
+    /// two failure shapes a raw count cannot: `damaged 40 · run 0` is a lossy link
+    /// that keeps recovering, `damaged 40 · run 40` is a stream that went down and
+    /// never came back. Both look identical as a total.
+    pub run: u32,
+    /// The longest [`Self::run`] of the session — the worst moment, which a
+    /// once-per-second sample of `run` will usually miss entirely.
+    pub worst_run: u32,
+    /// This device answers per-op decode-status queries
+    /// (`queryResultStatusSupport`). When FALSE — RADV, where recording a query
+    /// anyway HANGS the VCN ring — [`Self::failed`] can only ever read 0, because
+    /// there is no verdict to read: the status degrades to timeline completion,
+    /// exactly what FFmpeg knows on every driver. A report that omits this cannot
+    /// tell "clean" from "unmeasured", which is the precise shape of the failure
+    /// this program exists to end.
+    pub status_queries: bool,
+}
+
+impl DecodeHealth {
+    /// Fold one AU's verdict. `damaged` = its plan needed concealment; `refused` =
+    /// the decoder rejected the AU outright (an `Err` out of `decode`); `failed` =
+    /// how many PRIOR frames just read a `Failed` decode status.
+    ///
+    /// All three extend the run: a support engineer asking "did it ever recover?"
+    /// means the picture, and a refused AU or a driver-failed frame is as absent
+    /// from the screen as a concealed one.
+    ///
+    /// The one asymmetry is deliberate and is the whole point of
+    /// [`Self::status_queries`]: where the device answers no status queries, a
+    /// `Failed` read is NOT a driver verdict — it is the degraded timeline path
+    /// (the session generation is gone, the device is lost, the semaphore could
+    /// not be read) — so it extends the run without ever being counted as
+    /// [`Self::failed`]. Enforced here, at the one place every counter is written,
+    /// rather than at each call site, because "clean" and "unmeasured" staying
+    /// distinguishable is the invariant this struct exists for.
+    pub(crate) fn note(&mut self, damaged: bool, refused: bool, failed: u32) {
+        if self.status_queries {
+            self.failed = self.failed.saturating_add(u64::from(failed));
+        }
+        if damaged {
+            self.damaged = self.damaged.saturating_add(1);
+        }
+        if refused {
+            self.refused = self.refused.saturating_add(1);
+        }
+        if damaged || refused || failed > 0 {
+            self.run = self.run.saturating_add(1);
+            self.worst_run = self.worst_run.max(self.run);
+        } else {
+            self.run = 0;
+        }
+    }
+}
+
 /// A raw `VkFormat` code point, carried across the ash-free boundary.
 ///
 /// A newtype rather than a bare `i32` because the two hardware frame types
@@ -319,6 +425,28 @@ pub struct NativeVkFrame {
     /// leading pictures may be undecodable.
     pub keyframe: bool,
     pub poc: i32,
+    /// What this frame's AU said about intra-refresh RECOVERY, read out of the
+    /// bitstream's own recovery point SEI (pf-vkdecode's `RecoveryWatch`).
+    ///
+    /// [`Self::keyframe`] cannot answer for an intra-refresh session — the wave
+    /// never emits an IDR — so without this the pump has no clean point to lift a
+    /// post-loss freeze on and holds the last good picture until its 500 ms
+    /// backstop forces the very IDR the wave exists to avoid. The wire's
+    /// `USER_FLAG_RECOVERY_POINT` says the same thing when the host sets it, which
+    /// only one of the three wave-running encoder backends does (Linux
+    /// libav-NVENC); this is the same fact taken from the stream instead of from
+    /// the host, and it cannot be lost separately from the picture. Fed to
+    /// [`ReanchorGate::on_local_recovery`](punktfunk_core::reanchor::ReanchorGate::on_local_recovery).
+    pub recovery: punktfunk_core::reanchor::LocalRecovery,
+    /// This picture's position in DECODE order (pf-vkdecode's strictly increasing
+    /// per-session ordinal). Delivery order is not decode order: after a failed AU
+    /// the H.265 decoder flushes its DPB, handing back every buffered picture at
+    /// once — pictures decoded BEFORE the loss, carrying the recovery marks of the
+    /// wave they were decoded in. Arriving after the pump armed its freeze, those
+    /// marks would lift it on a heal that completed before the loss. The pump
+    /// stamps this ordinal at every arm and ignores [`Self::recovery`] from
+    /// anything older.
+    pub decode_order: u64,
     /// Sends the release token on drop — see [`NativeReleaseGuard`].
     pub guard: NativeReleaseGuard,
 }
@@ -360,6 +488,32 @@ impl DecodedImage {
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
             DecodedImage::NativeVk(f) => f.keyframe,
+        }
+    }
+
+    /// What the decoder's OWN bitstream parser saw about an intra-refresh heal on
+    /// this frame's AU — the recovery point SEI, which no platform decoder exposes.
+    ///
+    /// Only the native rung can answer: libavcodec parses the SEI internally and
+    /// surfaces nothing of it (its `AV_FRAME_FLAG_KEY` is IDR-only), MediaCodec and
+    /// VideoToolbox likewise. Everyone else reports
+    /// [`LocalRecovery::NONE`](punktfunk_core::reanchor::LocalRecovery::NONE) and
+    /// the pump's re-anchor behaviour on those lanes is byte-for-byte what it was.
+    pub fn local_recovery(&self) -> punktfunk_core::reanchor::LocalRecovery {
+        match self {
+            DecodedImage::NativeVk(f) => f.recovery,
+            _ => punktfunk_core::reanchor::LocalRecovery::NONE,
+        }
+    }
+
+    /// This frame's position in DECODE order, where the lane knows one — see
+    /// [`NativeVkFrame::decode_order`]. `None` everywhere else, which is what the
+    /// pump reads as "this lane reports no local recovery either, so there is
+    /// nothing to date-stamp".
+    pub fn decode_order(&self) -> Option<u64> {
+        match self {
+            DecodedImage::NativeVk(f) => Some(f.decode_order),
+            _ => None,
         }
     }
 
@@ -553,6 +707,34 @@ const VAAPI_DEMOTE_AFTER: u32 = 3;
 /// consecutive bad AUs from a single loss event no longer strands the session on
 /// software before the first requested IDR could even arrive.
 const HW_DEMOTE_MIN_STREAK: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// May a successful `decode` answer CLEAR the demotion error streak?
+///
+/// The streak is the hardware rungs' only escape hatch, and clearing it is a
+/// claim: *this decoder is working*. A delivered frame proves that outright. So
+/// does a clean `Ok(None)` — the decoder ran and had nothing to object to (it
+/// buffered, or skipped an H.265 RASL picture after an open-GOP join).
+///
+/// What proves nothing is the third `Ok(None)`: the native rung's CONCEALMENT
+/// answer, where the plan needed a substitute for something lost and the picture
+/// was released unshown. That is deliberately not an `Err` — stream damage is not
+/// a decoder fault, and three of them in a second must not demote the rung on
+/// exactly the lossy links it exists to diagnose — but "not an error" was silently
+/// read as "a success", and clearing on it is the dangerous half of that:
+///
+/// * a driver failing every OTHER AU on a lossy link has its `Err`s zeroed by the
+///   concealment between them and never reaches [`VAAPI_DEMOTE_AFTER`];
+/// * and a rung answering concealment FOREVER — a host framing regression putting
+///   two pictures in one AU makes every AU conceal, and unlike a reference gap it
+///   does not self-heal at an IDR — holds a frozen last-good frame with no escape
+///   at all, where before this milestone the same stream demoted to a rung that
+///   ignores AU boundaries and showed a picture.
+///
+/// Leaving the streak untouched costs nothing on a healthy link: one damaged AU
+/// between good frames is cleared by the next good frame.
+fn clears_demotion_streak(delivered: bool, concealed: bool) -> bool {
+    delivered || !concealed
+}
 
 /// `VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR` — the raw flag bit within
 /// [`VulkanDecodeDevice::decode_video_caps`] (this crate stays ash-free).
@@ -763,6 +945,39 @@ fn quiet_ffmpeg_log() {
     ffmpeg::util::log::set_level(level);
 }
 
+/// Say what `PUNKTFUNK_AU_FAULT` will do to THIS session, once, at decoder
+/// construction — including the two cases where the answer is "nothing".
+///
+/// The knob only bites on the native rung (its injector sits at that backend's
+/// decode entry), so a lab run that armed it and landed anywhere else — an FFmpeg
+/// rung, a shape the native rung refused, a session that demoted — must be told
+/// so. Silence there is indistinguishable from "the fault was injected and
+/// nothing detected it", which is precisely the conclusion a fault run exists to
+/// make trustworthy. Unset is the normal state and says nothing at all.
+fn report_au_fault_env(native_rung: bool) {
+    let Ok(spec) = std::env::var("PUNKTFUNK_AU_FAULT") else {
+        return;
+    };
+    if spec.is_empty() {
+        return;
+    }
+    match pf_vkdecode::AuFault::from_spec(&spec) {
+        // The native backend logs the arming itself (mode + period), with the
+        // decoder it is about to corrupt in hand — no need to say it twice.
+        Some(_) if native_rung => {}
+        Some(_) => tracing::warn!(
+            value = %spec,
+            "PUNKTFUNK_AU_FAULT is armed, but this session is NOT on the native \
+             Vulkan rung — no AU will be corrupted and no detector will fire"
+        ),
+        None => tracing::warn!(
+            value = %spec,
+            "PUNKTFUNK_AU_FAULT not understood (want drop|truncate|flip[:period]) \
+             — ignored"
+        ),
+    }
+}
+
 impl Decoder {
     /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
     /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`d3d11va`/
@@ -807,7 +1022,15 @@ impl Decoder {
             vk.and_then(|v| v.adapter_luid),
             vk.is_some_and(|v| v.d3d11_hdr10),
         );
-        let done = |backend| {
+        let done = |backend: Backend| {
+            // Whatever rung this session landed on, say what `PUNKTFUNK_AU_FAULT`
+            // is going to do about it — see [`report_au_fault_env`]. Here, at the
+            // one exit every backend leaves through, rather than in the native
+            // backend's constructor: a lab run whose session never REACHES that
+            // constructor (an FFmpeg rung, a refused shape, a demotion) would
+            // otherwise sit silently un-faulted and read as a fault run that
+            // detected nothing.
+            report_au_fault_env(matches!(backend, Backend::NativeVulkan(_)));
             Ok(Decoder {
                 backend,
                 codec_id,
@@ -1086,6 +1309,33 @@ impl Decoder {
         }
     }
 
+    /// This session's decode-integrity counters, or `None` on a backend that has
+    /// no way to answer (every FFmpeg rung and PyroWave — see [`DecodeHealth`]).
+    ///
+    /// `None` and `Some(DecodeHealth::default())` are deliberately different
+    /// answers, and the stats surface must keep them different: the first is "this
+    /// decoder cannot see corruption", the second is "this decoder looked and saw
+    /// none". Reporting the first as the second is exactly the mistake that let a
+    /// field corruption run undetected for a release.
+    pub fn decode_health(&self) -> Option<DecodeHealth> {
+        match &self.backend {
+            Backend::NativeVulkan(d) => Some(d.health()),
+            _ => None,
+        }
+    }
+
+    /// The DECODE-order ordinal of the newest picture this lane has planned — the
+    /// watermark a caller stamps when it arms a post-loss freeze, so it can tell a
+    /// frame decoded before the loss from one decoded after it (see
+    /// [`NativeVkFrame::decode_order`]). 0 on every lane that has no bitstream
+    /// parser of its own, which is also every lane that reports no local recovery.
+    pub fn decode_order(&self) -> u64 {
+        match &self.backend {
+            Backend::NativeVulkan(d) => d.decode_order(),
+            _ => 0,
+        }
+    }
+
     /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
     /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
     /// Open a PyroWave decoder for a `CODEC_PYROWAVE` session (plan §4.5): pyrowave
@@ -1101,6 +1351,8 @@ impl Decoder {
         color: ColorDesc,
         hdr16: bool,
     ) -> Result<Decoder> {
+        // Never the native rung — see [`report_au_fault_env`].
+        report_au_fault_env(false);
         Ok(Decoder {
             backend: Backend::PyroWave(Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
                 vk,
@@ -1177,6 +1429,11 @@ impl Decoder {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
+        // Did THIS AU come back as a concealment — an `Ok(None)` the native rung
+        // produced because the picture was damaged, not because the decoder was
+        // buffering? Only the native rung can answer, and the answer decides
+        // whether the `Ok` below is allowed to clear the demotion streak.
+        let mut concealed = false;
         let result = match &mut self.backend {
             Backend::Vulkan(v) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
@@ -1184,7 +1441,31 @@ impl Decoder {
             }
             Backend::NativeVulkan(n) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
-                n.decode(au).map(|f| f.map(DecodedImage::NativeVk))
+                let r = n.decode(au).map(|f| f.map(DecodedImage::NativeVk));
+                // STREAM damage is not a decoder fault, and must not ride the
+                // demotion streak.
+                //
+                // This distinction only exists on the native rung, because it is
+                // the only one that can SEE damage — and that is precisely what
+                // makes it dangerous. An FFmpeg rung conceals a lost reference
+                // silently and keeps its job; if the native rung turned the same
+                // event into an error, three of them over a second would demote
+                // the program's own headline decoder exactly on the lossy links it
+                // was built to diagnose. So concealment comes back as `Ok(None)`
+                // plus this flag: the pump still asks for a re-anchor at the same
+                // moment and through the same throttle it always did, and the
+                // hardware rung survives the loss that caused it.
+                //
+                // A driver `RESULT_STATUS` verdict of Failed is NOT routed here —
+                // it stays an `Err` below. That one really is a statement about
+                // the decoder ("I could not decode what I was given"), and a
+                // driver making it repeatedly is the exact case demotion exists
+                // for; it is also the Xbox Ally X shape.
+                if n.take_recovery_request() {
+                    self.want_keyframe = true;
+                    concealed = true;
+                }
+                r
             }
             #[cfg(target_os = "linux")]
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
@@ -1204,8 +1485,12 @@ impl Decoder {
         };
         match result {
             Ok(f) => {
-                self.vaapi_fails = 0;
-                self.first_fail = None;
+                // Only an answer that PROVES the rung works may clear the streak —
+                // see [`clears_demotion_streak`] for the whole argument.
+                if clears_demotion_streak(f.is_some(), concealed) {
+                    self.vaapi_fails = 0;
+                    self.first_fail = None;
+                }
                 self.delivered |= f.is_some();
                 Ok(f)
             }
@@ -1565,6 +1850,52 @@ mod tests {
             adapter_luid: None,
             queue_lock: std::sync::Arc::new(QueueLock::new()),
         }
+    }
+
+    /// The demotion streak's escape hatch, stated as the invariant it is: an `Ok`
+    /// clears the streak only when it PROVES the rung works.
+    ///
+    /// Concealment (`Ok(None)` with a recovery request) proves nothing — it is the
+    /// STREAM that was damaged — and before M4's review it cleared the streak
+    /// anyway, because the `Ok(_)` arm matched `Ok(None)` too. Two shapes followed
+    /// from that, and this test pins both away:
+    ///
+    /// * a driver failing every other AU on a lossy link: `Err` / concealment /
+    ///   `Err` / concealment … the concealment zeroed the count and
+    ///   [`VAAPI_DEMOTE_AFTER`] was never reached;
+    /// * and a rung that conceals forever and ships nothing: a frozen picture with
+    ///   no path down the ladder at all.
+    #[test]
+    fn only_an_answer_that_proves_the_rung_works_clears_the_demotion_streak() {
+        // A shipped frame is proof, concealed or not (the AU carried damage AND a
+        // picture — the decoder is plainly alive).
+        assert!(clears_demotion_streak(true, false));
+        assert!(clears_demotion_streak(true, true));
+        // A CLEAN no-output AU is proof too: the decoder ran and objected to
+        // nothing (it buffered, or skipped an H.265 RASL picture after an open-GOP
+        // join). Treating that as suspicious would demote healthy sessions.
+        assert!(clears_demotion_streak(false, false));
+        // Concealment with no picture is the one that proves nothing.
+        assert!(!clears_demotion_streak(false, true));
+
+        // The streak arithmetic that follows, spelled out on the milder and
+        // likelier shape: a broken driver alternating with concealment must still
+        // reach the demotion threshold.
+        let mut fails = 0u32;
+        for concealed_ok in [false, true, false, true, false] {
+            if concealed_ok {
+                if clears_demotion_streak(false, true) {
+                    fails = 0;
+                }
+            } else {
+                fails += 1; // an Err from the driver's own verdict
+            }
+        }
+        assert!(
+            fails >= VAAPI_DEMOTE_AFTER,
+            "three driver errors interleaved with concealment must still reach the \
+             demotion threshold — they got to {fails}"
+        );
     }
 
     /// Auto's hardware order (both OSes): Vulkan-first on NVIDIA (on Linux: no usable

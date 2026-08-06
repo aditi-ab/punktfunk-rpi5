@@ -181,6 +181,46 @@ pub struct Stats {
     /// `chroma_444` false, the host declined — the OSD says so instead of leaving the
     /// switch's effect unobservable.
     pub asked_444: bool,
+    /// The decode lane can answer integrity questions AT ALL (M4). True only on the
+    /// native rung; every FFmpeg rung leaves it false, because libavcodec's Vulkan
+    /// decoder creates no status queries (`nb_queries = 0`), never sets
+    /// `AV_FRAME_FLAG_CORRUPT`, and reports trouble only as log lines.
+    ///
+    /// Everything below is meaningless without it, and a surface that renders the
+    /// four counters as zeros on a lane that cannot see damage is repeating the
+    /// exact mistake this program exists to end: "clean" and "unmeasured" are not
+    /// the same claim.
+    pub decode_integrity: bool,
+    /// AUs whose plan needed CONCEALMENT this window — a lost reference, a
+    /// `frame_num` gap, a short NALU walk. Each one cost a frame (released unshown)
+    /// and a re-anchor request.
+    pub decode_damaged: u32,
+    /// Frames the DRIVER reported corrupt this window through their per-op
+    /// `RESULT_STATUS` query — the Xbox Ally X class, and the count no FFmpeg rung
+    /// can produce. Always 0 where `decode_status_queries` is false: there is no
+    /// verdict to read, not nothing to report. (`video::DecodeHealth::note`
+    /// enforces that, so the two fields can never contradict each other here.)
+    pub decode_failed: u32,
+    /// AUs the decoder REFUSED outright this window — a plan error, a
+    /// Vulkan/session failure. Distinct from `decode_damaged`, and the difference
+    /// is the whole diagnosis: concealment means the decoder coped with a damaged
+    /// stream, refusal means it could not run and the screen is frozen. A rung
+    /// refusing every AU used to report as a perfectly clean session.
+    pub decode_refused: u32,
+    /// Consecutive AUs with no showable picture as of this window's end (0 = the
+    /// stream is decoding clean right now). The field that separates a lossy link
+    /// from a stream that never came back — see `video::DecodeHealth::run`.
+    pub concealed_run: u32,
+    /// The LONGEST such run of the session so far — session-cumulative, not
+    /// windowed, and deliberately so: `concealed_run` is an instant sampled once a
+    /// second, which misses the bad moment almost every time. A window whose
+    /// `concealed_run` is 0 and whose `worst_concealed_run` is 40 is a session that
+    /// froze hard and recovered, and no other field on this struct says that.
+    pub worst_concealed_run: u32,
+    /// The device answers per-op decode-status queries (`queryResultStatusSupport`).
+    /// FALSE on RADV, where recording one HANGS the VCN ring, and there the integrity
+    /// report covers the parser's half only.
+    pub decode_status_queries: bool,
 }
 
 /// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
@@ -650,7 +690,30 @@ fn pump(
     let mut next_expected_index: Option<u32> = None;
     // Fixture capture for the native-decode program: every AU exactly as it reaches
     // `decode_frame`, plus a boundary/flags index — see `au_dump.rs` for the format.
+    //
+    // NOTE for fault runs: this captures what the HOST sent. `PUNKTFUNK_AU_FAULT`'s
+    // injector lives one level down, at the native backend's decode entry, so on a
+    // faulted run the fixture is the CLEAN bitstream and replaying it will not
+    // reproduce the damage (reconstruct that from the spec — the injector is pure
+    // and deterministic). Deliberate: the dump's job is to preserve the host's
+    // output, and moving the injector above it would corrupt every backend's input
+    // rather than only the lane whose detectors it exists to fire.
     let mut au_dump = crate::au_dump::AuDump::from_env(connector.codec);
+    // The decode-order watermark at the latest arm of the freeze gate (M4 review):
+    // a frame whose `decode_order` is at or below this was DECODED before the loss,
+    // whatever order it was delivered in, so its recovery point SEI describes a wave
+    // that completed before the loss and must not lift the freeze the loss raised.
+    // `gate.arms()` is the trigger to re-stamp — it moves at every arm site,
+    // including the two inside the gate, and not on the overdue backstop (which
+    // re-asks without re-arming, and where discarding an in-flight heal would be
+    // exactly wrong). Inert on every lane without its own parser: `decode_order` is
+    // 0 there and `local_recovery` is NONE anyway.
+    let mut gate_arms = gate.arms();
+    let mut arm_decode_order: u64 = 0;
+    // Decode-integrity window cursor (M4), the same per-window diffing as
+    // `window_dropped`: the decoder's counters are session-cumulative, the OSD shows
+    // the delta. `None` on every lane that cannot answer — see `Stats::decode_integrity`.
+    let mut window_health = decoder.decode_health();
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -769,11 +832,56 @@ fn pump(
                         au_dump = None;
                     }
                 }
+                // Re-stamp the arm watermark BEFORE this AU decodes and advances the
+                // decoder's ordinal, so it names the newest picture that existed when the
+                // freeze was armed. One site covers every arm: the frame-gap arm above
+                // happened moments ago in this same iteration, and the four sites below
+                // (`on_no_output` ×2, the decoder-recovery arm, `poll`'s dropped climb) all
+                // run AFTER the decode, so the next iteration reaches here with the ordinal
+                // still exactly as they left it.
+                if gate.arms() != gate_arms {
+                    gate_arms = gate.arms();
+                    arm_decode_order = decoder.decode_order();
+                }
                 match decoder.decode_frame(&frame.data, frame.flags, frame.complete) {
                     Ok(Some(image)) => {
-                        // Fold this decoded frame through the shared freeze gate: it reads the AU's
-                        // re-anchor wire flags (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT),
-                        // takes `image.is_keyframe()` as the ffmpeg keyframe belt, applies the two-mark
+                        // The decoder's OWN re-anchor observation FIRST (M4): a recovery point SEI
+                        // is the only clean point an intra-refresh session has when the host does not
+                        // mark the wire — its wave emits no IDR and libavcodec flags none, and only
+                        // one of the three encoder backends that run a wave sets
+                        // USER_FLAG_RECOVERY_POINT — so without this such a session freezes for the
+                        // full REANCHOR_FREEZE_MAX and then forces the very IDR the wave exists to
+                        // avoid. The gate pairs the mark against its own arm (only a wave that
+                        // STARTED after the loss proves anything about it) and lifts on the first
+                        // trusted one. Before `on_decoded`, so the frame that healed the picture is
+                        // itself presented rather than held one more round. Inert on every other
+                        // lane: `local_recovery` reports NONE and the wire path is untouched.
+                        //
+                        // The gate pairs by TIME; this pairs by DECODE ORDER, and both are
+                        // needed. A decoder that flushes its DPB after a failed AU hands back
+                        // every picture it still held — pictures decoded BEFORE the loss,
+                        // carrying the marks of the wave they were decoded in — and they
+                        // arrive after the arm, so the gate cannot tell. Their ordinal can.
+                        let local = match image.decode_order() {
+                            Some(order) if order <= arm_decode_order => {
+                                tracing::trace!(
+                                    order,
+                                    arm_decode_order,
+                                    "discarding the local recovery of a frame decoded before \
+                                     the loss"
+                                );
+                                punktfunk_core::reanchor::LocalRecovery::NONE
+                            }
+                            _ => image.local_recovery(),
+                        };
+                        if gate.on_local_recovery(local) {
+                            tracing::debug!(
+                                "re-anchored on the stream's own recovery point SEI — no IDR needed"
+                            );
+                        }
+                        // Then the shared freeze gate: it reads the AU's re-anchor wire flags
+                        // (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT), takes
+                        // `image.is_keyframe()` as the ffmpeg keyframe belt, applies the two-mark
                         // rule + the mark-patience backstop, clears the no-output streak, and returns
                         // whether to present this frame or withhold it as a post-loss concealment.
                         let present =
@@ -838,6 +946,20 @@ fn pump(
                         // shows becomes that sample — honest, at zero pipeline cost on
                         // every other frame. Software keeps the synchronous stamp on
                         // every frame (its decode really is done by now).
+                        //
+                        // M4 re-examined this against the native rung's non-blocking
+                        // reads (`poll_status`, `get_semaphore_counter_value`) and left
+                        // it exactly as it is. Polling can only ever answer "complete
+                        // by NOW", and the only place this thread polls is once per AU
+                        // — so every sample would be quantized up by as much as a whole
+                        // frame interval (8.3 ms at 120 Hz, against decodes that
+                        // measure ~0.1-2 ms). That is not a cheaper measurement, it is
+                        // a wrong one, and it would replace a true figure with a
+                        // plausible-looking upper bound nothing downstream could tell
+                        // apart. Sampling faster needs either a spin (the CPU burn this
+                        // comment already warns about) or a second thread on a decoder
+                        // that is `Send` but deliberately not `Sync`. Correctness beats
+                        // the metric: one honest sample per window stands.
                         let hw_fence = match &image {
                             DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
                             // The native rung's frame carries the same pair: the
@@ -931,9 +1053,31 @@ fn pump(
                 // GOP has no periodic keyframe, so a rebuilt/erroring decoder would stay
                 // gray/frozen until an unrelated packet drop happened to request one. Route it
                 // through the same throttle as loss recovery below.
+                //
+                // The native rung's DAMAGE path arrives here too (M4): an AU whose plan needed
+                // concealment answers `Ok(None)` and raises this flag rather than erroring, so
+                // the ask happens at exactly this moment and through exactly this throttle
+                // while the decoder keeps its rung — stream damage is not a decoder fault (see
+                // `video_vk_native`'s recovery policy). That also bounds the whole thing: one
+                // ask per 100 ms per session however fast the damage arrives, and once the gate
+                // is armed further damage refreshes an existing freeze rather than compounding
+                // into more requests.
+                //
+                // ARM ONLY WHEN NOT ALREADY HOLDING. This flag fires per DAMAGED AU, not per
+                // loss, and every `arm` zeroes the gate's recovery-mark count and its
+                // local-SEI credit. Re-arming on each one therefore made both re-anchor paths
+                // — the wire's two-mark rule and M4's local SEI — impossible to complete
+                // during exactly the sustained damage they were written for, leaving recovery
+                // resting entirely on the throttled keyframe ask. A genuinely NEW loss still
+                // re-arms with its marks zeroed: it arrives as a frame-index gap or a
+                // `frames_dropped` climb, both of which arm unconditionally. The keyframe ask
+                // below is untouched — it still fires per damaged AU, through the same 100 ms
+                // throttle.
                 if decoder.take_keyframe_request() {
                     let now = Instant::now();
-                    gate.arm(now);
+                    if !gate.is_holding() {
+                        gate.arm(now);
+                    }
                     if last_kf_req
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                     {
@@ -1064,6 +1208,28 @@ fn pump(
                 .saturating_sub(window_mic.dropped_full + window_mic.dropped_stale)
                 as u32;
             window_mic = mic_now;
+            // Decode integrity (M4): session-cumulative counters, diffed per window
+            // like `frames_dropped`. `None` on a lane that cannot see damage at all —
+            // and that stays distinguishable from "saw none" all the way to the OSD.
+            let health_now = decoder.decode_health();
+            let (decode_damaged, decode_failed, decode_refused) = match (health_now, window_health)
+            {
+                (Some(now), Some(prev)) => (
+                    now.damaged.saturating_sub(prev.damaged) as u32,
+                    now.failed.saturating_sub(prev.failed) as u32,
+                    now.refused.saturating_sub(prev.refused) as u32,
+                ),
+                // A lane that could not answer at the last window and can now.
+                // Unreachable today — the cursor is seeded from the decoder before
+                // the first AU and the ladder only ever demotes AWAY from the
+                // native rung, never back onto it — so this exists to keep the
+                // match total with a defensible answer (the cumulative figure)
+                // instead of an `unwrap` that would be a panic if that ever
+                // changed.
+                (Some(now), None) => (now.damaged as u32, now.failed as u32, now.refused as u32),
+                (None, _) => (0, 0, 0),
+            };
+            window_health = health_now;
             tracing::debug!(
                 fps = frames_n,
                 hostnet_p50_us = hn_p50,
@@ -1077,6 +1243,12 @@ fn pump(
                 lost,
                 mic_sent,
                 mic_dropped,
+                decode_damaged,
+                decode_failed,
+                decode_refused,
+                concealed_run = health_now.map(|h| h.run).unwrap_or(0),
+                worst_concealed_run = health_now.map(|h| h.worst_run).unwrap_or(0),
+                decode_status_queries = health_now.map(|h| h.status_queries).unwrap_or(false),
                 total_frames,
                 "stream window"
             );
@@ -1106,6 +1278,13 @@ fn pump(
                 auto_rate,
                 chroma_444,
                 asked_444,
+                decode_integrity: health_now.is_some(),
+                decode_damaged,
+                decode_failed,
+                decode_refused,
+                concealed_run: health_now.map(|h| h.run).unwrap_or(0),
+                worst_concealed_run: health_now.map(|h| h.worst_run).unwrap_or(0),
+                decode_status_queries: health_now.is_some_and(|h| h.status_queries),
             }));
             window_start = Instant::now();
             frames_n = 0;
