@@ -98,6 +98,11 @@ pub mod clipboard;
 // resolved itself — the present path is now literally the same code.
 #[cfg(windows)]
 pub mod video_d3d11;
+// Native D3D11VA (M5): `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the SAME
+// hand-off ring `video_d3d11` owns. Pin-only (`PUNKTFUNK_DECODER=native-d3d11va`) until it has
+// hardware evidence.
+#[cfg(windows)]
+pub mod video_d3d11_native;
 #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
 pub mod video_pyrowave;
 

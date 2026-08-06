@@ -761,6 +761,10 @@ mod tests {
         list0.extend(rps.st_curr_before.iter().copied());
         list0.extend(rps.st_curr_after.iter().copied());
         list0.extend(rps.lt_curr.iter().copied());
+        // The marked DPB is this AU's current sets and nothing more here: the Vulkan
+        // rung binds `pReferenceSlots` from the CURRENT sets (the slots this decode
+        // operation uses), so the snapshot is not an input to anything under test.
+        let dpb_refs = list0.clone();
         AuPlan {
             picture: mini_picture(poc, max_dpb_frames),
             rps,
@@ -770,6 +774,7 @@ mod tests {
                 outputs: vec![stored],
                 removed,
             },
+            dpb_refs,
             warnings: Vec::new(),
             sps,
             pps,
@@ -1036,6 +1041,7 @@ mod tests {
                 outputs: vec![2],
                 removed: Vec::new(),
             },
+            dpb_refs: vec![st_ref(1, 0)],
             warnings: Vec::new(),
             sps: Rc::clone(&sps),
             pps: Rc::clone(&pps),

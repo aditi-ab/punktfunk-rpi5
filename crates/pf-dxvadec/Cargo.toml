@@ -1,0 +1,24 @@
+[package]
+name = "pf-dxvadec"
+description = "Native D3D11VA (DXVA) H.264/HEVC decode for the Windows clients (M5): the hand-declared DXVA buffer layouts plus AuPlan → picparams/qmatrix/slice-control conversion — the CPU-testable half; the ID3D11VideoDecoder plumbing lives in pf-client-core's video_d3d11_native (design/client-native-decode.md §3.4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Direct dependency on the vendored parser crate, not just pf-bitstream: the picture-parameter
+# conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
+# `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already
+# builds — no duplicate types.
+cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+pf-bitstream = { path = "../pf-bitstream" }
+# For `SlotMap`/`SlotError` ONLY — see this crate's lib.rs for why the DPB slot ledger is
+# borrowed from the Vulkan crate rather than duplicated or moved.
+pf-vkdecode = { path = "../pf-vkdecode" }
+tracing = "0.1"
+
+[lints]
+workspace = true

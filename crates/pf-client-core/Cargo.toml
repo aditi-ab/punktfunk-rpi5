@@ -62,6 +62,12 @@ sdl3 = { version = "0.18", features = ["hidapi"] }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
+# Native D3D11VA decode (M5 of the native-decode program): the hand-declared DXVA buffer
+# layouts and the AuPlan → picparams/qmatrix/slice-control conversion that video_d3d11_native
+# submits. Windows-only because the rung is; the crate itself is cross-platform CPU code so
+# its tests run on every CI leg (which is the point — `cfg(windows)` code cannot be tested by
+# the Linux or macOS gates at all).
+pf-dxvadec = { path = "../pf-dxvadec" }
 # Pad-audio correlation (pad_audio.rs): the HID devnode's ContainerID and a render endpoint's
 # stamped PKEY_Device_ContainerId both live in the registry — read-only, which sidesteps COM
 # property stores entirely (the same version the host pins).

@@ -73,6 +73,40 @@ pub struct AuPlan {
     pub picture: PicturePlan,
     pub slices: Vec<SlicePlan>,
     pub dpb: DpbUpdate,
+    /// Every picture the DPB holds marked "used for reference" at the moment this AU
+    /// decodes — the MARKED DPB, not this AU's reference lists.
+    ///
+    /// [`Self::dpb`] reports a delta (stored/outputs/removed) because that is what a
+    /// surface allocator needs. This is the other half: the STATE, which is what the
+    /// DXVA picture-parameters formats ask for. `DXVA_PicParams_H264::RefFrameList`
+    /// is spec-defined as the pictures currently marked used for reference — with
+    /// `UsedForReferenceFlags` a statement about the DPB, not about this access unit
+    /// — and libavcodec's DXVA path fills it by walking its whole DPB
+    /// (`short_ref` then `long_ref`), not the derived lists. Vulkan's
+    /// `pReferenceSlots` is the opposite: spec-defined as the slots THIS decode
+    /// operation uses, so a subset is correct there and the native Vulkan rung binds
+    /// the AU's own set.
+    ///
+    /// The difference bites on the long-term/RFI class: a long-term reference held
+    /// across pictures that none of them names is absent from every derived list yet
+    /// must stay in `RefFrameList`, because a driver keeping per-reference state is
+    /// entitled to read its absence as "no longer a reference" and discard it.
+    ///
+    /// Captured at BEGIN-picture time — after 8.2.5.2 gap placeholders are inserted
+    /// and after any IDR drain, before this AU's own end-of-picture marking (8.2.5)
+    /// stores or evicts anything. That is exactly the DPB the hardware decodes this
+    /// picture against, and it is why a picture named here may still appear in
+    /// [`DpbUpdate::removed`] of the same plan: it was a valid reference for this
+    /// decode and stopped being one at its end.
+    ///
+    /// Order is the DPB's own (oldest stored first). DXVA imposes none — a driver
+    /// resolves an entry by its `FrameNumList`/`FieldOrderCntList` pair — so
+    /// backends are free to reorder, and pf-dxvadec does.
+    ///
+    /// 8.2.5.2 gap placeholders are ABSENT: they carry no [`PicId`], so there is no
+    /// surface a backend could name. A frame the DPB holds only for OUTPUT (already
+    /// unmarked) is absent too — it is not a reference.
+    pub dpb_refs: Vec<RefPic>,
     pub warnings: Vec<PlanWarning>,
     /// The SPS the planner activated for this AU — the one [`Self::picture`]'s
     /// parameters derive from (the FIRST slice's PPS's SPS; a later slice may
@@ -349,6 +383,9 @@ struct CurrentPicState {
     id: PicId,
     /// Reference picture lists, derived once per picture, indexed per slice.
     ref_pic_lists: ReferencePicLists,
+    /// The marked DPB as it stands for THIS picture's decode, captured beside the
+    /// reference lists it was derived from — see [`AuPlan::dpb_refs`].
+    dpb_refs: Vec<RefPic>,
     current_macroblock: CurrentMacroblockTracking,
 }
 
@@ -500,6 +537,7 @@ impl H264Planner {
         // cloned before finish_picture consumes `cur`.
         let pps = Rc::clone(&cur.first_slice_pps);
         let sps = Rc::clone(&pps.sps);
+        let dpb_refs = cur.dpb_refs.clone();
         let stored = self.finish_picture(cur, &mut warnings)?;
 
         // `removed` is the delta against what the backend last SAW alive, not against
@@ -519,6 +557,7 @@ impl H264Planner {
                 outputs: mem::take(&mut self.pending_outputs),
                 removed,
             },
+            dpb_refs,
             warnings,
             sps,
             pps,
@@ -1408,6 +1447,10 @@ impl H264Planner {
 
         let pic = self.init_current_pic(slice, &pps.sps, first_field.as_ref().map(|f| &f.0))?;
         let ref_pic_lists = self.dpb.build_ref_pic_lists(&pic);
+        // Taken here, beside the lists 8.2.4 derives from the same DPB state, and
+        // never later: `finish_picture` runs 8.2.5's marking and stores the picture,
+        // which is the DPB the NEXT AU decodes against, not this one.
+        let dpb_refs = self.dpb_snapshot();
 
         Ok(CurrentPicState {
             pic,
@@ -1415,8 +1458,46 @@ impl H264Planner {
             pps,
             id,
             ref_pic_lists,
+            dpb_refs,
             current_macroblock,
         })
+    }
+
+    /// The marked DPB as [`AuPlan::dpb_refs`] reports it.
+    ///
+    /// The filter is the pair of conditions a backend needs to name a surface: the
+    /// picture is marked used for reference (short- or long-term — anything the
+    /// sliding window or an MMCO has unmarked is skipped, even while the DPB still
+    /// holds it for output), and it carries a [`PicId`], which 8.2.5.2's non-existing
+    /// gap placeholders deliberately do not.
+    fn dpb_snapshot(&self) -> Vec<RefPic> {
+        self.dpb
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.reference?;
+                let pic = entry.pic.borrow();
+                let is_long_term = match pic.reference() {
+                    Reference::LongTerm => true,
+                    Reference::ShortTerm => false,
+                    Reference::None => return None,
+                };
+                Some(RefPic {
+                    id,
+                    top_field_order_cnt: pic.top_field_order_cnt,
+                    bottom_field_order_cnt: pic.bottom_field_order_cnt,
+                    is_long_term,
+                    // The same pair-key derivation `to_ref_pics` makes, and for the
+                    // same reason: DXVA's `FrameNumList` carries `LongTermFrameIdx`
+                    // for a long-term reference and `frame_num` for a short-term one.
+                    frame_num_or_lt_idx: if is_long_term {
+                        u16::try_from(pic.long_term_frame_idx).unwrap_or(u16::MAX)
+                    } else {
+                        pic.frame_num as u16
+                    },
+                })
+            })
+            .collect()
     }
 
     // Check whether first_mb_in_slice increases monotonically for the current
@@ -1996,6 +2077,103 @@ mod tests {
         let flush = planner.flush();
         assert!(flush.outputs.contains(&lt_id));
         assert!(flush.removed.contains(&lt_id));
+    }
+
+    #[test]
+    fn the_dpb_snapshot_holds_a_marked_long_term_reference_no_slice_of_the_au_names() {
+        // The shape a DXVA `RefFrameList` built from the derived lists loses: an
+        // anchor pinned long-term, still marked in the DPB, that this picture's own
+        // reference list is too short to reach. A driver told it is gone is entitled
+        // to discard it — and RFI recovery then decodes against nothing.
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = Vec::new();
+        Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
+        Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
+        au0.extend(write_idr_slice());
+        // AU1 pins ITSELF long-term (MMCO 4 admits index 0, MMCO 6 assigns it).
+        let au1 = write_p_slice(1, 2, 1, 1, Some(&[(4, 1), (6, 0)]));
+        // AU2 activates ONE reference: 8.2.4.2.1 puts the short-term IDR first, so
+        // the truncated list never names the long-term picture.
+        let au2 = write_p_slice(2, 4, 1, 1, None);
+
+        let mut planner = H264Planner::new();
+        let p0 = planner.plan_au(&au0).unwrap();
+        let p1 = planner.plan_au(&au1).unwrap();
+        let p2 = planner.plan_au(&au2).unwrap();
+        for plan in [&p0, &p1, &p2] {
+            assert!(plan.warnings.is_empty(), "must plan clean: {plan:?}");
+        }
+        let idr_id = p0.dpb.stored.unwrap();
+        let lt_id = p1.dpb.stored.unwrap();
+
+        assert_eq!(
+            p2.slices[0]
+                .ref_list0
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![idr_id],
+            "the AU's own list reaches only the short-term picture"
+        );
+        // …and the snapshot still reports both, the long-term one marked as such and
+        // keyed by its LongTermFrameIdx rather than its frame_num.
+        assert_eq!(
+            p2.dpb_refs
+                .iter()
+                .map(|r| (r.id, r.is_long_term, r.frame_num_or_lt_idx))
+                .collect::<Vec<_>>(),
+            vec![(idr_id, false, 0), (lt_id, true, 0)]
+        );
+
+        // The opening IDR has an empty DPB behind it; AU1 sees only the IDR, still
+        // short-term (its own marking is an end-of-picture process).
+        assert!(p0.dpb_refs.is_empty());
+        assert_eq!(
+            p1.dpb_refs
+                .iter()
+                .map(|r| (r.id, r.is_long_term))
+                .collect::<Vec<_>>(),
+            vec![(idr_id, false)]
+        );
+    }
+
+    #[test]
+    fn the_dpb_snapshot_matches_the_planners_own_live_ids_across_the_whole_vector() {
+        // Every picture the snapshot names must be one the planner considers live —
+        // a snapshot entry with no live id is a surface a backend cannot resolve.
+        // (The converse does not hold: the DPB holds unmarked pictures for output.)
+        let mut planner = H264Planner::new();
+        let mut plans = Vec::new();
+        for au in split_into_aus(TEST_25FPS) {
+            let plan = planner.plan_au(au).expect("plan");
+            plans.push(plan);
+        }
+        let mut live: BTreeSet<PicId> = BTreeSet::new();
+        for plan in &plans {
+            for r in &plan.dpb_refs {
+                assert!(
+                    live.contains(&r.id),
+                    "snapshot names {} which no earlier plan stored",
+                    r.id
+                );
+            }
+            // Uniqueness: one picture, one surface, one marking.
+            let mut ids: Vec<PicId> = plan.dpb_refs.iter().map(|r| r.id).collect();
+            let count = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), count, "the snapshot must not repeat a picture");
+            // The current picture is stored AFTER the snapshot is taken.
+            assert!(!ids.contains(&plan.dpb.stored.unwrap()));
+            live.insert(plan.dpb.stored.unwrap());
+            for id in &plan.dpb.removed {
+                live.remove(id);
+            }
+        }
+        // The IPPP… vector keeps every reference until the DPB is full, so the
+        // snapshot must be non-empty for the great majority of its AUs.
+        let non_empty = plans.iter().filter(|p| !p.dpb_refs.is_empty()).count();
+        assert!(non_empty >= 240, "only {non_empty} AUs carried a snapshot");
     }
 
     #[test]

@@ -35,6 +35,14 @@
 //!
 //! The decode device is created on the **presenter's adapter** (matched by the Vulkan device's
 //! LUID) so the shared textures never cross GPUs on a multi-adapter box.
+//!
+//! **Shared with the native rung.** M5 added a second D3D11VA decoder
+//! ([`crate::video_d3d11_native`], `PUNKTFUNK_DECODER=native-d3d11va`) that drives
+//! `ID3D11VideoDecoder` from pf-bitstream plans instead of libavcodec. It fills the SAME
+//! hand-off — device creation ([`create_device`]) and the video-processor ring
+//! ([`HandoffRing`]) are `pub(crate)` for exactly that, and are the only things the two rungs
+//! share. This half is the field-proven one; what changes between the rungs is only what
+//! writes the decode surface.
 
 use crate::video::ColorDesc;
 use crate::video_libav::AvBuffer;
@@ -285,7 +293,7 @@ unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> 
 /// `VkPhysicalDeviceIDProperties::deviceLUID` (little-endian LowPart‖HighPart) — matching it
 /// keeps the shared textures on one GPU. `None`/no match falls back to the first hardware
 /// adapter (single-GPU boxes; a WARP-only box fails out to software decode).
-fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     // SAFETY: DXGI factory creation takes no pointer and returns an owned factory or an error,
     // checked by `?`.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
@@ -528,18 +536,41 @@ impl SharedRing {
     }
 }
 
-pub(crate) struct D3d11vaDecoder {
-    ctx: *mut ffmpeg::ffi::AVCodecContext,
-    /// The D3D11VA hwdevice, owned. Nothing reads this field after construction — the codec context
-    /// took its own ref via `av_buffer_ref` — it exists so the device outlives the decoder and is
-    /// unref'd exactly once when it drops. Declared after `ctx` so it still releases AFTER the
-    /// `Drop` below frees packet/frame/context, which is the order the hand-written unref had.
-    /// `dead_code` is answered here rather than by removing the field (that would free the device
-    /// early) or by an underscore name (that would hide what it is).
-    #[allow(dead_code)]
-    hw_device: AvBuffer,
-    packet: *mut ffmpeg::ffi::AVPacket,
-    frame: *mut ffmpeg::ffi::AVFrame,
+/// One decoded picture, as [`HandoffRing::present`] needs to see it.
+///
+/// A struct rather than seven positional parameters because six of them are integers and
+/// booleans: a caller that swaps `width` and `height`, or `array_slice` and a dimension,
+/// compiles clean and renders a wrong picture. Named fields make each of those a build error.
+pub(crate) struct HandoffSource<'a> {
+    /// The decode pool's texture ARRAY — for the FFmpeg rung, libav's `data[0]`; for the
+    /// native rung, the pool this decoder created.
+    pub texture: &'a ID3D11Texture2D,
+    /// The picture's slice within that array — libav's `data[1]`, or the native rung's DPB
+    /// slot (which IS the DXVA surface index).
+    pub array_slice: u32,
+    /// The FRAME size. The surface is taller (DXVA alignment), which is exactly what the
+    /// stream source rect excludes — see the blit below.
+    pub width: u32,
+    pub height: u32,
+    /// The picture's colour signalling, per frame and never latched (the host flips PQ
+    /// in-band with a new SPS).
+    pub color: ColorDesc,
+    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal.
+    pub keyframe: bool,
+    /// Which decoder produced it, for the one-time layout log a field report leans on.
+    pub decoder: &'a str,
+}
+
+/// The shipping hand-off: the video processor, its ring of shareable RGBA textures, and the
+/// D3D11 objects they live on. Everything from "here is a decoded NV12/P010 surface" to "here
+/// is a [`D3d11Frame`] the presenter can import".
+///
+/// Extracted from [`D3d11vaDecoder`] verbatim so the M5 native rung
+/// ([`crate::video_d3d11_native`]) fills the identical ring rather than growing a second copy
+/// of it: this is the half with the field history (the NVIDIA NV12-import TDR, the Intel green
+/// bar, the keyed-mutex protocol), and two copies of it would be two chances to lose that
+/// history. Nothing about the hand-off changed in the extraction; only its owner did.
+pub(crate) struct HandoffRing {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     /// Creates the per-ring video processor + views.
@@ -552,198 +583,88 @@ pub(crate) struct D3d11vaDecoder {
     /// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]) — PQ streams get the HDR
     /// pass-through ring; without it they keep the tonemap-to-sRGB ring.
     hdr10_out: bool,
-    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
-    /// is the difference between hardware decode and a silent CPU fallback, so every
-    /// log a field report leans on carries it.
-    name: String,
 }
 
-// SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
-// interfaces it holds are reference-counted with interlocked counts, so moving the whole struct to
-// another thread and releasing it there is sound. D3D11's immediate context is not thread-SAFE but
-// it is thread-AGNOSTIC: it requires serialised use, which `&mut self` on every method gives, not
-// use from one fixed thread. The presenter never touches these objects — it reaches the shared
-// textures through their NT handles on its own device. Moved, never shared; deliberately NOT `Sync`.
-unsafe impl Send for D3d11vaDecoder {}
-
-impl D3d11vaDecoder {
+impl HandoffRing {
+    /// Take the interfaces the hand-off needs off a decode device, up front — their absence
+    /// must route the session to another rung NOW, not burn the opening IDR.
     pub(crate) fn new(
-        codec_id: ffmpeg::codec::Id,
-        luid: Option<[u8; 8]>,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
         hdr10_out: bool,
-    ) -> Result<D3d11vaDecoder> {
-        use ffmpeg::ffi;
-        let (device, context) = create_device(luid)?;
-        // The adapter must expose the codec's DXVA profile — checked here, not at the first AU.
-        decode_profile_supported(&device, codec_id)?;
-        // The hand-off converter's interfaces, up front (their absence must route to software
-        // decode NOW, not burn the opening IDR).
+    ) -> Result<HandoffRing> {
         let video_device: ID3D11VideoDevice = device
             .cast()
             .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
         let video_context1: ID3D11VideoContext1 = context
             .cast()
             .context("context lacks ID3D11VideoContext1 (pre-1703 Windows?)")?;
-        // SAFETY: a self-contained builder: every libav allocation is made here and null-checked,
-        // the D3D11VA hwctx fields are filled from the live device/context borrowed above, and
-        // what survives is moved into the decoder, which frees each exactly once in `Drop`.
-        unsafe {
-            let hw_device =
-                ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
-            if hw_device.is_null() {
-                bail!("av_hwdevice_ctx_alloc(D3D11VA) failed");
-            }
-            let devctx = (*hw_device).data as *mut ffi::AVHWDeviceContext;
-            let d3dctx = (*devctx).hwctx as *mut AVD3D11VADeviceContext;
-            // Hand FFmpeg an owned ref to the device + immediate context (it Releases them when
-            // the hwdevice ctx is freed). `into_raw()` transfers a +1 ref without releasing.
-            (*d3dctx).device = device.clone().into_raw();
-            (*d3dctx).device_context = context.clone().into_raw();
-            // lock left null → FFmpeg installs the ID3D11Multithread default lock in init.
-            let r = ffi::av_hwdevice_ctx_init(hw_device);
-            if r < 0 {
-                let mut hw = hw_device;
-                ffi::av_buffer_unref(&mut hw);
-                bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
-            }
-            // Owned from here: every `bail!` below drops it, so none of them unref by hand.
-            let hw_device = AvBuffer::from_raw(hw_device)
-                .context("av_hwdevice_ctx_alloc(D3D11VA) gave no device")?;
-            // Up-front viability probe (see `d3d11va_decode_supported`).
-            if !d3d11va_decode_supported(hw_device.as_ptr()) {
-                bail!("GPU can't create the D3D11VA decode surface pool");
-            }
-            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
-            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
-            // native decoder last) — a software decoder that silently ignores
-            // `hw_device_ctx` and fails every frame's D3D11-format guard mid-stream,
-            // even when the DXVA profile + pool probes above all passed. Select by
-            // capability instead: the first decoder that can drive AV_PIX_FMT_D3D11
-            // via hw_device_ctx, or fail here at open.
-            let codec =
-                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_D3D11)?;
-            let name = crate::video::codec_name(codec);
-            let ctx = ffi::avcodec_alloc_context3(codec);
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
-            (*ctx).get_format = Some(get_format_d3d11);
-            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-            (*ctx).thread_count = 1; // hwaccel: threads only add latency
-                                     // On top of the DPB-based pool libavcodec sizes: margin for the frames briefly held
-                                     // between decode and the ring copy (the copy runs immediately, so this is small).
-            (*ctx).extra_hw_frames = 4;
-            let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
-            if r < 0 {
-                let mut ctx = ctx;
-                ffi::avcodec_free_context(&mut ctx);
-                bail!("avcodec_open2 (D3D11VA): {}", ffmpeg::Error::from(r));
-            }
-            Ok(D3d11vaDecoder {
-                ctx,
-                hw_device,
-                packet: ffi::av_packet_alloc(),
-                frame: ffi::av_frame_alloc(),
-                device,
-                context,
-                video_device,
-                video_context1,
-                ring: None,
-                hdr10_out,
-                name,
-            })
-        }
+        Ok(HandoffRing {
+            device,
+            context,
+            video_device,
+            video_context1,
+            ring: None,
+            hdr10_out,
+        })
     }
 
-    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
-    pub(crate) fn name(&self) -> &str {
-        &self.name
+    /// The video device, for a caller that also needs it (the native rung enumerates decode
+    /// profiles and creates its decoder through the same interface).
+    pub(crate) fn video_device(&self) -> &ID3D11VideoDevice {
+        &self.video_device
     }
 
-    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
-        use ffmpeg::ffi;
-        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
-        // lifetime; `au` outlives the synchronous copy out of it, and every libav return is
-        // checked before use.
-        unsafe {
-            let r = ffi::av_new_packet(self.packet, au.len() as i32);
-            if r < 0 {
-                return Err(averr("av_new_packet", r));
-            }
-            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
-            let r = ffi::avcodec_send_packet(self.ctx, self.packet);
-            ffi::av_packet_unref(self.packet);
-            if r < 0 {
-                return Err(averr("send_packet", r));
-            }
-            let mut out = None;
-            loop {
-                let r = ffi::avcodec_receive_frame(self.ctx, self.frame);
-                if r == ffmpeg::ffi::AVERROR(ffmpeg::ffi::EAGAIN) {
-                    break;
-                }
-                if r < 0 {
-                    return Err(averr("receive_frame", r));
-                }
-                let lifted = self.lift();
-                // The decode surface goes back to the pool NOW — the ring copy (queued ahead
-                // of any later decoder write on the same immediate context) already owns the
-                // pixels. No cross-thread AVFrame guard exists in this backend at all.
-                ffi::av_frame_unref(self.frame);
-                out = Some(lifted?); // newest wins (one-in/one-out streams make this moot)
-            }
-            Ok(out)
-        }
-    }
-
-    /// Convert the decoded slice into the next ring slot (`VideoProcessorBlt`, NV12/P010 →
-    /// BGRA8) under its keyed mutex and describe the hand-off. The mutex acquire also
+    /// Convert one decoded surface into the next ring slot (`VideoProcessorBlt`, NV12/P010 →
+    /// BGRA8/RGB10A2) under its keyed mutex and describe the hand-off. The mutex acquire also
     /// back-pressures against the presenter still reading this slot (only possible if the
     /// stream runs `RING_SLOTS` ahead of present).
-    fn lift(&mut self) -> Result<D3d11Frame> {
-        use ffmpeg::ffi;
-        // SAFETY: `self.frame` is this decoder's own `AVFrame`; the format check below is what
-        // proves it carries a D3D11 texture before anything reads the surface out of it.
+    ///
+    pub(crate) fn present(&mut self, source: HandoffSource<'_>) -> Result<D3d11Frame> {
+        let HandoffSource {
+            texture: src,
+            array_slice,
+            width,
+            height,
+            color,
+            keyframe,
+            decoder,
+        } = source;
+        // AddRef'd locals so the mutable `ring` borrow below doesn't lock all of `self`.
+        let video_device = self.video_device.clone();
+        let video_context1 = self.video_context1.clone();
+        let context = self.context.clone();
+        // (Re)build the ring + video processor on first use, a stream size change, or a
+        // flavor change (the host flips PQ in-band; SDR↔HDR swaps the slot format, so
+        // it rebuilds like a resize — bit DEPTH alone still never rebuilds: an SDR
+        // 10-bit stream and an 8-bit one share the same output flavor).
+        let pq_out = self.hdr10_out && color.is_pq();
+        let rebuild = self
+            .ring
+            .as_ref()
+            .is_none_or(|r| r.width != width || r.height != height || r.pq_out != pq_out);
+        if rebuild {
+            let generation = self.ring.as_ref().map_or(0, |r| r.generation + 1);
+            self.ring = Some(SharedRing::build(
+                &self.device,
+                &video_device,
+                width,
+                height,
+                generation,
+                pq_out,
+            )?);
+        }
+        let ring = self.ring.as_mut().expect("ring built above");
+        let slot_idx = ring.next;
+        ring.next = (ring.next + 1) % ring.slots.len();
+        let slot = &ring.slots[slot_idx];
+
+        // SAFETY: every call below is a COM call on a live interface — the video device and
+        // context AddRef'd above, the ring's processor/enumerator/views built by
+        // `SharedRing::build`, and the caller's `src` texture, whose liveness for the call is
+        // this method's contract. Out-params are local `Option`s checked before use; the
+        // `ManuallyDrop` refs the stream struct carries are balanced explicitly below.
         unsafe {
-            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
-                bail!("decoder returned a software frame (no D3D11 surface)");
-            }
-            let width = (*self.frame).width as u32;
-            let height = (*self.frame).height as u32;
-            let color = ColorDesc::from_raw(self.frame);
-            // AddRef'd locals so the mutable `ring` borrow below doesn't lock all of `self`.
-            let video_device = self.video_device.clone();
-            let video_context1 = self.video_context1.clone();
-            let context = self.context.clone();
-            // (Re)build the ring + video processor on first use, a stream size change, or a
-            // flavor change (the host flips PQ in-band; SDR↔HDR swaps the slot format, so
-            // it rebuilds like a resize — bit DEPTH alone still never rebuilds: an SDR
-            // 10-bit stream and an 8-bit one share the same output flavor).
-            let pq_out = self.hdr10_out && color.is_pq();
-            let rebuild = self
-                .ring
-                .as_ref()
-                .is_none_or(|r| r.width != width || r.height != height || r.pq_out != pq_out);
-            if rebuild {
-                let generation = self.ring.as_ref().map_or(0, |r| r.generation + 1);
-                self.ring = Some(SharedRing::build(
-                    &self.device,
-                    &video_device,
-                    width,
-                    height,
-                    generation,
-                    pq_out,
-                )?);
-            }
-            let ring = self.ring.as_mut().expect("ring built above");
-            let slot_idx = ring.next;
-            ring.next = (ring.next + 1) % ring.slots.len();
-            let slot = &ring.slots[slot_idx];
-
-            let raw = (*self.frame).data[0] as *mut c_void;
-            let src: ID3D11Texture2D = ID3D11Texture2D::from_raw_borrowed(&raw)
-                .ok_or_else(|| anyhow!("null D3D11 texture on decoded frame"))?
-                .clone();
-            let index = (*self.frame).data[1] as usize as u32;
-
             // Input view over THIS slice of the decode array (cheap per-frame object).
             let mut iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0, // surface format speaks for itself
@@ -751,10 +672,10 @@ impl D3d11vaDecoder {
                 // Anonymous.Texture2D zeroed (MipSlice 0); ArraySlice is per-frame below.
                 ..Default::default()
             };
-            iv_desc.Anonymous.Texture2D.ArraySlice = index;
+            iv_desc.Anonymous.Texture2D.ArraySlice = array_slice;
             let mut in_view = None;
             video_device
-                .CreateVideoProcessorInputView(&src, &ring.enumerator, &iv_desc, Some(&mut in_view))
+                .CreateVideoProcessorInputView(src, &ring.enumerator, &iv_desc, Some(&mut in_view))
                 .ok()
                 .context("CreateVideoProcessorInputView")?;
             let in_view = in_view.expect("input view created");
@@ -844,9 +765,9 @@ impl D3d11vaDecoder {
                 height,
                 src_desc.Width,
                 src_desc.Height,
-                index,
+                array_slice,
                 color.is_pq(),
-                &self.name,
+                decoder,
             );
             Ok(D3d11Frame {
                 width,
@@ -870,10 +791,197 @@ impl D3d11vaDecoder {
                     }
                 },
                 rgb10: ring.pq_out,
-                // SAFETY: `self.frame` is the live decoded AVFrame for this call.
-                keyframe: crate::video::frame_is_keyframe(self.frame),
+                keyframe,
                 handle,
                 generation,
+            })
+        }
+    }
+}
+
+pub(crate) struct D3d11vaDecoder {
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    /// The D3D11VA hwdevice, owned. Nothing reads this field after construction — the codec context
+    /// took its own ref via `av_buffer_ref` — it exists so the device outlives the decoder and is
+    /// unref'd exactly once when it drops. Declared after `ctx` so it still releases AFTER the
+    /// `Drop` below frees packet/frame/context, which is the order the hand-written unref had.
+    /// `dead_code` is answered here rather than by removing the field (that would free the device
+    /// early) or by an underscore name (that would hide what it is).
+    #[allow(dead_code)]
+    hw_device: AvBuffer,
+    packet: *mut ffmpeg::ffi::AVPacket,
+    frame: *mut ffmpeg::ffi::AVFrame,
+    /// The video processor + shareable ring the decoded surfaces are converted into. Declared
+    /// here — after `ctx` — so it still releases AFTER the `Drop` below frees
+    /// packet/frame/context: no decode can be in flight past `avcodec_free_context`.
+    handoff: HandoffRing,
+    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
+    /// is the difference between hardware decode and a silent CPU fallback, so every
+    /// log a field report leans on carries it.
+    name: String,
+}
+
+// SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
+// interfaces it holds are reference-counted with interlocked counts, so moving the whole struct to
+// another thread and releasing it there is sound. D3D11's immediate context is not thread-SAFE but
+// it is thread-AGNOSTIC: it requires serialised use, which `&mut self` on every method gives, not
+// use from one fixed thread. The presenter never touches these objects — it reaches the shared
+// textures through their NT handles on its own device. Moved, never shared; deliberately NOT `Sync`.
+unsafe impl Send for D3d11vaDecoder {}
+
+impl D3d11vaDecoder {
+    pub(crate) fn new(
+        codec_id: ffmpeg::codec::Id,
+        luid: Option<[u8; 8]>,
+        hdr10_out: bool,
+    ) -> Result<D3d11vaDecoder> {
+        use ffmpeg::ffi;
+        let (device, context) = create_device(luid)?;
+        // The adapter must expose the codec's DXVA profile — checked here, not at the first AU.
+        decode_profile_supported(&device, codec_id)?;
+        // The hand-off converter's interfaces, up front (their absence must route to software
+        // decode NOW, not burn the opening IDR).
+        let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out)?;
+        // SAFETY: a self-contained builder: every libav allocation is made here and null-checked,
+        // the D3D11VA hwctx fields are filled from the live device/context borrowed above, and
+        // what survives is moved into the decoder, which frees each exactly once in `Drop`.
+        unsafe {
+            let hw_device =
+                ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+            if hw_device.is_null() {
+                bail!("av_hwdevice_ctx_alloc(D3D11VA) failed");
+            }
+            let devctx = (*hw_device).data as *mut ffi::AVHWDeviceContext;
+            let d3dctx = (*devctx).hwctx as *mut AVD3D11VADeviceContext;
+            // Hand FFmpeg an owned ref to the device + immediate context (it Releases them when
+            // the hwdevice ctx is freed). `into_raw()` transfers a +1 ref without releasing.
+            (*d3dctx).device = device.clone().into_raw();
+            (*d3dctx).device_context = context.clone().into_raw();
+            // lock left null → FFmpeg installs the ID3D11Multithread default lock in init.
+            let r = ffi::av_hwdevice_ctx_init(hw_device);
+            if r < 0 {
+                let mut hw = hw_device;
+                ffi::av_buffer_unref(&mut hw);
+                bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
+            }
+            // Owned from here: every `bail!` below drops it, so none of them unref by hand.
+            let hw_device = AvBuffer::from_raw(hw_device)
+                .context("av_hwdevice_ctx_alloc(D3D11VA) gave no device")?;
+            // Up-front viability probe (see `d3d11va_decode_supported`).
+            if !d3d11va_decode_supported(hw_device.as_ptr()) {
+                bail!("GPU can't create the D3D11VA decode surface pool");
+            }
+            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
+            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
+            // native decoder last) — a software decoder that silently ignores
+            // `hw_device_ctx` and fails every frame's D3D11-format guard mid-stream,
+            // even when the DXVA profile + pool probes above all passed. Select by
+            // capability instead: the first decoder that can drive AV_PIX_FMT_D3D11
+            // via hw_device_ctx, or fail here at open.
+            let codec =
+                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_D3D11)?;
+            let name = crate::video::codec_name(codec);
+            let ctx = ffi::avcodec_alloc_context3(codec);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
+            (*ctx).get_format = Some(get_format_d3d11);
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).thread_count = 1; // hwaccel: threads only add latency
+                                     // On top of the DPB-based pool libavcodec sizes: margin for the frames briefly held
+                                     // between decode and the ring copy (the copy runs immediately, so this is small).
+            (*ctx).extra_hw_frames = 4;
+            let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+            if r < 0 {
+                let mut ctx = ctx;
+                ffi::avcodec_free_context(&mut ctx);
+                bail!("avcodec_open2 (D3D11VA): {}", ffmpeg::Error::from(r));
+            }
+            Ok(D3d11vaDecoder {
+                ctx,
+                hw_device,
+                packet: ffi::av_packet_alloc(),
+                frame: ffi::av_frame_alloc(),
+                handoff,
+                name,
+            })
+        }
+    }
+
+    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
+        use ffmpeg::ffi;
+        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
+        // lifetime; `au` outlives the synchronous copy out of it, and every libav return is
+        // checked before use.
+        unsafe {
+            let r = ffi::av_new_packet(self.packet, au.len() as i32);
+            if r < 0 {
+                return Err(averr("av_new_packet", r));
+            }
+            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
+            let r = ffi::avcodec_send_packet(self.ctx, self.packet);
+            ffi::av_packet_unref(self.packet);
+            if r < 0 {
+                return Err(averr("send_packet", r));
+            }
+            let mut out = None;
+            loop {
+                let r = ffi::avcodec_receive_frame(self.ctx, self.frame);
+                if r == ffmpeg::ffi::AVERROR(ffmpeg::ffi::EAGAIN) {
+                    break;
+                }
+                if r < 0 {
+                    return Err(averr("receive_frame", r));
+                }
+                let lifted = self.lift();
+                // The decode surface goes back to the pool NOW — the ring copy (queued ahead
+                // of any later decoder write on the same immediate context) already owns the
+                // pixels. No cross-thread AVFrame guard exists in this backend at all.
+                ffi::av_frame_unref(self.frame);
+                out = Some(lifted?); // newest wins (one-in/one-out streams make this moot)
+            }
+            Ok(out)
+        }
+    }
+
+    /// Hand the decoded surface over to the shared [`HandoffRing`], which does the
+    /// `VideoProcessorBlt` into the next shareable ring slot and describes the result.
+    /// This method's whole job is turning libav's `AVFrame` into the four facts that ring
+    /// needs — the D3D11 texture, its array slice, the frame size and the colour
+    /// signalling — because everything after that is decoder-agnostic and the native rung
+    /// ([`crate::video_d3d11_native`]) fills the identical ring.
+    fn lift(&mut self) -> Result<D3d11Frame> {
+        use ffmpeg::ffi;
+        // SAFETY: `self.frame` is this decoder's own `AVFrame`, live until the caller unrefs
+        // it; the format check below is what proves it carries a D3D11 texture before
+        // anything reads the surface out of it, and `from_raw_borrowed` neither takes nor
+        // releases a reference — the `clone()` is what gives the local its own.
+        unsafe {
+            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
+                bail!("decoder returned a software frame (no D3D11 surface)");
+            }
+            let width = (*self.frame).width as u32;
+            let height = (*self.frame).height as u32;
+            let color = ColorDesc::from_raw(self.frame);
+            let keyframe = crate::video::frame_is_keyframe(self.frame);
+            // `data[0]` is the pool's texture ARRAY and `data[1]` the slice within it —
+            // libav's D3D11 frame descriptor, unchanged since the legacy presenter.
+            let raw = (*self.frame).data[0] as *mut c_void;
+            let src: ID3D11Texture2D = ID3D11Texture2D::from_raw_borrowed(&raw)
+                .ok_or_else(|| anyhow!("null D3D11 texture on decoded frame"))?
+                .clone();
+            let index = (*self.frame).data[1] as usize as u32;
+            self.handoff.present(HandoffSource {
+                texture: &src,
+                array_slice: index,
+                width,
+                height,
+                color,
+                keyframe,
+                decoder: &self.name,
             })
         }
     }
@@ -900,6 +1008,13 @@ impl Drop for D3d11vaDecoder {
 /// One-time dump of the first decoded surface's layout — the forensics for a new GPU/driver.
 /// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
 /// stream source rect excludes.
+///
+/// Once PER DECODER, not once per process. Two rungs share this hand-off now — the FFmpeg
+/// D3D11VA one and the native one — and a single process-wide latch would mean a session that
+/// pinned the native rung and then demoted logged the native layout and nothing else, leaving
+/// the rung that actually painted the session's frames undocumented in exactly the report
+/// that needs it. The set is keyed by the rung's name, which is a `&'static str` per rung, so
+/// it holds at most one short entry per rung for the life of the process.
 fn log_layout_once(
     width: u32,
     height: u32,
@@ -909,9 +1024,17 @@ fn log_layout_once(
     pq: bool,
     decoder: &str,
 ) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static ONCE: AtomicBool = AtomicBool::new(true);
-    if ONCE.swap(false, Ordering::Relaxed) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    // A poisoned lock costs a log line, never a frame: a panic while holding it can only have
+    // happened inside the set, and the worst outcome of ignoring it is a repeated line.
+    let first = match seen.lock() {
+        Ok(mut seen) => seen.insert(decoder.to_owned()),
+        Err(_) => false,
+    };
+    if first {
         tracing::info!(
             width,
             height,

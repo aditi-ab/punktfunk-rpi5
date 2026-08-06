@@ -81,6 +81,34 @@ pub struct AuPlan {
     pub rps: RpsPlan,
     pub slices: Vec<SlicePlan>,
     pub dpb: DpbUpdate,
+    /// Every picture the DPB holds marked "used for reference" at the moment this AU
+    /// decodes — the MARKED DPB, which is a SUPERSET of [`Self::rps`]'s three current
+    /// sets.
+    ///
+    /// The difference is 8.3.2's *Foll* sets: `RefPicSetStFoll` and `RefPicSetLtFoll`
+    /// are pictures this AU keeps marked for FUTURE pictures to reference while
+    /// naming none of them itself. They belong in `DXVA_PicParams_HEVC::RefPicList`
+    /// all the same — that array is spec-defined as the pictures currently marked
+    /// used for reference, and libavcodec's DXVA HEVC path fills it by walking its
+    /// whole DPB for `HEVC_FRAME_FLAG_{LONG,SHORT}_REF`, then points the
+    /// `RefPicSet*Curr` INDEX arrays into it. A driver keeping per-reference state is
+    /// entitled to read a picture's absence from `RefPicList` as "no longer a
+    /// reference" and discard it; a long-term anchor held across an RFI recovery
+    /// window is exactly the picture that disappears and comes back.
+    ///
+    /// Vulkan asks the opposite question — `pReferenceSlots` is spec-defined as the
+    /// slots THIS decode operation uses — so the native Vulkan rung binds
+    /// [`Self::rps`] and is right to.
+    ///
+    /// Captured at BEGIN-picture time: after 8.3.2 has derived and MARKED this
+    /// picture's reference picture sets and after C.5.2.2's pre-decode DPB update,
+    /// before the current picture itself is stored. It therefore never contains the
+    /// current picture, and — like libavcodec's walk — never contains a picture the
+    /// RPS just unmarked.
+    ///
+    /// Order is the DPB's own (oldest stored first), which is also libavcodec's.
+    /// Entries are unique: one picture, one surface, one marking.
+    pub dpb_refs: Vec<RefPic>,
     pub warnings: Vec<PlanWarning>,
     /// The SPS the planner activated for this AU — the one [`Self::picture`]'s
     /// parameters derive from (the FIRST slice's PPS's SPS; a later slice segment may
@@ -344,6 +372,9 @@ struct CurrentPicState {
     id: PicId,
     /// The picture's RPS, resolved at begin-picture time and captured for the plan.
     rps_plan: RpsPlan,
+    /// The marked DPB as it stands for THIS picture's decode, captured beside the
+    /// RPS that marked it — see [`AuPlan::dpb_refs`].
+    dpb_refs: Vec<RefPic>,
     /// 7.4.7.1: `slice_segment_address` must increase across a picture's segments.
     prev_segment_address: Option<u32>,
 }
@@ -624,6 +655,7 @@ impl H265Planner {
 
         let picture = Self::picture_plan(&cur, recovery_point);
         let rps = cur.rps_plan.clone();
+        let dpb_refs = cur.dpb_refs.clone();
         // The activated parameter sets ride out with the plan (AuPlan field docs);
         // cloned before finish_picture consumes `cur`.
         let pps = Rc::clone(&cur.first_slice_pps);
@@ -648,6 +680,7 @@ impl H265Planner {
                 outputs: mem::take(&mut self.pending_outputs),
                 removed,
             },
+            dpb_refs,
             warnings,
             sps,
             pps,
@@ -1090,6 +1123,9 @@ impl H265Planner {
         self.update_dpb_before_decoding(&pic, was_first_in_bitstream, &pps.sps);
 
         let rps_plan = self.rps_plan();
+        // Taken here, beside the RPS that marked it, and never later: `finish_picture`
+        // stores the current picture, which belongs to the NEXT AU's snapshot.
+        let dpb_refs = self.dpb_snapshot();
 
         Ok(CurrentPicState {
             pic,
@@ -1097,8 +1133,20 @@ impl H265Planner {
             pps,
             id,
             rps_plan,
+            dpb_refs,
             prev_segment_address: None,
         })
+    }
+
+    /// The marked DPB as [`AuPlan::dpb_refs`] reports it — every picture 8.3.2 left
+    /// marked "used for short-term reference" or "used for long-term reference",
+    /// whether or not THIS picture names it.
+    fn dpb_snapshot(&self) -> Vec<RefPic> {
+        self.dpb
+            .get_all_references()
+            .iter()
+            .map(Self::to_ref_pic)
+            .collect()
     }
 
     /// Infallible by design: the caller ([`Self::begin_picture`]) has already run the
@@ -2156,6 +2204,110 @@ mod tests {
         assert!(p3.warnings.is_empty(), "{:?}", p3.warnings);
         assert_eq!(p3.rps.lt_curr.len(), 1);
         assert_eq!(p3.rps.lt_curr[0].id, idr_id);
+    }
+
+    #[test]
+    fn the_dpb_snapshot_holds_a_foll_long_term_anchor_the_current_rps_never_names() {
+        // 8.3.2's *Foll* sets are the whole point of the snapshot: an anchor pinned
+        // long-term for LATER pictures, marked in the DPB, in none of this picture's
+        // three current sets. `RefPicSetLtCurr` is empty here — a DXVA `RefPicList`
+        // built from the current sets alone drops the anchor for exactly the
+        // pictures between the pin and its use.
+        let sps = SpsOpts {
+            long_term: true,
+            ..Default::default()
+        };
+        let mut planner = H265Planner::new();
+        let mut au0 = param_sets(&sps);
+        au0.extend(idr_slice());
+        let p0 = planner.plan_au(&au0).unwrap();
+        let idr_id = p0.dpb.stored.unwrap();
+        assert!(
+            p0.dpb_refs.is_empty(),
+            "an opening IDR has no DPB behind it"
+        );
+
+        let p1 = planner
+            .plan_au(&synth_slice(&SliceOpts {
+                poc_lsb: 1,
+                neg: vec![(0, true)],
+                sps_long_term: true,
+                num_ref_idx_l0: 1,
+                ..Default::default()
+            }))
+            .unwrap();
+        let p1_id = p1.dpb.stored.unwrap();
+        assert!(p1.warnings.is_empty(), "{:?}", p1.warnings);
+
+        // used_by_curr_pic_lt_flag = 0: the IDR lands in RefPicSetLtFoll — kept
+        // marked long-term, referenced by nothing in this picture.
+        let p2 = planner
+            .plan_au(&synth_slice(&SliceOpts {
+                poc_lsb: 2,
+                neg: vec![(0, true)],
+                lt: vec![(0, false, None)],
+                sps_long_term: true,
+                num_ref_idx_l0: 1,
+                ..Default::default()
+            }))
+            .unwrap();
+        assert!(p2.warnings.is_empty(), "{:?}", p2.warnings);
+        assert!(
+            p2.rps.lt_curr.is_empty(),
+            "the anchor is Foll, not Curr, for this picture"
+        );
+        assert_eq!(
+            p2.slices[0]
+                .ref_list0
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![p1_id]
+        );
+        // …and it is still in the DPB, still marked long-term.
+        assert_eq!(
+            p2.dpb_refs
+                .iter()
+                .map(|r| (r.id, r.is_long_term))
+                .collect::<Vec<_>>(),
+            vec![(idr_id, true), (p1_id, false)]
+        );
+        assert!(
+            !p2.dpb.removed.contains(&idr_id),
+            "a Foll entry must not be retired"
+        );
+    }
+
+    #[test]
+    fn the_dpb_snapshot_is_a_superset_of_the_current_rps_across_the_whole_vector() {
+        let (_, plans) = plan_whole_clip(TEST_25FPS);
+        assert_eq!(plans.len(), 250);
+        for (i, plan) in plans.iter().enumerate() {
+            let mut ids: Vec<PicId> = plan.dpb_refs.iter().map(|r| r.id).collect();
+            let count = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), count, "AU {i}: the snapshot repeats a picture");
+            // Every current-set entry is a marked DPB picture, with the SAME marking
+            // — the snapshot is the authority a backend keys its arrays by.
+            for rp in plan
+                .rps
+                .st_curr_before
+                .iter()
+                .chain(&plan.rps.st_curr_after)
+                .chain(&plan.rps.lt_curr)
+            {
+                let found = plan
+                    .dpb_refs
+                    .iter()
+                    .find(|d| d.id == rp.id)
+                    .unwrap_or_else(|| panic!("AU {i}: RPS entry {} is not marked", rp.id));
+                assert_eq!(found.is_long_term, rp.is_long_term);
+                assert_eq!(found.pic_order_cnt, rp.pic_order_cnt);
+            }
+            // The current picture is stored AFTER the snapshot is taken.
+            assert!(!ids.contains(&plan.dpb.stored.unwrap()));
+        }
     }
 
     #[test]

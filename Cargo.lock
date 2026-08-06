@@ -2992,6 +2992,7 @@ dependencies = [
  "ffmpeg-next",
  "mdns-sd",
  "opus",
+ "pf-dxvadec",
  "pf-ffvk",
  "pf-update-check",
  "pf-vkdecode",
@@ -3047,6 +3048,16 @@ name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "pf-dxvadec"
+version = "0.24.0"
+dependencies = [
+ "cros-codecs",
+ "pf-bitstream",
+ "pf-vkdecode",
+ "tracing",
 ]
 
 [[package]]

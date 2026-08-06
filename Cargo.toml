@@ -26,6 +26,7 @@ members = [
     "crates/pf-inject",
     "crates/pf-vdisplay",
     "crates/pf-vkdecode",
+    "crates/pf-dxvadec",
     "crates/pyrowave-sys",
     "crates/libvpl-sys",
     "clients/probe",

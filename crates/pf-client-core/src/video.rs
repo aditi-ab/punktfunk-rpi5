@@ -11,9 +11,13 @@
 //! native → vulkan → vaapi → software on NVIDIA and ALL AMD (VanGogh included), vaapi →
 //! native → vulkan → software on Intel/unknown. Windows: native → vulkan → d3d11va →
 //! software on NVIDIA/AMD, d3d11va → native → vulkan → software on Intel/unknown.
-//! Override: `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software|native-vulkan` —
+//! Override:
+//! `PUNKTFUNK_DECODER=vulkan|vaapi|d3d11va|software|native-vulkan|native-d3d11va` —
 //! `vulkan` names the FFmpeg-Vulkan backend specifically; `native-vulkan` pins the
-//! pf-vkdecode decoder by name, skipping the vendor-ordered rungs ahead of it):
+//! pf-vkdecode decoder by name, skipping the vendor-ordered rungs ahead of it;
+//! `native-d3d11va` (Windows) pins M5's pf-dxvadec `ID3D11VideoDecoder` rung, which is
+//! reachable ONLY by that pin — it is absent from every `auto` arm until it has the
+//! hardware evidence M2's native rung had before IT joined `auto`):
 //!
 //! * **Vulkan Video**: FFmpeg's Vulkan decoder running on the PRESENTER's own VkDevice
 //!   (its handles arrive via [`VulkanDecodeDevice`]) — the decoded VkImage feeds the
@@ -611,6 +615,16 @@ enum Backend {
     Vaapi(VaapiDecoder),
     #[cfg(windows)]
     D3d11va(crate::video_d3d11::D3d11vaDecoder),
+    /// Native D3D11VA (`pf-dxvadec` + `video_d3d11_native`) — M5's replacement for the
+    /// FFmpeg-backed [`Backend::D3d11va`] rung: `ID3D11VideoDecoder` driven from
+    /// pf-bitstream plans, filling the same shareable-RGBA hand-off, no libavcodec.
+    /// **Pin-only** (`PUNKTFUNK_DECODER=native-d3d11va`) and deliberately NOT in the
+    /// automatic ladder: M2's native Vulkan rung was admitted to `auto` only after
+    /// hardware parity, and this one has decoded nothing yet. Errors ride the SAME
+    /// streak/demotion machinery as every other hardware rung.
+    /// Boxed: the decoder (two planners plus a session) dwarfs the other variants.
+    #[cfg(windows)]
+    NativeD3d11va(Box<crate::video_d3d11_native::NativeD3d11Decoder>),
     /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device,
     /// no FFmpeg involvement (Linux + Windows — same Vulkan presenter on both). No demotion
     /// rung — there is no other decoder for it.
@@ -758,6 +772,21 @@ fn native_codec(codec_id: ffmpeg::codec::Id) -> Option<(NativeCodec, u32)> {
     match codec_id {
         ffmpeg::codec::Id::H264 => Some((NativeCodec::H264, VIDEO_CODEC_OP_DECODE_H264)),
         ffmpeg::codec::Id::HEVC => Some((NativeCodec::H265, VIDEO_CODEC_OP_DECODE_H265)),
+        _ => None,
+    }
+}
+
+/// The native DXVA decoder for a negotiated wire codec, or `None` for one pf-dxvadec
+/// cannot decode. No caps bit accompanies it (unlike [`native_codec`]): DXVA advertises
+/// support as a profile GUID on the adapter, which
+/// [`crate::video_d3d11_native::NativeD3d11Decoder::new`] checks directly against the
+/// device it is about to build on — there is no device-level "which codecs" flag to
+/// consult first.
+#[cfg(windows)]
+fn native_d3d11_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_dxvadec::Codec> {
+    match codec_id {
+        ffmpeg::codec::Id::H264 => Some(pf_dxvadec::Codec::H264),
+        ffmpeg::codec::Id::HEVC => Some(pf_dxvadec::Codec::H265),
         _ => None,
     }
 }
@@ -1056,6 +1085,48 @@ impl Decoder {
         // here on) — a native failure must never be quieter, or land somewhere
         // other, than the FFmpeg rungs' failures do.
         let mut choice = choice;
+        // Native D3D11VA (M5, pf-dxvadec) — PIN ONLY, ahead of everything because a pin is a
+        // pin. It is deliberately absent from every `auto` arm below: M2's native Vulkan rung
+        // joined `auto` only after WP-D closed bit-exact against libavcodec on three drivers
+        // and a 92-minute soak, and this rung has decoded nothing yet. A refusal or an init
+        // failure logs and drops to the standard ladder (choice reads as `auto` from here on),
+        // exactly like the native-vulkan pin below — a native failure must never be quieter,
+        // or land somewhere other, than the FFmpeg rungs' failures do.
+        #[cfg(windows)]
+        if choice == crate::video_d3d11_native::DECODER_PIN {
+            match (native_d3d11_codec(codec_id), vk.filter(|v| v.d3d11_import)) {
+                (Some(codec), Some(v)) => {
+                    match crate::video_d3d11_native::NativeD3d11Decoder::new(
+                        codec,
+                        stream,
+                        v.adapter_luid,
+                        v.d3d11_hdr10,
+                    ) {
+                        Ok(d) => {
+                            tracing::info!(
+                                ?codec_id,
+                                decoder = d.name(),
+                                "native D3D11VA hardware decode active \
+                                 (pf-dxvadec, shared-texture hand-off)"
+                            );
+                            return done(Backend::NativeD3d11va(Box::new(d)));
+                        }
+                        Err(e) => tracing::warn!(reason = %format!("{e:#}"),
+                            "native D3D11VA init failed — demoting to the standard ladder"),
+                    }
+                }
+                (None, _) => tracing::warn!(
+                    ?codec_id,
+                    "PUNKTFUNK_DECODER=native-d3d11va refused (needs an H.264 or HEVC \
+                     session) — standard ladder"
+                ),
+                (_, None) => tracing::warn!(
+                    "PUNKTFUNK_DECODER=native-d3d11va refused (the presenter's device lacks \
+                     the win32 external-memory import extensions) — standard ladder"
+                ),
+            }
+            choice = "auto".to_string();
+        }
         let mut native_tried = false;
         if choice == "native-vulkan" {
             if native_vulkan_gate(
@@ -1320,6 +1391,13 @@ impl Decoder {
     pub fn decode_health(&self) -> Option<DecodeHealth> {
         match &self.backend {
             Backend::NativeVulkan(d) => Some(d.health()),
+            // The native DXVA rung has the bitstream planner, so it sees concealment and
+            // refusals — but D3D11VA exposes no per-picture status query at all, so its
+            // `status_queries` is false and `failed` stays structurally 0. That is the
+            // honest report: "this decoder looked at the STREAM and saw none" without
+            // claiming a driver verdict nothing can produce.
+            #[cfg(windows)]
+            Backend::NativeD3d11va(d) => Some(d.health()),
             _ => None,
         }
     }
@@ -1471,6 +1549,21 @@ impl Decoder {
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             #[cfg(windows)]
             Backend::D3d11va(d) => d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
+            #[cfg(windows)]
+            Backend::NativeD3d11va(d) => {
+                debug_assert!(complete, "partial AUs are pyrowave-only");
+                let r = d.decode(au).map(|f| f.map(DecodedImage::D3d11));
+                // Same split as the native Vulkan rung above, for the same reason: this
+                // rung can SEE stream damage, and turning what an FFmpeg rung conceals
+                // silently into an error would demote it on exactly the lossy links it
+                // exists to diagnose. Concealment comes back as `Ok(None)` plus a
+                // re-anchor request through the pump's one throttle.
+                if d.take_recovery_request() {
+                    self.want_keyframe = true;
+                    concealed = true;
+                }
+                r
+            }
             // No demote ladder below PyroWave (nothing else decodes it): propagate the
             // error; the pump surfaces it and the session falls back to HEVC by
             // renegotiation (plan §4.6), not by decoder swap.
@@ -1500,6 +1593,8 @@ impl Decoder {
                     Backend::NativeVulkan(_) => "native Vulkan Video",
                     #[cfg(windows)]
                     Backend::D3d11va(_) => "D3D11VA",
+                    #[cfg(windows)]
+                    Backend::NativeD3d11va(_) => "native D3D11VA",
                     _ => "VAAPI",
                 };
                 self.vaapi_fails += 1;
@@ -1568,10 +1663,16 @@ impl Decoder {
                     }
                     // Windows' hardware rung below Vulkan (FFmpeg or native) is D3D11VA
                     // (a 4K120 stream is not survivable on software) — same-GPU rebuild
-                    // via the stashed LUID.
+                    // via the stashed LUID. The NATIVE D3D11VA rung demotes here too:
+                    // its failure is a statement about pf-dxvadec's submission, not about
+                    // DXVA, so the FFmpeg decoder on the very same profile is the right
+                    // next rung — and while that rung is pin-only, this is the only way a
+                    // lab session that pinned it keeps hardware decode.
                     #[cfg(windows)]
-                    if matches!(self.backend, Backend::Vulkan(_) | Backend::NativeVulkan(_))
-                        && self.d3d11_import
+                    if matches!(
+                        self.backend,
+                        Backend::Vulkan(_) | Backend::NativeVulkan(_) | Backend::NativeD3d11va(_)
+                    ) && self.d3d11_import
                     {
                         match crate::video_d3d11::D3d11vaDecoder::new(
                             self.codec_id,
@@ -1580,8 +1681,8 @@ impl Decoder {
                         ) {
                             Ok(d) => {
                                 tracing::warn!(error = %e, fails = self.vaapi_fails,
-                                    decoder = d.name(),
-                                    "Vulkan Video decode failing repeatedly — demoting to D3D11VA");
+                                    from = which, decoder = d.name(),
+                                    "hardware decode failing repeatedly — demoting to D3D11VA");
                                 self.backend = Backend::D3d11va(d);
                                 self.vaapi_fails = 0;
                                 self.first_fail = None;
