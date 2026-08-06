@@ -2273,24 +2273,27 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
-/// Did this session end because **the game the host launched for it exited**? `*out` is set to 1
-/// when it did and 0 otherwise; the return status reports only whether the handle was usable.
+/// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
+/// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
 ///
-/// A refinement of "the session ended", never a substitute — read it only once a plane has
-/// returned [`PunktfunkStatus::Closed`] (or the embedder's own end-of-session signal fired), and
-/// treat 0 as "ended for some other reason" (user stop, host gone, network loss, idle timeout).
-/// It latches, so it is still readable while the connection is being torn down, and a client that
-/// never calls it behaves exactly as it did before this existed.
+/// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
+/// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
+/// while the connection is torn down, and a client that never calls it behaves exactly as it did
+/// before this existed.
 ///
-/// The point is that a game ending is a normal finish, not a failure: a launcher client can send
-/// the player back to the host's library — one tap from the next title — rather than reporting an
-/// error and dropping to host selection for something the player just did on purpose.
+/// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
+/// their game from a host falling off the network, so every client wrote one message for all of
+/// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
+/// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
+/// for `HOST_ERROR` and `LOST`.
+///
+/// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 #[cfg(feature = "quic")]
 #[no_mangle]
-pub unsafe extern "C" fn punktfunk_connection_game_exited(
+pub unsafe extern "C" fn punktfunk_connection_end_reason(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
@@ -2303,7 +2306,7 @@ pub unsafe extern "C" fn punktfunk_connection_game_exited(
         };
         if !out.is_null() {
             // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
-            unsafe { *out = u8::from(c.inner.ended_because_game_exited()) };
+            unsafe { *out = c.inner.end_reason() as u8 };
         }
         PunktfunkStatus::Ok
     })
