@@ -47,6 +47,7 @@ import android.widget.Toast
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
+import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.Tab
@@ -61,6 +62,11 @@ fun App(forceGamepadUi: Boolean = false) {
     // so the stream screen never re-reads the store behind its own connect's back.
     var session by remember { mutableStateOf<ActiveSession?>(null) }
     var tab by remember { mutableStateOf(Tab.Connect) }
+    // Set when a session ends because its game exited and it began as a library launch: the host
+    // whose library the console shell should come back to. Held HERE because the shell's own
+    // navigation state does not outlive the stream. Cleared once the shell has consumed it, so a
+    // later manual Back out of the library is not undone by a stale value.
+    var reopenLibraryHostId by remember { mutableStateOf<String?>(null) }
 
     // Console (gamepad) mode mirrors the Apple client: the setting AND (a pad is attached OR this is
     // a TV OR the dev force flag). Flips live as controllers connect/disconnect.
@@ -107,7 +113,20 @@ fun App(forceGamepadUi: Boolean = false) {
     ) { active ->
         if (active != null) {
             // Immersive: the stream takes the whole screen, no bottom bar.
-            StreamScreen(active, onDisconnect = { session = null })
+            StreamScreen(active) { reason ->
+                // A game launched from a library exiting is a normal finish, and the player is
+                // almost certainly after the next title — so send them back to that library rather
+                // than all the way out to host selection. The console shell's own screen state does
+                // not survive the stream (StreamScreen replaces it in the composition, discarding
+                // its `remember`s), so the intent is hoisted here and handed back on the way in.
+                reopenLibraryHostId =
+                    if (reason == SessionEndReason.GAME_EXITED && active.launchedFromLibrary) {
+                        active.hostId
+                    } else {
+                        null
+                    }
+                session = null
+            }
         } else if (gamepadUi) {
             GamepadShell(
                 settings = settings,
@@ -115,6 +134,8 @@ fun App(forceGamepadUi: Boolean = false) {
                 onConnected = { session = it },
                 deepLink = pendingLink,
                 onDeepLinkHandled = { activity?.pendingDeepLink = null },
+                reopenLibraryHostId = reopenLibraryHostId,
+                onReopenLibraryHandled = { reopenLibraryHostId = null },
             )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
@@ -218,10 +239,31 @@ fun GamepadShell(
     onConnected: (ActiveSession) -> Unit,
     deepLink: String? = null,
     onDeepLinkHandled: () -> Unit = {},
+    /**
+     * Open this saved host's library instead of Home on the way in — set when a game launched from
+     * it has just exited. Null (the default) starts on Home exactly as before.
+     */
+    reopenLibraryHostId: String? = null,
+    onReopenLibraryHandled: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var screen by remember { mutableStateOf(GamepadScreen.Home) }
     var libraryHost by remember { mutableStateOf<io.unom.punktfunk.kit.security.KnownHost?>(null) }
+
+    // Consume the "come back to this library" intent once, on entry. Keyed on the id so a second
+    // game exit re-fires it; the parent clears it immediately, so a manual Back stays backed out.
+    // A host that has since been forgotten simply leaves us on Home rather than failing.
+    LaunchedEffect(reopenLibraryHostId) {
+        val id = reopenLibraryHostId ?: return@LaunchedEffect
+        // Navigate BEFORE acknowledging: acknowledging clears the parent's state, which re-keys
+        // this effect and cancels the coroutine running it. Nothing suspends in between today, so
+        // either order happens to work — but this one cannot be broken by a later edit that adds a
+        // suspending call. A host that has since been forgotten just leaves us on Home.
+        KnownHostStore(context).all()
+            .firstOrNull { it.id == id }
+            ?.let { libraryHost = it; screen = GamepadScreen.Library }
+        onReopenLibraryHandled()
+    }
 
     // On a TV, shrink the 10-foot UI so its elements aren't oversized. Density-aware: expand the
     // effective dp footprint to at least CONSOLE_TV_MIN_WIDTH_DP (→ smaller elements) ONLY when the
