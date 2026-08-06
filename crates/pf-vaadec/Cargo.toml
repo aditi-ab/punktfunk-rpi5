@@ -9,6 +9,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Direct dependency on the vendored parser crate, not just pf-bitstream: the conversion
+# consumes the parser's `Sps`/`Pps`/`SliceType` wholesale (pf-bitstream re-exports only a
+# subset), and the same path means the one crate instance the workspace already builds.
+cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
 pf-bitstream = { path = "../pf-bitstream" }
 # For `SlotMap`/`SlotError` ONLY — see this crate's lib.rs for why the DPB slot ledger is
 # borrowed from the Vulkan crate rather than duplicated or moved.

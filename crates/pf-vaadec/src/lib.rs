@@ -57,6 +57,7 @@
 
 pub mod config;
 pub mod pic;
+pub mod pic_h265;
 pub mod va;
 pub mod va_h265;
 
@@ -90,6 +91,9 @@ pub use config::VA_ENTRYPOINT_VLD;
 pub use pic::plan_to_va;
 pub use pic::DecodePlanVa;
 pub use pic::PlanToVaError;
+pub use pic_h265::plan_to_va_h265;
+pub use pic_h265::DecodePlanVaH265;
+pub use pic_h265::PlanToVaH265Error;
 pub use va::PicFieldsH264;
 pub use va::SeqFieldsH264;
 pub use va::VaIqMatrixBufferH264;

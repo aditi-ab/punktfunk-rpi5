@@ -3199,6 +3199,7 @@ dependencies = [
 name = "pf-vaadec"
 version = "0.24.0"
 dependencies = [
+ "cros-codecs",
  "pf-bitstream",
  "pf-vkdecode",
 ]

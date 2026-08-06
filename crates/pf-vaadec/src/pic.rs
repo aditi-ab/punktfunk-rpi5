@@ -193,7 +193,7 @@ impl std::fmt::Display for PlanToVaError {
 impl std::error::Error for PlanToVaError {}
 
 /// The Annex-B start-code length at the front of `bytes` (3 or 4), or `None`.
-fn start_code_len(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn start_code_len(bytes: &[u8]) -> Option<usize> {
     if bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]) {
         Some(4)
     } else if bytes.starts_with(&[0x00, 0x00, 0x01]) {
