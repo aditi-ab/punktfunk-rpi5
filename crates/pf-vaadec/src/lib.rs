@@ -11,12 +11,15 @@
 //! - [`va`]: the libva decode buffer layouts, **hand-declared**, with every size and
 //!   offset measured off the real headers and pinned as compile-time assertions.
 //! - [`config`]: profile, render-target format and surface-count decisions.
+//! - [`pic`]: one `AuPlan` into picture parameters, IQ matrices and slice records.
 //!
 //! # Status
 //!
-//! **Layouts and configuration only.** The `AuPlan` → picture/slice/IQ-matrix
-//! conversion is the next work package; the groundwork it needs is established and
-//! recorded here so it starts from facts rather than from a reading of the spec:
+//! **H.264 conversion complete; no libva calls yet.** What remains for the rung is
+//! the Linux-only plumbing (config/context/surface creation, `vaRenderPicture`,
+//! sync, dmabuf export) and the H.265 twin of [`pic`].
+//!
+//! Four things this crate settled that a reader would otherwise have to re-derive:
 //!
 //! * **`slice_data_bit_offset` costs no new parsing.** VAAPI is the only one of the
 //!   three backends that wants a bit position — DXVA takes a byte offset, Vulkan
@@ -26,10 +29,10 @@
 //!   `(nalu.size - emulation_prevention_bytes) * 8 - bits_left`, it counts from and
 //!   including the NAL header byte with emulation-prevention bytes removed, which is
 //!   what `VASliceParameterBufferH264` documents.
-//! * **The slice data buffer starts at the NAL header byte**, so the start code must
-//!   be skipped — `SlicePlan::data` is start-code-inclusive, and the prefix is three
-//!   OR four bytes (the real host emits four on 100% of access units). The same
-//!   normalisation the Vulkan ring layer performs, and the reason that layer exists.
+//! * **The slice data buffer starts at the NAL header byte**, so the start code is
+//!   skipped — `SlicePlan::data` is start-code-inclusive, and the prefix is three
+//!   OR four bytes (the real host emits four on 100% of access units), so it is
+//!   measured per slice rather than assumed.
 //! * **`VAPictureParameterBufferH264::reference_frames` is the MARKED DPB**, not the
 //!   access unit's own lists — the same statement DXVA's `RefFrameList` makes, so it
 //!   is filled from pf-bitstream's per-AU `dpb_refs` snapshot. Vulkan's
@@ -37,11 +40,10 @@
 //!   conventions now have a written home.
 //! * **Unlike DXVA's short-format slice control, VAAPI wants the per-slice reference
 //!   lists themselves** (`RefPicList0`/`RefPicList1`, 32 entries each, in 8.2.4.2
-//!   order) and the full prediction weight tables. `SlicePlan::ref_list0`/`ref_list1`
-//!   and `SliceHeader::pred_weight_table` supply both — with one wrinkle to handle
-//!   rather than discover later: the vendored `PredWeightTable` stores
-//!   `luma_offset_l0` as `[i8; 32]` but `luma_offset_l1` as `[i16; 32]`, an upstream
-//!   inconsistency, while libva wants `i16` for both.
+//!   order) and the prediction weight tables. One wrinkle handled in [`pic`]: the
+//!   vendored `PredWeightTable` stores `luma_offset_l0` as `[i8; 32]` but
+//!   `luma_offset_l1` as `[i16; 32]`, an upstream inconsistency, while libva wants
+//!   `i16` for both.
 //!
 //! # Why the slot ledger is borrowed
 //!
@@ -54,6 +56,7 @@
 //! a parameter and stay pure.
 
 pub mod config;
+pub mod pic;
 pub mod va;
 
 /// The DPB slot ledger — borrowed, not redefined (crate docs).
@@ -83,6 +86,9 @@ pub use config::Codec;
 pub use config::ConfigError;
 pub use config::VaProfile;
 pub use config::VA_ENTRYPOINT_VLD;
+pub use pic::plan_to_va;
+pub use pic::DecodePlanVa;
+pub use pic::PlanToVaError;
 pub use va::PicFieldsH264;
 pub use va::SeqFieldsH264;
 pub use va::VaIqMatrixBufferH264;
