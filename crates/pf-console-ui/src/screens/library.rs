@@ -12,7 +12,7 @@ use crate::library::{
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{white, Fonts, DIM, W, WHITE};
+use crate::theme::{brand, white, Fonts, DIM, W, WHITE};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
 use std::collections::HashMap;
@@ -168,10 +168,31 @@ impl LibraryScreen {
         }
     }
 
+    /// How many launcher entries lead the shelf — [`LibraryShared::set_games`] groups them at the
+    /// front, so the launcher group is always the prefix `0..launcher_count()`.
+    fn launcher_count(&self) -> usize {
+        self.games.iter().take_while(|g| g.launcher).count()
+    }
+
+    /// Is the focused entry a launcher? (Drives the confirm hint: you *open* Steam, you *play* a
+    /// game.)
+    fn focused_is_launcher(&self) -> bool {
+        self.games
+            .get(self.cursor as usize)
+            .is_some_and(|g| g.launcher)
+    }
+
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
         match &self.phase {
             LibraryPhase::Ready => vec![
-                Hint::new(HintKey::Confirm, "Play"),
+                Hint::new(
+                    HintKey::Confirm,
+                    if self.focused_is_launcher() {
+                        "Open"
+                    } else {
+                        "Play"
+                    },
+                ),
                 Hint::new(HintKey::Shoulders, "Jump"),
                 Hint::new(HintKey::Back, "Back"),
             ],
@@ -277,6 +298,30 @@ impl LibraryScreen {
         let pos = self.anim.pos;
         let bump = self.bump.pos * k;
 
+        // Group heading. The model groups launcher entries at the front (design D4), and a
+        // coverflow is one-dimensional — so instead of a second focus rail (a new up/down nav
+        // model, in three renderers, for two or three tiles) the heading names the group the
+        // cursor is in and changes as it crosses the boundary. Drawn only when the shelf
+        // actually has both groups, so a library without launchers looks exactly as before.
+        let launchers = self.launcher_count();
+        if launchers > 0 && launchers < self.games.len() {
+            let heading = if (self.cursor as usize) < launchers {
+                "LAUNCHERS"
+            } else {
+                "GAMES"
+            };
+            fonts.centered(
+                canvas,
+                heading,
+                W::SemiBold,
+                12.0 * k,
+                white(0.5),
+                f64::from(rect.left) + w / 2.0,
+                cy - card_h / 2.0 - 22.0 * k,
+                w * 0.5,
+            );
+        }
+
         // Paint order = draw order: farthest from the (integer) cursor first, so the
         // dense side stacks overlap toward the focus.
         let mut order: Vec<usize> = (0..self.games.len()).collect();
@@ -326,21 +371,31 @@ impl LibraryScreen {
                 }
                 None => {
                     // Solid face, not glass: the side cards OVERLAP.
-                    canvas.draw_rect(
-                        crect,
-                        &Paint::new(Color4f::new(0.118, 0.118, 0.145, 1.0), None),
-                    );
-                    let mono = initials(&game.title);
-                    let font = fonts.font(W::Bold, 38.0 * k);
-                    let tw = font.measure_str(&mono, None).0;
+                    //
+                    // A launcher tile usually has no poster, and an art-less launcher drawn like
+                    // an art-less game reads as "a game whose cover failed to load". So it gets
+                    // the brand-tinted face and names its launcher, instead of a title monogram.
+                    let face = if game.launcher {
+                        Color4f::new(0.153, 0.137, 0.267, 1.0)
+                    } else {
+                        Color4f::new(0.118, 0.118, 0.145, 1.0)
+                    };
+                    canvas.draw_rect(crect, &Paint::new(face, None));
+                    let (glyph, size, ink) = if game.launcher {
+                        (store_label(&game.store).to_string(), 22.0 * k, white(0.85))
+                    } else {
+                        (initials(&game.title), 38.0 * k, white(0.45))
+                    };
+                    let font = fonts.font(W::Bold, size);
+                    let tw = font.measure_str(&glyph, None).0;
                     canvas.draw_str(
-                        &mono,
+                        &glyph,
                         Point::new(
                             (card_w as f32 - tw) / 2.0,
                             card_h as f32 / 2.0 + 13.0 * k as f32,
                         ),
                         &font,
-                        &Paint::new(white(0.45), None),
+                        &Paint::new(ink, None),
                     );
                 }
             }
@@ -351,13 +406,20 @@ impl LibraryScreen {
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
                 let (px, py) = (8.0 * k, 8.0 * k);
                 let (bw, bh) = (tw + 16.0 * k, 20.0 * k);
+                // Brand-filled for a launcher, smoked glass for a game — the one cue that
+                // survives being three cards deep in the recede.
+                let pill = if game.launcher {
+                    brand(0.85)
+                } else {
+                    Color4f::new(0.0, 0.0, 0.0, 0.55)
+                };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(
                         Rect::from_xywh(px as f32, py as f32, bw as f32, bh as f32),
                         (bh / 2.0) as f32,
                         (bh / 2.0) as f32,
                     ),
-                    &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.55), None),
+                    &Paint::new(pill, None),
                 );
                 fonts.draw(
                     canvas,
@@ -395,9 +457,14 @@ impl LibraryScreen {
                 f64::from(rect.bottom) - 64.0 * k,
                 w * 0.8,
             );
+            let sub = if g.launcher {
+                format!("{} · LAUNCHER", store_label(&g.store).to_uppercase())
+            } else {
+                store_label(&g.store).to_uppercase()
+            };
             fonts.centered(
                 canvas,
-                &store_label(&g.store).to_uppercase(),
+                &sub,
                 W::Regular,
                 12.0 * k,
                 white(0.5),

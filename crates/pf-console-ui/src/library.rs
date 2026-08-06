@@ -419,6 +419,11 @@ pub struct LibraryGame {
     pub id: String,
     pub title: String,
     pub store: String,
+    /// This entry opens the launcher itself (Steam Big Picture, Heroic, Lutris) rather than a
+    /// title — design D4. The host's `role` field, already reduced to a boolean by
+    /// [`pf_client_core::library::GameEntry::is_launcher`] so the "anything that isn't
+    /// `launcher` is a game" rule lives in exactly one place.
+    pub launcher: bool,
 }
 
 struct Shared {
@@ -454,7 +459,15 @@ impl LibraryShared {
     }
 
     /// Loaded games → the carousel (empty = the empty scene).
+    ///
+    /// **Launcher entries are moved to the front, keeping the host's title order within each
+    /// group.** Grouping here rather than in the renderer means the carousel's cursor arithmetic,
+    /// the art pump and every future consumer of this model all inherit the invariant for free —
+    /// a launcher tile is never buried in the middle of a 400-title shelf.
     pub fn set_games(&self, games: Vec<LibraryGame>) {
+        let mut games = games;
+        // `sort_by_key` is stable, so this is a partition that preserves the incoming order.
+        games.sort_by_key(|g| !g.launcher);
         let mut s = self.0.lock().unwrap();
         s.phase = if games.is_empty() {
             LibraryPhase::Empty
@@ -519,6 +532,52 @@ mod tests {
         assert_eq!(step_cursor(4, 5, 1, false), StepResult::Boundary);
         assert_eq!(step_cursor(2, 5, 1, false), StepResult::Moved(3));
         assert_eq!(step_cursor(0, 0, 1, false), StepResult::Boundary);
+    }
+
+    /// Design D4: launcher entries lead the shelf, and the host's title order survives within
+    /// each group. The renderer's `launcher_count()` reads the launcher group as the prefix
+    /// `0..n`, so an interleaved list would silently mislabel the group heading.
+    #[test]
+    fn set_games_groups_launchers_first_and_keeps_title_order() {
+        let g = |title: &str, launcher: bool| LibraryGame {
+            id: format!("steam:{title}"),
+            title: title.to_string(),
+            store: "steam".into(),
+            launcher,
+        };
+        let shared = LibraryShared::default();
+        shared.set_games(vec![
+            g("Celeste", false),
+            g("Big Picture", true),
+            g("Portal 2", false),
+            g("Heroic", true),
+        ]);
+        let (phase, games, _) = shared.snapshot();
+        assert!(matches!(phase, LibraryPhase::Ready));
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Big Picture", "Heroic", "Celeste", "Portal 2"]);
+        assert_eq!(games.iter().take_while(|g| g.launcher).count(), 2);
+    }
+
+    /// A library with no launcher entries is untouched — the whole point of the grouping being
+    /// invisible until a plugin actually publishes a launcher tile.
+    #[test]
+    fn set_games_leaves_a_launcher_less_library_alone() {
+        let shared = LibraryShared::default();
+        shared.set_games(
+            ["Celeste", "Portal 2", "Tunic"]
+                .iter()
+                .map(|t| LibraryGame {
+                    id: format!("steam:{t}"),
+                    title: (*t).to_string(),
+                    store: "steam".into(),
+                    launcher: false,
+                })
+                .collect(),
+        );
+        let (_, games, _) = shared.snapshot();
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Celeste", "Portal 2", "Tunic"]);
     }
 
     #[test]

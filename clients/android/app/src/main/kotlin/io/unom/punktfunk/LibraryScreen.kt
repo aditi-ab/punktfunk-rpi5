@@ -248,7 +248,22 @@ private fun Coverflow(
             onActivate = { games.getOrNull(navTarget)?.let(onLaunch) },
         )
 
+        // Design D4: the launcher entries lead the strip (the client groups them at parse time).
+        // A coverflow is one-dimensional, so instead of a second focus rail the heading names the
+        // group the cursor is in and changes as it crosses the boundary. Only drawn when the
+        // library actually has both groups — otherwise the screen is exactly what it was.
+        val bothGroups = games.any { it.isLauncher } && games.any { !it.isLauncher }
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
+            if (bothGroups) {
+                Text(
+                    if (current?.isLauncher == true) "LAUNCHERS" else "GAMES",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.45f),
+                    letterSpacing = 2.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                )
+            }
             HorizontalPager(
                 state = pagerState,
                 pageSize = PageSize.Fixed(coverWidth),
@@ -312,7 +327,8 @@ private fun Coverflow(
                 )
                 if (current != null) {
                     Text(
-                        if (current.isCustom) "CUSTOM" else "STEAM",
+                        if (current.isLauncher) "${current.storeLabel.uppercase()} \u00B7 LAUNCHER"
+                        else current.storeLabel.uppercase(),
                         style = MaterialTheme.typography.labelMedium,
                         color = Color.White.copy(alpha = 0.5f),
                         letterSpacing = 2.sp,
@@ -346,8 +362,10 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
                 onError = { idx++ }, // this candidate failed — try the next, or fall to the placeholder
             )
         } else {
+            // A launcher rarely has poster art. Naming the launcher says "opens Steam"; the title
+            // would read as "a game whose cover failed to load".
             Text(
-                game.title,
+                if (game.isLauncher) game.storeLabel else game.title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = Color.White.copy(alpha = 0.75f),
@@ -355,15 +373,18 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
                 modifier = Modifier.padding(12.dp),
             )
         }
-        // Store badge, top-start.
+        // Store badge, top-start — brand-filled for a launcher entry (design D4).
         Box(Modifier.fillMaxSize().padding(8.dp), contentAlignment = Alignment.TopStart) {
             Text(
-                if (game.isCustom) "Custom" else "Steam",
+                game.storeLabel,
                 style = MaterialTheme.typography.labelSmall,
                 color = Color.White,
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
-                    .background(Color.Black.copy(alpha = 0.5f))
+                    .background(
+                        if (game.isLauncher) MaterialTheme.colorScheme.primary
+                        else Color.Black.copy(alpha = 0.5f),
+                    )
                     .padding(horizontal = 8.dp, vertical = 3.dp),
             )
         }

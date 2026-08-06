@@ -38,12 +38,46 @@ public struct LaunchSpec: Codable, Hashable, Sendable {
 /// One title in the unified library. `id` is store-qualified: `steam:<appid>` / `custom:<id>`.
 public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
     public var id: String
-    public var store: String // "steam" | "custom"
+    public var store: String // "steam" | "custom" | "lutris" | "heroic" | "epic" | "gog" | "xbox"
     public var title: String
     public var art: Artwork
     public var launch: LaunchSpec?
+    /// `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that opens
+    /// the launcher itself (Steam Big Picture, Heroic) rather than a title. Deliberately a plain
+    /// optional String: the host owns the vocabulary, and an unknown future value must never fail
+    /// the whole library decode. Anything that isn't `"launcher"` is a game (design D4).
+    public var role: String?
 
     public var isCustom: Bool { store == "custom" }
+
+    /// Whether this entry opens a launcher rather than a game.
+    public var isLauncher: Bool { role == "launcher" }
+
+    /// Display name for the store badge — the same table the Rust clients use
+    /// (`pf-console-ui::library::store_label`). Before this existed the badge said "Steam" for
+    /// every non-custom entry, which a Lutris or GOG title made a lie.
+    public var storeLabel: String {
+        switch store {
+        case "steam": return "Steam"
+        case "custom": return "Custom"
+        case "heroic": return "Heroic"
+        case "lutris": return "Lutris"
+        case "epic": return "Epic"
+        case "gog": return "GOG"
+        case "xbox": return "Xbox"
+        default: return "Game"
+        }
+    }
+}
+
+public extension Array where Element == GameEntry {
+    /// Design D4: launcher entries lead the shelf, and the host's title order survives within each
+    /// group. Applied once where the library is fetched, so no individual view has to remember
+    /// the rule — and a library without launcher entries comes back untouched.
+    var launchersFirst: [GameEntry] {
+        let launchers = filter(\.isLauncher)
+        return launchers.isEmpty ? self : launchers + filter { !$0.isLauncher }
+    }
 }
 
 /// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").

@@ -204,10 +204,18 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
         });
     match crate::library::fetch_games(&addr, port, &identity, pin) {
         Ok(games) => {
+            // A fourth column, appended: `game` or `launcher` (design D4). Appended rather than
+            // folded into an existing field so anything reading the first three columns is
+            // untouched.
             for g in &games {
-                println!("{}\t{}\t{}", g.id, g.store, g.title);
+                let role = if g.is_launcher() { "launcher" } else { "game" };
+                println!("{}\t{}\t{}\t{}", g.id, g.store, g.title, role);
             }
-            println!("{} game(s)", games.len());
+            let launchers = games.iter().filter(|g| g.is_launcher()).count();
+            match launchers {
+                0 => println!("{} game(s)", games.len()),
+                n => println!("{} game(s), {} launcher(s)", games.len() - n, n),
+            }
             glib::ExitCode::SUCCESS
         }
         Err(e) => {
