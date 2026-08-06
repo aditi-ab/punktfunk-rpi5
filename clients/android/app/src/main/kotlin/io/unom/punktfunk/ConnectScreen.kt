@@ -1,11 +1,14 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -622,6 +625,32 @@ fun ConnectScreen(
         savedHosts = knownHostStore.all()
     }
 
+    // "Copy link" — the self-emitted form every other client already hands out
+    // (design/client-deep-links.md §4): the host's STABLE id first, with `host=` and `fp=` alongside,
+    // so a link written today still lands on the right box after the host changes address or this
+    // client is reinstalled. A PINNED card copies its own profile with it, because that combination
+    // is the thing being copied; a host card copies no profile at all and so keeps honouring the
+    // host's binding, exactly like a tap on it does.
+    fun copyLink(kh: KnownHost, pin: StreamProfile?) {
+        val url = DeepLinks.forHost(kh, profile = pin?.id).toUrl()
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val copied = clipboard != null && runCatching {
+            clipboard.setPrimaryClip(ClipData.newPlainText("Punktfunk link", url))
+        }.isSuccess
+        // Android 13 draws its own clipboard confirmation, and stacking a second one on top of it is
+        // the platform's own documented anti-pattern. Below it nothing visible happens at all unless
+        // we say so — a silent menu item reads as a broken one.
+        if (copied && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+        val message = if (copied) "Link copied." else "Couldn't copy the link to the clipboard."
+        // The console home renders neither the notice nor the status banner, so there it has to be a
+        // toast; the touch grid has both, and a success dressed as an error banner is a small lie.
+        when {
+            gamepadUi -> Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+            copied -> notice = message
+            else -> status = message
+        }
+    }
+
     // The profile rows a card's overflow menu grows. With no profiles at all it stays empty — a
     // user who never wants this feature sees no new clutter anywhere but the settings scope chips.
     // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
@@ -630,6 +659,7 @@ fun ConnectScreen(
         if (pin == null) {
             add(HostMenuItem("Network speed test") { startSpeedTest(HostCardEntry(kh, null)) })
         }
+        add(HostMenuItem("Copy link") { copyLink(kh, pin) })
         if (profiles.isEmpty()) return@buildList
         if (pin != null) {
             add(HostMenuItem("Unpin card", startsSection = true) { togglePin(kh, pin) })
@@ -1162,6 +1192,7 @@ fun ConnectScreen(
             } else {
                 null
             },
+            onCopyLink = { optionsTarget = null; copyLink(kh, pin) },
             onEdit = { optionsTarget = null; editTarget = kh },
             onForget = {
                 knownHostStore.remove(kh)

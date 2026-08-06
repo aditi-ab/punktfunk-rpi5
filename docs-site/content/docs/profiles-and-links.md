@@ -164,11 +164,12 @@ could do, minus every trust decision.**
 ## Getting a link, and making a shortcut
 
 On Linux and Windows a host card's menu has **Copy link** and **Create shortcut…**. On macOS and iOS
-the card menu has **Copy Link** (tvOS has no clipboard, so it isn't offered; the Android app has no
-copy action yet).
+the card menu has **Copy Link**; tvOS has no clipboard, so it isn't offered there. Android has
+**Copy link** in both of its homes — the touch grid's card menu, and the controller home's host
+options (press Up on a host's tile).
 
-On Linux and Apple a pinned card has its own menu, and the link it hands out carries that card's
-profile. Windows pinned tiles have no menu, and neither Windows action adds a `profile=`, so a
+On Linux, Apple and Android a pinned card has its own menu, and the link it hands out carries that
+card's profile. Windows pinned tiles have no menu, and neither Windows action adds a `profile=`, so a
 Windows link always uses the host's binding until you edit the URL yourself.
 
 A copied link carries the host's stable record id, plus `host=` and `fp=` (the fingerprint only when
