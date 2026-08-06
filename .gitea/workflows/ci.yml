@@ -275,3 +275,31 @@ jobs:
         run: bun run build
       - name: Typecheck
         run: bun run lint
+
+  # web/bun.nix and sdk/bun.nix are GENERATED from their bun.lock (bun2nix) and committed; the Nix
+  # build fetches node_modules from nothing else. They regenerate only on a local `bun install` that
+  # runs lifecycle scripts — never under CI's `--ignore-scripts`, and never on a merge or rebase,
+  # which happily carries a lockfile change past a bun.nix generated before it. That is not
+  # theoretical: web/bun.nix sat stale on main for 553 commits (2026-07-27 → 2026-08-05) with
+  # `nix build .#punktfunk-web` broken, and was repaired only by accident when an advisory bump
+  # happened to rerun a real `bun install`.
+  #
+  # Deliberately UNFILTERED and in ci.yml rather than nix.yml: it needs no Nix, takes well under a
+  # minute, and the whole point is that the drift arrives through commits that look unrelated to
+  # Nix. The Nix-toolchain gates (flake eval + building the bun packages) live in nix.yml.
+  bun-nix:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    steps:
+      # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
+      # actions/checkout needs all three (see the web job).
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/checkout@v4
+      # Regenerates each bun.nix from its committed bun.lock and diffs, and checks that the
+      # bun2nix version pin agrees across flake.nix and both package.json files (bun.nix has no
+      # schema stability across bun2nix releases). Fix with: scripts/ci/check-bun-nix.sh --fix
+      - name: bun.nix drift gate
+        run: sh scripts/ci/check-bun-nix.sh
