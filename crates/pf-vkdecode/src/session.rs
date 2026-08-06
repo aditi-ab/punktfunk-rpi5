@@ -33,6 +33,7 @@ use crate::device::DecodeDevice;
 use crate::params::pps_to_std;
 use crate::params::sps_to_std;
 use crate::params::ParamsError;
+use crate::params_av1::ParamsAv1Error;
 use crate::params_h265::H265ParamsError;
 
 /// Parameter-object capacity. Punktfunk hosts emit one SPS + one PPS per stream;
@@ -151,6 +152,9 @@ pub(crate) enum SessionError {
     /// An H.265 parameter set has no Std representation (the H.265 session's
     /// counterpart of [`SessionError::Params`]).
     ParamsH265(H265ParamsError),
+    /// An AV1 sequence header has no Std representation (the AV1 session's
+    /// counterpart of [`SessionError::Params`]).
+    ParamsAv1(ParamsAv1Error),
     /// Session memory binding found no matching memory type (never a fallback).
     NoMemoryType {
         type_bits: u32,
@@ -173,6 +177,12 @@ impl From<ParamsError> for SessionError {
 impl From<H265ParamsError> for SessionError {
     fn from(e: H265ParamsError) -> Self {
         SessionError::ParamsH265(e)
+    }
+}
+
+impl From<ParamsAv1Error> for SessionError {
+    fn from(e: ParamsAv1Error) -> Self {
+        SessionError::ParamsAv1(e)
     }
 }
 

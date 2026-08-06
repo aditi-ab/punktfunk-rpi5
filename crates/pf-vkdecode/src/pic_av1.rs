@@ -21,6 +21,12 @@
 //! coincide right up until they do not. Here the trap is narrower but identical in
 //! shape, so the plan carries slot indices and says so, and the backend lays
 //! `pReferenceSlots` out in [`DecodePlanVkAv1::refs`] order independently.
+//!
+//! The NAME itself comes from the planner, not from counting: `AuPlan::refs` is
+//! indexed by reference name and a lost reference leaves a hole there, so the loop
+//! below reads its index off the iterator and skips the holes. Compacting the list
+//! first — which is what it used to receive — renamed every reference after the
+//! first loss.
 
 use ash::vk::native as hh;
 use pf_bitstream::av1::AuPlan;
@@ -61,9 +67,13 @@ pub struct DecodePlanVkAv1 {
     /// to, or [`REFERENCE_NAME_UNUSED`] — see the module docs. Not positions in
     /// [`Self::refs`].
     pub reference_name_slot_indices: [i32; REFS_PER_FRAME],
-    /// Each tile group's byte range in the access unit as planned. The recording
-    /// layer packs these into the bitstream buffer and rebases, exactly as the
-    /// H.264/H.265 slice offsets are rebased.
+    /// Each tile group's byte range in the access unit as planned — whole OBUs.
+    ///
+    /// ⚠ NOT what is uploaded. The bitstream buffer holds the raw tile PAYLOADS
+    /// found inside these OBUs and nothing else, and the recording layer walks
+    /// them itself (`decoder_av1`'s `plan_bitstream`) because that walk needs the
+    /// access-unit bytes, which a conversion never sees. Carried here so a caller
+    /// can see what the frame was made of without re-parsing.
     pub tiles: Vec<TilePlan>,
     /// The slot the decoded picture activates (`pSetupReferenceSlot`).
     pub setup_slot: u8,
@@ -163,6 +173,21 @@ fn narrow(field: &'static str, value: u32) -> Result<u8, PlanToVkAv1Error> {
     u8::try_from(value).map_err(|_| PlanToVkAv1Error::FieldOverflow { field, value })
 }
 
+/// The parser's frame type as `StdVideoAV1FrameType`.
+///
+/// Written out rather than cast even though the four discriminants happen to
+/// coincide: the coincidence is between a vendored crate's enum and a Vulkan
+/// header, and neither is ours to keep in step. Both the picture info and every
+/// reference info go through here, so the two can never disagree either.
+fn std_frame_type(frame_type: pf_bitstream::av1::FrameType) -> hh::StdVideoAV1FrameType {
+    match frame_type {
+        pf_bitstream::av1::FrameType::KeyFrame => STD_FRAME_TYPE_KEY,
+        pf_bitstream::av1::FrameType::InterFrame => STD_FRAME_TYPE_INTER,
+        pf_bitstream::av1::FrameType::IntraOnlyFrame => STD_FRAME_TYPE_INTRA_ONLY,
+        pf_bitstream::av1::FrameType::SwitchFrame => STD_FRAME_TYPE_SWITCH,
+    }
+}
+
 /// Convert one planned AV1 frame.
 ///
 /// Nothing mutates `slots` until every fallible step has passed — the same
@@ -177,9 +202,13 @@ pub fn plan_to_vk_av1(
 
     // --- resolve, before any mutation ------------------------------------
     // The unique references, first appearance first, plus the per-NAME slot table.
+    // `plan.refs` is indexed BY NAME and holes are real (a lost reference), so the
+    // index is taken from the iterator and empty names are skipped rather than
+    // shifting everything after them up one.
     let mut refs: Vec<VkRefAv1> = Vec::new();
     let mut reference_name_slot_indices = [REFERENCE_NAME_UNUSED; REFS_PER_FRAME];
-    for (name, r) in plan.refs.iter().enumerate().take(REFS_PER_FRAME) {
+    for (name, r) in plan.refs.iter().enumerate() {
+        let Some(r) = r else { continue };
         let slot = slots
             .slot_of(r.id)
             .ok_or(PlanToVkAv1Error::UnresolvedReference(r.id))?;
@@ -187,7 +216,9 @@ pub fn plan_to_vk_av1(
         if !refs.iter().any(|existing| existing.id == r.id) {
             refs.push(VkRefAv1 {
                 slot,
-                std: reference_info(r.order_hint, header.frame_type as u32)?,
+                // The REFERENCE's own state, never this frame's — see
+                // `pf_bitstream::av1::RefState`.
+                std: reference_info(&r.state)?,
                 id: r.id,
             });
         }
@@ -196,8 +227,15 @@ pub fn plan_to_vk_av1(
         return Err(PlanToVkAv1Error::TooManyReferences(refs.len()));
     }
 
-    let pic = picture_info(plan)?;
-    let setup_ref = reference_info(header.order_hint, header.frame_type as u32)?;
+    let pic = picture_info(header, &plan.sequence)?;
+    // The picture being decoded activates a slot, so it needs the same answers a
+    // reference does — and it is cached as that slot's reference info for later
+    // frames (`decoder_av1`'s `slot_refs`), so it is built through the SAME
+    // function the reference path uses. libavcodec leaves `SavedOrderHints` zero
+    // here because it rebuilds a reference's info from scratch every frame and
+    // never re-reads the setup entry; this rung caches, so filling them keeps the
+    // cached copy equal to the one the reference path would build.
+    let setup_ref = reference_info(&pf_bitstream::av1::RefState::of(header))?;
 
     // --- mutations, after every fallible step -----------------------------
     for &id in &plan.dpb.removed {
@@ -224,22 +262,51 @@ pub fn plan_to_vk_av1(
     })
 }
 
+/// One picture's `StdVideoDecodeAV1ReferenceInfo`, from THAT picture's own header
+/// state.
+///
+/// Every field here is about the reference, and answering any of them from the
+/// frame currently being decoded is a silent mispredict rather than an error. The
+/// set matches libavcodec's `vulkan_av1.c` field for field (`vk_av1_fill_pict`);
+/// `RefFrameSignBias` and `SavedOrderHints` are the two RADV reads
+/// (`radv_video.c`, `av1->ref_frames[i].ref_frame_sign_bias`).
 fn reference_info(
-    order_hint: u32,
-    frame_type: u32,
+    state: &pf_bitstream::av1::RefState,
 ) -> Result<hh::StdVideoDecodeAV1ReferenceInfo, PlanToVkAv1Error> {
     // SAFETY: StdVideoDecodeAV1ReferenceInfo is a plain-C bindgen struct of a
     // bitfield word, three small integers and a byte array; all-zero is valid for
     // every field.
     let mut std: hh::StdVideoDecodeAV1ReferenceInfo = unsafe { std::mem::zeroed() };
-    std.frame_type = narrow("frame_type", frame_type)?;
-    std.OrderHint = narrow("OrderHint", order_hint)?;
+    std.flags
+        .set_disable_frame_end_update_cdf(state.disable_frame_end_update_cdf.into());
+    std.flags
+        .set_segmentation_enabled(state.segmentation_enabled.into());
+    std.frame_type = narrow("frame_type", std_frame_type(state.frame_type))?;
+    std.RefFrameSignBias = state.ref_frame_sign_bias;
+    std.OrderHint = narrow("OrderHint", state.order_hint)?;
+    for (dst, hint) in std
+        .SavedOrderHints
+        .iter_mut()
+        .zip(state.saved_order_hints.iter())
+    {
+        // Order hints are `order_hint_bits` wide and that is at most 8, so the
+        // truncation is unreachable — and it is the same cast `OrderHints` in the
+        // picture info takes, kept identical on purpose.
+        *dst = *hint as u8;
+    }
     Ok(std)
 }
 
-fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Error> {
-    let p = &*plan.header;
-
+/// One frame header (plus the sequence header, for the film-grain gate) into the
+/// Std picture info and everything its eight pointers target.
+///
+/// Takes the two headers rather than the whole [`AuPlan`] so a hand-built header —
+/// film grain, say, which no vendored vector codes — can be converted in a unit
+/// test without inventing a plan around it.
+fn picture_info(
+    p: &pf_bitstream::av1::ParsedFrameHeader,
+    sequence: &pf_bitstream::av1::ParsedSequenceHeader,
+) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Error> {
     // Tile info, and its four arrays.
     let tile = &p.tile_info;
     let mi_col_starts: Box<[u16]> = tile.mi_col_starts.iter().map(|v| *v as u16).collect();
@@ -344,12 +411,24 @@ fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Erro
     let cdef = Box::new(c_std);
 
     // Loop restoration.
+    //
+    // ⚠ `LoopRestorationSize` is NOT the size in pixels. The Vulkan field carries
+    // the CODED value — RADV names its destination `log2_restoration_size_minus5`
+    // (`radv_video.c`) and libavcodec sends `1 + lr_unit_shift` (luma) and
+    // `1 + lr_unit_shift - lr_uv_shift` (chroma) — while the vendored parser
+    // records the pixel size, 64/128/256. Sending 64 where a driver expects 1 asks
+    // for a restoration unit of 2^69 pixels.
     let lr = &p.loop_restoration_params;
     // SAFETY: see above.
     let mut lr_std: hh::StdVideoAV1LoopRestoration = unsafe { std::mem::zeroed() };
+    let luma_size = 1 + u16::from(lr.lr_unit_shift);
+    // `lr_uv_shift` is one coded bit (0 or 1) and `luma_size` is at least 1, so the
+    // saturation is unreachable; it is here so a malformed parse cannot wrap to
+    // 65535, which a driver would read as log2(size) − 5.
+    let chroma_size = luma_size.saturating_sub(u16::from(lr.lr_uv_shift));
     for i in 0..3 {
         lr_std.FrameRestorationType[i] = lr.frame_restoration_type[i] as u32;
-        lr_std.LoopRestorationSize[i] = lr.loop_restoration_size[i];
+        lr_std.LoopRestorationSize[i] = if i == 0 { luma_size } else { chroma_size };
     }
     let loop_restoration = Box::new(lr_std);
 
@@ -366,7 +445,7 @@ fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Erro
     // Film grain: only where the SEQUENCE enables it and this frame applies it.
     // The gate is deliberately both — a zeroed block behind a live pointer would ask
     // the decoder to synthesise grain the stream never described.
-    let film_grain = if plan.sequence.film_grain_params_present && p.film_grain_params.apply_grain {
+    let film_grain = if sequence.film_grain_params_present && p.film_grain_params.apply_grain {
         let fg = &p.film_grain_params;
         // SAFETY: see above.
         let mut fg_std: hh::StdVideoAV1FilmGrain = unsafe { std::mem::zeroed() };
@@ -384,6 +463,17 @@ fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Erro
         fg_std.grain_scale_shift = fg.grain_scale_shift;
         fg_std.grain_seed = fg.grain_seed;
         fg_std.film_grain_params_ref_idx = fg.film_grain_params_ref_idx;
+        // The chroma scaling function's six coefficients (7.18.3.5 `scaling_lut`
+        // for the chroma planes). Nothing else describes how luma feeds chroma
+        // grain, so leaving them zero synthesises grey-drifting chroma noise on
+        // any stream that codes grain — libavcodec sets all six, and so does this
+        // program's DXVA conversion.
+        fg_std.cb_mult = fg.cb_mult;
+        fg_std.cb_luma_mult = fg.cb_luma_mult;
+        fg_std.cb_offset = fg.cb_offset;
+        fg_std.cr_mult = fg.cr_mult;
+        fg_std.cr_luma_mult = fg.cr_luma_mult;
+        fg_std.cr_offset = fg.cr_offset;
 
         // ⚠ The PARSER's point arrays are 16 entries; the Std ones are 14 (luma) and
         // 10 (chroma), which are the spec's own maxima. So the counts are checked
@@ -456,6 +546,37 @@ fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Erro
     std.flags
         .set_disable_cdf_update(p.disable_cdf_update.into());
     std.flags.set_use_superres(p.use_superres.into());
+    // The four that CHANGE RECONSTRUCTION and were missing until the M7 review.
+    // Measured incidence on the vendored 274-frame vector:
+    //
+    // * `allow_screen_content_tools` — 274/274 frames, and RADV reads it
+    //   (`av1->pic_flags.allow_screen_content_tools`). It also has to be set for
+    //   `allow_intrabc` below to be coherent: intra block copy is only codeable
+    //   when screen-content tools are on, so the two disagreeing is a contradiction
+    //   a driver is free to resolve either way;
+    // * `allow_warped_motion` — 273/274;
+    // * `is_filter_switchable` — 172/274;
+    // * `force_integer_mv` — 1/274 (the key frame: the parser applies the spec's
+    //   `frame_is_intra ⇒ 1` rule, as libavcodec does for `cur_frame`).
+    std.flags
+        .set_allow_screen_content_tools(u32::from(p.allow_screen_content_tools != 0));
+    std.flags
+        .set_allow_warped_motion(p.allow_warped_motion.into());
+    std.flags
+        .set_is_filter_switchable(p.is_filter_switchable.into());
+    std.flags
+        .set_force_integer_mv(u32::from(p.force_integer_mv != 0));
+    // The four informational ones libavcodec also sends. No driver in this fleet is
+    // known to act on them, but they are coded facts about the frame and a decoder
+    // is entitled to check them against its own parse.
+    std.flags
+        .set_render_and_frame_size_different(p.render_and_frame_size_different.into());
+    std.flags
+        .set_frame_size_override_flag(p.frame_size_override_flag.into());
+    std.flags
+        .set_buffer_removal_time_present_flag(p.buffer_removal_time_present_flag.into());
+    std.flags
+        .set_frame_refs_short_signaling(p.frame_refs_short_signaling.into());
     std.flags.set_allow_intrabc(p.allow_intrabc.into());
     std.flags
         .set_allow_high_precision_mv(p.allow_high_precision_mv.into());
@@ -487,16 +608,21 @@ fn picture_info(plan: &AuPlan) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Erro
     std.flags.set_UsesLr(u32::from(
         lr.frame_restoration_type.iter().any(|t| *t as u32 != 0),
     ));
+    // `usesChromaLr` is deliberately LEFT ZERO, and this is not an oversight.
+    //
+    // The AV1 spec's `UsesChromaLr` is `FrameRestorationType[1] != NONE ||
+    // FrameRestorationType[2] != NONE` — the vendored parser even computes it
+    // (`LoopRestorationParams::uses_chroma_lr`). libavcodec's `vulkan_av1.c` sets
+    // neither, and libavcodec is the implementation every driver in this fleet was
+    // validated against: a driver that reads the field at all reads it as zero
+    // today, and sending a truthful 1 would be the FIRST implementation to do so.
+    // That is not a bet to take blind on a rung with no on-glass mileage. Revisit
+    // with a driver-by-driver measurement, not by "fixing" it.
     // Kept in step with the `pFilmGrain` gate above by construction: the flag says
     // grain is applied exactly when a block describing it is attached.
     std.flags.set_apply_grain(u32::from(film_grain.is_some()));
 
-    std.frame_type = match p.frame_type {
-        pf_bitstream::av1::FrameType::KeyFrame => STD_FRAME_TYPE_KEY,
-        pf_bitstream::av1::FrameType::InterFrame => STD_FRAME_TYPE_INTER,
-        pf_bitstream::av1::FrameType::IntraOnlyFrame => STD_FRAME_TYPE_INTRA_ONLY,
-        pf_bitstream::av1::FrameType::SwitchFrame => STD_FRAME_TYPE_SWITCH,
-    };
+    std.frame_type = std_frame_type(p.frame_type);
     std.current_frame_id = p.current_frame_id;
     std.OrderHint = narrow("OrderHint", p.order_hint)?;
     std.primary_ref_frame = narrow("primary_ref_frame", p.primary_ref_frame)?;
@@ -626,5 +752,321 @@ mod tests {
             "frames {frames} · with refs {with_refs} · slot-vs-position disagreements \
              {disagreements}"
         );
+    }
+
+    /// Every `StdVideoDecodeAV1PictureInfoFlags` bit this conversion is responsible
+    /// for, checked against the parsed header on all 274 frames — with the
+    /// INCIDENCE of each pinned, so a bit that silently stopped being written
+    /// fails here.
+    ///
+    /// Nine of these were unset when M7 first landed, and four of them change
+    /// reconstruction. A test that only asserted "flag == header field" would have
+    /// passed just as happily against a conversion that wrote neither, which is why
+    /// the counts below are assertions and not `eprintln!`s.
+    #[test]
+    fn every_picture_info_flag_matches_the_header_and_the_incidence_is_pinned() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let mut frames = 0u32;
+        let (mut screen, mut warped, mut switchable, mut integer_mv) = (0u32, 0u32, 0u32, 0u32);
+        let (mut informational, mut intrabc) = (0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let vk = plan_to_vk_av1(&plan, &mut slots).expect("converts");
+                let f = &vk.pic.std().flags;
+                let p = &*plan.header;
+                frames += 1;
+
+                let bit = |b: bool| u32::from(b);
+                // --- the four that change reconstruction ---
+                assert_eq!(
+                    f.allow_screen_content_tools(),
+                    bit(p.allow_screen_content_tools != 0)
+                );
+                assert_eq!(f.allow_warped_motion(), bit(p.allow_warped_motion));
+                assert_eq!(f.is_filter_switchable(), bit(p.is_filter_switchable));
+                assert_eq!(f.force_integer_mv(), bit(p.force_integer_mv != 0));
+                // Intra block copy is only codeable where screen-content tools are
+                // on, so a frame claiming intrabc without them is a contradiction a
+                // driver resolves however it likes.
+                if f.allow_intrabc() == 1 {
+                    assert_eq!(
+                        f.allow_screen_content_tools(),
+                        1,
+                        "allow_intrabc without allow_screen_content_tools"
+                    );
+                    intrabc += 1;
+                }
+                // --- the four informational ones libavcodec also sends ---
+                assert_eq!(
+                    f.render_and_frame_size_different(),
+                    bit(p.render_and_frame_size_different)
+                );
+                assert_eq!(
+                    f.frame_size_override_flag(),
+                    bit(p.frame_size_override_flag)
+                );
+                assert_eq!(
+                    f.buffer_removal_time_present_flag(),
+                    bit(p.buffer_removal_time_present_flag)
+                );
+                assert_eq!(
+                    f.frame_refs_short_signaling(),
+                    bit(p.frame_refs_short_signaling)
+                );
+                informational += f.render_and_frame_size_different()
+                    + f.frame_size_override_flag()
+                    + f.buffer_removal_time_present_flag()
+                    + f.frame_refs_short_signaling();
+                // --- the twenty that were already right ---
+                assert_eq!(f.error_resilient_mode(), bit(p.error_resilient_mode));
+                assert_eq!(f.disable_cdf_update(), bit(p.disable_cdf_update));
+                assert_eq!(f.use_superres(), bit(p.use_superres));
+                assert_eq!(f.allow_high_precision_mv(), bit(p.allow_high_precision_mv));
+                assert_eq!(
+                    f.is_motion_mode_switchable(),
+                    bit(p.is_motion_mode_switchable)
+                );
+                assert_eq!(f.use_ref_frame_mvs(), bit(p.use_ref_frame_mvs));
+                assert_eq!(
+                    f.disable_frame_end_update_cdf(),
+                    bit(p.disable_frame_end_update_cdf)
+                );
+                assert_eq!(f.reduced_tx_set(), bit(p.reduced_tx_set));
+                assert_eq!(f.reference_select(), bit(p.reference_select));
+                assert_eq!(f.skip_mode_present(), bit(p.skip_mode_present));
+                assert_eq!(
+                    f.segmentation_enabled(),
+                    bit(p.segmentation_params.segmentation_enabled)
+                );
+                // ⚠ `usesChromaLr` is deliberately zero even where the spec would
+                // want it — see picture_info. Asserted so "fixing" it trips here
+                // and the reasoning gets read.
+                assert_eq!(
+                    f.usesChromaLr(),
+                    0,
+                    "usesChromaLr is deliberately left at libavcodec's zero"
+                );
+
+                screen += f.allow_screen_content_tools();
+                warped += f.allow_warped_motion();
+                switchable += f.is_filter_switchable();
+                integer_mv += f.force_integer_mv();
+            }
+        }
+
+        assert_eq!(frames, 274);
+        // Measured on this vector. These are what make the four assertions above
+        // real: a conversion that never set them would report zero.
+        assert_eq!(screen, 274, "allow_screen_content_tools: 274/274");
+        assert_eq!(warped, 273, "allow_warped_motion: 273/274");
+        assert_eq!(switchable, 172, "is_filter_switchable: 172/274");
+        assert_eq!(integer_mv, 1, "force_integer_mv: the key frame only");
+        assert!(intrabc <= frames);
+        // ⚠ Honest gap: this vector codes none of the four informational flags, so
+        // their assertions above compare 0 against 0. They are covered by review
+        // and by the libavcodec cross-read, not by this measurement.
+        assert_eq!(
+            informational, 0,
+            "if this ever fires, the informational flags ARE exercised — say so \
+             here rather than deleting the count"
+        );
+    }
+
+    /// `LoopRestorationSize` carries the CODED value, not the pixel size.
+    ///
+    /// Three frames of the vector switch loop restoration on, at
+    /// `lr_unit_shift = 1` / `lr_uv_shift = 0` — a 128-pixel unit whose coded value
+    /// is 2. Sending 128 (what the parser stores, and what this conversion sent
+    /// until the M7 review) asks a driver that reads the field as
+    /// `log2_restoration_size_minus5` for a restoration unit of 2^133 pixels.
+    #[test]
+    fn loop_restoration_size_is_the_coded_value_not_the_pixel_size() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let (mut frames, mut with_lr) = (0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let vk = plan_to_vk_av1(&plan, &mut slots).expect("converts");
+                frames += 1;
+                let lr = &plan.header.loop_restoration_params;
+                // SAFETY: `pLoopRestoration` points at the boxed block `vk.pic`
+                // owns, alive for as long as `vk` is.
+                let sizes = unsafe { (*vk.pic.std().pLoopRestoration).LoopRestorationSize };
+                assert_eq!(
+                    sizes[0],
+                    1 + u16::from(lr.lr_unit_shift),
+                    "luma: libavcodec sends 1 + lr_unit_shift"
+                );
+                let chroma = 1 + u16::from(lr.lr_unit_shift) - u16::from(lr.lr_uv_shift);
+                assert_eq!(sizes[1], chroma);
+                assert_eq!(sizes[2], chroma);
+                if lr.uses_lr {
+                    with_lr += 1;
+                    assert_eq!(lr.loop_restoration_size, [128, 128, 128]);
+                    assert_eq!(sizes, [2, 2, 2]);
+                    assert_ne!(
+                        sizes[0], lr.loop_restoration_size[0],
+                        "the coded value and the pixel size must differ here, or \
+                         this test cannot tell them apart"
+                    );
+                }
+            }
+        }
+        assert_eq!(frames, 274);
+        assert_eq!(
+            with_lr, 3,
+            "three frames of this vector use loop restoration; at zero the \
+             assertions above only ever saw the off state"
+        );
+    }
+
+    /// A reference's Std info must describe the REFERENCE, not the frame reading
+    /// it — and `RefFrameSignBias` must actually carry the future references this
+    /// vector is full of.
+    #[test]
+    fn reference_info_describes_the_reference_and_not_the_current_frame() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let mut frames = 0u32;
+        let (mut mixed_types, mut biased, mut with_saved_hints) = (0u32, 0u32, 0u32);
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let vk = plan_to_vk_av1(&plan, &mut slots).expect("converts");
+                frames += 1;
+                let current_type = plan.header.frame_type as u8;
+
+                for r in &vk.refs {
+                    let by_id = plan
+                        .refs
+                        .iter()
+                        .flatten()
+                        .find(|p| p.id == r.id)
+                        .expect("every vk ref came from a named plan reference");
+                    assert_eq!(r.std.frame_type, by_id.state.frame_type as u8);
+                    assert_eq!(r.std.RefFrameSignBias, by_id.state.ref_frame_sign_bias);
+                    assert_eq!(
+                        r.std.flags.disable_frame_end_update_cdf(),
+                        u32::from(by_id.state.disable_frame_end_update_cdf)
+                    );
+                    assert_eq!(
+                        r.std.flags.segmentation_enabled(),
+                        u32::from(by_id.state.segmentation_enabled)
+                    );
+                    assert_eq!(r.std.OrderHint, by_id.state.order_hint as u8);
+                    for (sent, want) in r
+                        .std
+                        .SavedOrderHints
+                        .iter()
+                        .zip(by_id.state.saved_order_hints.iter())
+                    {
+                        assert_eq!(u32::from(*sent), *want);
+                    }
+
+                    if r.std.frame_type != current_type {
+                        mixed_types += 1;
+                    }
+                    if r.std.RefFrameSignBias != 0 {
+                        biased += 1;
+                    }
+                    if r.std.SavedOrderHints.iter().any(|h| *h != 0) {
+                        with_saved_hints += 1;
+                    }
+                }
+                // The setup picture activates a slot and is cached as that slot's
+                // reference info, so it must carry the current frame's own state
+                // through the very same path.
+                let own = pf_bitstream::av1::RefState::of(&plan.header);
+                assert_eq!(vk.setup_ref.frame_type, own.frame_type as u8);
+                assert_eq!(vk.setup_ref.RefFrameSignBias, own.ref_frame_sign_bias);
+                assert_eq!(vk.setup_ref.OrderHint, own.order_hint as u8);
+            }
+        }
+
+        assert_eq!(frames, 274);
+        assert!(
+            mixed_types > 0,
+            "no reference ever had a different frame type from the frame reading \
+             it, so handing every reference the CURRENT type would have passed"
+        );
+        assert!(
+            biased > 0,
+            "no reference carried a sign bias: this is the hidden-ALTREF vector, \
+             so a zero here means the mask never reached the Std struct and every \
+             future reference reads as past"
+        );
+        assert!(with_saved_hints > 0, "SavedOrderHints never carried a hint");
+        eprintln!(
+            "refs with a foreign frame type {mixed_types} · with a sign bias \
+             {biased} · with saved order hints {with_saved_hints}"
+        );
+    }
+
+    /// Film grain's six chroma-scaling coefficients reach the Std block.
+    ///
+    /// ⚠ The vendored vector codes NO film grain (`film_grain_params_present` is
+    /// false on all 274 frames), so this is a hand-built header — the only way the
+    /// grain path is exercised at all. It is also why the six fields could go
+    /// missing unnoticed: nothing that runs on the vector touches them.
+    #[test]
+    fn film_grain_carries_the_chroma_scaling_coefficients() {
+        let mut sequence = pf_bitstream::av1::ParsedSequenceHeader {
+            film_grain_params_present: true,
+            ..Default::default()
+        };
+
+        let mut header = pf_bitstream::av1::ParsedFrameHeader::default();
+        let fg = &mut header.film_grain_params;
+        fg.apply_grain = true;
+        fg.grain_seed = 0x1234;
+        fg.num_y_points = 2;
+        fg.num_cb_points = 1;
+        fg.num_cr_points = 1;
+        fg.cb_mult = 128;
+        fg.cb_luma_mult = 192;
+        fg.cb_offset = 256;
+        fg.cr_mult = 129;
+        fg.cr_luma_mult = 193;
+        fg.cr_offset = 257;
+
+        let pic = picture_info(&header, &sequence).expect("a grain header converts");
+        assert_eq!(pic.std().flags.apply_grain(), 1);
+        assert!(!pic.std().pFilmGrain.is_null());
+        // SAFETY: `pFilmGrain` points at the boxed block `pic` owns, alive here.
+        let grain = unsafe { *pic.std().pFilmGrain };
+        assert_eq!(grain.grain_seed, 0x1234);
+        assert_eq!(
+            (
+                grain.cb_mult,
+                grain.cb_luma_mult,
+                grain.cb_offset,
+                grain.cr_mult,
+                grain.cr_luma_mult,
+                grain.cr_offset
+            ),
+            (128, 192, 256, 129, 193, 257),
+            "the six chroma-scaling coefficients: nothing else describes how luma \
+             feeds chroma grain, and zeroes are not 'less grain', they are \
+             different grain"
+        );
+
+        // And the gate still holds: a sequence that never declared grain gets a
+        // null block whatever the frame says.
+        sequence.film_grain_params_present = false;
+        let pic = picture_info(&header, &sequence).expect("converts");
+        assert!(pic.std().pFilmGrain.is_null());
+        assert_eq!(pic.std().flags.apply_grain(), 0);
     }
 }

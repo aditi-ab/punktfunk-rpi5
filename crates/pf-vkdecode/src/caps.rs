@@ -14,6 +14,8 @@
 use ash::vk;
 use ash::vk::native as hh;
 
+use crate::caps_av1::Av1ProfileChain;
+use crate::caps_av1::Av1ProfileKey;
 use crate::caps_h265::H265ProfileChain;
 use crate::caps_h265::H265ProfileKey;
 use crate::device::DecodeDevice;
@@ -132,12 +134,13 @@ pub struct RawH264Caps {
 /// A device's decode level ceiling, tagged with the codec whose Std code space it
 /// is stated in.
 ///
-/// `StdVideoH264LevelIdc` and `StdVideoH265LevelIdc` are both `c_uint` aliases, so
-/// nothing stops one being assigned where the other belongs — the compiler is
-/// silent and the numbers even look plausible (H.264 level 4.1 and H.265 level 4.1
-/// are different code points). This is the confusion `DecodeProfile` was introduced
-/// to make unrepresentable for profiles; the level ceiling gets the same treatment,
-/// so a caps derivation has to SAY which codec's query it copied.
+/// `StdVideoH264LevelIdc`, `StdVideoH265LevelIdc` and `StdVideoAV1Level` are all
+/// `c_uint` aliases, so nothing stops one being assigned where another belongs —
+/// the compiler is silent and the numbers even look plausible (H.264 level 4.1 and
+/// H.265 level 4.1 are different code points; AV1 5.1 is 13 where H.265 5.1 is 12).
+/// This is the confusion `DecodeProfile` was introduced to make unrepresentable for
+/// profiles; the level ceiling gets the same treatment, so a caps derivation has to
+/// SAY which codec's query it copied.
 ///
 /// The gate itself stays a numeric comparison against [`Self::code_point`]: within
 /// ONE codec the Std code points ascend with the level, which is exactly what makes
@@ -149,6 +152,11 @@ pub enum MaxLevelIdc {
     H264(hh::StdVideoH264LevelIdc),
     /// `VkVideoDecodeH265CapabilitiesKHR::maxLevelIdc`.
     H265(hh::StdVideoH265LevelIdc),
+    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel`. Unlike the other two this code
+    /// space is the BITSTREAM's own: `StdVideoAV1Level` is index-coded exactly like
+    /// AV1's `seq_level_idx` (2.0 = 0, 2.1 = 1, … 7.3 = 23), so the decoder's gate
+    /// compares the sequence header's value against it directly.
+    Av1(hh::StdVideoAV1Level),
 }
 
 impl MaxLevelIdc {
@@ -157,7 +165,7 @@ impl MaxLevelIdc {
     /// which) — the tag is the whole point of the type.
     pub fn code_point(self) -> u32 {
         match self {
-            MaxLevelIdc::H264(level) | MaxLevelIdc::H265(level) => level,
+            MaxLevelIdc::H264(level) | MaxLevelIdc::H265(level) | MaxLevelIdc::Av1(level) => level,
         }
     }
 }
@@ -167,6 +175,7 @@ impl std::fmt::Display for MaxLevelIdc {
         match self {
             MaxLevelIdc::H264(level) => write!(f, "H.264 Std level {level}"),
             MaxLevelIdc::H265(level) => write!(f, "H.265 Std level {level}"),
+            MaxLevelIdc::Av1(level) => write!(f, "AV1 Std level {level}"),
         }
     }
 }
@@ -521,15 +530,21 @@ impl H264ProfileChain {
 /// chain, because profile identity in Vulkan is BY VALUE: each consumer rebuilds
 /// its own structurally identical chain from this, and nothing shares pointers.
 ///
-/// It is also the reason this type exists at all: `StdVideoH264ProfileIdc` and
-/// `StdVideoH265ProfileIdc` are BOTH `c_uint`, so a bare idc parameter would let
-/// an H.265 profile silently build an H.264 chain — the images and the session
-/// would then disagree about the profile and the driver would reject (or worse,
-/// accept) at submit time. The enum makes that mistake unrepresentable.
+/// It is also the reason this type exists at all: `StdVideoH264ProfileIdc`,
+/// `StdVideoH265ProfileIdc` and `StdVideoAV1Profile` are ALL `c_uint`, so a bare
+/// idc parameter would let one codec's profile silently build another's chain —
+/// the images and the session would then disagree about the profile and the driver
+/// would reject (or worse, accept) at submit time. The enum makes that mistake
+/// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeProfile {
     H264(hh::StdVideoH264ProfileIdc),
     H265(H265ProfileKey),
+    /// AV1's key additionally carries `filmGrainSupport`, which is part of the
+    /// profile — so an image pool built for a grain stream is a different pool
+    /// from one built for a grain-less one, by construction
+    /// ([`crate::caps_av1`] module docs).
+    Av1(Av1ProfileKey),
 }
 
 impl DecodeProfile {
@@ -539,15 +554,17 @@ impl DecodeProfile {
         match self {
             DecodeProfile::H264(idc) => ProfileChain::H264(H264ProfileChain::new(idc)),
             DecodeProfile::H265(key) => ProfileChain::H265(H265ProfileChain::new(key)),
+            DecodeProfile::Av1(key) => ProfileChain::Av1(Av1ProfileChain::new(key)),
         }
     }
 }
 
 /// One codec's profile chain, type-erased for the shared creation paths (images,
-/// bitstream ring, query pool). Same immobility contract as the two variants.
+/// bitstream ring, query pool). Same immobility contract as the three variants.
 pub(crate) enum ProfileChain {
     H264(H264ProfileChain),
     H265(H265ProfileChain),
+    Av1(Av1ProfileChain),
 }
 
 impl ProfileChain {
@@ -557,6 +574,7 @@ impl ProfileChain {
         match self {
             ProfileChain::H264(chain) => chain.wire(),
             ProfileChain::H265(chain) => chain.wire(),
+            ProfileChain::Av1(chain) => chain.wire(),
         }
     }
 }

@@ -13,7 +13,8 @@
 //! does with them:
 //!
 //! * `ref_frame_idx[0..7]` names the slots this frame READS (seven references, which
-//!   may repeat a slot);
+//!   may repeat a slot) — and its POSITION is the AV1 reference name, which is why
+//!   [`AuPlan::refs`] is name-indexed and a lost reference leaves a hole;
 //! * `refresh_frame_flags` is an eight-bit mask naming the slots this frame WRITES
 //!   once decoded;
 //! * `show_frame` says whether the frame displays now, and `show_existing_frame`
@@ -62,7 +63,8 @@ pub const NUM_REF_SLOTS: usize = 8;
 /// References a single inter frame may name (`REFS_PER_FRAME`).
 pub const REFS_PER_FRAME: usize = 7;
 
-/// One reference: which picture, and which slot holds it.
+/// One reference: which picture, which slot holds it, and what that picture's OWN
+/// frame header said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefPic {
     pub id: PicId,
@@ -70,7 +72,90 @@ pub struct RefPic {
     /// this; backends that address them by surface resolve `id` through their own
     /// table.
     pub slot: u8,
+    /// The reference's own header state — see [`RefState`], and note it is the
+    /// REFERENCE's, never the frame being decoded.
+    pub state: RefState,
+}
+
+/// What one picture's own frame header said, kept for as long as that picture can
+/// serve as a reference.
+///
+/// Every backend has a per-REFERENCE structure — Vulkan's
+/// `StdVideoDecodeAV1ReferenceInfo`, DXVA's `DXVA_PicEntry_AV1`, libva's
+/// `VAReferenceFrameAV1` — and each of them asks questions about the reference
+/// picture, not about the frame being decoded. Answering them from the CURRENT
+/// header is the shape of a whole bug class: it compiles, it looks like the fields
+/// are filled, and the hardware predicts from a picture it has been told the wrong
+/// things about. So the answers are recorded once, where they are unambiguous —
+/// when the picture is STORED into its slots — and travel on the slot.
+///
+/// [`Av1Planner::refresh_slots`] is the only writer, and [`RefState::of`] the only
+/// way to build one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefState {
+    /// The picture's `OrderHint`.
     pub order_hint: u32,
+    /// The picture's own frame type — a reference is routinely a different type
+    /// from the frame reading it.
+    pub frame_type: FrameType,
+    /// `RefFrameSignBias` packed the way Vulkan wants it: bit `i` set where
+    /// `RefFrameSignBias[i]` is 1, `i` being an AV1 reference frame index
+    /// (`INTRA_FRAME` = 0, `LAST_FRAME` = 1 … `ALTREF_FRAME` = 7).
+    ///
+    /// This is what tells a decoder that a reference lies in the FUTURE, so it
+    /// drives compound prediction and motion-field projection. All-zero means
+    /// "every reference is in the past", which for any stream with hidden ALTREFs
+    /// — the ordinary case — is wrong rather than merely conservative.
+    pub ref_frame_sign_bias: u8,
+    /// The picture's own `OrderHints[]`, which become `SavedOrderHints` once it is
+    /// a reference (7.20). Indexed by AV1 reference frame index, as above.
+    pub saved_order_hints: [u32; NUM_REF_SLOTS],
+    pub disable_frame_end_update_cdf: bool,
+    pub segmentation_enabled: bool,
+}
+
+impl RefState {
+    /// Read one frame header's reference-relevant state.
+    ///
+    /// Called by the planner when a picture is stored, and by a backend for the
+    /// picture it is about to decode (which activates a slot, so it needs the same
+    /// answers). One function so the two can never drift.
+    pub fn of(header: &FrameHeaderObu) -> RefState {
+        // ⚠⚠ INDEX SHIFT, and it is the vendored parser's, not ours.
+        //
+        // AV1 7.8 writes `RefFrameSignBias[ refFrame ]` with `refFrame =
+        // LAST_FRAME + i`, and libavcodec's `av1dec.c` (`order_hint_info`) does
+        // exactly that — so `RefFrameSignBias` bit 1 is LAST_FRAME. The vendored
+        // cros-codecs parser writes `fh.ref_frame_sign_bias[i]` in the SAME loop
+        // body where it writes `fh.order_hints[ref_frame]`, so its array is
+        // shifted one down: index 0 holds LAST_FRAME's bias and index 7 is never
+        // written. (Its own VP9 parser gets this right, which is how the AV1 one
+        // reads as a slip rather than a convention.)
+        //
+        // Corrected here rather than in the vendored tree so the pin stays clean,
+        // and pinned by `the_sign_bias_mask_is_spec_indexed_not_parser_indexed`,
+        // which recomputes the bias from `order_hints` through the parser's own
+        // `get_relative_dist`.
+        let mut ref_frame_sign_bias = 0u8;
+        for (i, biased) in header
+            .ref_frame_sign_bias
+            .iter()
+            .take(REFS_PER_FRAME)
+            .enumerate()
+        {
+            if *biased {
+                ref_frame_sign_bias |= 1 << (i + 1);
+            }
+        }
+        RefState {
+            order_hint: header.order_hint,
+            frame_type: header.frame_type,
+            ref_frame_sign_bias,
+            saved_order_hints: header.order_hints,
+            disable_frame_end_update_cdf: header.disable_frame_end_update_cdf,
+            segmentation_enabled: header.segmentation_params.segmentation_enabled,
+        }
+    }
 }
 
 /// What this access unit does to the decoded-picture store.
@@ -128,14 +213,21 @@ pub struct PicturePlan {
 pub struct AuPlan {
     pub picture: PicturePlan,
     pub tiles: Vec<TilePlan>,
-    /// The references this frame names, in `ref_frame_idx` order and with repeats
-    /// preserved — a frame may legitimately point several of its seven references at
-    /// one slot, and collapsing them would renumber the list the bitstream indexes.
-    pub refs: Vec<RefPic>,
+    /// The references this frame names, **indexed by AV1 reference NAME** —
+    /// position `i` is `ref_frame_idx[i]`, i.e. `LAST_FRAME + i`.
+    ///
+    /// `None` where the named slot held nothing: the reference is lost, it is also
+    /// reported as [`PlanWarning::MissingReference`], and it leaves a HOLE. The
+    /// array shape is the point. A `Vec` of the references that happened to resolve
+    /// renumbers every name after the first loss — name 4 silently becomes name 3 —
+    /// and every backend that read position-as-name then predicted from the wrong
+    /// picture. Repeats are preserved for the same reason: a frame may legitimately
+    /// point several of its seven names at one slot.
+    pub refs: [Option<RefPic>; REFS_PER_FRAME],
     pub dpb: DpbUpdate,
     /// Every slot that holds a picture as this AU decodes — AV1's answer to the
-    /// "marked DPB" the DXVA and VAAPI conversions want, and a superset of
-    /// [`Self::refs`]. Slot order, each slot once.
+    /// "marked DPB" the DXVA and VAAPI conversions want, and a superset of the
+    /// pictures [`Self::refs`] names. Slot order, each slot once.
     pub dpb_refs: Vec<RefPic>,
     pub warnings: Vec<PlanWarning>,
     pub sequence: Rc<SequenceHeaderObu>,
@@ -377,7 +469,10 @@ impl Av1Planner {
             // place removals are computed.
             let removed = if header.frame_type == FrameType::KeyFrame {
                 match shown {
-                    Some(pic) => self.refresh_slots(0xff, pic.id, pic.order_hint),
+                    // The SHOWN picture's state is what every refreshed slot takes
+                    // (7.20 loads the shown frame's state), not this header's —
+                    // a show_existing_frame header carries none of its own.
+                    Some(pic) => self.refresh_slots(0xff, pic.id, pic.state),
                     None => Vec::new(),
                 }
             } else {
@@ -387,7 +482,7 @@ impl Av1Planner {
             return Ok(AuPlan {
                 picture,
                 tiles,
-                refs: Vec::new(),
+                refs: [None; REFS_PER_FRAME],
                 dpb: DpbUpdate {
                     stored: None,
                     outputs: shown.map(|p| p.id).into_iter().collect(),
@@ -400,16 +495,17 @@ impl Av1Planner {
             });
         }
 
-        // The references this frame names. Repeats are preserved: `ref_frame_idx` is
-        // what the bitstream's own reference numbering indexes into.
-        let mut refs = Vec::with_capacity(REFS_PER_FRAME);
+        // The references this frame names, BY NAME. A slot holding nothing leaves
+        // its name empty rather than shortening the list (field docs): position is
+        // the AV1 reference name and nothing may renumber it.
+        let mut refs = [None; REFS_PER_FRAME];
         if !matches!(
             header.frame_type,
             FrameType::KeyFrame | FrameType::IntraOnlyFrame
         ) {
             for (ref_index, &slot) in header.ref_frame_idx.iter().enumerate() {
                 match self.slots.get(usize::from(slot)).copied().flatten() {
-                    Some(pic) => refs.push(pic),
+                    Some(pic) => refs[ref_index] = Some(pic),
                     None => warnings.push(PlanWarning::MissingReference {
                         slot,
                         // Seven references; the cast cannot truncate.
@@ -428,7 +524,7 @@ impl Av1Planner {
         if let Err(e) = self.parser.ref_frame_update(&header) {
             return Err(PlanError::Parse(e));
         }
-        let removed = self.refresh_slots(header.refresh_frame_flags, id, header.order_hint);
+        let removed = self.refresh_slots(header.refresh_frame_flags, id, RefState::of(&header));
 
         let picture = picture_plan(&header, &sequence);
         let outputs = if header.show_frame {
@@ -464,7 +560,7 @@ impl Av1Planner {
         &mut self,
         refresh_frame_flags: u32,
         id: PicId,
-        order_hint: u32,
+        state: RefState,
     ) -> Vec<PicId> {
         let mut displaced: Vec<PicId> = Vec::new();
         for slot in 0..NUM_REF_SLOTS {
@@ -480,7 +576,7 @@ impl Av1Planner {
                 id,
                 // Eight slots; the cast cannot truncate.
                 slot: slot as u8,
-                order_hint,
+                state,
             });
         }
         displaced.retain(|gone| !self.slots.iter().flatten().any(|held| held.id == *gone));
@@ -585,7 +681,7 @@ mod tests {
                         "a show_existing_frame decodes nothing and can carry no tiles"
                     );
                 }
-                max_refs = max_refs.max(plan.refs.len());
+                max_refs = max_refs.max(plan.refs.iter().flatten().count());
 
                 // Every tile range must lie inside the access unit it came from.
                 for tile in &plan.tiles {
@@ -596,12 +692,18 @@ mod tests {
                         packet.len()
                     );
                 }
-                // A reference must name a slot that holds the picture it claims.
-                for r in &plan.refs {
+                // A reference must name a slot that holds the picture it claims,
+                // and the name it sits under must be the one the bitstream coded.
+                for (name, r) in plan.refs.iter().enumerate() {
+                    let Some(r) = r else { continue };
                     assert!(usize::from(r.slot) < NUM_REF_SLOTS);
-                }
-                // The marked store is a superset of what this frame reads.
-                for r in &plan.refs {
+                    assert_eq!(
+                        r.slot, plan.header.ref_frame_idx[name],
+                        "frame {frames}: reference name {name} holds the picture in \
+                         slot {}, but ref_frame_idx[{name}] names slot {}",
+                        r.slot, plan.header.ref_frame_idx[name]
+                    );
+                    // The marked store is a superset of what this frame reads.
                     assert!(
                         plan.dpb_refs.iter().any(|d| d.id == r.id),
                         "frame {frames}: reference {} is not in the marked store",
@@ -652,13 +754,17 @@ mod tests {
     #[test]
     fn a_picture_held_by_several_slots_is_not_removed_until_the_last_one_goes() {
         let mut planner = Av1Planner::new();
+        let at = |order_hint: u32| RefState {
+            order_hint,
+            ..RefState::of(&FrameHeaderObu::default())
+        };
         // A key frame in every slot.
-        let removed = planner.refresh_slots(0xff, 1, 0);
+        let removed = planner.refresh_slots(0xff, 1, at(0));
         assert!(removed.is_empty(), "nothing was there to displace");
         assert_eq!(planner.dpb_refs().len(), NUM_REF_SLOTS);
 
         // A frame takes one slot: picture 1 still holds the other seven.
-        let removed = planner.refresh_slots(0b0000_0001, 2, 1);
+        let removed = planner.refresh_slots(0b0000_0001, 2, at(1));
         assert!(
             removed.is_empty(),
             "picture 1 still occupies seven slots — reporting it removed would free \
@@ -666,12 +772,170 @@ mod tests {
         );
 
         // Take the rest: now it really is gone, and reported exactly once.
-        let removed = planner.refresh_slots(0b1111_1110, 3, 2);
+        let removed = planner.refresh_slots(0b1111_1110, 3, at(2));
         assert_eq!(removed, vec![1], "reported once, not once per slot");
 
         // And picture 2's single slot.
-        let removed = planner.refresh_slots(0b0000_0001, 4, 3);
+        let removed = planner.refresh_slots(0b0000_0001, 4, at(3));
         assert_eq!(removed, vec![2]);
+    }
+
+    /// A lost reference must leave a HOLE at its own name, not shorten the list.
+    ///
+    /// This is the defect the name-indexed [`AuPlan::refs`] closes, and it is worth
+    /// a synthetic case because the clean vector never loses a reference: with a
+    /// `Vec` of survivors, dropping the picture behind name 2 slid names 3..6 down
+    /// one, and every backend that reads position-as-name then predicted LAST from
+    /// the picture GOLDEN should have supplied. Nothing else in the plan would say
+    /// so — the reference count is still plausible and every entry is still a real
+    /// picture.
+    #[test]
+    fn a_lost_reference_leaves_its_name_empty_and_does_not_renumber_the_others() {
+        // The vector's first unit is a key frame: it gives the vendored parser its
+        // sequence header (`ref_frame_update` needs one) and fills all eight slots.
+        let mut planner = Av1Planner::new();
+        let first = IvfIterator::new(AV1_25FPS).next().expect("a first packet");
+        let sequence = planner
+            .plan_au(first)
+            .expect("the key frame plans")
+            .first()
+            .expect("a frame")
+            .sequence
+            .clone();
+        assert_eq!(planner.dpb_refs().len(), NUM_REF_SLOTS);
+
+        // Empty the slot name 2 will point at — a reference lost upstream.
+        planner.slots[5] = None;
+
+        let header = FrameHeaderObu {
+            frame_type: FrameType::InterFrame,
+            ref_frame_idx: [0, 1, 5, 3, 4, 2, 6],
+            // Refresh nothing: this frame is here to be PLANNED, not to disturb
+            // the ledger the assertions read.
+            refresh_frame_flags: 0,
+            ..Default::default()
+        };
+        let plan = planner
+            .plan_frame(header, sequence, Vec::new(), Vec::new())
+            .expect("an inter frame with a lost reference still plans");
+
+        assert_eq!(
+            plan.warnings,
+            vec![PlanWarning::MissingReference {
+                slot: 5,
+                ref_index: 2
+            }]
+        );
+        assert!(plan.refs[2].is_none(), "the lost name stays empty");
+        let named: Vec<Option<u8>> = plan.refs.iter().map(|r| r.map(|p| p.slot)).collect();
+        assert_eq!(
+            named,
+            vec![Some(0), Some(1), None, Some(3), Some(4), Some(2), Some(6)],
+            "every surviving name must still sit at ITS OWN index — a compacted \
+             list would read [0, 1, 3, 4, 2, 6] and rename four references"
+        );
+    }
+
+    /// `RefFrameSignBias` must come out SPEC-indexed (bit 1 = `LAST_FRAME`), which
+    /// the vendored parser's array is not.
+    ///
+    /// Recomputed here from `order_hints` — which the parser DOES index by
+    /// reference name — through the spec's own `get_relative_dist` (5.9.3),
+    /// transcribed rather than borrowed because cros-codecs' `helpers` module is
+    /// private. So this does not restate [`RefState::of`]'s shift; it restates the
+    /// spec, and the two must agree on every frame of the vector. Without the
+    /// shift, ALTREF's bias lands on GOLDEN and `INTRA_FRAME` (bit 0, which the
+    /// spec never sets) picks up LAST's.
+    #[test]
+    fn the_sign_bias_mask_is_spec_indexed_not_parser_indexed() {
+        /// AV1 5.9.3 `get_relative_dist`, verbatim.
+        fn get_relative_dist(enable_order_hint: bool, bits: i32, a: i32, b: i32) -> i32 {
+            if !enable_order_hint {
+                return 0;
+            }
+            let diff = a - b;
+            let m = 1 << (bits - 1);
+            (diff & (m - 1)) - (diff & m)
+        }
+
+        let mut planner = Av1Planner::new();
+        let (mut frames, mut nonzero_masks, mut future_refs) = (0u32, 0u32, 0u32);
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                frames += 1;
+                let h = &*plan.header;
+                let seq = &*plan.sequence;
+                let bits = seq.order_hint_bits_minus_1 + 1;
+                let state = RefState::of(h);
+
+                let mut expected = 0u8;
+                if !h.frame_is_intra {
+                    for name in 1..=REFS_PER_FRAME {
+                        let dist = get_relative_dist(
+                            seq.enable_order_hint,
+                            bits,
+                            h.order_hints[name] as i32,
+                            h.order_hint as i32,
+                        );
+                        if dist > 0 {
+                            expected |= 1 << name;
+                            future_refs += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    state.ref_frame_sign_bias, expected,
+                    "frame {frames}: sign-bias mask {:#010b} does not match the \
+                     spec's own RefFrameSignBias[1..8] {expected:#010b}",
+                    state.ref_frame_sign_bias
+                );
+                assert_eq!(
+                    state.ref_frame_sign_bias & 1,
+                    0,
+                    "bit 0 is INTRA_FRAME and the spec never sets it — a set bit \
+                     there is the parser's off-by-one leaking through"
+                );
+                if state.ref_frame_sign_bias != 0 {
+                    nonzero_masks += 1;
+                }
+            }
+        }
+        assert_eq!(frames, 274);
+        assert!(
+            nonzero_masks > 0 && future_refs > 0,
+            "this vector is the hidden-ALTREF one: if no frame ever biased a \
+             reference into the future, this test compared zero against zero and \
+             the shift above is untested"
+        );
+        eprintln!("frames {frames} · frames with a future reference {nonzero_masks}");
+    }
+
+    /// A reference carries ITS OWN frame type, not the frame reading it.
+    #[test]
+    fn a_reference_carries_its_own_frame_type() {
+        let mut planner = Av1Planner::new();
+        let mut mixed = 0u32;
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                for r in plan.refs.iter().flatten() {
+                    if r.state.frame_type != plan.header.frame_type {
+                        mixed += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            mixed > 0,
+            "no frame of the vector ever referenced a picture of a DIFFERENT frame \
+             type, so nothing here can tell the reference's own type from the \
+             current frame's — the exact substitution this field exists to prevent"
+        );
     }
 
     #[test]

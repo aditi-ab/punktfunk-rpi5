@@ -65,6 +65,29 @@
 //! - [`decoder_h265`]: [`VkH265Decoder`], mirroring [`VkH264Decoder`]'s public
 //!   surface method-for-method. Codec DISPATCH is the client wiring's job.
 //!
+//! M7 (AV1) — the CPU half, over [`pf_bitstream::av1`]'s planner:
+//!
+//! - [`params_av1`]: the sequence header into `StdVideoAV1SequenceHeader` behind an
+//!   owning wrapper ([`OwnedStdAv1SequenceHeader`]) — the ONE parameter set AV1 has.
+//! - [`pic_av1`]: [`plan_to_vk_av1`], one [`pf_bitstream::av1::AuPlan`] into
+//!   `StdVideoDecodeAV1PictureInfo` and its eight per-frame sub-blocks, plus the
+//!   per-reference-NAME DPB SLOT table, the tile-group ranges and the slot bindings
+//!   — over the SAME [`SlotMap`] (AV1's ceiling is eight references + one setup).
+//!
+//! M7 (AV1) — the GPU half, sharing every codec-agnostic piece with the other two
+//! (picture pool, bitstream ring, op ring, frame delivery, DPB settling) rather
+//! than re-implementing them:
+//!
+//! - [`caps_av1`]: [`Av1ProfileKey`] — Std profile, sampling, bit depth AND the
+//!   sequence's film-grain flag, because `filmGrainSupport` is part of the Vulkan
+//!   decode PROFILE — and [`derive_caps_av1`]: 4:2:0 8-bit → NV12, 10-bit → P010,
+//!   4:4:4 → the two-plane 4:4:4 pair, with a device that cannot host the
+//!   combination (film grain very much included) refused BEFORE a session exists.
+//! - [`session_av1`]: the AV1 session and its ONE-set parameters ledger — no PPS,
+//!   no VPS, no update path at all, so a changed sequence header RECREATES.
+//! - [`decoder_av1`]: [`VkAv1Decoder`], mirroring [`VkH265Decoder`]'s public
+//!   surface method-for-method, over temporal units that may carry several frames.
+//!
 //! M4 (status and telemetry) — three pure modules turning the signals above into
 //! something a session, a user and a support engineer can act on:
 //!
@@ -95,8 +118,10 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod caps;
+pub mod caps_av1;
 pub mod caps_h265;
 pub mod decoder;
+pub mod decoder_av1;
 pub mod decoder_h265;
 pub mod device;
 pub mod fault;
@@ -111,6 +136,7 @@ pub mod pic_h265;
 pub mod recovery;
 pub mod ring;
 pub mod session;
+pub mod session_av1;
 pub mod session_h265;
 pub mod slots;
 
@@ -121,6 +147,13 @@ pub mod slots;
 pub use ash;
 // The pf-bitstream types a [`DecodedVkFrame`] consumer names, re-exported so it
 // doesn't grow a pf-bitstream dependency of its own:
+/// [`VkAv1Decoder::take_warnings`]'s warning type — the AV1 twin of
+/// [`PlanWarning`], renamed for the same reason [`H265PlanWarning`] is: the three
+/// enums are genuinely different (AV1 has `MissingShowExisting`, and its
+/// `MissingReference` needs no interpretation because no AV1 process empties a
+/// reference slot behind the stream's back) and a consumer dispatching per codec
+/// must be able to name all three.
+pub use pf_bitstream::av1::PlanWarning as Av1PlanWarning;
 /// [`DecodedVkFrame::colour`]'s type.
 pub use pf_bitstream::h264::ColourDescription;
 /// [`DecodedVkFrame::crop`]'s type.
@@ -149,6 +182,9 @@ pub use caps::OUTPUT_FORMATS;
 pub use caps::P010;
 pub use caps::YUV444_10;
 pub use caps::YUV444_8;
+pub use caps_av1::derive_caps_av1;
+pub use caps_av1::Av1ProfileKey;
+pub use caps_av1::RawAv1Caps;
 pub use caps_h265::derive_caps_h265;
 pub use caps_h265::output_format_for;
 pub use caps_h265::H265ProfileKey;
@@ -157,6 +193,8 @@ pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;
 pub use decoder::VkH264Decoder;
+pub use decoder_av1::Av1TileError;
+pub use decoder_av1::VkAv1Decoder;
 pub use decoder_h265::VkH265Decoder;
 pub use device::DecodeDevice;
 pub use device::DeviceHandles;
@@ -177,6 +215,9 @@ pub use params::sps_to_std;
 pub use params::OwnedStdPps;
 pub use params::OwnedStdSps;
 pub use params::ParamsError;
+pub use params_av1::sequence_to_std;
+pub use params_av1::OwnedStdAv1SequenceHeader;
+pub use params_av1::ParamsAv1Error;
 pub use params_h265::fallback_vps_from_sps;
 pub use params_h265::pps_to_std_h265;
 pub use params_h265::sps_to_std_h265;
@@ -189,6 +230,12 @@ pub use pic::plan_to_vk;
 pub use pic::DecodePlanVk;
 pub use pic::PlanToVkError;
 pub use pic::VkRef;
+pub use pic_av1::plan_to_vk_av1;
+pub use pic_av1::DecodePlanVkAv1;
+pub use pic_av1::OwnedStdAv1PictureInfo;
+pub use pic_av1::PlanToVkAv1Error;
+pub use pic_av1::VkRefAv1;
+pub use pic_av1::REFERENCE_NAME_UNUSED;
 pub use pic_h265::plan_to_vk_h265;
 pub use pic_h265::DecodePlanVkH265;
 pub use pic_h265::PlanToVkH265Error;
@@ -199,6 +246,8 @@ pub use recovery::RecoveryWatch;
 pub use ring::RingLayout;
 pub use session::ParamsAction;
 pub use session::SessionConfig;
+pub use session_av1::ParamsActionAv1;
+pub use session_av1::SessionConfigAv1;
 pub use session_h265::ParamsActionH265;
 pub use session_h265::SessionConfigH265;
 pub use slots::SlotError;

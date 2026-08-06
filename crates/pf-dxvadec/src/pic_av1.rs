@@ -25,10 +25,12 @@
 //!
 //! Vulkan hangs one `StdVideoAV1GlobalMotion` block off the picture info, with an
 //! eight-entry array inside it. DXVA puts each reference's warp parameters in that
-//! reference's own `DXVA_PicEntry_AV1`. The AV1 syntax agrees with Vulkan (global
-//! motion is signalled per reference SLOT in the frame header), so the conversion
-//! reads by slot and writes by name — which is exactly the sort of transposition
-//! that silently leaves every warped reference at identity.
+//! reference's own `DXVA_PicEntry_AV1`. Both are indexed by reference NAME —
+//! `global_motion_params()` loops `ref = LAST_FRAME..ALTREF_FRAME` — so the
+//! Vulkan block is a straight copy and DXVA's per-entry read is
+//! `gm_params[LAST_FRAME + name]`. Reading it by DPB SLOT instead is the exact
+//! transposition that silently gives every warped reference somebody else's warp;
+//! it agrees with the truth only while reference `i` happens to sit in slot `i+1`.
 
 use std::ops::Range;
 
@@ -63,6 +65,11 @@ use crate::SlotMap;
 
 /// `DXVA_PicParams_AV1::tiles` holds at most 64 column and 64 row sizes.
 pub const MAX_TILE_DIM: usize = 64;
+
+/// `LAST_FRAME` (AV1 spec): the first reference NAME, and the offset between a
+/// position in `ref_frame_idx` and the index the spec's per-reference arrays
+/// (global motion, order hints, sign bias) use. `INTRA_FRAME` is 0.
+const LAST_FRAME: usize = 1;
 
 /// Everything one AV1 `SubmitDecoderBuffers` call needs.
 #[derive(Debug, Clone)]
@@ -162,26 +169,42 @@ pub fn plan_to_dxva_av1(
     }
 
     // The seven reference NAMES. Each carries a surface AND that reference's own
-    // global motion, read out of the frame header BY SLOT (module docs).
+    // global motion (module docs).
+    //
+    // `plan.refs` is indexed BY NAME and a lost reference leaves a hole, so the
+    // name comes off the iterator and holes are skipped — they keep DXVA's
+    // `UNUSED_INDEX`. A compacted list (which is what this loop used to receive)
+    // renamed every reference after the first loss.
     let mut frame_refs = [PicEntryAv1::zeroed(); REFS_PER_FRAME];
     let inter = !matches!(
         h.frame_type,
         FrameType::KeyFrame | FrameType::IntraOnlyFrame
     );
     if inter {
-        for (name, r) in plan.refs.iter().enumerate().take(REFS_PER_FRAME) {
+        for (name, r) in plan.refs.iter().enumerate() {
+            let Some(r) = r else { continue };
             let slot = slots
                 .slot_of(r.id)
                 .ok_or(PlanToDxvaAv1Error::UnresolvedReference(r.id))?;
-            let gm_slot = usize::from(r.slot);
+            // ⚠ Global motion is indexed by reference NAME, never by DPB slot.
+            // AV1's `global_motion_params()` loops `ref = LAST_FRAME..ALTREF_FRAME`
+            // and the vendored parser stores it that way; libavcodec's
+            // `dxva2_av1.c` reads `gm_params[AV1_REF_FRAME_LAST + i]` for
+            // `frame_refs[i]`. Reading by slot instead happens to agree only while
+            // reference `i` sits in slot `i + 1`, and silently hands every warped
+            // reference somebody else's warp the moment it does not.
+            let gm_name = LAST_FRAME + name;
             let gm = &h.global_motion_params;
             frame_refs[name] = PicEntryAv1 {
                 width: h.upscaled_width,
                 height: h.frame_height,
-                wmmat: gm.gm_params[gm_slot],
+                wmmat: gm.gm_params[gm_name],
                 global_motion_flags: GlobalMotionFlags {
-                    wminvalid: false,
-                    wmtype: gm.gm_type[gm_slot] as u8,
+                    // `warp_valid` is the parser's `setup_shear` verdict — a warp
+                    // whose shear parameters are out of range is unusable, and
+                    // DXVA's flag is the inverse.
+                    wminvalid: !gm.warp_valid[gm_name],
+                    wmtype: gm.gm_type[gm_name] as u8,
                 }
                 .pack(),
                 index: slot,
@@ -539,6 +562,7 @@ mod tests {
         let mut planner = Av1Planner::new();
         let mut slots = SlotMap::new(NUM_REF_SLOTS);
         let (mut frames, mut inter, mut store_beyond_refs) = (0u32, 0u32, 0u32);
+        let mut gm_by_slot_would_differ = 0u32;
 
         for packet in IvfIterator::new(AV1_25FPS) {
             for plan in planner.plan_au(packet).expect("the clean vector plans") {
@@ -567,20 +591,57 @@ mod tests {
                     .filter(|i| **i != UNUSED_INDEX)
                     .count();
                 assert_eq!(named, plan.dpb_refs.len());
-                if named > plan.refs.len() {
+                let referenced = plan.refs.iter().flatten().count();
+                if named > referenced {
                     store_beyond_refs += 1;
                 }
 
-                if !plan.refs.is_empty() {
+                if referenced > 0 {
                     inter += 1;
-                    // Every reference NAME must carry a surface the store also has.
-                    for (name, _) in plan.refs.iter().enumerate().take(REFS_PER_FRAME) {
+                    // Every reference NAME must carry a surface the store also has,
+                    // and each one's global motion must be the entry the AV1 syntax
+                    // codes for THAT name.
+                    for (name, r) in plan.refs.iter().enumerate() {
                         let e = dx.pic_params.frame_refs[name];
+                        let Some(named_ref) = r else {
+                            assert_eq!(
+                                e.index, UNUSED_INDEX,
+                                "an unnamed reference must stay unused, not read as \
+                                 surface 0"
+                            );
+                            continue;
+                        };
                         assert_ne!(
                             e.index, UNUSED_INDEX,
                             "reference name {name} carries no surface"
                         );
                         assert!(dx.pic_params.ref_frame_map_texture_index.contains(&e.index));
+                        let gm = &plan.header.global_motion_params;
+                        // `PicEntryAv1` is `#[repr(packed)]`, so its fields are
+                        // copied out before being compared — a reference to one
+                        // may be unaligned.
+                        let (wmmat, flags) = (e.wmmat, e.global_motion_flags);
+                        assert_eq!(
+                            wmmat,
+                            gm.gm_params[LAST_FRAME + name],
+                            "reference name {name} must carry gm_params[LAST_FRAME \
+                             + {name}], not the entry at its DPB slot"
+                        );
+                        assert_eq!(
+                            flags,
+                            GlobalMotionFlags {
+                                wminvalid: !gm.warp_valid[LAST_FRAME + name],
+                                wmtype: gm.gm_type[LAST_FRAME + name] as u8,
+                            }
+                            .pack()
+                        );
+                        // Would reading by DPB SLOT have given the same answer?
+                        let slot = usize::from(named_ref.slot);
+                        if gm.gm_params[LAST_FRAME + name] != gm.gm_params[slot]
+                            || gm.gm_type[LAST_FRAME + name] != gm.gm_type[slot]
+                        {
+                            gm_by_slot_would_differ += 1;
+                        }
                     }
                 }
                 assert_eq!(dx.pic_params.curr_pic_texture_index, dx.setup_slot);
@@ -588,6 +649,13 @@ mod tests {
         }
 
         assert_eq!(frames, 274);
+        eprintln!("gm reads where name and slot disagree: {gm_by_slot_would_differ}");
+        assert!(
+            gm_by_slot_would_differ > 0,
+            "reading global motion by DPB SLOT never disagreed with reading it by \
+             reference NAME on this vector, so the assertions above cannot tell the \
+             two apart — which is how the slot read shipped in the first place"
+        );
         assert!(inter > 0, "a 274-frame vector must have inter frames");
         assert!(
             store_beyond_refs > 0,

@@ -189,6 +189,55 @@ pub(crate) fn pack_slices(au: &[u8], segments: &[std::ops::Range<usize>]) -> Opt
     })
 }
 
+/// One AU's AV1 tile payloads as they will sit in a ring slot: the AU byte ranges
+/// to concatenate, and the offset each lands at.
+///
+/// [`PackedSlices`]' AV1 twin, and a separate type rather than a flag because the
+/// two differ in exactly the thing that must never be confused: an Annex-B slice
+/// gets its start-code prefix NORMALISED ([`three_byte_prefix`]) and an AV1 tile
+/// must not be touched at all. AV1 has no start codes — a tile payload is entropy-
+/// coded bytes that may legitimately begin `00 00 00`, and trimming those would
+/// silently shorten the tile the driver decodes.
+///
+/// The segments are the RAW TILE PAYLOADS, not the OBUs that carried them: the
+/// bitstream buffer holds nothing else (see [`crate::decoder_av1`]), so `offsets[i]`
+/// is directly tile `i`'s `pTileOffsets` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackedAv1Tiles {
+    /// The AU ranges to concatenate, verbatim and in order.
+    pub(crate) segments: Vec<std::ops::Range<usize>>,
+    /// The offset each range lands at once concatenated — one per segment, in the
+    /// same order.
+    pub(crate) offsets: Vec<u32>,
+}
+
+/// How AV1 `tiles` of `au` pack into one ring slot: verbatim, with the offset each
+/// lands at.
+///
+/// The offsets exist for the reason [`pack_slices`]' do — the plan's ranges are
+/// AU-relative and the buffer holds only what was uploaded — but the packing itself
+/// is a plain concatenation: see [`PackedAv1Tiles`] for why no prefix normalisation
+/// happens (or may happen) here.
+///
+/// Offsets are `u32` because Vulkan's are; a packed AU large enough to overflow
+/// one cannot fit any ring slot this crate allocates, and the sum is taken in
+/// `u64` so the check is real rather than a wrapped compare.
+pub(crate) fn pack_av1_tiles(tiles: &[std::ops::Range<usize>]) -> Option<PackedAv1Tiles> {
+    let mut offsets = Vec::with_capacity(tiles.len());
+    let mut cursor: u64 = 0;
+    for tile in tiles {
+        offsets.push(u32::try_from(cursor).ok()?);
+        cursor += tile.len() as u64;
+    }
+    // The END of the last segment must also be expressible: `pTileSizes` and the
+    // recorded `srcBufferRange` are read against it.
+    u32::try_from(cursor).ok()?;
+    Some(PackedAv1Tiles {
+        segments: tiles.to_vec(),
+        offsets,
+    })
+}
+
 /// Concatenate `segments` of `au` into `dst`, zeroing whatever is left of it.
 ///
 /// The zero tail matters: `dst` is a whole recorded `srcBufferRange` (the packed

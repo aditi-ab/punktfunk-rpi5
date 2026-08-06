@@ -64,10 +64,12 @@ use crate::images::PicturePool;
 use crate::images::HOLD_HEADROOM;
 use crate::params::level_to_std;
 use crate::params::ParamsError;
+use crate::params_av1::ParamsAv1Error;
 use crate::params_h265::H265ParamsError;
 use crate::pic::plan_to_vk;
 use crate::pic::DecodePlanVk;
 use crate::pic::PlanToVkError;
+use crate::pic_av1::PlanToVkAv1Error;
 use crate::pic_h265::PlanToVkH265Error;
 use crate::ring::pack_slices;
 use crate::ring::BitstreamRing;
@@ -210,6 +212,28 @@ pub enum VkDecodeError {
     /// outside the H.265 decode envelope (chroma format / bit depth / profile) —
     /// a stream-integrity failure, refused rather than half-converted.
     ParamsH265(H265ParamsError),
+    /// [`VkDecodeError::Plan`]'s AV1 counterpart.
+    PlanAv1(pf_bitstream::av1::PlanError),
+    /// [`VkDecodeError::Convert`]'s AV1 counterpart.
+    ConvertAv1(PlanToVkAv1Error),
+    /// An AV1 sequence header has no Std representation, or the stream sits
+    /// outside the AV1 decode envelope (sampling / bit depth / profile).
+    ParamsAv1(ParamsAv1Error),
+    /// The AV1 access unit's tile groups could not be split into the per-tile
+    /// byte ranges `VkVideoDecodeAV1PictureInfoKHR::pTileOffsets` wants — a
+    /// malformed or unexpected OBU. Refused rather than submitted with the whole
+    /// OBU standing in for its tiles ([`crate::decoder_av1`]).
+    TilesAv1(crate::decoder_av1::Av1TileError),
+    /// An AV1 frame named a reference slot the planner's store no longer holds.
+    ///
+    /// Fatal rather than degraded, and for a sharper reason than "the picture
+    /// would be wrong": the planner COMPACTS the surviving references into
+    /// `AuPlan::refs`, so the seven AV1 reference NAMES stop lining up with that
+    /// list the moment one is lost — every later name would resolve to the wrong
+    /// picture, which is the plausible-looking corruption this crate refuses to
+    /// produce. `ref_index` is the AV1 reference name (`LAST_FRAME` = 0 through
+    /// `ALTREF_FRAME` = 6), `slot` the reference slot it pointed at.
+    MissingReferenceAv1 { slot: u8, ref_index: u8 },
     /// Plan-to-Vulkan conversion failed (caller/session bugs; `CapacityMismatch`
     /// is consumed internally by the rebuild path and only surfaces if the rebuilt
     /// session STILL mismatches).
@@ -265,6 +289,19 @@ impl std::fmt::Display for VkDecodeError {
             VkDecodeError::ParamsH265(e) => {
                 write!(f, "H.265 parameter-set conversion failed: {e}")
             }
+            VkDecodeError::PlanAv1(e) => write!(f, "AV1 AU planning failed: {e}"),
+            VkDecodeError::ConvertAv1(e) => write!(f, "AV1 plan conversion failed: {e}"),
+            VkDecodeError::ParamsAv1(e) => {
+                write!(f, "AV1 sequence-header conversion failed: {e}")
+            }
+            VkDecodeError::TilesAv1(e) => write!(f, "AV1 tile split failed: {e}"),
+            VkDecodeError::MissingReferenceAv1 { slot, ref_index } => {
+                write!(
+                    f,
+                    "AV1 reference name {ref_index} points at slot {slot}, which holds \
+                     no picture — the surviving references would renumber"
+                )
+            }
             VkDecodeError::Convert(e) => write!(f, "plan conversion failed: {e}"),
             VkDecodeError::ConvertH265(e) => write!(f, "H.265 plan conversion failed: {e}"),
             VkDecodeError::Caps(e) => write!(f, "decode capabilities unusable: {e}"),
@@ -318,6 +355,10 @@ impl std::error::Error for VkDecodeError {
             VkDecodeError::ParamsH265(e) => Some(e),
             VkDecodeError::Convert(e) => Some(e),
             VkDecodeError::ConvertH265(e) => Some(e),
+            VkDecodeError::PlanAv1(e) => Some(e),
+            VkDecodeError::ConvertAv1(e) => Some(e),
+            VkDecodeError::ParamsAv1(e) => Some(e),
+            VkDecodeError::TilesAv1(e) => Some(e),
             VkDecodeError::Caps(e) => Some(e),
             VkDecodeError::Device(e) => Some(e),
             _ => None,
@@ -353,6 +394,18 @@ impl From<H265ParamsError> for VkDecodeError {
     }
 }
 
+impl From<ParamsAv1Error> for VkDecodeError {
+    fn from(e: ParamsAv1Error) -> Self {
+        VkDecodeError::ParamsAv1(e)
+    }
+}
+
+impl From<PlanToVkAv1Error> for VkDecodeError {
+    fn from(e: PlanToVkAv1Error) -> Self {
+        VkDecodeError::ConvertAv1(e)
+    }
+}
+
 impl From<CapsError> for VkDecodeError {
     fn from(e: CapsError) -> Self {
         VkDecodeError::Caps(e)
@@ -371,6 +424,7 @@ impl From<SessionError> for VkDecodeError {
             SessionError::Vk(r) => VkDecodeError::from(r),
             SessionError::Params(p) => VkDecodeError::Params(p),
             SessionError::ParamsH265(p) => VkDecodeError::ParamsH265(p),
+            SessionError::ParamsAv1(p) => VkDecodeError::ParamsAv1(p),
             SessionError::NoMemoryType { type_bits, flags } => {
                 VkDecodeError::NoMemoryType { type_bits, flags }
             }
@@ -1524,8 +1578,23 @@ pub(crate) fn build_frame(
 /// generic for testability — and codec-agnostic (H.265 plans carry the very same
 /// [`DpbUpdate`] type), so both decoders settle through this one function.
 pub(crate) fn settle_dpb<F>(pending: &mut BTreeMap<PicId, F>, dpb: &DpbUpdate) -> (Vec<F>, Vec<F>) {
+    settle_dpb_ids(pending, &dpb.outputs, &dpb.removed)
+}
+
+/// [`settle_dpb`] over the two id lists directly.
+///
+/// It exists because AV1's planner declares its OWN `DpbUpdate`
+/// ([`pf_bitstream::av1::DpbUpdate`]) rather than re-using the H.264 one the way
+/// H.265 does — structurally identical, a distinct type. Splitting the settle at
+/// the id lists is what lets all three codecs share ONE implementation of the
+/// output/free bookkeeping instead of the AV1 rung growing a copy that could drift.
+pub(crate) fn settle_dpb_ids<F>(
+    pending: &mut BTreeMap<PicId, F>,
+    outputs: &[PicId],
+    removed: &[PicId],
+) -> (Vec<F>, Vec<F>) {
     let mut ready = Vec::new();
-    for id in &dpb.outputs {
+    for id in outputs {
         match pending.remove(id) {
             Some(entry) => ready.push(entry),
             // Ids planned before this decoder existed (post-recovery), or
@@ -1533,11 +1602,7 @@ pub(crate) fn settle_dpb<F>(pending: &mut BTreeMap<PicId, F>, dpb: &DpbUpdate) -
             None => trace!(id, "output id without a pending picture"),
         }
     }
-    let dropped = dpb
-        .removed
-        .iter()
-        .filter_map(|id| pending.remove(id))
-        .collect();
+    let dropped = removed.iter().filter_map(|id| pending.remove(id)).collect();
     (ready, dropped)
 }
 

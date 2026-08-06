@@ -19,12 +19,25 @@ pub const STD_PROFILE_HIGH: hh::StdVideoAV1Profile = 1;
 pub const STD_PROFILE_PROFESSIONAL: hh::StdVideoAV1Profile = 2;
 
 /// Why a sequence header cannot be expressed to Vulkan.
+///
+/// The last two variants are the ENVELOPE gate rather than the conversion's:
+/// [`crate::caps_av1::Av1ProfileKey::from_stream`] builds the Vulkan profile from
+/// the same sequence header and has to refuse the sampling/depth combinations this
+/// crate has no picture format for. They live here, with the other sequence-header
+/// refusals, for the reason `H265ParamsError` carries its own pair — one error type
+/// per codec's parameter surface, so a caller matches on one enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamsAv1Error {
     /// A profile outside the Std enumeration.
     UnsupportedProfile(u8),
     /// A field wider than the Std struct's type for it.
     FieldOverflow { field: &'static str, value: u32 },
+    /// The sequence's sampling, in H.264's `chroma_format_idc` vocabulary (the
+    /// planner's translation): 0 = monochrome, 2 = 4:2:2, 4 = the 4:4:0 shape no
+    /// AV1 profile has. None of them has a picture format in this crate.
+    UnsupportedChromaFormat(u8),
+    /// 12-bit — legal in AV1 Professional, with no output format here.
+    UnsupportedBitDepth(u8),
 }
 
 impl std::fmt::Display for ParamsAv1Error {
@@ -35,6 +48,12 @@ impl std::fmt::Display for ParamsAv1Error {
             }
             ParamsAv1Error::FieldOverflow { field, value } => {
                 write!(f, "{field} = {value} does not fit its Std field")
+            }
+            ParamsAv1Error::UnsupportedChromaFormat(c) => {
+                write!(f, "AV1 chroma format {c} has no picture format here")
+            }
+            ParamsAv1Error::UnsupportedBitDepth(d) => {
+                write!(f, "{d}-bit AV1 has no picture format here")
             }
         }
     }
