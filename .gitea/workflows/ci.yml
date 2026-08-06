@@ -252,6 +252,11 @@ jobs:
         run: bun run build
       - name: Typecheck
         run: bun run lint
+      # Scoped to server/: the console's browser code has no test runner, but the gate that keeps a
+      # plugin's origin apart from the console's does — and its failure mode is a well-formed header
+      # that only a browser rejects, which nothing else here would catch.
+      - name: Test
+        run: bun run test
 
   docs-site:
     runs-on: ubuntu-24.04

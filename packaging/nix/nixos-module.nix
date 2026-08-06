@@ -234,7 +234,11 @@ in
         type = types.bool;
         default = cfg.host.openFirewall;
         defaultText = literalExpression "config.services.punktfunk.host.openFirewall";
-        description = "Open TCP 47992 so the console is reachable from other devices on the LAN.";
+        description = ''
+          Open TCP 47992 so the console is reachable from other devices on the LAN, and TCP 47993,
+          the separate origin its plugin UIs are served from (without it, plugin interfaces do not
+          load in the console).
+        '';
       };
 
       autoStart = mkOption {
@@ -388,7 +392,12 @@ in
       environment.systemPackages = [ cfg.web.package ];
 
       networking.firewall = mkIf cfg.web.openFirewall {
-        allowedTCPPorts = [ 47992 ]; # console HTTPS (packaging/linux/punktfunk-web.xml)
+        # 47992 = the console itself. 47993 = the SEPARATE ORIGIN its plugin UIs are served from
+        # (console port + 1): same host and certificate, different port, so the browser's same-origin
+        # policy keeps a plugin from acting as the logged-in operator. Leaving it closed does not
+        # degrade gracefully — every plugin interface is simply an empty panel from any other device.
+        # Keep in step with packaging/linux/punktfunk-web.xml and punktfunk.ufw.
+        allowedTCPPorts = [ 47992 47993 ];
       };
 
       # First-run setup: generate the console login password once, in the user's config dir, and

@@ -101,6 +101,18 @@ export const SectionPlugin: FC = () => {
 		staleTime: 60_000,
 	});
 
+	// The frame must not be mounted until that probe has SETTLED.
+	//
+	// A firewalled port DROPs rather than refuses, so the probe does not fail fast — it hangs for the
+	// browser's whole connect timeout. Mounting the iframe in the meantime puts an empty panel on
+	// screen with nothing to explain it, and that is precisely what a closed 47993 looked like in the
+	// field: a plugin page that "just doesn't load", with the real answer only in devtools. Waiting
+	// costs a placeholder for the milliseconds a reachable origin takes, and buys the explanation.
+	//
+	// Only gate when the probe actually runs: under `vite dev` `pluginOrigin` is "" and the query is
+	// disabled, which leaves it pending forever — gating on that would never render a frame at all.
+	const originProbePending = !!pluginOrigin && reachable.isPending;
+
 	// The iframe src is fixed at the initial deep-link path; the plugin's own in-app navigation drives
 	// the console URL via postMessage (below), never the src — so there's no reload loop.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally pinned to the initial path
@@ -169,7 +181,9 @@ export const SectionPlugin: FC = () => {
 				/>
 			) : health.isError ? (
 				<OfflineCard title={title} onRetry={() => health.refetch()} />
-			) : health.isSuccess && pluginOrigin !== undefined ? (
+			) : health.isSuccess &&
+				!originProbePending &&
+				pluginOrigin !== undefined ? (
 				<iframe
 					ref={iframeRef}
 					src={initialSrc}

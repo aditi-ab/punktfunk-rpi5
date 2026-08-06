@@ -259,6 +259,42 @@ Work through
 [Why the toggle does nothing](/docs/clipboard#why-the-toggle-does-nothing-or-is-greyed-out) — it also
 names the clients and host sessions where nothing crosses no matter what you set.
 
+## A plugin's interface doesn't load
+
+The plugin's page in the console opens — title, version, **Open in new tab** — but the panel below
+it stays empty.
+
+Plugin interfaces are served on **TCP 47993**, a separate port from the console's 47992, so that a
+plugin can't act as you with your logged-in session (see
+[Two ports, not one](/docs/web-console#two-ports-not-one)). An empty panel means the browser can't
+load anything from that second port. Two reasons, in order of likelihood:
+
+- **The port isn't open.** Only the console's port is reachable, so the frame has nothing to show.
+  On a host you *upgraded*, this is the usual answer: an already-open firewall does not pick up a
+  port that a later version added, because the rule it saved lists the ports it knew at the time.
+
+  ```sh
+  # ufw (CachyOS, Ubuntu): re-expand the profile, then reload
+  sudo ufw app update punktfunk-web && sudo ufw reload
+
+  # firewalld (Fedora, Bazzite, Nobara): re-read the shipped service definition
+  sudo firewall-cmd --reload
+  ```
+
+  ```powershell
+  # Windows: re-run the service installer, which re-adds both console rules
+  punktfunk-host service install
+  ```
+
+  Check what's actually open with `sudo ufw status verbose` or
+  `sudo firewall-cmd --info-service=punktfunk-web` — you want **47993** listed next to 47992.
+- **The certificate isn't trusted for that port yet.** Browsers keep a self-signed certificate
+  exception *per port*, and a warning page can't be shown inside a panel. The console detects this
+  and offers a link to open the plugin in its own tab: accept the warning there once and come back.
+
+If the panel is empty and the console shows *no* explanation at all, the plugin's own port is
+probably being dropped rather than refused — open 47993 as above.
+
 ## Pairing is rejected / the client can't connect
 
 - The host **requires pairing** by default. Arm pairing from the web console, then enter the PIN on

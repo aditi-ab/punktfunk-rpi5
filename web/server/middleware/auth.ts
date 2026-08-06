@@ -21,6 +21,8 @@ import {
 } from "../util/auth";
 import {
 	consoleOriginPort,
+	consoleOriginScheme,
+	frameAncestorSource,
 	isPluginUiPath,
 	listenerOf,
 } from "../util/pluginOrigin";
@@ -127,8 +129,16 @@ export default defineEventHandler(async (event) => {
 
 /**
  * The console origin, as a `frame-ancestors` source, derived from the request the PLUGIN origin is
- * answering: same scheme and hostname (whatever name the operator actually browsed to — an IP, an
- * mDNS name, a hostname — so the policy matches their address bar), the console's port.
+ * answering: the hostname is whatever name the operator actually browsed to (an IP, an mDNS name, a
+ * hostname — so the policy matches their address bar), plus the console's port and scheme.
+ *
+ * ⚠ The scheme must NOT come from the request. `getRequestURL` reports `http:` on an HTTPS listener
+ * here — Nitro hands the app a synthetic request with no TLS socket — so this named
+ * `http://host:47992` as the only permitted ancestor of a console the operator was reading over
+ * HTTPS, and every plugin UI came up as an empty panel with `ERR_BLOCKED_BY_RESPONSE`. It is taken
+ * from the listener's own TLS state instead (`consoleOriginScheme`), with `x-forwarded-proto`
+ * winning when something in front terminated TLS for us — that is the one case where the browser's
+ * scheme differs from this process's.
  *
  * Falls back to `'none'` rather than `'self'` or `*` when the console port is unknown: an unframable
  * plugin page is a visible, harmless failure, and the alternatives are a policy that either does
@@ -138,5 +148,11 @@ function consoleFrameAncestor(event: H3Event): string {
 	const port = consoleOriginPort();
 	if (!port) return "'none'";
 	const url = getRequestURL(event);
-	return `${url.protocol}//${url.hostname}:${port}`;
+	return frameAncestorSource({
+		forwardedProto: getRequestHeader(event, "x-forwarded-proto"),
+		listenerScheme: consoleOriginScheme(),
+		requestScheme: url.protocol,
+		hostname: url.hostname,
+		port,
+	});
 }
