@@ -38,13 +38,19 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use cros_codecs::codec::av1::parser::FrameHeaderObu;
-use cros_codecs::codec::av1::parser::FrameType;
 use cros_codecs::codec::av1::parser::ObuAction;
 use cros_codecs::codec::av1::parser::ParsedObu;
 use cros_codecs::codec::av1::parser::Parser;
 use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 
 use crate::h264::ColourDescription;
+
+/// The parsed types a backend conversion names, re-exported so each names them
+/// through this module rather than reaching into the vendored crate — the same
+/// courtesy [`crate::h264`] does with its `Sps`/`Pps`.
+pub use cros_codecs::codec::av1::parser::FrameHeaderObu as ParsedFrameHeader;
+pub use cros_codecs::codec::av1::parser::FrameType;
+pub use cros_codecs::codec::av1::parser::SequenceHeaderObu as ParsedSequenceHeader;
 
 /// A stable identity for a decoded picture, the same currency the other two planners
 /// deal in: the backends key their surface tables by it and never by slot index.
@@ -133,6 +139,17 @@ pub struct AuPlan {
     pub dpb_refs: Vec<RefPic>,
     pub warnings: Vec<PlanWarning>,
     pub sequence: Rc<SequenceHeaderObu>,
+    /// The frame header this plan was built from, whole.
+    ///
+    /// [`Self::picture`] is the digest the CLIENT needs — size, depth, colour,
+    /// keyframe — while a hardware backend needs nearly all of the header:
+    /// AV1 puts tile info, quantisation, segmentation, loop filter, CDEF, loop
+    /// restoration, global motion and film grain in the per-frame header rather
+    /// than in a parameter set, and every one of them reaches the driver. Carried
+    /// whole for the same reason the H.264 and H.265 plans carry their activated
+    /// SPS/PPS: a backend must build its structures from exactly what was parsed,
+    /// never by re-reading the access unit.
+    pub header: Rc<FrameHeaderObu>,
 }
 
 /// Concealment signals: planning continues, the session layer requests recovery.
@@ -342,6 +359,9 @@ impl Av1Planner {
         tiles: Vec<TilePlan>,
         mut warnings: Vec<PlanWarning>,
     ) -> Result<AuPlan, PlanError> {
+        // Shared with the plan: the backends need the whole header and there is no
+        // reason for each to own a copy of a struct this size.
+        let header = Rc::new(header);
         let dpb_refs = self.dpb_refs();
 
         // `show_existing_frame` decodes nothing: it displays a slot's contents.
@@ -374,6 +394,7 @@ impl Av1Planner {
                     removed,
                 },
                 dpb_refs,
+                header: header.clone(),
                 warnings,
                 sequence,
             });
@@ -425,6 +446,7 @@ impl Av1Planner {
                 removed,
             },
             dpb_refs,
+            header: header.clone(),
             warnings,
             sequence,
         })
