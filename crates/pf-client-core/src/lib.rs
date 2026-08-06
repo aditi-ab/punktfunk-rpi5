@@ -77,10 +77,11 @@ mod video_software;
 mod video_libav;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
-// Native Vulkan Video H.264 decode (WP-C of the native-decode program): pf-vkdecode's
-// decoder on the presenter's shared device — auto's rung immediately above
-// FFmpeg-Vulkan (2026-08-05 ladder decision; the program is dropping FFmpeg from the
-// client), also pinnable via `PUNKTFUNK_DECODER=native-vulkan`.
+// Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
+// WP-2): pf-vkdecode's H.264/H.265 decoders on the presenter's shared device — auto's
+// rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision; the program is
+// dropping FFmpeg from the client), also pinnable via
+// `PUNKTFUNK_DECODER=native-vulkan`.
 #[cfg(any(target_os = "linux", windows))]
 mod video_vk_native;
 #[cfg(any(target_os = "linux", windows))]

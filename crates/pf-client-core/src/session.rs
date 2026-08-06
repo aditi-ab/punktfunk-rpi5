@@ -442,6 +442,14 @@ fn pump(
     // Build the decoder for the codec the host resolved (never assume HEVC), honoring the
     // Settings backend preference (auto/vaapi/software).
     let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
+    // The picture shape the host RESOLVED (not what we asked for) — the native
+    // Vulkan rung probes its device against it at construction, so a 4:4:4 or
+    // Main 10 session that this GPU has no decode format for refuses BEFORE it is
+    // chosen instead of error-streaking past FFmpeg-Vulkan mid-stream.
+    let stream_format = crate::video::StreamFormat {
+        chroma_format_idc: connector.chroma_format,
+        bit_depth: connector.bit_depth,
+    };
     // The WIRE codec is the negotiated truth; the FFmpeg id is meaningful only where
     // FFmpeg decodes it. `ffmpeg_codec_id`'s fallthrough maps every unknown wire bit —
     // PyroWave included — to HEVC, so logging it unconditionally claimed
@@ -497,10 +505,20 @@ fn pump(
             )),
         }
     } else {
-        Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref())
+        Decoder::new(
+            codec_id,
+            &params.decoder,
+            params.vulkan.as_ref(),
+            stream_format,
+        )
     };
     #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
-    let built = Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref());
+    let built = Decoder::new(
+        codec_id,
+        &params.decoder,
+        params.vulkan.as_ref(),
+        stream_format,
+    );
     let mut decoder = match built {
         Ok(d) => d,
         Err(e) => {

@@ -218,10 +218,14 @@ impl VkH265Decoder {
     /// and features, truthful queue families) — held for this decoder's whole
     /// lifetime, not just this call. The device must additionally have been
     /// created with `VK_KHR_video_decode_h265` enabled; that part of the contract
-    /// is CHECKED below rather than trusted, because it is the one the client
-    /// wiring is most likely to get wrong (the presenter creates its device with
-    /// `VK_KHR_video_decode_h264` alone today) and getting it wrong is undefined
-    /// behaviour at session creation rather than an error.
+    /// is checked below AS FAR AS IT CAN BE — the check reads the decode queue
+    /// family's advertised `videoCodecOperations`, which is the
+    /// device's own claim about the family, not proof that the client enabled the
+    /// extension at `vkCreateDevice`. (punktfunk's presenter enables h264 + h265 +
+    /// av1, filtered by what the device supports — `pf-presenter/src/vk/setup.rs`
+    /// — so the two coincide there.) Getting it wrong is undefined behaviour at
+    /// session creation rather than an error, which is why the family check runs
+    /// before anything is queried or created.
     pub unsafe fn new(
         handles: &DeviceHandles,
         lock: Box<dyn QueueLock>,
@@ -248,6 +252,43 @@ impl VkH265Decoder {
             device_lost: false,
             recovery: RecoveryLatch::default(),
         })
+    }
+
+    /// Ask the device, BEFORE a single AU is fed, whether it can decode a stream of
+    /// the negotiated (chroma format, bit depth) shape — the construction-time half
+    /// of what the lazy `ensure_state` path would otherwise only discover at the
+    /// first SPS.
+    ///
+    /// Why it exists: the session's picture format is the STREAM's, and a device
+    /// that advertises H.265 decode need not advertise a picture format for every
+    /// shape of it — 4:4:4 RExt is absent everywhere but NVIDIA, and 10-bit is
+    /// absent on some older silicon. Discovering that lazily makes the refusal a
+    /// mid-stream ERROR STREAK, which demotes past the FFmpeg rungs to
+    /// VAAPI/D3D11VA/software; discovering it here makes it a construction failure,
+    /// which the client's ladder answers by falling through to the next rung with
+    /// the session's hardware decode intact. Same query, same derivation, same
+    /// [`crate::CapsError`] — only the timing differs.
+    ///
+    /// The negotiated facts are a HINT (the in-band SPS is authoritative), so this
+    /// is deliberately not a promise that decode will succeed: the level ceiling and
+    /// an SPS that disagrees with the Welcome still surface at the first AU. What it
+    /// does guarantee is that a shape the device provably cannot host never gets a
+    /// session built for it.
+    pub fn probe_stream_support(
+        &self,
+        chroma_format_idc: u8,
+        bit_depth_luma_minus8: u8,
+    ) -> Result<(), VkDecodeError> {
+        let key = H265ProfileKey::from_negotiated(chroma_format_idc, bit_depth_luma_minus8)?;
+        let wanted = key
+            .output_format()
+            .expect("from_negotiated gated the chroma/depth combination");
+        // SAFETY: the constructor's `DeviceHandles` contract holds for this
+        // decoder's whole lifetime, so the physical device is live — the same
+        // proof `ensure_state`'s identical call carries.
+        let raw = unsafe { query_h265_caps(&self.dev, key) }.map_err(VkDecodeError::from)?;
+        derive_caps_h265(&raw, wanted)?;
+        Ok(())
     }
 
     /// Decode one access unit. Returns the next display-ready frame, if the

@@ -9,7 +9,7 @@ use crate::overlay::OverlayFrame;
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
-use pf_client_core::video::{NativeVkFrame, NativeVkLayout, VkVideoFrame};
+use pf_client_core::video::{NativeVkFrame, NativeVkLayout, RawVkFormat, VkVideoFrame};
 
 impl Presenter {
     /// Present one frame: route `input` into the video image (staging upload or dmabuf
@@ -383,8 +383,7 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                let ten_bit =
-                    f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw();
+                let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
                 // The one path that samples a surface BIGGER than the picture: FFmpeg's
                 // pool is the coded size (1080 → 1088 rows). Scale the UVs to the visible
                 // crop or the alignment padding — the last picture row, replicated by the
@@ -397,8 +396,8 @@ impl Presenter {
                         f.height as f32 / f.coded_height as f32,
                     ],
                     f.color,
-                    if ten_bit { 10 } else { 8 },
-                    ten_bit,
+                    depth,
+                    msb_packed,
                 );
                 vk_sync = Some(sync);
             }
@@ -434,16 +433,18 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                // Depth 8 / 4:2:0 because only H.264 is WIRED to the native decoder
-                // today, and H.264 in this program is the 8-bit 4:2:0 envelope
-                // (NV12) — NOT because pf-vkdecode can only produce that. An HEVC
-                // wiring must carry `pf_vkdecode::DecodedVkFrame::format` through
-                // to NativeVkFrame and pick depth + MSB packing from it, exactly
-                // as the FFmpeg-Vulkan arm above does from `f.vk_format`: Main 10
-                // decodes to P010 and RExt 4:4:4 to the two-plane 4:4:4 formats,
-                // and 8-bit transfer/range math over a P010 surface (or 4:2:0 UV
-                // scaling over a 4:4:4 one) is the plausible-looking-and-wrong
-                // class. Colour rides the frame (BT.709-limited SDR default).
+                // Bit depth and MSB packing come from the PICTURE's own format, which
+                // the decoder stamps on every frame — H.264 and HEVC Main deliver
+                // NV12 (8-bit), Main 10 delivers P010 (10 significant bits in the
+                // MSBs of 16), RExt delivers the two-plane 4:4:4 pair — and which can
+                // change mid-stream when the host renegotiates. Nothing here assumes
+                // a codec: 8-bit transfer/range math over a P010 surface decodes
+                // correctly and displays wrong, the plausible-looking-and-wrong class
+                // this program refuses. Chroma siting needs no decision — the CSC
+                // shader's quarter-texel 4:2:0 correction self-disables when the
+                // chroma plane is full width, so the 4:4:4 formats are already right.
+                // Colour rides the frame (BT.709-limited SDR default).
+                let (depth, msb_packed) = csc_depth_packing_or_8bit(f.vk_format);
                 self.record_csc(
                     v.framebuffer,
                     extent,
@@ -452,8 +453,8 @@ impl Presenter {
                         f.height as f32 / f.coded_height as f32,
                     ],
                     f.color,
-                    8,
-                    false,
+                    depth,
+                    msb_packed,
                 );
                 native_layer_barrier(
                     &self.device,
@@ -988,7 +989,7 @@ impl Presenter {
             bail!(
                 "Vulkan-Video pool format {} unsupported (expected 2-plane 4:2:0 or 4:4:4, \
                  8/10-bit — 3-plane layouts need a third CSC binding)",
-                f.vk_format
+                f.vk_format.0
             );
         };
         // img[0] is creation-constant (only the sync fields need the frames lock).
@@ -1049,7 +1050,7 @@ impl Presenter {
 /// - 3-plane 4:4:4 stays rejected: the CSC pass samples exactly two planes (luma +
 ///   interleaved chroma); a triplanar pool needs a third binding + shader variant. No
 ///   supported driver reports it for HEVC decode today — revisit when one does.
-fn vkframe_plane_formats(raw: i32) -> Option<(vk::Format, vk::Format)> {
+fn vkframe_plane_formats(raw: RawVkFormat) -> Option<(vk::Format, vk::Format)> {
     let eight = (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM);
     let ten = (
         vk::Format::R10X6_UNORM_PACK16,
@@ -1062,7 +1063,70 @@ fn vkframe_plane_formats(raw: i32) -> Option<(vk::Format, vk::Format)> {
         (vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16, ten),
     ]
     .into_iter()
-    .find_map(|(f, planes)| (f.as_raw() == raw).then_some(planes))
+    .find_map(|(f, planes)| (f.as_raw() == raw.0).then_some(planes))
+}
+
+/// The CSC pass's `(bit depth, MSB-packed)` pair for a decoded picture's `VkFormat`,
+/// or `None` for a format this presenter has no colour math for.
+///
+/// This is the whole of what the shader needs to know about the picture format, and
+/// it is a property of the STREAM, never of the codec — both hardware lanes carry the
+/// real format on the frame ([`VkVideoFrame::vk_format`] from FFmpeg's pool,
+/// [`NativeVkFrame::vk_format`] from pf-vkdecode's) and read it here:
+/// - 8-bit two-plane (NV12-layout and its 4:4:4 sibling) → depth 8, unpacked.
+/// - 10-bit two-plane `3PACK16` (P010-layout and its 4:4:4 sibling) → depth 10,
+///   MSB-packed: 10 significant bits live in the MSBs of 16, so a UNORM16 sample
+///   reads `code·64/65535` and `csc_rows` folds in the `65535/65472` correction.
+///   Rendering those with 8-bit math is not a subtle error — range expansion and the
+///   PQ curve both land wrong — but it is a silent one, which is why the depth is
+///   derived rather than assumed.
+///
+/// Chroma subsampling deliberately does NOT appear: the CSC shader samples both
+/// planes in normalized coordinates and self-disables its quarter-texel 4:2:0 siting
+/// correction when the chroma plane is full width, so 4:2:0 and 4:4:4 differ only in
+/// what the sampler reads. Pure, with a test pinning the table.
+fn csc_depth_packing(raw: RawVkFormat) -> Option<(u8, bool)> {
+    [
+        (vk::Format::G8_B8R8_2PLANE_420_UNORM, (8, false)),
+        (vk::Format::G8_B8R8_2PLANE_444_UNORM, (8, false)),
+        (
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            (10, true),
+        ),
+        (
+            vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
+            (10, true),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(f, dp)| (f.as_raw() == raw.0).then_some(dp))
+}
+
+/// [`csc_depth_packing`] with the 8-bit fallback for a format neither lane should
+/// ever hand us — FFmpeg's arm has already been through [`vkframe_plane_formats`]
+/// (which rejects anything not in the same table) and pf-vkdecode refuses a picture
+/// format it has no plane mapping for before a session exists. Unreachable is not
+/// impossible, so it is said once PER FORMAT rather than silently guessed forever.
+///
+/// Per format, not once per process: a session can renegotiate its picture format
+/// mid-stream (the ABR/HDR flips this program exists around), so a single latch
+/// would let the first unmapped format silence every later, DIFFERENT one — and the
+/// second one is the interesting one, because the pair says the gap is systematic.
+fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
+    csc_depth_packing(raw).unwrap_or_else(|| {
+        use std::sync::Mutex;
+        static WARNED: Mutex<Vec<RawVkFormat>> = Mutex::new(Vec::new());
+        let mut seen = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&raw) {
+            seen.push(raw);
+            tracing::warn!(
+                vk_format = raw.0,
+                "decoded picture in a format the CSC pass has no depth mapping for — \
+                 rendering it as 8-bit, which is wrong if it is not"
+            );
+        }
+        (8, false)
+    })
 }
 
 /// Flatten the 3×vec4 rows for the push-constant block.
@@ -1140,7 +1204,7 @@ mod tests {
             vk::Format::R10X6G10X6_UNORM_2PACK16,
         ));
         // 2-plane 4:2:0, both depths — the classic pair.
-        let f = |fmt: vk::Format| vkframe_plane_formats(fmt.as_raw());
+        let f = |fmt: vk::Format| vkframe_plane_formats(RawVkFormat(fmt.as_raw()));
         assert_eq!(f(vk::Format::G8_B8R8_2PLANE_420_UNORM), eight);
         assert_eq!(
             f(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
@@ -1159,7 +1223,83 @@ mod tests {
         assert_eq!(f(vk::Format::G8_B8R8_2PLANE_422_UNORM), None);
         assert_eq!(f(vk::Format::G16_B16R16_2PLANE_444_UNORM), None);
         // Garbage never maps.
-        assert_eq!(vkframe_plane_formats(0), None);
-        assert_eq!(vkframe_plane_formats(-1), None);
+        assert_eq!(vkframe_plane_formats(RawVkFormat(0)), None);
+        assert_eq!(vkframe_plane_formats(RawVkFormat(-1)), None);
+    }
+
+    /// The colour-math half of the same decision: what bit depth and packing the CSC
+    /// pass runs for a decoded picture's format. Both hardware lanes read it off the
+    /// frame — an HEVC Main 10 stream reaches the native decoder as P010 and the
+    /// FFmpeg one as the same format, and rendering either with 8-bit range/transfer
+    /// math is wrong in a way only a side-by-side would catch.
+    #[test]
+    fn csc_depth_and_packing_follow_the_pictures_format() {
+        let d = |fmt: vk::Format| csc_depth_packing(RawVkFormat(fmt.as_raw()));
+        // 8-bit: H.264, HEVC Main, and the 4:4:4 RExt 8-bit sibling.
+        assert_eq!(d(vk::Format::G8_B8R8_2PLANE_420_UNORM), Some((8, false)));
+        assert_eq!(d(vk::Format::G8_B8R8_2PLANE_444_UNORM), Some((8, false)));
+        // 10-bit, MSB-packed into 16: HEVC Main 10 and its 4:4:4 sibling. The packing
+        // flag is what recovers exact `code/1023` from a UNORM16 sample.
+        assert_eq!(
+            d(vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
+            Some((10, true))
+        );
+        assert_eq!(
+            d(vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
+            Some((10, true))
+        );
+        // Formats the presenter cannot sample at all (they never survive
+        // `vkframe_plane_formats`, and pf-vkdecode never produces them) have no
+        // mapping rather than a plausible default.
+        assert_eq!(d(vk::Format::G8_B8_R8_3PLANE_444_UNORM), None);
+        assert_eq!(d(vk::Format::G16_B16R16_2PLANE_444_UNORM), None);
+        assert_eq!(csc_depth_packing(RawVkFormat(0)), None);
+        assert_eq!(csc_depth_packing(RawVkFormat(-1)), None);
+        // …and the fallback says 8-bit for those rather than panicking, because a
+        // wrong-looking picture beats a dead session.
+        assert_eq!(csc_depth_packing_or_8bit(RawVkFormat(0)), (8, false));
+        // The FFmpeg lane's own closure: every pool format it admits must have
+        // colour math. This half is the table checked against itself, which is
+        // exactly right HERE — `vkframe_plane_formats` IS that lane's producer (a
+        // format it rejects never reaches the CSC pass).
+        for fmt in [
+            vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            vk::Format::G8_B8R8_2PLANE_444_UNORM,
+            vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
+        ] {
+            let raw = RawVkFormat(fmt.as_raw());
+            assert!(vkframe_plane_formats(raw).is_some(), "{fmt:?}");
+            assert!(csc_depth_packing(raw).is_some(), "{fmt:?}");
+        }
+    }
+
+    /// The NATIVE lane's closure, and the one the table above cannot state: its
+    /// producer is pf-vkdecode, whose output-format vocabulary this presenter has no
+    /// dependency on — so the check is against
+    /// [`pf_client_core::video::native_picture_formats`], which forwards
+    /// `pf_vkdecode::OUTPUT_FORMATS` verbatim.
+    ///
+    /// Without it, pf-vkdecode growing a fifth output format (12-bit RExt) would
+    /// build images fine, reach `csc_depth_packing_or_8bit`, render 10 or 12 bits as
+    /// 8 behind one warn line — and every test here would stay green, because they
+    /// only ever asked the FFmpeg lane's table about itself. Note there is NO
+    /// converse assertion: pf-vkdecode is not obliged to produce every format the
+    /// presenter can sample.
+    #[test]
+    fn every_format_the_native_decoder_can_deliver_has_colour_math_here() {
+        let produced = pf_client_core::video::native_picture_formats();
+        assert!(!produced.is_empty(), "the vocabulary must not be empty");
+        for raw in produced {
+            assert!(
+                csc_depth_packing(raw).is_some(),
+                "pf-vkdecode delivers vk_format {} and the CSC pass has no depth \
+                 mapping for it — it would render as 8-bit",
+                raw.0
+            );
+            // …and the sampler contract too: pf-vkdecode makes the per-plane views
+            // itself, but the two tables must agree on what a plane pair means.
+            assert!(vkframe_plane_formats(raw).is_some(), "vk_format {}", raw.0);
+        }
     }
 }

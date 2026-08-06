@@ -109,6 +109,39 @@ impl H265ProfileKey {
         })
     }
 
+    /// The key for a stream whose (chroma format, bit depth) the SESSION already
+    /// negotiated but whose SPS has not arrived yet — the construction-time probe's
+    /// entry point ([`crate::VkH265Decoder::probe_stream_support`]).
+    ///
+    /// The profile idc is the one thing the negotiation does not carry, so it is
+    /// derived from the pair: 4:2:0 8-bit → Main, 4:2:0 10-bit → Main 10, 4:4:4 →
+    /// Format Range Extensions (4:4:4 is only expressible in RExt, so that leg is
+    /// exact — and it is the leg the probe exists for). A stream that turns out to
+    /// carry a DIFFERENT profile idc for the same pair (RExt 4:2:0, say) simply
+    /// re-queries under its real key at the first AU: [`Self::from_stream`] stays
+    /// the authority once the SPS is in hand, and this one never widens what that
+    /// gate admits — every combination it cannot express is refused here too.
+    pub fn from_negotiated(
+        chroma_format_idc: u8,
+        bit_depth_luma_minus8: u8,
+    ) -> Result<Self, H265ParamsError> {
+        let general_profile_idc = match (chroma_format_idc, bit_depth_luma_minus8) {
+            (1, 0) => 1,
+            (1, 2) => 2,
+            (3, _) => 4,
+            // Everything else is outside the envelope; hand it to `from_stream`
+            // with a profile that cannot rescue it so ONE gate produces the error.
+            _ => 4,
+        };
+        Self::from_stream(
+            general_profile_idc,
+            chroma_format_idc,
+            false,
+            bit_depth_luma_minus8,
+            bit_depth_luma_minus8,
+        )
+    }
+
     /// The picture format a session on this profile decodes to, or `None` for a
     /// combination outside the envelope (unreachable off [`Self::from_stream`],
     /// which already gated it).
@@ -399,6 +432,58 @@ mod tests {
             assert_eq!(output_format_for(chroma, depth), Some(format));
         }
         assert_eq!(output_format_for(2, 0), None, "4:2:2 has no output format");
+    }
+
+    /// The negotiated-facts constructor: the session knows the chroma format and
+    /// bit depth from the host's Welcome long before the first SPS, and that is
+    /// enough to pick the profile a punktfunk host encodes the pair with — which
+    /// is what lets the client PROBE the device before it commits to the native
+    /// decoder rung.
+    #[test]
+    fn the_negotiated_pair_picks_the_profile_a_host_encodes_it_with() {
+        let main = H265ProfileKey::from_negotiated(1, 0).unwrap();
+        assert_eq!(
+            main,
+            H265ProfileKey::from_stream(1, 1, false, 0, 0).unwrap()
+        );
+        assert_eq!(main.output_format(), Some(NV12));
+
+        let main10 = H265ProfileKey::from_negotiated(1, 2).unwrap();
+        assert_eq!(
+            main10,
+            H265ProfileKey::from_stream(2, 1, false, 2, 2).unwrap()
+        );
+        assert_eq!(main10.output_format(), Some(P010));
+
+        // 4:4:4 is only expressible in RExt, so this leg is exact — and it is the
+        // one the probe exists for (a 4:4:4 session on a device with no 4:4:4
+        // decode format used to burn the ladder mid-stream).
+        let rext8 = H265ProfileKey::from_negotiated(3, 0).unwrap();
+        assert_eq!(
+            rext8,
+            H265ProfileKey::from_stream(4, 3, false, 0, 0).unwrap()
+        );
+        assert_eq!(rext8.output_format(), Some(YUV444_8));
+        let rext10 = H265ProfileKey::from_negotiated(3, 2).unwrap();
+        assert_eq!(rext10.output_format(), Some(YUV444_10));
+
+        // It never admits what `from_stream` refuses: outside-envelope pairs come
+        // back typed, so the probe REFUSES rather than guessing a profile.
+        assert_eq!(
+            H265ProfileKey::from_negotiated(2, 0).unwrap_err(),
+            H265ParamsError::UnsupportedChromaFormat(2)
+        );
+        assert_eq!(
+            H265ProfileKey::from_negotiated(0, 0).unwrap_err(),
+            H265ParamsError::UnsupportedChromaFormat(0)
+        );
+        assert_eq!(
+            H265ProfileKey::from_negotiated(1, 4).unwrap_err(),
+            H265ParamsError::UnsupportedBitDepth {
+                luma_minus8: 4,
+                chroma_minus8: 4
+            }
+        );
     }
 
     #[test]

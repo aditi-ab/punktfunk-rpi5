@@ -51,11 +51,12 @@ only, no Skia anywhere in the dependency tree.
 
 Decode follows the Settings preference (auto is vendor-ordered: hardware Vulkan Video →
 VAAPI → software on Linux, hardware Vulkan Video → D3D11VA → software on Windows, with
-VAAPI/D3D11VA first on Intel; on H.264 the native pf-vkdecode Vulkan decoder is tried
-immediately before FFmpeg-Vulkan): the Vulkan decoders run on the presenter's own
+VAAPI/D3D11VA first on Intel; on H.264 and HEVC the native pf-vkdecode Vulkan decoder
+is tried immediately before FFmpeg-Vulkan): the Vulkan decoders run on the presenter's own
 device where the stack supports it (every vendor, zero copy); VAAPI dmabufs import
-per-plane elsewhere (D3D11VA textures on Windows); software is the universal fallback. 10-bit Main10 and HDR10 are advertised
-(`VIDEO_CAP_10BIT|HDR`): P010 decodes through all three paths, and PQ streams present
+per-plane elsewhere (D3D11VA textures on Windows); software is the universal fallback.
+10-bit Main10 and HDR10 are advertised (`VIDEO_CAP_10BIT|HDR`): P010 decodes through the
+native, FFmpeg-Vulkan, VAAPI/D3D11VA and software paths alike, and PQ streams present
 on an HDR10/ST.2084 swapchain when the desktop offers one (KDE HDR, gamescope) or
 tone-map in-shader to SDR when it doesn't (`PUNKTFUNK_TONEMAP_PEAK` tunes the rolloff,
 default ≈1000 nits). The host still gates the upgrade behind its `PUNKTFUNK_10BIT`

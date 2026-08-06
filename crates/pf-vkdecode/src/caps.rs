@@ -28,6 +28,17 @@ pub const YUV444_8: vk::Format = vk::Format::G8_B8R8_2PLANE_444_UNORM;
 /// 10-bit 4:4:4 two-plane: H.265 RExt 4:4:4 10-bit, where the device advertises it.
 pub const YUV444_10: vk::Format = vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16;
 
+/// EVERY picture format a pf-vkdecode session can deliver — this crate's whole
+/// output vocabulary, in one place.
+///
+/// It exists so a CONSUMER's per-format table (the presenter's CSC bit-depth and
+/// MSB-packing map) can be pinned against the PRODUCER rather than against a
+/// hand-copied list of its own: a fifth format added here (12-bit RExt, say) breaks
+/// the consumer's test instead of silently rendering through that consumer's
+/// fallback. [`plane_formats`] and [`crate::caps_h265::output_format_for`] are both
+/// tested to agree with it, so the vocabulary can only grow in one edit.
+pub const OUTPUT_FORMATS: [vk::Format; 4] = [NV12, P010, YUV444_8, YUV444_10];
+
 /// The `R*`/`R*G*` per-plane view formats the presenter's sampler path needs for
 /// one picture format, or `None` for a format this crate has no plane mapping for.
 ///
@@ -747,6 +758,36 @@ mod tests {
             coincide_formats: vec![],
             ..radv_like()
         }
+    }
+
+    /// [`OUTPUT_FORMATS`] is the vocabulary a CONSUMER pins its own per-format
+    /// table against, so it has to be the whole of what this crate can deliver —
+    /// no more (a format listed here but unmappable would fail a pool build) and
+    /// no less (a format produced but unlisted is exactly the silent
+    /// wrong-colour-math case the listing exists to stop).
+    #[test]
+    fn the_output_format_vocabulary_is_the_whole_of_what_this_crate_delivers() {
+        for format in OUTPUT_FORMATS {
+            assert!(
+                plane_formats(format).is_some(),
+                "{format:?} is advertised as an output but has no plane views"
+            );
+        }
+        // Every (chroma, depth) pair the H.265 envelope admits resolves INTO the
+        // vocabulary — the one producer that picks a format from stream facts.
+        for chroma in 0u8..=4 {
+            for depth in 0u8..=4 {
+                if let Some(f) = crate::caps_h265::output_format_for(chroma, depth) {
+                    assert!(
+                        OUTPUT_FORMATS.contains(&f),
+                        "output_format_for({chroma}, {depth}) = {f:?} is outside \
+                         OUTPUT_FORMATS"
+                    );
+                }
+            }
+        }
+        // H.264 is the 8-bit 4:2:0 envelope — its one format is in there too.
+        assert!(OUTPUT_FORMATS.contains(&NV12));
     }
 
     #[test]

@@ -101,6 +101,15 @@ pub use pf_bitstream::h264::ColourDescription;
 pub use pf_bitstream::h264::DisplayCrop;
 /// [`VkH264Decoder::take_warnings`]'s warning type.
 pub use pf_bitstream::h264::PlanWarning;
+/// [`VkH265Decoder::take_warnings`]'s warning type — the H.265 twin of
+/// [`PlanWarning`], renamed rather than shadowed because the two enums are
+/// genuinely different (H.264 has `FrameNumGap`/`Mmco5Rebase`, H.265 has
+/// `NonZeroReorder`) and a consumer dispatching per codec must be able to name
+/// BOTH. Without it the client could only render warnings as strings — and it has
+/// to BRANCH on them: `NonZeroReorder` and `Mmco5Rebase` are spec-legal facts the
+/// planner planned in full, not concealment, and dropping their frames would cost
+/// a visible hitch at every SPS activation.
+pub use pf_bitstream::h265::PlanWarning as H265PlanWarning;
 
 pub use caps::derive_caps;
 pub use caps::plane_formats;
@@ -110,6 +119,7 @@ pub use caps::MaxLevelIdc;
 pub use caps::RawH264Caps;
 pub use caps::VideoFormat;
 pub use caps::NV12;
+pub use caps::OUTPUT_FORMATS;
 pub use caps::P010;
 pub use caps::YUV444_10;
 pub use caps::YUV444_8;

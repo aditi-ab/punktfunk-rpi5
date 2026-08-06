@@ -1,10 +1,37 @@
-//! Native Vulkan Video H.264 decode backend (WP-C of the native-decode program):
-//! pf-vkdecode's [`VkH264Decoder`] running on the PRESENTER's own VkDevice — the same
-//! zero-copy shape as the FFmpeg-Vulkan backend, with no FFmpeg in the path. Auto's
-//! rung immediately ABOVE FFmpeg-Vulkan since the 2026-08-05 ladder decision (WP-D
-//! closed bit-exact — the program is dropping FFmpeg from the client), also pinnable
-//! via `PUNKTFUNK_DECODER=native-vulkan`; `video::native_vulkan_gate` is the
-//! admission either way, and a failure falls through to the FFmpeg-Vulkan rung.
+//! Native Vulkan Video decode backend (WP-C of the native-decode program, widened to
+//! HEVC by M3 WP-2): pf-vkdecode's [`VkH264Decoder`]/[`VkH265Decoder`] running on the
+//! PRESENTER's own VkDevice — the same zero-copy shape as the FFmpeg-Vulkan backend,
+//! with no FFmpeg in the path. Auto's rung immediately ABOVE FFmpeg-Vulkan since the
+//! 2026-08-05 ladder decision (WP-D closed bit-exact — the program is dropping FFmpeg
+//! from the client), also pinnable via `PUNKTFUNK_DECODER=native-vulkan`;
+//! `video::native_vulkan_gate` is the admission either way, and a failure falls
+//! through to the FFmpeg-Vulkan rung.
+//!
+//! **Codec dispatch:** the negotiated codec picks the decoder ONCE, at construction
+//! ([`Codec`]) — H.264 or H.265, the two codecs pf-vkdecode speaks. The negotiated
+//! picture SHAPE (chroma format + bit depth) is checked there too, against the
+//! device: an H.265 session this GPU has no decode format for is refused at
+//! construction, where the ladder answers with FFmpeg-Vulkan, rather than at the
+//! first AU, where the only exit is an error streak PAST that rung
+//! ([`NativeVulkanDecoder::new`]). Nothing below the codec enum is per-codec: the
+//! shipped-frame ledger, the release tokens, the
+//! decode-status reads, the timeline waits and the teardown drain are shared, because
+//! both decoders deliver the identical [`DecodedVkFrame`] contract (same pool/slot
+//! lifecycle, same `value + 1` write-back, same query slots, same generations).
+//! Forking that machinery per codec would fork the one part of this backend hardware
+//! has already proven.
+//!
+//! **A skipped RASL picture is NOT a decode error.** An HEVC stream joined at a CRA
+//! carries leading pictures whose references precede the join; the spec's own answer
+//! (8.1.3 NOTE) is to decode and output nothing for them. [`VkH265Decoder::decode`]
+//! implements exactly that: `h265::PlanError::RaslSkipped` never becomes a
+//! `VkDecodeError`, so the AU comes back as `Ok` with whatever was ALREADY
+//! display-ready (usually `None`) and with the warning ledger cleared. This backend
+//! must therefore treat `Ok(None)` as "no picture this AU" and nothing more — no
+//! release-unshown, no re-anchor request, no error. Mapping it to an error would make
+//! every open-GOP join beg the host for a keyframe it has no reason to send. (Dead in
+//! the field today — punktfunk hosts emit IDR-only re-entry points — but it is the
+//! contract pf-bitstream's `h265` module docs record for this wiring.)
 //!
 //! **Queue lock:** pf-vkdecode submits on queue 0 of the decode family
 //! ([`DECODE_QUEUE_INDEX`] — the presenter creates exactly one queue per family). When
@@ -24,12 +51,12 @@
 //! returned token proves the GPU is done with the image; a frame dropped UNPRESENTED
 //! (newest-wins displacement, post-demotion drain) releases through the same drop. The
 //! backend drains the channel at every `decode` entry and calls
-//! [`VkH264Decoder::release_frame`] — but only once the frame's decode-status query has
+//! [`Codec::release_frame`] — but only once the frame's decode-status query has
 //! also been read (the slot stays pinned meanwhile, which is what makes re-polling the
 //! query safe: an unreleased slot can never be recycled under the poll).
 //!
 //! **Status queries:** every decode op carries a `RESULT_STATUS_ONLY` query —
-//! [`VkH264Decoder::poll_status`], read non-blockingly here at each decode entry. A
+//! [`Codec::poll_status`], read non-blockingly here at each decode entry. A
 //! `Failed` verdict is driver-reported decode corruption, the class FFmpeg's
 //! `vulkan_decode.c` (`nb_queries = 0`) architecturally cannot see — the Xbox Ally X
 //! field case. It surfaces as an `Err` from the CURRENT `decode_frame` call so the
@@ -48,7 +75,9 @@ use crate::video::{
 use anyhow::{anyhow, bail, Result};
 use pf_vkdecode::ash::vk;
 use pf_vkdecode::ash::vk::Handle as _;
-use pf_vkdecode::{DecodeStatus, DecodedVkFrame, DeviceHandles, VkH264Decoder};
+use pf_vkdecode::{
+    DecodeStatus, DecodedVkFrame, DeviceHandles, VkDecodeError, VkH264Decoder, VkH265Decoder,
+};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -102,6 +131,233 @@ impl pf_vkdecode::QueueLock for NativeQueueLock {
     }
 }
 
+/// The codecs pf-vkdecode has a decoder for — the native rung's whole vocabulary,
+/// named ash-free so `video.rs` can pick one from the negotiated wire codec without
+/// this module knowing about FFmpeg's codec ids (and `video::native_vulkan_gate`
+/// stays the single admission decision). AV1 is deliberately absent: the Vulkan
+/// decode op exists and real hardware advertises it, but there is no AV1 decoder in
+/// pf-vkdecode, so those sessions must keep falling through to the FFmpeg rungs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCodec {
+    H264,
+    H265,
+}
+
+/// The decoder this backend drives, chosen ONCE from the negotiated codec.
+///
+/// Dispatch stops here. Everything the backend does around a decoder — the
+/// shipped-frame ledger, release tokens, status-query settling, timeline waits,
+/// teardown — is codec-agnostic, because [`VkH264Decoder`] and [`VkH265Decoder`]
+/// expose the same surface over the same [`DecodedVkFrame`] contract (same pool/slot
+/// lifecycle, same `value + 1` write-back, same query slots, same generations). The
+/// forwarders below are therefore mechanically identical per arm on purpose: the
+/// H.264 path is hardware-verified bit-exact, and dispatch must not be able to change
+/// its behaviour.
+// Unboxed on purpose, against `large_enum_variant`: the arms differ by ~1.7 KB (both
+// decoders carry a planner, a slot ledger and pinned Std parameter sets), and exactly
+// ONE of these exists per session — inside the `Box<NativeVulkanDecoder>` the backend
+// already lives in. So the "waste" is 1.7 KB of slack in a single session-lifetime
+// allocation, while boxing would put a second indirection between the pump and the
+// decoder on the per-AU path and change how the hardware-verified H.264 decoder is
+// reached. Neither trade is worth 1.7 KB.
+#[allow(clippy::large_enum_variant)]
+enum Codec {
+    H264(VkH264Decoder),
+    H265(VkH265Decoder),
+}
+
+impl Codec {
+    /// Feed one access unit — see [`VkH264Decoder::decode`] /
+    /// [`VkH265Decoder::decode`]. `Ok(None)` means "no display-ready picture from
+    /// this AU", which for H.265 also covers a RASL picture skipped after an
+    /// open-GOP join (the module doc's contract: never an error).
+    fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
+        match self {
+            Codec::H264(d) => d.decode(au),
+            Codec::H265(d) => d.decode(au),
+        }
+    }
+
+    /// Drain the plan warnings of the AU just decoded, TYPED — the two planners
+    /// have genuinely different enums ([`pf_vkdecode::PlanWarning`] has
+    /// `FrameNumGap`/`Mmco5Rebase`, [`pf_vkdecode::H265PlanWarning`] has
+    /// `NonZeroReorder`, neither a subset of the other), so the pair is carried as
+    /// a two-armed value rather than flattened.
+    ///
+    /// Typed and not rendered because the backend must BRANCH on them: only some
+    /// warnings mean the picture is damaged ([`PlanWarnings::integrity`]), and
+    /// dropping a frame for the others costs a visible hitch on a stream the
+    /// planner says it planned correctly. Strings would make that a substring
+    /// match on `Debug` output.
+    fn take_warnings(&mut self) -> PlanWarnings {
+        match self {
+            Codec::H264(d) => PlanWarnings::H264(d.take_warnings()),
+            Codec::H265(d) => PlanWarnings::H265(d.take_warnings()),
+        }
+    }
+
+    /// Pull the next already display-ready frame the last AU did not return
+    /// directly (burst output).
+    fn take_ready(&mut self) -> Option<DecodedVkFrame> {
+        match self {
+            Codec::H264(d) => d.take_ready(),
+            Codec::H265(d) => d.take_ready(),
+        }
+    }
+
+    /// Hand a delivered frame back to its pool; `presented` reports whether the
+    /// consumer enqueued the frame's `value + 1` timeline signal.
+    fn release_frame(
+        &mut self,
+        frame: &DecodedVkFrame,
+        presented: bool,
+    ) -> Result<(), VkDecodeError> {
+        match self {
+            Codec::H264(d) => d.release_frame(frame, presented),
+            Codec::H265(d) => d.release_frame(frame, presented),
+        }
+    }
+
+    /// The decoder's current session generation (a frame from an older one has an
+    /// unknowable status verdict — see [`NativeVulkanDecoder::settle_statuses`]).
+    fn generation(&self) -> u64 {
+        match self {
+            Codec::H264(d) => d.generation(),
+            Codec::H265(d) => d.generation(),
+        }
+    }
+
+    /// Non-blocking read of a frame's `RESULT_STATUS_ONLY` query.
+    fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
+        match self {
+            Codec::H264(d) => d.poll_status(frame),
+            Codec::H265(d) => d.poll_status(frame),
+        }
+    }
+
+    /// Bounded host wait for a frame's decode-complete timeline signal (the pump's
+    /// sampled decode-latency stat).
+    fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
+        match self {
+            Codec::H264(d) => d.wait_decoded(frame, timeout_ns),
+            Codec::H265(d) => d.wait_decoded(frame, timeout_ns),
+        }
+    }
+}
+
+/// The plan warnings one AU produced, still in their codec's own enum.
+///
+/// The split that matters is INTEGRITY vs. spec-legal, not H.264 vs. H.265. Both
+/// planners emit two kinds of warning through one channel:
+///
+/// - **Integrity** — a reference the DPB does not hold, a `frame_num` gap, an AU
+///   whose NALU walk stopped early. The plan was completed with a SUBSTITUTE in
+///   place of something lost: the picture is damaged, so its output is released
+///   unshown and a re-anchor is requested.
+/// - **Spec-legal envelope signals** — h265's `NonZeroReorder` (the activated SPS
+///   sets `sps_max_num_reorder_pics > 0`) and h264's `Mmco5Rebase`. pf-bitstream
+///   documents both as "spec-legal and fully planned"; they exist as the field
+///   signal that a punktfunk-host assumption broke, not as damage. `NonZeroReorder`
+///   in particular fires on the AU that ACTIVATES an SPS — the opening IDR, and the
+///   fresh IDR at every ABR resolution change — so treating it as concealment costs
+///   a released-unshown frame plus a keyframe round trip at every renegotiation, on
+///   a stream the planner planned correctly. pf-bitstream's own conformance harness
+///   excludes `NonZeroReorder` from its integrity set for exactly this reason.
+///
+/// Everything is logged either way; only integrity warnings drop the frame.
+enum PlanWarnings {
+    H264(Vec<pf_vkdecode::PlanWarning>),
+    H265(Vec<pf_vkdecode::H265PlanWarning>),
+}
+
+/// Does this H.264 warning mean the PICTURE is damaged? `Mmco5Rebase` does not: the
+/// AU carried an MMCO 5 and pf-bitstream planned it in full (the plan holds the
+/// pre-rebase 8.2.1 values, later AUs reference the rebased ones).
+fn h264_is_integrity(w: &pf_vkdecode::PlanWarning) -> bool {
+    use pf_vkdecode::PlanWarning as W;
+    matches!(
+        w,
+        W::FrameNumGap { .. } | W::MissingReference { .. } | W::TruncatedAu { .. }
+    )
+}
+
+/// The H.265 twin — the same set pf-bitstream's `h265` conformance harness calls
+/// integrity, `NonZeroReorder` deliberately excluded (see [`PlanWarnings`]).
+fn h265_is_integrity(w: &pf_vkdecode::H265PlanWarning) -> bool {
+    use pf_vkdecode::H265PlanWarning as W;
+    matches!(w, W::MissingReference { .. } | W::TruncatedAu { .. })
+}
+
+impl PlanWarnings {
+    fn is_empty(&self) -> bool {
+        match self {
+            PlanWarnings::H264(w) => w.is_empty(),
+            PlanWarnings::H265(w) => w.is_empty(),
+        }
+    }
+
+    /// Just the warnings that mean the picture is damaged — the concealment set.
+    /// Allocates, but only off the clean path: [`Self::is_empty`] is true for every
+    /// AU of a healthy stream.
+    fn integrity(&self) -> PlanWarnings {
+        match self {
+            PlanWarnings::H264(w) => {
+                PlanWarnings::H264(w.iter().filter(|x| h264_is_integrity(x)).cloned().collect())
+            }
+            PlanWarnings::H265(w) => {
+                PlanWarnings::H265(w.iter().filter(|x| h265_is_integrity(x)).cloned().collect())
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            PlanWarnings::H264(w) => w.len(),
+            PlanWarnings::H265(w) => w.len(),
+        }
+    }
+
+    /// The concealment log. Per arm so the rendering is the codec's OWN enum —
+    /// `warnings=[FrameNumGap { .. }]`, exactly what the hardware-verified H.264
+    /// path emitted before dispatch existed (a `Vec<String>` renders
+    /// `["FrameNumGap { .. }"]`, and a wrapper enum would prefix the arm).
+    fn warn_concealment(&self) {
+        // Spelled out per arm rather than shared through a `const`: this is the
+        // H.264 path's PRODUCTION log line, and a literal is what keeps it a static
+        // tracing message rather than a formatted one.
+        match self {
+            PlanWarnings::H264(w) => tracing::warn!(
+                warnings = ?w,
+                "native decode planned with concealment — dropping the frame, \
+                 requesting re-anchor"
+            ),
+            PlanWarnings::H265(w) => tracing::warn!(
+                warnings = ?w,
+                "native decode planned with concealment — dropping the frame, \
+                 requesting re-anchor"
+            ),
+        }
+    }
+
+    /// The spec-legal log: the planner flagged an envelope fact and planned the AU
+    /// in full, so the frame is SHOWN. Rare by construction (SPS activation, MMCO
+    /// 5), which is why it is a `warn` and not a per-frame `debug`.
+    fn warn_planned_in_full(&self) {
+        match self {
+            PlanWarnings::H264(w) => tracing::warn!(
+                warnings = ?w,
+                "native decode: spec-legal envelope signal — the AU was planned in \
+                 full and the frame is kept"
+            ),
+            PlanWarnings::H265(w) => tracing::warn!(
+                warnings = ?w,
+                "native decode: spec-legal envelope signal — the AU was planned in \
+                 full and the frame is kept"
+            ),
+        }
+    }
+}
+
 /// One frame shipped to the presenter and not yet fully settled: settled = its release
 /// token came back (GPU reads proven done) AND its status query was read.
 struct Shipped {
@@ -137,9 +393,85 @@ fn note_token(outstanding: &mut [Shipped], token: NativeReleaseToken) -> bool {
     }
 }
 
+/// Flatten a delivered [`DecodedVkFrame`] into the ash-free [`NativeVkFrame`] the
+/// presenter consumes. Pure over the frame (the guard is the caller's), so the
+/// projection — every fact the presenter can no longer look up for itself — is
+/// CPU-testable.
+///
+/// The one that is easy to get wrong is [`NativeVkFrame::vk_format`]: the picture
+/// format is the STREAM's, not the codec's. H.264 in this program is always the 8-bit
+/// 4:2:0 envelope (NV12), but an H.265 session decodes Main to NV12, Main 10 to P010
+/// and RExt 4:4:4 to the two-plane 4:4:4 formats — and can change format mid-stream
+/// when the host renegotiates. A consumer that assumes 8-bit 4:2:0 renders a Main 10
+/// picture with 8-bit transfer/range math: plausible-looking and wrong. So the format
+/// is carried, never inferred, all the way to the presenter's CSC pass.
+fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkFrame {
+    NativeVkFrame {
+        image: frame.image.as_raw(),
+        vk_format: crate::video::RawVkFormat(frame.format.as_raw()),
+        plane_views: [frame.plane_views[0].as_raw(), frame.plane_views[1].as_raw()],
+        layer: frame.layer,
+        layout: if frame.layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
+            NativeVkLayout::DecodeDpb
+        } else {
+            NativeVkLayout::DecodeDst
+        },
+        semaphore: frame.semaphore.as_raw(),
+        semaphore_value: frame.value,
+        generation: frame.generation,
+        width: frame.crop.width,
+        height: frame.crop.height,
+        coded_width: frame.coded_width,
+        coded_height: frame.coded_height,
+        crop_x: frame.crop.x,
+        crop_y: frame.crop.y,
+        // H.273 code points straight off the picture's ACTIVE SPS/VUI — per frame,
+        // never latched, because the Windows host switches an HDR desktop to
+        // PQ/BT.2020 IN-BAND (the Welcome still says SDR). pf-bitstream applies
+        // E.2.1's "unspecified" inference (2/2/2, limited) where the VUI is
+        // silent, and `csc_rows` resolves "unspecified" to its BT.709-limited
+        // SDR default — same verdicts libavcodec's CICP passthrough produced.
+        color: ColorDesc {
+            primaries: frame.colour.colour_primaries,
+            transfer: frame.colour.transfer_characteristics,
+            matrix: frame.colour.matrix_coefficients,
+            full_range: frame.colour.video_full_range,
+        },
+        keyframe: frame.is_idr,
+        poc: frame.poc,
+        guard,
+    }
+}
+
+/// The picture format an H.265 session of the negotiated shape decodes to, or a named
+/// refusal for a shape pf-vkdecode has no output format for at all.
+///
+/// The DEVICE-INDEPENDENT half of [`NativeVulkanDecoder::new`]'s shape check: 4:2:2
+/// and 12-bit are legal H.265 that no punktfunk host emits and this client has no
+/// plumbing for, so no driver has to be asked about them. Pure, so the refusal is
+/// CPU-testable — the device-dependent half (a shape with a format that THIS driver
+/// does not advertise) is [`VkH265Decoder::probe_stream_support`], covered by
+/// pf-vkdecode's `derive_caps_h265` refusal tests.
+fn h265_picture_format(stream: crate::video::StreamFormat) -> Result<vk::Format> {
+    let depth = stream.bit_depth_minus8().ok_or_else(|| {
+        anyhow!(
+            "negotiated HEVC bit depth {} is outside the 8/10-bit decode envelope",
+            stream.bit_depth
+        )
+    })?;
+    pf_vkdecode::output_format_for(stream.chroma_format_idc, depth).ok_or_else(|| {
+        anyhow!(
+            "no native picture format for the negotiated HEVC stream shape \
+             (chroma_format_idc={}, {}-bit)",
+            stream.chroma_format_idc,
+            stream.bit_depth
+        )
+    })
+}
+
 /// The native backend: the decoder plus the shipped-frame ledger and release channel.
 pub(crate) struct NativeVulkanDecoder {
-    dec: VkH264Decoder,
+    dec: Codec,
     /// Cloned into every shipped frame's guard. `Option` so teardown can DROP the
     /// backend's own sender: only then does `release_rx` report Disconnected once
     /// the last guard is gone — the teardown short-circuit signal.
@@ -154,14 +486,51 @@ pub(crate) struct NativeVulkanDecoder {
 
 // SAFETY: the decoder is used strictly serially through `&mut self` from whichever
 // single thread owns the enclosing `Decoder` (the session pump) — `Send` only moves
-// that ownership. The `Rc`s inside pf-vkdecode's planner never escape it, so they all
-// move together; every queue submission runs under the collision-aware queue lock; the
-// mpsc endpoints are `Send`. Same contract, same shape as the `VulkanDecoder` and
-// `PyroWaveDecoder` impls above/beside it. Deliberately NOT `Sync`.
+// that ownership. The `Rc`s inside pf-vkdecode's planners (H.264 and H.265 alike)
+// never escape them, so they all move together; every queue submission runs under the
+// collision-aware queue lock; the mpsc endpoints are `Send`. Same contract, same shape
+// as the `VulkanDecoder` and `PyroWaveDecoder` impls above/beside it. Deliberately NOT
+// `Sync`.
 unsafe impl Send for NativeVulkanDecoder {}
 
 impl NativeVulkanDecoder {
-    pub(crate) fn new(vk: &VulkanDecodeDevice) -> Result<NativeVulkanDecoder> {
+    /// Build the backend over the presenter's device for `codec` — the codec the
+    /// session negotiated, already admitted by `video::native_vulkan_gate` (which
+    /// checked that the decode family advertises this codec's decode op; the
+    /// decoders re-check it themselves rather than trust the caller, because
+    /// creating a video session for a codec operation the family cannot run is
+    /// undefined behaviour rather than an error).
+    ///
+    /// Sessions and pools are built lazily from the first AU's parameter sets, so
+    /// nothing BELOW this constructor depends on the stream's shape — which is why
+    /// the shape is checked HERE, against `stream` (the host's resolved Welcome
+    /// facts), rather than being discovered at the first decode.
+    ///
+    /// The difference is which rung a refusal lands on. pf-vkdecode's picture format
+    /// is the STREAM's (Main → NV12, Main 10 → P010, RExt 4:4:4 → the two-plane 4:4:4
+    /// formats) and a device that advertises H.265 decode need not advertise a format
+    /// for every shape of it: 4:4:4 is absent everywhere but NVIDIA. Discovered
+    /// lazily, that is a mid-stream ERROR STREAK, and the streak machinery demotes a
+    /// Vulkan rung to VAAPI/D3D11VA — PAST FFmpeg-Vulkan, which on NVIDIA/Linux (no
+    /// usable VAAPI) means a 4K HEVC session lands on SOFTWARE. Refused here it is an
+    /// ordinary construction failure, and `video::Decoder::new` falls through to
+    /// FFmpeg-Vulkan — the rung that session ran on before this backend existed.
+    ///
+    /// Two legs the probe cannot see, because they are stream facts no negotiation
+    /// carries: a level above the device's `maxLevelIdc`, and an SPS that disagrees
+    /// with the Welcome. Those still surface at the first decode — and are caught by
+    /// the "never delivered a frame" arm in [`crate::video::Decoder::decode_frame`],
+    /// which routes exactly that state to FFmpeg-Vulkan instead of past it.
+    ///
+    /// H.264 is deliberately NOT probed: its envelope is fixed at 8-bit 4:2:0, so the
+    /// only fact a probe could add is a profile idc guess — on the one path in this
+    /// program that is hardware-verified bit-exact against libavcodec. It keeps the
+    /// never-delivered arm as its backstop.
+    pub(crate) fn new(
+        vk: &VulkanDecodeDevice,
+        codec: NativeCodec,
+        stream: crate::video::StreamFormat,
+    ) -> Result<NativeVulkanDecoder> {
         if !vk.video_decode {
             bail!("presenter device lacks Vulkan Video decode");
         }
@@ -180,16 +549,58 @@ impl NativeVulkanDecoder {
             decode_queue_index: DECODE_QUEUE_INDEX,
             graphics_qf: vk.graphics_qf,
         };
-        // SAFETY: the handles are the presenter's live instance/device, which outlives
-        // every session pump (the run loop tears the pump — and with it this decoder —
-        // down first: the exact liveness contract the FFmpeg and PyroWave backends
-        // already rely on over the same bundle). `video_decode` (checked above) is set
-        // only when the presenter enabled the Vulkan Video decode extension stack +
-        // synchronization2/timelineSemaphore at device creation, and
-        // `decode_qf`/`graphics_qf` mirror the families it created queues for (one
-        // queue, index 0, each).
-        let dec = unsafe { VkH264Decoder::new(&handles, lock) }
-            .map_err(|e| anyhow!("VkH264Decoder init: {e}"))?;
+        // The `DeviceHandles` caller contract, held for the decoder's whole lifetime
+        // and identical for both arms (it is the HANDLES' contract, not the codec's):
+        // the handles are the presenter's live instance/device, which outlives every
+        // session pump (the run loop tears the pump — and with it this decoder — down
+        // first: the exact liveness contract the FFmpeg and PyroWave backends already
+        // rely on over the same bundle). `video_decode` (checked above) is set only
+        // when the presenter enabled the Vulkan Video decode extension stack +
+        // synchronization2/timelineSemaphore at device creation — including the
+        // per-codec `VK_KHR_video_decode_h264`/`_h265`/`_av1` extensions, one for
+        // every codec operation the decode family advertises (`vk/setup.rs` enables
+        // exactly those it finds). What the decoders then re-check for themselves is
+        // the QUEUE FAMILY's advertised `videoCodecOperations` — the device's own
+        // claim about the family, which is what `native_vulkan_gate` reads too. That
+        // is not a proof the extension was enabled at `vkCreateDevice`; it is the
+        // same fact `vk/setup.rs` derived its enable list FROM, so the two agree by
+        // construction here and the check catches a caller that got the family wrong.
+        // `decode_qf`/`graphics_qf` mirror the families the presenter created queues
+        // for (one queue, index 0, each).
+        let dec = match codec {
+            NativeCodec::H264 => {
+                // SAFETY: the handle contract stated directly above.
+                let d = unsafe { VkH264Decoder::new(&handles, lock) }
+                    .map_err(|e| anyhow!("VkH264Decoder init: {e}"))?;
+                Codec::H264(d)
+            }
+            NativeCodec::H265 => {
+                // The device-independent half of the shape check, first: a stream
+                // shape pf-vkdecode has NO picture format for (4:2:2, 12-bit) needs
+                // no driver to refuse it.
+                let wanted = h265_picture_format(stream)?;
+                // SAFETY: the handle contract stated directly above.
+                let d = unsafe { VkH265Decoder::new(&handles, lock) }
+                    .map_err(|e| anyhow!("VkH265Decoder init: {e}"))?;
+                // …and the device-dependent half: does THIS driver advertise that
+                // format for a decode session of this profile? Same query and same
+                // derivation `ensure_state` would run at the first AU — only the
+                // timing differs, and the timing is the whole point.
+                let depth = stream
+                    .bit_depth_minus8()
+                    .expect("h265_picture_format accepted the depth");
+                d.probe_stream_support(stream.chroma_format_idc, depth)
+                    .map_err(|e| {
+                        anyhow!(
+                            "device cannot decode the negotiated HEVC stream shape \
+                             (chroma_format_idc={}, {}-bit, needs {wanted:?}): {e}",
+                            stream.chroma_format_idc,
+                            stream.bit_depth
+                        )
+                    })?;
+                Codec::H265(d)
+            }
+        };
         let (release_tx, release_rx) = mpsc::channel();
         Ok(NativeVulkanDecoder {
             dec,
@@ -206,6 +617,13 @@ impl NativeVulkanDecoder {
     /// decode trouble — a decoder error, a plan that needed concealment, or a
     /// driver-reported corrupt PREVIOUS frame — routed through the caller's shared
     /// streak/demotion machinery.
+    ///
+    /// The one thing `Ok(None)` deliberately does NOT mean is trouble. An H.265 RASL
+    /// picture skipped after an open-GOP join arrives here as exactly that — the
+    /// decoder never turns `h265::PlanError::RaslSkipped` into a `VkDecodeError`, and
+    /// it clears the warning ledger on its way out, so the concealment branch below
+    /// cannot fire on it either. Nothing is released unshown, no re-anchor is asked
+    /// for, and the next AU decodes normally (module doc; pf-bitstream `h265`).
     ///
     /// Ordering: the CURRENT AU decodes FIRST — the planner's reference state must
     /// advance even when a PRIOR frame's status turns out Failed, or the recovery
@@ -228,7 +646,12 @@ impl NativeVulkanDecoder {
         }
 
         let corrupt = self.settle_statuses();
-        if !warnings.is_empty() || corrupt > 0 {
+        // ONLY integrity warnings are concealment (see [`PlanWarnings`]): a
+        // spec-legal envelope signal — h265's `NonZeroReorder` on every SPS
+        // activation, h264's `Mmco5Rebase` — is an AU the planner planned in FULL,
+        // and dropping its frame would hitch the picture at every renegotiation.
+        let integrity = warnings.integrity();
+        if !integrity.is_empty() || corrupt > 0 {
             // Concealment planned into THIS AU, or driver-reported corruption on a
             // PRIOR frame (the Ally X class, invisible to FFmpeg's query-less
             // decoder): this call's output is released unshown and the call errors,
@@ -245,15 +668,18 @@ impl NativeVulkanDecoder {
                      (RESULT_STATUS_ONLY query) — re-anchor needed"
                 ));
             }
-            tracing::warn!(
-                ?warnings,
-                "native decode planned with concealment — dropping the frame, \
-                 requesting re-anchor"
-            );
+            // The log carries EVERY warning of the AU (the spec-legal ones are
+            // context); the count is the concealment count, which is what the
+            // frame was dropped for. On H.264 the two coincide for every warning
+            // a punktfunk host can produce.
+            warnings.warn_concealment();
             bail!(
                 "AU planned with concealment ({} warning(s))",
-                warnings.len()
+                integrity.len()
             );
+        }
+        if !warnings.is_empty() {
+            warnings.warn_planned_in_full();
         }
 
         self.deliverable.extend(fresh);
@@ -270,46 +696,16 @@ impl NativeVulkanDecoder {
             generation: frame.generation,
             presented: false,
         };
-        let native = NativeVkFrame {
-            image: frame.image.as_raw(),
-            plane_views: [frame.plane_views[0].as_raw(), frame.plane_views[1].as_raw()],
-            layer: frame.layer,
-            layout: if frame.layout == vk::ImageLayout::VIDEO_DECODE_DPB_KHR {
-                NativeVkLayout::DecodeDpb
-            } else {
-                NativeVkLayout::DecodeDst
-            },
-            semaphore: frame.semaphore.as_raw(),
-            semaphore_value: frame.value,
-            generation: frame.generation,
-            width: frame.crop.width,
-            height: frame.crop.height,
-            coded_width: frame.coded_width,
-            coded_height: frame.coded_height,
-            crop_x: frame.crop.x,
-            crop_y: frame.crop.y,
-            // H.273 code points straight off the picture's ACTIVE SPS — per frame,
-            // never latched, because the Windows host switches an HDR desktop to
-            // PQ/BT.2020 IN-BAND (the Welcome still says SDR). pf-bitstream applies
-            // E.2.1's "unspecified" inference (2/2/2, limited) where the VUI is
-            // silent, and `csc_rows` resolves "unspecified" to its BT.709-limited
-            // SDR default — same verdicts libavcodec's CICP passthrough produced.
-            color: ColorDesc {
-                primaries: frame.colour.colour_primaries,
-                transfer: frame.colour.transfer_characteristics,
-                matrix: frame.colour.matrix_coefficients,
-                full_range: frame.colour.video_full_range,
-            },
-            keyframe: frame.is_idr,
-            poc: frame.poc,
-            guard: NativeReleaseGuard::new(
+        let native = project_frame(
+            &frame,
+            NativeReleaseGuard::new(
                 self.release_tx
                     .as_ref()
                     .expect("release_tx lives until Drop")
                     .clone(),
                 token,
             ),
-        };
+        );
         self.outstanding.push(Shipped {
             seq,
             frame,
@@ -515,37 +911,65 @@ impl Drop for NativeVulkanDecoder {
 mod tests {
     use super::*;
 
+    /// A delivered frame whose every field carries a DISTINCT non-zero value.
+    ///
+    /// Deliberately not "inert handles, zeros elsewhere": [`project_frame`] is a
+    /// 20-field struct literal lifted out of `ship`, and the bugs it can hide are
+    /// field SWAPS and DROPS — `crop_x: frame.crop.y`, `semaphore_value: frame.poc
+    /// as u64`, a `keyframe` that stopped being carried. Against zeros every one of
+    /// those passes. So: no two numbers here are equal, no boolean is false, and
+    /// each CICP code point differs from the others.
+    fn decoded(format: vk::Format, layout: vk::ImageLayout, generation: u64) -> DecodedVkFrame {
+        DecodedVkFrame {
+            image: vk::Image::from_raw(0x1001),
+            format,
+            view: vk::ImageView::from_raw(0x2001),
+            plane_views: [
+                vk::ImageView::from_raw(0x2002),
+                vk::ImageView::from_raw(0x2003),
+            ],
+            layer: 3,
+            layout,
+            coded_width: 1920,
+            coded_height: 1088,
+            // A non-origin crop: punktfunk hosts emit origin crops only, but x != y
+            // here is what makes an x/y swap in the projection visible.
+            crop: pf_vkdecode::DisplayCrop {
+                x: 8,
+                y: 4,
+                width: 1904,
+                height: 1072,
+            },
+            // BT.2020 primaries / PQ transfer / a third code point for the matrix,
+            // so no two CICP fields share a value.
+            colour: pf_vkdecode::ColourDescription {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 10,
+                video_full_range: true,
+            },
+            semaphore: vk::Semaphore::from_raw(0x3001),
+            value: 7,
+            poc: 5,
+            is_idr: true,
+            query_slot: 2,
+            submission: 11,
+            picture: 6,
+            generation,
+        }
+    }
+
     /// A shipped-ledger entry with inert handles — the bookkeeping under test is pure.
     fn shipped(seq: u64, generation: u64) -> Shipped {
         Shipped {
             seq,
-            frame: DecodedVkFrame {
-                image: vk::Image::null(),
-                // The H.264 envelope's picture format (this decoder is H.264-only);
-                // the ledger under test never reads it.
-                format: pf_vkdecode::NV12,
-                view: vk::ImageView::null(),
-                plane_views: [vk::ImageView::null(); 2],
-                layer: 0,
-                layout: vk::ImageLayout::VIDEO_DECODE_DST_KHR,
-                coded_width: 1920,
-                coded_height: 1088,
-                crop: pf_bitstream_crop(1920, 1080),
-                colour: pf_vkdecode::ColourDescription {
-                    colour_primaries: 2,
-                    transfer_characteristics: 2,
-                    matrix_coefficients: 2,
-                    video_full_range: false,
-                },
-                semaphore: vk::Semaphore::null(),
-                value: 0,
-                poc: 0,
-                is_idr: false,
-                query_slot: 0,
-                submission: 0,
-                picture: 0,
+            // The ledger under test never reads the picture format; NV12 is what an
+            // H.264 session always delivers.
+            frame: decoded(
+                pf_vkdecode::NV12,
+                vk::ImageLayout::VIDEO_DECODE_DST_KHR,
                 generation,
-            },
+            ),
             released: false,
             presented: false,
             resolved: false,
@@ -553,13 +977,161 @@ mod tests {
         }
     }
 
-    fn pf_bitstream_crop(width: u32, height: u32) -> pf_vkdecode::DisplayCrop {
-        pf_vkdecode::DisplayCrop {
-            x: 0,
-            y: 0,
+    /// Project one frame with a throwaway guard (the channel is the caller's).
+    fn project(frame: &DecodedVkFrame) -> NativeVkFrame {
+        let (tx, _rx) = mpsc::channel();
+        project_frame(
+            frame,
+            NativeReleaseGuard::new(
+                tx,
+                NativeReleaseToken {
+                    seq: 0,
+                    generation: frame.generation,
+                    presented: false,
+                },
+            ),
+        )
+    }
+
+    /// The picture format is the STREAM's, and it must reach the presenter intact:
+    /// H.264 and H.265 Main deliver NV12, Main 10 delivers P010, RExt 4:4:4 delivers
+    /// the two-plane 4:4:4 formats. The presenter picks bit depth, MSB packing and
+    /// chroma siting from exactly this number, so a projection that dropped or
+    /// defaulted it would render a Main 10 picture with 8-bit math — decoded
+    /// correctly, displayed wrong, and nothing would flag it.
+    #[test]
+    fn the_projection_carries_the_pictures_own_format_whatever_the_codec() {
+        for format in [
+            pf_vkdecode::NV12,
+            pf_vkdecode::P010,
+            pf_vkdecode::YUV444_8,
+            pf_vkdecode::YUV444_10,
+        ] {
+            let frame = decoded(format, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 1);
+            assert_eq!(
+                project(&frame).vk_format,
+                crate::video::RawVkFormat(format.as_raw()),
+                "the presenter reads the format off the frame, never off the codec"
+            );
+        }
+    }
+
+    /// EVERY field of the projection, against a frame whose values are all distinct
+    /// (see [`decoded`]): the display crop is what the presenter shows, the coded
+    /// extent is what it must divide by (the 1088-row lesson), the crop ORIGIN is
+    /// what its UV-scale path assumes is (0,0), the timeline pair is what it waits,
+    /// the CICP quadruple is what it does colour maths with, and the decode layout is
+    /// what it has to restore after sampling. A swap or a drop among any of them is a
+    /// silently wrong picture, so the list here is deliberately exhaustive — if
+    /// `NativeVkFrame` grows a field, this test should stop compiling before it can
+    /// go unchecked.
+    #[test]
+    fn the_projection_carries_every_field_the_presenter_can_no_longer_look_up() {
+        let frame = decoded(pf_vkdecode::P010, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 4);
+        let p = project(&frame);
+        // Destructured, not field-accessed: a NEW field on NativeVkFrame breaks this
+        // pattern and lands the author right here.
+        let NativeVkFrame {
+            image,
+            vk_format,
+            plane_views,
+            layer,
+            layout,
+            semaphore,
+            semaphore_value,
+            generation,
             width,
             height,
-        }
+            coded_width,
+            coded_height,
+            crop_x,
+            crop_y,
+            color,
+            keyframe,
+            poc,
+            guard: _,
+        } = p;
+        assert_eq!(image, 0x1001);
+        assert_eq!(
+            vk_format,
+            crate::video::RawVkFormat(pf_vkdecode::P010.as_raw())
+        );
+        assert_eq!(
+            plane_views,
+            [0x2002, 0x2003],
+            "the plane views, in order — NOT the whole-image view (0x2001)"
+        );
+        assert_eq!(layer, 3, "the picture's array layer, not slot 0");
+        assert_eq!(layout, NativeVkLayout::DecodeDst);
+        assert_eq!(semaphore, 0x3001);
+        assert_eq!(
+            semaphore_value, 7,
+            "the frame's timeline value — not its POC (5)"
+        );
+        assert_eq!(generation, 4);
+        assert_eq!((width, height), (1904, 1072), "the display crop's SIZE");
+        assert_eq!(
+            (coded_width, coded_height),
+            (1920, 1088),
+            "the allocated surface — the UV-scale denominator"
+        );
+        assert_eq!((crop_x, crop_y), (8, 4), "the crop ORIGIN, x then y");
+        assert_eq!(color.primaries, 9);
+        assert_eq!(color.transfer, 16);
+        assert_eq!(color.matrix, 10);
+        assert!(color.full_range);
+        assert!(
+            keyframe,
+            "is_idr rides through as the pump's re-anchor signal"
+        );
+        assert_eq!(poc, 5);
+
+        // Coincide mode: the picture IS a DPB slot, so the presenter must put the
+        // layer back in DPB layout after sampling.
+        let dpb = project(&decoded(
+            pf_vkdecode::NV12,
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            4,
+        ));
+        assert_eq!(dpb.layout, NativeVkLayout::DecodeDpb);
+    }
+
+    /// The construction-time shape refusal, device-independent half. A negotiated
+    /// shape pf-vkdecode has no picture format for must be refused where
+    /// `Decoder::new` still has FFmpeg-Vulkan to fall through to — NOT discovered at
+    /// the first AU, where the only exit is an error streak that demotes PAST that
+    /// rung to VAAPI/D3D11VA (and on NVIDIA/Linux, straight to software).
+    #[test]
+    fn a_stream_shape_with_no_native_picture_format_is_refused_at_construction() {
+        use crate::video::StreamFormat;
+        let f = |chroma, bit_depth| {
+            h265_picture_format(StreamFormat {
+                chroma_format_idc: chroma,
+                bit_depth,
+            })
+        };
+        // What the envelope DOES admit resolves, and to the right format — Main,
+        // Main 10 and both RExt 4:4:4 depths.
+        assert_eq!(f(1, 8).unwrap(), pf_vkdecode::NV12);
+        assert_eq!(f(1, 10).unwrap(), pf_vkdecode::P010);
+        assert_eq!(f(3, 8).unwrap(), pf_vkdecode::YUV444_8);
+        assert_eq!(f(3, 10).unwrap(), pf_vkdecode::YUV444_10);
+        assert_eq!(
+            h265_picture_format(StreamFormat::SDR_420_8).unwrap(),
+            pf_vkdecode::NV12,
+            "the default/older-host shape is the ordinary one"
+        );
+        // 4:2:2 and monochrome are legal H.265 with no output plumbing here.
+        assert!(f(2, 8).is_err(), "4:2:2");
+        assert!(f(0, 8).is_err(), "monochrome");
+        // 12-bit has no output format either, and a depth BELOW 8 must not wrap
+        // around into a plausible `bit_depth_luma_minus8`.
+        assert!(f(1, 12).is_err(), "12-bit");
+        assert!(
+            f(1, 0).is_err(),
+            "an absurd depth refuses, never underflows"
+        );
+        assert!(f(3, 6).is_err());
     }
 
     #[test]
@@ -618,6 +1190,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let frame = NativeVkFrame {
             image: 0,
+            vk_format: crate::video::RawVkFormat(pf_vkdecode::NV12.as_raw()),
             plane_views: [0; 2],
             layer: 0,
             layout: NativeVkLayout::DecodeDst,
@@ -675,6 +1248,75 @@ mod tests {
             },
         );
         drop(guard); // must not panic
+    }
+
+    /// Concealment is the INTEGRITY warnings, not "any warning at all".
+    ///
+    /// h265's `NonZeroReorder` is emitted on the AU that ACTIVATES an SPS with
+    /// `sps_max_num_reorder_pics > 0` — the opening IDR, and the fresh IDR at every
+    /// ABR resolution change. pf-bitstream documents it as spec-legal and fully
+    /// planned (C.5.2 bumping honours the reordering) and excludes it from its own
+    /// integrity set. Treating it as concealment releases that IDR UNSHOWN, errors,
+    /// and begs the host for a keyframe: a visible hitch at every renegotiation, on
+    /// a stream the planner says it planned correctly.
+    #[test]
+    fn a_spec_legal_envelope_warning_is_not_concealment() {
+        use pf_vkdecode::H265PlanWarning as H265;
+        use pf_vkdecode::PlanWarning as H264;
+
+        // The case from the field: an SPS activation, nothing else.
+        let reorder = PlanWarnings::H265(vec![H265::NonZeroReorder {
+            max_num_reorder_pics: 1,
+        }]);
+        assert!(!reorder.is_empty(), "it IS a warning and IS logged");
+        assert!(
+            reorder.integrity().is_empty(),
+            "…but it is not concealment: the frame must be shown, not dropped"
+        );
+
+        // h264's twin: an MMCO 5 was planned in full too (the plan carries the
+        // pre-rebase 8.2.1 values).
+        let mmco5 = PlanWarnings::H264(vec![H264::Mmco5Rebase]);
+        assert!(!mmco5.is_empty());
+        assert!(mmco5.integrity().is_empty());
+
+        // Everything that means a reference or a slice was LOST still is — this is
+        // the H.264 behaviour the hardware-verified path shipped with.
+        for w in [
+            H264::FrameNumGap {
+                expected: 4,
+                got: 7,
+            },
+            H264::MissingReference {
+                context: "list0",
+                detail: "poc 12".into(),
+            },
+            H264::TruncatedAu { offset: 900 },
+        ] {
+            let warnings = PlanWarnings::H264(vec![w]);
+            assert_eq!(warnings.integrity().len(), 1, "damage is concealment");
+        }
+        for w in [
+            H265::MissingReference {
+                context: "StCurrBefore",
+                detail: "poc 12".into(),
+            },
+            H265::TruncatedAu { offset: 900 },
+        ] {
+            let warnings = PlanWarnings::H265(vec![w]);
+            assert_eq!(warnings.integrity().len(), 1);
+        }
+
+        // Mixed AU: the damage decides, and the count the error reports is the
+        // damage count — the spec-legal companion rides along in the log only.
+        let mixed = PlanWarnings::H265(vec![
+            H265::NonZeroReorder {
+                max_num_reorder_pics: 2,
+            },
+            H265::TruncatedAu { offset: 12 },
+        ]);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed.integrity().len(), 1);
     }
 
     #[test]

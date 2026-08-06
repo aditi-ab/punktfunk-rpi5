@@ -374,7 +374,7 @@ impl VulkanDecoder {
                 bail!("Vulkan decode output {sw:?} unsupported (NV12/P010/NV24/P410 only)");
             }
             let vkfc = (*fc).hwctx as *const pf_ffvk::AVVulkanFramesContext;
-            let vk_format = (*vkfc).format[0] as i32;
+            let vk_format = crate::video::RawVkFormat((*vkfc).format[0] as i32);
             let lock_frame = (*vkfc).lock_frame.map_or(0, |f| f as usize);
             let unlock_frame = (*vkfc).unlock_frame.map_or(0, |f| f as usize);
             if lock_frame == 0 || unlock_frame == 0 {

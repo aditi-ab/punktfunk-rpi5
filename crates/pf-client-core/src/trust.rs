@@ -938,9 +938,10 @@ pub struct Settings {
     #[serde(default = "default_codec")]
     pub codec: String,
     /// Video decoder preference: `"auto"` (vendor-ordered hardware ladder — on H.264
-    /// the native pf-vkdecode rung sits immediately above FFmpeg-Vulkan; then
-    /// VAAPI/D3D11VA, then software — see `video::Decoder::new` for the per-vendor
-    /// order), `"vulkan"`, `"vaapi"`, `"d3d11va"`, `"native-vulkan"`, `"software"`.
+    /// and HEVC the native pf-vkdecode rung sits immediately above FFmpeg-Vulkan;
+    /// then VAAPI/D3D11VA, then software — see `video::Decoder::new` for the
+    /// per-vendor order), `"vulkan"`, `"vaapi"`, `"d3d11va"`, `"native-vulkan"`,
+    /// `"software"`.
     /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
     pub decoder: String,
     /// Decode/present GPU (multi-GPU boxes): the adapter's marketing name, as the WinUI
