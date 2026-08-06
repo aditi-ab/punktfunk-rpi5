@@ -52,6 +52,7 @@
 pub mod config;
 pub mod descriptors;
 pub mod dxva;
+pub mod dxva_av1;
 pub mod pack;
 pub mod pic;
 pub mod pic_h265;
