@@ -61,6 +61,13 @@ const CSS: &str = "
 .pf-poster { border-radius: 10px; background: alpha(currentColor, 0.08); }
 .pf-poster-monogram { font-size: 2.4em; font-weight: bold; color: alpha(currentColor, 0.45); }
 .pf-store-badge { color: white; background: rgba(0, 0, 0, 0.55); }
+/* Launcher entries (design D4) open the launcher itself. They rarely have poster art, so an
+   art-less one must not read as a game whose cover failed to load: accent face, the launcher
+   named instead of a title monogram, and an accent badge. */
+.pf-poster.pf-launcher { background: alpha(@accent_color, 0.18); }
+.pf-poster-launcher-name { font-size: 1.15em; font-weight: bold; color: alpha(currentColor, 0.85); }
+.pf-store-badge.pf-launcher { color: white; background: @accent_color; }
+.pf-group-heading { font-size: 0.8em; font-weight: bold; color: alpha(currentColor, 0.55); }
 ";
 
 /// Everything the shell shares below the component tree.

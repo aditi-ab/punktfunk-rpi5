@@ -37,9 +37,51 @@ data class Artwork(val portrait: String?, val header: String?, val hero: String?
     val posterCandidates: List<String> get() = listOfNotNull(portrait, header, hero)
 }
 
-/** One title in the unified library. [id] is store-qualified (`steam:<appid>` / `custom:<id>`). */
-data class GameEntry(val id: String, val store: String, val title: String, val art: Artwork) {
+/**
+ * One title in the unified library. [id] is store-qualified (`steam:<appid>` / `custom:<id>`).
+ *
+ * [role] is `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that
+ * opens the launcher itself (Steam Big Picture, Heroic) rather than a title. Kept a plain nullable
+ * String on purpose: the host owns the vocabulary, and an unknown future value must degrade to a
+ * game rather than break the decode (design D4).
+ */
+data class GameEntry(
+    val id: String,
+    val store: String,
+    val title: String,
+    val art: Artwork,
+    val role: String? = null,
+) {
     val isCustom: Boolean get() = store == "custom"
+
+    /** Whether this entry opens a launcher rather than a game. */
+    val isLauncher: Boolean get() = role == "launcher"
+
+    /**
+     * Display name for the store badge — the same table the other clients use
+     * (`pf-console-ui::library::store_label`). Before this the UI said "Steam" for every non-custom
+     * entry, which a Lutris or GOG title made a lie.
+     */
+    val storeLabel: String get() = when (store) {
+        "steam" -> "Steam"
+        "custom" -> "Custom"
+        "heroic" -> "Heroic"
+        "lutris" -> "Lutris"
+        "epic" -> "Epic"
+        "gog" -> "GOG"
+        "xbox" -> "Xbox"
+        else -> "Game"
+    }
+}
+
+/**
+ * Design D4: launcher entries lead the shelf, keeping the host's title order within each group.
+ * Applied once where the library is fetched, so no screen has to remember the rule — and a library
+ * without launcher entries comes back untouched.
+ */
+fun List<GameEntry>.launchersFirst(): List<GameEntry> {
+    val launchers = filter { it.isLauncher }
+    return if (launchers.isEmpty()) this else launchers + filterNot { it.isLauncher }
 }
 
 /** Fetch outcome — three states so the UI can guide setup (the common case is "not paired yet"). */
@@ -108,10 +150,11 @@ object LibraryClient {
                         header = resolveArt(str(art, "header"), base),
                         hero = resolveArt(str(art, "hero"), base),
                     ),
+                    role = str(o, "role"),
                 ),
             )
         }
-        return out
+        return out.launchersFirst()
     }
 
     /** A present, non-null, non-blank JSON string field, else null. */

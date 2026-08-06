@@ -80,19 +80,45 @@ struct LibraryView: View {
     }
 
     private var grid: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 18) {
-                ForEach(games) { game in
-                    if let onLaunch {
-                        Button { onLaunch(game.id) } label: { GameCard(game: game, imageSession: imageSession) }
-                            .buttonStyle(.plain)
-                    } else {
-                        GameCard(game: game, imageSession: imageSession)
-                    }
+        // Design D4: launcher entries get their own section above the titles, never interleaved.
+        // Both headers appear only when both groups exist, so a library without launcher entries
+        // renders exactly as it did before.
+        let launchers = games.filter(\.isLauncher)
+        let titles = games.filter { !$0.isLauncher }
+        let both = !launchers.isEmpty && !titles.isEmpty
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if !launchers.isEmpty {
+                    if both { sectionHeader("Launchers") }
+                    tiles(launchers)
+                }
+                if !titles.isEmpty {
+                    if both { sectionHeader("Games") }
+                    tiles(titles)
                 }
             }
             .padding()
         }
+    }
+
+    private func tiles(_ entries: [GameEntry]) -> some View {
+        LazyVGrid(columns: columns, spacing: 18) {
+            ForEach(entries) { game in
+                if let onLaunch {
+                    Button { onLaunch(game.id) } label: { GameCard(game: game, imageSession: imageSession) }
+                        .buttonStyle(.plain)
+                } else {
+                    GameCard(game: game, imageSession: imageSession)
+                }
+            }
+        }
+    }
+
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text)
+            .font(.geist(12, .semibold, relativeTo: .caption))
+            .tracking(1.1)
+            .foregroundStyle(.secondary)
     }
 
     private var columns: [GridItem] {
@@ -152,12 +178,15 @@ struct LibraryView: View {
             return
         }
         do {
+            // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid and
+            // the gamepad coverflow both inherit the D4 ordering.
             games = try await LibraryClient.fetch(
                 address: current.address,
                 port: current.effectiveMgmtPort,
                 certPEM: identity.certPEM,
                 keyPEM: identity.keyPEM,
-                hostFingerprint: current.pinnedSHA256)
+                hostFingerprint: current.pinnedSHA256
+            ).launchersFirst
             imageSession?.finishTasksAndInvalidate()
             imageSession = try LibraryImageLoader.session(
                 address: current.address,
@@ -185,7 +214,9 @@ private struct GameCard: View {
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .frame(maxWidth: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(alignment: .topLeading) { StoreBadge(isCustom: game.isCustom) }
+                .overlay(alignment: .topLeading) {
+                    StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
+                }
             Text(game.title)
                 .font(.geist(12, relativeTo: .caption))
                 .lineLimit(2)

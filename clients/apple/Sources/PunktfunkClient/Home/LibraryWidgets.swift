@@ -12,14 +12,21 @@ import AppKit
 /// The store-provenance badge (Steam vs. a user-curated custom entry) overlaid on a poster —
 /// shared by the touch grid's `GameCard` and the gamepad coverflow's cover cell.
 struct StoreBadge: View {
-    let isCustom: Bool
+    /// Which store surfaced the entry, already resolved to a display name (`GameEntry.storeLabel`).
+    let label: String
+    /// A launcher entry (design D4) gets the brand fill, so "opens Steam" is legible at poster size
+    /// without reading the title.
+    var isLauncher: Bool = false
 
     var body: some View {
-        Text(isCustom ? "Custom" : "Steam")
+        Text(label)
             .font(.geist(11, .semibold, relativeTo: .caption2))
+            .foregroundStyle(isLauncher ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(.ultraThinMaterial, in: Capsule())
+            .background(
+                isLauncher ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.ultraThinMaterial),
+                in: Capsule())
             .padding(6)
     }
 }

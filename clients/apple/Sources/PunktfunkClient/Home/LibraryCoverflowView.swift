@@ -52,12 +52,15 @@ struct LibraryCoverflowView: View {
         // Fit the tallest poster into the height the detail line + paddings leave (the hints are a
         // safe-area inset, already out of this budget) — capped so it never dwarfs a large iPad and
         // clamped by width on a narrow screen.
-        let reserved: CGFloat = compact ? 72 : 96 // detail line + spacers
+        let reserved: CGFloat = (compact ? 72 : 96) + (showsGroupHeading ? 26 : 0)
         let coverHeight = min(360, min(max(140, size.height - reserved), size.width * 0.9))
         let coverWidth = coverHeight * 2 / 3
 
         VStack(spacing: 0) {
             Spacer(minLength: 4)
+            if showsGroupHeading {
+                groupHeading.padding(.bottom, 6)
+            }
             carousel(coverWidth: coverWidth, coverHeight: coverHeight)
             detailPanel
                 .padding(.top, 12)
@@ -89,7 +92,9 @@ struct LibraryCoverflowView: View {
         PosterImage(candidates: game.art.posterCandidates, title: game.title, session: imageSession)
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(alignment: .topLeading) { StoreBadge(isCustom: game.isCustom) }
+            .overlay(alignment: .topLeading) {
+                StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
+            }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .strokeBorder(.white.opacity(0.12), lineWidth: 1)
@@ -112,6 +117,23 @@ struct LibraryCoverflowView: View {
             }
     }
 
+    /// Does this library have both groups? Only then does the heading earn its row — a
+    /// launcher-less library gets exactly the layout it had before design D4.
+    private var showsGroupHeading: Bool {
+        games.contains(where: \.isLauncher) && games.contains { !$0.isLauncher }
+    }
+
+    /// Which group the cursor is in. A coverflow is one-dimensional, so instead of a second focus
+    /// rail (a whole new up/down nav model for two or three tiles) the heading names the group and
+    /// changes as the selection crosses the boundary — the launcher entries lead the strip.
+    private var groupHeading: some View {
+        let selected = games.first { $0.id == selection }
+        return Text(selected?.isLauncher == true ? "LAUNCHERS" : "GAMES")
+            .font(.geist(11, .semibold, relativeTo: .caption2))
+            .tracking(1.4)
+            .foregroundStyle(.white.opacity(0.45))
+    }
+
     /// The centered title + store tag — empty (not hidden) so the layout doesn't jump.
     @ViewBuilder private var detailPanel: some View {
         let game = games.first { $0.id == selection }
@@ -123,10 +145,13 @@ struct LibraryCoverflowView: View {
                 .minimumScaleFactor(0.75)
                 .multilineTextAlignment(.center)
             if let game {
-                Text(game.isCustom ? "CUSTOM" : "STEAM")
-                    .font(.geist(11, .semibold, relativeTo: .caption2))
-                    .tracking(1.2)
-                    .foregroundStyle(.white.opacity(0.5))
+                Text(
+                    game.isLauncher
+                        ? "\(game.storeLabel.uppercased()) · LAUNCHER" : game.storeLabel.uppercased()
+                )
+                .font(.geist(11, .semibold, relativeTo: .caption2))
+                .tracking(1.2)
+                .foregroundStyle(.white.opacity(0.5))
             }
         }
         .frame(maxWidth: .infinity)
@@ -139,7 +164,10 @@ struct LibraryCoverflowView: View {
     private var hints: [GamepadHint] {
         var hints: [GamepadHint] = []
         if onLaunch != nil {
-            hints.append(.init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Launch"))
+            // You *open* a launcher and *launch* a game — the hint follows the focused entry.
+            let opens = games.first { $0.id == selection }?.isLauncher == true
+            hints.append(
+                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: opens ? "Open" : "Launch"))
         }
         hints.append(.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close"))
         return hints

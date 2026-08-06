@@ -251,6 +251,7 @@ fn dump_console_screens() {
             id: format!("steam:{i}"),
             title: (*t).to_string(),
             store: "steam".into(),
+            launcher: false,
         })
         .collect(),
     );

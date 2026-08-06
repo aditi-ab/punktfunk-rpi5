@@ -791,6 +791,7 @@ fn spawn_fetch(
                                 id: g.id.clone(),
                                 title: g.title.clone(),
                                 store: g.store.clone(),
+                                launcher: g.is_launcher(),
                             })
                             .collect(),
                     );
@@ -831,6 +832,7 @@ fn load_fake(shared: &LibraryShared, path: &str) {
                 id: g.id.clone(),
                 title: g.title.clone(),
                 store: g.store.clone(),
+                launcher: g.is_launcher(),
             })
             .collect(),
     );
