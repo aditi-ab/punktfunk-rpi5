@@ -86,14 +86,22 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
 /// 1. `PUNKTFUNK_SPLIT_ENCODE` = `0`/`disable` | `1`/`auto` (AUTO_FORCED) | `2` | `3` — operator
 ///    override, always wins, except that `2`/`3` are clamped to the GPU's real engine count (see
 ///    [`clamp_to_engines`]; the driver honours an over-ask and silently encodes narrower).
-/// 2. 10-bit → DISABLE: 2-way split is measurably SLOWER on Ada for Main10 — at 5120×1440@240
-///    forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine (the split/merge
-///    overhead dominates), and a single engine handles 5K@240 Main10 well under budget. This was
-///    the "broken animations in HDR" cap at ~131 fps.
-/// 3. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force the WIDEST split the GPU can deliver
+/// 2. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force the WIDEST split the GPU can deliver
 ///    ([`max_forced_split_mode`]), not a hard-coded 2 (AUTO never engages below ~2112 px height,
 ///    so 4K120 must be forced onto the other engines; and a 3-NVENC part left at 2-way wastes a
 ///    third of its encode silicon).
+/// 3. **HEVC** Main10 below that bar → DISABLE: 2-way split measured SLOWER on Ada for Main10 — at
+///    5120×1440@240 forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine, the
+///    "broken animations in HDR" cap. ⚠ This rule used to sit ABOVE the pixel-rate arm and take no
+///    codec, so it (a) vetoed 10-bit **4K120** — the very case the pixel-rate arm exists for — and
+///    (b) applied an HEVC-on-Ada result to **AV1 10-bit**, which has no such measurement. Both
+///    fixed; what remains is a conservative default in the regime where a second engine buys
+///    nothing anyway.
+///    ⚠⚠ **UNVALIDATED CONSEQUENCE:** 5120×1440@240 Main10 (1.77 Gpix/s) now clears the pixel-rate
+///    bar and WILL be forced to split — i.e. the exact configuration that measurement came from
+///    flips behaviour. That is deliberate (the datapoint is one sample, at low bits/frame, and the
+///    bits/frame hypothesis predicts it should not generalise) but it is **the first thing to
+///    re-measure on Ada**; `PUNKTFUNK_SPLIT_ENCODE=0` is the escape if it regresses.
 /// 4. Else AUTO — ⚠ whose behaviour is **conditional on sub-frame**, measured on `.21` at 4K:
 ///    - sub-frame **ON** (the fleet default): AUTO **does not split** — 5023/5157 µs against
 ///      DISABLE's 4979/5000. Split and sub-frame are mutually unsupported for HEVC, so the driver
@@ -110,7 +118,12 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
 /// `engines` is the GPU's `NV_ENC_CAPS_NUM_ENCODER_ENGINES`; pass `0` when it could not be probed
 /// (treated as "unknown", which keeps the pre-probe behaviour of assuming a second engine exists
 /// and letting the open-time rejection fallback sort it out).
-pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64, engines: u32) -> u32 {
+pub(super) fn resolve_split_mode(
+    codec: Codec,
+    bit_depth: u8,
+    pixel_rate: u64,
+    engines: u32,
+) -> u32 {
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
     let hw_max = max_forced_split_mode(engines);
     let mode = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
@@ -118,14 +131,26 @@ pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64, engines: u32) -
         Some("1") | Some("auto") => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
         Some("3") => clamp_to_engines(M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32, hw_max, engines),
         Some("2") => clamp_to_engines(M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32, hw_max, engines),
-        _ if bit_depth >= 10 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
         // Use every engine the card has, not a hard-coded two: on a 3-NVENC part (GB202, AD102
         // workstation) forcing 2 leaves a third of the silicon idle.
+        //
+        // ⚠ This arm now comes FIRST, ahead of the 10-bit rule. That reordering is the D1 fix: a
+        // 10-bit 4K120 session (995.3 Mpix/s) used to be vetoed by the depth rule before ever
+        // reaching the pixel-rate arm written for exactly it.
         _ if pixel_rate >= super::SPLIT_FORCE_PIXEL_RATE => hw_max,
+        // Below that bar, HEVC Main10 keeps the conservative single-engine default. The one Ada
+        // measurement we have says split can be *slower* for Main10, and nothing under this bar
+        // needs a second engine anyway — so the cost of being wrong here is ~nil, unlike above it.
+        //
+        // ⚠ Now codec-scoped (the D2 fix): the measurement behind this was HEVC Main10 on Ada, and
+        // it used to veto **AV1 10-bit** too, which has neither the sub-frame conflict nor any
+        // measurement against it.
+        _ if codec == Codec::H265 && bit_depth >= 10 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
         _ => M::NV_ENC_SPLIT_AUTO_MODE as u32,
     };
     tracing::debug!(
         split_mode = mode,
+        ?codec,
         bit_depth,
         pixel_rate,
         engines,
@@ -695,7 +720,7 @@ mod tests {
         // 4090 because AUTO never engages at 2160 px height.
         let four_k_120 = 3840u64 * 2160 * 120;
         assert_eq!(
-            resolve_split_mode(8, four_k_120, 2),
+            resolve_split_mode(Codec::H265, 8, four_k_120, 2),
             M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
         );
     }
@@ -705,19 +730,53 @@ mod tests {
         // 884.7 Mpix/s is comfortably single-engine — the threshold move must not drag it in.
         let qhd_240 = 2560u64 * 1440 * 240;
         assert_eq!(
-            resolve_split_mode(8, qhd_240, 2),
+            resolve_split_mode(Codec::H265, 8, qhd_240, 2),
             M::NV_ENC_SPLIT_AUTO_MODE as u32
         );
     }
 
     #[test]
-    fn split_disabled_for_10bit_even_at_high_pixel_rate() {
-        // The measured Main10 rule: split/merge overhead dominates 10-bit on Ada (7.6 ms forced-2
-        // vs 2.8 ms single-engine at 5K240) — 10-bit precedes the pixel-rate arm.
-        let five_k_240 = 5120u64 * 1440 * 240;
+    fn split_rules_for_10bit_after_dropping_the_short_circuit() {
+        let five_k_240 = 5120u64 * 1440 * 240; // 1.77 Gpix/s — over the bar
+        let four_k_120 = 3840u64 * 2160 * 120; // 995.3 Mpix/s — over the bar
+        let hd_60 = 1920u64 * 1080 * 60; // 124 Mpix/s — well under
+
+        // ⚠ BEHAVIOUR FLIP, deliberate: the config the Main10 veto was measured on (7.6 ms
+        // forced-2 vs 2.8 ms single-engine on Ada) now clears the pixel-rate bar and SPLITS. The
+        // datapoint is one sample at low bits/frame; re-measuring it on Ada is the first on-glass
+        // item, and PUNKTFUNK_SPLIT_ENCODE=0 is the escape if it regresses.
         assert_eq!(
-            resolve_split_mode(10, five_k_240, 2),
+            resolve_split_mode(Codec::H265, 10, five_k_240, 2),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        );
+        // D1: 10-bit 4K120 used to be vetoed by the depth rule BEFORE reaching the pixel-rate arm
+        // written for exactly it. It splits now.
+        assert_eq!(
+            resolve_split_mode(Codec::H265, 10, four_k_120, 2),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        );
+        // Under the bar, HEVC Main10 keeps the conservative single-engine default — a second
+        // engine buys nothing there, so being wrong costs ~nil.
+        assert_eq!(
+            resolve_split_mode(Codec::H265, 10, hd_60, 2),
             M::NV_ENC_SPLIT_DISABLE_MODE as u32
+        );
+    }
+
+    /// D2: the Main10 rule was measured on HEVC and used to be codec-blind, so it vetoed **AV1
+    /// 10-bit** — which has neither the sub-frame conflict nor any measurement against it.
+    #[test]
+    fn av1_10bit_is_no_longer_vetoed_by_an_hevc_measurement() {
+        let hd_60 = 1920u64 * 1080 * 60;
+        let four_k_120 = 3840u64 * 2160 * 120;
+        assert_eq!(
+            resolve_split_mode(Codec::Av1, 10, hd_60, 2),
+            M::NV_ENC_SPLIT_AUTO_MODE as u32,
+            "AV1 10-bit must follow the ordinary path, not inherit an HEVC veto"
+        );
+        assert_eq!(
+            resolve_split_mode(Codec::Av1, 10, four_k_120, 2),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
         );
     }
 
@@ -729,17 +788,17 @@ mod tests {
     fn split_uses_every_engine_the_gpu_has() {
         let four_k_120 = 3840u64 * 2160 * 120;
         assert_eq!(
-            resolve_split_mode(8, four_k_120, 3),
+            resolve_split_mode(Codec::H265, 8, four_k_120, 3),
             M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
             "a 3-engine GPU must split three ways"
         );
         assert_eq!(
-            resolve_split_mode(8, four_k_120, 1),
+            resolve_split_mode(Codec::H265, 8, four_k_120, 1),
             M::NV_ENC_SPLIT_DISABLE_MODE as u32,
             "a 1-engine GPU must not pretend to split — today this costs a wasted session open"
         );
         assert_eq!(
-            resolve_split_mode(8, four_k_120, 0),
+            resolve_split_mode(Codec::H265, 8, four_k_120, 0),
             M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
             "unprobed engine count keeps the historical assumption; the rejection fallback corrects"
         );

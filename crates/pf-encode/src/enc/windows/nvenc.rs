@@ -1166,7 +1166,7 @@ impl NvencD3d11Encoder {
             // The init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
             let split_mode: u32 =
-                resolve_split_mode(self.bit_depth, pixel_rate, self.encoder_engines);
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
             // Negotiated multi-slice (P2f): the direct-NVENC default of 4, clamped by the
             // client's ceiling — a single-slice client keeps today's shape, a
             // VIDEO_CAP_MULTI_SLICE / Moonlight slices-per-frame client gets real slices.

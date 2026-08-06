@@ -1366,7 +1366,7 @@ impl NvencCudaEncoder {
             // [`resolve_split_mode`] for the precedence (env override / 10-bit / pixel rate).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
             let mut split_mode: u32 =
-                resolve_split_mode(self.bit_depth, pixel_rate, self.encoder_engines);
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
             // A verdict this process already measured for this exact config wins over the static
             // rule — that is the whole point of arbitrating, and it lets later sessions skip the
             // ~1 s experiment. An operator pin still beats both (checked inside `resolve_split_mode`,
@@ -3940,6 +3940,114 @@ mod tests {
         // every later test that opens the same config with the split env unset (the D5 legs do
         // exactly that).
         super::super::nvenc_core::clear_split_verdicts();
+    }
+
+    /// ON-HARDWARE — **THE ADA MAIN10 QUESTION**, the one this whole programme has been deferring.
+    ///
+    /// The 10-bit split veto rests on a single datapoint: at 5120×1440@240 Main10 on Ada, forced-2
+    /// took 7.6 ms/frame against 2.8 ms single-engine — split was **2.7× SLOWER**. That number
+    /// vetoed splitting for every HDR session on every GPU, and `resolve_split_mode` has now
+    /// stopped short-circuiting on it, which means a Main10 session above the pixel-rate bar WILL
+    /// split. If the datapoint generalises, that is a regression and the veto has to come back
+    /// (scoped properly this time).
+    ///
+    /// So: 4K **Main10** (10-bit, via the packed-RGB10 input path), forced-2 against
+    /// single-engine, same bitrate, sub-frame pinned off so only the split variable moves.
+    /// Reports rather than asserts — both outcomes are legitimate findings and the point is the
+    /// number. Run on the **Ada** box (`.181`) and compare against Blackwell (`.21`):
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_main10_split_ab --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually (Ada .181 vs Blackwell .21)"]
+    fn nvenc_cuda_main10_split_ab() {
+        use std::time::Instant;
+        const BPS: u64 = 400_000_000;
+        const WARMUP: u32 = 12;
+        const MEASURED: u32 = 32;
+        // Mode is overridable so the SAME test can be pointed at the configuration the veto was
+        // originally measured on — `PF_AB_MODE=5120x1440x240` reproduces the 2.7×-slower datapoint's
+        // operating point, which is the one config this change flips behaviour for.
+        let (w, h, fps) = std::env::var("PF_AB_MODE")
+            .ok()
+            .and_then(|s| {
+                let p: Vec<u32> = s.split('x').filter_map(|v| v.parse().ok()).collect();
+                (p.len() == 3).then(|| (p[0], p[1], p[2]))
+            })
+            .unwrap_or((3840, 2160, 60));
+
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        // 10-bit input: the packed 2:10:10:10 PQ path is how a Main10 session is actually fed here
+        // (`bit_depth`/`hdr` are DERIVED from the input format, never trusted from the args).
+        let frames: Vec<CapturedFrame> = (0..4).map(|i| rgb10_frame(w, h, i)).collect();
+
+        let run = |split: &str| -> (u128, u8, usize) {
+            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                PixelFormat::X2Rgb10,
+                w,
+                h,
+                fps,
+                BPS,
+                true,
+                10,
+                ChromaFormat::Yuv420,
+                false,
+                4,
+            )
+            .expect("open NVENC CUDA session");
+            let (mut times, mut bytes) = (Vec::new(), Vec::new());
+            for i in 0..(WARMUP + MEASURED) {
+                let t0 = Instant::now();
+                enc.submit_indexed(&frames[(i % 4) as usize], i)
+                    .expect("submit");
+                let mut got = 0usize;
+                while let Some(au) = enc.poll().expect("poll") {
+                    got = au.data.len();
+                }
+                if i >= WARMUP {
+                    times.push(t0.elapsed().as_micros());
+                    bytes.push(got);
+                }
+            }
+            let depth = enc.bit_depth;
+            let opened = enc.split_mode;
+            enc.flush().ok();
+            times.sort_unstable();
+            bytes.sort_unstable();
+            println!(
+                "    (opened split_mode={opened}, derived bit_depth={depth}, \
+                 {} B/AU)",
+                bytes[bytes.len() / 2]
+            );
+            (times[times.len() / 2], depth, bytes[bytes.len() / 2])
+        };
+
+        println!(
+            "Main10 split A/B @ {w}x{h}@{fps} HEVC 10-bit, {} Mbps:",
+            BPS / 1_000_000
+        );
+        let (single_us, d1, _) = run("0");
+        println!("  single-engine : {single_us:>6} us/frame");
+        let (split_us, d2, _) = run("2");
+        println!("  forced 2-way  : {split_us:>6} us/frame");
+        assert_eq!(d1, 10, "leg 1 did not derive a 10-bit session");
+        assert_eq!(d2, 10, "leg 2 did not derive a 10-bit session");
+        let ratio = single_us as f64 / split_us.max(1) as f64;
+        println!(
+            "  ⇒ split is {ratio:.2}× the single-engine rate — {}",
+            if ratio > 1.15 {
+                "split WINS for Main10 here; the 2.7x-slower datapoint does NOT generalise"
+            } else if ratio < 0.87 {
+                "split LOSES for Main10 — the veto was right and must come back, scoped"
+            } else {
+                "a wash; neither arm is clearly better for Main10 here"
+            }
+        );
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).
