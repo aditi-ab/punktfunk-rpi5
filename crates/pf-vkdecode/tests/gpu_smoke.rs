@@ -11,15 +11,18 @@
 //! - a Vulkan 1.3 loader on the library path (`libvulkan.so.1` / `vulkan-1.dll`);
 //! - a physical device advertising `VK_KHR_video_queue`,
 //!   `VK_KHR_video_decode_queue` and the leg's codec extension
-//!   (`VK_KHR_video_decode_h264` / `VK_KHR_video_decode_h265`), with a queue
+//!   (`VK_KHR_video_decode_h264` / `VK_KHR_video_decode_h265` /
+//!   `VK_KHR_video_decode_av1`), with a queue
 //!   family carrying `VIDEO_DECODE_KHR` ops for that codec;
-//! - `timelineSemaphore` + `synchronization2` feature support (Vulkan 1.3 core).
+//! - `timelineSemaphore` + `synchronization2` feature support (Vulkan 1.3 core);
+//! - on RADV, `RADV_PERFTEST=video_decode` in the environment — for AV1 exactly as
+//!   for the other two, and without it the AV1 leg reports missing silicon it has.
 //!
 //! One leg per codec, running the SAME body ([`smoke`]) over the vendored 25fps
-//! vector of that codec — a box that decodes only one of the two runs that leg and
-//! reports the other as "no physical device with VK_KHR_video_decode_…", which is
-//! a fact about the box rather than a failure. Device bring-up lives in
-//! `tests/common/mod.rs`.
+//! vector of that codec — a box that decodes only some of the three runs those legs
+//! and reports the rest as "no physical device with VK_KHR_video_decode_…", which is
+//! a fact about the box rather than a failure (AV1 is the one most likely to say so
+//! on today's fleet). Device bring-up lives in `tests/common/mod.rs`.
 //!
 //! What they prove: device wrap → caps query/derivation on REAL caps → session +
 //! parameters creation → the decoupled picture pool → 48 AUs of the vendored
@@ -45,11 +48,13 @@ use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
 use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
+use pf_vkdecode::VkAv1Decoder;
 use pf_vkdecode::VkH264Decoder;
 use pf_vkdecode::VkH265Decoder;
 
-/// AUs fed: far past either vector's DPB depth (`max_dpb_frames = 7` for the
-/// H.264 clip), so DPB slots re-activate onto fresh pool images repeatedly.
+/// AUs fed: far past every vector's DPB depth (`max_dpb_frames = 7` for the
+/// H.264 clip, eight reference slots for AV1), so DPB slots re-activate onto fresh
+/// pool images repeatedly.
 const AUS: usize = 48;
 /// The REAL client's consumption shape: the consumer holds four delivered frames
 /// and releases only the oldest beyond that (its channels + preroll + in-flight
@@ -77,8 +82,8 @@ struct Geometry {
 /// Decode [`AUS`] access units while holding [`CLIENT_HOLD`] frames, asserting the
 /// decode verdict of every frame before its release.
 ///
-/// One body for both codecs (over `common::TestDecoder`) so "the H.265 leg proves
-/// what the H.264 leg proves" is structural rather than a claim about two copies.
+/// One body for all three codecs (over `common::TestDecoder`) so "the AV1 leg proves
+/// what the H.264 leg proves" is structural rather than a claim about three copies.
 fn smoke(decoder: &mut impl TestDecoder, aus: &[&[u8]], geometry: &Geometry) {
     // The smoke legs exist to prove the PRODUCTION pool arrangement survives 48
     // AUs at the client's hold depth. `PF_VKD_TEST_READBACK` adds TRANSFER_SRC to
@@ -131,7 +136,7 @@ fn smoke(decoder: &mut impl TestDecoder, aus: &[&[u8]], geometry: &Geometry) {
                 }
                 // A pool built for the wrong picture format decodes and then
                 // renders with the wrong maths (`DecodedVkFrame::format` docs);
-                // both vectors are 8-bit 4:2:0, so both must land on NV12.
+                // all three vectors are 8-bit 4:2:0, so all three must land on NV12.
                 assert_eq!(
                     frame.format,
                     pf_vkdecode::NV12,
@@ -267,13 +272,67 @@ fn h265_decodes_48_aus_holding_four_frames_like_the_real_client() {
     unsafe { setup.destroy() };
 }
 
+/// The AV1 leg — the rung's first hardware evidence of ANY kind.
+///
+/// The same 48 access units at the same client hold depth, but AV1 loads the pool
+/// harder than either H.26x leg does and that is the point of running it: the first
+/// 48 temporal units carry 53 coded frames to show 48 (the number
+/// [`the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus`]
+/// prints), each hidden frame keeps a pool image resident as a reference while
+/// nothing displays it, and eight reference slots re-activate against that. A pool
+/// sized as if one access unit meant one picture starves exactly here — which is this
+/// leg's whole job, since `gpu_parity`'s AV1 leg would report the same starvation as a
+/// decode failure with a less obvious cause.
+#[test]
+#[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
+fn av1_decodes_48_aus_holding_four_frames_like_the_real_client() {
+    // One codec at a time on the device (see `common::gpu_lock`).
+    let _gpu = common::gpu_lock();
+
+    let setup = common::bring_up(&common::Request {
+        codec: common::AV1,
+        graphics: common::Graphics::DecodeFamilyIsFine,
+        report_families: true,
+    });
+    let handles = setup.handles();
+    {
+        // SAFETY: as the H.264 leg — `setup` outlives this block and was created
+        // with the AV1 decode extension + timeline/sync2 features.
+        let mut decoder = unsafe { VkAv1Decoder::new(&handles, Box::new(NoopQueueLock)) }
+            .expect("wrap the device");
+        // The construction-time shape gate on the vector's own facts (Main, 4:2:0,
+        // 8-bit, NO film grain → NV12). The film-grain argument is the one that has
+        // no H.26x counterpart: grain synthesis is part of the Vulkan decode PROFILE,
+        // so a box offering only the grain-enabled profile refuses HERE with a caps
+        // reason rather than at the first temporal unit.
+        decoder.probe_stream_support(1, 8, false).expect(
+            "the box must host AV1 Main 4:2:0 8-bit without film grain (the vector's shape)",
+        );
+        smoke(
+            &mut decoder,
+            &common::split_av1_aus(common::TEST_25FPS_AV1),
+            &Geometry {
+                display: (320, 240),
+                // As HEVC: no hardware evidence for AV1's `pictureAccessGranularity`
+                // on any fleet box yet, so the leg prints what it allocates rather
+                // than asserting a number nobody has observed. AV1's decode extent is
+                // the POST-superres width, which is another reason not to guess.
+                exact_coded: None,
+            },
+        );
+    }
+    // SAFETY: as the H.264 leg — the decoder is gone and nothing else references
+    // the setup's handles.
+    unsafe { setup.destroy() };
+}
+
 // ---------------------------------------------------------------------------
-// CPU coherence guard — NOT `#[ignore]`d.
+// CPU coherence guards — NOT `#[ignore]`d.
 //
 // The legs above only run on the fleet, so [`MIN_DELIVERED`] would otherwise be a
-// number copied from the H.264 leg and never checked against the H.265 vector's
-// own reorder depth. It is the CPU planner that decides how many of the first
-// [`AUS`] pictures can possibly be delivered — the decoder builds exactly one
+// number copied from the H.264 leg and never checked against the H.265 or AV1
+// vector's own reorder depth. It is the CPU planner that decides how many of the
+// first [`AUS`] pictures can possibly be delivered — the decoder builds exactly one
 // frame per `dpb.outputs` id — so the floor is checkable here, without a GPU, and
 // a re-synced vector that reorders more deeply fails HERE instead of looking like
 // a pool-starvation bug on hardware.
@@ -313,7 +372,30 @@ fn the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus() {
             })
             .sum::<usize>()
     };
-    eprintln!("outputs from the first {AUS} AUs: h264={h264} h265={h265}");
+    // AV1 needs the extra fold: one temporal unit can plan SEVERAL frames, so the
+    // outputs of a unit are the outputs of all of its plans — and counting one plan
+    // per unit is exactly how a reader would under-count here.
+    let (av1, av1_frames) = {
+        let mut planner = pf_bitstream::av1::Av1Planner::new();
+        let mut outputs = 0usize;
+        let mut frames = 0usize;
+        for (index, au) in common::split_av1_aus(common::TEST_25FPS_AV1)
+            .iter()
+            .take(AUS)
+            .enumerate()
+        {
+            let plans = planner
+                .plan_au(au)
+                .unwrap_or_else(|e| panic!("AV1 temporal unit {index} must plan, got {e:?}"));
+            frames += plans.len();
+            outputs += plans.iter().map(|p| p.dpb.outputs.len()).sum::<usize>();
+        }
+        (outputs, frames)
+    };
+    eprintln!(
+        "outputs from the first {AUS} AUs: h264={h264} h265={h265} av1={av1} \
+         (av1 decoded {av1_frames} frames to show {av1} — the hidden ones)"
+    );
     // No `flush` here on purpose: the smoke legs do not flush either, so the
     // planner's un-flushed output count is exactly the frame budget they have.
     assert!(
@@ -325,5 +407,20 @@ fn the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus() {
         h265 >= MIN_DELIVERED,
         "the H.265 leg asserts >= {MIN_DELIVERED} delivered but the planner only \
          outputs {h265} pictures from the first {AUS} AUs"
+    );
+    assert!(
+        av1 >= MIN_DELIVERED,
+        "the AV1 leg asserts >= {MIN_DELIVERED} delivered but the planner only \
+         outputs {av1} pictures from the first {AUS} temporal units"
+    );
+    // The AV1 leg's load is not the same as the other two's, and the assertion above
+    // cannot see the difference: the pool must hold the hidden frames as well as the
+    // shown ones. If these ever became equal, the leg would have stopped exercising
+    // multi-frame temporal units — the one pool pressure AV1 has that H.26x has not —
+    // while still passing everything above.
+    assert!(
+        av1_frames > av1,
+        "the first {AUS} AV1 temporal units must decode MORE frames ({av1_frames}) \
+         than they show ({av1}); equal counts mean the hidden-frame coverage is gone"
     );
 }

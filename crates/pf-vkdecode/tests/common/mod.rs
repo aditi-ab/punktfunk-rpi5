@@ -1,18 +1,18 @@
 //! Shared Vulkan Video bring-up for the `#[ignore]`d GPU legs.
 //!
-//! `tests/gpu_smoke.rs` and `tests/gpu_parity.rs` each drive TWO codecs, and the
+//! `tests/gpu_smoke.rs` and `tests/gpu_parity.rs` each drive THREE codecs, and the
 //! path from "a Vulkan loader exists" to "a [`DeviceHandles`] a decoder can be
 //! constructed on" is the same ~150 unsafe lines every time: loader → instance →
 //! pick a physical device whose queue families carry the codec's decode ops →
 //! logical device with the decode extensions plus `timelineSemaphore` and
-//! `synchronization2`. Four copies of that would be four places for a
+//! `synchronization2`. Six copies of that would be six places for a
 //! fleet-only failure to hide, so it lives here once, parameterised by the one
 //! thing that genuinely differs between the callers ([`Graphics`]: the parity
 //! legs read back on a graphics queue and so REQUIRE one, while the smoke legs
 //! accept a decode-only device and fall back to the decode family — which also
 //! decides whether pool images end up EXCLUSIVE or CONCURRENT, so it is not
 //! cosmetic). [`Request::report_families`] exists so a caller CAN suppress the
-//! per-family table, but all four legs currently ask for it: it is the first
+//! per-family table, but every leg currently asks for it: it is the first
 //! thing a fleet failure report needs, and it is a physical-device property
 //! query, never a recorded RESULT_STATUS query, so it cannot trip the RADV VCN
 //! hang.
@@ -63,6 +63,39 @@ pub const TEST_25FPS_H264: &[u8] = include_bytes!(
 pub const TEST_25FPS_H265: &[u8] = include_bytes!(
     "../../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
 );
+
+/// The vendored AV1 twin: 320x240 Main 4:2:0 8-bit, no film grain, **250 temporal
+/// units carrying 274 coded frames** — 24 units carry two frames each, and those 24
+/// extras are HIDDEN (decoded, referenced, never shown; the vector contains no
+/// `show_existing_frame` at all). 250 frames are displayed, which is what the rung
+/// delivers and what `data/test-25fps-av1.nv12.sha256` hashes.
+///
+/// Note the file name: it is `test-25fps.ivf.av1`, not `test-25fps.av1.ivf` — the
+/// directory holds BOTH, byte-identical, and only the former has the `.md5`/`.crc`
+/// reference hashes beside it. pf-bitstream's planner tests include this one.
+pub const TEST_25FPS_AV1: &[u8] = include_bytes!(
+    "../../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
+);
+
+/// Split the AV1 vector into access units — one IVF packet per TEMPORAL UNIT.
+///
+/// Unlike the two Annex-B splitters below there is nothing to re-derive here: AV1
+/// carries no start codes, so an access unit is not something a scan recovers from
+/// the elementary stream — it is the container's framing, and the vector's container
+/// is IVF. `IvfIterator` is the vendored parser's own reader (the same one
+/// pf-bitstream's AV1 planner tests walk), so this is a rename for symmetry with
+/// [`split_h264_aus`]/[`split_h265_aus`] rather than a second implementation that
+/// could disagree with production.
+///
+/// The consequence for the parity legs is worth stating: AV1 has **no prefix-width
+/// leg** and needs none. The four-byte-start-code hazard that made HEVC unplayable
+/// on every driver (see [`h265_four_byte_start_codes`]) simply has no AV1
+/// counterpart — OBUs are length-delimited, the host hands whole temporal units
+/// across, and there is no prefix for a driver to mis-skip. Its absence here is
+/// deliberate, not an omission.
+pub fn split_av1_aus(stream: &[u8]) -> Vec<&[u8]> {
+    cros_codecs::bitstream_utils::IvfIterator::new(stream).collect()
+}
 
 /// Test-only H.264 AU splitter, mirroring pf-bitstream's
 /// (`#[cfg(test)]`-private there): a new AU starts at a non-VCL NALU following
@@ -190,11 +223,11 @@ pub fn h265_four_byte_start_codes(stream: &[u8]) -> Vec<u8> {
 
 /// The slice of a decoder's surface the GPU legs drive.
 ///
-/// `VkH264Decoder` and `VkH265Decoder` expose it method-for-method (the crate
-/// docs say so deliberately) but share no trait — codec DISPATCH is the client
-/// wiring's job, not this crate's. Binding it here lets each GPU leg run ONE body
-/// against both codecs, which is the only way "the H.265 leg proves the same thing
-/// the H.264 leg does" can be a fact instead of a claim about two hand-copied
+/// `VkH264Decoder`, `VkH265Decoder` and `VkAv1Decoder` expose it method-for-method
+/// (the crate docs say so deliberately) but share no trait — codec DISPATCH is the
+/// client wiring's job, not this crate's. Binding it here lets each GPU leg run ONE
+/// body against all three codecs, which is the only way "the AV1 leg proves the same
+/// thing the H.264 leg does" can be a fact instead of a claim about three hand-copied
 /// functions.
 pub trait TestDecoder {
     fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError>;
@@ -210,7 +243,7 @@ pub trait TestDecoder {
     fn debug_snapshot(&self) -> String;
 }
 
-/// Forwarding impl — one macro so the two decoders can never drift into being
+/// Forwarding impl — one macro so the three decoders can never drift into being
 /// driven differently by accident.
 macro_rules! impl_test_decoder {
     ($ty:ty) => {
@@ -246,6 +279,7 @@ macro_rules! impl_test_decoder {
 
 impl_test_decoder!(pf_vkdecode::VkH264Decoder);
 impl_test_decoder!(pf_vkdecode::VkH265Decoder);
+impl_test_decoder!(pf_vkdecode::VkAv1Decoder);
 
 /// Serializes the GPU legs within one test binary. Hold it for the whole leg.
 ///
@@ -291,6 +325,18 @@ pub const H264: Codec = Codec {
 pub const H265: Codec = Codec {
     op: vk::VideoCodecOperationFlagsKHR::DECODE_H265,
     extension: ash::khr::video_decode_h265::NAME,
+};
+
+/// AV1 decode (`VkAv1Decoder`).
+///
+/// The narrowest of the three on the fleet: `VK_KHR_video_decode_av1` only reached
+/// core drivers in 2024, so a box that decodes both H.26x codecs may still report
+/// "no physical device with VK_KHR_video_decode_av1", which is a fact about the box.
+/// On RADV the extension is additionally behind `RADV_PERFTEST=video_decode`, the
+/// same knob the other two need.
+pub const AV1: Codec = Codec {
+    op: vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+    extension: ash::khr::video_decode_av1::NAME,
 };
 
 /// What a caller needs from the GRAPHICS queue family — the one behavioural

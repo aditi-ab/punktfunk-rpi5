@@ -1,4 +1,4 @@
-//! GPU frame-hash parity tests (WP-D) — the two decode legs are `#[ignore]`d
+//! GPU frame-hash parity tests (WP-D) — the decode legs are `#[ignore]`d
 //! because they need real Vulkan Video hardware; the coherence guards at the
 //! bottom of this file are not, and run in ordinary CI.
 //!
@@ -8,35 +8,54 @@
 //! cargo test -p pf-vkdecode --test gpu_parity -- --ignored --nocapture
 //! ```
 //!
-//! (RADV boxes additionally need `RADV_PERFTEST=video_decode`; multi-GPU boxes
+//! (RADV boxes additionally need `RADV_PERFTEST=video_decode` — for AV1 as much as
+//! for the other two, and without it `bring_up` reports "no physical device with
+//! VK_KHR_video_decode_av1", which reads like missing silicon; multi-GPU boxes
 //! pin the vendor with `PF_VKD_SMOKE_VENDOR=0x1002` / `0x10de`, same knob as
 //! the smoke tests. Device bring-up lives in `tests/common/mod.rs`.)
 //!
-//! What they prove: H.264 and H.265 decoding are both exactly specified — every
+//! What they prove: H.264, H.265 and AV1 decoding are all exactly specified — every
 //! conformant decoder must produce bit-identical output — so the vendored 25fps
-//! vector of each codec is decoded through [`VkH264Decoder`] / [`VkH265Decoder`],
+//! vector of each codec is decoded through [`VkH264Decoder`] / [`VkH265Decoder`] /
+//! [`VkAv1Decoder`],
 //! every output frame's NV12 planes are read back (`vkCmdCopyImageToBuffer` on the
 //! graphics queue — GPU→CPU is fine in a test; the pool grows TRANSFER_SRC via the
 //! decoders' `PF_VKD_TEST_READBACK` hook), cropped to the display region,
 //! SHA-256-hashed in DISPLAY order and compared against goldens from libavcodec's
 //! SOFTWARE decoder (the reference implementation — provenance in
-//! `data/test-25fps.nv12.sha256` and `data/test-25fps-h265.nv12.sha256`). ALL
+//! `data/test-25fps.nv12.sha256`, `data/test-25fps-h265.nv12.sha256` and
+//! `data/test-25fps-av1.nv12.sha256`). ALL
 //! frames are collected, including the tail `flush` delivers, and the frame count
 //! must match libavcodec's too.
 //!
-//! Both legs run ONE body ([`collect_hashes`]) over `common::TestDecoder`, so the
-//! H.265 leg cannot quietly test something weaker than the H.264 one. A box that
-//! decodes only one codec runs that leg and reports the other as "no physical
-//! device with VK_KHR_video_decode_…", which is a fact about the box.
+//! Every leg runs ONE body ([`collect_hashes`]) over `common::TestDecoder`, so the
+//! H.265 and AV1 legs cannot quietly test something weaker than the H.264 one. A box
+//! that decodes only some of the three runs those legs and reports the rest as "no
+//! physical device with VK_KHR_video_decode_…", which is a fact about the box —
+//! and on today's fleet AV1 is the one most likely to say so.
 //!
-//! Each codec runs that body TWICE: once over the vendored vector as it sits,
-//! and once over the same vector rewritten to FOUR-byte start codes, which is
+//! The two Annex-B codecs run that body TWICE: once over the vendored vector as it
+//! sits, and once over the same vector rewritten to FOUR-byte start codes, which is
 //! what the real host emits on 100% of access units in both codecs (1514/1514
 //! H.264 and 1133/1133 HEVC, measured off the M0 NVENC corpus). Prefix width
 //! carries no information, so both runs must reproduce the same goldens —
 //! and submitting the four-byte form to the driver unchanged is precisely the
 //! defect that made HEVC unplayable on every driver tested. Until these legs
-//! existed no parity vector exercised the form that actually ships.
+//! existed no parity vector exercised the form that actually ships. **AV1 has no
+//! such twin and needs none**: OBUs are length-delimited, so there is no start-code
+//! prefix for a driver to mis-skip and no second framing to test (see
+//! `common::split_av1_aus`). Its absence is deliberate.
+//!
+//! # Why the AV1 leg exists at all
+//!
+//! Because until it did, the AV1 rung had no pixel evidence whatsoever. An
+//! adversarial review of the conversion found four defects — per-frame flags left
+//! unset on all 274 frames, a units error in `LoopRestorationSize`, per-reference
+//! info describing the wrong picture, and zeroed film-grain fields — and every one
+//! of them would have shown as a hash mismatch on frame 0 or shortly after, while
+//! NONE of them failed clippy or the crate's unit tests. Type-checking a struct
+//! conversion cannot tell you the struct describes the right picture; only the
+//! pixels can.
 //!
 //! The readback follows the presenter's exact frame contract: wait the frame's
 //! timeline `value`, round-trip the layout, signal `value + 1` in the SAME
@@ -56,6 +75,7 @@ use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
 use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
+use pf_vkdecode::VkAv1Decoder;
 use pf_vkdecode::VkH264Decoder;
 use pf_vkdecode::VkH265Decoder;
 use sha2::Digest;
@@ -66,6 +86,12 @@ const GOLDENS_H264: &str = include_str!("data/test-25fps.nv12.sha256");
 
 /// The H.265 twin, cross-checked between two independent FFmpeg builds (header).
 const GOLDENS_H265: &str = include_str!("data/test-25fps-h265.nv12.sha256");
+
+/// The AV1 twin: 250 DISPLAYED frames of a 274-coded-frame vector, cross-checked
+/// between two independent FFmpeg builds on two architectures AND against the
+/// per-frame MD5s cros-codecs vendored beside the vector (full provenance in the
+/// file's header — it is the only golden here with a third-party corroboration).
+const GOLDENS_AV1: &str = include_str!("data/test-25fps-av1.nv12.sha256");
 
 /// The ten-bit vector and its goldens. No hardware leg in this file consumes them
 /// yet — the D3D11VA rung is where the ten-bit parity leg currently runs — but the
@@ -87,14 +113,38 @@ const DISPLAY_H264: (u32, u32) = (320, 240);
 /// parameter instead of reading one global pair.
 const DISPLAY_H265: (u32, u32) = (320, 240);
 
-/// Both vectors' picture format: 8-bit 4:2:0. H.264 is NV12 by envelope
-/// (`derive_caps` wants nothing else), H.265 Main resolves to it from the SPS —
+/// The AV1 vector's display region — its `render_width` x `render_height`, AV1's
+/// answer to a conformance window, and what [`DecodedVkFrame::crop`] carries on this
+/// rung. Equal to the coded (post-superres) size for this vector, which
+/// [`av1_goldens_and_the_ivf_split_agree_with_the_planner`] pins rather than assumes:
+/// a re-synced vector whose render region shrank would make the readback crop a
+/// region the goldens never hashed.
+const DISPLAY_AV1: (u32, u32) = (320, 240);
+
+/// All three vectors' picture format: 8-bit 4:2:0. H.264 is NV12 by envelope
+/// (`derive_caps` wants nothing else), H.265 Main resolves to it from the SPS and
+/// AV1 Main (`seq_profile = 0`, `high_bitdepth = 0`) from the sequence header —
 /// and [`DecodedVkFrame::format`] exists precisely so a pool misconfigured to
 /// P010 fails loudly instead of hashing differently.
 const EXPECTED_FORMAT: vk::Format = pf_vkdecode::NV12;
 
-/// Every vendored 25fps vector, in both codecs, is 250 display frames.
+/// Every vendored 25fps vector, in all three codecs, is 250 DISPLAY frames.
+///
+/// For H.264 and H.265 that is also one per access unit. For AV1 it is emphatically
+/// not: its 250 temporal units carry [`AV1_CODED_FRAME_COUNT`] coded frames, 24 of
+/// which are HIDDEN — decoded, referenced by later frames, never shown (the vector
+/// uses no `show_existing_frame`, so they are displayed by no route at all). The
+/// rung delivers one frame per `dpb.outputs` id, so 250 is the number the goldens
+/// carry and the number the parity leg must compare.
 const FRAME_COUNT: usize = 250;
+
+/// The AV1 vector's CODED frame count — 24 more than [`FRAME_COUNT`].
+///
+/// Asserted by the CPU guard so the display/coded distinction stays a measured fact
+/// rather than a comment: if a re-sync ever made these two numbers equal, the vector
+/// would have lost its hidden-frame coverage (the exact thing that makes AV1's
+/// multi-frame temporal units worth testing) while every hash still matched.
+const AV1_CODED_FRAME_COUNT: usize = 274;
 
 /// The golden file's hash lines (comments and blanks skipped).
 fn golden_hashes(file: &'static str) -> Vec<&'static str> {
@@ -102,6 +152,50 @@ fn golden_hashes(file: &'static str) -> Vec<&'static str> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect()
+}
+
+/// Refuse a golden set that could make a parity verdict vacuous.
+///
+/// Three ways a comparison can "pass" while proving nothing, all closed here:
+///
+/// - **an empty or short set** — [`assert_bit_identical`] compares `hashes` against
+///   `goldens` pairwise and asserts the lengths match, so a file that lost its
+///   entries to a bad regeneration would agree with a decoder that delivered
+///   nothing. Pinning the count against a constant the CPU guards also re-derive
+///   from the planner closes that.
+/// - **junk that is not a digest** — a truncated or re-formatted line can never
+///   equal a real hash, but a file of blank-looking lines could quietly become a
+///   comparison of nothing.
+/// - **all entries identical** — the one that matters most on a video codec. If
+///   every golden were the same digest, a decoder emitting one frozen frame 250
+///   times would pass, which is precisely the failure mode a broken reference
+///   conversion produces. All four golden sets here are fully distinct (250/250
+///   H.264, 250/250 H.265, 250/250 AV1, 50/50 Main 10), so requiring full
+///   distinctness is not a weak bound.
+fn assert_goldens_are_a_real_set(goldens: &[&str], expected: usize, path: &str) {
+    assert_eq!(
+        goldens.len(),
+        expected,
+        "{path} must carry one hash per display frame"
+    );
+    assert!(
+        goldens
+            .iter()
+            .all(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{path}: every golden line is a bare lowercase SHA-256 hex digest"
+    );
+    let distinct = goldens
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(
+        distinct,
+        goldens.len(),
+        "{path}: {distinct} of {} goldens are distinct — a set with repeats (and \
+         above all a set that is ALL one digest) would let a decoder that froze on \
+         a single frame pass parity",
+        goldens.len()
+    );
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -486,7 +580,16 @@ fn consume_frame(
 }
 
 /// Decode every AU, hash every delivered frame in display order, including the
-/// tail `flush` hands back. One body for both codecs.
+/// tail `flush` hands back. One body for all three codecs.
+///
+/// The flush tail is where the codecs legitimately differ and the body deliberately
+/// does not: H.264 and H.265 can hold pictures back for reorder, so their planners'
+/// `flush` releases a tail. AV1's planner has no `flush` at all — a shown frame is
+/// output by the very temporal unit that decodes it — so `VkAv1Decoder::flush` frees
+/// the hidden pictures' images and hands back nothing. Draining afterwards is
+/// therefore a no-op for AV1 rather than a special case, and running the identical
+/// body means an AV1 rung that ever DID strand a shown frame would be caught by the
+/// frame-count assertion instead of hidden by a codec-specific shortcut.
 fn collect_hashes(
     decoder: &mut impl TestDecoder,
     readback: &Readback,
@@ -532,21 +635,28 @@ fn assert_bit_identical(hashes: &[String], goldens: &[&str], codec: &str) {
         goldens.len()
     );
     let mut mismatches = 0usize;
+    let mut first_divergence: Option<usize> = None;
     for (index, (got, want)) in hashes.iter().zip(goldens.iter()).enumerate() {
         if got.as_str() != *want {
             if mismatches < 10 {
                 eprintln!("frame {index}: MISMATCH\n  ours:   {got}\n  golden: {want}");
             }
+            first_divergence.get_or_insert(index);
             mismatches += 1;
         }
     }
-    assert_eq!(
-        mismatches,
-        0,
-        "{codec}: {mismatches}/{} frames diverge from libavcodec (first 10 printed \
-         above; frame 0 is intra-only — if IT mismatches, suspect readback \
-         geometry (pitch/crop) or intra decode; later-only mismatches point at \
-         inter prediction / DPB management)",
+    // The FIRST divergent index is the whole diagnostic: everything after it may be
+    // downstream of that one frame through prediction and the DPB, so a report that
+    // only counted mismatches would bury the one number that localises the defect.
+    assert!(
+        first_divergence.is_none(),
+        "{codec}: FIRST DIVERGENT FRAME = {} ({mismatches}/{} frames diverge from \
+         libavcodec; up to 10 printed above). Frame 0 is intra-only — if IT is the \
+         first, suspect readback geometry (pitch/crop), the picture format, or intra \
+         decode / the per-frame parameter conversion; a first divergence LATER points \
+         at inter prediction, per-reference info or DPB management, and the frames \
+         after it are probably just downstream of it.",
+        first_divergence.unwrap_or_default(),
         hashes.len()
     );
     eprintln!(
@@ -766,6 +876,115 @@ fn h265_four_byte_start_codes_decode_bit_identically() {
     );
 }
 
+/// The AV1 twin of [`h265_parity_run`].
+///
+/// Concrete where the H.265 one is parameterised, because AV1 has exactly one
+/// vendored vector and one shape (Main 4:2:0 8-bit, no film grain, 320x240); the
+/// facts it hard-codes are re-derived from the planner, without a GPU, by
+/// [`av1_goldens_and_the_ivf_split_agree_with_the_planner`], so a re-synced vector
+/// of another shape fails in ordinary CI with the reason rather than on the fleet as
+/// a confusing probe refusal. A second AV1 vector (Main 10, or one that uses
+/// `show_existing_frame`) is the point at which this should grow the same parameters
+/// the H.265 body carries — not before.
+fn av1_parity_run(aus: &[&[u8]], label: &str) {
+    // As the other legs: one codec at a time on the device, and the `set_var` below
+    // happens only under this lock (see `common::gpu_lock`).
+    let _gpu = common::gpu_lock();
+
+    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+
+    let goldens = golden_hashes(GOLDENS_AV1);
+    // Non-vacuity, before any hardware is touched: the right number of entries, all
+    // real digests, all distinct (see the helper's docs — a frozen-frame decoder
+    // must not be able to pass this leg).
+    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps-av1.nv12.sha256");
+    // …and the leg must actually be fed something. An IVF whose packets failed to
+    // parse would hand `collect_hashes` an empty AU list, which delivers no frames
+    // and would then fail as a frame-count mismatch that reads like a decoder defect.
+    assert_eq!(
+        aus.len(),
+        FRAME_COUNT,
+        "{label}: the vector must split into {FRAME_COUNT} temporal units"
+    );
+
+    let setup = common::bring_up(&common::Request {
+        codec: common::AV1,
+        // As the other parity legs: the readback records on the graphics queue, so a
+        // device without a graphics family is skipped rather than defaulted.
+        graphics: common::Graphics::Required,
+        report_families: true,
+    });
+    let handles = setup.handles();
+
+    let hashes = {
+        // SAFETY: as the H.264/H.265 legs — `setup` outlives this block (destroyed
+        // below, after the decoder and readback drop at the block's end), it was
+        // created with the AV1 decode extension + timeline/sync2 features, and its
+        // queue fields name the families/queues it created.
+        let mut decoder = unsafe { VkAv1Decoder::new(&handles, Box::new(NoopQueueLock)) }
+            .expect("wrap the device");
+        // The construction-time shape gate, on the vector's own facts: 4:2:0, 8-bit,
+        // and NO film grain. The third argument is the load-bearing one — grain
+        // synthesis is part of the Vulkan decode PROFILE, so a box that offers only
+        // the grain-enabled profile (or only the disabled one) refuses HERE with a
+        // caps reason instead of failing at the first temporal unit.
+        decoder
+            .probe_stream_support(1, 8, false)
+            .unwrap_or_else(|e| {
+                panic!("{label}: the box must host AV1 Main 4:2:0 8-bit, no film grain — {e:?}");
+            });
+        // SAFETY: as the other legs — live instance/device, queue 0 of `graphics_qf`
+        // was created by the bring-up; destroyed at the end of this block.
+        let readback = unsafe {
+            Readback::new(
+                &setup.instance,
+                setup.pd,
+                &setup.device,
+                setup.graphics_qf,
+                DISPLAY_AV1,
+                EXPECTED_FORMAT,
+            )
+        };
+        let hashes = collect_hashes(&mut decoder, &readback, aus);
+        // SAFETY: every readback was fence-waited inside `read_nv12`; nothing else
+        // references its handles.
+        unsafe { readback.destroy() };
+        hashes
+    };
+
+    // SAFETY: as the other legs — the decoder is gone (its Drop drained the queue and
+    // destroyed its session/pools) and the readback's handles are destroyed.
+    unsafe { setup.destroy() };
+
+    assert_bit_identical(&hashes, &goldens, label);
+}
+
+/// The AV1 rung's first pixel evidence.
+///
+/// 250 temporal units in, 250 DISPLAYED frames out (the 24 hidden frames the vector
+/// also codes are decoded, referenced and never shown — module docs), each read back
+/// as tightly packed NV12 over its `render_width` x `render_height` region and
+/// compared against libavcodec's software decode.
+///
+/// What a failure looks like, and where to point it:
+/// - **frame 0** — the sequence header or the per-frame parameter conversion:
+///   `StdVideoAV1SequenceHeader`, the eight per-frame sub-blocks (tile info,
+///   quantisation, segmentation, loop filter, CDEF, loop restoration, global motion,
+///   film grain), the tile-group ranges, or the readback geometry. AV1 puts in the
+///   frame header what H.26x puts in parameter sets, so a single wrong field here
+///   damages every frame.
+/// - **frame 1** — the first frame with a reference. Per-reference info, the
+///   reference-NAME → DPB-slot table, or `ref_frame_idx` ordering.
+/// - **later, then everything after** — DPB slot management, `refresh_frame_flags`,
+///   or the hidden frames: a run that is clean until roughly the first multi-frame
+///   temporal unit and wrong thereafter is the signature of the hidden ALTREF being
+///   stored wrong or not at all.
+#[test]
+#[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
+fn av1_every_frame_hashes_bit_identical_to_libavcodec() {
+    av1_parity_run(&common::split_av1_aus(common::TEST_25FPS_AV1), "AV1");
+}
+
 // ---------------------------------------------------------------------------
 // CPU coherence guards — NOT `#[ignore]`d.
 //
@@ -776,7 +995,10 @@ fn h265_four_byte_start_codes_decode_bit_identically() {
 // hardware round trip to disprove.
 //
 // Each guard pins the whole chain the parity verdict rests on: the AU split, the
-// planner's output count, and the golden line count — with NO GPU involved.
+// planner's output count, the vector's shape and the golden set — with NO GPU
+// involved. And they are what make the verdicts non-vacuous: a comparison of zero
+// frames, or of 250 copies of one digest, would otherwise "pass" on any hardware
+// (see [`assert_goldens_are_a_real_set`]).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -784,17 +1006,7 @@ fn h265_goldens_and_au_split_agree_with_the_planner() {
     use pf_bitstream::h265::H265Planner;
 
     let goldens = golden_hashes(GOLDENS_H265);
-    assert_eq!(
-        goldens.len(),
-        FRAME_COUNT,
-        "data/test-25fps-h265.nv12.sha256 must carry one hash per display frame"
-    );
-    assert!(
-        goldens
-            .iter()
-            .all(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit())),
-        "every golden line is a bare lowercase SHA-256 hex digest"
-    );
+    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps-h265.nv12.sha256");
 
     // The AU split the parity leg feeds the decoder. `common::split_h265_aus` is
     // the copy of pf-bitstream's private splitter, and it keys on HEVC's 2-byte
@@ -886,17 +1098,7 @@ fn h264_goldens_and_au_split_agree_with_the_planner() {
     use pf_bitstream::h264::H264Planner;
 
     let goldens = golden_hashes(GOLDENS_H264);
-    assert_eq!(
-        goldens.len(),
-        FRAME_COUNT,
-        "data/test-25fps.nv12.sha256 must carry one hash per display frame"
-    );
-    assert!(
-        goldens
-            .iter()
-            .all(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit())),
-        "every golden line is a bare lowercase SHA-256 hex digest"
-    );
+    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps.nv12.sha256");
 
     let aus = common::split_h264_aus(common::TEST_25FPS_H264);
     assert_eq!(
@@ -927,17 +1129,7 @@ fn the_main10_vector_is_ten_bit_and_agrees_with_its_goldens() {
     use pf_bitstream::h265::H265Planner;
 
     let goldens = golden_hashes(GOLDENS_MAIN10);
-    assert_eq!(
-        goldens.len(),
-        MAIN10_FRAME_COUNT,
-        "data/test-main10.p010.sha256 must carry one hash per display frame"
-    );
-    assert!(
-        goldens
-            .iter()
-            .all(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit())),
-        "every golden line is a bare lowercase SHA-256 hex digest"
-    );
+    assert_goldens_are_a_real_set(&goldens, MAIN10_FRAME_COUNT, "data/test-main10.p010.sha256");
 
     let aus = common::split_h265_aus(TEST_MAIN10_H265);
     assert_eq!(
@@ -981,6 +1173,145 @@ fn the_main10_vector_is_ten_bit_and_agrees_with_its_goldens() {
         goldens.len(),
         "the planner outputs {outputs} pictures but the goldens carry {}",
         goldens.len()
+    );
+}
+
+/// The AV1 leg's whole chain, with no GPU: the golden set, the IVF split, the shape
+/// the leg hard-codes, and — the one that matters — that **250 goldens is the
+/// DISPLAY count of a 274-frame vector**, re-derived from the planner rather than
+/// asserted from a comment.
+///
+/// Every number here is a way the fleet run could otherwise fail for a reason that
+/// is not the decoder:
+///
+/// - a golden file regenerated per CODED frame would carry 274 hashes and the leg
+///   would report a frame-count mismatch that reads exactly like dropped frames;
+/// - an IVF reader that lost packets would feed a short AU list and the leg would
+///   report the same thing;
+/// - a re-synced vector at another bit depth, sampling, or with film grain would
+///   make `probe_stream_support(1, 8, false)` probe the WRONG Vulkan profile and the
+///   readback expect the wrong format, which on hardware surfaces as a caps refusal
+///   or half a hashed picture;
+/// - and if the 24 hidden frames ever disappeared, the leg would still pass while
+///   having quietly stopped exercising multi-frame temporal units at all — the one
+///   thing AV1 has that neither H.26x vector does.
+#[test]
+fn av1_goldens_and_the_ivf_split_agree_with_the_planner() {
+    use pf_bitstream::av1::Av1Planner;
+
+    let goldens = golden_hashes(GOLDENS_AV1);
+    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps-av1.nv12.sha256");
+
+    // The AU split the parity leg feeds the decoder: one IVF packet per temporal
+    // unit. AV1 carries no start codes, so this is the container's framing rather
+    // than something a scan could get subtly wrong — but a truncated or re-muxed
+    // vector would still shorten it silently.
+    let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
+    assert_eq!(
+        aus.len(),
+        FRAME_COUNT,
+        "the vendored AV1 vector is {FRAME_COUNT} temporal units"
+    );
+    assert!(
+        aus.iter().all(|au| !au.is_empty()),
+        "no temporal unit is empty — an IVF reader that returned empty packets would \
+         make the parity leg decode nothing and blame the decoder"
+    );
+
+    // Walk the CPU planner over the same temporal units. It is the authority on how
+    // many frames the GPU leg can possibly deliver: the decoder builds exactly one
+    // delivered frame per `dpb.outputs` id, and AV1's planner has no `flush` tail.
+    let mut planner = Av1Planner::new();
+    let mut outputs = 0usize;
+    let mut coded_frames = 0usize;
+    let mut multi_frame_units = 0usize;
+    let mut show_existing = 0usize;
+    let mut warnings = 0usize;
+    for (index, au) in aus.iter().enumerate() {
+        let plans = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("temporal unit {index}: the clean vector must plan without errors, got {e:?}")
+        });
+        if plans.len() > 1 {
+            multi_frame_units += 1;
+        }
+        for plan in &plans {
+            coded_frames += 1;
+            outputs += plan.dpb.outputs.len();
+            warnings += plan.warnings.len();
+            // A `show_existing_frame` decodes nothing and stores nothing.
+            if plan.dpb.stored.is_none() {
+                show_existing += 1;
+            }
+            // Pin the picture shape both AV1 legs hard-code. They call
+            // `probe_stream_support(1, 8, false)` and assert an NV12 output format;
+            // a re-synced Main-10, 4:4:4 or film-grain vector would make both
+            // silently probe and expect the WRONG Vulkan decode profile on the
+            // fleet — grain synthesis is part of the PROFILE, not a per-frame
+            // toggle, so a grain-bearing vector is a different device requirement,
+            // not merely different pixels.
+            assert_eq!(
+                (
+                    plan.picture.chroma_format_idc,
+                    plan.picture.bit_depth,
+                    plan.sequence.film_grain_params_present,
+                ),
+                (1, 8, false),
+                "frame {coded_frames} (temporal unit {index}): the vendored AV1 vector \
+                 must stay Main 4:2:0 8-bit with no film grain"
+            );
+            if coded_frames == 1 {
+                assert!(plan.picture.is_key, "the vector opens on a key frame");
+                // What `Readback` crops to, and what the goldens hash.
+                assert_eq!(
+                    (plan.picture.render_width, plan.picture.render_height),
+                    DISPLAY_AV1,
+                    "the display (render) region the readback asserts against"
+                );
+                // …and what the pool allocates. Equal to the render region here, so
+                // the vector needs no AV1 conformance-window equivalent — the golden
+                // header's claim.
+                assert_eq!(
+                    (plan.picture.upscaled_width, plan.picture.frame_height),
+                    DISPLAY_AV1,
+                    "the decoded (post-superres) picture IS the display region for \
+                     this vector — coded size and render size coincide"
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        outputs,
+        goldens.len(),
+        "the planner outputs {outputs} pictures but the goldens carry {} hashes — the \
+         parity leg's frame-count assertion would fail on hardware for a reason that \
+         has nothing to do with the GPU",
+        goldens.len()
+    );
+    assert_eq!(
+        coded_frames,
+        AV1_CODED_FRAME_COUNT,
+        "the vendored AV1 vector codes {AV1_CODED_FRAME_COUNT} frames; {} of them are \
+         hidden, which is why the goldens are {FRAME_COUNT} and not {coded_frames}",
+        AV1_CODED_FRAME_COUNT - FRAME_COUNT
+    );
+    assert_eq!(
+        multi_frame_units, 24,
+        "24 temporal units carry two frames each — the hidden ALTREFs, and the only \
+         reason AV1's `plan_au` returns a vector at all. If this reaches 0 the parity \
+         leg has stopped exercising multi-frame temporal units while still passing"
+    );
+    assert_eq!(
+        show_existing, 0,
+        "this vector uses no `show_existing_frame`; if that ever changes, frames start \
+         being displayed by a route the decoder handles differently and the display \
+         order the goldens assume needs rederiving"
+    );
+    assert_eq!(
+        warnings, 0,
+        "a clean conformance vector must plan without concealment — any warning here \
+         means the parity leg would be hashing concealed pixels against a clean \
+         reference"
     );
 }
 
