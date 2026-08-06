@@ -809,6 +809,11 @@ const VIDEO_CODEC_OP_DECODE_H264: u32 = 0x0000_0001;
 /// would only invite a gate that admits a session nothing can decode.)
 const VIDEO_CODEC_OP_DECODE_H265: u32 = 0x0000_0002;
 
+/// `VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR`. The Deck's VanGogh advertises
+/// it alongside H.264/H.265/VP9, and it is what
+/// [`av1_hardware_decodable`] reads.
+const VIDEO_CODEC_OP_DECODE_AV1: u32 = 0x0000_0004;
+
 /// The native decoder for a negotiated wire codec, plus the
 /// `VkVideoCodecOperationFlagBitsKHR` the presenter's decode family must advertise
 /// for it — or `None` for a codec pf-vkdecode cannot decode natively.
@@ -990,6 +995,9 @@ pub(crate) unsafe fn codec_name(codec: *const ffmpeg::ffi::AVCodec) -> String {
 
 /// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
 /// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
+///
+/// ⚠ **AV1 here is a decoder EXISTING, not a decoder that can keep up.** Use
+/// [`decodable_codecs_for`], which gates it on hardware — see [`av1_hardware_decodable`].
 pub fn decodable_codecs() -> u8 {
     let _ = ffmpeg::init();
     let mut bits = 0u8;
@@ -1005,12 +1013,56 @@ pub fn decodable_codecs() -> u8 {
     bits
 }
 
+/// Can this machine decode AV1 in HARDWARE?
+///
+/// The question exists because `ffmpeg::decoder::find(AV1)` answers yes on every
+/// build that links libdav1d — a SOFTWARE decoder — so advertising AV1 off that
+/// answer tells the host "send me AV1" on machines that will then try to decode a
+/// 4K stream on the CPU. That is the standing open item M7 closes: the wire's codec
+/// negotiation is a promise about capability, and a promise the client cannot keep
+/// is worse than not making it, because the host has no other codec to fall back to
+/// once the session is running.
+///
+/// Answered from device facts only, never from a decoder registry:
+///
+/// * the presenter's Vulkan device advertises `DECODE_AV1` in its decode queue
+///   family's codec operations, or
+/// * (Windows) the presenter can import D3D11 textures, which is the same gate the
+///   D3D11VA rung itself sits behind — that rung decodes AV1 Profile 0 today
+///   (`video_d3d11.rs`'s profile table), so a machine reaching it has hardware AV1.
+///
+/// ⚠ Deliberately NOT consulted: VAAPI. Asking libva costs opening a display, which
+/// this function is called too early and too often to do; the Vulkan bit covers the
+/// Mesa devices where VAAPI AV1 exists in practice, and a machine with VAAPI AV1 but
+/// no Vulkan AV1 loses only the ADVERTISEMENT, not a working path.
+pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
+    if vk.is_some_and(|v| v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_AV1 != 0) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        return vk.is_some_and(|v| v.d3d11_import);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// [`decodable_codecs`] plus the PyroWave bit when the presenter's device passed the
 /// compute-feature probe. Advertisement-only: `resolve_codec` never auto-picks PyroWave —
 /// the session must also name it `preferred_codec` (plan §3), which the client does only
 /// under its explicit opt-in.
 pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>) -> u8 {
-    let bits = decodable_codecs();
+    let mut bits = decodable_codecs();
+    // AV1 is hardware-gated (M7). Without this the bit rides on libdav1d's mere
+    // presence and the host is told to send AV1 to a machine that would decode it on
+    // the CPU — and once the session is negotiated there is nothing to fall back to.
+    if bits & punktfunk_core::quic::CODEC_AV1 != 0 && !av1_hardware_decodable(vk) {
+        tracing::info!(
+            "AV1 not advertised: no hardware AV1 decode on this device (a software \
+             decoder exists, but a 4K AV1 stream is not survivable on it)"
+        );
+        bits &= !punktfunk_core::quic::CODEC_AV1;
+    }
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     if vk.map(|v| v.pyrowave_decode).unwrap_or(false) {
         return bits | punktfunk_core::quic::CODEC_PYROWAVE;
@@ -2150,6 +2202,42 @@ mod tests {
     /// decision and again by M3 WP-2's HEVC wiring): the pin AND the auto family
     /// admit on a capable H.264 or HEVC session — native sits immediately above
     /// FFmpeg-Vulkan because the program is dropping FFmpeg — while every explicit
+    /// AV1 is advertised on a HARDWARE fact, never on a decoder existing.
+    ///
+    /// The standing open item M7 closes. `ffmpeg::decoder::find(AV1)` says yes
+    /// wherever libdav1d is linked, so the old advertisement told the host "send me
+    /// AV1" on machines that would then decode it on the CPU — and codec negotiation
+    /// happens once, so there is no falling back afterwards.
+    #[test]
+    fn av1_is_advertised_only_where_hardware_can_decode_it() {
+        // No device at all: no claim.
+        assert!(!av1_hardware_decodable(None));
+
+        // A decode-capable device that does NOT list AV1 among its codec
+        // operations. `video_decode` alone is not the question — plenty of devices
+        // decode H.264 and H.265 and no AV1.
+        let mut dev = decode_device(0x10de, "no-av1");
+        dev.decode_video_caps = VIDEO_CODEC_OP_DECODE_H264 | VIDEO_CODEC_OP_DECODE_H265;
+        #[cfg(not(windows))]
+        assert!(
+            !av1_hardware_decodable(Some(&dev)),
+            "H.264+H.265 decode support says nothing about AV1"
+        );
+
+        // The AV1 operation bit is the yes.
+        let mut dev = decode_device(0x1002, "vangogh-ish");
+        dev.decode_video_caps =
+            VIDEO_CODEC_OP_DECODE_H264 | VIDEO_CODEC_OP_DECODE_H265 | VIDEO_CODEC_OP_DECODE_AV1;
+        assert!(av1_hardware_decodable(Some(&dev)));
+
+        // A device whose decode queue is absent cannot be taken at its caps word.
+        let mut dev = decode_device(0x1002, "no-decode-queue");
+        dev.decode_video_caps = VIDEO_CODEC_OP_DECODE_AV1;
+        dev.video_decode = false;
+        #[cfg(not(windows))]
+        assert!(!av1_hardware_decodable(Some(&dev)));
+    }
+
     /// backend pin refuses (`vulkan` names the FFmpeg-Vulkan backend specifically and
     /// must keep meaning exactly that), and the codec/device legs still refuse for
     /// every choice. The codec's OWN caps bit is the device leg: admitting HEVC on an
