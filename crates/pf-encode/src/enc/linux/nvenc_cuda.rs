@@ -3177,6 +3177,245 @@ mod tests {
         let _ = (a_bytes, b_bytes, c_bytes);
     }
 
+    /// ON-HARDWARE — **spike S1c**, the leg S1a/S1b deliberately excluded. Both pinned sub-frame
+    /// OFF to isolate the split variable, but a real HEVC arbitration cannot: split and sub-frame
+    /// readback are mutually unsupported there (`resolve_split_subframe`), so engaging split means
+    /// flipping `enableSubFrameWrite` in the same breath — a SECOND init param, and the one the
+    /// reconfigure path deliberately pins today (`windows/nvenc.rs:624-628`).
+    ///
+    /// So: can the PAIR move in place? `(DISABLE, sub-frame on)` → `(TWO_FORCED, sub-frame off)`,
+    /// `resetEncoder=0`, and back. Accepted? IDR-free?
+    ///
+    /// ⚠ Also pins the invariant that makes this safe to build on: `subframe_chunks` is latched
+    /// ONLY in the init path (line ~1625) and is NOT recomputed by `reconfigure_bitrate`, so a
+    /// caller flipping sub-frame in place MUST clear it too — otherwise `supports_chunked_poll`
+    /// keeps reporting true and `poll_chunk` busy-polls its whole budget every AU against a
+    /// `numSlices` that never advances. That is the exact failure the Phase 8 comment warns about
+    /// for an in-params drop; here the test performs the correct sequence and asserts the state
+    /// stays coherent, so WP3 has a worked example to copy. Run ALONE:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_split_subframe_pair_reconfigure --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_split_subframe_pair_reconfigure() {
+        use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        const BPS: u64 = 40_000_000;
+        let disable = M::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+
+        // Open split-DISABLED, and leave sub-frame at its Linux default (ON where the GPU
+        // advertises SUBFRAME_READBACK) — that is the fleet shape the arbitration starts from.
+        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            BPS,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            4,
+        )
+        .expect("open NVENC CUDA session");
+
+        let submit_and_poll = |enc: &mut NvencCudaEncoder, range: std::ops::Range<u32>| {
+            let (mut aus, mut keyframes) = (0usize, 0usize);
+            for i in range {
+                let frame = nv12_frame(W, H, i);
+                enc.submit_indexed(&frame, i).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    aus += 1;
+                    keyframes += au.keyframe as usize;
+                }
+            }
+            (aus, keyframes)
+        };
+
+        let (aus, kfs) = submit_and_poll(&mut enc, 0..4);
+        assert!(aus > 0 && kfs == 1, "opening IDR then steady P-frames");
+        println!(
+            "S1c: opened split={} subframe_on={} subframe_chunks={} chunked_poll={}",
+            enc.split_mode,
+            enc.subframe_on,
+            enc.subframe_chunks,
+            enc.supports_chunked_poll()
+        );
+        if !enc.subframe_on {
+            println!(
+                "S1c SKIPPED: sub-frame is off at open on this GPU/driver, so there is no pair to \
+                 flip — the arbitration reduces to S1a's plain split switch here."
+            );
+            std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+            return;
+        }
+
+        // THE PAIR FLIP, in the order WP3 must use: clear the chunked-poll latch alongside the
+        // sub-frame flag, or `poll_chunk` outlives the feature it depends on.
+        enc.split_mode = two;
+        enc.subframe_on = false;
+        enc.subframe_chunks = false;
+        let accepted = enc.reconfigure_bitrate(BPS);
+        println!("S1c: (DISABLE,sub-frame on) → (TWO_FORCED,sub-frame off) accepted = {accepted}");
+
+        if accepted {
+            let (aus, kfs) = submit_and_poll(&mut enc, 4..8);
+            assert!(aus > 0, "no AUs after the pair flip");
+            assert!(
+                !enc.supports_chunked_poll(),
+                "chunked poll must be disarmed once sub-frame is off — a stale latch makes \
+                 poll_chunk busy-poll its whole budget every AU"
+            );
+            println!(
+                "S1c VERDICT: {}",
+                if kfs == 0 {
+                    "PASS — the split×sub-frame PAIR moves in place with NO IDR"
+                } else {
+                    "FAIL — pair flip forced an IDR"
+                }
+            );
+
+            // …and back, which is what a de-escalation would do.
+            enc.split_mode = disable;
+            enc.subframe_on = true;
+            enc.subframe_chunks = enc.slices >= 2 && enc.async_rt.is_none();
+            let back = enc.reconfigure_bitrate(BPS);
+            let kfs_back = if back {
+                submit_and_poll(&mut enc, 8..12).1
+            } else {
+                usize::MAX
+            };
+            println!("S1c: reverse pair flip accepted = {back}, keyframes after = {kfs_back}");
+        } else {
+            println!(
+                "S1c VERDICT: FAIL — driver REJECTED the pair flip. Split can still move alone \
+                 (S1a), so a WP3 arbitration would have to keep sub-frame fixed for the session \
+                 and only arbitrate split within that."
+            );
+            enc.split_mode = disable;
+            enc.subframe_on = true;
+        }
+
+        enc.flush().ok();
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+    }
+
+    /// ON-HARDWARE — **the D5 confirm** (design §2 defect D5), the one claim in that list that was
+    /// only ever *inferred*: plain `AUTO` + default-on sub-frame is believed to resolve to
+    /// no-split, because HEVC split is unsupported *with* sub-frame — which would make the
+    /// resolver's `AUTO` fallthrough read as "let the driver decide" while actually meaning "never
+    /// split", on both platforms.
+    ///
+    /// The driver reports no "mode I actually chose", so this settles it the same way S1b settled
+    /// its question: by timing. At 4K the split/no-split gap is unmissable (~2×), so
+    ///   AUTO+sub-frame ≈ DISABLE ⇒ the driver did NOT split ⇒ D5 CONFIRMED
+    ///   AUTO+sub-frame ≈ TWO_FORCED ⇒ it did ⇒ D5 REFUTED and the `AUTO` arm is fine as-is
+    ///
+    /// Content is trivial here for the reason `nvenc_cuda_split_reconfigure_takes_effect`
+    /// documents (zeroed VRAM), so this compares the PIXEL-proportional cost — which is exactly
+    /// the term split halves, so the discriminator holds. Run ALONE:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_auto_split_with_subframe --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_auto_split_with_subframe() {
+        use std::time::Instant;
+        const W: u32 = 3840;
+        const H: u32 = 2160;
+        const BPS: u64 = 400_000_000;
+        const WARMUP: u32 = 8;
+        const MEASURED: u32 = 24;
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
+
+        // (split env, sub-frame env) → p50 µs, plus the resolved sub-frame state for the printout.
+        // `split: None` means UNSET, which is the only way to reach the resolver's plain-`AUTO`
+        // fallthrough: the env knob cannot express it (`0` is DISABLE, `1` is AUTO_**FORCED**),
+        // and AUTO_FORCED counts as forced in `resolve_split_subframe`, so passing `1` here would
+        // silently disarm sub-frame and test a completely different configuration. That mistake
+        // produced a spurious "D5 REFUTED" on the first run of this test.
+        let run = |split: Option<&str>, subframe: Option<&str>| -> (u128, bool) {
+            match split {
+                Some(v) => std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", v),
+                None => std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE"),
+            }
+            match subframe {
+                Some(v) => std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", v),
+                None => std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME"),
+            }
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                PixelFormat::Nv12,
+                W,
+                H,
+                60,
+                BPS,
+                true,
+                8,
+                ChromaFormat::Yuv420,
+                false,
+                4,
+            )
+            .expect("open NVENC CUDA session");
+            let mut times = Vec::new();
+            for i in 0..(WARMUP + MEASURED) {
+                let t0 = Instant::now();
+                enc.submit_indexed(&frames[(i % 4) as usize], i)
+                    .expect("submit");
+                while enc.poll().expect("poll").is_some() {}
+                if i >= WARMUP {
+                    times.push(t0.elapsed().as_micros());
+                }
+            }
+            let sub = enc.subframe_on;
+            enc.flush().ok();
+            times.sort_unstable();
+            (times[times.len() / 2], sub)
+        };
+
+        // THE FLEET CASE: env unset ⇒ 4K60 8-bit is below SPLIT_FORCE_PIXEL_RATE (497.7 vs 950
+        // Mpix/s) and not 10-bit, so the resolver falls through to plain AUTO, and sub-frame
+        // stays at its caps-gated default. This leg must report sub-frame TRUE or it is not
+        // testing D5.
+        let (auto_us, auto_sub) = run(None, None);
+        let (dis_us, dis_sub) = run(Some("0"), None);
+        let (two_us, two_sub) = run(Some("2"), Some("0"));
+
+        println!("D5 confirm @ {W}x{H}@60 HEVC 8-bit:");
+        println!("  AUTO (unset) + sub-frame({auto_sub}) : {auto_us:>6} us/frame");
+        println!("  DISABLE      + sub-frame({dis_sub}) : {dis_us:>6} us/frame");
+        println!("  TWO_FORCED,   no sub-frame({two_sub}): {two_us:>6} us/frame");
+        assert!(
+            auto_sub,
+            "the AUTO leg resolved sub-frame OFF — it is not testing D5's fleet shape"
+        );
+        let (near_dis, near_two) = (auto_us.abs_diff(dis_us), auto_us.abs_diff(two_us));
+        println!(
+            "  ⇒ AUTO sits nearer {} (|A-D|={near_dis} vs |A-T|={near_two}) — D5 {}",
+            if near_dis < near_two {
+                "DISABLE"
+            } else {
+                "TWO"
+            },
+            if near_dis < near_two {
+                "CONFIRMED: AUTO + sub-frame does NOT split; the resolver's AUTO arm is dead"
+            } else {
+                "REFUTED: AUTO does engage the second engine even with sub-frame on"
+            }
+        );
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).
     /// Needs no GPU session (it short-circuits on the null encoder / range checks), so it runs in the
     /// normal suite — but `open` gates on the NVENC `.so`, so it skips gracefully where the NVIDIA
