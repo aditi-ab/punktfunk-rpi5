@@ -130,6 +130,64 @@ pub fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
     aus
 }
 
+/// Rewrite every Annex-B start code in `stream` to the FOUR-byte form
+/// (`00 00 00 01`), leaving each NAL's payload bytes untouched.
+///
+/// # Why the suite needs this
+///
+/// Both vendored vectors use THREE-byte start codes throughout, while the real
+/// host emits FOUR-byte ones on **100% of access units, both codecs** — measured
+/// off the M0 NVENC corpus through the capture hook's `.idx` offsets: 1514/1514
+/// H.264 AUs and 1133/1133 HEVC. So without this, every parity verdict this
+/// program has recorded was taken on a prefix form that never ships.
+///
+/// That gap was not theoretical. Submitting four-byte start codes to
+/// `vkCmdDecodeVideoKHR` is exactly what made HEVC unplayable on every driver
+/// tested: drivers are validated on the three-byte form, and a fixed `+3 + 2`
+/// skip into a four-byte-prefixed slice lands a byte early and reads a nonsense
+/// `pps_id`. The cure lives in `ring::pack_slices`, which trims the leading zero
+/// byte and derives the slice offsets from the trimmed lengths in one call.
+/// H.264 was safe here only by its vendored encoder's convention, never by
+/// structure — which is why the normalisation is shared and so is this helper.
+///
+/// # What it preserves
+///
+/// The payload copied is `nalu.data[nalu.offset..]`: exactly the `nal_size`
+/// bytes the parser itself hands the planner. `Nalu::next` already discards
+/// `trailing_zero_8bits` before the following start code, so the NALs in the
+/// output are the NALs the production parser sees in the input, and the ONLY
+/// difference between the two streams is the width of every prefix.
+///
+/// Generic over the NAL header because both codecs share one `Nalu` type. The
+/// AU splitters above cannot be shared for the opposite reason: their AU
+/// boundary rules genuinely differ.
+fn four_byte_start_codes<H>(stream: &[u8]) -> Vec<u8>
+where
+    H: cros_codecs::codec::h264::nalu::Header + std::fmt::Debug,
+{
+    use cros_codecs::codec::h264::nalu::Nalu;
+
+    // A lower bound, not the answer: the output gains a byte per three-byte
+    // prefix and loses any trailing zeroes.
+    let mut out = Vec::with_capacity(stream.len());
+    let mut cursor = Cursor::new(stream);
+    while let Ok(nalu) = Nalu::<H>::next(&mut cursor) {
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(&nalu.data[nalu.offset..]);
+    }
+    out
+}
+
+/// [`four_byte_start_codes`] bound to H.264's NAL header.
+pub fn h264_four_byte_start_codes(stream: &[u8]) -> Vec<u8> {
+    four_byte_start_codes::<cros_codecs::codec::h264::parser::NaluHeader>(stream)
+}
+
+/// [`four_byte_start_codes`] bound to H.265's NAL header.
+pub fn h265_four_byte_start_codes(stream: &[u8]) -> Vec<u8> {
+    four_byte_start_codes::<cros_codecs::codec::h265::parser::NaluHeader>(stream)
+}
+
 /// The slice of a decoder's surface the GPU legs drive.
 ///
 /// `VkH264Decoder` and `VkH265Decoder` expose it method-for-method (the crate

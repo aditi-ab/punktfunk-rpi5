@@ -29,6 +29,15 @@
 //! decodes only one codec runs that leg and reports the other as "no physical
 //! device with VK_KHR_video_decode_…", which is a fact about the box.
 //!
+//! Each codec runs that body TWICE: once over the vendored vector as it sits,
+//! and once over the same vector rewritten to FOUR-byte start codes, which is
+//! what the real host emits on 100% of access units in both codecs (1514/1514
+//! H.264 and 1133/1133 HEVC, measured off the M0 NVENC corpus). Prefix width
+//! carries no information, so both runs must reproduce the same goldens —
+//! and submitting the four-byte form to the driver unchanged is precisely the
+//! defect that made HEVC unplayable on every driver tested. Until these legs
+//! existed no parity vector exercised the form that actually ships.
+//!
 //! The readback follows the presenter's exact frame contract: wait the frame's
 //! timeline `value`, round-trip the layout, signal `value + 1` in the SAME
 //! submission, then `release_frame(frame, true)` — and every submission is
@@ -515,9 +524,15 @@ fn assert_bit_identical(hashes: &[String], goldens: &[&str], codec: &str) {
     );
 }
 
-#[test]
-#[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
-fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
+/// One H.264 parity run over a caller-supplied AU list.
+///
+/// The AUs are a parameter rather than a constant because two legs share this
+/// body: the vendored vector as it sits (three-byte start codes) and the same
+/// vector rewritten to the four-byte ones the real host actually emits. Both
+/// must reproduce the SAME goldens, because prefix width carries no
+/// information — and running one body twice is what makes that an equality
+/// rather than two similar-looking assertions that could drift apart.
+fn h264_parity_run(aus: &[&[u8]], label: &str) {
     // One codec at a time on the device, and the `set_var` below happens only
     // under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
@@ -560,11 +575,7 @@ fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
                 DISPLAY_H264,
             )
         };
-        let hashes = collect_hashes(
-            &mut decoder,
-            &readback,
-            &common::split_h264_aus(common::TEST_25FPS_H264),
-        );
+        let hashes = collect_hashes(&mut decoder, &readback, aus);
         // SAFETY: every readback was fence-waited inside `read_nv12`; nothing
         // else references its handles.
         unsafe { readback.destroy() };
@@ -576,12 +587,34 @@ fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
     // references the setup's handles.
     unsafe { setup.destroy() };
 
-    assert_bit_identical(&hashes, &goldens, "H.264");
+    assert_bit_identical(&hashes, &goldens, label);
 }
 
 #[test]
-#[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
-fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
+#[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
+fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
+    h264_parity_run(&common::split_h264_aus(common::TEST_25FPS_H264), "H.264");
+}
+
+/// The same 250 frames, submitted the way the real host submits them.
+///
+/// A failure here where the leg above passes means the four-byte prefix is
+/// reaching the driver — `ring::pack_slices` stopped trimming the leading zero
+/// byte, or stopped deriving the slice offsets from the trimmed lengths — which
+/// is the defect that made HEVC unplayable on every driver tested.
+#[test]
+#[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
+fn h264_four_byte_start_codes_decode_bit_identically() {
+    let stream = common::h264_four_byte_start_codes(common::TEST_25FPS_H264);
+    h264_parity_run(
+        &common::split_h264_aus(&stream),
+        "H.264 (4-byte start codes)",
+    );
+}
+
+/// The H.265 twin of [`h264_parity_run`]; see its docs for why the AUs are a
+/// parameter.
+fn h265_parity_run(aus: &[&[u8]], label: &str) {
     // As the H.264 leg: one codec at a time, `set_var` under the lock.
     let _gpu = common::gpu_lock();
 
@@ -624,11 +657,7 @@ fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
                 DISPLAY_H265,
             )
         };
-        let hashes = collect_hashes(
-            &mut decoder,
-            &readback,
-            &common::split_h265_aus(common::TEST_25FPS_H265),
-        );
+        let hashes = collect_hashes(&mut decoder, &readback, aus);
         // SAFETY: every readback was fence-waited inside `read_nv12`; nothing
         // else references its handles.
         unsafe { readback.destroy() };
@@ -638,7 +667,25 @@ fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
     // SAFETY: as the H.264 leg — decoder and readback are gone.
     unsafe { setup.destroy() };
 
-    assert_bit_identical(&hashes, &goldens, "H.265");
+    assert_bit_identical(&hashes, &goldens, label);
+}
+
+#[test]
+#[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
+fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
+    h265_parity_run(&common::split_h265_aus(common::TEST_25FPS_H265), "H.265");
+}
+
+/// The HEVC leg of the production prefix form — the one that would have caught
+/// the shipped defect. See [`h264_four_byte_start_codes_decode_bit_identically`].
+#[test]
+#[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
+fn h265_four_byte_start_codes_decode_bit_identically() {
+    let stream = common::h265_four_byte_start_codes(common::TEST_25FPS_H265);
+    h265_parity_run(
+        &common::split_h265_aus(&stream),
+        "H.265 (4-byte start codes)",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -794,5 +841,148 @@ fn h264_goldens_and_au_split_agree_with_the_planner() {
         goldens.len(),
         "the planner outputs {outputs} pictures but the goldens carry {} hashes",
         goldens.len()
+    );
+}
+
+/// Count Annex-B start codes in `stream` as `(total, three_byte)`.
+///
+/// Emulation prevention guarantees `00 00 01` cannot occur inside a NAL payload,
+/// so every hit is a real prefix; a hit not preceded by a zero byte is a
+/// three-byte one.
+fn annexb_prefixes(stream: &[u8]) -> (usize, usize) {
+    let mut total = 0;
+    let mut three_byte = 0;
+    for i in 0..stream.len().saturating_sub(2) {
+        if stream[i..i + 3] == [0x00, 0x00, 0x01] {
+            total += 1;
+            if i == 0 || stream[i - 1] != 0x00 {
+                three_byte += 1;
+            }
+        }
+    }
+    (total, three_byte)
+}
+
+// The two guards below are what stop the four-byte hardware legs from passing
+// vacuously. Those legs assert that a rewritten vector decodes to the SAME
+// goldens as the original — which is trivially true if the rewrite quietly
+// returned its input, or dropped NALs the planner never missed. Nothing on the
+// fleet would notice; these notice in ordinary CI, with the reason.
+
+#[test]
+fn the_h264_four_byte_rewrite_changes_prefixes_and_nothing_else() {
+    use pf_bitstream::h264::H264Planner;
+
+    let original = common::TEST_25FPS_H264;
+    let rewritten = common::h264_four_byte_start_codes(original);
+
+    let (original_total, original_three) = annexb_prefixes(original);
+    let (rewritten_total, rewritten_three) = annexb_prefixes(&rewritten);
+
+    assert!(
+        original_three > 0,
+        "the vendored H.264 vector is supposed to carry THREE-byte start codes; \
+         if it no longer does, `h264_four_byte_start_codes_decode_bit_identically` \
+         is feeding the hardware the same bytes as the leg above it and proves \
+         nothing"
+    );
+    assert_eq!(
+        rewritten_three, 0,
+        "every start code in the rewritten stream must be four-byte — {rewritten_three} \
+         of {rewritten_total} are not"
+    );
+    assert_eq!(
+        rewritten_total, original_total,
+        "the rewrite must preserve the NAL count exactly ({original_total}), not \
+         drop or invent units"
+    );
+    assert!(
+        rewritten.len() > original.len(),
+        "widening every prefix cannot shrink the stream"
+    );
+
+    // Same access units, same planner verdict: the rewrite changed the framing
+    // and nothing the decoder acts on.
+    let aus = common::split_h264_aus(&rewritten);
+    assert_eq!(
+        aus.len(),
+        common::split_h264_aus(original).len(),
+        "the rewritten stream must split into the same access units"
+    );
+    assert_eq!(
+        aus.len(),
+        FRAME_COUNT,
+        "…and there are {FRAME_COUNT} of them"
+    );
+
+    let mut planner = H264Planner::new();
+    let mut outputs = 0usize;
+    for (index, au) in aus.iter().enumerate() {
+        let plan = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("AU {index}: the four-byte rewrite must plan as the original does, got {e:?}")
+        });
+        outputs += plan.dpb.outputs.len();
+    }
+    outputs += planner.flush().outputs.len();
+    assert_eq!(
+        outputs, FRAME_COUNT,
+        "the rewritten vector must still output {FRAME_COUNT} pictures"
+    );
+}
+
+#[test]
+fn the_h265_four_byte_rewrite_changes_prefixes_and_nothing_else() {
+    use pf_bitstream::h265::H265Planner;
+
+    let original = common::TEST_25FPS_H265;
+    let rewritten = common::h265_four_byte_start_codes(original);
+
+    let (original_total, original_three) = annexb_prefixes(original);
+    let (rewritten_total, rewritten_three) = annexb_prefixes(&rewritten);
+
+    assert!(
+        original_three > 0,
+        "the vendored H.265 vector is supposed to carry THREE-byte start codes; \
+         if it no longer does, `h265_four_byte_start_codes_decode_bit_identically` \
+         proves nothing"
+    );
+    assert_eq!(
+        rewritten_three, 0,
+        "every start code in the rewritten stream must be four-byte — {rewritten_three} \
+         of {rewritten_total} are not"
+    );
+    assert_eq!(
+        rewritten_total, original_total,
+        "the rewrite must preserve the NAL count exactly ({original_total})"
+    );
+    assert!(
+        rewritten.len() > original.len(),
+        "widening every prefix cannot shrink the stream"
+    );
+
+    let aus = common::split_h265_aus(&rewritten);
+    assert_eq!(
+        aus.len(),
+        common::split_h265_aus(original).len(),
+        "the rewritten stream must split into the same access units"
+    );
+    assert_eq!(
+        aus.len(),
+        FRAME_COUNT,
+        "…and there are {FRAME_COUNT} of them"
+    );
+
+    let mut planner = H265Planner::new();
+    let mut outputs = 0usize;
+    for (index, au) in aus.iter().enumerate() {
+        let plan = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("AU {index}: the four-byte rewrite must plan as the original does, got {e:?}")
+        });
+        outputs += plan.dpb.outputs.len();
+    }
+    outputs += planner.flush().outputs.len();
+    assert_eq!(
+        outputs, FRAME_COUNT,
+        "the rewritten vector must still output {FRAME_COUNT} pictures"
     );
 }
