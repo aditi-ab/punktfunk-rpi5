@@ -55,6 +55,7 @@ pub mod dxva;
 pub mod dxva_av1;
 pub mod pack;
 pub mod pic;
+pub mod pic_av1;
 pub mod pic_h265;
 
 /// The DPB slot ledger — see the crate docs for why it is borrowed rather than
