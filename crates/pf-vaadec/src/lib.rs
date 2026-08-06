@@ -58,6 +58,7 @@
 pub mod config;
 pub mod pic;
 pub mod va;
+pub mod va_h265;
 
 /// The DPB slot ledger — borrowed, not redefined (crate docs).
 pub use pf_vkdecode::SlotError;

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <va/va.h>
+#include <va/va_dec_hevc.h>
 
 #define S(t)        printf("size %-34s %zu align %zu\n", #t, sizeof(t), _Alignof(t))
 #define O(t, f)     printf("off  %-20s %-28s %zu\n", #t, #f, offsetof(t, f))
@@ -110,6 +111,115 @@ int main(void) {
         p.pic_fields.bits.weighted_bipred_idc = 3;
         printf("bits pic_fields.weighted_bipred_idc=3 -> value 0x%08x\n", p.pic_fields.value);
     }
+
+    /* ---- HEVC (va_dec_hevc.h) ---- */
+    S(VAPictureHEVC);
+    O(VAPictureHEVC, picture_id);
+    O(VAPictureHEVC, pic_order_cnt);
+    O(VAPictureHEVC, flags);
+    O(VAPictureHEVC, va_reserved);
+
+    S(VAPictureParameterBufferHEVC);
+    O(VAPictureParameterBufferHEVC, CurrPic);
+    O(VAPictureParameterBufferHEVC, ReferenceFrames);
+    O(VAPictureParameterBufferHEVC, pic_width_in_luma_samples);
+    O(VAPictureParameterBufferHEVC, pic_height_in_luma_samples);
+    O(VAPictureParameterBufferHEVC, pic_fields);
+    O(VAPictureParameterBufferHEVC, sps_max_dec_pic_buffering_minus1);
+    O(VAPictureParameterBufferHEVC, bit_depth_luma_minus8);
+    O(VAPictureParameterBufferHEVC, bit_depth_chroma_minus8);
+    O(VAPictureParameterBufferHEVC, pcm_sample_bit_depth_luma_minus1);
+    O(VAPictureParameterBufferHEVC, pcm_sample_bit_depth_chroma_minus1);
+    O(VAPictureParameterBufferHEVC, log2_min_luma_coding_block_size_minus3);
+    O(VAPictureParameterBufferHEVC, log2_diff_max_min_luma_coding_block_size);
+    O(VAPictureParameterBufferHEVC, log2_min_transform_block_size_minus2);
+    O(VAPictureParameterBufferHEVC, log2_diff_max_min_transform_block_size);
+    O(VAPictureParameterBufferHEVC, log2_min_pcm_luma_coding_block_size_minus3);
+    O(VAPictureParameterBufferHEVC, log2_diff_max_min_pcm_luma_coding_block_size);
+    O(VAPictureParameterBufferHEVC, max_transform_hierarchy_depth_intra);
+    O(VAPictureParameterBufferHEVC, max_transform_hierarchy_depth_inter);
+    O(VAPictureParameterBufferHEVC, init_qp_minus26);
+    O(VAPictureParameterBufferHEVC, diff_cu_qp_delta_depth);
+    O(VAPictureParameterBufferHEVC, pps_cb_qp_offset);
+    O(VAPictureParameterBufferHEVC, pps_cr_qp_offset);
+    O(VAPictureParameterBufferHEVC, log2_parallel_merge_level_minus2);
+    O(VAPictureParameterBufferHEVC, num_tile_columns_minus1);
+    O(VAPictureParameterBufferHEVC, num_tile_rows_minus1);
+    O(VAPictureParameterBufferHEVC, column_width_minus1);
+    O(VAPictureParameterBufferHEVC, row_height_minus1);
+    O(VAPictureParameterBufferHEVC, slice_parsing_fields);
+    O(VAPictureParameterBufferHEVC, log2_max_pic_order_cnt_lsb_minus4);
+    O(VAPictureParameterBufferHEVC, num_short_term_ref_pic_sets);
+    O(VAPictureParameterBufferHEVC, num_long_term_ref_pic_sps);
+    O(VAPictureParameterBufferHEVC, num_ref_idx_l0_default_active_minus1);
+    O(VAPictureParameterBufferHEVC, num_ref_idx_l1_default_active_minus1);
+    O(VAPictureParameterBufferHEVC, pps_beta_offset_div2);
+    O(VAPictureParameterBufferHEVC, pps_tc_offset_div2);
+    O(VAPictureParameterBufferHEVC, num_extra_slice_header_bits);
+    O(VAPictureParameterBufferHEVC, st_rps_bits);
+    O(VAPictureParameterBufferHEVC, va_reserved);
+
+    S(VASliceParameterBufferHEVC);
+    O(VASliceParameterBufferHEVC, slice_data_size);
+    O(VASliceParameterBufferHEVC, slice_data_offset);
+    O(VASliceParameterBufferHEVC, slice_data_flag);
+    O(VASliceParameterBufferHEVC, slice_data_byte_offset);
+    O(VASliceParameterBufferHEVC, slice_segment_address);
+    O(VASliceParameterBufferHEVC, RefPicList);
+    O(VASliceParameterBufferHEVC, LongSliceFlags);
+    O(VASliceParameterBufferHEVC, collocated_ref_idx);
+    O(VASliceParameterBufferHEVC, num_ref_idx_l0_active_minus1);
+    O(VASliceParameterBufferHEVC, num_ref_idx_l1_active_minus1);
+    O(VASliceParameterBufferHEVC, slice_qp_delta);
+    O(VASliceParameterBufferHEVC, slice_cb_qp_offset);
+    O(VASliceParameterBufferHEVC, slice_cr_qp_offset);
+    O(VASliceParameterBufferHEVC, slice_beta_offset_div2);
+    O(VASliceParameterBufferHEVC, slice_tc_offset_div2);
+    O(VASliceParameterBufferHEVC, luma_log2_weight_denom);
+    O(VASliceParameterBufferHEVC, delta_chroma_log2_weight_denom);
+    O(VASliceParameterBufferHEVC, delta_luma_weight_l0);
+    O(VASliceParameterBufferHEVC, luma_offset_l0);
+    O(VASliceParameterBufferHEVC, delta_chroma_weight_l0);
+    O(VASliceParameterBufferHEVC, ChromaOffsetL0);
+    O(VASliceParameterBufferHEVC, delta_luma_weight_l1);
+    O(VASliceParameterBufferHEVC, luma_offset_l1);
+    O(VASliceParameterBufferHEVC, delta_chroma_weight_l1);
+    O(VASliceParameterBufferHEVC, ChromaOffsetL1);
+    O(VASliceParameterBufferHEVC, five_minus_max_num_merge_cand);
+    O(VASliceParameterBufferHEVC, num_entry_point_offsets);
+    O(VASliceParameterBufferHEVC, entry_offset_to_subset_array);
+    O(VASliceParameterBufferHEVC, slice_data_num_emu_prevn_bytes);
+    O(VASliceParameterBufferHEVC, va_reserved);
+
+    S(VAIQMatrixBufferHEVC);
+    O(VAIQMatrixBufferHEVC, ScalingList4x4);
+    O(VAIQMatrixBufferHEVC, ScalingList8x8);
+    O(VAIQMatrixBufferHEVC, ScalingList16x16);
+    O(VAIQMatrixBufferHEVC, ScalingList32x32);
+    O(VAIQMatrixBufferHEVC, ScalingListDC16x16);
+    O(VAIQMatrixBufferHEVC, ScalingListDC32x32);
+    O(VAIQMatrixBufferHEVC, va_reserved);
+
+    {
+        VAPictureParameterBufferHEVC h;
+        h.pic_fields.value = 0;
+        h.pic_fields.bits.chroma_format_idc = 3;
+        printf("bits hevc pic_fields.chroma_format_idc=3 -> 0x%08x\n", h.pic_fields.value);
+        h.pic_fields.value = 0;
+        h.pic_fields.bits.NoBiPredFlag = 1;
+        printf("bits hevc pic_fields.NoBiPredFlag=1 -> 0x%08x\n", h.pic_fields.value);
+        h.slice_parsing_fields.value = 0;
+        h.slice_parsing_fields.bits.IntraPicFlag = 1;
+        printf("bits hevc slice_parsing_fields.IntraPicFlag=1 -> 0x%08x\n", h.slice_parsing_fields.value);
+        VASliceParameterBufferHEVC s;
+        s.LongSliceFlags.value = 0;
+        s.LongSliceFlags.fields.slice_type = 3;
+        printf("bits hevc LongSliceFlags.slice_type=3 -> 0x%08x\n", s.LongSliceFlags.value);
+        s.LongSliceFlags.value = 0;
+        s.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
+        printf("bits hevc LongSliceFlags.slice_loop_filter_across=1 -> 0x%08x\n", s.LongSliceFlags.value);
+    }
+
     printf("VA_PADDING_LOW=%d VA_PADDING_MEDIUM=%d\n", VA_PADDING_LOW, VA_PADDING_MEDIUM);
     return 0;
 }
