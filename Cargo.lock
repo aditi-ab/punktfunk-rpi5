@@ -3196,6 +3196,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-vaadec"
+version = "0.24.0"
+dependencies = [
+ "pf-bitstream",
+ "pf-vkdecode",
+]
+
+[[package]]
 name = "pf-vdisplay"
 version = "0.24.0"
 dependencies = [
