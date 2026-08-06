@@ -1,4 +1,4 @@
-//! GPU smoke test — `#[ignore]`d because it needs real Vulkan Video hardware.
+//! GPU smoke tests — `#[ignore]`d because they need real Vulkan Video hardware.
 //!
 //! Run on a Vulkan-Video box with:
 //!
@@ -10,11 +10,18 @@
 //! any machine like them):
 //! - a Vulkan 1.3 loader on the library path (`libvulkan.so.1` / `vulkan-1.dll`);
 //! - a physical device advertising `VK_KHR_video_queue`,
-//!   `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`, with a queue
-//!   family carrying `VIDEO_DECODE_KHR` ops for H.264;
+//!   `VK_KHR_video_decode_queue` and the leg's codec extension
+//!   (`VK_KHR_video_decode_h264` / `VK_KHR_video_decode_h265`), with a queue
+//!   family carrying `VIDEO_DECODE_KHR` ops for that codec;
 //! - `timelineSemaphore` + `synchronization2` feature support (Vulkan 1.3 core).
 //!
-//! What it proves: device wrap → caps query/derivation on REAL caps → session +
+//! One leg per codec, running the SAME body ([`smoke`]) over the vendored 25fps
+//! vector of that codec — a box that decodes only one of the two runs that leg and
+//! reports the other as "no physical device with VK_KHR_video_decode_…", which is
+//! a fact about the box rather than a failure. Device bring-up lives in
+//! `tests/common/mod.rs`.
+//!
+//! What they prove: device wrap → caps query/derivation on REAL caps → session +
 //! parameters creation → the decoupled picture pool → 48 AUs of the vendored
 //! 25fps vector decoded through `vkCmdDecodeVideoKHR` — well past DPB-full, so
 //! slot re-activation binds fresh pool images repeatedly — while the consumer
@@ -23,308 +30,300 @@
 //! Every frame's RESULT_STATUS_ONLY query must read COMPLETE before its
 //! release. This is the regression test for the .25 field failure class: any
 //! pool sizing that ignores the stream's DPB depth or the client's hold depth
-//! starves exactly here. What it deliberately does NOT prove (WP-D on-glass):
-//! pixel correctness vs the ffmpeg rung, presenter interop (the `value + 1`
-//! signal-back — no presenter runs here, so releases pass `false`), soak, and
-//! both vendors' DPB arrangements at once (each box exercises only its own).
+//! starves exactly here. What they deliberately do NOT prove (that is
+//! `gpu_parity`'s and WP-D on-glass's ground): pixel correctness vs the ffmpeg
+//! rung, presenter interop (the `value + 1` signal-back — no presenter runs here,
+//! so releases pass `false`), soak, and both vendors' DPB arrangements at once
+//! (each box exercises only its own).
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use std::io::Cursor;
+mod common;
 
 use ash::vk;
-use ash::vk::Handle;
-use cros_codecs::codec::h264::parser::Nalu;
-use cros_codecs::codec::h264::parser::NaluType;
+use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
-use pf_vkdecode::DeviceHandles;
+use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
 use pf_vkdecode::VkH264Decoder;
+use pf_vkdecode::VkH265Decoder;
 
-// The same vendored vector the WP-A tests convert, same relative path.
-const TEST_25FPS: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-);
+/// AUs fed: far past either vector's DPB depth (`max_dpb_frames = 7` for the
+/// H.264 clip), so DPB slots re-activate onto fresh pool images repeatedly.
+const AUS: usize = 48;
+/// The REAL client's consumption shape: the consumer holds four delivered frames
+/// and releases only the oldest beyond that (its channels + preroll + in-flight
+/// present hold ~4-7).
+const CLIENT_HOLD: usize = 4;
+/// 48 AUs may legitimately leave a few pictures buffered for reorder; anything
+/// below this is a delivery failure, not reordering.
+const MIN_DELIVERED: usize = 40;
 
-/// Test-only AU splitter, mirroring pf-bitstream's (`#[cfg(test)]`-private there).
-fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
+/// The geometry one leg's vector must deliver.
+struct Geometry {
+    /// The vector's display (conformance-window) region.
+    display: (u32, u32),
+    /// The ALLOCATED extent, when the leg knows it for a fact.
+    ///
+    /// `pictureAccessGranularity` rounds the coded size up, so this is a
+    /// per-vector AND per-driver fact, not a property of the bitstream. The H.264
+    /// leg has asserted `(320, 240)` on the fleet since WP-B and keeps asserting
+    /// it; the H.265 leg has NO hardware evidence yet, so it asserts only the
+    /// invariant that always holds (allocated >= display) and PRINTS what it got
+    /// — which is exactly what a first fleet run needs in order to pin it later.
+    exact_coded: Option<(u32, u32)>,
+}
 
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let nalu_offset = cursor.position() as usize;
-        let start = nalu_offset - nalu.offset;
-        let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-        let first_mb_zero = is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_mb_zero) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
+/// Decode [`AUS`] access units while holding [`CLIENT_HOLD`] frames, asserting the
+/// decode verdict of every frame before its release.
+///
+/// One body for both codecs (over `common::TestDecoder`) so "the H.265 leg proves
+/// what the H.264 leg proves" is structural rather than a claim about two copies.
+fn smoke(decoder: &mut impl TestDecoder, aus: &[&[u8]], geometry: &Geometry) {
+    // The smoke legs exist to prove the PRODUCTION pool arrangement survives 48
+    // AUs at the client's hold depth. `PF_VKD_TEST_READBACK` adds TRANSFER_SRC to
+    // the picture pool for whoever sets it, so a shell that exported it while
+    // iterating on the parity legs would quietly test a pool production never
+    // builds — and the leg would still pass. Refuse rather than mislead.
+    assert!(
+        std::env::var_os("PF_VKD_TEST_READBACK").is_none(),
+        "PF_VKD_TEST_READBACK is set in the environment: it grows the picture pool \
+         a usage flag production never carries, so this leg would no longer be \
+         testing the production pool arrangement. Unset it for the smoke legs \
+         (the parity legs set it themselves, under the same GPU lock)."
+    );
+    // Status is read (COMPLETE required, the program's whole point) as each frame
+    // retires; `take_ready` is drained every AU so nothing is stranded. No
+    // presenter runs here, so releases report `presenter_signaled = false` (no
+    // `value + 1` write-back).
+    let mut held: std::collections::VecDeque<DecodedVkFrame> = std::collections::VecDeque::new();
+    let mut delivered = 0usize;
+    let mut geometry_checked = false;
+    for (index, au) in aus.iter().enumerate().take(AUS) {
+        let mut next = decoder.decode(au).unwrap_or_else(|e| {
+            panic!(
+                "AU {index}: decode failed: {e}\n  state: {}",
+                decoder.debug_snapshot()
+            )
+        });
+        while let Some(frame) = next {
+            if !geometry_checked {
+                assert_eq!(
+                    (frame.crop.width, frame.crop.height),
+                    geometry.display,
+                    "the vector's display region"
+                );
+                assert!(
+                    frame.coded_width >= frame.crop.width
+                        && frame.coded_height >= frame.crop.height,
+                    "the ALLOCATED extent ({}x{}) must cover the display region ({}x{})",
+                    frame.coded_width,
+                    frame.coded_height,
+                    frame.crop.width,
+                    frame.crop.height,
+                );
+                if let Some(exact) = geometry.exact_coded {
+                    assert_eq!(
+                        (frame.coded_width, frame.coded_height),
+                        exact,
+                        "ALLOCATED extent (this vector needs no granularity padding here)"
+                    );
+                }
+                // A pool built for the wrong picture format decodes and then
+                // renders with the wrong maths (`DecodedVkFrame::format` docs);
+                // both vectors are 8-bit 4:2:0, so both must land on NV12.
+                assert_eq!(
+                    frame.format,
+                    pf_vkdecode::NV12,
+                    "8-bit 4:2:0 vector must decode into an NV12 pool"
+                );
+                assert_ne!(frame.image, vk::Image::null());
+                assert_ne!(frame.semaphore, vk::Semaphore::null());
+                assert!(frame.value > 0);
+                eprintln!(
+                    "geometry: allocated {}x{} display {}x{} format {:?} layout {:?}",
+                    frame.coded_width,
+                    frame.coded_height,
+                    frame.crop.width,
+                    frame.crop.height,
+                    frame.format,
+                    frame.layout,
+                );
+                geometry_checked = true;
+            }
+            held.push_back(frame);
+            delivered += 1;
+            // Steady state: keep CLIENT_HOLD frames in hand, retire beyond.
+            while held.len() > CLIENT_HOLD {
+                let oldest = held.pop_front().expect("nonempty");
+                assert_eq!(
+                    decoder.wait_status(&oldest),
+                    DecodeStatus::Ok,
+                    "AU {index}: decode op not COMPLETE\n  state: {}",
+                    decoder.debug_snapshot()
+                );
+                decoder
+                    .release_frame(&oldest, false)
+                    .unwrap_or_else(|e| panic!("AU {index}: release failed: {e}"));
+            }
+            next = decoder.take_ready();
         }
-        au_has_slice |= is_slice;
     }
-    aus.push(&stream[au_start..]);
-    aus
+    // Retire the tail the consumer still holds.
+    for frame in held.drain(..) {
+        assert_eq!(decoder.wait_status(&frame), DecodeStatus::Ok);
+        decoder
+            .release_frame(&frame, false)
+            .expect("tail frames release");
+    }
+    assert!(
+        delivered >= MIN_DELIVERED,
+        "expected at least {MIN_DELIVERED} delivered frames from {AUS} AUs, got {delivered}"
+    );
+    // The DPB mode the caps derivation chose, and whether this box answers per-op
+    // status at all — a passing run should say so too (failure paths already carry
+    // the snapshot).
+    eprintln!(
+        "final state: {} status_queries={}",
+        decoder.debug_snapshot(),
+        decoder.status_queries()
+    );
 }
 
 #[test]
 #[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
-fn decodes_48_aus_holding_four_frames_like_the_real_client() {
-    // ---- instance ----
-    // SAFETY: loads the system Vulkan loader; no Vulkan objects exist yet.
-    let entry = unsafe { ash::Entry::load() }.expect("a Vulkan loader on this box");
-    let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
-    let instance_ci = vk::InstanceCreateInfo::default().application_info(&app);
-    // SAFETY: valid create info rooted in locals; the instance is destroyed at the
-    // end of this test after everything created from it.
-    let instance =
-        unsafe { entry.create_instance(&instance_ci, None) }.expect("create a Vulkan 1.3 instance");
+fn h264_decodes_48_aus_holding_four_frames_like_the_real_client() {
+    // One codec at a time on the device (see `common::gpu_lock`).
+    let _gpu = common::gpu_lock();
 
-    // Optional vendor pin (`PF_VKD_SMOKE_VENDOR`, hex `0x1002` or decimal): multi-GPU
-    // boxes enumerate several decode-capable devices and first-match hides all but
-    // one — the pin makes a run attributable to a specific vendor's driver.
-    let vendor_filter: Option<u32> = std::env::var("PF_VKD_SMOKE_VENDOR").ok().map(|raw| {
-        let trimmed = raw.trim();
-        trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .map_or_else(|| trimmed.parse(), |hex| u32::from_str_radix(hex, 16))
-            .unwrap_or_else(|_| panic!("PF_VKD_SMOKE_VENDOR is not a PCI vendor id: {raw:?}"))
+    let setup = common::bring_up(&common::Request {
+        codec: common::H264,
+        // The smoke legs submit nothing outside the decoder, so a decode-only
+        // device is usable (and its EXCLUSIVE pool sharing is worth exercising).
+        graphics: common::Graphics::DecodeFamilyIsFine,
+        report_families: true,
     });
-
-    // ---- physical device with an H.264 decode queue family ----
-    // SAFETY: live instance.
-    let physical_devices =
-        unsafe { instance.enumerate_physical_devices() }.expect("enumerate physical devices");
-    let mut picked: Option<(vk::PhysicalDevice, u32, u32)> = None;
-    for pd in physical_devices {
-        // SAFETY: `pd` was just enumerated from this instance.
-        let props = unsafe { instance.get_physical_device_properties(pd) };
-        if vendor_filter.is_some_and(|vendor| props.vendor_id != vendor) {
-            continue;
-        }
-        // SAFETY: `pd` was just enumerated from this instance.
-        let ext_props =
-            unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
-        let has = |name: &std::ffi::CStr| {
-            ext_props.iter().any(|e| {
-                e.extension_name_as_c_str()
-                    .is_ok_and(|extension| extension == name)
-            })
-        };
-        if !(has(ash::khr::video_queue::NAME)
-            && has(ash::khr::video_decode_queue::NAME)
-            && has(ash::khr::video_decode_h264::NAME))
-        {
-            continue;
-        }
-        // SAFETY: live physical device; the two-call form fills the chained video
-        // properties for each family.
-        let family_count = unsafe { instance.get_physical_device_queue_family_properties2_len(pd) };
-        let mut video_props = vec![vk::QueueFamilyVideoPropertiesKHR::default(); family_count];
-        let mut families: Vec<vk::QueueFamilyProperties2<'_>> = video_props
-            .iter_mut()
-            .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
-            .collect();
-        // SAFETY: as above, arrays sized to the reported count.
-        unsafe { instance.get_physical_device_queue_family_properties2(pd, &mut families) };
-        let flags_per_family: Vec<vk::QueueFlags> = families
-            .iter()
-            .map(|f| f.queue_family_properties.queue_flags)
-            .collect();
-        drop(families); // release the &mut borrows so video_props is readable
-
-        // Print each family's video ops + RESULT_STATUS query support — the
-        // context every failure report needs first (which mode the box runs and
-        // whether per-op status verdicts even exist here; RADV: they do not,
-        // and recording one hangs the VCN — the 2026-08 .25 lesson).
-        {
-            let mut status_props =
-                vec![vk::QueueFamilyQueryResultStatusPropertiesKHR::default(); family_count];
-            let mut families2: Vec<vk::QueueFamilyProperties2<'_>> = status_props
-                .iter_mut()
-                .map(|s| vk::QueueFamilyProperties2::default().push_next(s))
-                .collect();
-            // SAFETY: as the query above.
-            unsafe { instance.get_physical_device_queue_family_properties2(pd, &mut families2) };
-            drop(families2);
-            for (i, s) in status_props.iter().enumerate() {
-                eprintln!(
-                    "family {i}: flags={:?} video_ops={:?} query_result_status={}",
-                    flags_per_family[i],
-                    video_props[i].video_codec_operations,
-                    s.query_result_status_support != vk::FALSE,
-                );
-            }
-        }
-
-        let mut decode_qf = None;
-        let mut graphics_qf = None;
-        for (index, flags) in flags_per_family.iter().enumerate() {
-            if flags.contains(vk::QueueFlags::GRAPHICS) && graphics_qf.is_none() {
-                graphics_qf = Some(index as u32);
-            }
-            if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
-                && video_props[index]
-                    .video_codec_operations
-                    .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
-                && decode_qf.is_none()
-            {
-                decode_qf = Some(index as u32);
-            }
-        }
-        if let Some(decode) = decode_qf {
-            picked = Some((pd, decode, graphics_qf.unwrap_or(decode)));
-            break;
-        }
-    }
-    let (pd, decode_qf, graphics_qf) =
-        picked.expect("a physical device with VK_KHR_video_decode_h264 and a decode queue");
-
-    // Attribution header: which device (and driver) this run actually exercised.
+    let handles = setup.handles();
     {
-        let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver_props);
-        // SAFETY: live physical device; the chain fills the Vulkan 1.2 core
-        // driver-identity struct.
-        unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
-        let props = props2.properties;
-        eprintln!(
-            "picked: {:?} vendor=0x{:04x} driver={:?} info={:?}",
-            props.device_name_as_c_str().unwrap_or(c"?"),
-            props.vendor_id,
-            driver_props.driver_name_as_c_str().unwrap_or(c"?"),
-            driver_props.driver_info_as_c_str().unwrap_or(c"?"),
-        );
-    }
-
-    // ---- logical device: decode (+ graphics) queues, video + sync features ----
-    let priorities = [1.0f32];
-    let mut queue_infos = vec![vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(decode_qf)
-        .queue_priorities(&priorities)];
-    if graphics_qf != decode_qf {
-        queue_infos.push(
-            vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(graphics_qf)
-                .queue_priorities(&priorities),
-        );
-    }
-    let extensions = [
-        ash::khr::video_queue::NAME.as_ptr(),
-        ash::khr::video_decode_queue::NAME.as_ptr(),
-        ash::khr::video_decode_h264::NAME.as_ptr(),
-    ];
-    let mut features12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
-    let mut features13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
-    let device_ci = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_infos)
-        .enabled_extension_names(&extensions)
-        .push_next(&mut features12)
-        .push_next(&mut features13);
-    // SAFETY: live physical device, valid create info rooted in locals; destroyed
-    // at the end of this test after the decoder drops.
-    let device =
-        unsafe { instance.create_device(pd, &device_ci, None) }.expect("create the decode device");
-
-    // ---- the decoder over borrowed handles, exactly as WP-C will hold it ----
-    let handles = DeviceHandles {
-        get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
-        instance: instance.handle().as_raw() as usize,
-        physical_device: pd.as_raw() as usize,
-        device: device.handle().as_raw() as usize,
-        decode_qf,
-        decode_queue_index: 0,
-        graphics_qf,
-    };
-    {
-        // SAFETY: the handles above are live for this whole block (the decoder
-        // drops at its end, before the device/instance destroys below), the device
-        // was created with the decode extensions + timeline/sync2 features, and
-        // the queue fields name the families/queues created above.
+        // SAFETY: `setup` outlives this block (destroyed below, after the decoder
+        // drops at the block's end), it was created with the H.264 decode
+        // extensions + timeline/sync2 features, and its queue fields name the
+        // families/queues it created.
         let mut decoder = unsafe { VkH264Decoder::new(&handles, Box::new(NoopQueueLock)) }
             .expect("wrap the device");
-
-        // 48 AUs — far past the vector's DPB depth (max_dpb_frames = 7), so DPB
-        // slots re-activate onto fresh pool images repeatedly — with the REAL
-        // client's consumption shape: the consumer HOLDS four delivered frames
-        // and releases only the oldest beyond that (its channels + preroll +
-        // in-flight present hold ~4-7). Status is read (COMPLETE required, the
-        // program's whole point) as each frame retires; `take_ready` is drained
-        // every AU so nothing is stranded. No presenter runs here, so releases
-        // report `presenter_signaled = false` (no `value+1` write-back).
-        const CLIENT_HOLD: usize = 4;
-        let aus = split_into_aus(TEST_25FPS);
-        let mut held: std::collections::VecDeque<pf_vkdecode::DecodedVkFrame> =
-            std::collections::VecDeque::new();
-        let mut delivered = 0usize;
-        let mut geometry_checked = false;
-        for (index, au) in aus.iter().enumerate().take(48) {
-            let mut next = decoder.decode(au).unwrap_or_else(|e| {
-                panic!(
-                    "AU {index}: decode failed: {e}\n  state: {}",
-                    decoder.debug_snapshot()
-                )
-            });
-            while let Some(frame) = next {
-                if !geometry_checked {
-                    assert_eq!(
-                        (frame.coded_width, frame.coded_height),
-                        (320, 240),
-                        "ALLOCATED extent (320x240 needs no granularity padding here)"
-                    );
-                    assert_eq!(
-                        (frame.crop.width, frame.crop.height),
-                        (320, 240),
-                        "the vector is uncropped"
-                    );
-                    assert_ne!(frame.image, vk::Image::null());
-                    assert_ne!(frame.semaphore, vk::Semaphore::null());
-                    assert!(frame.value > 0);
-                    geometry_checked = true;
-                }
-                held.push_back(frame);
-                delivered += 1;
-                // Steady state: keep CLIENT_HOLD frames in hand, retire beyond.
-                while held.len() > CLIENT_HOLD {
-                    let oldest = held.pop_front().expect("nonempty");
-                    assert_eq!(
-                        decoder.wait_status(&oldest),
-                        DecodeStatus::Ok,
-                        "AU {index}: decode op not COMPLETE\n  state: {}",
-                        decoder.debug_snapshot()
-                    );
-                    decoder
-                        .release_frame(&oldest, false)
-                        .unwrap_or_else(|e| panic!("AU {index}: release failed: {e}"));
-                }
-                next = decoder.take_ready();
-            }
-        }
-        // Retire the tail the consumer still holds.
-        for frame in held.drain(..) {
-            assert_eq!(decoder.wait_status(&frame), DecodeStatus::Ok);
-            decoder
-                .release_frame(&frame, false)
-                .expect("tail frames release");
-        }
-        assert!(
-            delivered >= 40,
-            "expected at least 40 delivered frames from 48 AUs, got {delivered}"
+        smoke(
+            &mut decoder,
+            &common::split_h264_aus(common::TEST_25FPS_H264),
+            &Geometry {
+                display: (320, 240),
+                exact_coded: Some((320, 240)),
+            },
         );
-        // The DPB mode the caps derivation chose — a passing run should say so
-        // too (failure paths already carry it via the same snapshot).
-        eprintln!("final state: {}", decoder.debug_snapshot());
     }
+    // SAFETY: the decoder is gone (its Drop drained the queue and destroyed its
+    // session/pools), and nothing else references the setup's handles.
+    unsafe { setup.destroy() };
+}
 
-    // ---- teardown (decoder is gone; its Drop drained the queue) ----
-    // SAFETY: every object created from the device (the decoder's pools/session)
-    // was destroyed when the decoder dropped above.
-    unsafe {
-        device.destroy_device(None);
-        instance.destroy_instance(None);
+#[test]
+#[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
+fn h265_decodes_48_aus_holding_four_frames_like_the_real_client() {
+    // One codec at a time on the device (see `common::gpu_lock`).
+    let _gpu = common::gpu_lock();
+
+    let setup = common::bring_up(&common::Request {
+        codec: common::H265,
+        graphics: common::Graphics::DecodeFamilyIsFine,
+        report_families: true,
+    });
+    let handles = setup.handles();
+    {
+        // SAFETY: as the H.264 leg — `setup` outlives this block and was created
+        // with the H.265 decode extensions + timeline/sync2 features.
+        let mut decoder = unsafe { VkH265Decoder::new(&handles, Box::new(NoopQueueLock)) }
+            .expect("wrap the device");
+        // The construction-time shape gate the client's ladder relies on, on the
+        // vector's own facts (Main, 4:2:0, 8-bit → NV12). Called here rather than
+        // left to the first AU so a device that cannot host the combination says
+        // so as a refusal with a caps reason, not as a mid-stream decode failure —
+        // and so this path has hardware evidence at all.
+        decoder
+            .probe_stream_support(1, 0)
+            .expect("the box must host H.265 Main 8-bit 4:2:0 (the vector's shape)");
+        smoke(
+            &mut decoder,
+            &common::split_h265_aus(common::TEST_25FPS_H265),
+            &Geometry {
+                display: (320, 240),
+                // No hardware evidence for HEVC's `pictureAccessGranularity` on
+                // any fleet box yet; the leg prints what it allocates instead of
+                // asserting a number nobody has observed.
+                exact_coded: None,
+            },
+        );
     }
+    // SAFETY: as the H.264 leg — the decoder is gone and nothing else references
+    // the setup's handles.
+    unsafe { setup.destroy() };
+}
+
+// ---------------------------------------------------------------------------
+// CPU coherence guard — NOT `#[ignore]`d.
+//
+// The legs above only run on the fleet, so [`MIN_DELIVERED`] would otherwise be a
+// number copied from the H.264 leg and never checked against the H.265 vector's
+// own reorder depth. It is the CPU planner that decides how many of the first
+// [`AUS`] pictures can possibly be delivered — the decoder builds exactly one
+// frame per `dpb.outputs` id — so the floor is checkable here, without a GPU, and
+// a re-synced vector that reorders more deeply fails HERE instead of looking like
+// a pool-starvation bug on hardware.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus() {
+    let h264 = {
+        let mut planner = pf_bitstream::h264::H264Planner::new();
+        common::split_h264_aus(common::TEST_25FPS_H264)
+            .iter()
+            .take(AUS)
+            .enumerate()
+            .map(|(index, au)| {
+                planner
+                    .plan_au(au)
+                    .unwrap_or_else(|e| panic!("H.264 AU {index} must plan, got {e:?}"))
+                    .dpb
+                    .outputs
+                    .len()
+            })
+            .sum::<usize>()
+    };
+    let h265 = {
+        let mut planner = pf_bitstream::h265::H265Planner::new();
+        common::split_h265_aus(common::TEST_25FPS_H265)
+            .iter()
+            .take(AUS)
+            .enumerate()
+            .map(|(index, au)| {
+                planner
+                    .plan_au(au)
+                    .unwrap_or_else(|e| panic!("H.265 AU {index} must plan, got {e:?}"))
+                    .dpb
+                    .outputs
+                    .len()
+            })
+            .sum::<usize>()
+    };
+    eprintln!("outputs from the first {AUS} AUs: h264={h264} h265={h265}");
+    // No `flush` here on purpose: the smoke legs do not flush either, so the
+    // planner's un-flushed output count is exactly the frame budget they have.
+    assert!(
+        h264 >= MIN_DELIVERED,
+        "the H.264 leg asserts >= {MIN_DELIVERED} delivered but the planner only \
+         outputs {h264} pictures from the first {AUS} AUs"
+    );
+    assert!(
+        h265 >= MIN_DELIVERED,
+        "the H.265 leg asserts >= {MIN_DELIVERED} delivered but the planner only \
+         outputs {h265} pictures from the first {AUS} AUs"
+    );
 }
