@@ -29,5 +29,10 @@
 		"vite.config.ts",
 		"vite.storybook.config.ts",
 		"orval.config.ts"
-	]
+	],
+	// Tests run under `bun test`, which typechecks nothing and needs nothing — but `bun:test` has no
+	// types without pulling in @types/bun, and that package redeclares globals this DOM-targeted
+	// config already owns. Not worth a lockfile change (and the bun.nix regeneration it drags along)
+	// to typecheck assertions that bun executes directly.
+	"exclude": ["**/*.test.ts"]
 }

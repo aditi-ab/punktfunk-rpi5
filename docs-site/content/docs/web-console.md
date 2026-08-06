@@ -14,6 +14,27 @@ game-library browsing to paired clients.
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.
 
+## Two ports, not one
+
+The console also listens on **TCP 47993**, and plugin interfaces are served from there — same host,
+same certificate, **different port**.
+
+That is a deliberate boundary rather than a second console. A plugin's interface is third-party
+code, and on the console's own port the browser would treat it as part of the console: it could act
+as you, with your logged-in session, against every admin action the console can reach. A different
+port is a different *origin*, so the browser itself keeps the two apart — while staying the same
+*site*, which is what lets your login still carry over so you don't sign in twice.
+
+What this means in practice:
+
+- **Open 47993 alongside 47992** on the host's firewall if you browse the console from another
+  device. The packaged firewall profiles already list both.
+- **Trust the certificate twice.** Browsers store a self-signed certificate exception *per port*.
+  The first time you open a plugin, the console will notice it can't reach 47993 yet and offer a
+  link to open it in a tab — accept the warning there once, come back, and it works from then on.
+- If a plugin's page is an empty panel, see
+  [A plugin's interface doesn't load](/docs/troubleshooting#a-plugins-interface-doesnt-load).
+
 ## Enable the console
 
 - **Linux packages (apt / RPM / Bazzite):** on Ubuntu the host package is `punktfunk-host`

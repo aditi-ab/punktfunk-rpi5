@@ -11,7 +11,7 @@
 	"nav_plugins": "Plugins",
 	"plugin_offline_title": "Dieses Plugin läuft nicht",
 	"plugin_origin_untrusted_title": "Port dieses Plugins einmal bestätigen",
-	"plugin_origin_untrusted_hint": "Plugin-Oberflächen laufen auf einem eigenen Port, damit ein Plugin nicht in deinem Namen auf der Konsole handeln kann. Dein Browser vertraut dem Zertifikat dieses Hosts für den Konsolen-Port, aber noch nicht für diesen — und in einem Frame kann er nicht nachfragen. Öffne ihn einmal in einem Tab, bestätige das Zertifikat und komm zurück.",
+	"plugin_origin_untrusted_hint": "Plugin-Oberflächen laufen auf einem eigenen Port, damit ein Plugin nicht in deinem Namen auf der Konsole handeln kann. Dein Browser spricht mit diesem Port noch nicht: entweder hat er das Zertifikat dieses Hosts dafür nicht bestätigt — Zertifikate gelten pro Port, und in einem Frame kann er nicht nachfragen — oder der Port ist in der Firewall des Hosts zu. Öffne ihn einmal in einem Tab: bei einer Zertifikatswarnung bestätigen und zurückkommen; kommt gar keine Verbindung zustande, öffne TCP 47993 auf dem Host.",
 	"plugin_origin_untrusted_open": "In neuem Tab öffnen",
 	"plugin_origin_unavailable_title": "Plugin-Oberflächen sind nicht verfügbar",
 	"plugin_origin_unavailable_hint": "Plugin-Oberflächen laufen auf einem eigenen Port, damit ein Plugin nicht in deinem Namen auf der Konsole handeln kann. Dieser Port konnte nicht geöffnet werden, deshalb bleiben sie deaktiviert. Sieh ins Konsolen-Log, setze dann PUNKTFUNK_UI_PLUGIN_PORT auf einen freien Port und starte neu.",

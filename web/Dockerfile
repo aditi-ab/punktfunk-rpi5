@@ -6,6 +6,12 @@
 #
 # Runtime: PORT (default 47992) and PUNKTFUNK_MGMT_URL (upstream management API the Nitro
 # server proxies /api to; see web/server/routes).
+#
+# TWO ports, not one. The console also listens on PUNKTFUNK_UI_PLUGIN_PORT (default PORT + 1 =
+# 47993) and serves plugin UIs from there — a different origin, so a plugin's own code cannot act
+# as the logged-in operator on the console's origin. Publish BOTH (`-p 47992:47992 -p
+# 47993:47993`): the browser loads the frame from the second port directly, so a container that
+# only publishes 47992 serves a console whose every plugin interface is an empty panel.
 FROM oven/bun:1 AS build
 WORKDIR /repo/web
 
@@ -25,5 +31,5 @@ WORKDIR /app
 COPY --from=build /repo/web/.output ./.output
 USER bun
 ENV PORT=47992
-EXPOSE 47992
+EXPOSE 47992 47993
 CMD ["bun", "run", ".output/server/index.mjs"]
