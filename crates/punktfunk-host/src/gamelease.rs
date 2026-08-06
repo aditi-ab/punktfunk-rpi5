@@ -52,6 +52,24 @@ const EXIT_CONFIRM: Duration = Duration::from_secs(3);
 const SHIM_WINDOW: Duration = Duration::from_secs(5);
 /// How long a game gets to close on its own after a polite request, before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(10);
+/// How long [`crate::procscan::running_hint`] may hold off the exit once the game's processes have
+/// all gone.
+///
+/// The hint is a tie-breaker for a scan that momentarily cannot see the game — a launcher re-execing,
+/// an engine relaunching itself into a new pid — and those gaps are over in seconds, an order of
+/// magnitude inside this window. Past it, a game nothing can find is gone whatever the hint says.
+///
+/// **Bounded because the hint's backing state is not guaranteed to be truthful.** Windows reads
+/// Steam's per-app `Running` registry flag, which Steam leaves set whenever it does not cleanly
+/// observe the exit (Steam crashed or was closed first, the game re-parented, a launcher appid stays
+/// set) — and `steam_running_hint` believes the first hive that says so, including a stale one left
+/// in another profile. An UNBOUNDED veto turns that into a session that never ends on its own: the
+/// console shows the game running for as long as the host does, `session_on_game_exit` never fires,
+/// and only a manual "End" gets the stream back (field report 2026-08-06, Windows host 0.24.0).
+///
+/// Ending a moment too early is the cheaper failure: the stream drops while the game lives (the user
+/// reconnects, and `finish` never kills anything). Ending never is the bug above.
+const VETO_LIMIT: Duration = Duration::from_secs(30);
 
 /// A child process the host spawned for a launch, and what may safely be signalled for it.
 #[derive(Clone, Copy, Debug)]
@@ -540,27 +558,57 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
             gone_since = None;
             vetoed = false;
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
-        } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= EXIT_CONFIRM {
-            // Last check before ending a session: does anything outside the process scan still think
-            // the game is up? Only a veto, never a reason to call it running — see
-            // `procscan::running_hint`. The failure mode of honoring it is a stream that stays up.
-            if crate::procscan::running_hint(&shared.spec) == Some(true) {
-                if !vetoed {
-                    vetoed = true;
-                    tracing::info!(
-                        title = %shared.game.title,
-                        "no game processes found, but its launcher still reports it running — not \
-                         ending the session"
-                    );
+        } else {
+            // How long the game's processes have been CONTINUOUSLY absent. Deliberately not reset by
+            // the veto below — letting it run on is exactly what bounds the veto.
+            let gone_for = gone_since.get_or_insert_with(Instant::now).elapsed();
+            if gone_for >= EXIT_CONFIRM {
+                // Last check before ending a session: does anything outside the process scan still
+                // think the game is up? Only a veto, never a reason to call it running — see
+                // `procscan::running_hint`.
+                let hint_running = crate::procscan::running_hint(&shared.spec) == Some(true);
+                if !exit_confirmed(gone_for, hint_running) {
+                    if !vetoed {
+                        vetoed = true;
+                        tracing::info!(
+                            title = %shared.game.title,
+                            veto_limit_s = VETO_LIMIT.as_secs(),
+                            "no game processes found, but its launcher still reports it running — \
+                             holding off on ending the session"
+                        );
+                    }
+                } else {
+                    if hint_running {
+                        // The veto outlived its usefulness: nothing this scan can see has existed
+                        // for VETO_LIMIT, so the launcher's opinion is stale, not early.
+                        tracing::warn!(
+                            title = %shared.game.title,
+                            gone_for_s = gone_for.as_secs(),
+                            "its launcher still reports the game running, but nothing of it has \
+                             been on the box for {}s — treating that as a stale flag and ending \
+                             the session",
+                            VETO_LIMIT.as_secs()
+                        );
+                    }
+                    finish(&shared, &on_exit, "the game exited");
+                    return;
                 }
-                gone_since = None;
-            } else {
-                finish(&shared, &on_exit, "the game exited");
-                return;
             }
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Whether a game nothing can find any more counts as exited: absent for at least [`EXIT_CONFIRM`],
+/// and either unopposed or absent long enough that the opposition ([`crate::procscan::running_hint`]
+/// saying `Some(true)`) has been overruled by [`VETO_LIMIT`].
+///
+/// Split out of the watch loop because it is the one rule in this file whose *bound* is the fix:
+/// the loop itself polls a live process table and cannot be unit-tested, which is how an unbounded
+/// veto shipped. Pure, so the table below is the whole contract.
+#[cfg(any(target_os = "linux", windows))]
+fn exit_confirmed(gone_for: Duration, hint_running: bool) -> bool {
+    gone_for >= EXIT_CONFIRM && (!hint_running || gone_for >= VETO_LIMIT)
 }
 
 /// Record the exit and, unless the host itself ended the game, run the session-ending action.
@@ -1035,6 +1083,34 @@ mod tests {
         pending_snapshot()
             .iter()
             .any(|(s, _)| s.game.id.as_deref() == Some(id))
+    }
+
+    /// The exit rule, including the thing that was missing: the veto ENDS.
+    ///
+    /// Field 2026-08-06 (Windows 0.24.0): Steam's per-app `Running` flag was left set after the game
+    /// exited, the watcher honoured it on every pass and reset its own confirm window each time, so
+    /// the game read as running for the life of the host and the stream never auto-ended. The last
+    /// case below is that regression.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_launcher_veto_expires_instead_of_pinning_a_session_open() {
+        let brief = EXIT_CONFIRM / 2;
+        let confirmed = EXIT_CONFIRM + Duration::from_secs(1);
+        let long = VETO_LIMIT + Duration::from_secs(1);
+
+        // Too early to call it either way — a process swap is still plausible.
+        assert!(!exit_confirmed(brief, false));
+        assert!(!exit_confirmed(brief, true));
+        // Gone past the confirm window with nothing objecting: exited.
+        assert!(exit_confirmed(confirmed, false));
+        // Same, but the launcher objects — that is what the veto is FOR, so hold off.
+        assert!(!exit_confirmed(confirmed, true));
+        // …and this is the bound. Still objecting, but nothing of the game has existed for
+        // VETO_LIMIT, so the objection is stale and the session ends anyway.
+        assert!(exit_confirmed(long, true));
+        assert!(exit_confirmed(long, false));
+        // (The middle two cases together also pin VETO_LIMIT > EXIT_CONFIRM: a veto that did not
+        // outlast the window it overrides could never hold anything off in the first place.)
     }
 
     #[test]
