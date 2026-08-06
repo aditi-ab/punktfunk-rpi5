@@ -2754,6 +2754,60 @@ mod tests {
         enc.encoder_engines
     }
 
+    /// An NV12 frame filled with **real high-entropy content**, not the zeroed VRAM every other
+    /// helper here hands the encoder.
+    ///
+    /// This matters more than it looks. Under CBR the rate controller spends its quota only if
+    /// there is something to code; against uninitialised (driver-zeroed) buffers it emits ~300 B/AU
+    /// where the configured rate wants ~833 KB, so every timing taken that way measures the
+    /// PIXEL-proportional cost and is blind to the bits/frame regime — the regime the 4K60 HDR
+    /// field report actually came from. A cheap xorshift per pixel plus a per-frame seed gives both
+    /// spatial detail (so intra costs real bits) and inter-frame change (so P-frames cannot
+    /// skip-code), which is what drives the entropy coder.
+    /// `block` sets the spatial detail: 1 = per-pixel noise (incompressible — rate control
+    /// OVERSHOOTS any low target), larger = blockier and cheaper to code. Sweeping it is how the
+    /// bench reaches the LOW bits/frame end at all; pure noise cannot get there.
+    fn noise_nv12_frame(w: u32, h: u32, i: u32, block: usize) -> CapturedFrame {
+        let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
+        let (uv_ptr, uv_pitch) = buf.uv.expect("NV12 buffer has a UV plane");
+        let mut st = 0x2545_F491_4F6C_DD1Du64 ^ ((i as u64 + 1) << 32);
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let b = block.max(1);
+        let mut plane = |pw: usize, ph: usize| -> Vec<u8> {
+            let bw = pw.div_ceil(b);
+            let cells: Vec<u8> = (0..(bw * ph.div_ceil(b)))
+                .map(|_| (next() >> 24) as u8)
+                .collect();
+            let mut out = Vec::with_capacity(pw * ph);
+            for y in 0..ph {
+                let row = y / b * bw;
+                for x in 0..pw {
+                    out.push(cells[row + x / b]);
+                }
+            }
+            out
+        };
+        let y = plane(w as usize, h as usize);
+        let uv = plane(w as usize, h as usize / 2);
+        pf_zerocopy::cuda::write_plane_from_host(buf.ptr, buf.pitch, &y, w as usize, h as usize)
+            .expect("upload Y plane");
+        pf_zerocopy::cuda::write_plane_from_host(uv_ptr, uv_pitch, &uv, w as usize, h as usize / 2)
+            .expect("upload UV plane");
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: i as u64 * 16_666_667,
+            format: PixelFormat::Nv12,
+            payload: FramePayload::Cuda(buf),
+            cursor: None,
+        }
+    }
+
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Content is uninitialized device memory — NVENC encodes it fine; this smoke test asserts the
         // session/registration/encode/RFI machinery, not picture fidelity (that's the on-glass A/B).
@@ -4045,6 +4099,99 @@ mod tests {
                 "a wash; neither arm is clearly better for Main10 here"
             }
         );
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
+    /// ON-HARDWARE — **THE BITS/FRAME CURVE**, the measurement this whole programme has been blind
+    /// to (WP0's real deliverable).
+    ///
+    /// Every other timing here was taken against driver-zeroed buffers, so rate control had
+    /// nothing to code (~300 B/AU against an 833 KB quota) and only the PIXEL-proportional half of
+    /// the encode cost was ever exercised. But the 4K60 HDR field report was a *bits/frame*
+    /// problem — 6.8 Mbit/frame — and the central hypothesis is that split's benefit and the
+    /// 10-bit veto's origin both live on that axis. [`noise_nv12_frame`] finally puts real entropy
+    /// in front of the encoder.
+    ///
+    /// Sweeps bitrate at a fixed mode, single-engine vs forced-2, and prints **bytes/AU alongside
+    /// every timing** — without that column a run that silently undershoots its quota looks like a
+    /// result instead of a non-measurement. Run on both boxes:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_bits_per_frame_curve --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually (Ada .181 / Blackwell .21)"]
+    fn nvenc_cuda_bits_per_frame_curve() {
+        use std::time::Instant;
+        const WARMUP: u32 = 10;
+        const MEASURED: u32 = 24;
+        let (w, h, fps) = std::env::var("PF_AB_MODE")
+            .ok()
+            .and_then(|s| {
+                let p: Vec<u32> = s.split('x').filter_map(|v| v.parse().ok()).collect();
+                (p.len() == 3).then(|| (p[0], p[1], p[2]))
+            })
+            .unwrap_or((3840, 2160, 60));
+
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        // Sweep CONTENT DETAIL, not nominal bitrate. Pure noise is incompressible, so a low
+        // bitrate target simply overshoots (measured: 719 KB/AU against a 104 KB quota) and every
+        // low row lands at the same high bits/frame — the exact blindness this test exists to fix.
+        // Blockier content codes cheaper, so detail is what actually moves along the axis, and the
+        // x-axis below is the bits/frame the encoder ACTUALLY produced, never the one requested.
+        let bps: u64 = 600_000_000;
+        println!(
+            "bits/frame curve @ {w}x{h}@{fps} HEVC 8-bit, REAL content, {} Mbps cap:",
+            bps / 1_000_000
+        );
+        println!("  detail | ACTUAL bits/frame |   single |  split-2 | ratio");
+        for block in [64usize, 32, 16, 8, 4, 1] {
+            let frames: Vec<CapturedFrame> =
+                (0..4).map(|i| noise_nv12_frame(w, h, i, block)).collect();
+            let run = |split: &str| -> (u128, usize) {
+                std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+                let mut enc = NvencCudaEncoder::open(
+                    Codec::H265,
+                    PixelFormat::Nv12,
+                    w,
+                    h,
+                    fps,
+                    bps,
+                    true,
+                    8,
+                    ChromaFormat::Yuv420,
+                    false,
+                    4,
+                )
+                .expect("open NVENC CUDA session");
+                let (mut times, mut bytes) = (Vec::new(), Vec::new());
+                for i in 0..(WARMUP + MEASURED) {
+                    let t0 = Instant::now();
+                    enc.submit_indexed(&frames[(i % 4) as usize], i)
+                        .expect("submit");
+                    let mut got = 0usize;
+                    while let Some(au) = enc.poll().expect("poll") {
+                        got = au.data.len();
+                    }
+                    if i >= WARMUP {
+                        times.push(t0.elapsed().as_micros());
+                        bytes.push(got);
+                    }
+                }
+                enc.flush().ok();
+                times.sort_unstable();
+                bytes.sort_unstable();
+                (times[times.len() / 2], bytes[bytes.len() / 2])
+            };
+            let (s_us, s_bytes) = run("0");
+            let (p_us, _) = run("2");
+            println!(
+                "  {block:>5}px | {:>10.2} Mbit    | {s_us:>6}us | {p_us:>6}us | {:>4.2}×",
+                s_bytes as f64 * 8.0 / 1e6,
+                s_us as f64 / p_us.max(1) as f64
+            );
+        }
 
         std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
         std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
