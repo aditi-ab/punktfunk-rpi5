@@ -205,9 +205,9 @@ private fun DialogText(text: String) {
 }
 
 /**
- * Console host options for a saved tile — Wake (offered only when offline + a MAC is known), Edit,
- * Forget. Reached by pressing Up on a focused saved host in the carousel; the console counterpart of
- * the touch host card's overflow menu.
+ * Console host options for a saved tile — Wake (offered only when offline + a MAC is known), Copy
+ * link, Edit, Forget. Reached by pressing Up on a focused saved host in the carousel; the console
+ * counterpart of the touch host card's overflow menu.
  */
 @Composable
 fun GamepadHostOptionsDialog(
@@ -217,6 +217,12 @@ fun GamepadHostOptionsDialog(
     onLibrary: (() -> Unit)?, // non-null when the game library is enabled → reachable without Y
     onEdit: () -> Unit,
     onForget: () -> Unit,
+    /**
+     * Copy this tile's `punktfunk://` link. Offered on a pinned tile too — unlike the host's other
+     * actions it says nothing about the host, it hands out the shortcut this very tile already is
+     * (profile included), which is exactly what a pin is for.
+     */
+    onCopyLink: () -> Unit,
     onDismiss: () -> Unit,
     onSpeedTest: (() -> Unit)? = null,
     /**
@@ -233,12 +239,14 @@ fun GamepadHostOptionsDialog(
         actions = buildList {
             if (onUnpin != null) {
                 add(DialogAction("Unpin card", primary = true, onClick = onUnpin))
+                add(DialogAction("Copy link", onClick = onCopyLink))
                 add(DialogAction("Cancel", onClick = onDismiss))
                 return@buildList
             }
             if (onLibrary != null) add(DialogAction("Library", primary = true, onClick = onLibrary))
             if (canWake) add(DialogAction("Wake host", onClick = onWake))
             if (onSpeedTest != null) add(DialogAction("Network speed test", onClick = onSpeedTest))
+            add(DialogAction("Copy link", onClick = onCopyLink))
             add(DialogAction("Edit…", primary = onLibrary == null, onClick = onEdit))
             add(DialogAction("Forget", onClick = onForget))
             add(DialogAction("Cancel", onClick = onDismiss))
