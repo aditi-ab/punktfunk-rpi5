@@ -463,11 +463,11 @@ fun GamepadLocalNetworkDialog(onAllow: () -> Unit, onSettings: () -> Unit, onDis
         ),
     ) {
         DialogText(
-            "Android blocks punktfunk from talking to devices on your network, so it can't find " +
+            "Android blocks Punktfunk from talking to devices on your network, so it can't find " +
                 "or reach any host until you allow it.",
         )
         DialogText(
-            "If no prompt appears after Allow, enable “Nearby devices” for punktfunk in " +
+            "If no prompt appears after Allow, enable “Nearby devices” for Punktfunk in " +
                 "system settings.",
         )
     }

@@ -1,4 +1,4 @@
-/* Penner easing tokens — shared with the punktfunk marketing site + @unom/ui.
+/* Penner easing tokens — shared with the Punktfunk marketing site + @unom/ui.
    @unom/ui's accordion/collapsible/material animations resolve these by name. */
 @theme {
 	--ease-in-sine: cubic-bezier(0.47, 0, 0.745, 0.715);

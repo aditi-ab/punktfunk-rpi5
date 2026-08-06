@@ -224,7 +224,7 @@ path below is the maintainer's test box — substitute your own `punktfunk-probe
 # Recover a WEDGED driver. Symptom: every session fails with
 #   create virtual output: pf-vdisplay ADD ...: DeviceIoControl(0x222400): Element nicht gefunden (0x80070490)
 # i.e. ERROR_NOT_FOUND — sustained ADD/REMOVE churn exhausted the IddCx monitor slots (ghost
-# "Generic Monitor (punktfunk)" nodes pile up, target_ids climb). A host restart's CLEAR_ALL does NOT
+# "Generic Monitor (Punktfunk)" nodes pile up, target_ids climb). A host restart's CLEAR_ALL does NOT
 # fix it; the driver instance must be reloaded. This clears the ghosts + cycles the adapter (no reboot —
 # this box boots to Proxmox).
 powershell -ExecutionPolicy Bypass -File reset-pf-vdisplay.ps1 -Verify -Probe C:\t-goal1\debug\punktfunk-probe.exe

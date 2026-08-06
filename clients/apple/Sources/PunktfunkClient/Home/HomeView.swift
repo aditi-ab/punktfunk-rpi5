@@ -344,7 +344,7 @@ struct HomeView: View {
         ContentUnavailableView {
             Label("No Hosts", systemImage: "rectangle.connected.to.line.below")
         } description: {
-            Text("Add your punktfunk host with the + button, or scan the network again.")
+            Text("Add your Punktfunk host with the + button, or scan the network again.")
         } actions: {
             Button("Add Host") { showAddHost = true }
                 .glassProminentButtonStyle()

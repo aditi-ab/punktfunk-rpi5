@@ -453,7 +453,7 @@ public final class HostDiscovery: ObservableObject {
 
     private static func instanceName(_ endpoint: NWEndpoint) -> String {
         if case let .service(name, _, _, _) = endpoint { return name }
-        return "punktfunk host"
+        return "Punktfunk host"
     }
 
     private static func entry(_ txt: NWTXTRecord, _ field: String) -> String? {

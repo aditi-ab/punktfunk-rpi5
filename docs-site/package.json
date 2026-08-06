@@ -2,7 +2,7 @@
   "name": "punktfunk-docs",
   "private": true,
   "type": "module",
-  "description": "punktfunk documentation site — Fumadocs on TanStack Start (Vite + Nitro/bun)",
+  "description": "Punktfunk documentation site — Fumadocs on TanStack Start (Vite + Nitro/bun)",
   "scripts": {
     "dev": "vite dev --port 3001",
     "build": "vite build",

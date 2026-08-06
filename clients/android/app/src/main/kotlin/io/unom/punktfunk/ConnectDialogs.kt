@@ -168,9 +168,9 @@ internal fun LocalNetworkDialog(onAllow: () -> Unit, onSettings: () -> Unit, onD
         title = { Text("Allow local network access") },
         text = {
             Text(
-                "Android blocks punktfunk from talking to devices on your network, so it can't " +
+                "Android blocks Punktfunk from talking to devices on your network, so it can't " +
                     "find or reach any host until you allow it. If no prompt appears when you tap " +
-                    "Allow, enable “Nearby devices” for punktfunk in system settings.",
+                    "Allow, enable “Nearby devices” for Punktfunk in system settings.",
             )
         },
         confirmButton = {

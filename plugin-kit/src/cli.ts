@@ -83,7 +83,7 @@ export const runPluginCli = async <E, R>(opts: {
 	} catch (e) {
 		const hint =
 			e instanceof HostRequestError
-				? " (is the punktfunk host running?)"
+				? " (is the Punktfunk host running?)"
 				: "";
 		console.error(`${opts.def.name}: ${name} failed: ${e}${hint}`);
 		process.exitCode = 1;
