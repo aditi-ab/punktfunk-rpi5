@@ -47,12 +47,16 @@ struct ConnectOverlay: View {
         return nil
     }
 
+    @Environment(\.gamepadInk) private var ink
+
     var body: some View {
         if let phase {
             ZStack {
                 if gamepadUI {
-                    // Console: an opaque, living aurora over everything.
-                    Color.black.ignoresSafeArea()
+                    // Console: an opaque, living aurora over everything, in the chosen palette.
+                    // The takeover's own text rides `ink`, so a pale palette flips it here too —
+                    // without that this is the one console screen that stays white-on-white.
+                    ink.isLight ? Color.white.ignoresSafeArea() : Color.black.ignoresSafeArea()
                     GamepadScreenBackground().ignoresSafeArea()
                     Color.clear.contentShape(Rectangle()).onTapGesture {}
                     content(phase).padding(40).frame(maxWidth: 460)
@@ -70,7 +74,8 @@ struct ConnectOverlay: View {
                         .padding(40)
                 }
             }
-            .environment(\.colorScheme, .dark)
+            // The console takeover follows the palette; the default UI's modal stays dark.
+            .environment(\.colorScheme, gamepadUI && ink.isLight ? .light : .dark)
             .transition(.opacity)
             #if os(iOS) || os(macOS)
             .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }

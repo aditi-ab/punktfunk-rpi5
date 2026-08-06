@@ -109,8 +109,10 @@ fun App(forceGamepadUi: Boolean = false) {
     // threaded through every screen that draws a backdrop. Because it is read from the SAME
     // `settings` state the gamepad settings screen writes, stepping the Background row recolours
     // the field behind that very row.
+    val palette = GamepadPalette.named(settings.uiPalette)
     CompositionLocalProvider(
-        LocalGamepadPalette provides GamepadPalette.named(settings.uiPalette),
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
     ) {
     AnimatedContent(
         targetState = session,

@@ -249,25 +249,34 @@ fn dump_console_screens() {
     dump(&mut s, 3, 25, "02-transition", true);
     dump(&mut s, 40, 8, "03-settings", true);
 
-    // The Interface tab (5 shoulder presses along) leads with the Background row, so this frame
-    // shows both the strip mid-list and the palette picker…
+    // The Interface tab (5 shoulder presses along) leads with the Background row, so these
+    // frames show the strip mid-list AND the palette picker. Palettes are set directly rather
+    // than by counting Confirm presses, so reordering the table can't silently shoot the wrong
+    // one. Each is a whole LOOK, not just a backdrop: accent, ink and scrim move together, so
+    // the pale ones must be eyeballed with dark text on them.
     for _ in 0..5 {
         s.handle_menu(MenuEvent::JumpForward);
     }
-    dump(&mut s, 40, 8, "03b-settings-interface", true);
-    // …and cycling it three times lands on Ember, which is the whole point: the CALM backdrop
-    // behind these rows recolours live.
-    for _ in 0..3 {
-        s.handle_menu(MenuEvent::Confirm);
+    for id in ["violet", "ember", "abyss", "holo", "sunset", "mint"] {
+        s.settings.ui_palette = id.to_string();
+        dump(&mut s, 40, 8, &format!("03-settings-{id}"), true);
     }
-    dump(&mut s, 40, 8, "03c-settings-ember", true);
-    // Back to the brand default and the first tab so the later scenes look like they always did.
-    for _ in 0..3 {
-        s.handle_menu(MenuEvent::Confirm);
-    }
+    // Back to the first tab so the later scenes look like they always did.
     for _ in 0..5 {
         s.handle_menu(MenuEvent::JumpBack);
     }
+    // …and the LAUNCHER at full contrast under a few of them — the backdrop's loudest form,
+    // and the one the palettes are really chosen by.
+    s.handle_menu(MenuEvent::Back);
+    dump(&mut s, 20, 8, "_settle", true);
+    for id in ["nebula", "sunset", "holo"] {
+        s.settings.ui_palette = id.to_string();
+        dump(&mut s, 40, 8, &format!("01-home-{id}"), true);
+    }
+    s.settings.ui_palette = "violet".to_string();
+    dump(&mut s, 20, 8, "_settle2", true);
+    s.handle_menu(MenuEvent::Tertiary); // back into Settings for the scenes below
+    dump(&mut s, 20, 8, "_settle3", true);
 
     // Add Host with the keyboard tray up (keyboard glyph style: no pad).
     s.handle_menu(MenuEvent::Back);

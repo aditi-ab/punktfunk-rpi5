@@ -5,90 +5,116 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // The console UI's background palettes. These assertions are the CONTRACT the Rust
-// (`pf-console-ui::library::tint`) and Swift (`GamepadPalette.tint`) ports have to reproduce — the
-// same ids, the same rotation orientation, the same in-gamut results — so one `ui_palette` value
-// names the same colour family on every client.
+// (`pf-console-ui::library`) and Swift (`GamepadPalette.swift`) ports reproduce — the same ids in
+// the same order, the same light/dark split, the same ramp — so one `ui_palette` value is one look
+// on every client.
 class GamepadPaletteTest {
-    /** The brightest pool of the field — the colour a palette is judged by. */
-    private val violetPool = Triple(0.49, 0.39, 0.95)
 
-    /**
-     * The brand default must be the IDENTITY transform. Every existing install already sees the
-     * shipped violet backdrop, and a palette table that quietly restyled it would be a regression
-     * dressed as a feature.
-     */
-    @Test
-    fun violetIsTheUntouchedShippedField() {
-        val violet = GamepadPalette.named("violet")
-        assertEquals("violet", GamepadPalette.ALL.first().id)
-        assertTrue(violet.isIdentity)
-        assertEquals(violetPool, violet.tint(violetPool))
-        // An unknown name is a newer client's palette, not an error.
-        assertEquals("violet", GamepadPalette.named("chartreuse").id)
-        assertEquals("violet", GamepadPalette.named("").id)
+    private fun luma(c: Triple<Double, Double, Double>) =
+        0.2126 * c.first + 0.7152 * c.second + 0.0722 * c.third
+
+    /** Hue angle in degrees, or null for something too grey to have one. */
+    private fun hue(c: Triple<Double, Double, Double>): Double? {
+        val (r, g, b) = c
+        val max = maxOf(r, g, b)
+        val min = minOf(r, g, b)
+        val d = max - min
+        if (d < 0.04) return null
+        val h = when (max) {
+            r -> 60.0 * (((g - b) / d) % 6.0)
+            g -> 60.0 * ((b - r) / d + 2.0)
+            else -> 60.0 * ((r - g) / d + 4.0)
+        }
+        return (h + 360.0) % 360.0
     }
 
-    /** The ids and their order are the cross-client contract (strip order, and the L1/R1 cycle). */
+    /** Ids, order and the light/dark split are the cross-client contract. */
     @Test
     fun tableMatchesTheOtherClients() {
         assertEquals(
-            listOf("violet", "tide", "forest", "ember", "rose", "graphite"),
+            listOf(
+                "violet", "nebula", "abyss", "ember", "moss", "graphite",
+                "holo", "sunset", "bloom", "dawn", "mint", "opal",
+            ),
             GamepadPalette.ALL.map { it.id },
         )
-        assertEquals(
-            listOf("Violet", "Tide", "Forest", "Ember", "Rose", "Graphite"),
-            GamepadPalette.ALL.map { it.name },
-        )
+        // Dark fields lead, pale ones follow, so stepping the row walks one direction.
+        val firstLight = GamepadPalette.ALL.indexOfFirst { it.light }
+        assertEquals(6, firstLight)
+        assertTrue(GamepadPalette.ALL.drop(firstLight).all { it.light })
+        // An unknown name is a newer client's palette, not an error.
+        assertEquals("violet", GamepadPalette.named("chartreuse").id)
+        assertEquals("violet", GamepadPalette.named("").id)
+        // The brand default keeps the shipped field rather than a generated ramp.
+        assertTrue(GamepadPalette.named("violet").stops.isEmpty())
     }
 
     /**
-     * A rotation moves the hue while roughly holding luminance, and the saturation scale collapses
-     * toward grey — the same four checks the Rust and Swift tests make.
+     * A palette must read as SEVERAL hues, not one hue at several brightnesses — that was exactly
+     * the complaint about the hue-rotation model this replaced.
      */
     @Test
-    fun tintRotatesHueAndScalesSaturation() {
-        assertTrue(violetPool.third > violetPool.first && violetPool.third > violetPool.second)
-
-        // +105° (Ember) turns the blue-dominant pool red-dominant…
-        val ember = GamepadPalette.named("ember").tint(violetPool)
-        assertTrue("$ember should be warm", ember.first > ember.third)
-        // …−130° (Forest) turns it green-dominant…
-        val forest = GamepadPalette.named("forest").tint(violetPool)
-        assertTrue("$forest", forest.second > forest.first && forest.second > forest.third)
-        // …and −70° (Tide) lands on a cyan whose green and blue both beat red.
-        val tide = GamepadPalette.named("tide").tint(violetPool)
-        assertTrue("$tide", tide.second > tide.first && tide.third > tide.first)
-
-        // Graphite's saturation scale leaves the channels nearly equal…
-        val grey = GamepadPalette.named("graphite").tint(violetPool)
-        val channels = listOf(grey.first, grey.second, grey.third)
-        assertTrue("$grey", channels.max() - channels.min() < 0.08)
-        // …at about the source's luminance (it desaturates, it doesn't dim).
-        val luma = 0.2126 * violetPool.first + 0.7152 * violetPool.second + 0.0722 * violetPool.third
-        assertEquals(luma, grey.second, 0.05)
-    }
-
-    /**
-     * Every palette stays in gamut on every colour the field is built from — an out-of-range
-     * channel would clamp differently on each platform's rasteriser.
-     */
-    @Test
-    fun everyPaletteStaysInGamut() {
-        val field = listOf(
-            Triple(0.075, 0.060, 0.160), Triple(0.34, 0.27, 0.72), Triple(0.30, 0.26, 0.74),
-            Triple(0.42, 0.20, 0.54), Triple(0.49, 0.39, 0.95), Triple(0.28, 0.31, 0.84),
-            Triple(0.16, 0.26, 0.64), Triple(0.45, 0.23, 0.60), Triple(0.53, 0.31, 0.75),
-            Triple(0.35, 0.35, 0.91), Triple(0.19, 0.28, 0.70), Triple(0.22, 0.18, 0.54),
-            Triple(0.24, 0.20, 0.58),
-        )
-        for (palette in GamepadPalette.ALL) {
-            for (c in field) {
-                val t = palette.tint(c)
-                for (v in listOf(t.first, t.second, t.third)) {
-                    assertTrue("${palette.id} $c → $t", v in 0.0..1.0)
+    fun everyPaletteIsMultiTone() {
+        for (p in GamepadPalette.ALL) {
+            val stops = p.stops.ifEmpty { continue }
+            val hues = stops.mapNotNull { hue(it) }
+            assertTrue("${p.id}: too few coloured stops", hues.size >= 3)
+            var spread = 0.0
+            for (a in hues) {
+                for (b in hues) {
+                    val d = Math.abs(a - b) % 360.0
+                    spread = maxOf(spread, minOf(d, 360.0 - d))
                 }
             }
+            // Graphite and Opal are deliberately near-neutral; the rest must travel.
+            val floor = if (p.id == "graphite" || p.id == "opal") 20.0 else 45.0
+            assertTrue("${p.id} spans only $spread° of hue", spread >= floor)
         }
+    }
+
+    /** A pale palette really is pale — its ink flips, so a mislabelled one is unreadable. */
+    @Test
+    fun palettesAreHonestAboutLightness() {
+        for (p in GamepadPalette.ALL) {
+            if (p.light) {
+                assertTrue("${p.id}'s ground is dark", luma(p.ground) > 0.6)
+                assertTrue("${p.id}'s accent is too pale", luma(p.accent) < 0.45)
+            } else {
+                assertTrue("${p.id}'s ground is light", luma(p.ground) < 0.2)
+                assertTrue("${p.id}'s accent is too dark", luma(p.accent) > 0.25)
+            }
+        }
+    }
+
+    /** The ramp is the shared sampling rule the Rust and Swift ports reproduce. */
+    @Test
+    fun rampInterpolatesBetweenStops() {
+        val stops = listOf(
+            Triple(0.0, 0.0, 0.0), Triple(1.0, 0.0, 0.0), Triple(1.0, 1.0, 1.0),
+        )
+        assertEquals(Triple(0.0, 0.0, 0.0), GamepadPalette.ramp(stops, 0.0))
+        assertEquals(Triple(1.0, 1.0, 1.0), GamepadPalette.ramp(stops, 1.0))
+        assertEquals(Triple(1.0, 0.0, 0.0), GamepadPalette.ramp(stops, 0.5))
+        assertEquals(0.5, GamepadPalette.ramp(stops, 0.25).first, 1e-9)
+        // Out of range clamps rather than throwing.
+        assertEquals(Triple(0.0, 0.0, 0.0), GamepadPalette.ramp(stops, -3.0))
+        assertEquals(Triple(1.0, 1.0, 1.0), GamepadPalette.ramp(stops, 9.0))
+        assertEquals(Triple(0.0, 0.0, 0.0), GamepadPalette.ramp(emptyList(), 0.5))
+    }
+
+    /** The ink a palette calls for: white on a dark field, near-black on a pale one. */
+    @Test
+    fun inkFollowsTheField() {
+        val dark = GamepadInk.of(GamepadPalette.named("violet"))
+        assertTrue(!dark.isLight)
+        assertEquals(1f, dark.fg.red, 1e-6f)
+        assertEquals(1f, dark.shadeScale, 1e-6f)
+
+        val light = GamepadInk.of(GamepadPalette.named("holo"))
+        assertTrue(light.isLight)
+        assertTrue("pale fields need dark ink", light.fg.red < 0.3f)
+        // A pale field's scrims must pull far less, or they bleach the gradient.
+        assertTrue(light.shadeScale < 0.5f)
     }
 
     /**

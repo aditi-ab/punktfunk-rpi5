@@ -80,6 +80,12 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     let shape: S
     var tint: Color?
     var interactive = false
+    /// The console surface follows the background palette: a PALE field needs the material to
+    /// frost light and the glass to read as white, or the dark ink on top of it disappears.
+    /// Defaults to the dark ink, so every non-gamepad caller is unchanged.
+    @Environment(\.gamepadInk) private var ink
+
+    private var scheme: ColorScheme { ink.isLight ? .light : .dark }
 
     func body(content: Content) -> some View {
         #if os(tvOS)
@@ -89,16 +95,16 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
         // the 10-foot platform). The tint rides an overlay so the focused row keeps its wash.
         content.background {
             shape.fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
+                .environment(\.colorScheme, scheme)
                 .overlay {
                     if let tint { shape.fill(tint) }
                 }
         }
         #else
         if #available(iOS 26, macOS 26, *) {
-            content.glassEffect(glass, in: shape)
+            content.glassEffect(glass, in: shape).environment(\.colorScheme, scheme)
         } else {
-            content.background { shape.fill(.ultraThinMaterial).environment(\.colorScheme, .dark) }
+            content.background { shape.fill(.ultraThinMaterial).environment(\.colorScheme, scheme) }
         }
         #endif
     }

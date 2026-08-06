@@ -11,7 +11,7 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{Fonts, DIM, W};
+use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
@@ -405,7 +405,7 @@ impl SettingsScreen {
             detail,
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             f64::from(rect.left) + f64::from(rect.width()) / 2.0,
             f64::from(rect.bottom) - detail_h + 6.0 * k,
             f64::from(rect.width()) * 0.8,

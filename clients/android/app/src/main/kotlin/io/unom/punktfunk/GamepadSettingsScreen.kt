@@ -346,6 +346,7 @@ fun GamepadSettingsScreen(
 
 @Composable
 private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused)
     val shape = RoundedCornerShape(14.dp)
     // The chevrons keep their layout slot and only fade, so the value never jumps sideways when
@@ -357,7 +358,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
         label = "chevrons",
     )
     val valueColor by animateColorAsState(
-        Color.White.copy(alpha = if (focused) 1f else 0.6f),
+        ink.fg(if (focused) 1f else 0.6f),
         tween(160),
         label = "valueColor",
     )
@@ -366,7 +367,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
             Text(
                 row.header.uppercase(),
                 style = MaterialTheme.typography.labelMedium,
-                color = Color.White.copy(alpha = 0.45f),
+                color = ink.fg(0.45f),
                 letterSpacing = 1.4.sp,
                 modifier = Modifier.padding(start = 16.dp, top = 14.dp, bottom = 4.dp),
             )
@@ -392,7 +393,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                     fontWeight = FontWeight.SemiBold,
                     // A disabled row (the "No profiles yet" placeholder) dims but stays focusable,
                     // so its detail line can still explain what would go here.
-                    color = Color.White.copy(alpha = if (row.enabled) 1f else 0.45f),
+                    color = ink.fg(if (row.enabled) 1f else 0.45f),
                     maxLines = 1,
                 )
                 Spacer(Modifier.weight(1f))
@@ -400,7 +401,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                     // A toggle is a switch, not text — the sliding knob + tinting track IS the value.
                     ConsoleSwitch(on = row.toggled, focused = focused)
                 } else {
-                    Text("‹ ", color = Color.White, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
+                    Text("‹ ", color = ink.fg, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
                     // The value slides in the direction it was stepped and its width animates, so
                     // cycling a choice reads as motion through a list rather than a text swap.
                     AnimatedContent(
@@ -421,7 +422,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Text(" ›", color = Color.White, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
+                    Text(" ›", color = ink.fg, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
                 }
             }
             // The focused row carries its own one-line description — no dedicated (space-eating)
@@ -434,7 +435,7 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                 Text(
                     row.detail,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.6f),
+                    color = ink.fg(0.6f),
                     maxLines = 2,
                     modifier = Modifier.padding(top = 6.dp),
                 )

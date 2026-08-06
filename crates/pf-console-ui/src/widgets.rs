@@ -6,7 +6,7 @@
 
 use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
-use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, DIM, FAINT, W, WHITE};
+use crate::theme::{accent, fg, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, Path, RRect, Rect};
 
@@ -209,7 +209,7 @@ impl MenuList {
                     W::SemiBold,
                     12.0 * k,
                     1.4 * k,
-                    white(0.45),
+                    fg(0.45),
                 );
             }
             // Focus scale eases 0.98 → 1.0 about the row center.
@@ -226,9 +226,9 @@ impl MenuList {
                 PanelStroke::Plain(0.06 + 0.22 * f as f32)
             };
             let tint = if row.caret {
-                Some(brand(0.30))
+                Some(accent(0.30))
             } else if f > 0.01 {
-                Some(brand(0.30 * f as f32))
+                Some(accent(0.30 * f as f32))
             } else {
                 None
             };
@@ -237,7 +237,7 @@ impl MenuList {
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {
                 // Action row: centered label, brand when actionable.
-                let color = if row.enabled { BRAND } else { FAINT };
+                let color = if row.enabled { accent(1.0) } else { fg(0.35) };
                 let tw = fonts.measure(&row.label, W::SemiBold, 16.0 * k) as f64;
                 fonts.draw(
                     canvas,
@@ -256,15 +256,15 @@ impl MenuList {
                     baseline,
                     W::SemiBold,
                     16.0 * k,
-                    if row.enabled { WHITE } else { DIM },
+                    if row.enabled { fg(1.0) } else { fg(0.55) },
                 );
                 let value = row.value.as_deref().unwrap_or_default();
                 let vcolor = if row.value_dim {
-                    FAINT
+                    fg(0.35)
                 } else if f > 0.5 {
-                    WHITE
+                    fg(1.0)
                 } else {
-                    white(0.6 + 0.4 * f as f32)
+                    fg(0.6 + 0.4 * f as f32)
                 };
                 let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
                 let caret_w = if row.caret { 8.0 * k } else { 0.0 };
@@ -282,7 +282,7 @@ impl MenuList {
                             (2.0 * k) as f32,
                             (18.0 * k) as f32,
                         ),
-                        &Paint::new(BRAND, None),
+                        &Paint::new(accent(1.0), None),
                     );
                 }
                 if row.adjustable && f > 0.01 {
@@ -362,7 +362,7 @@ impl TabStrip {
             canvas,
             Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
             (pill_h / 2.0 / k) as f32,
-            Some(brand(0.85)),
+            Some(accent(0.85)),
             PanelStroke::Plain(0.22),
             k as f32,
         );
@@ -382,7 +382,7 @@ impl TabStrip {
                 baseline,
                 W::SemiBold,
                 size,
-                white(0.5 + 0.5 * covered),
+                fg(0.5 + 0.5 * covered),
             );
             x += widths[i] + gap;
         }
@@ -407,7 +407,7 @@ fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> Stri
 
 fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     let dir = if left { -1.0 } else { 1.0 };
-    let mut p = Paint::new(white(alpha), None);
+    let mut p = Paint::new(fg(alpha), None);
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width((1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -594,7 +594,7 @@ impl Keyboard {
                 let focused = r == self.row && c == self.col;
                 let kr = Rect::from_xywh(x as f32, y as f32, key_w as f32, key_h as f32);
                 let fill = if focused {
-                    let mut b = BRAND;
+                    let mut b = accent(1.0);
                     if self.key_flash > 0.02 {
                         // A just-typed key flashes brighter, then eases back.
                         let f = self.key_flash as f32;
@@ -607,16 +607,18 @@ impl Keyboard {
                     }
                     b
                 } else {
-                    white(0.08)
+                    fg(0.08)
                 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(kr, (9.0 * k) as f32, (9.0 * k) as f32),
                     &Paint::new(fill, None),
                 );
+                // The focused key is filled with the accent, so its letter needs ink that
+                // reads on THAT, not on the field.
                 let ink = if focused {
-                    skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0)
+                    crate::theme::on_accent()
                 } else {
-                    WHITE
+                    fg(1.0)
                 };
                 let (cx, cy) = (x + key_w / 2.0, y + key_h / 2.0);
                 match key {

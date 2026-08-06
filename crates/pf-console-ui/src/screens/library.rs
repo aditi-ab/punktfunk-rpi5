@@ -12,7 +12,7 @@ use crate::library::{
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{brand, white, Fonts, DIM, W, WHITE};
+use crate::theme::{accent, fg, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
 use std::collections::HashMap;
@@ -237,7 +237,7 @@ impl LibraryScreen {
                     "Loading library…",
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 16.0 * k,
                     w * 0.8,
@@ -249,7 +249,7 @@ impl LibraryScreen {
                     "No games found",
                     W::Bold,
                     22.0 * k,
-                    WHITE,
+                    fg(1.0),
                     cx,
                     cy_all - 20.0 * k,
                     w * 0.8,
@@ -259,7 +259,7 @@ impl LibraryScreen {
                     "Install Steam titles or add custom entries in the host's web console.",
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 12.0 * k,
                     w * 0.8,
@@ -271,7 +271,7 @@ impl LibraryScreen {
                     &title,
                     W::Bold,
                     22.0 * k,
-                    WHITE,
+                    fg(1.0),
                     cx,
                     cy_all - 32.0 * k,
                     w * 0.8,
@@ -281,7 +281,7 @@ impl LibraryScreen {
                     &body,
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 4.0 * k,
                     (600.0 * k).min(w * 0.85),
@@ -315,7 +315,7 @@ impl LibraryScreen {
                 heading,
                 W::SemiBold,
                 12.0 * k,
-                white(0.5),
+                fg(0.5),
                 f64::from(rect.left) + w / 2.0,
                 cy - card_h / 2.0 - 22.0 * k,
                 w * 0.5,
@@ -382,9 +382,9 @@ impl LibraryScreen {
                     };
                     canvas.draw_rect(crect, &Paint::new(face, None));
                     let (glyph, size, ink) = if game.launcher {
-                        (store_label(&game.store).to_string(), 22.0 * k, white(0.85))
+                        (store_label(&game.store).to_string(), 22.0 * k, fg(0.85))
                     } else {
-                        (initials(&game.title), 38.0 * k, white(0.45))
+                        (initials(&game.title), 38.0 * k, fg(0.45))
                     };
                     let font = fonts.font(W::Bold, size);
                     let tw = font.measure_str(&glyph, None).0;
@@ -409,9 +409,9 @@ impl LibraryScreen {
                 // Brand-filled for a launcher, smoked glass for a game — the one cue that
                 // survives being three cards deep in the recede.
                 let pill = if game.launcher {
-                    brand(0.85)
+                    accent(0.85)
                 } else {
-                    Color4f::new(0.0, 0.0, 0.0, 0.55)
+                    crate::theme::shade(0.55)
                 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(
@@ -428,7 +428,7 @@ impl LibraryScreen {
                     py + 14.0 * k,
                     W::SemiBold,
                     size,
-                    WHITE,
+                    fg(1.0),
                 );
             }
             // The brightness recede: an opaque-black veil, never whole-card alpha.
@@ -452,7 +452,7 @@ impl LibraryScreen {
                 &g.title,
                 W::Bold,
                 27.0 * k,
-                WHITE,
+                fg(1.0),
                 cx,
                 f64::from(rect.bottom) - 64.0 * k,
                 w * 0.8,
@@ -467,7 +467,7 @@ impl LibraryScreen {
                 &sub,
                 W::Regular,
                 12.0 * k,
-                white(0.5),
+                fg(0.5),
                 cx,
                 f64::from(rect.bottom) - 30.0 * k,
                 w * 0.5,

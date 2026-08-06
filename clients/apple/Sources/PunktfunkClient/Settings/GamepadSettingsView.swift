@@ -45,6 +45,7 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 }
 
 struct GamepadSettingsView: View {
+    @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
     /// count pins from its live hosts. Threaded in from GamepadHomeView like the home screen
@@ -136,7 +137,7 @@ struct GamepadSettingsView: View {
             VStack(spacing: compact ? 4 : 8) {
                 Text(title)
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                     .frame(maxWidth: .infinity)
                     .overlay(alignment: .trailing) { closeButton.padding(.trailing, 20) }
                 // The picker is one layer deeper — its rows aren't sections of anything, so the
@@ -151,7 +152,7 @@ struct GamepadSettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(focusedDetail)
                     .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
-                    .foregroundStyle(.white.opacity(0.55))
+                    .foregroundStyle(ink.fg(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
                 GamepadHintBar(hints: hints)
@@ -168,6 +169,9 @@ struct GamepadSettingsView: View {
         // colour and luminance to lens without the launcher's contrast, and the palette setting
         // applies here too, so this screen previews the row you're stepping.
         .background { GamepadFormBackground() }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
         .onAppear {
             gamepads.refresh()
             gamepads.startDiscovery()
@@ -220,7 +224,7 @@ struct GamepadSettingsView: View {
         let selected = t == tab
         return Text(t.rawValue)
             .font(.geist(compact ? 12 : 13, .semibold, relativeTo: .footnote))
-            .foregroundStyle(selected ? .white : .white.opacity(0.55))
+            .foregroundStyle(selected ? ink.fg : ink.fg(0.55))
             .padding(.horizontal, 13)
             .padding(.vertical, 7)
             .background {
@@ -228,7 +232,7 @@ struct GamepadSettingsView: View {
                 // in and out — the highlight travels the way the press did.
                 if selected {
                     Capsule()
-                        .fill(Color.brand.opacity(0.85))
+                        .fill(ink.accent(0.85))
                         .matchedGeometryEffect(id: "tab", in: tabHighlight)
                 }
             }
@@ -276,7 +280,7 @@ struct GamepadSettingsView: View {
         Button { dismiss() } label: {
             Image(systemName: "xmark")
                 .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
                 .glassBackground(Circle(), interactive: true)
                 .contentShape(Circle())
@@ -347,18 +351,18 @@ struct GamepadSettingsView: View {
             HStack(spacing: 14) {
                 Image(systemName: row.icon)
                     .font(.system(size: m.iconFont))
-                    .foregroundStyle(focused ? Color.brand : .white.opacity(0.55))
+                    .foregroundStyle(focused ? ink.accent : ink.fg(0.55))
                     .frame(width: m.iconWidth)
                 Text(row.label)
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                     .lineLimit(1)
                 Spacer(minLength: 12)
                 HStack(spacing: 9) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
-                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
+                            ink.fg(focused && row.adjustable && row.enabled ? 0.6 : 0))
                     // Keyed by the value so a change slides the new option in instead of
                     // hard-swapping the string — a QUIET horizontal slip following the user's
                     // motion (a right-step enters from the right), crossfading over ~14 pt.
@@ -369,7 +373,7 @@ struct GamepadSettingsView: View {
                     ZStack {
                         Text(row.value)
                             .font(.geist(m.valueFont, .medium, relativeTo: .callout))
-                            .foregroundStyle(focused ? .white : .white.opacity(0.6))
+                            .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
                             .lineLimit(1)
                             .id(row.value)
                             .transition(.asymmetric(
@@ -380,7 +384,7 @@ struct GamepadSettingsView: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
-                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
+                            ink.fg(focused && row.adjustable && row.enabled ? 0.6 : 0))
                 }
             }
             // Contents only — the glass and border below stay at full strength, so a dimmed row
@@ -391,11 +395,11 @@ struct GamepadSettingsView: View {
             // Every row is Liquid Glass; the focused one takes a brand wash and reacts to press.
             .consoleGlass(
                 RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
-                tint: focused ? Color.brand.opacity(0.30) : nil,
+                tint: focused ? ink.accent(0.30) : nil,
                 interactive: focused)
             .overlay {
                 RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
-                    .strokeBorder(.white.opacity(focused ? 0.28 : 0.06), lineWidth: 1)
+                    .strokeBorder(ink.fg(focused ? 0.28 : 0.06), lineWidth: 1)
             }
             .scaleEffect(focused ? 1.0 : 0.98)
             .animation(.smooth(duration: 0.18), value: focused)

@@ -7,7 +7,7 @@
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
 use crate::screens::{Ctx, Outbox};
-use crate::theme::{Fonts, DIM, W};
+use crate::theme::{fg, Fonts, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -214,7 +214,7 @@ impl AddHostScreen {
             "Hosts on this network appear automatically — add one by address for everything else.",
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             cx,
             f64::from(rect.top) + 2.0 * k,
             f64::from(rect.width()) * 0.72,
