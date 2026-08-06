@@ -640,20 +640,31 @@ final class SessionModel: ObservableObject {
         guard let conn = connection else { return }
         let name = activeHost?.displayName ?? "host"
         // WHY it ended, asked while the connection is still up — `disconnect` tears it down.
-        // The host closes with APP_EXITED when the game it launched for this session quit, which is
-        // a normal finish the player just performed, not a failure to report.
-        let gameExited = conn.endedBecauseGameExited
+        let reason = conn.sessionEndReason
         // Where a game exit sends us: back into the library this title was launched from, so the
         // next one is a tap away. Only for a launch that CAME from the library — a game exiting in
         // a plain desktop session has no library to return to.
         let host = activeHost
         let cameFromLibrary = launchedTitleID != nil
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
-        if gameExited {
+        switch reason {
+        case .gameExited:
+            // The player quit their own game. Not a failure, and they are probably after the next
+            // title — so no banner, and back to the library it came from.
             if cameFromLibrary, let host {
                 returnToLibrary = host
             }
-        } else {
+        case .hostEnded, .local:
+            // Someone asked for this: an operator "End" on the host, or our own close racing in.
+            // Say it plainly, without the error framing.
+            errorMessage = "\(name) ended the session."
+        case .hostError:
+            errorMessage = "\(name) ended the session with an error."
+        case .lost:
+            errorMessage = "Lost the connection to \(name)."
+        case .none:
+            // No verdict (an older core, or the close raced the read): keep the wording this path
+            // has always used rather than inventing one.
             errorMessage = "Session ended by \(name)."
         }
     }

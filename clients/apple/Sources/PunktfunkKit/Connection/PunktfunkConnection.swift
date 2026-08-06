@@ -1430,23 +1430,48 @@ public final class PunktfunkConnection {
         }
     }
 
-    /// Did this session end because **the game the host launched for it exited**, rather than the
-    /// stream dropping out?
+    /// Why a stream session ended — the Swift mirror of `PunktfunkEndReason` (ABI v17).
     ///
-    /// Only meaningful once the session HAS ended (a plane threw `.closed`, or `onSessionEnd`
-    /// fired) — before that it is simply false. False also covers every other ending: a user stop,
-    /// the host going away, network loss, an idle timeout. Read it before tearing the connection
-    /// down; once `close()` has been requested this reports false like any other ending, which is
-    /// the safe direction (the caller falls back to its normal end-of-session handling).
-    ///
-    /// A game ending is a normal finish, not a failure — that is the whole point of asking. See
-    /// `punktfunk_connection_game_exited` (ABI v17).
-    public var endedBecauseGameExited: Bool {
-        guard let h = liveHandle() else { return false }
-        var out: UInt8 = 0
-        guard punktfunk_connection_game_exited(h, &out) == statusOK else { return false }
-        return out != 0
+    /// The distinction that matters to a UI is normal vs alarming, and it is not a spectrum: a
+    /// player quitting their game and a host falling off the network both arrive as "the session
+    /// ended". Without this every client wrote one message for all of them, and every client chose
+    /// an error.
+    public enum SessionEndReason: UInt8, Sendable {
+        /// Not ended, or ended before a reason could be observed. Also the fallback for an
+        /// unrecognized value — the core may be newer than this code.
+        case none = 0
+        /// This client closed the session. Nothing to report: the UI initiated it.
+        case local = 1
+        /// The host's launched game exited. A normal finish, and the one reason worth acting on:
+        /// go back to the library the title was launched from.
+        case gameExited = 2
+        /// The host ended the session deliberately (an operator "End", or it simply finished).
+        case hostEnded = 3
+        /// The host closed reporting a failure of its own.
+        case hostError = 4
+        /// The connection died rather than being closed: idle timeout, reset, network gone. This —
+        /// and only this — is the "the host may be asleep" case.
+        case lost = 5
+
+        /// Is this an ordinary outcome rather than something to alarm the user about? `.none`
+        /// counts as normal: no evidence of trouble is not evidence of it.
+        public var isNormal: Bool { self != .hostError && self != .lost }
     }
+
+    /// Why this session ended. Only meaningful once it HAS ended (a plane threw `.closed`, or
+    /// `onSessionEnd` fired) — before that it is `.none`.
+    ///
+    /// Read it before tearing the connection down: once `close()` has been requested this reports
+    /// `.none`, which is the safe direction (the caller falls back to its normal handling).
+    public var sessionEndReason: SessionEndReason {
+        guard let h = liveHandle() else { return .none }
+        var out: UInt8 = 0
+        guard punktfunk_connection_end_reason(h, &out) == statusOK else { return .none }
+        return SessionEndReason(rawValue: out) ?? .none
+    }
+
+    /// Shorthand for the single most actionable reason: the host's launched game exited.
+    public var endedBecauseGameExited: Bool { sessionEndReason == .gameExited }
 
     deinit { close() }
 
