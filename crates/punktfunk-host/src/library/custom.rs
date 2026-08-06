@@ -461,6 +461,13 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     launch.value
                 ));
             }
+            // The value is interpolated into a `playnite://` URI, so it is charset-checked here as
+            // well as at launch time — same reasoning as the two kinds above.
+            if launch.kind == "playnite" && !valid_playnite_id(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `playnite` must be a Playnite game GUID"
+                ));
+            }
         }
         if let Some(marker) = &e.detect.env_marker {
             if !valid_env_key(&marker.key) {
