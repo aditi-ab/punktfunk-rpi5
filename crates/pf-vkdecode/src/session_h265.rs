@@ -29,6 +29,17 @@
 //! real VPS finally arrives, the content differs from the fallback and the object
 //! RECREATES onto the real one, exactly as any other content change would.
 //!
+//! ⚠⚠⚠ **The Std sets' heap blocks must outlive the parameters OBJECT, not just the
+//! call that hands them over.** Vulkan reads as though parameter data were captured
+//! by `vkCreateVideoSessionParametersKHR`, and all three codecs in this crate
+//! assumed it. NVIDIA 610.57.04 does not: for AV1 it was measured keeping
+//! `StdVideoAV1SequenceHeader::pColorConfig` and dereferencing it when a decode is
+//! RECORDED, which decoded every frame against recycled heap ([`crate::session_av1`]
+//! carries the measurement). H.265 embeds MORE such pointers than any other codec
+//! here — the SPS alone carries seven — so [`StoredParamsH265`] holds the object and
+//! its backings in ONE value with one lifetime, and both the recreate path and
+//! `Drop` destroy the object before that value is released.
+//!
 //! `ParamsLedgerH265` is the pure half of that decision table (unit-tested);
 //! `VideoSessionH265` is the thin Vulkan half.
 
@@ -47,6 +58,8 @@ use crate::params_h265::pps_to_std_h265;
 use crate::params_h265::sps_to_std_h265;
 use crate::params_h265::vps_to_std_h265;
 use crate::params_h265::H265ParamsError;
+use crate::params_h265::OwnedStdH265Pps;
+use crate::params_h265::OwnedStdH265Sps;
 use crate::params_h265::OwnedStdH265Vps;
 use crate::params_h265::Pps;
 use crate::params_h265::Sps;
@@ -247,13 +260,73 @@ pub struct SessionConfigH265 {
     pub profile: H265ProfileKey,
 }
 
+/// A live parameters object **and every Std parameter set it was given**, in one
+/// field — because the two may not drift apart. `session::StoredParams` one codec
+/// over, with the VPS leg H.264 does not have.
+///
+/// The wrapper is not decoration and not defensive: a driver in this fleet keeps
+/// the embedded pointers out of a Std set and dereferences them long after the call
+/// that handed them over returned (module docs), so releasing the backing early
+/// hands it freed memory. One value rather than two fields makes "an object whose
+/// backing is gone" unrepresentable, which is the only shape of this bug — and the
+/// shape a `let owned = …;` local silently had. H.265 has the most to lose: its Std
+/// SPS points at a profile/tier/level block, a DPB-manager block, scaling lists,
+/// the short-term RPS candidate array and the long-term SPS candidates.
+///
+/// What is pinned, precisely: the wrappers' BOXED blocks, which is what the driver
+/// was measured retaining. The contiguous array of outer `StdVideoH265*` structs
+/// each call receives is a short-lived temporary, and the driver copies THAT before
+/// returning — which is what the AV1 fix itself rests on, its Std header being moved
+/// into storage after the create call on a rung that is now 250/250 bit-exact. So
+/// moving these wrappers, or reallocating the `Vec`s holding them, disturbs nothing
+/// the driver kept; `params_h265::moving_the_wrapper_leaves_the_driver_s_pointers_put`
+/// pins the half that matters.
+struct StoredParamsH265 {
+    object: vk::VideoSessionParametersKHR,
+    /// One entry per set the OBJECT stores, held for the object's whole life.
+    /// Never read by this crate after the create/update call; the DRIVER reads the
+    /// blocks they own.
+    vps: Vec<OwnedStdH265Vps>,
+    sps: Vec<OwnedStdH265Sps>,
+    pps: Vec<OwnedStdH265Pps>,
+}
+
+impl StoredParamsH265 {
+    /// The placeholder a half-built session holds. `vkDestroyVideoSessionParametersKHR`
+    /// ignores a NULL handle, so a [`VideoSessionH265::create`] that fails before
+    /// the object exists still drops cleanly.
+    fn none() -> Self {
+        Self {
+            object: vk::VideoSessionParametersKHR::null(),
+            vps: Vec::new(),
+            sps: Vec::new(),
+            pps: Vec::new(),
+        }
+    }
+
+    /// Take over sets an `Add` just handed to the live object — they belong to the
+    /// OBJECT now, so their blocks live as long as it does rather than as long as
+    /// the update call. Only ever reached after that call SUCCEEDED: a failed
+    /// update stored nothing, and its wrappers are dropped instead.
+    fn adopt(
+        &mut self,
+        vps: Option<OwnedStdH265Vps>,
+        sps: Option<OwnedStdH265Sps>,
+        pps: Option<OwnedStdH265Pps>,
+    ) {
+        self.vps.extend(vps);
+        self.sps.extend(sps);
+        self.pps.extend(pps);
+    }
+}
+
 /// The Vulkan half: session + bound memory + parameters object.
 pub(crate) struct VideoSessionH265 {
     device: ash::Device,
     video_queue: ash::khr::video_queue::Device,
     session: vk::VideoSessionKHR,
     memory: Vec<vk::DeviceMemory>,
-    parameters: vk::VideoSessionParametersKHR,
+    parameters: StoredParamsH265,
     ledger: ParamsLedgerH265,
     pub(crate) config: SessionConfigH265,
     /// The session has never run a coding scope: the first one records a
@@ -306,7 +379,7 @@ impl VideoSessionH265 {
             video_queue: dev.video_queue().clone(),
             session,
             memory: Vec::new(),
-            parameters: vk::VideoSessionParametersKHR::null(),
+            parameters: StoredParamsH265::none(),
             ledger: ParamsLedgerH265::default(),
             config,
             needs_reset: ResetArm::armed(),
@@ -324,35 +397,43 @@ impl VideoSessionH265 {
                     return Err(failure.error);
                 }
             }
-            built.parameters = built.create_parameters_object(&[], &[], &[])?;
+            built.parameters =
+                built.create_parameters_object(Vec::new(), Vec::new(), Vec::new())?;
         }
         Ok(built)
     }
 
     /// Create a parameters object holding exactly `vps`/`sps`/`pps` (any may be
-    /// empty).
+    /// empty), **fused with the wrappers whose heap blocks it points at**.
+    ///
+    /// Taking the wrappers BY VALUE rather than as Std slices is the point: there is
+    /// no way to reach `vkCreateVideoSessionParametersKHR` from here without the
+    /// resulting object taking ownership of everything it will go on dereferencing
+    /// (module docs, [`StoredParamsH265`]).
     ///
     /// # Safety
     ///
-    /// Live device + live session; the Std slices' backing (the `OwnedStd*`
-    /// wrappers, INCLUDING the heap blocks their embedded pointers target)
-    /// outlives this call.
-    ///
-    /// ⚠ This used to end "— Vulkan copies all parameter data before returning",
-    /// and that is **not universally true**: see [`crate::session::VideoSession`]'s
-    /// twin of this comment and [`crate::session_av1`], where a driver was measured
-    /// dereferencing a retained pointer long after the create call. H.265's Std SPS
-    /// carries SEVEN embedded pointers, more than any other set in this crate.
+    /// Live device + live session.
     unsafe fn create_parameters_object(
         &self,
-        vps: &[hh::StdVideoH265VideoParameterSet],
-        sps: &[hh::StdVideoH265SequenceParameterSet],
-        pps: &[hh::StdVideoH265PictureParameterSet],
-    ) -> Result<vk::VideoSessionParametersKHR, SessionError> {
+        vps: Vec<OwnedStdH265Vps>,
+        sps: Vec<OwnedStdH265Sps>,
+        pps: Vec<OwnedStdH265Pps>,
+    ) -> Result<StoredParamsH265, SessionError> {
+        // The contiguous Std arrays the call wants. These are COPIES of each
+        // wrapper's Std struct (it is `Copy`, and the driver copies them again
+        // before returning); the embedded pointers they carry still address the
+        // wrappers' own boxed blocks, which are what must outlive the OBJECT.
+        let std_vps: Vec<hh::StdVideoH265VideoParameterSet> =
+            vps.iter().map(|o| *o.std()).collect();
+        let std_sps: Vec<hh::StdVideoH265SequenceParameterSet> =
+            sps.iter().map(|o| *o.std()).collect();
+        let std_pps: Vec<hh::StdVideoH265PictureParameterSet> =
+            pps.iter().map(|o| *o.std()).collect();
         let add = vk::VideoDecodeH265SessionParametersAddInfoKHR::default()
-            .std_vp_ss(vps)
-            .std_sp_ss(sps)
-            .std_pp_ss(pps);
+            .std_vp_ss(&std_vps)
+            .std_sp_ss(&std_sps)
+            .std_pp_ss(&std_pps);
         let mut h265 = vk::VideoDecodeH265SessionParametersCreateInfoKHR::default()
             .max_std_vps_count(MAX_STD_VPS as u32)
             .max_std_sps_count(MAX_STD_SPS as u32)
@@ -361,20 +442,27 @@ impl VideoSessionH265 {
         let ci = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(self.session)
             .push_next(&mut h265);
-        let mut parameters = vk::VideoSessionParametersKHR::null();
-        // SAFETY: fn contract; `ci` roots locals outliving the call.
+        let mut object = vk::VideoSessionParametersKHR::null();
+        // SAFETY: fn contract; `ci` roots locals outliving the call, and the blocks
+        // the driver may retain past it are owned by `vps`/`sps`/`pps`, which are
+        // moved into the returned value rather than dropped here.
         let r = unsafe {
             (self.video_queue.fp().create_video_session_parameters_khr)(
                 self.device.handle(),
                 &ci,
                 std::ptr::null(),
-                &mut parameters,
+                &mut object,
             )
         };
         if r != vk::Result::SUCCESS {
             return Err(SessionError::Vk(r));
         }
-        Ok(parameters)
+        Ok(StoredParamsH265 {
+            object,
+            vps,
+            sps,
+            pps,
+        })
     }
 
     /// The ledger's verdict for activating (`vps`, `sps`, `pps`), without mutating
@@ -447,19 +535,22 @@ impl VideoSessionH265 {
                     .update_sequence_count(self.ledger.next_update_seq())
                     .push_next(&mut add);
                 // SAFETY: live device + parameters object; `update` roots locals
-                // (incl. the OwnedStd backings) outliving the call. See
-                // `create_parameters_object` on why "and the driver copies them"
-                // is an observation about this fleet rather than a guarantee.
+                // (incl. the OwnedStd backings) outliving the call — and the
+                // backings go on outliving it, adopted below.
                 let r = unsafe {
                     (self.video_queue.fp().update_video_session_parameters_khr)(
                         self.device.handle(),
-                        self.parameters,
+                        self.parameters.object,
                         &update,
                     )
                 };
                 if r != vk::Result::SUCCESS {
                     return Err(SessionError::Vk(r));
                 }
+                // ⚠ The added sets now belong to the OBJECT, so their heap blocks
+                // must too: an Add whose wrappers died at the end of this arm would
+                // be the AV1 use-after-free with an update call in front of it.
+                self.parameters.adopt(owned_vps, owned_sps, owned_pps);
                 self.ledger.commit(action, vps, sps, pps);
                 Ok(())
             }
@@ -473,26 +564,35 @@ impl VideoSessionH265 {
                 let owned_vps = vps.to_std()?;
                 let owned_sps = sps_to_std_h265(sps)?;
                 let owned_pps = pps_to_std_h265(pps)?;
-                // SAFETY: fn contract (the OwnedStd backings live across the call).
+                // SAFETY: fn contract — live device + live session. The wrappers
+                // are MOVED IN and come back owned by the fresh object, so they
+                // live as long as it does rather than merely across the call.
                 let fresh = unsafe {
                     self.create_parameters_object(
-                        std::slice::from_ref(owned_vps.std()),
-                        std::slice::from_ref(owned_sps.std()),
-                        std::slice::from_ref(owned_pps.std()),
+                        vec![owned_vps],
+                        vec![owned_sps],
+                        vec![owned_pps],
                     )?
                 };
+                // The old object goes FIRST and its backings with it — installing
+                // `fresh` through a local keeps the destroy ahead of the free,
+                // which is the order a driver still holding the old pointers needs.
+                let old = std::mem::replace(&mut self.parameters, fresh);
                 // SAFETY: the fn-level contract — the caller drained every
                 // in-flight decode before a Recreate reached here (checked via
                 // parameters_action), so no submitted work reads the old object;
-                // it is this session's own handle.
+                // it is this session's own handle, on a live device.
                 unsafe {
                     (self.video_queue.fp().destroy_video_session_parameters_khr)(
                         self.device.handle(),
-                        self.parameters,
+                        old.object,
                         std::ptr::null(),
                     );
                 }
-                self.parameters = fresh;
+                // Explicit, because the ORDER is the whole point: every Std block
+                // `old` owns is released only now, after the object that pointed at
+                // them is gone.
+                drop(old);
                 self.ledger.commit(action, vps, sps, pps);
                 Ok(())
             }
@@ -504,7 +604,7 @@ impl VideoSessionH265 {
     }
 
     pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
-        self.parameters
+        self.parameters.object
     }
 
     /// Whether the next coding scope must record the initialization RESET —
@@ -531,11 +631,14 @@ impl Drop for VideoSessionH265 {
         // ORDER is load-bearing, not stylistic: memory bound into a session may
         // not be freed while the session lives, so the session is destroyed first
         // — which is also why a failed bind hands its allocations back here
-        // instead of freeing them itself (`crate::session::BindFailure`).
+        // instead of freeing them itself (`crate::session::BindFailure`). The Std
+        // backings are freed after both, by the `parameters` field's own drop,
+        // which Rust runs AFTER this body — the same reason `ensure_parameters`
+        // destroys before it replaces.
         unsafe {
             (self.video_queue.fp().destroy_video_session_parameters_khr)(
                 self.device.handle(),
-                self.parameters,
+                self.parameters.object,
                 std::ptr::null(),
             );
             (self.video_queue.fp().destroy_video_session_khr)(
@@ -630,6 +733,42 @@ mod tests {
             qp_bd_offset_y: 0,
             sps: Rc::clone(sps),
         })
+    }
+
+    /// An `Add` hands NEW Std sets to an EXISTING parameters object, so their heap
+    /// blocks must live as long as that OBJECT — not as long as the update call
+    /// that carried them. [`StoredParamsH265::adopt`] is where the transfer
+    /// happens, and this pins that it genuinely takes ownership: `ensure_parameters`
+    /// drops its local wrappers the instant this returns, and a driver holding
+    /// `pDecPicBufMgr` or `pProfileTierLevel` would be reading freed heap from the
+    /// next frame on ([`crate::session_av1`] for the measurement that made this
+    /// real).
+    #[test]
+    fn an_added_set_keeps_its_blocks_alive_past_the_update_call() {
+        // The ledger fixtures never convert, so they leave `general_profile_idc`
+        // at the unmappable 0; Std conversion needs a real one.
+        let mut base = (*authored_sps(0, 0, 64)).clone();
+        base.profile_tier_level.general_profile_idc = 1; // Main
+        base.max_dec_pic_buffering_minus1 = [5, 0, 0, 0, 0, 0, 0];
+        let sps = Rc::new(base);
+        let owned_vps = VpsSource::for_sps(&sps).to_std().expect("converts");
+        let owned_sps = sps_to_std_h265(&sps).expect("converts");
+        let vps_ptl = owned_vps.std().pProfileTierLevel;
+        let sps_dpb = owned_sps.std().pDecPicBufMgr;
+        assert!(!vps_ptl.is_null() && !sps_dpb.is_null());
+
+        let mut stored = StoredParamsH265::none();
+        stored.adopt(Some(owned_vps), Some(owned_sps), None);
+        assert_eq!(
+            (stored.vps.len(), stored.sps.len(), stored.pps.len()),
+            (1, 1, 0),
+            "the object took the sets themselves, not borrows of them"
+        );
+        assert_eq!(stored.vps[0].std().pProfileTierLevel, vps_ptl);
+        assert_eq!(stored.sps[0].std().pDecPicBufMgr, sps_dpb);
+        // SAFETY: `stored` owns both blocks — which is exactly the property here.
+        let dpb = unsafe { (*sps_dpb).max_dec_pic_buffering_minus1[0] };
+        assert_eq!(dpb, 5, "the fixture's DPB sizing, read back live");
     }
 
     #[test]

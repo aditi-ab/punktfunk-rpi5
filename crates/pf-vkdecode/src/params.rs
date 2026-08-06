@@ -80,9 +80,12 @@ impl std::error::Error for ParamsError {}
 ///   pointers hold the addresses of.
 /// - [`Self::std`] hands the struct out by shared reference. The struct is `Copy`; a
 ///   copy taken out of the wrapper still points INTO the wrapper's backing and must
-///   not outlive it. The intended use is passing the reference straight into
-///   `vkCreateVideoSessionParametersKHR`, which copies all parameter data before
-///   returning — keeping the wrapper alive across that call is the whole obligation.
+///   not outlive it. ⚠⚠ The obligation is NOT merely "keep the wrapper alive across
+///   `vkCreateVideoSessionParametersKHR`", which is what this said and what the
+///   spec reads like: NVIDIA 610.57.04 was measured retaining an embedded pointer
+///   out of a Std set and dereferencing it at every `vkCmdDecodeVideoKHR`
+///   ([`crate::session_av1`]). The wrapper must outlive the parameters OBJECT, and
+///   [`crate::session`] is where that is enforced by construction.
 /// - Nothing exposes mutation of the backing, so for the wrapper's lifetime the
 ///   pointed-to data is immutable and the `*const` aliasing rules hold trivially.
 /// - Deliberately NOT `Clone`: a derived clone would duplicate the pointer VALUES but
@@ -535,6 +538,109 @@ mod tests {
         // num_ref_frames_in_pic_order_cnt_cycle i32s, alive for this whole scope.
         let offsets = unsafe { std::slice::from_raw_parts(std.pOffsetForRefFrame, 3) };
         assert_eq!(offsets, [2, -1, 4]);
+    }
+
+    /// Scribble over the stack the conversion's frames just used.
+    ///
+    /// The discriminator in the move tests is READING a block back, and pointer
+    /// equality cannot stand in for it: the Std struct carries its pointers by
+    /// VALUE, so a stale one is copied along with the struct and still compares
+    /// equal. An inlined backing therefore shows up only as wrong CONTENT — and
+    /// only if the dead slot has actually been reused by then. This makes that
+    /// certain instead of lucky: after it runs, a pointer into a dead local reads
+    /// back `0xA5`s rather than, by chance, its old contents.
+    #[inline(never)]
+    fn clobber_the_dead_stack() {
+        let mut scratch = [0xA5u8; 16 * 1024];
+        std::hint::black_box(&mut scratch);
+    }
+
+    /// Both wrappers may be MOVED — into the session's stored parameters, out of a
+    /// `Result`, into a `Vec` that later reallocates — without disturbing the
+    /// addresses a driver has already been given.
+    ///
+    /// Not a Rust triviality worth skipping: it is the whole reason
+    /// [`crate::session`] can fix its use-after-free by STORING these values
+    /// alongside the parameters object rather than by boxing or pinning them. It
+    /// holds because every backing is `Box`ed; an "optimisation" that inlined any
+    /// one of them as a field would keep every other test in this crate green, keep
+    /// compiling, and hand the driver a pointer into a moved-from stack slot. The
+    /// H.264 parity leg would catch it on hardware — this catches it in ordinary CI.
+    /// (`params_av1::moving_the_wrapper_leaves_the_driver_s_pointers_put` is the
+    /// same test one codec over; `params_h265`'s is the third.)
+    #[test]
+    fn moving_the_wrapper_leaves_the_driver_s_pointers_put() {
+        // An SPS carrying BOTH of its embedded pointers: the POC-type-1 offset
+        // array and the scaling lists. (The vendored `Sps` is not `Clone`, so the
+        // fixture is a builder rather than a value.)
+        let pointer_bearing_sps = || {
+            let mut sps = full_sps();
+            sps.pic_order_cnt_type = 1;
+            sps.num_ref_frames_in_pic_order_cnt_cycle = 3;
+            sps.offset_for_ref_frame[0] = 2;
+            sps.offset_for_ref_frame[1] = -1;
+            sps.offset_for_ref_frame[2] = 4;
+            sps.seq_scaling_matrix_present_flag = true;
+            sps.scaling_lists_4x4 = std::array::from_fn(|i| [10 + i as u8; 16]);
+            sps
+        };
+        // And a PPS carrying its one.
+        let mut pps = full_pps(pointer_bearing_sps());
+        pps.pic_scaling_matrix_present_flag = true;
+        pps.scaling_lists_4x4 = std::array::from_fn(|i| [60 + i as u8; 16]);
+
+        let owned_sps = sps_to_std(&pointer_bearing_sps()).expect("a High-profile SPS converts");
+        let owned_pps = pps_to_std(&pps).expect("its PPS converts");
+        let (offsets, sps_lists) = (
+            owned_sps.std().pOffsetForRefFrame,
+            owned_sps.std().pScalingLists,
+        );
+        let pps_lists = owned_pps.std().pScalingLists;
+        assert!(!offsets.is_null(), "POC type 1 attaches the offset array");
+        assert!(!sps_lists.is_null(), "the SPS declares scaling lists");
+        assert!(!pps_lists.is_null(), "so does the PPS");
+
+        // Every move the session's stored parameters put them through: out of the
+        // conversion, into a `Vec`, through a reallocation of that `Vec` as later
+        // Adds push more sets in, and along with the whole `StoredParams` value as
+        // it is installed by `mem::replace`.
+        let stored_sps = vec![owned_sps];
+        let mut stored_pps = vec![owned_pps];
+        for id in 1..crate::session::MAX_STD_PPS as u8 {
+            let mut more = full_pps(pointer_bearing_sps());
+            more.pic_parameter_set_id = id;
+            stored_pps.push(pps_to_std(&more).expect("converts"));
+        }
+        assert!(
+            stored_pps.capacity() > 1,
+            "the pushes reallocated, which is the case being pinned"
+        );
+        let stored = (stored_sps, stored_pps, 0u8);
+        let (stored_sps, stored_pps, _) = stored;
+
+        assert_eq!(stored_sps[0].std().pOffsetForRefFrame, offsets);
+        assert_eq!(stored_sps[0].std().pScalingLists, sps_lists);
+        assert_eq!(stored_pps[0].std().pScalingLists, pps_lists);
+
+        // The assertions that actually bite. Pointer equality above cannot fail —
+        // the Std struct carries the value, so a stale pointer is copied along with
+        // it — but an inlined backing leaves those pointers addressing dead locals
+        // in `sps_to_std`/`pps_to_std`'s returned frames, which this has just
+        // overwritten.
+        clobber_the_dead_stack();
+        // They still address live blocks holding the fixture's own values, not
+        // stale copies.
+        // SAFETY: `stored_sps`/`stored_pps` are alive here and own every block.
+        let (read_offsets, read_sps_lists, read_pps_lists) = unsafe {
+            (
+                std::slice::from_raw_parts(offsets, 3),
+                &*sps_lists,
+                &*pps_lists,
+            )
+        };
+        assert_eq!(read_offsets, [2, -1, 4]);
+        assert_eq!(read_sps_lists.ScalingList4x4[5], [15; 16]);
+        assert_eq!(read_pps_lists.ScalingList4x4[5], [65; 16]);
     }
 
     #[test]

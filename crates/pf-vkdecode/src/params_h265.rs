@@ -1290,6 +1290,187 @@ mod tests {
         assert_eq!(dpb.max_dec_pic_buffering_minus1[0], 5);
     }
 
+    /// Scribble over the stack the conversion's frames just used.
+    ///
+    /// The discriminator in the move tests is READING a block back, and pointer
+    /// equality cannot stand in for it: the Std struct carries its pointers by
+    /// VALUE, so a stale one is copied along with the struct and still compares
+    /// equal. An inlined backing therefore shows up only as wrong CONTENT — and
+    /// only if the dead slot has actually been reused by then. This makes that
+    /// certain instead of lucky: after it runs, a pointer into a dead local reads
+    /// back `0xA5`s rather than, by chance, its old contents.
+    #[inline(never)]
+    fn clobber_the_dead_stack() {
+        let mut scratch = [0xA5u8; 16 * 1024];
+        std::hint::black_box(&mut scratch);
+    }
+
+    /// All three wrappers may be MOVED — into the session's stored parameters, out
+    /// of a `Result`, into a `Vec` that later reallocates — without disturbing the
+    /// addresses a driver has already been given.
+    ///
+    /// Not a Rust triviality worth skipping: it is the whole reason
+    /// [`crate::session_h265`] can fix its use-after-free by STORING these values
+    /// alongside the parameters object rather than by boxing or pinning them. It
+    /// holds because every backing is `Box`ed; an "optimisation" that inlined any
+    /// one of them as a field would keep every other test in this crate green, keep
+    /// compiling, and hand the driver a pointer into a moved-from stack slot. The
+    /// H.265 and Main 10 parity legs would catch it on hardware — this catches it in
+    /// ordinary CI. H.265 has the most surface of the three codecs: seven pointers
+    /// across the SPS alone, and this exercises every one a stream can populate.
+    /// (`params_av1::moving_the_wrapper_leaves_the_driver_s_pointers_put` and
+    /// `params::`'s are the same test one codec over.)
+    #[test]
+    fn moving_the_wrapper_leaves_the_driver_s_pointers_put() {
+        // An SPS carrying every embedded pointer it can: profile/tier/level and
+        // DPB manager (always), plus scaling lists, short-term RPS candidates and
+        // long-term SPS candidates.
+        let mut sps = full_sps();
+        sps.scaling_list_data_present_flag = true;
+        sps.scaling_list.scaling_list_4x4 = std::array::from_fn(|i| [10 + i as u8; 16]);
+        sps.num_short_term_ref_pic_sets = 1;
+        let mut st = ShortTermRefPicSet {
+            num_negative_pics: 1,
+            ..Default::default()
+        };
+        st.delta_poc_s0[0] = -1;
+        st.used_by_curr_pic_s0[0] = true;
+        sps.short_term_ref_pic_set = vec![st];
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 1;
+        sps.lt_ref_pic_poc_lsb_sps[0] = 11;
+        sps.used_by_curr_pic_lt_sps_flag[0] = true;
+        // A PPS carrying its one, and a VPS carrying its two.
+        let mut pps = full_pps(sps.clone());
+        pps.scaling_list_data_present_flag = true;
+        pps.scaling_list.scaling_list_4x4 = std::array::from_fn(|i| [60 + i as u8; 16]);
+        let vps = Vps {
+            video_parameter_set_id: 2,
+            max_sub_layers_minus1: 1,
+            profile_tier_level: full_sps().profile_tier_level,
+            // Distinct from the SPS's [5, 6, …] so a read-back names which block
+            // it came from rather than merely that some block was readable.
+            max_dec_pic_buffering_minus1: [3, 4, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+
+        let owned_vps = vps_to_std_h265(&vps).expect("the VPS converts");
+        let owned_sps = sps_to_std_h265(&sps).expect("a Main 10 SPS converts");
+        let owned_pps = pps_to_std_h265(&pps).expect("its PPS converts");
+        let vps_ptrs = (
+            owned_vps.std().pProfileTierLevel,
+            owned_vps.std().pDecPicBufMgr,
+        );
+        let sps_ptrs = (
+            owned_sps.std().pProfileTierLevel,
+            owned_sps.std().pDecPicBufMgr,
+            owned_sps.std().pScalingLists,
+            owned_sps.std().pShortTermRefPicSet,
+            owned_sps.std().pLongTermRefPicsSps,
+        );
+        let pps_lists = owned_pps.std().pScalingLists;
+        for (what, ptr) in [
+            ("vps pProfileTierLevel", vps_ptrs.0.cast::<()>()),
+            ("vps pDecPicBufMgr", vps_ptrs.1.cast()),
+            ("sps pProfileTierLevel", sps_ptrs.0.cast()),
+            ("sps pDecPicBufMgr", sps_ptrs.1.cast()),
+            ("sps pScalingLists", sps_ptrs.2.cast()),
+            ("sps pShortTermRefPicSet", sps_ptrs.3.cast()),
+            ("sps pLongTermRefPicsSps", sps_ptrs.4.cast()),
+            ("pps pScalingLists", pps_lists.cast()),
+        ] {
+            assert!(!ptr.is_null(), "{what} is attached by this fixture");
+        }
+
+        // Every move the session's stored parameters put them through: out of the
+        // conversion, into a `Vec`, through a reallocation of that `Vec` as later
+        // Adds push more sets in, and along with the whole `StoredParamsH265` value
+        // as it is installed by `mem::replace`.
+        let stored_vps = vec![owned_vps];
+        let stored_sps = vec![owned_sps];
+        let mut stored_pps = vec![owned_pps];
+        for id in 1..crate::session_h265::MAX_STD_PPS as u8 {
+            let mut more = full_pps(sps.clone());
+            more.pic_parameter_set_id = id;
+            stored_pps.push(pps_to_std_h265(&more).expect("converts"));
+        }
+        assert!(
+            stored_pps.capacity() > 1,
+            "the pushes reallocated, which is the case being pinned"
+        );
+        let stored = (stored_vps, stored_sps, stored_pps, 0u8);
+        let (stored_vps, stored_sps, stored_pps, _) = stored;
+
+        let moved_vps = stored_vps[0].std();
+        assert_eq!(
+            (moved_vps.pProfileTierLevel, moved_vps.pDecPicBufMgr),
+            vps_ptrs
+        );
+        let moved_sps = stored_sps[0].std();
+        assert_eq!(
+            (
+                moved_sps.pProfileTierLevel,
+                moved_sps.pDecPicBufMgr,
+                moved_sps.pScalingLists,
+                moved_sps.pShortTermRefPicSet,
+                moved_sps.pLongTermRefPicsSps,
+            ),
+            sps_ptrs
+        );
+        assert_eq!(stored_pps[0].std().pScalingLists, pps_lists);
+
+        // The assertions that actually bite. Pointer equality above cannot fail —
+        // the Std struct carries the value, so a stale pointer is copied along with
+        // it — but an inlined backing leaves those pointers addressing dead locals
+        // in the conversions' returned frames, which this has just overwritten.
+        clobber_the_dead_stack();
+        // They still address live blocks holding the fixture's own values, not
+        // stale copies.
+        // Every one of the eight, so no single backing can be inlined without this
+        // failing — an earlier draft read only six and let exactly that through.
+        // SAFETY: `stored_*` are alive here and own every one of these blocks.
+        let (vps_ptl, vps_dpb) = unsafe { (&*vps_ptrs.0, &*vps_ptrs.1) };
+        // SAFETY: as above.
+        let (sps_ptl, sps_dpb, sps_scaling, sps_st, sps_lt) = unsafe {
+            (
+                &*sps_ptrs.0,
+                &*sps_ptrs.1,
+                &*sps_ptrs.2,
+                &*sps_ptrs.3,
+                &*sps_ptrs.4,
+            )
+        };
+        // SAFETY: as above.
+        let pps_scaling = unsafe { &*pps_lists };
+        assert_eq!(
+            vps_ptl.general_level_idc,
+            hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_4_1,
+            "vps pProfileTierLevel"
+        );
+        assert_eq!(
+            &vps_dpb.max_dec_pic_buffering_minus1[..2],
+            &[3, 4],
+            "vps pDecPicBufMgr"
+        );
+        assert_eq!(
+            sps_ptl.general_level_idc,
+            hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_4_1,
+            "sps pProfileTierLevel"
+        );
+        assert_eq!(
+            &sps_dpb.max_dec_pic_buffering_minus1[..2],
+            &[5, 6],
+            "sps pDecPicBufMgr"
+        );
+        assert_eq!(sps_scaling.ScalingList4x4[5], [15; 16], "sps pScalingLists");
+        assert_eq!(sps_st.num_negative_pics, 1, "sps pShortTermRefPicSet");
+        assert_eq!(
+            sps_lt.lt_ref_pic_poc_lsb_sps[0], 11,
+            "sps pLongTermRefPicsSps"
+        );
+        assert_eq!(pps_scaling.ScalingList4x4[5], [65; 16], "pps pScalingLists");
+    }
+
     #[test]
     fn sps_scaling_lists_convert_verbatim_including_the_32x32_pair_and_dc_values() {
         let mut sps = full_sps();
