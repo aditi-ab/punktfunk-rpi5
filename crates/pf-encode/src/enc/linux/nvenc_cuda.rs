@@ -830,6 +830,15 @@ pub struct NvencCudaEncoder {
     encoder_engines: u32,
     /// Submit stamp for the split arbiter's per-frame cost (sync depth-1 path only).
     last_submit_at: Option<std::time::Instant>,
+    /// Whole-AU paced-send time (µs) the host last reported, via
+    /// [`Encoder::set_send_spread_us`]. `0` = never reported, which keeps the arbiter out of the
+    /// sub-frame trade entirely (it cannot price what it cannot see).
+    send_spread_us: u32,
+    /// Sub-frame state the session was OPENED able to run — what `resolve_subframe` decided from
+    /// the caps probe and the env. `subframe_on` moves as the arbiter flips arms; this does not,
+    /// so a return to a non-forced split can restore sub-frame without re-deriving it (and
+    /// without ever turning it on for a session that never had it).
+    subframe_opened_with: bool,
     /// The live split-mode experiment, when one is running. `None` = not arbitrating (gated off,
     /// already decided this process, or the config is one we refuse to arbitrate).
     arbiter: Option<SplitArbiter>,
@@ -923,6 +932,8 @@ impl NvencCudaEncoder {
             subframe_chunks: false,
             encoder_engines: 0,
             last_submit_at: None,
+            send_spread_us: 0,
+            subframe_opened_with: false,
             arbiter: None,
             chunk: None,
         })
@@ -1383,6 +1394,7 @@ impl NvencCudaEncoder {
                 self.subframe_forced,
             );
             self.subframe_on = subframe_on;
+            self.subframe_opened_with = subframe_on;
             const CLAMP_TOL_BPS: u64 = 20_000_000;
 
             // Ceiling cache (process lifetime, `nvenc_core`): a prior clamp search already found
@@ -1724,13 +1736,25 @@ impl NvencCudaEncoder {
         {
             return;
         }
-        if self.subframe_on && self.codec != Codec::Av1 {
-            tracing::debug!(
-                "NVENC split arbitration skipped: sub-frame readback is on and this codec cannot \
-                 keep it while split, so the trade costs send overlap the encoder cannot measure"
-            );
-            return;
-        }
+        // Losing sub-frame costs the send/encode overlap: without it the AU's last byte waits for
+        // the WHOLE send instead of just the final slice, so the challenger owes roughly
+        // `spread × (slices−1)/slices`. Priced here because only the encoder knows `slices`; the
+        // host reports the raw spread.
+        let handicap_us = if self.subframe_on && self.codec != Codec::Av1 {
+            if self.send_spread_us == 0 || self.slices < 2 {
+                tracing::debug!(
+                    "NVENC split arbitration skipped: engaging split would cost sub-frame readback \
+                     and no send-spread has been reported, so the trade cannot be priced — an \
+                     encode-only comparison would take the arm that looks fastest and lose \
+                     end-to-end"
+                );
+                return;
+            }
+            let slices = self.slices as u64;
+            self.send_spread_us as u64 * (slices - 1) / slices
+        } else {
+            0
+        };
         // Pick the challenger that tests the question worth asking: "are we leaving engines idle?"
         // So anything that is not already the widest forced split is challenged BY the widest, and
         // only a session already there is challenged by single-engine ("is splitting even helping
@@ -1752,9 +1776,15 @@ impl NvencCudaEncoder {
         tracing::info!(
             incumbent = self.split_mode,
             challenger,
+            handicap_us,
+            send_spread_us = self.send_spread_us,
             "NVENC split arbitration armed — measuring both arms on the live session (no IDR)"
         );
-        self.arbiter = Some(SplitArbiter::new(self.split_mode, challenger));
+        self.arbiter = Some(SplitArbiter::with_handicap(
+            self.split_mode,
+            challenger,
+            handicap_us,
+        ));
     }
 
     /// The config identity this session's split verdict is cached under.
@@ -1776,17 +1806,34 @@ impl NvencCudaEncoder {
     /// moves. Returns whether the driver accepted it; on refusal the field is restored so the
     /// encoder's idea of its own session stays truthful.
     fn apply_split_mode(&mut self, mode: u32) -> bool {
-        let previous = self.split_mode;
+        let (prev_mode, prev_sub, prev_chunks) =
+            (self.split_mode, self.subframe_on, self.subframe_chunks);
+        // Sub-frame rides along: HEVC cannot hold both, so a forced split must drop it and a
+        // return to non-forced may take it back (only up to what the session was opened able to
+        // do — `subframe_cap`/`resolve_subframe` decided that once, at open).
+        let (mode, subframe) = resolve_split_subframe(
+            self.codec,
+            mode,
+            self.subframe_opened_with,
+            self.subframe_forced,
+        );
         self.split_mode = mode;
+        self.subframe_on = subframe;
+        // ⚠ The latch `reconfigure_bitrate` does NOT recompute (spike S1c): leave it stale and
+        // `supports_chunked_poll` keeps saying yes while `numSlices` never advances, so
+        // `poll_chunk` busy-polls its entire budget every AU.
+        self.subframe_chunks = self.slices >= 2 && subframe && self.async_rt.is_none();
         if self.reconfigure_bitrate(self.bitrate_bps) {
             true
         } else {
             tracing::warn!(
-                from = previous,
+                from = prev_mode,
                 to = mode,
                 "NVENC split arbitration: driver refused the in-place split change — staying put"
             );
-            self.split_mode = previous;
+            self.split_mode = prev_mode;
+            self.subframe_on = prev_sub;
+            self.subframe_chunks = prev_chunks;
             false
         }
     }
@@ -2551,6 +2598,17 @@ impl Encoder for NvencCudaEncoder {
                     "NVENC chunked poll: picture type diverged from the submit-time prediction"
                 );
             }
+            // The AU is complete here too — the chunked path is how a sub-frame session finishes,
+            // so the arbiter has to be fed from BOTH completion points or it would never see a
+            // frame on the incumbent arm of an HEVC sub-frame experiment (that arm is chunked;
+            // only the challenger, with sub-frame dropped, comes through `poll`).
+            let encode_us = self
+                .last_submit_at
+                .take()
+                .map(|t| t.elapsed().as_micros() as u64);
+            if let Some(us) = encode_us {
+                self.feed_split_arbiter(us);
+            }
             Ok(Some(AuChunk {
                 data,
                 pts_ns,
@@ -2632,6 +2690,10 @@ impl Encoder for NvencCudaEncoder {
                 }
             }
         }
+    }
+
+    fn set_send_spread_us(&mut self, us: u32) {
+        self.send_spread_us = us;
     }
 
     fn applied_bitrate_bps(&self) -> Option<u64> {

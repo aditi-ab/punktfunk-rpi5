@@ -402,6 +402,13 @@ pub(super) struct SplitArbiter {
     samples: Vec<u64>,
     incumbent_us: u64,
     settle_left: u32,
+    /// Latency the challenger COSTS beyond its encode time, added to its measured result before
+    /// the comparison. Non-zero only when winning the split means giving up sub-frame readback:
+    /// sub-frame lets the send overlap the encode, so losing it pushes the AU's last byte out by
+    /// roughly `send_spread × (slices−1)/slices`. Without this term the arbiter compares encode
+    /// against encode, always prefers split on HEVC, and makes end-to-end latency worse while
+    /// reporting a win.
+    challenger_handicap_us: u64,
 }
 
 /// Frames discarded after a switch before the challenger is judged (measured — see the struct doc).
@@ -419,7 +426,9 @@ const WIN_MARGIN_PCT: u64 = 10;
 
 #[cfg(target_os = "linux")]
 impl SplitArbiter {
-    pub(super) fn new(incumbent: u32, challenger: u32) -> Self {
+    /// `handicap_us` is what the challenger costs OUTSIDE the encode it is measured on — pass `0`
+    /// when it gives up nothing. See [`Self::challenger_handicap_us`].
+    pub(super) fn with_handicap(incumbent: u32, challenger: u32, handicap_us: u64) -> Self {
         Self {
             state: ArbState::MeasuringIncumbent,
             incumbent,
@@ -427,6 +436,7 @@ impl SplitArbiter {
             samples: Vec::with_capacity(SAMPLE_FRAMES),
             incumbent_us: 0,
             settle_left: 0,
+            challenger_handicap_us: handicap_us,
         }
     }
 
@@ -457,7 +467,9 @@ impl SplitArbiter {
                 if self.samples.len() < SAMPLE_FRAMES {
                     return None;
                 }
-                let challenger_us = median(&mut self.samples);
+                // Compare TOTAL cost, not encode cost: whatever the challenger gives up outside
+                // the encode (on HEVC, the sub-frame send overlap) is charged to it here.
+                let challenger_us = median(&mut self.samples) + self.challenger_handicap_us;
                 self.state = ArbState::Done;
                 // Strictly better by the margin, or the incumbent keeps the session. Equal-ish is
                 // deliberately a win for the incumbent: we are already there.
@@ -1241,7 +1253,49 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
 #[cfg(all(test, target_os = "linux"))]
 mod arbiter_tests {
     use super::{ArbAction, SplitArbiter, SETTLE_FRAMES};
+
     use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    /// THE SUB-FRAME TRADE, which is the whole reason `set_send_spread_us` exists. Same encode
+    /// numbers both times; only the handicap differs.
+    ///
+    /// A 4K HEVC session where split halves the encode (5000 → 2400 µs) but costs sub-frame
+    /// readback. With a cheap send there is headroom and split wins. With an expensive send the
+    /// lost overlap outweighs the encode saving, and the arbiter must REFUSE the arm that looks
+    /// twice as fast — which is exactly the mistake an encode-only comparison makes.
+    #[test]
+    fn handicap_can_reverse_the_verdict() {
+        let (inc, chal) = (
+            M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        );
+        let run = |handicap: u64| {
+            let mut arb = SplitArbiter::with_handicap(inc, chal, handicap);
+            let mut live = inc;
+            for _ in 0..500 {
+                if arb.is_done() {
+                    break;
+                }
+                let us = if live == inc { 5000 } else { 2400 };
+                if let Some(a) = arb.on_frame(us) {
+                    match a {
+                        ArbAction::SwitchTo(m) | ArbAction::Settled(m) => live = m,
+                    }
+                }
+            }
+            live
+        };
+        // Cheap send: the 2600 µs encode saving is real, split wins.
+        assert_eq!(run(500), chal, "with a cheap send, split should win");
+        // Expensive send: 2400 + 3000 = 5400 against 5000 — the "twice as fast" arm is a LOSS
+        // end to end, and an encode-only comparison would have taken it.
+        assert_eq!(
+            run(3000),
+            inc,
+            "when losing sub-frame costs more than split saves, the incumbent must hold — this is \
+             the regression an encode-only arbiter would ship"
+        );
+    }
 
     /// Drive an arbiter with a fixed cost per arm and return every action it emitted.
     fn drive(incumbent_us: u64, challenger_us: u64) -> (Vec<ArbAction>, u32) {
@@ -1249,7 +1303,7 @@ mod arbiter_tests {
             M::NV_ENC_SPLIT_DISABLE_MODE as u32,
             M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
         );
-        let mut arb = SplitArbiter::new(inc, chal);
+        let mut arb = SplitArbiter::with_handicap(inc, chal, 0);
         let mut actions = Vec::new();
         // Whatever the session is currently running; the harness follows the arbiter's switches
         // so the cost it reports matches the arm actually in effect.
@@ -1323,7 +1377,7 @@ mod arbiter_tests {
             M::NV_ENC_SPLIT_DISABLE_MODE as u32,
             M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
         );
-        let mut arb = SplitArbiter::new(inc, chal);
+        let mut arb = SplitArbiter::with_handicap(inc, chal, 0);
         let mut switched_at = None;
         let mut frame = 0usize;
         let mut outcome = None;

@@ -443,6 +443,20 @@ pub trait Encoder: Send {
     /// flagged [`EncodedFrame::chunk_aligned`] and the session marks them on the wire.
     /// Default: no-op (the H.26x backends' bitstreams cannot be cut losslessly).
     fn set_wire_chunking(&mut self, _shard_payload: usize) {}
+    /// How long a whole AU's packets currently take to leave the socket (µs, smoothed) — the
+    /// host's paced-send `spread_us`.
+    ///
+    /// Exists for ONE decision, and only the host can supply it. The Linux direct-NVENC split
+    /// arbitration compares single-engine against split, but on HEVC engaging split costs
+    /// sub-frame readback, and sub-frame's whole value is that the send overlaps the encode. So
+    /// the real comparison is `encode_1eng + send_of_last_slice` against
+    /// `encode_2eng + send_of_whole_AU`, and an encoder that measures only encode time would
+    /// reliably pick split and make end-to-end latency WORSE. The backend turns this number into
+    /// that handicap (it knows its own slice count); the host just reports what it observes.
+    ///
+    /// Optional by design: a backend that ignores it simply never arbitrates the sub-frame trade,
+    /// which is the safe direction. `0` = unknown / not reported yet.
+    fn set_send_spread_us(&mut self, _us: u32) {}
     /// How many frames the CAPTURER guarantees the encoder may hold in flight before it starts
     /// reusing an input texture (`Capturer::pipeline_depth`). Backends that encode the capturer's
     /// textures IN PLACE — no `CopyResource` — must not pipeline deeper than this: the capturer
