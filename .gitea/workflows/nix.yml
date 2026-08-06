@@ -71,52 +71,86 @@ jobs:
   flake:
     runs-on: ubuntu-24.04
     container:
-      # Official Nix image (Docker Hub, like this fleet's other WAN images: oven/bun:1,
-      # fedora:43, node:22-bookworm). It ships nix and little else.
-      image: nixos/nix:latest
+      # NOT nixos/nix. That image contains nix and essentially nothing else — in particular no
+      # /bin/sleep, and Gitea's act_runner starts every job container with
+      # `entrypoint=["/bin/sleep","10800"]`. The container therefore never starts:
+      #   failed to create shim task: OCI runtime create failed: unable to start container
+      #   process: exec: "/bin/sleep": stat /bin/sleep: no such file or directory
+      # and — the part that makes this expensive to debug — every step is then reported as
+      # `cancelled` rather than failed, which reads exactly like a superseded run.
+      #
+      # node:22-bookworm instead: a full Debian with coreutils (so the entrypoint exists) and a
+      # real node (so actions/checkout works with no pre-checkout install dance), and audit.yml
+      # already pulls it on this fleet, so it is proven to resolve here. Nix is installed below.
+      image: node:22-bookworm
     timeout-minutes: 90
     env:
-      # The image defaults to stable Nix with the experimental features off; the flake needs both.
-      # Set at job level so every step — including the `nix profile install` below — sees it.
+      # The flake needs both experimental features. Also baked into the installer's --extra-conf
+      # below; this covers any step that shells out before that config is read.
       NIX_CONFIG: "experimental-features = nix-command flakes"
+      # Absolute path rather than $GITHUB_PATH: one less runner behaviour to assume.
+      NIX: /nix/var/nix/profiles/default/bin/nix
+      # `--init none` installs Nix with NO daemon running, but the installer still writes a profile
+      # script that exports NIX_REMOTE=daemon. Anything that sources it (any `-l` login shell) then
+      # dies on `cannot connect to socket at '/nix/var/nix/daemon-socket/socket'` — which is exactly
+      # how the installer's own self-test fails during this step, harmlessly, and would be a
+      # confusing first thing to read in the log. The steps below never source that profile, but pin
+      # the empty value so a future step cannot reintroduce it. Empty = talk to the local store
+      # directly, which works because the job runs as root (MEASURED: "Store URL: local, Trusted: 1",
+      # and a real `nix build` of a trivial derivation succeeds).
+      NIX_REMOTE: ""
     steps:
-      # actions/checkout is a JS action and needs node; a plain `run:` step executes through the
-      # container shell, so this must come BEFORE the checkout (same ordering, and the same
-      # reason, as flatpak.yml's fedora job).
-      - name: node + git for the JS actions
-        run: nix profile install nixpkgs#nodejs nixpkgs#git
-
       - uses: actions/checkout@v4
+
+      # The Determinate installer needs curl + xz; git so nix can read the flake from the checkout.
+      # (node:22-bookworm is the full image and already has all three — this is belt-and-braces
+      # against a future slim-image swap, and costs one cached apt call.)
+      - name: Installer prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git
+
+      # `--init none` is the container mode: no systemd, no daemon. Running as root, nix then talks
+      # to the store directly. Determinate Nix is also what the Nix box (.21) runs, so CI and the
+      # hand-verification box stay on the same distribution.
+      - name: Install Nix
+        run: |
+          curl -fsSL https://install.determinate.systems/nix -o /tmp/nix-installer.sh
+          sh /tmp/nix-installer.sh install linux --init none --no-confirm \
+            --extra-conf "experimental-features = nix-command flakes"
+          "$NIX" --version
 
       # Nix reads the flake through libgit2 and refuses a checkout owned by another uid
       # ("detected dubious ownership"), which is the normal case for a container job.
       - name: Trust the checkout
         run: git config --global --add safe.directory "$PWD"
 
-      # First-run diagnostics — cheap, and the difference between "the gate found a real problem"
-      # and "the runner had no disk" is otherwise a guess.
+      # Diagnostics. This fleet ran a runner out of disk on 2026-08-06 (the ci.yml `web` job died
+      # with "no space left on device" mid-`bun install`), and a Nix build is the heaviest thing
+      # here — so record the headroom, or a future failure is a guess.
       - name: Environment
-        run: |
-          nix --version
-          df -h /nix /tmp || true
+        run: df -h / /nix /tmp || true
 
       # Evaluates + instantiates every flake output without building any of it.
       - name: nix flake check (eval only)
-        run: nix flake check --no-build --show-trace
+        run: |
+          "$NIX" flake check --no-build --show-trace
 
       # The bun packages, built for real. This is the leg that would have caught the stale
       # web/bun.nix end to end: the derivation's offline `bun install` runs against a store cache
       # built strictly from bun.nix, so a lockfile that cache does not cover fails here.
+      # Path-filtered, so it runs only when the packaging or a lockfile actually moves. If it ever
+      # starts going red on runner disk rather than on real defects, demote it to the dispatch
+      # opt-in below rather than leaving an infra-red gate on the board.
       - name: Build the bun packages
-        run: nix build --print-build-logs .#punktfunk-web .#punktfunk-scripting
+        run: |
+          "$NIX" build --print-build-logs .#punktfunk-web .#punktfunk-scripting
 
       # Both launchers exec pkgs.bun from the store; confirm they were produced and are real entry
       # points rather than dangling wrappers.
       - name: Smoke the built launchers
         run: |
           set -eu
-          web=$(nix path-info .#punktfunk-web)
-          scripting=$(nix path-info .#punktfunk-scripting)
+          web=$("$NIX" path-info .#punktfunk-web)
+          scripting=$("$NIX" path-info .#punktfunk-scripting)
           test -x "$web/bin/punktfunk-web-server" || { echo "no punktfunk-web-server in $web" >&2; exit 1; }
           test -x "$scripting/bin/punktfunk-scripting" || { echo "no punktfunk-scripting in $scripting" >&2; exit 1; }
           # The console must be the bun bundle, not a node one — the same assertion packages.nix
@@ -129,4 +163,5 @@ jobs:
       # `github.event.inputs.*` (string) rather than `inputs.*` — the portable spelling.
       - name: Build the Rust packages (dispatch opt-in)
         if: ${{ github.event.inputs.build-rust == 'true' }}
-        run: nix build --print-build-logs .#punktfunk-host .#punktfunk-client
+        run: |
+          "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client
