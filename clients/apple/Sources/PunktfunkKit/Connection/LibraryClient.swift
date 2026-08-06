@@ -221,6 +221,10 @@ extension Artwork {
 /// Transport Security can stay ON app-wide. Every other origin keeps ordinary `URLSession` with
 /// full system trust evaluation and no client certificate, which is exactly what it should get.
 ///
+/// Posters are cached on disk (`ArtCache`), so a second visit to a library costs no network at
+/// all — and the connections behind a first visit are pooled and kept alive rather than paying a
+/// TLS handshake per tile.
+///
 /// Built once per library screen and reused across a whole grid's worth of posters.
 public final class LibraryArtLoader: @unchecked Sendable {
     private let address: String
@@ -230,6 +234,8 @@ public final class LibraryArtLoader: @unchecked Sendable {
     /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
     /// system's normal certificate validation.
     private let cdn = URLSession(configuration: .default)
+    /// nil when the caches directory is unavailable — then we simply always fetch.
+    private let cache = ArtCache.standard()
 
     public init(
         address: String,
@@ -245,6 +251,20 @@ public final class LibraryArtLoader: @unchecked Sendable {
     }
 
     public func data(for url: URL) async throws -> Data {
+        if let cache, let cached = await cache.data(for: url) { return cached }
+        let fetched = try await fetch(url)
+        if let cache { await cache.store(fetched, for: url) }
+        return fetched
+    }
+
+    /// Release this host's pooled connections — call when the library screen goes away, so we
+    /// don't sit on open TLS sockets the user is finished with.
+    public func close() async {
+        await MgmtConnectionPool.shared.closeAll(
+            matching: "\(MgmtTransport.unbracketed(address)):\(port):")
+    }
+
+    private func fetch(_ url: URL) async throws -> Data {
         guard isHostOrigin(url) else { return try await cdn.data(from: url).0 }
         var path = url.path.isEmpty ? "/" : url.path
         if let query = url.query { path += "?\(query)" }
