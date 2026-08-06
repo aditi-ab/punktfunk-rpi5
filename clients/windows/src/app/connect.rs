@@ -560,7 +560,7 @@ fn wake_and_connect(
                 None => {}
             }
             ticks += 1;
-            if ticks % 5 == 0 {
+            if ticks.is_multiple_of(5) {
                 rescan.request();
             }
             std::thread::sleep(Duration::from_secs(1));
