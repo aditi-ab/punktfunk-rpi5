@@ -592,6 +592,11 @@ pub struct NvencD3d11Encoder {
     /// sub-frame readback (the Linux backend's rule since its Phase 3; Windows joined after the
     /// 2026-07-31 on-glass A/B), so a GPU without it never has sub-frame forced by default.
     subframe_cap: bool,
+    /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
+    /// [`query_caps`](Self::query_caps). `0` = not probed / unreadable. The split-encode ceiling:
+    /// the driver accepts a split wider than the hardware and silently encodes narrower, so this
+    /// is the only honest source for how wide we may go (see `nvenc_core::max_forced_split_mode`).
+    encoder_engines: u32,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
     /// in-flight encode. The fourth field tags the first frame encoded after a successful
     /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor P-frame the
@@ -753,6 +758,7 @@ impl NvencD3d11Encoder {
             input_ring_depth: None,
             async_supported: false,
             subframe_cap: false,
+            encoder_engines: 0,
             pending: VecDeque::new(),
             frame_idx: 0,
             force_kf: false,
@@ -928,6 +934,10 @@ impl NvencD3d11Encoder {
         );
         let async_enc = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT);
         let subframe = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK);
+        // How many NVENC engines this GPU has — the split-encode ceiling. Must be probed rather
+        // than inferred from a rejection: the driver ACCEPTS a split wider than the hardware and
+        // silently encodes narrower (measured on `.21`, see `max_forced_split_mode`).
+        let engines = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES);
         let _ = (api().destroy_encoder)(enc);
 
         // Reject an over-range mode with a clear message instead of an opaque InvalidParam.
@@ -962,6 +972,7 @@ impl NvencD3d11Encoder {
         self.custom_vbv = custom_vbv != 0;
         self.async_supported = async_enc != 0;
         self.subframe_cap = subframe != 0;
+        self.encoder_engines = engines.max(0) as u32;
         tracing::info!(
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
@@ -1154,7 +1165,8 @@ impl NvencD3d11Encoder {
             // precedence (env override / the measured Main10 don't-split rule / pixel rate).
             // The init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
+            let split_mode: u32 =
+                resolve_split_mode(self.bit_depth, pixel_rate, self.encoder_engines);
             // Negotiated multi-slice (P2f): the direct-NVENC default of 4, clamped by the
             // client's ceiling — a single-slice client keeps today's shape, a
             // VIDEO_CAP_MULTI_SLICE / Moonlight slices-per-frame client gets real slices.

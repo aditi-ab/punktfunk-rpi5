@@ -81,35 +81,96 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
 /// Linux direct-SDK backends (they had drifted into byte-identical duplicates, one of which
 /// logged and one didn't). Precedence:
 /// 1. `PUNKTFUNK_SPLIT_ENCODE` = `0`/`disable` | `1`/`auto` (AUTO_FORCED) | `2` | `3` — operator
-///    override, always wins.
+///    override, always wins, except that `2`/`3` are clamped to the GPU's real engine count (see
+///    [`clamp_to_engines`]; the driver honours an over-ask and silently encodes narrower).
 /// 2. 10-bit → DISABLE: 2-way split is measurably SLOWER on Ada for Main10 — at 5120×1440@240
 ///    forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine (the split/merge
 ///    overhead dominates), and a single engine handles 5K@240 Main10 well under budget. This was
 ///    the "broken animations in HDR" cap at ~131 fps.
-/// 3. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force 2-way (AUTO never engages below
-///    ~2112 px height, so 4K120 must be forced onto the second engine).
-/// 4. Else AUTO (the ~2% BD-rate split cost isn't worth it at low pixel rates).
+/// 3. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force the WIDEST split the GPU can deliver
+///    ([`max_forced_split_mode`]), not a hard-coded 2 (AUTO never engages below ~2112 px height,
+///    so 4K120 must be forced onto the other engines; and a 3-NVENC part left at 2-way wastes a
+///    third of its encode silicon).
+/// 4. Else AUTO — ⚠ which measurably means **never split** whenever sub-frame readback is on, i.e.
+///    the whole default Linux/Windows fleet (4K: AUTO+sub-frame 4904 µs vs DISABLE+sub-frame 5062
+///    vs TWO_FORCED 3464, measured on `.21`). Kept for now because changing it is a behaviour
+///    change beyond the engine-count fix; the plan's WP1 retires this arm.
 ///
 /// The caller still owns the rejection fallback (retry split-disabled) — a codec/config that
 /// rejects the chosen mode downgrades at open, not here.
-pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64) -> u32 {
+///
+/// `engines` is the GPU's `NV_ENC_CAPS_NUM_ENCODER_ENGINES`; pass `0` when it could not be probed
+/// (treated as "unknown", which keeps the pre-probe behaviour of assuming a second engine exists
+/// and letting the open-time rejection fallback sort it out).
+pub(super) fn resolve_split_mode(bit_depth: u8, pixel_rate: u64, engines: u32) -> u32 {
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+    let hw_max = max_forced_split_mode(engines);
     let mode = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
         Some("0") | Some("disable") => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
         Some("1") | Some("auto") => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
-        Some("3") => M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
-        Some("2") => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        Some("3") => clamp_to_engines(M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32, hw_max, engines),
+        Some("2") => clamp_to_engines(M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32, hw_max, engines),
         _ if bit_depth >= 10 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
-        _ if pixel_rate >= super::SPLIT_FORCE_PIXEL_RATE => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        // Use every engine the card has, not a hard-coded two: on a 3-NVENC part (GB202, AD102
+        // workstation) forcing 2 leaves a third of the silicon idle.
+        _ if pixel_rate >= super::SPLIT_FORCE_PIXEL_RATE => hw_max,
         _ => M::NV_ENC_SPLIT_AUTO_MODE as u32,
     };
     tracing::debug!(
         split_mode = mode,
         bit_depth,
         pixel_rate,
+        engines,
         "NVENC split-encode mode selected"
     );
     mode
+}
+
+/// The strongest split mode this GPU's engine count can actually deliver.
+///
+/// ⚠ **The driver will NOT tell you when you over-ask.** Measured on `.21` (RTX 5070 Ti, 2 NVENC,
+/// driver 610.57.04, 4K HEVC): requesting `THREE_FORCED` was **HONOURED** — session opened in mode
+/// 3 — and ran at **2303 µs/frame, identical to `TWO_FORCED`'s 2308**. No rejection, no warning,
+/// no third engine; just a log line claiming 3-way over a 2-way encode. So the rejection fallback
+/// cannot be relied on to find the ceiling and the clamp has to happen here.
+///
+/// `NV_ENC_SPLIT_ENCODE_MODE` can only *name* counts up to three (SDK 0.4.0 / NVENCAPI 12.1;
+/// values 4..14 are unallocated, so a future API may extend it). Above that we fall back to
+/// `AUTO_FORCED` = "split, driver picks how many", which measurably does force a split (2.01× vs
+/// disabled on the same box) and is the only way to express "use everything you have".
+pub(super) fn max_forced_split_mode(engines: u32) -> u32 {
+    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+    match engines {
+        // Unknown (cap unreadable / not probed): keep the historical assumption of a second
+        // engine and let the open-time rejection fallback correct it.
+        0 => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        1 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+        2 => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        3 => M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+        // More engines than the enum can name — let the driver use them all.
+        _ => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
+    }
+}
+
+/// Hold an operator's `PUNKTFUNK_SPLIT_ENCODE=2|3` to what the hardware can deliver, loudly.
+/// Without this the knob silently lies (see [`max_forced_split_mode`]); an override that asks for
+/// more engines than exist is a mistake worth surfacing, not honouring.
+fn clamp_to_engines(requested: u32, hw_max: u32, engines: u32) -> u32 {
+    // Only the named N-way modes are ordered; `hw_max` may be AUTO_FORCED (1) on a >3-engine part,
+    // which is not "less than" TWO_FORCED and must not clamp a legitimate request down.
+    let named = |m: u32| (2..=3).contains(&m);
+    if engines != 0 && named(requested) && named(hw_max) && requested > hw_max {
+        tracing::warn!(
+            requested,
+            engines,
+            using = hw_max,
+            "PUNKTFUNK_SPLIT_ENCODE asks for more NVENC engines than this GPU has — clamping. \
+             (The driver would ACCEPT the over-ask and silently encode with fewer, so the log \
+             would otherwise claim a split width that never happened.)"
+        );
+        return hw_max;
+    }
+    requested
 }
 
 /// Whether the operator EXPLICITLY forced sub-frame readback on (`PUNKTFUNK_NVENC_SUBFRAME=1`)
@@ -382,7 +443,7 @@ mod tests {
         // 4090 because AUTO never engages at 2160 px height.
         let four_k_120 = 3840u64 * 2160 * 120;
         assert_eq!(
-            resolve_split_mode(8, four_k_120),
+            resolve_split_mode(8, four_k_120, 2),
             M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
         );
     }
@@ -392,7 +453,7 @@ mod tests {
         // 884.7 Mpix/s is comfortably single-engine — the threshold move must not drag it in.
         let qhd_240 = 2560u64 * 1440 * 240;
         assert_eq!(
-            resolve_split_mode(8, qhd_240),
+            resolve_split_mode(8, qhd_240, 2),
             M::NV_ENC_SPLIT_AUTO_MODE as u32
         );
     }
@@ -403,8 +464,93 @@ mod tests {
         // vs 2.8 ms single-engine at 5K240) — 10-bit precedes the pixel-rate arm.
         let five_k_240 = 5120u64 * 1440 * 240;
         assert_eq!(
-            resolve_split_mode(10, five_k_240),
+            resolve_split_mode(10, five_k_240, 2),
             M::NV_ENC_SPLIT_DISABLE_MODE as u32
+        );
+    }
+
+    /// THE ENGINE-COUNT FIX: a high-pixel-rate session must use every engine the GPU has, not a
+    /// hard-coded two. A 3-NVENC part (GB202 / AD102 workstation) left at 2-way wastes a third of
+    /// its encode silicon, and the driver never complains because it accepts an over- OR
+    /// under-wide request without comment.
+    #[test]
+    fn split_uses_every_engine_the_gpu_has() {
+        let four_k_120 = 3840u64 * 2160 * 120;
+        assert_eq!(
+            resolve_split_mode(8, four_k_120, 3),
+            M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+            "a 3-engine GPU must split three ways"
+        );
+        assert_eq!(
+            resolve_split_mode(8, four_k_120, 1),
+            M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            "a 1-engine GPU must not pretend to split — today this costs a wasted session open"
+        );
+        assert_eq!(
+            resolve_split_mode(8, four_k_120, 0),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+            "unprobed engine count keeps the historical assumption; the rejection fallback corrects"
+        );
+    }
+
+    /// `NV_ENC_SPLIT_ENCODE_MODE` cannot NAME more than three (SDK 0.4.0 / NVENCAPI 12.1), so a
+    /// hypothetical wider part falls back to AUTO_FORCED = "split, driver picks how many" — which
+    /// is measurably a real split (2.01× vs disabled on `.21`), not a no-op.
+    #[test]
+    fn split_beyond_three_engines_delegates_to_the_driver() {
+        assert_eq!(
+            max_forced_split_mode(4),
+            M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32
+        );
+        assert_eq!(
+            max_forced_split_mode(8),
+            M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32
+        );
+    }
+
+    /// An operator over-ask must be clamped, because the DRIVER WON'T: measured on `.21` (2 NVENC),
+    /// `THREE_FORCED` was honoured and ran identically to `TWO_FORCED` (2303 vs 2308 µs/frame) —
+    /// a log claiming a 3-way split over a 2-way encode. Clamping keeps the log honest.
+    #[test]
+    fn operator_override_is_clamped_to_real_engine_count() {
+        assert_eq!(
+            clamp_to_engines(
+                M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+                max_forced_split_mode(2),
+                2
+            ),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+            "asking for 3 on a 2-engine card must clamp to 2"
+        );
+        // Within budget → untouched.
+        assert_eq!(
+            clamp_to_engines(
+                M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+                max_forced_split_mode(3),
+                3
+            ),
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        );
+        // Unknown engine count must not clamp — we have nothing to clamp against.
+        assert_eq!(
+            clamp_to_engines(
+                M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+                max_forced_split_mode(0),
+                0
+            ),
+            M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32
+        );
+        // ⚠ The ordering trap: on a >3-engine part `hw_max` is AUTO_FORCED (1), which is NOT
+        // "narrower than" TWO_FORCED (2) despite comparing smaller. A naive `min` would clamp a
+        // legitimate 3-way request down to AUTO on the widest hardware we support.
+        assert_eq!(
+            clamp_to_engines(
+                M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+                max_forced_split_mode(4),
+                4
+            ),
+            M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+            "a 4-engine GPU must honour an explicit 3-way request, not collapse it to AUTO"
         );
     }
 

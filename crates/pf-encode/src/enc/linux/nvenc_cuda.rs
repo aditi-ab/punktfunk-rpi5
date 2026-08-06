@@ -821,6 +821,11 @@ pub struct NvencCudaEncoder {
     /// Sub-frame chunked poll armed for the live session (§7 LN1 Phase 1): multi-slice +
     /// sub-frame readback configured AND sync retrieve at init. See [`Encoder::poll_chunk`].
     subframe_chunks: bool,
+    /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
+    /// [`query_caps`]. `0` = not probed / unreadable. The split-encode ceiling: the driver accepts
+    /// a split wider than the hardware and silently encodes narrower, so this is the only honest
+    /// source for how wide we may go (see `nvenc_core::max_forced_split_mode`).
+    encoder_engines: u32,
     /// In-progress chunked readback of the front in-flight AU. See [`ChunkState`].
     chunk: Option<ChunkState>,
 }
@@ -909,6 +914,7 @@ impl NvencCudaEncoder {
             subframe_on: false,
             subframe_forced: false,
             subframe_chunks: false,
+            encoder_engines: 0,
             chunk: None,
         })
     }
@@ -1081,6 +1087,10 @@ impl NvencCudaEncoder {
         // consumed when slice-level readback lands. Not stored — LN1 re-probes when it configures.
         let subframe = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK);
         let dyn_slice = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_DYNAMIC_SLICE_MODE);
+        // How many NVENC engines this GPU has — the split-encode ceiling. Must be probed rather
+        // than inferred from a rejection: the driver ACCEPTS a split wider than the hardware and
+        // silently encodes narrower (measured on `.21`, see `max_forced_split_mode`).
+        let engines = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES);
         let _ = (api().destroy_encoder)(enc);
 
         if wmax > 0 && hmax > 0 && (self.width as i32 > wmax || self.height as i32 > hmax) {
@@ -1100,6 +1110,7 @@ impl NvencCudaEncoder {
         self.rfi_supported = rfi != 0;
         self.custom_vbv = custom_vbv != 0;
         self.subframe_cap = subframe != 0;
+        self.encoder_engines = engines.max(0) as u32;
         // Phase-3 default-on (nvenc-subframe-slice-output.md): 4 slices + sub-frame readback on
         // every Linux direct-NVENC session, resolved HERE (before the session opens) so the
         // config author, the init params and the chunked-poll latch all agree; the caps probe
@@ -1334,7 +1345,8 @@ impl NvencCudaEncoder {
             // 2-way NVENC split-frame encoding (Ada dual-NVENC) — shared selector, see
             // [`resolve_split_mode`] for the precedence (env override / 10-bit / pixel rate).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
+            let split_mode: u32 =
+                resolve_split_mode(self.bit_depth, pixel_rate, self.encoder_engines);
             // Split × sub-frame arbitration (Phase 8) BEFORE the ladder, the ceiling key and the
             // chunked-poll latch — all three must see the post-arbitration truth (a drop inside
             // build_init_params would leave poll_chunk busy-polling its whole budget per AU).
@@ -1639,6 +1651,12 @@ impl NvencCudaEncoder {
                 // INFO+, and "did 4K120 actually split across engines?" was undiagnosable from
                 // a user log without it (Windows only had a debug! at selection time).
                 split_mode = self.split_mode,
+                // …and how many engines the GPU HAS, so `split_mode` can be read against the
+                // ceiling it was chosen from. Without it a log showing split_mode=2 is ambiguous
+                // between "used both engines" and "left a third engine idle", and the driver
+                // silently honours an over-wide request, so the mode alone cannot be trusted.
+                engines = self.encoder_engines,
+                subframe = self.subframe_on,
                 "NVENC CUDA session ready"
             );
             Ok(())
@@ -2498,6 +2516,12 @@ mod tests {
         assert_eq!(slot_fmt_of(F::NV_ENC_BUFFER_FORMAT_ARGB), SlotFormat::Argb);
     }
 
+    /// The `encoder_engines` field `query_caps` latched — read through a helper so the intent
+    /// ("what the resolver will actually see") is explicit at the call site.
+    fn self_engines(enc: &NvencCudaEncoder) -> u32 {
+        enc.encoder_engines
+    }
+
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Content is uninitialized device memory — NVENC encodes it fine; this smoke test asserts the
         // session/registration/encode/RFI machinery, not picture fidelity (that's the on-glass A/B).
@@ -3006,7 +3030,20 @@ mod tests {
                 nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES,
             )
         };
-        println!("S1: NV_ENC_CAPS_NUM_ENCODER_ENGINES = {engines}");
+        println!(
+            "S1: NV_ENC_CAPS_NUM_ENCODER_ENGINES = {engines} (query_caps latched \
+             encoder_engines={})",
+            self_engines(&enc)
+        );
+        // The cap is only useful if `query_caps` actually stored it — that latched field is what
+        // `resolve_split_mode` reads to pick the split width, so a silent 0 there would quietly
+        // fall back to "assume two engines" on every GPU.
+        assert_eq!(
+            self_engines(&enc),
+            engines.max(0) as u32,
+            "query_caps must latch NUM_ENCODER_ENGINES — resolve_split_mode reads that field, \
+             not the live cap"
+        );
         assert!(
             engines >= 2,
             "this GPU reports {engines} NVENC engine(s) — S1 is not interpretable here, run it on \
@@ -3080,6 +3117,12 @@ mod tests {
         const BPS: u64 = 400_000_000;
         const WARMUP: u32 = 8;
         const MEASURED: u32 = 24;
+        /// Frames to discard AFTER an in-place switch before measuring. Split-encode does not
+        /// reach steady state on the first frame — even a FRESH `TWO_FORCED` session shows it
+        /// (early-half 3280 µs vs late-half 1996 in one run) — and without this the switched leg
+        /// lands midway between the two arms and the verdict flips run to run. Measured: at 16
+        /// the switched leg reaches the fresh-split steady state; at 0 it did so only sometimes.
+        const SETTLE: u32 = 16;
         let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
 
         std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
@@ -3094,8 +3137,8 @@ mod tests {
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
 
-        // Returns (p50 encode µs, median bytes/AU).
-        let run_leg = |open_split: &str, switch_to: Option<u32>| -> (u128, usize) {
+        // Returns (early-half p50 µs, late-half p50 µs, median bytes/AU).
+        let run_leg = |open_split: &str, switch_to: Option<u32>| -> (u128, u128, usize) {
             std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", open_split);
             let mut enc = NvencCudaEncoder::open(
                 Codec::H265,
@@ -3112,8 +3155,15 @@ mod tests {
             )
             .expect("open NVENC CUDA session");
 
+            // Every leg is measured over the SAME number of frames; a switched leg just starts its
+            // window `SETTLE` frames later, so the arms stay comparable.
+            let measure_from = if switch_to.is_some() {
+                WARMUP + SETTLE
+            } else {
+                WARMUP
+            };
             let (mut times, mut sizes) = (Vec::new(), Vec::new());
-            for i in 0..(WARMUP + MEASURED) {
+            for i in 0..(measure_from + MEASURED) {
                 // Flip to the target mode exactly once, after warmup, in place.
                 if i == WARMUP {
                     if let Some(target) = switch_to {
@@ -3133,25 +3183,43 @@ mod tests {
                     got = au.data.len();
                 }
                 let dt = t0.elapsed().as_micros();
-                if i >= WARMUP {
+                if i >= measure_from {
                     times.push(dt);
                     sizes.push(got);
                 }
             }
             enc.flush().ok();
-            times.sort_unstable();
+            // Split the window in half. A single median over the whole post-switch run is
+            // ACTIVELY MISLEADING here: leg C's median landed midway between the two arms and the
+            // nearest-neighbour verdict flipped run to run. Early-vs-late says whether the switch
+            // SETTLES — which a median cannot.
+            let half = times.len() / 2;
+            let med = |s: &[u128]| {
+                let mut v = s.to_vec();
+                v.sort_unstable();
+                v[v.len() / 2]
+            };
+            let (early, late) = (med(&times[..half]), med(&times[half..]));
             sizes.sort_unstable();
-            (times[times.len() / 2], sizes[sizes.len() / 2])
+            (early, late, sizes[sizes.len() / 2])
         };
 
-        let (a_us, a_bytes) = run_leg("0", None);
-        let (b_us, b_bytes) = run_leg("2", None);
-        let (c_us, c_bytes) = run_leg("0", Some(two));
+        let (a_early, a_late, a_bytes) = run_leg("0", None);
+        let (b_early, b_late, b_bytes) = run_leg("2", None);
+        let (c_early, c_late, c_bytes) = run_leg("0", Some(two));
+        let (a_us, b_us, c_us) = (a_late, b_late, c_late);
 
         println!("S1b @ {W}x{H}@60 HEVC 8-bit, {} Mbps CBR:", BPS / 1_000_000);
-        println!("  A fresh DISABLE      : {a_us:>6} us/frame, {a_bytes:>8} B/AU");
-        println!("  B fresh TWO_FORCED   : {b_us:>6} us/frame, {b_bytes:>8} B/AU");
-        println!("  C DISABLE→TWO in situ: {c_us:>6} us/frame, {c_bytes:>8} B/AU");
+        println!("  (early = first half of the measured window, late = second half)");
+        println!("  A fresh DISABLE      : early {a_early:>6} late {a_late:>6} us/frame, {a_bytes:>8} B/AU");
+        println!("  B fresh TWO_FORCED   : early {b_early:>6} late {b_late:>6} us/frame, {b_bytes:>8} B/AU");
+        println!("  C DISABLE→TWO in situ: early {c_early:>6} late {c_late:>6} us/frame, {c_bytes:>8} B/AU");
+        if c_early > c_late + c_late / 8 {
+            println!(
+                "  ⇒ leg C SETTLES ({c_early} → {c_late} us): the in-place switch is not \
+                 instantaneous, so a whole-window median understates it."
+            );
+        }
 
         let want_bytes = (BPS / 60 / 8) as usize;
         if a_bytes * 4 < want_bytes {
@@ -3410,6 +3478,117 @@ mod tests {
             } else {
                 "REFUTED: AUTO does engage the second engine even with sub-frame on"
             }
+        );
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
+    /// ON-HARDWARE — **what is the real split ceiling on this GPU?** Feeds WP1.1: we want to use
+    /// every engine the card has, not a hard-coded 2.
+    ///
+    /// `NV_ENC_SPLIT_ENCODE_MODE` tops out at `THREE_FORCED` in SDK 0.4.0 / NVENCAPI 12.1 (values
+    /// 4..14 are unallocated, so a future API could add more), and `AUTO_FORCED` means "split, you
+    /// pick how many" — the only way to name a count we have no enum for.
+    ///
+    /// For each candidate this reports what the session ACTUALLY opened with, which is the honest
+    /// signal: the backend's rejection fallback silently retries split-disabled, so a mode the
+    /// driver refuses shows up as `split_mode == DISABLE` afterwards rather than as an error. And
+    /// the timing says whether an ACCEPTED mode did anything — a card that takes `THREE_FORCED`
+    /// but only has two engines would otherwise look like a win. Run ALONE:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_split_hardware_max --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_split_hardware_max() {
+        use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+        use std::time::Instant;
+        const W: u32 = 3840;
+        const H: u32 = 2160;
+        const BPS: u64 = 400_000_000;
+        const WARMUP: u32 = 8;
+        const MEASURED: u32 = 24;
+
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
+
+        // → (requested mode, mode actually opened, p50 µs, engines the driver reports)
+        let run = |split: &str| -> (u32, u128, i32) {
+            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                PixelFormat::Nv12,
+                W,
+                H,
+                60,
+                BPS,
+                true,
+                8,
+                ChromaFormat::Yuv420,
+                false,
+                4,
+            )
+            .expect("open NVENC CUDA session");
+            let mut times = Vec::new();
+            for i in 0..(WARMUP + MEASURED) {
+                let t0 = Instant::now();
+                enc.submit_indexed(&frames[(i % 4) as usize], i)
+                    .expect("submit");
+                while enc.poll().expect("poll").is_some() {}
+                if i >= WARMUP {
+                    times.push(t0.elapsed().as_micros());
+                }
+            }
+            // SAFETY: the session is live (frames encoded above); `get_cap` only reads a cap and
+            // returns 0 on any driver error.
+            let engines = unsafe {
+                enc.get_cap(
+                    enc.encoder,
+                    nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES,
+                )
+            };
+            let opened = enc.split_mode;
+            enc.flush().ok();
+            times.sort_unstable();
+            (opened, times[times.len() / 2], engines)
+        };
+
+        println!("split ceiling probe @ {W}x{H}@60 HEVC 8-bit:");
+        let mut baseline = None;
+        // The env value is NOT the enum value for DISABLE (`0` selects `NV_ENC_SPLIT_DISABLE_MODE`,
+        // which is 15), so compare against the enum each arm actually asks for.
+        for (label, env, want) in [
+            ("DISABLE     ", "0", M::NV_ENC_SPLIT_DISABLE_MODE as u32),
+            ("AUTO_FORCED ", "1", M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32),
+            ("TWO_FORCED  ", "2", M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32),
+            (
+                "THREE_FORCED",
+                "3",
+                M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+            ),
+        ] {
+            let (opened, us, engines) = run(env);
+            let honoured = opened == want;
+            let vs = match baseline {
+                None => {
+                    baseline = Some(us);
+                    String::new()
+                }
+                Some(b) => format!("  ({:.2}× vs DISABLE)", b as f64 / us as f64),
+            };
+            println!(
+                "  req {label} → opened_mode={opened:<2} {} {us:>6} us/frame{vs}  [engines={engines}]",
+                if honoured {
+                    "HONOURED"
+                } else {
+                    "FELL BACK"
+                }
+            );
+        }
+        println!(
+            "  note: opened_mode 15 = DISABLE (the backend's rejection fallback); a mode that is \
+             HONOURED but no faster than DISABLE was accepted and did nothing."
         );
 
         std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
