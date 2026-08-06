@@ -11,7 +11,7 @@
 
 use crate::anim::Progress;
 use crate::glyphs::GlyphStyle;
-use crate::library::{mesh_sksl, LibraryShared};
+use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
 use anyhow::{anyhow, Result};
@@ -81,7 +81,17 @@ pub(crate) struct Shell {
     wake_optimistic: bool,
     toast: Option<Toast>,
     mesh: RuntimeEffect,
-    /// 0 = aurora, 1 = form — chased, so backdrops crossfade with the transition.
+    /// The `ui_palette` the compiled `mesh` bakes. The settings screen can change the palette
+    /// mid-frame-loop, so [`Self::sync`] recompiles when this falls out of step — the backdrop
+    /// re-colours under the cursor as the row is stepped, which is the whole point of putting
+    /// the picker on a screen the backdrop is behind.
+    mesh_palette: String,
+    /// The palette's corner colour × 0.4 — the calm lift, precomputed with `mesh`. Chosen so
+    /// `col*0.6 + lift` leaves a corner EXACTLY where it was and pulls the bright pools down
+    /// to it: the form screens lose the launcher's contrast, not its colour.
+    mesh_lift: [f32; 3],
+    /// 0 = launcher aurora, 1 = the calm form field — chased, so the backdrop settles into
+    /// (or out of) calm alongside the screen transition.
     bg_mix: f64,
     glyphs: GlyphStyle,
     chip: Option<String>,
@@ -99,8 +109,8 @@ impl Shell {
         stack: Vec<Screen>,
     ) -> Result<Shell> {
         anyhow::ensure!(!stack.is_empty(), "the console needs a root screen");
-        let mesh = RuntimeEffect::make_for_shader(mesh_sksl(), None)
-            .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+        let settings = trust::Settings::load();
+        let (mesh, mesh_lift) = build_mesh(&settings.ui_palette)?;
         let bg_mix = match stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -112,7 +122,8 @@ impl Shell {
             library,
             bus,
             actions: VecDeque::new(),
-            settings: trust::Settings::load(),
+            mesh_palette: settings.ui_palette.clone(),
+            settings,
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
@@ -123,6 +134,7 @@ impl Shell {
             wake_optimistic: false,
             toast: None,
             mesh,
+            mesh_lift,
             bg_mix,
             glyphs: GlyphStyle::Keyboard,
             chip: None,
@@ -188,6 +200,26 @@ impl Shell {
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
 
     fn sync(&mut self) {
+        // The settings screen writes `ui_palette` straight into `self.settings`; recompiling
+        // here is what makes the backdrop re-colour live under the row being stepped. A
+        // rejected compile keeps the palette that IS drawing — the field never goes black
+        // because someone picked a colour.
+        if self.settings.ui_palette != self.mesh_palette {
+            match build_mesh(&self.settings.ui_palette) {
+                Ok((mesh, lift)) => {
+                    self.mesh = mesh;
+                    self.mesh_lift = lift;
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "console: {} palette rejected: {e}",
+                        self.settings.ui_palette
+                    );
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+            }
+        }
         if self.console.hosts_gen() != self.hosts_gen {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
         }
@@ -432,12 +464,25 @@ impl Shell {
         }
     }
 
-    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64) {
-        let uniforms: [f32; 3] = [w as f32, h as f32, t as f32];
-        // SAFETY: `uniforms` is a local `[f32; 3]` — exactly 12 bytes — and `f32` has no padding or
+    /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
+    /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
+    /// former aurora-over-static-form crossfade is now a single uniform.
+    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4).
+        let uniforms: [f32; 8] = [
+            w as f32,
+            h as f32,
+            t as f32,
+            calm as f32,
+            self.mesh_lift[0],
+            self.mesh_lift[1],
+            self.mesh_lift[2],
+            0.0,
+        ];
+        // SAFETY: `uniforms` is a local `[f32; 8]` — exactly 32 bytes — and `f32` has no padding or
         // invalid bit patterns, so reading it as bytes is sound; the slice is copied by
         // `Data::new_copy` before `uniforms` goes out of scope.
-        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 12) };
+        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 32) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
                 let mut paint = Paint::default();
@@ -449,6 +494,31 @@ impl Shell {
             }
         }
     }
+}
+
+/// Compile the mesh shader for a palette, returning it with its precomputed calm lift.
+/// `uniform_size` is checked rather than assumed: the byte buffer [`Shell::draw_aurora`]
+/// hands Skia is hand-packed, and a silent layout change would feed the field garbage
+/// instead of failing.
+fn build_mesh(palette_id: &str) -> Result<(RuntimeEffect, [f32; 3])> {
+    let p = palette(palette_id);
+    let colors = p.mesh_colors();
+    let effect = RuntimeEffect::make_for_shader(mesh_sksl(&colors), None)
+        .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+    anyhow::ensure!(
+        effect.uniform_size() == 32,
+        "mesh uniform block is {} bytes, expected 32 (u_res, u_tc, u_lift)",
+        effect.uniform_size()
+    );
+    let corner = colors[0];
+    Ok((
+        effect,
+        [
+            (corner.0 * 0.4) as f32,
+            (corner.1 * 0.4) as f32,
+            (corner.2 * 0.4) as f32,
+        ],
+    ))
 }
 
 #[cfg(test)]

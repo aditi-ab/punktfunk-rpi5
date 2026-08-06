@@ -152,8 +152,9 @@ fun GamepadNavEffect(
  * keyboard). Same hysteresis + hold-to-repeat as [GamepadNavEffect] but on both axes — the dominant
  * stick axis (or the pressed D-pad/HAT) commits a [NavDir], and it re-arms only after the stick
  * returns near centre (so a flick is one step). [onActivate] is A / center, [onTertiary] is X,
- * [onSecondary] is Y. B is left to MainActivity's BACK remap → the screen's BackHandler (so B "peels
- * one layer": close the keyboard, then the screen).
+ * [onSecondary] is Y, and [onShoulder] is L1 (-1) / R1 (+1) — a step SIDEWAYS out of the list, which
+ * the settings screen uses for its section tabs. B is left to MainActivity's BACK remap → the
+ * screen's BackHandler (so B "peels one layer": close the keyboard, then the screen).
  */
 @Composable
 fun GamepadNavEffect2D(
@@ -162,6 +163,7 @@ fun GamepadNavEffect2D(
     onActivate: () -> Unit,
     onTertiary: () -> Unit = {},
     onSecondary: () -> Unit = {},
+    onShoulder: (Int) -> Unit = {},
 ) {
     val activity = LocalContext.current as? MainActivity ?: return
     val state = remember { NavInputState() }
@@ -169,6 +171,7 @@ fun GamepadNavEffect2D(
     val currentOnActivate by rememberUpdatedState(onActivate)
     val currentOnTertiary by rememberUpdatedState(onTertiary)
     val currentOnSecondary by rememberUpdatedState(onSecondary)
+    val currentOnShoulder by rememberUpdatedState(onShoulder)
 
     DisposableEffect(active) {
         // Stable probe refs so onDispose only releases the slot if WE still own it — during a
@@ -196,7 +199,10 @@ fun GamepadNavEffect2D(
                 KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (edge) currentOnActivate(); true }
                 KeyEvent.KEYCODE_BUTTON_X -> { if (edge) currentOnTertiary(); true }
                 KeyEvent.KEYCODE_BUTTON_Y -> { if (edge) currentOnSecondary(); true }
-                else -> false // B / shoulders → MainActivity (B remaps to BACK → BackHandler)
+                // Edge-only, no auto-repeat: a held shoulder shouldn't spin through the tabs.
+                KeyEvent.KEYCODE_BUTTON_L1 -> { if (edge) currentOnShoulder(-1); true }
+                KeyEvent.KEYCODE_BUTTON_R1 -> { if (edge) currentOnShoulder(1); true }
+                else -> false // B → MainActivity (remapped to BACK → BackHandler)
             }
         }
         if (active) {

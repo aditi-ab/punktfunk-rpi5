@@ -107,6 +107,9 @@ class ScreenshotTest {
     fun connectingConsole() = shootRoot("connecting-console") { ConnectConsoleScene() }
 
     @Test
+    fun consoleSettings() = shootRoot("console-settings") { ConsoleSettingsScene() }
+
+    @Test
     fun trust() = shootScreen("trust") {
         HostsScene()
         TrustDialog()

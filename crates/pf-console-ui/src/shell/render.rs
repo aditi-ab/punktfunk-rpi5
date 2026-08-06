@@ -8,7 +8,7 @@ use crate::screens::{Bg, Ctx, Screen};
 use crate::theme::{white, Fonts, PanelStroke, W, WHITE};
 use pf_client_core::gamepad::PadInfo;
 use pf_client_core::trust;
-use skia_safe::{Canvas, Color4f, Rect};
+use skia_safe::{Canvas, Rect};
 use std::time::Instant;
 
 use super::{Motion, Shell, BOTTOM_BAND, TOP_BAND};
@@ -67,7 +67,9 @@ impl Shell {
             }
         };
 
-        // Backdrop crossfade follows the top screen.
+        // The backdrop settles into (or out of) calm with the screen transition. It is the
+        // SAME living field either way — a form screen quiets it, it doesn't replace it —
+        // so this is one shader pass with a chased uniform, not two stacked backdrops.
         let bg_target = match self.stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -76,16 +78,7 @@ impl Shell {
         if (self.bg_mix - bg_target).abs() < 0.005 {
             self.bg_mix = bg_target;
         }
-        if self.bg_mix < 1.0 {
-            self.draw_aurora(canvas, w, h, t);
-        } else {
-            canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
-        }
-        if self.bg_mix > 0.0 {
-            canvas.save_layer_alpha_f(None, self.bg_mix as f32);
-            crate::theme::draw_form_background(canvas, w, h);
-            canvas.restore();
-        }
+        self.draw_aurora(canvas, w, h, t, self.bg_mix);
 
         // The screens, through the transition choreography.
         let content = Rect::from_ltrb(

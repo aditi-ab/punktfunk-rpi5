@@ -122,12 +122,21 @@ struct GamepadHintBar: View {
     }
 }
 
-/// The console backdrop: a living aurora in the brand's violet family, drifting slowly over black
-/// so it reads as ambience behind the cards, never as content. On iOS 18 / macOS 15+ it's an
-/// animated `MeshGradient` — a continuous silk of colour whose control points wander on slow,
-/// out-of-phase sinusoids — finished with an elliptical vignette (pools light in the centre, sinks
-/// the corners) and a top/bottom legibility scrim. Older OSes fall back to the original drifting
-/// radial-blob field, unchanged, so nothing regresses.
+/// The console backdrop: a living aurora drifting slowly over black so it reads as ambience behind
+/// the cards, never as content. On iOS 18 / macOS 15+ it's an animated `MeshGradient` — a continuous
+/// silk of colour whose control points wander on slow, out-of-phase sinusoids — finished with an
+/// elliptical vignette (pools light in the centre, sinks the corners) and a top/bottom legibility
+/// scrim. Older OSes fall back to the original drifting radial-blob field, unchanged, so nothing
+/// regresses.
+///
+/// `calm` is what the FORM screens (settings, add-host) wear: the same living field with its pools
+/// dimmed onto its own corner colour, so those screens keep real colour under their Liquid Glass
+/// rows without the launcher's contrast. They used to sit on a still gradient; nothing in the
+/// gamepad UI is backed by a static image now. Motion is identical in both modes on purpose — only
+/// the contrast differs, so a screen change can't make the field jump.
+///
+/// `GamepadPalette` recolours the whole thing (the shared `ui_palette` setting) by transforming the
+/// COLOURS, not by stacking a filter — see GamepadPalette.swift for why.
 ///
 /// Deliberately pure SwiftUI, no `.metal`: these sources build under both SwiftPM (`swift run`/
 /// tests) and the Xcode project's synchronized folders, and a compiled metallib is only reliably
@@ -136,35 +145,52 @@ struct GamepadHintBar: View {
 /// can't inflate the caller's layout past the safe area (see the layout note in GamepadHomeView's
 /// header). Honors Reduce Motion by freezing the field at a fixed phase.
 struct GamepadScreenBackground: View {
+    /// Quiet the field for a form screen (see the type comment).
+    var calm = false
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
 
     var body: some View {
+        let palette = GamepadPalette.named(paletteID)
         Group {
             if reduceMotion {
-                composite(at: 0)
+                composite(at: 0, palette: palette)
             } else {
                 // 30 Hz is plenty for a field that drifts centimetres per minute, and halves the
                 // redraw cost of a battery-fed couch device vs. the display's native rate.
                 TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
-                    composite(at: context.date.timeIntervalSinceReferenceDate)
+                    composite(at: context.date.timeIntervalSinceReferenceDate, palette: palette)
                 }
             }
         }
         .ignoresSafeArea()
     }
 
-    /// The colour field under a very slow warm/cool hue sway, an elliptical vignette, and the
-    /// title/hints legibility scrim.
-    private func composite(at t: TimeInterval) -> some View {
+    /// The colour field under a very slow warm/cool hue sway, the calm flattening, an elliptical
+    /// vignette, and the title/hints legibility scrim — in that order, matching the console
+    /// shader's `composite` so the two platforms' backdrops stay the same picture.
+    private func composite(at t: TimeInterval, palette: GamepadPalette) -> some View {
         ZStack {
             Color.black
-            colorField(at: t)
+            colorField(at: t, palette: palette)
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
+                // Calm = col·0.6 + corner·0.4: over black, `.opacity` IS the multiply…
+                .opacity(calm ? 0.6 : 1)
+            if calm {
+                // …and a plusLighter wash of the palette's own corner colour IS the add. Chosen so
+                // a corner lands exactly where it was and the bright pools come down to meet it.
+                Self.color(palette.tint(Self.cornerRGB))
+                    .opacity(0.4)
+                    .blendMode(.plusLighter)
+            }
             // Cinematic vignette: darker toward the edges so the cards sit in the pooled light.
             // Soft (extends past the frame) so the corners deepen rather than crush to black.
+            // Halved under calm: a launcher's cards sit in the pooled centre, but a form screen's
+            // rows run out toward the edges, where crushing to black just eats them.
             EllipticalGradient(
-                colors: [.clear, .black.opacity(0.42)],
+                colors: [.clear, .black.opacity(calm ? 0.21 : 0.42)],
                 center: .center, startRadiusFraction: 0.25, endRadiusFraction: 1.15)
             // Legibility grounding for the pinned title (top) and hint pill (bottom). This one
             // darkens the aurora itself (it's the backdrop's bottom layer — nothing behind it to
@@ -180,33 +206,45 @@ struct GamepadScreenBackground: View {
         }
     }
 
-    @ViewBuilder private func colorField(at t: TimeInterval) -> some View {
+    @ViewBuilder private func colorField(at t: TimeInterval, palette: GamepadPalette) -> some View {
         if #available(iOS 18, macOS 15, tvOS 18, *) {
             MeshGradient(
                 width: 4, height: 4,
                 points: Self.meshPoints(at: t),
-                colors: Self.meshColors,
+                colors: Self.meshColors(palette),
                 smoothsColors: true)
         } else {
-            LegacyBlobField(t: t)
+            LegacyBlobField(t: t, palette: palette)
         }
     }
 
     // MARK: - MeshGradient aurora (iOS 18 / macOS 15+)
 
+    static func color(_ c: SIMD3<Double>) -> Color {
+        Color(red: c.x, green: c.y, blue: c.z)
+    }
+
+    /// The corner colour — the four pinned corners AND the calm lift's base.
+    static let cornerRGB = SIMD3(0.075, 0.060, 0.160)
+
     /// Sixteen mesh colours (row-major, 4×4): dark-violet corners sink the frame, the edges carry
     /// mid-tone violets, and the four interior points hold the bright brand family — a violet and a
     /// blue-violet up top, a magenta-violet and a violet below — so warm pools on the left, cool on
-    /// the right, and the silk shifts temperature as those interior points drift.
-    private static let meshColors: [Color] = {
-        let corner = Color(red: 0.075, green: 0.060, blue: 0.160)
-        return [
-            corner, Color(red: 0.34, green: 0.27, blue: 0.72), Color(red: 0.30, green: 0.26, blue: 0.74), corner,
-            Color(red: 0.42, green: 0.20, blue: 0.54), Color(red: 0.49, green: 0.39, blue: 0.95), Color(red: 0.28, green: 0.31, blue: 0.84), Color(red: 0.16, green: 0.26, blue: 0.64),
-            Color(red: 0.45, green: 0.23, blue: 0.60), Color(red: 0.53, green: 0.31, blue: 0.75), Color(red: 0.35, green: 0.35, blue: 0.91), Color(red: 0.19, green: 0.28, blue: 0.70),
-            corner, Color(red: 0.22, green: 0.18, blue: 0.54), Color(red: 0.24, green: 0.20, blue: 0.58), corner,
-        ]
-    }()
+    /// the right, and the silk shifts temperature as those interior points drift. A palette rotates
+    /// the whole grid; `violet` is the identity, so this array IS what the default draws.
+    private static let baseMeshRGB: [SIMD3<Double>] = [
+        cornerRGB, SIMD3(0.34, 0.27, 0.72), SIMD3(0.30, 0.26, 0.74), cornerRGB,
+        SIMD3(0.42, 0.20, 0.54), SIMD3(0.49, 0.39, 0.95), SIMD3(0.28, 0.31, 0.84), SIMD3(0.16, 0.26, 0.64),
+        SIMD3(0.45, 0.23, 0.60), SIMD3(0.53, 0.31, 0.75), SIMD3(0.35, 0.35, 0.91), SIMD3(0.19, 0.28, 0.70),
+        cornerRGB, SIMD3(0.22, 0.18, 0.54), SIMD3(0.24, 0.20, 0.58), cornerRGB,
+    ]
+
+    /// `baseMeshRGB` under a palette. Recomputed per frame rather than cached — sixteen `tint`
+    /// calls at 30 Hz costs nothing next to rasterising the mesh, and the obvious cache would be
+    /// mutable global state on a type SwiftUI is free to evaluate off the main actor.
+    private static func meshColors(_ palette: GamepadPalette) -> [Color] {
+        baseMeshRGB.map { color(palette.tint($0)) }
+    }
 
     /// The 4×4 control points at time `t`: every boundary point is PINNED to the frame (so the mesh
     /// always fills edge-to-edge — a drifting edge point would shrink the mesh and expose the black
@@ -233,15 +271,18 @@ struct GamepadScreenBackground: View {
 }
 
 /// Pre-18/15 fallback for `GamepadScreenBackground`: the original drifting radial-blob field — four
-/// soft colour blobs on slow Lissajous paths, additively blended. Kept verbatim so older OSes see
-/// exactly the aurora they shipped with (the mesh path is the upgrade for OS 18/15+).
+/// soft colour blobs on slow Lissajous paths, additively blended. Geometry and motion are verbatim
+/// so older OSes see exactly the aurora they shipped with (the mesh path is the upgrade for OS
+/// 18/15+); only the blob COLOURS now pass through the palette, so an older device honours the
+/// setting too instead of being stuck on violet.
 private struct LegacyBlobField: View {
     let t: TimeInterval
+    let palette: GamepadPalette
 
     /// One drifting color blob: a base position + drift ellipse (unit coordinates), angular speeds
     /// (rad/s — periods of 30–90 s), and a radius that slowly breathes.
     private struct Blob {
-        let color: Color
+        let rgb: SIMD3<Double>
         let center: CGPoint
         let drift: CGSize
         let speed: (x: Double, y: Double)
@@ -252,19 +293,19 @@ private struct LegacyBlobField: View {
     }
 
     private static let blobs: [Blob] = [
-        Blob(color: Color(red: 0.53, green: 0.47, blue: 0.96), // brand violet
+        Blob(rgb: SIMD3(0.53, 0.47, 0.96), // brand violet
              center: CGPoint(x: 0.30, y: 0.24), drift: CGSize(width: 0.16, height: 0.10),
              speed: (0.111, 0.083), phase: (0.0, 1.9),
              radius: 0.52, breathe: (0.07, 0.061), opacity: 0.52),
-        Blob(color: Color(red: 0.24, green: 0.20, blue: 0.72), // deep indigo
+        Blob(rgb: SIMD3(0.24, 0.20, 0.72), // deep indigo
              center: CGPoint(x: 0.78, y: 0.66), drift: CGSize(width: 0.13, height: 0.14),
              speed: (0.071, 0.096), phase: (2.4, 0.7),
              radius: 0.58, breathe: (0.08, 0.049), opacity: 0.55),
-        Blob(color: Color(red: 0.62, green: 0.30, blue: 0.80), // plum
+        Blob(rgb: SIMD3(0.62, 0.30, 0.80), // plum
              center: CGPoint(x: 0.16, y: 0.82), drift: CGSize(width: 0.12, height: 0.09),
              speed: (0.089, 0.067), phase: (4.1, 3.2),
              radius: 0.44, breathe: (0.09, 0.078), opacity: 0.42),
-        Blob(color: Color(red: 0.22, green: 0.38, blue: 0.86), // cool blue
+        Blob(rgb: SIMD3(0.22, 0.38, 0.86), // cool blue
              center: CGPoint(x: 0.70, y: 0.12), drift: CGSize(width: 0.10, height: 0.08),
              speed: (0.059, 0.104), phase: (1.2, 5.0),
              radius: 0.40, breathe: (0.06, 0.055), opacity: 0.38),
@@ -287,9 +328,10 @@ private struct LegacyBlobField: View {
         let y = blob.center.y + blob.drift.height * CGFloat(cos(t * blob.speed.y + blob.phase.y))
         let r = side * blob.radius
             * (1 + blob.breathe.amount * CGFloat(sin(t * blob.breathe.speed + blob.phase.x)))
+        let color = GamepadScreenBackground.color(palette.tint(blob.rgb))
         return Circle()
             .fill(RadialGradient(
-                colors: [blob.color, blob.color.opacity(0)],
+                colors: [color, color.opacity(0)],
                 center: .center, startRadius: 0, endRadius: r / 2))
             .frame(width: r, height: r)
             .position(x: x * size.width, y: y * size.height)
@@ -330,27 +372,16 @@ struct GamepadTrayScrim: View {
     }
 }
 
-/// The calm backdrop for the gamepad UI's form screens (settings, add-host) — NOT the launcher's
-/// drifting aurora (this stays still and quiet), but deliberately NOT near-black either: Liquid
-/// Glass refracts whatever sits behind it, so over black the rows turn invisible. A deep indigo
-/// base plus two soft, static violet/indigo glows give the glass real colour and luminance to lens,
-/// so the rows read as glass while the screen stays restful.
+/// The backdrop for the gamepad UI's form screens (settings, add-host). It used to be a STILL pair
+/// of glows over a deep indigo base — deliberately not near-black, because Liquid Glass refracts
+/// whatever sits behind it and over black the rows turn invisible. It is now the launcher's own
+/// living field at `calm`, which keeps that luminance under the glass, keeps the palette setting
+/// honoured on every screen rather than only the launcher, and leaves nothing in the gamepad UI
+/// backed by a static image. Kept as its own type because that is what the form screens ask for by
+/// name; the console (`pf-console-ui`) made the same substitution behind its `Bg::Form`.
 struct GamepadFormBackground: View {
     var body: some View {
-        ZStack {
-            Color(red: 0.075, green: 0.062, blue: 0.150)
-            // Violet lift top-leading, cooler indigo bottom-trailing — resolution-independent
-            // (fraction radii) so the glow scale tracks the window on any screen.
-            EllipticalGradient(
-                colors: [Color(red: 0.40, green: 0.31, blue: 0.68).opacity(0.9), .clear],
-                center: UnitPoint(x: 0.26, y: 0.14),
-                startRadiusFraction: 0, endRadiusFraction: 0.78)
-            EllipticalGradient(
-                colors: [Color(red: 0.20, green: 0.24, blue: 0.58).opacity(0.75), .clear],
-                center: UnitPoint(x: 0.82, y: 0.9),
-                startRadiusFraction: 0, endRadiusFraction: 0.78)
-        }
-        .ignoresSafeArea()
+        GamepadScreenBackground(calm: true)
     }
 }
 

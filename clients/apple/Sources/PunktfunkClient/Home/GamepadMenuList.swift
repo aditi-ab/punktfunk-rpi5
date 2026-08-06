@@ -35,6 +35,10 @@ struct GamepadMenuList<Item: Identifiable, Row: View>: View where Item.ID: Hasha
     let onActivate: (Item) -> Void
     /// B → back/dismiss; nil disables it.
     var onBack: (() -> Void)?
+    /// L1 (`-1`) / R1 (`+1`) — a step SIDEWAYS out of the list: the settings screen's section
+    /// tabs. Wired on tvOS too, where the focus engine owns up/down but leaves the shoulders
+    /// to the poll. nil ⇒ the shoulders do nothing.
+    var onShoulder: ((Int) -> Void)?
     /// Whether this list currently owns controller input — same handoff contract as
     /// GamepadCarousel's `isActive` (a covered screen must stop polling the shared pad).
     var isActive: Bool = true
@@ -159,6 +163,7 @@ struct GamepadMenuList<Item: Identifiable, Row: View>: View where Item.ID: Hasha
             case .up, .down: break
             }
         }
+        input.onShoulder = { forward in onShoulder?(forward ? 1 : -1) }
         #else
         input.onMove = { direction in
             switch direction {
@@ -170,6 +175,7 @@ struct GamepadMenuList<Item: Identifiable, Row: View>: View where Item.ID: Hasha
         }
         input.onConfirm = { activate() }
         input.onBack = onBack
+        input.onShoulder = { forward in onShoulder?(forward ? 1 : -1) }
         #endif
     }
 

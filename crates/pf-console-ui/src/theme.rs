@@ -112,59 +112,12 @@ pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alph
 }
 
 // --- The form backdrop (settings / add-host / pair) --------------------------------------
-
-/// The calm backdrop for the form screens — NOT the launcher's aurora (this stays still
-/// and quiet), and deliberately not near-black: a deep indigo base plus two soft static
-/// glows give the glass rows real color to sit on. A light top/bottom scrim grounds the
-/// pinned title and hint bar (the Swift build blurs a tray instead; same job).
-pub(crate) fn draw_form_background(canvas: &Canvas, w: f64, h: f64) {
-    let (wf, hf) = (w as f32, h as f32);
-    canvas.draw_rect(
-        Rect::from_wh(wf, hf),
-        &Paint::new(Color4f::new(0.075, 0.062, 0.150, 1.0), None),
-    );
-    // Violet lift top-leading, cooler indigo bottom-trailing — elliptical (window
-    // aspect) via a unit-radius radial gradient under a scale.
-    for (cx, cy, color, alpha) in [
-        (0.26, 0.14, Color4f::new(0.40, 0.31, 0.68, 1.0), 0.9f32),
-        (0.82, 0.90, Color4f::new(0.20, 0.24, 0.58, 1.0), 0.75),
-    ] {
-        let mut paint = Paint::default();
-        let c = Color4f::new(color.r, color.g, color.b, alpha);
-        paint.set_shader(gradient_shader::radial(
-            Point::new(0.0, 0.0),
-            0.78,
-            gradient_shader::GradientShaderColors::Colors(&[
-                c.to_color(),
-                Color4f::new(color.r, color.g, color.b, 0.0).to_color(),
-            ]),
-            None,
-            TileMode::Clamp,
-            None,
-            None,
-        ));
-        canvas.save();
-        canvas.translate((wf * cx, hf * cy));
-        canvas.scale((wf, hf));
-        canvas.draw_rect(Rect::from_ltrb(-1.0, -1.0, 1.0, 1.0), &paint);
-        canvas.restore();
-    }
-    let mut scrim = Paint::default();
-    scrim.set_shader(gradient_shader::linear(
-        (Point::new(0.0, 0.0), Point::new(0.0, hf)),
-        gradient_shader::GradientShaderColors::Colors(&[
-            Color4f::new(0.0, 0.0, 0.0, 0.30).to_color(),
-            Color4f::new(0.0, 0.0, 0.0, 0.0).to_color(),
-            Color4f::new(0.0, 0.0, 0.0, 0.0).to_color(),
-            Color4f::new(0.0, 0.0, 0.0, 0.32).to_color(),
-        ]),
-        Some(&[0.0, 0.22, 0.74, 1.0][..]),
-        TileMode::Clamp,
-        None,
-        None,
-    ));
-    canvas.draw_rect(Rect::from_wh(wf, hf), &scrim);
-}
+//
+// There isn't one any more. The form screens used to sit on a STATIC deep-indigo field
+// drawn here, crossfaded over the launcher's aurora; they now wear the same living mesh at
+// `calm = 1` (see `library::mesh_sksl` and `Shell::draw_aurora`), which keeps the glass rows
+// on real colour, keeps the console's one backdrop palette-themed everywhere, and means no
+// screen in the gamepad UI is ever backed by a still image.
 
 /// The loading/connecting spinner: a rotating 270° arc driven by the shell clock.
 pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
