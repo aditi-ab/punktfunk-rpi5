@@ -180,6 +180,9 @@ pub struct NativeClient {
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
+    /// Set with `shutdown` when the host's close carried [`crate::quic::APP_EXITED_CLOSE_CODE`] —
+    /// see [`NativeClient::ended_because_game_exited`].
+    game_exited: Arc<AtomicBool>,
     /// Deliberate-quit flag: [`NativeClient::disconnect_quit`] sets it, so the worker closes the QUIC
     /// connection with [`crate::quic::QUIT_CLOSE_CODE`] (a user "stop") instead of code 0 — telling the
     /// host to skip the keep-alive linger. A plain drop leaves it false → an unwanted-disconnect close.
@@ -448,6 +451,7 @@ impl NativeClient {
             std::sync::mpsc::sync_channel::<crate::quic::CursorState>(CURSOR_STATE_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let game_exited = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
@@ -463,6 +467,7 @@ impl NativeClient {
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
         let shutdown_w = shutdown.clone();
+        let game_exited_w = game_exited.clone();
         let quit_w = quit.clone();
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
@@ -538,6 +543,7 @@ impl NativeClient {
                     clip_cmd_rx,
                     ready_tx,
                     shutdown: shutdown_w,
+                    game_exited: game_exited_w,
                     quit: quit_w,
                     mode_slot: mode_slot_w,
                     probe: probe_w,
@@ -591,6 +597,7 @@ impl NativeClient {
             host_caps: negotiated.host_caps,
             probe,
             shutdown,
+            game_exited,
             quit,
             worker: Some(worker),
             frames_dropped,
@@ -807,6 +814,24 @@ impl NativeClient {
     /// frame forever — the poll-friendly counterpart to reacting to a `Closed` in a plane loop.
     pub fn is_session_ended(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Whether the session ended because **the game the host launched for it exited** — the host
+    /// closed with [`crate::quic::APP_EXITED_CLOSE_CODE`] rather than dropping out.
+    ///
+    /// A refinement of [`is_session_ended`](Self::is_session_ended), never a substitute: it is only
+    /// ever true once that is, and false covers every other ending (user stop, host gone, network
+    /// loss, idle timeout) — so a client that ignores it behaves exactly as before.
+    ///
+    /// What it is FOR: a game ending is a normal, expected finish, not a failure. A launcher client
+    /// can read this and go back to the host's library — where the player is one tap from the next
+    /// title — instead of showing "session ended by <host>" and dropping to host selection, which
+    /// reads as an error for something the player just did on purpose.
+    ///
+    /// Poll it after the session ends (a `Closed` on any plane, or `is_session_ended`); it latches,
+    /// so it is still readable while the connection is being torn down.
+    pub fn ended_because_game_exited(&self) -> bool {
+        self.game_exited.load(Ordering::SeqCst)
     }
 
     /// Register the calling thread as latency-critical so a later

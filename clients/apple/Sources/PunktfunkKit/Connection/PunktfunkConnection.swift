@@ -1430,6 +1430,24 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// Did this session end because **the game the host launched for it exited**, rather than the
+    /// stream dropping out?
+    ///
+    /// Only meaningful once the session HAS ended (a plane threw `.closed`, or `onSessionEnd`
+    /// fired) — before that it is simply false. False also covers every other ending: a user stop,
+    /// the host going away, network loss, an idle timeout. Read it before tearing the connection
+    /// down; once `close()` has been requested this reports false like any other ending, which is
+    /// the safe direction (the caller falls back to its normal end-of-session handling).
+    ///
+    /// A game ending is a normal finish, not a failure — that is the whole point of asking. See
+    /// `punktfunk_connection_game_exited` (ABI v17).
+    public var endedBecauseGameExited: Bool {
+        guard let h = liveHandle() else { return false }
+        var out: UInt8 = 0
+        guard punktfunk_connection_game_exited(h, &out) == statusOK else { return false }
+        return out != 0
+    }
+
     deinit { close() }
 
     /// Snapshot the handle unless close is pending (callers hold their plane lock).

@@ -65,6 +65,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clip_cmd_rx,
         ready_tx,
         shutdown,
+        game_exited,
         quit,
         mode_slot,
         probe,
@@ -194,12 +195,22 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clip_cmd_rx,
     ));
 
-    // Watch for connection close → stop the pump.
+    // Watch for connection close → stop the pump, and record WHY if the host said so.
     {
         let shutdown = shutdown.clone();
+        let game_exited = game_exited.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
-            conn.closed().await;
+            let why = conn.closed().await;
+            // The host closes with APP_EXITED when the game it launched for this session exited.
+            // Latch that before `shutdown`, so any client that reacts to the shutdown flag can
+            // already read the reason — the two are observed by different threads.
+            if let quinn::ConnectionError::ApplicationClosed(ac) = &why {
+                if u32::try_from(u64::from(ac.error_code)) == Ok(crate::quic::APP_EXITED_CLOSE_CODE)
+                {
+                    game_exited.store(true, Ordering::SeqCst);
+                }
+            }
             shutdown.store(true, Ordering::SeqCst);
         });
     }

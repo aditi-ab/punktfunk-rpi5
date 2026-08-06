@@ -68,6 +68,10 @@ pub(crate) struct WorkerArgs {
     pub(crate) clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     pub(crate) ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// Set alongside `shutdown` when the HOST's close carried
+    /// [`crate::quic::APP_EXITED_CLOSE_CODE`] — the launched game exited (see
+    /// [`NativeClient::ended_because_game_exited`]).
+    pub(crate) game_exited: Arc<AtomicBool>,
     /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
     pub(crate) quit: Arc<AtomicBool>,
     pub(crate) mode_slot: Arc<std::sync::Mutex<Mode>>,

@@ -76,7 +76,13 @@
 // capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
 // receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
 // arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 16
+// v17: added `punktfunk_connection_game_exited` — asks, once a session has ended, whether it
+// ended because the game the host launched for it EXITED (the host's close carried
+// [`quic::APP_EXITED_CLOSE_CODE`], which it has sent since long before this bump; nothing
+// consumed it). Purely a read of state the core already had: no new call is required of an
+// embedder, a client that never calls it is unchanged, and the host sends exactly the same bytes
+// either way, so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 17
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -2496,6 +2502,26 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Did this session end because **the game the host launched for it exited**? `*out` is set to 1
+// when it did and 0 otherwise; the return status reports only whether the handle was usable.
+//
+// A refinement of "the session ended", never a substitute — read it only once a plane has
+// returned [`PunktfunkStatus::Closed`] (or the embedder's own end-of-session signal fired), and
+// treat 0 as "ended for some other reason" (user stop, host gone, network loss, idle timeout).
+// It latches, so it is still readable while the connection is being torn down, and a client that
+// never calls it behaves exactly as it did before this existed.
+//
+// The point is that a game ending is a normal finish, not a failure: a launcher client can send
+// the player back to the host's library — one tap from the next title — rather than reporting an
+// error and dropping to host selection for something the player just did on purpose.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_game_exited(PunktfunkConnection *c,
+                                                 uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

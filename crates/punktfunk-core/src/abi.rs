@@ -2273,6 +2273,42 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
+/// Did this session end because **the game the host launched for it exited**? `*out` is set to 1
+/// when it did and 0 otherwise; the return status reports only whether the handle was usable.
+///
+/// A refinement of "the session ended", never a substitute — read it only once a plane has
+/// returned [`PunktfunkStatus::Closed`] (or the embedder's own end-of-session signal fired), and
+/// treat 0 as "ended for some other reason" (user stop, host gone, network loss, idle timeout).
+/// It latches, so it is still readable while the connection is being torn down, and a client that
+/// never calls it behaves exactly as it did before this existed.
+///
+/// The point is that a game ending is a normal finish, not a failure: a launcher client can send
+/// the player back to the host's library — one tap from the next title — rather than reporting an
+/// error and dropping to host selection for something the player just did on purpose.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_game_exited(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = u8::from(c.inner.ended_because_game_exited()) };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
 /// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
 /// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows

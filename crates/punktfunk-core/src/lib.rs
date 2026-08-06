@@ -138,7 +138,13 @@ pub use stats::Stats;
 /// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
 /// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
 /// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 16;
+/// v17: added `punktfunk_connection_game_exited` — asks, once a session has ended, whether it
+/// ended because the game the host launched for it EXITED (the host's close carried
+/// [`quic::APP_EXITED_CLOSE_CODE`], which it has sent since long before this bump; nothing
+/// consumed it). Purely a read of state the core already had: no new call is required of an
+/// embedder, a client that never calls it is unchanged, and the host sends exactly the same bytes
+/// either way, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 17;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
