@@ -184,21 +184,33 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
         // shell:AppsFolder — which runs in the interactive user session (UWP activation fails as
         // SYSTEM/session-0; spawn_in_active_session uses the user token). Guard the charset (the value
         // is host-derived from MicrosoftGame.config + AppRepository, but belt-and-suspenders).
-        "aumid" => {
-            let valid = spec.value.split_once('!').is_some_and(|(pfn, app)| {
-                let part = |s: &str| {
-                    !s.is_empty()
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-                };
-                part(pfn) && part(app)
-            });
-            valid.then(|| {
-                (
-                    format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value),
-                    None,
-                )
-            })
+        "aumid" => valid_aumid(&spec.value).then(|| {
+            (
+                format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value),
+                None,
+            )
+        }),
+        // Xbox / Game Pass from a library PLUGIN: `<Identity>!<AppId>`, both read straight out of
+        // `MicrosoftGame.config`. The host completes it into the AUMID.
+        //
+        // This kind exists because of a measured privilege asymmetry (2026-08-06): resolving the
+        // PackageFamilyName means enumerating `%ProgramData%\…\AppRepository\Packages`, which is
+        // denied to `NT AUTHORITY\LocalService` — the principal the plugin runner runs as — and
+        // allowed to the host, which runs as LocalSystem. So the plugin sends what it can read and
+        // the host reads the authoritative publisher hash itself, at launch time.
+        //
+        // Resolving here rather than caching at install time also means a package update that
+        // changes the hash cannot leave a stale, unlaunchable tile behind.
+        "xbox" => {
+            let (identity, app_id) = spec.value.split_once('!')?;
+            if !aumid_part(identity) || !aumid_part(app_id) {
+                return None;
+            }
+            let pfn = xbox_pfn(identity)?;
+            Some((
+                format!("explorer.exe \"shell:AppsFolder\\{pfn}!{app_id}\""),
+                None,
+            ))
         }
         // Playnite: open the game through Playnite's own URI handler, which is what actually knows
         // how to start it (Playnite maps the id to whichever store owns the title). explorer.exe
@@ -283,6 +295,23 @@ pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
 /// never carry a third value that silently resolves to nothing at launch time.
 pub(crate) fn valid_steam_ui(value: &str) -> bool {
     matches!(value, "bigpicture" | "desktop")
+}
+
+/// One half of an AUMID (a package family name or an app id): non-empty, and no character that
+/// could break out of the `shell:AppsFolder\…` argument. Both halves are host-derived, so this is
+/// belt-and-braces — but the `xbox` kind now takes an Identity straight off a plugin's wire, which
+/// makes it load-bearing rather than defensive.
+pub(crate) fn aumid_part(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A full `<PFN>!<AppId>` AUMID.
+pub(crate) fn valid_aumid(value: &str) -> bool {
+    value
+        .split_once('!')
+        .is_some_and(|(pfn, app)| aumid_part(pfn) && aumid_part(app))
 }
 
 /// A Playnite game id: the GUID Playnite's own database uses, and the only client-influenced part
@@ -682,6 +711,26 @@ mod tests {
         }
         assert!(!valid_launcher_ui(""));
         assert!(!valid_launcher_ui("lutris; rm -rf ~"));
+    }
+
+    /// The `xbox` kind is what a library PLUGIN can publish: the runner's principal cannot read
+    /// AppRepository (measured 2026-08-06), so it sends `<Identity>!<AppId>` and the host resolves
+    /// the publisher hash. The charset guard is load-bearing here — unlike `aumid`, this value
+    /// arrives over the wire.
+    #[test]
+    fn xbox_value_is_identity_bang_appid_and_charset_guarded() {
+        assert!(valid_aumid("Microsoft.Foo!Game"));
+        assert!(valid_aumid("A_b-c.d!App"));
+        // Both halves must be present and non-empty.
+        assert!(!valid_aumid("Microsoft.Foo"));
+        assert!(!valid_aumid("!Game"));
+        assert!(!valid_aumid("Microsoft.Foo!"));
+        assert!(!valid_aumid(""));
+        // Nothing that could break out of the `shell:AppsFolder\…` argument.
+        assert!(!valid_aumid("Foo\"!Game"));
+        assert!(!valid_aumid("Foo!Game\" & calc"));
+        assert!(!valid_aumid("Foo\\..\\Bar!Game"));
+        assert!(!valid_aumid("Foo Bar!Game"));
     }
 
     /// Windows' launcher tile opens Playnite's FULLSCREEN app. Both negatives are the point: the

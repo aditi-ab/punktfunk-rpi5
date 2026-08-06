@@ -31,8 +31,8 @@ fn check_entry_fields(
                 &format!(
                     "`{field}` is executed as the host user and may only be set with the \
                      operator's admin token — a plugin may publish entries with any host-resolved \
-                     launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, lutris_id, heroic, \
-                     playnite) \
+                     launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
+                     heroic, playnite) \
                      instead"
                 ),
             ));

@@ -134,8 +134,14 @@ fn xbox_parse_config(text: &str, folder: Option<&str>) -> Option<(String, String
 /// Resolve a package's PackageFamilyName by finding its
 /// `AppRepository\Packages\<PackageFullName>` dir (machine-wide, SYSTEM-readable) and reducing the
 /// full name to `Name_PublisherHash`. This READS the authoritative PFN — never compute the hash.
+///
+/// **Readable by the host, NOT by the plugin runner.** Measured on 2026-08-06: that directory is
+/// `UnauthorizedAccessException` for `NT AUTHORITY\LocalService` (which the runner is), while the
+/// host service runs as LocalSystem and enumerates all 348 entries. That asymmetry is why the
+/// `xbox` launch kind exists — a library plugin sends the package Identity it CAN read out of
+/// `MicrosoftGame.config`, and this resolves the rest at launch time (see `launch.rs`).
 #[cfg(windows)]
-fn xbox_pfn(identity: &str) -> Option<String> {
+pub(crate) fn xbox_pfn(identity: &str) -> Option<String> {
     let pkgs = PathBuf::from(std::env::var_os("ProgramData")?)
         .join("Microsoft")
         .join("Windows")

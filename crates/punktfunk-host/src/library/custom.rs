@@ -468,6 +468,14 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     "entries[{i}]: `launch.value` for kind `playnite` must be a Playnite game GUID"
                 ));
             }
+            // `<Identity>!<AppId>`, both straight off `MicrosoftGame.config`. The host completes it
+            // into an AUMID at launch (it can read the publisher hash; the runner cannot), so the
+            // shape is checked here where the author can still act on the error.
+            if launch.kind == "xbox" && !valid_aumid(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
+                ));
+            }
         }
         if let Some(marker) = &e.detect.env_marker {
             if !valid_env_key(&marker.key) {
