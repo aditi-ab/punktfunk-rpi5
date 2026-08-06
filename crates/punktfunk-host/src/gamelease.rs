@@ -266,6 +266,20 @@ pub struct LeaseRequest {
     pub spec: DetectSpec,
     /// The game's own compositor-nested-ness: `true` when a bare-spawn gamescope owns it.
     pub nested: bool,
+    /// This entry opens a LAUNCHER rather than a game (design D4), which makes the lease
+    /// [`LeaseKind::Untracked`] no matter what else is known about it.
+    ///
+    /// A launcher has no "the game exited" moment to detect, and trying to infer one is worse than
+    /// not trying. Steam is the clean counterexample: Big Picture is a *mode* of an already-running
+    /// Steam client, not a process — and on a Deck or SteamOS host Steam is always running — so no
+    /// process signal can express "the Big Picture window closed".
+    ///
+    /// Without this flag the lifetime would also be decided by something the user cannot see:
+    /// launching a launcher that is NOT yet running leaves the host holding a live child (tracked,
+    /// so quitting it ends the session), while launching one that IS running has the command
+    /// forward and exit inside [`SHIM_WINDOW`] (untracked, so the session persists). Same tile, two
+    /// behaviours. Untracked is the honest one of the two, so it is the one that always applies.
+    pub launcher: bool,
     /// The child the host spawned for this launch, when it spawned one directly, and whether it
     /// leads its own process group (see [`OwnedChild::group_leader`]).
     pub child: Option<(std::process::Child, bool)>,
@@ -300,11 +314,18 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         plane,
         spec,
         nested,
+        launcher,
         child,
         launch_stamp,
     } = req;
 
-    let kind = if nested {
+    // A launcher tile is untracked FIRST, before anything else is considered — see
+    // `LeaseRequest::launcher`. Checking it ahead of `child` is the whole point: a launcher the host
+    // just started leaves a live child behind, and tracking that child is exactly the inconsistency
+    // this removes.
+    let kind = if launcher {
+        LeaseKind::Untracked
+    } else if nested {
         LeaseKind::Nested
     } else if child.is_some() {
         LeaseKind::Child
@@ -335,7 +356,14 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         last_seen_ms: AtomicU64::new(0),
     });
 
-    if matches!(kind, LeaseKind::Untracked) {
+    if launcher {
+        tracing::info!(
+            title = %shared.game.title,
+            app = shared.game.id.as_deref().unwrap_or("-"),
+            "this entry opens a launcher, not a game — the session stays up until the client \
+             leaves, and closing the launcher does not end it"
+        );
+    } else if matches!(kind, LeaseKind::Untracked) {
         tracing::info!(
             title = %shared.game.title,
             app = shared.game.id.as_deref().unwrap_or("-"),
@@ -1072,10 +1100,60 @@ mod tests {
             plane: crate::events::Plane::Native,
             spec,
             nested,
+            launcher: false,
             child: None,
             // No start-time floor: these leases are never matched against real processes.
             launch_stamp: None,
         }
+    }
+
+    /// Design D4: an entry that opens a LAUNCHER is untracked, whatever else is known about it.
+    ///
+    /// Both cases below are the same tile - "Steam Big Picture" - differing only in whether Steam
+    /// happened to be running already, which the user cannot see:
+    ///
+    ///   * not running: the host's spawned child stays alive, which would otherwise be a `Child`
+    ///     lease, so quitting the launcher would end the session;
+    ///   * already running: the command forwards to the live instance and exits inside
+    ///     `SHIM_WINDOW`, leaving nothing to track, so the session would persist.
+    ///
+    /// Untracked is the honest answer of the two. Big Picture is a *mode* of an already-running
+    /// Steam client rather than a process, and on a Deck or SteamOS host Steam is always running,
+    /// so no process signal can express "the launcher's window closed". Pinning it here keeps the
+    /// tile's behaviour from depending on invisible state.
+    #[test]
+    fn a_launcher_entry_is_untracked_however_it_was_started() {
+        // Already running: nothing held, nothing to detect.
+        let mut r = req("steam:big-picture", DetectSpec::default(), false);
+        r.launcher = true;
+        let lease = open(r, Box::new(|| {}));
+        assert!(matches!(lease.shared().kind, LeaseKind::Untracked));
+        assert!(!lease.shared().is_trackable());
+
+        // Not running: the entry also carries detect signals, which would normally make this a
+        // `Matched` lease. `launcher` outranks them.
+        let mut r = req(
+            "steam:big-picture-2",
+            DetectSpec::exe("/usr/bin/steam"),
+            false,
+        );
+        r.launcher = true;
+        assert!(
+            !r.spec.is_empty(),
+            "the guard is only meaningful with signals"
+        );
+        let lease = open(r, Box::new(|| {}));
+        assert!(matches!(lease.shared().kind, LeaseKind::Untracked));
+        assert!(!lease.shared().is_trackable());
+
+        // The same request WITHOUT the flag is tracked - so the assertions above are the flag's
+        // doing, not an artifact of the fixture.
+        let plain = open(
+            req("steam:570", DetectSpec::exe("/usr/bin/steam"), false),
+            Box::new(|| {}),
+        );
+        assert!(matches!(plain.shared().kind, LeaseKind::Matched));
+        assert!(plain.shared().is_trackable());
     }
 
     /// Is a lease for `id` currently on probation?
@@ -1254,6 +1332,7 @@ mod tests {
                 // A real signal that no process will ever match — the game never shows up.
                 spec: DetectSpec::steam(999_001),
                 nested: false,
+                launcher: false,
                 child: Some((child, false)),
                 launch_stamp: None,
             },
@@ -1312,6 +1391,7 @@ mod tests {
                 plane: crate::events::Plane::Native,
                 spec: DetectSpec::dir(td.path()),
                 nested: false,
+                launcher: false,
                 child: Some((child, true)),
                 launch_stamp,
             },

@@ -19,6 +19,10 @@ use super::*;
 pub struct LaunchTarget {
     /// Identity for the status surface and the `game.*` events.
     pub game: crate::gamelease::GameRef,
+    /// This entry opens a LAUNCHER, not a game (design D4) — so there is no "the game exited"
+    /// moment to detect, and the lease stays untracked no matter what else is known about it.
+    /// See [`crate::gamelease::LeaseRequest::launcher`].
+    pub launcher: bool,
     /// How to recognize the running game ([`DetectSpec`]); empty when the store offers nothing.
     pub detect: DetectSpec,
     /// The resolved shell command. `Some` on Linux (where the host runs it); `None` on Windows,
@@ -51,6 +55,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
         let command = entry.launch.as_ref().and_then(command_for)?;
         Some(LaunchTarget {
             game,
+            launcher: entry.role == GameRole::Launcher,
             detect: entry.detect,
             command: Some(command),
         })
@@ -62,6 +67,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
         // the existing warning fires there.
         Some(LaunchTarget {
             game,
+            launcher: entry.role == GameRole::Launcher,
             detect: entry.detect,
             command: None,
         })
