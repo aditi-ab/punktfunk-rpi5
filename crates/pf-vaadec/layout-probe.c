@@ -24,6 +24,7 @@
 #include <stddef.h>
 #include <va/va.h>
 #include <va/va_dec_hevc.h>
+#include <va/va_drmcommon.h>
 
 #define S(t)        printf("size %-34s %zu align %zu\n", #t, sizeof(t), _Alignof(t))
 #define O(t, f)     printf("off  %-20s %-28s %zu\n", #t, #f, offsetof(t, f))
@@ -221,5 +222,67 @@ int main(void) {
     }
 
     printf("VA_PADDING_LOW=%d VA_PADDING_MEDIUM=%d\n", VA_PADDING_LOW, VA_PADDING_MEDIUM);
+
+    /*
+     * The export descriptor. This one is not a buffer we FILL — it is a struct the
+     * driver WRITES, so a wrong layout is read as plausible garbage (an fd from the
+     * middle of a pitch, a plane count from a modifier's high word) rather than
+     * refused. It carries fixed-size arrays whose bounds the flattening walk trusts,
+     * which is exactly the shape that turned into the green-screen bug once already.
+     */
+    S(VADRMPRIMESurfaceDescriptor);
+    O(VADRMPRIMESurfaceDescriptor, fourcc);
+    O(VADRMPRIMESurfaceDescriptor, width);
+    O(VADRMPRIMESurfaceDescriptor, height);
+    O(VADRMPRIMESurfaceDescriptor, num_objects);
+    O(VADRMPRIMESurfaceDescriptor, objects);
+    O(VADRMPRIMESurfaceDescriptor, num_layers);
+    O(VADRMPRIMESurfaceDescriptor, layers);
+    printf("count VADRMPRIMESurfaceDescriptor objects   %zu\n",
+           sizeof(((VADRMPRIMESurfaceDescriptor *)0)->objects) /
+               sizeof(((VADRMPRIMESurfaceDescriptor *)0)->objects[0]));
+    printf("count VADRMPRIMESurfaceDescriptor layers    %zu\n",
+           sizeof(((VADRMPRIMESurfaceDescriptor *)0)->layers) /
+               sizeof(((VADRMPRIMESurfaceDescriptor *)0)->layers[0]));
+    printf("count layer.object_index                    %zu\n",
+           sizeof(((VADRMPRIMESurfaceDescriptor *)0)->layers[0].object_index) /
+               sizeof(((VADRMPRIMESurfaceDescriptor *)0)->layers[0].object_index[0]));
+
+    /*
+     * The enumerators the runtime calls pass by value. Printed rather than
+     * transcribed because two of them are the exact pair this program has already
+     * been warned about: VASliceParameterBufferType and VASliceDataBufferType are
+     * 4 and 5, not the 3 and 4 that counting the enum from the top suggests.
+     */
+    printf("enum VAEntrypointVLD                        %d\n", VAEntrypointVLD);
+    printf("enum VAConfigAttribRTFormat                 %d\n", VAConfigAttribRTFormat);
+    printf("enum VAPictureParameterBufferType           %d\n", VAPictureParameterBufferType);
+    printf("enum VAIQMatrixBufferType                   %d\n", VAIQMatrixBufferType);
+    printf("enum VASliceParameterBufferType             %d\n", VASliceParameterBufferType);
+    printf("enum VASliceDataBufferType                  %d\n", VASliceDataBufferType);
+    printf("enum VA_EXPORT_SURFACE_READ_ONLY            0x%04x\n", VA_EXPORT_SURFACE_READ_ONLY);
+    printf("enum VA_EXPORT_SURFACE_SEPARATE_LAYERS      0x%04x\n",
+           VA_EXPORT_SURFACE_SEPARATE_LAYERS);
+    printf("enum VA_SURFACE_ATTRIB_SETTABLE             0x%04x\n", VA_SURFACE_ATTRIB_SETTABLE);
+    printf("enum VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 0x%08x\n",
+           VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2);
+    printf("enum VASurfaceAttribPixelFormat             %d\n", VASurfaceAttribPixelFormat);
+    printf("enum VAGenericValueTypeInteger              %d\n", VAGenericValueTypeInteger);
+    printf("enum VA_STATUS_SUCCESS                      %d\n", VA_STATUS_SUCCESS);
+    printf("enum VA_INVALID_ID                          0x%08x\n", VA_INVALID_ID);
+    printf("enum VA_FOURCC_NV12                         0x%08x\n", VA_FOURCC_NV12);
+    printf("enum VA_FOURCC_P010                         0x%08x\n", VA_FOURCC_P010);
+    printf("enum VA_PROGRESSIVE                         0x%04x\n", VA_PROGRESSIVE);
+
+    S(VASurfaceAttrib);
+    O(VASurfaceAttrib, type);
+    O(VASurfaceAttrib, flags);
+    O(VASurfaceAttrib, value);
+    S(VAGenericValue);
+    O(VAGenericValue, type);
+    O(VAGenericValue, value);
+    S(VAConfigAttrib);
+    O(VAConfigAttrib, type);
+    O(VAConfigAttrib, value);
     return 0;
 }

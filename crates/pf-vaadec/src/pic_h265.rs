@@ -144,12 +144,15 @@ impl std::fmt::Display for PlanToVaH265Error {
 impl std::error::Error for PlanToVaH265Error {}
 
 /// Convert one planned HEVC access unit. See [`crate::pic::plan_to_va`] for the
-/// parameter contract — `au` and `surfaces` mean the same things.
+/// parameter contract — `au`, `surfaces` and `setup_surface` mean the same things,
+/// including the reason the decode target is bound by the caller rather than read
+/// out of a slot-indexed table.
 pub fn plan_to_va_h265(
     plan: &AuPlanH265,
     au: &[u8],
     slots: &mut SlotMap,
     surfaces: &[u32],
+    setup_surface: u32,
 ) -> Result<DecodePlanVaH265, PlanToVaH265Error> {
     if plan.slices.is_empty() {
         return Err(PlanToVaH265Error::NoSlices);
@@ -167,6 +170,14 @@ pub fn plan_to_va_h265(
         return Err(PlanToVaH265Error::CapacityMismatch {
             required,
             capacity: slots.capacity(),
+        });
+    }
+    // See the H.264 twin: a pre-check, so the caller's post-call bind of
+    // `setup_surface` to the returned slot is always in range.
+    if surfaces.len() < slots.capacity() {
+        return Err(PlanToVaH265Error::SurfaceOutOfRange {
+            slot: (slots.capacity() - 1) as u8,
+            surfaces: surfaces.len(),
         });
     }
     if plan.dpb_refs.len() > REFERENCE_FRAMES_LEN_H265 {
@@ -358,17 +369,9 @@ pub fn plan_to_va_h265(
     if setup_evicted {
         slots.release(setup_id);
     }
-    let curr_surface =
-        *surfaces
-            .get(usize::from(setup_slot))
-            .ok_or(PlanToVaH265Error::SurfaceOutOfRange {
-                slot: setup_slot,
-                surfaces: surfaces.len(),
-            })?;
-
     let pic_params = VaPictureParameterBufferHEVC {
         curr_pic: VaPictureHEVC {
-            picture_id: curr_surface,
+            picture_id: setup_surface,
             pic_order_cnt: pic.pic_order_cnt,
             flags: 0,
             va_reserved: [0; 4],
@@ -533,6 +536,9 @@ mod tests {
     use crate::va_h265::REF_PIC_LIST_UNUSED;
     use crate::va_h265::VA_PICTURE_HEVC_INVALID;
 
+    /// `SURFACE_BASE + access-unit index` — see the H.264 twin's constant.
+    const SURFACE_BASE: u32 = 0xa000;
+
     const TEST_25FPS_H265: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
     );
@@ -576,7 +582,9 @@ mod tests {
         assert_eq!(aus.len(), expect_aus, "{label}: access-unit count");
 
         let mut planner = H265Planner::new();
-        let surfaces: Vec<u32> = (0..32u32).map(|i| 0xa000 + i).collect();
+        // The caller's binding model — see the H.264 twin: one never-reused surface
+        // id per picture, bound to its slot after the conversion returns.
+        let mut surfaces: Vec<u32> = Vec::new();
         let mut slots: Option<SlotMap> = None;
         let mut saw_rps_flags = false;
         let mut saw_list_entries = false;
@@ -586,8 +594,11 @@ mod tests {
                 .plan_au(au)
                 .unwrap_or_else(|e| panic!("{label} AU {index}: must plan, got {e:?}"));
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
-            let out = plan_to_va_h265(&plan, au, map, &surfaces)
+            surfaces.resize(map.capacity(), crate::va::VA_INVALID_SURFACE);
+            let setup_surface = SURFACE_BASE + index as u32;
+            let out = plan_to_va_h265(&plan, au, map, &surfaces, setup_surface)
                 .unwrap_or_else(|e| panic!("{label} AU {index}: conversion failed: {e}"));
+            surfaces[usize::from(out.setup_slot)] = setup_surface;
 
             assert_eq!(out.slices.len(), plan.slices.len());
             for (n, (rec, range)) in out.slices.iter().zip(&out.slice_data).enumerate() {

@@ -15,9 +15,10 @@
 //!
 //! # Status
 //!
-//! **H.264 conversion complete; no libva calls yet.** What remains for the rung is
-//! the Linux-only plumbing (config/context/surface creation, `vaRenderPicture`,
-//! sync, dmabuf export) and the H.265 twin of [`pic`].
+//! **Both codecs converted, and the rung is wired.** `pf-client-core`'s
+//! `video_vaapi_native` dlopens libva and drives these buffers; this crate holds
+//! everything decidable without a device — including [`drm`], the export
+//! descriptor the driver writes back and the plane walk that reads it.
 //!
 //! Four things this crate settled that a reader would otherwise have to re-derive:
 //!
@@ -56,6 +57,7 @@
 //! a parameter and stay pure.
 
 pub mod config;
+pub mod drm;
 pub mod pic;
 pub mod pic_h265;
 pub mod va;
@@ -69,6 +71,8 @@ pub use pf_vkdecode::SlotMap;
 /// every type it touches through `pf_vaadec` — the same courtesy `pf-dxvadec` does
 /// for the Windows layer.
 pub use pf_bitstream::h264::AuPlan;
+pub use pf_bitstream::h264::ColourDescription;
+pub use pf_bitstream::h264::DisplayCrop;
 pub use pf_bitstream::h264::H264Planner;
 pub use pf_bitstream::h264::PlanError;
 pub use pf_bitstream::h264::PlanWarning;
@@ -80,6 +84,16 @@ pub use pf_bitstream::h265::PlanWarning as PlanWarningH265;
 /// native rungs conceal on exactly the same predicate.
 pub use pf_vkdecode::is_integrity_warning;
 pub use pf_vkdecode::is_integrity_warning_h265;
+
+pub use drm::flatten;
+pub use drm::ExportError;
+pub use drm::ExportedPlane;
+pub use drm::ExportedSurface;
+pub use drm::VaDrmPrimeSurfaceDescriptor;
+pub use drm::VA_EXPORT_SURFACE_READ_ONLY;
+pub use drm::VA_EXPORT_SURFACE_SEPARATE_LAYERS;
+pub use drm::VA_FOURCC_NV12;
+pub use drm::VA_FOURCC_P010;
 
 pub use config::profile_for;
 pub use config::rt_format;

@@ -237,8 +237,26 @@ fn surface_of(slots: &SlotMap, surfaces: &[u32], id: PicId) -> Result<(u8, u32),
 ///
 /// `au` is the access unit the plan was built from — needed because the slice data
 /// buffer must start at the NAL header byte, and the start-code prefix is three or
-/// four bytes depending on the encoder. `surfaces` maps DPB slot to `VASurfaceID`;
-/// this crate never allocates one.
+/// four bytes depending on the encoder. `surfaces` maps DPB slot to `VASurfaceID`
+/// for the pictures the DPB already holds; this crate never allocates one.
+///
+/// # Why the decode target is a parameter and not `surfaces[setup_slot]`
+///
+/// The caller binds the target surface, at activation time, exactly as
+/// `pf-vkdecode` binds a pool image when a DPB slot is activated. A slot ledger
+/// is not a surface allocator: [`SlotMap::assign`] takes the lowest free slot, and
+/// a slot freed by this AU's own removals is free by the time the setup picture
+/// takes it — measured at **225 of the vendored vector's 250 access units**
+/// (`the_setup_picture_routinely_inherits_a_just_freed_slot`). Reading the target
+/// out of a slot-indexed table would therefore decode, on nine frames in ten,
+/// into the surface holding the picture that was just displayed — which the
+/// consumer may still be sampling. Zero-copy means the decoder cannot have that
+/// surface back until the consumer says so, and only the caller knows.
+///
+/// `setup_surface` must be free in that sense: bound to no live picture and held
+/// by no consumer. After a successful call the caller binds it to
+/// [`DecodePlanVa::setup_slot`], so later access units resolve references to this
+/// picture through `surfaces`.
 ///
 /// Nothing mutates `slots` until every fallible step has passed.
 pub fn plan_to_va(
@@ -246,6 +264,7 @@ pub fn plan_to_va(
     au: &[u8],
     slots: &mut SlotMap,
     surfaces: &[u32],
+    setup_surface: u32,
 ) -> Result<DecodePlanVa, PlanToVaError> {
     if plan.slices.is_empty() {
         return Err(PlanToVaError::NoSlices);
@@ -269,6 +288,16 @@ pub fn plan_to_va(
         return Err(PlanToVaError::CapacityMismatch {
             required,
             capacity: slots.capacity(),
+        });
+    }
+    // The caller binds `setup_surface` to the returned slot, so a table that cannot
+    // express every slot is caught HERE — before anything mutates the ledger —
+    // rather than as an out-of-range bind after a successful conversion. Checked
+    // against the capacity, not the chosen slot, precisely so it stays a pre-check.
+    if surfaces.len() < slots.capacity() {
+        return Err(PlanToVaError::SurfaceOutOfRange {
+            slot: (slots.capacity() - 1) as u8,
+            surfaces: surfaces.len(),
         });
     }
 
@@ -415,16 +444,9 @@ pub fn plan_to_va(
     if setup_evicted {
         slots.release(setup_id);
     }
-    let curr_surface =
-        *surfaces
-            .get(usize::from(setup_slot))
-            .ok_or(PlanToVaError::SurfaceOutOfRange {
-                slot: setup_slot,
-                surfaces: surfaces.len(),
-            })?;
 
     let curr_pic = VaPictureH264 {
-        picture_id: curr_surface,
+        picture_id: setup_surface,
         // For the current picture this is `frame_num`, not a long-term index.
         frame_idx: u32::from(pic.frame_num),
         flags: if pic.is_reference {
@@ -511,6 +533,14 @@ pub fn plan_to_va(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::va::VA_INVALID_SURFACE;
+
+    /// Surface ids for the walks below: `SURFACE_BASE + access-unit index`, so every
+    /// picture gets its own and none is ever reused. Well away from slot indices, so
+    /// a mix-up shows as a value rather than a plausible off-by-one — and unique, so
+    /// a stale or aliased reference cannot hide behind a surface that happens to be
+    /// right again.
+    const SURFACE_BASE: u32 = 0x9000;
     use crate::va::VA_PICTURE_H264_INVALID;
 
     /// The vendored conformance vector every other rung's parity legs decode: 250
@@ -567,10 +597,13 @@ mod tests {
         assert_eq!(aus.len(), 250, "the vendored vector is 250 access units");
 
         let mut planner = H264Planner::new();
-        // One surface per slot, with ids that are distinguishable from slot indices
-        // so a mix-up shows up as a value, not as an off-by-one that still looks
-        // plausible.
-        let surfaces: Vec<u32> = (0..32u32).map(|i| 0x9000 + i).collect();
+        // The caller's binding, modelled the way the rung does it: every picture is
+        // given its OWN never-reused surface id, and the slot table is updated after
+        // the conversion returns. Ids start well away from slot indices so a mix-up
+        // shows up as a value rather than as a plausible-looking off-by-one, and
+        // never reusing one means a stale or aliased reference cannot hide behind a
+        // surface that happens to be right again.
+        let mut surfaces: Vec<u32> = Vec::new();
         let mut slots: Option<SlotMap> = None;
         let mut converted = 0usize;
         let mut saw_multi_slice = false;
@@ -581,8 +614,11 @@ mod tests {
                 .plan_au(au)
                 .unwrap_or_else(|e| panic!("AU {index}: the clean vector must plan, got {e:?}"));
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
-            let out = plan_to_va(&plan, au, map, &surfaces)
+            surfaces.resize(map.capacity(), VA_INVALID_SURFACE);
+            let setup_surface = SURFACE_BASE + index as u32;
+            let out = plan_to_va(&plan, au, map, &surfaces, setup_surface)
                 .unwrap_or_else(|e| panic!("AU {index}: conversion failed: {e}"));
+            surfaces[usize::from(out.setup_slot)] = setup_surface;
 
             assert_eq!(
                 out.slices.len(),
@@ -654,6 +690,86 @@ mod tests {
         assert!(
             saw_references,
             "a 250-frame vector must reference something"
+        );
+    }
+
+    /// The decode target must never be a surface this same access unit READS.
+    ///
+    /// This is the question a slot ledger cannot answer, and it is why the caller
+    /// binds the setup surface instead of the conversion reading one out of a
+    /// slot-indexed table.
+    ///
+    /// `SlotMap::assign` takes the LOWEST free slot, and a slot freed by this
+    /// access unit's own removals is free by the time the setup picture is
+    /// assigned. Measured on the vendored vector, that is not an edge case: the
+    /// setup picture inherits a just-freed slot on **225 of 250** access units.
+    /// A surface bound BY SLOT would therefore decode, on nine frames in ten,
+    /// into the surface still holding the picture that was just displayed — which
+    /// under zero-copy the consumer may still be sampling. Hence the pool model
+    /// this crate's callers use, and hence `setup_surface`.
+    ///
+    /// The second half of the test is the reassurance that comes with it: given
+    /// the caller's contract (a surface bound to no live picture), the decode
+    /// target is never a surface the same access unit READS. That is checked
+    /// against both readable sets, which are not the same snapshot — `dpb_refs` is
+    /// taken after this AU's marking process, the per-slice lists before it.
+    #[test]
+    fn the_setup_picture_routinely_inherits_a_just_freed_slot() {
+        use pf_bitstream::h264::H264Planner;
+
+        let aus = split_aus(TEST_25FPS_H264);
+        let mut planner = H264Planner::new();
+        let mut surfaces: Vec<u32> = Vec::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut collisions = 0usize;
+        let mut first: Option<usize> = None;
+        let mut inherited = 0usize;
+
+        for (index, au) in aus.iter().enumerate() {
+            let plan = planner.plan_au(au).expect("the clean vector plans");
+            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+            surfaces.resize(map.capacity(), VA_INVALID_SURFACE);
+            // Which slots this AU's own removals will free — read BEFORE the
+            // conversion applies them, because afterwards the ledger has forgotten.
+            let freed: Vec<u8> = plan
+                .dpb
+                .removed
+                .iter()
+                .filter_map(|id| map.slot_of(*id))
+                .collect();
+            let setup_surface = SURFACE_BASE + index as u32;
+            let out = plan_to_va(&plan, au, map, &surfaces, setup_surface)
+                .expect("the clean vector converts");
+            surfaces[usize::from(out.setup_slot)] = setup_surface;
+            if freed.contains(&out.setup_slot) {
+                inherited += 1;
+            }
+            let curr = out.pic_params.curr_pic.picture_id;
+            let names =
+                |e: &VaPictureH264| e.flags & VA_PICTURE_H264_INVALID == 0 && e.picture_id == curr;
+            let read_by_this_au = out.pic_params.reference_frames.iter().any(names)
+                || out.slices.iter().any(|s| {
+                    s.ref_pic_list0.iter().any(names) || s.ref_pic_list1.iter().any(names)
+                });
+            if read_by_this_au {
+                collisions += 1;
+                first.get_or_insert(index);
+            }
+        }
+        // The measurement this design rests on. A floor rather than the exact
+        // count, so a planner change that shifts it by a frame does not fail —
+        // but one that made slot reuse RARE would, and would mean the doc above
+        // has stopped being true.
+        assert!(
+            inherited > 200,
+            "the setup picture inherited a just-freed slot on only {inherited} of 250 access \
+             units — the reason `setup_surface` is a parameter no longer holds, and the \
+             documentation that cites it needs re-measuring"
+        );
+        assert_eq!(
+            collisions, 0,
+            "the decode target collided with a picture this access unit reads, on \
+             {collisions} of 250 (first at AU {first:?})"
         );
     }
 

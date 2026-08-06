@@ -1635,8 +1635,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         st.hdr_untonemapped = true;
                         presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
                     }
+                    // Both VAAPI rungs — libavcodec's and M6's native one — hand over
+                    // the same thing: dmabuf fds plus a plane layout, with the guard
+                    // opaque either way. One arm, therefore, rather than a second copy
+                    // of the import and its failure-streak demotion. They stay separate
+                    // VARIANTS so that everywhere it MATTERS which rung decoded (the
+                    // stats tag) the compiler asks; here it genuinely does not.
                     #[cfg(target_os = "linux")]
-                    DecodedImage::Dmabuf(d)
+                    DecodedImage::Dmabuf(d) | DecodedImage::NativeDmabuf(d)
                         if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
                     {
                         st.hdr = d.color.is_pq();
@@ -1673,7 +1679,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                     }
                     #[cfg(target_os = "linux")]
-                    DecodedImage::Dmabuf(_) => {
+                    DecodedImage::Dmabuf(_) | DecodedImage::NativeDmabuf(_) => {
                         // No import extensions on this device (or already demoted) — the
                         // pump rebuilds the decoder as software; frames flow again soon.
                         if !st.dmabuf_demoted {

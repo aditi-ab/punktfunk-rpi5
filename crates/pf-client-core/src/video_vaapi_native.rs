@@ -1,0 +1,1855 @@
+//! Native VAAPI decode — M6 of the native-decode program, and the FFmpeg-free
+//! replacement for [`crate::video_vaapi`].
+//!
+//! `pf-vaadec` turns one pf-bitstream `AuPlan` into the buffers a
+//! `vaRenderPicture` call carries; this module is everything libva-shaped around
+//! that: the display, the config and context, the surface pool, the submission, and
+//! the DRM-PRIME export the presenter imports. Its output is
+//! [`DecodedImage::NativeDmabuf`] — physically identical to what the FFmpeg VAAPI
+//! rung delivers, deliberately a different variant so a log can never confuse the
+//! two rungs (see that variant's docs).
+//!
+//! # libva is dlopen'd, never linked
+//!
+//! Everything here resolves `libva.so.2` and `libva-drm.so.2` at runtime. Three
+//! things follow, and all three are the point:
+//!
+//! * `pf-client-core` gains no build-time libva dependency, so the **pf-lxcheck2
+//!   container compiles and clippies this whole rung** even though it has no
+//!   `libva-dev`. On a program where `cfg(windows)` code could only ever be checked
+//!   on a box, that is the difference between a defect found on a laptop and one
+//!   found on hardware.
+//! * A machine without libva gets a clean refusal at construction — the ladder
+//!   falls through exactly as it does for any other unavailable rung — instead of a
+//!   packaging dependency or a link error.
+//! * Nothing in the shipped packages needs to change to try it.
+//!
+//! # The surface pool, and why it is not the slot map
+//!
+//! VAAPI has no DPB slots: `VAPictureH264::picture_id` is a `VASurfaceID`, and
+//! `vaBeginPicture` takes the target surface itself. The slot ledger
+//! ([`pf_vaadec::SlotMap`], borrowed from the Vulkan rung) is our own indirection
+//! from a stable `PicId` to a small integer, and a slot is emphatically NOT a
+//! surface index.
+//!
+//! It cannot be, because [`pf_vaadec::SlotMap::assign`] hands out the lowest free
+//! slot and a slot freed by this access unit's own removals is free by then —
+//! measured at **225 of the vendored vector's 250 access units** (pf-vaadec's
+//! `the_setup_picture_routinely_inherits_a_just_freed_slot`). A surface bound by
+//! slot index would therefore decode, on nine frames in ten, straight into the
+//! surface holding the picture that was just displayed. Under zero-copy the
+//! presenter is still sampling that surface: it holds the frame until its fence has
+//! been waited, which is exactly what "zero-copy" costs.
+//!
+//! So the pool follows pf-vkdecode's image model. Surfaces outnumber slots by
+//! [`pf_vaadec::config::PRESENTER_HEADROOM`], the decode target is taken from a free
+//! list at activation time and bound to its slot afterwards, and a surface the
+//! presenter holds simply stays off the free list until its release token comes
+//! back. A surface is free when no live picture is bound to it AND no consumer holds
+//! it — two conditions, tracked separately, because they end at different times.
+
+use std::os::fd::AsRawFd as _;
+use std::os::fd::FromRawFd as _;
+use std::os::fd::OwnedFd;
+use std::os::raw::c_char;
+use std::os::raw::c_int;
+use std::os::raw::c_uint;
+use std::os::raw::c_void;
+use std::sync::mpsc;
+
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::Context as _;
+use anyhow::Result;
+
+use crate::video::DecodeHealth;
+use crate::video::DmabufFrame;
+use crate::video::DmabufPlane;
+use crate::video::DrmFrameGuard;
+use crate::video::StreamFormat;
+use crate::video_color::ColorDesc;
+
+/// `PUNKTFUNK_DECODER=native-vaapi` — the pin that selects this rung.
+///
+/// Pin-only, like M5's native D3D11VA rung was at the same stage and for the same
+/// reason: the native Vulkan rung joined `auto` only after bit-exact parity on
+/// several drivers and a long soak, and this one has decoded nothing yet.
+pub(crate) const DECODER_PIN: &str = "native-vaapi";
+
+// ---------------------------------------------------------------------------
+// libva, resolved at runtime
+// ---------------------------------------------------------------------------
+
+/// `VADisplay` — an opaque driver handle.
+type VaDisplay = *mut c_void;
+type VaStatus = c_int;
+type VaSurfaceId = c_uint;
+type VaConfigId = c_uint;
+type VaContextId = c_uint;
+type VaBufferId = c_uint;
+
+const VA_STATUS_SUCCESS: VaStatus = 0;
+/// `VA_INVALID_ID` — also the "no surface" sentinel in a slot table.
+const VA_INVALID_ID: c_uint = 0xffff_ffff;
+/// `VA_PROGRESSIVE` — the only picture structure this rung's envelope contains.
+const VA_PROGRESSIVE: c_uint = 0x0001;
+
+/// `VAGenericValue` — 16 bytes, value at offset 8, align 8 (measured).
+///
+/// The C type's `value` is a union of `int`/`float`/`void*`/function pointer. Two
+/// consequences are written out here rather than left to a Rust `union` declaration:
+///
+/// * the union holds a pointer, so it is **eight-byte aligned** — which is why the
+///   enum ahead of it is followed by four bytes of padding, and why the whole thing
+///   is 16 bytes and not 12. The compile-time assertion below caught exactly that
+///   mistake in this file;
+/// * a Rust union initialised through its `i32` arm leaves the other four bytes
+///   **uninitialised**, and those are the bytes a driver reading the pointer arm
+///   would see. Naming the remainder and writing zero means everything crossing the
+///   FFI boundary was written by us.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct VaGenericValue {
+    kind: c_int,
+    _pad: u32,
+    /// The union's integer arm, first in the union — where `VAGenericValue.i` lives.
+    i: i32,
+    /// The rest of the union. Always zero.
+    _rest: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VaSurfaceAttrib {
+    kind: c_int,
+    flags: c_uint,
+    value: VaGenericValue,
+}
+
+/// `VASurfaceAttribPixelFormat` / `VAGenericValueTypeInteger` /
+/// `VA_SURFACE_ATTRIB_SETTABLE` — measured by `pf-vaadec/layout-probe.c`.
+const VA_SURFACE_ATTRIB_PIXEL_FORMAT: c_int = 1;
+const VA_GENERIC_VALUE_TYPE_INTEGER: c_int = 1;
+const VA_SURFACE_ATTRIB_SETTABLE: c_uint = 0x0002;
+
+// The layouts these calls pass by value, measured (`pf-vaadec/layout-probe.c`).
+const _: () = {
+    assert!(size_of::<VaGenericValue>() == 16);
+    assert!(std::mem::offset_of!(VaGenericValue, i) == 8);
+    assert!(size_of::<VaSurfaceAttrib>() == 24);
+    assert!(std::mem::offset_of!(VaSurfaceAttrib, flags) == 4);
+    assert!(std::mem::offset_of!(VaSurfaceAttrib, value) == 8);
+};
+
+/// The libva entry points this rung calls, resolved from `libva.so.2` and
+/// `libva-drm.so.2` at runtime (the same pattern the host's NVML and CUDA loaders
+/// use — no link-time dependency, absent library = clean refusal).
+struct Libva {
+    _va: libloading::Library,
+    _drm: libloading::Library,
+    get_display_drm: unsafe extern "C" fn(c_int) -> VaDisplay,
+    initialize: unsafe extern "C" fn(VaDisplay, *mut c_int, *mut c_int) -> VaStatus,
+    terminate: unsafe extern "C" fn(VaDisplay) -> VaStatus,
+    error_str: unsafe extern "C" fn(VaStatus) -> *const c_char,
+    query_config_entrypoints:
+        unsafe extern "C" fn(VaDisplay, c_int, *mut c_int, *mut c_int) -> VaStatus,
+    max_entrypoints: unsafe extern "C" fn(VaDisplay) -> c_int,
+    create_config: unsafe extern "C" fn(
+        VaDisplay,
+        c_int,
+        c_int,
+        *mut c_void,
+        c_int,
+        *mut VaConfigId,
+    ) -> VaStatus,
+    destroy_config: unsafe extern "C" fn(VaDisplay, VaConfigId) -> VaStatus,
+    create_surfaces: unsafe extern "C" fn(
+        VaDisplay,
+        c_uint,
+        c_uint,
+        c_uint,
+        *mut VaSurfaceId,
+        c_uint,
+        *mut VaSurfaceAttrib,
+        c_uint,
+    ) -> VaStatus,
+    destroy_surfaces: unsafe extern "C" fn(VaDisplay, *mut VaSurfaceId, c_int) -> VaStatus,
+    create_context: unsafe extern "C" fn(
+        VaDisplay,
+        VaConfigId,
+        c_int,
+        c_int,
+        c_int,
+        *mut VaSurfaceId,
+        c_int,
+        *mut VaContextId,
+    ) -> VaStatus,
+    destroy_context: unsafe extern "C" fn(VaDisplay, VaContextId) -> VaStatus,
+    create_buffer: unsafe extern "C" fn(
+        VaDisplay,
+        VaContextId,
+        c_uint,
+        c_uint,
+        c_uint,
+        *mut c_void,
+        *mut VaBufferId,
+    ) -> VaStatus,
+    destroy_buffer: unsafe extern "C" fn(VaDisplay, VaBufferId) -> VaStatus,
+    begin_picture: unsafe extern "C" fn(VaDisplay, VaContextId, VaSurfaceId) -> VaStatus,
+    render_picture:
+        unsafe extern "C" fn(VaDisplay, VaContextId, *mut VaBufferId, c_int) -> VaStatus,
+    end_picture: unsafe extern "C" fn(VaDisplay, VaContextId) -> VaStatus,
+    sync_surface: unsafe extern "C" fn(VaDisplay, VaSurfaceId) -> VaStatus,
+    /// `vaExportSurfaceHandle(dpy, surface_id, mem_type, flags, descriptor)` — five
+    /// parameters, and the descriptor's type is decided by `mem_type`.
+    export_surface_handle:
+        unsafe extern "C" fn(VaDisplay, VaSurfaceId, c_uint, c_uint, *mut c_void) -> VaStatus,
+}
+
+impl Libva {
+    fn load() -> Result<Libva> {
+        // SAFETY: `Library::new` runs the trusted system libva's initialisers, and each
+        // `lib.get` resolves a documented libva symbol to the matching `unsafe extern "C"`
+        // signature transcribed from `va.h` / `va_drm.h` (by-value integers and pointers
+        // throughout, no callbacks). Both `Library` handles are stored in the returned
+        // struct, so every resolved pointer outlives its uses.
+        unsafe {
+            let va = libloading::Library::new("libva.so.2")
+                .context("libva.so.2 (no VAAPI runtime on this system)")?;
+            let drm = libloading::Library::new("libva-drm.so.2")
+                .context("libva-drm.so.2 (no VAAPI DRM backend on this system)")?;
+            // Each symbol is resolved AT the field's own type — `Library::get` is
+            // generic, so the struct's declared signature is what `dlsym`'s pointer
+            // is read as. No `transmute` anywhere: a mistyped entry point is then a
+            // mismatch the reader can see next to the declaration rather than a cast
+            // that accepts anything. Bound with `let` (not inline in the literal) so
+            // each borrow of the `Library` ends before it is moved into the struct.
+            macro_rules! get {
+                ($lib:expr, $name:literal) => {
+                    *$lib
+                        .get(concat!($name, "\0").as_bytes())
+                        .map_err(|e| anyhow!(concat!("dlsym ", $name, ": {}"), e))?
+                };
+            }
+            let get_display_drm = get!(drm, "vaGetDisplayDRM");
+            let initialize = get!(va, "vaInitialize");
+            let terminate = get!(va, "vaTerminate");
+            let error_str = get!(va, "vaErrorStr");
+            let query_config_entrypoints = get!(va, "vaQueryConfigEntrypoints");
+            let max_entrypoints = get!(va, "vaMaxNumEntrypoints");
+            let create_config = get!(va, "vaCreateConfig");
+            let destroy_config = get!(va, "vaDestroyConfig");
+            let create_surfaces = get!(va, "vaCreateSurfaces");
+            let destroy_surfaces = get!(va, "vaDestroySurfaces");
+            let create_context = get!(va, "vaCreateContext");
+            let destroy_context = get!(va, "vaDestroyContext");
+            let create_buffer = get!(va, "vaCreateBuffer");
+            let destroy_buffer = get!(va, "vaDestroyBuffer");
+            let begin_picture = get!(va, "vaBeginPicture");
+            let render_picture = get!(va, "vaRenderPicture");
+            let end_picture = get!(va, "vaEndPicture");
+            let sync_surface = get!(va, "vaSyncSurface");
+            let export_surface_handle = get!(va, "vaExportSurfaceHandle");
+            Ok(Libva {
+                get_display_drm,
+                initialize,
+                terminate,
+                error_str,
+                query_config_entrypoints,
+                max_entrypoints,
+                create_config,
+                destroy_config,
+                create_surfaces,
+                destroy_surfaces,
+                create_context,
+                destroy_context,
+                create_buffer,
+                destroy_buffer,
+                begin_picture,
+                render_picture,
+                end_picture,
+                sync_surface,
+                export_surface_handle,
+                _va: va,
+                _drm: drm,
+            })
+        }
+    }
+
+    /// libva's own text for a status code, so a driver's reason reaches the log
+    /// instead of a bare number.
+    fn err(&self, what: &str, status: VaStatus) -> anyhow::Error {
+        // SAFETY: `vaErrorStr` is documented total — it returns a pointer into libva's
+        // static string table for any input, valid while the library is loaded, which
+        // `&self` proves.
+        let text = unsafe {
+            let p = (self.error_str)(status);
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        if text.is_empty() {
+            anyhow!("{what} failed ({status})")
+        } else {
+            anyhow!("{what} failed: {text} ({status})")
+        }
+    }
+
+    fn check(&self, what: &str, status: VaStatus) -> Result<()> {
+        if status == VA_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.err(what, status))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The display
+// ---------------------------------------------------------------------------
+
+/// An initialised `VADisplay` over a DRM render node.
+struct Display {
+    va: Libva,
+    display: VaDisplay,
+    /// The render node. libva does NOT dup the fd it is given, so the display is
+    /// only valid while this is open — it is dropped after `vaTerminate`.
+    node: Option<OwnedFd>,
+    /// Which node, for the field report that asks "which GPU decoded?".
+    path: String,
+    version: (c_int, c_int),
+}
+
+// SAFETY: the display is created and used from ONE thread (the pump), and `Send` only
+// permits MOVING that ownership. libva is not safe for concurrent calls on one
+// display, which is why `Sync` is deliberately absent: every path into it goes through
+// `&mut NativeVaapiDecoder`, and that is the serialisation.
+unsafe impl Send for Display {}
+
+impl Display {
+    /// Open a render node and initialise libva on it.
+    ///
+    /// `PUNKTFUNK_VAAPI_DEVICE` pins a node explicitly. Otherwise nodes are tried in
+    /// name order and the first that initialises wins — the rule libavcodec's VAAPI
+    /// device creation uses when given no device string, so a box that gets hardware
+    /// decode from the FFmpeg rung today gets the same GPU here.
+    ///
+    /// ⚠ On a multi-GPU box that is not necessarily the PRESENTER's GPU, and a dmabuf
+    /// exported from one GPU and imported into another either fails outright or
+    /// copies. The FFmpeg rung has always had this property; the env pin is the
+    /// escape hatch, and the chosen node is logged so a field report can name it.
+    fn open(va: Libva) -> Result<Display> {
+        if let Some(pin) = std::env::var_os("PUNKTFUNK_VAAPI_DEVICE") {
+            let path = pin.to_string_lossy().into_owned();
+            let (display, node, version) = Display::probe(&va, &path)
+                .with_context(|| format!("PUNKTFUNK_VAAPI_DEVICE={path}"))?;
+            return Ok(Display {
+                va,
+                display,
+                node: Some(node),
+                path,
+                version,
+            });
+        }
+        let mut nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")
+            .context("/dev/dri (no DRM devices on this machine)")?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("renderD"))
+            })
+            .collect();
+        nodes.sort();
+        let mut tried: Vec<String> = Vec::new();
+        for node in &nodes {
+            let path = node.to_string_lossy().into_owned();
+            match Display::probe(&va, &path) {
+                Ok((display, node, version)) => {
+                    return Ok(Display {
+                        va,
+                        display,
+                        node: Some(node),
+                        path,
+                        version,
+                    })
+                }
+                Err(e) => {
+                    tracing::debug!(node = %path, reason = %format!("{e:#}"), "not a VAAPI device");
+                    tried.push(path);
+                }
+            }
+        }
+        bail!(
+            "no render node initialised a VAAPI display ({})",
+            if tried.is_empty() {
+                "/dev/dri has no renderD* nodes".to_string()
+            } else {
+                format!("tried {}", tried.join(", "))
+            }
+        )
+    }
+
+    /// Try ONE node, borrowing the loaded library — so a box with several GPUs
+    /// dlopens libva once rather than once per node, and a failure carries only its
+    /// reason.
+    fn probe(va: &Libva, path: &str) -> Result<(VaDisplay, OwnedFd, (c_int, c_int))> {
+        let node = OwnedFd::from(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("open {path}"))?,
+        );
+        // SAFETY: `vaGetDisplayDRM` takes the render node's fd by value and returns an
+        // opaque display or null; `vaInitialize` writes the two version ints through
+        // the out-pointers, which are locals live across the call. The fd stays open in
+        // `node` for as long as the display exists — libva does not dup it.
+        unsafe {
+            let display = (va.get_display_drm)(node.as_raw_fd());
+            if display.is_null() {
+                bail!("vaGetDisplayDRM({path}) returned no display");
+            }
+            let (mut major, mut minor) = (0, 0);
+            let status = (va.initialize)(display, &mut major, &mut minor);
+            if status != VA_STATUS_SUCCESS {
+                let e = va.err("vaInitialize", status);
+                // The display is unusable but still allocated; terminate it so the
+                // driver's own state goes with the attempt.
+                (va.terminate)(display);
+                // No path in the context: every caller already names the node it
+                // asked about, and on a box where nothing initialises that printed
+                // the node twice on every line.
+                return Err(e);
+            }
+            Ok((display, node, (major, minor)))
+        }
+    }
+}
+
+impl Display {
+    /// Does this device decode that profile?
+    ///
+    /// Asked BEFORE `vaCreateConfig` so an unsupported profile is a clean refusal
+    /// naming the profile, not a driver status code — the ladder falls through
+    /// either way, but only one of them tells a field report why.
+    fn require_entrypoint(&self, profile: c_int) -> Result<()> {
+        // SAFETY: `vaMaxNumEntrypoints` returns the array size this display needs;
+        // the vector is allocated to exactly that and `count` is a local written
+        // through by the call.
+        unsafe {
+            let max = (self.va.max_entrypoints)(self.display);
+            if max <= 0 {
+                bail!("vaMaxNumEntrypoints returned {max}");
+            }
+            let mut entrypoints = vec![0 as c_int; max as usize];
+            let mut count: c_int = 0;
+            self.va.check(
+                "vaQueryConfigEntrypoints",
+                (self.va.query_config_entrypoints)(
+                    self.display,
+                    profile,
+                    entrypoints.as_mut_ptr(),
+                    &mut count,
+                ),
+            )?;
+            let vld = pf_vaadec::VA_ENTRYPOINT_VLD as c_int;
+            if !entrypoints[..count.clamp(0, max) as usize].contains(&vld) {
+                bail!("this device has no VLD decode entrypoint for VAProfile {profile}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `vaCreateBuffer` with the data copied in — libva's documented behaviour for a
+    /// non-null `data` pointer, and what makes the caller's structs free to die
+    /// straight after.
+    fn create_buffer(
+        &self,
+        context: VaContextId,
+        kind: u32,
+        size: usize,
+        data: *const c_void,
+    ) -> Result<VaBufferId> {
+        let mut id: VaBufferId = VA_INVALID_ID;
+        // SAFETY: a live display and context; `data` points at `size` readable bytes
+        // for the duration of the call (the caller's live struct or slice), and `id`
+        // is a local written through. libva copies the payload before returning.
+        self.va.check("vaCreateBuffer", unsafe {
+            (self.va.create_buffer)(
+                self.display,
+                context,
+                kind as c_uint,
+                size as c_uint,
+                1,
+                data.cast_mut(),
+                &mut id,
+            )
+        })?;
+        Ok(id)
+    }
+
+    /// Destroy every buffer of a submission.
+    ///
+    /// ⚠ Not optional and not automatic. `va.h` is explicit — *"The user must call
+    /// vaDestroyBuffer() to destroy a buffer"*, and *"a buffer can be re-used and
+    /// sent to the server by another Begin/Render/End sequence if vaDestroyBuffer()
+    /// is not called"*. The libva 0.x behaviour where `vaEndPicture` consumed them is
+    /// long gone; leaking two-plus buffers per picture at 60 fps exhausts the
+    /// driver's buffer store in minutes.
+    fn destroy_buffers(&self, buffers: &[VaBufferId]) {
+        for &b in buffers {
+            if b == VA_INVALID_ID {
+                continue;
+            }
+            // SAFETY: each id came from `create_buffer` on this display and is
+            // destroyed exactly once — the submission's list is consumed here.
+            unsafe { (self.va.destroy_buffer)(self.display, b) };
+        }
+    }
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        // SAFETY: `self.display` was initialised in `open_node` and nothing else
+        // terminates it; `Drop` runs once. The node fd is dropped AFTER this, which is
+        // the order libva requires — it holds the fd, it does not own it.
+        unsafe { (self.va.terminate)(self.display) };
+        self.node = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The stream shape a session is built for
+// ---------------------------------------------------------------------------
+
+/// Everything about a stream that sizes or configures a session. Any change rebuilds
+/// the whole thing: the config, the context, the surface pool and the slot map all
+/// derive from it, and a half-rebuilt session hands out surfaces the pool does not
+/// have. (M5's review found the depth/chroma half of this missing on the D3D11 rung —
+/// the Windows host flips an HDR desktop to PQ in-band with a NEW SPS at unchanged
+/// size, so a shape keyed on size alone decodes 10-bit samples into an 8-bit pool.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamShape {
+    coded_width: u32,
+    coded_height: u32,
+    display_width: u32,
+    display_height: u32,
+    max_dpb_frames: usize,
+    chroma_format_idc: u8,
+    bit_depth: u8,
+}
+
+/// Which codec, and the planner that plans it.
+enum Planner {
+    H264(Box<pf_vaadec::H264Planner>),
+    H265(Box<pf_vaadec::H265Planner>),
+}
+
+impl Planner {
+    fn name(&self) -> &'static str {
+        match self {
+            Planner::H264(_) => "native-vaapi h264",
+            Planner::H265(_) => "native-vaapi h265",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface release: the consumer's half of the zero-copy contract
+// ---------------------------------------------------------------------------
+
+/// What a shipped frame hands back when the consumer is done with it.
+///
+/// `generation` is what makes a renegotiation safe: a token from a retired pool
+/// names a surface index that no longer exists, and freeing that index in the NEW
+/// pool would hand a live surface to the decoder as if it were spare.
+#[derive(Debug, Clone, Copy)]
+struct VaRelease {
+    surface: usize,
+    generation: u64,
+}
+
+/// Holds one shipped picture's surface out of the decoder's free list, and owns the
+/// fds exported for it.
+///
+/// The presenter DUPS every fd it imports (`pf-presenter`'s dmabuf import says so in
+/// as many words) and drops the frame — and so this guard — only after the fence for
+/// its sampling submission has been waited. So "guard dropped" means "the GPU is done
+/// reading", which is exactly when the surface may be decoded into again.
+pub struct VaFrameGuard {
+    /// The exported PRIME fds, closed by this field's own drop. One per OBJECT, not
+    /// per plane: several planes routinely name one object, and closing a shared fd
+    /// twice would close an unrelated file.
+    _fds: Vec<OwnedFd>,
+    tx: mpsc::Sender<VaRelease>,
+    release: VaRelease,
+}
+
+impl Drop for VaFrameGuard {
+    fn drop(&mut self) {
+        // A dead channel means the decoder is gone; there is nothing to release to.
+        let _ = self.tx.send(self.release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The session
+// ---------------------------------------------------------------------------
+
+/// The live config, context and surface pool for one [`StreamShape`].
+struct Session {
+    shape: StreamShape,
+    config: VaConfigId,
+    context: VaContextId,
+    /// The pool. Indices into this are what everything else here refers to.
+    surfaces: Vec<VaSurfaceId>,
+    /// A consumer holds this surface. Cleared when its release token returns.
+    held: Vec<bool>,
+    /// DPB slot → pool index, rebound at ACTIVATION (module docs). `None` for a slot
+    /// holding no picture.
+    slot_surface: Vec<Option<usize>>,
+    /// Decoded pictures the planner has not output yet, `(PicId, pool index)`.
+    /// Separate from the slot binding because the two end at different times: a
+    /// non-reference picture leaves the DPB immediately but still owes an output.
+    pending: Vec<(u64, usize)>,
+    slots: pf_vaadec::SlotMap,
+    /// The surface fourcc the pool was created with (NV12 or P010).
+    fourcc: u32,
+    /// Bumped on every rebuild; stamped into release tokens.
+    generation: u64,
+}
+
+impl Session {
+    /// A surface bound to no live picture, owed no output, and held by no consumer.
+    ///
+    /// All three conditions, because they end at different moments: a picture leaves
+    /// the DPB when the planner removes it, stops being pending when it is output,
+    /// and stops being held when the presenter's fence has been waited — and the
+    /// display is usually the LAST of the three.
+    fn free_surface(&self) -> Option<usize> {
+        (0..self.surfaces.len()).find(|i| {
+            !self.held[*i]
+                && !self.slot_surface.contains(&Some(*i))
+                && !self.pending.iter().any(|(_, p)| p == i)
+        })
+    }
+
+    /// Re-derive the slot bindings from the ledger: a slot the planner released
+    /// binds nothing.
+    ///
+    /// Done by reading the ledger rather than by tracking `removed` here, so there is
+    /// exactly one source of truth for which slots are live. `plan_to_va` has already
+    /// applied this AU's removals by the time it returns.
+    fn sync_slot_bindings(&mut self) {
+        let mut live = vec![false; self.slot_surface.len()];
+        for (slot, _) in self.slots.held() {
+            if let Some(l) = live.get_mut(usize::from(slot)) {
+                *l = true;
+            }
+        }
+        for (slot, bound) in self.slot_surface.iter_mut().enumerate() {
+            if !live[slot] {
+                *bound = None;
+            }
+        }
+    }
+
+    /// Slot → `VASurfaceID`, for the pictures the DPB holds RIGHT NOW.
+    ///
+    /// Built before the conversion, because references resolve against the
+    /// pre-removal state. An unbound slot reads [`VA_INVALID_ID`], never 0 — a zero
+    /// there is a plausible surface id, and the conversion only ever indexes slots
+    /// the ledger says are live, so the sentinel exists to make a bug in that
+    /// argument visible rather than silent.
+    fn surface_table(&self) -> Vec<VaSurfaceId> {
+        self.slot_surface
+            .iter()
+            .map(|b| b.map_or(VA_INVALID_ID, |i| self.surfaces[i]))
+            .collect()
+    }
+
+    /// Release every libva object this session owns, in creation-reverse order.
+    /// Called explicitly (a `Drop` here could not reach the display).
+    fn destroy(mut self, d: &Display) {
+        // SAFETY: every handle was created on this display by `build` and is
+        // destroyed exactly once — `destroy` consumes `self`. Surfaces are freed
+        // after the context that referenced them, which is the order libva documents.
+        unsafe {
+            (d.va.destroy_context)(d.display, self.context);
+            (d.va.destroy_surfaces)(
+                d.display,
+                self.surfaces.as_mut_ptr(),
+                self.surfaces.len() as c_int,
+            );
+            (d.va.destroy_config)(d.display, self.config);
+        }
+    }
+
+    /// Build a config, a surface pool and a context for one stream shape.
+    fn build(d: &Display, codec: pf_vaadec::Codec, shape: StreamShape) -> Result<Session> {
+        let profile = pf_vaadec::profile_for(codec, shape.chroma_format_idc, shape.bit_depth)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rt_format = pf_vaadec::rt_format(shape.chroma_format_idc, shape.bit_depth)
+            .map_err(|e| anyhow!("{e}"))?;
+        let fourcc = match shape.bit_depth {
+            8 => pf_vaadec::VA_FOURCC_NV12,
+            10 => pf_vaadec::VA_FOURCC_P010,
+            other => bail!("no VAAPI surface format for {other}-bit output"),
+        };
+        d.require_entrypoint(profile.value)?;
+
+        // `VAConfigAttribRTFormat` (= 0, measured) is set explicitly rather than left
+        // to the driver's default: on a Main 10 stream the default is the 8-bit
+        // format, and a decoder writing 10-bit samples into an 8-bit surface is the
+        // silent-narrowing failure this program refuses everywhere else.
+        let mut attrib = VaConfigAttrib {
+            kind: VA_CONFIG_ATTRIB_RT_FORMAT,
+            value: rt_format,
+        };
+        let mut config: VaConfigId = VA_INVALID_ID;
+        // SAFETY: a live display; `attrib` and `config` are locals that outlive the
+        // call, and the count matches the slice length.
+        d.va.check("vaCreateConfig", unsafe {
+            (d.va.create_config)(
+                d.display,
+                profile.value,
+                pf_vaadec::VA_ENTRYPOINT_VLD as c_int,
+                (&mut attrib as *mut VaConfigAttrib).cast::<c_void>(),
+                1,
+                &mut config,
+            )
+        })?;
+
+        // From here every early return must destroy what has been created, so the
+        // fallible tail is written as a closure and unwound once.
+        let built = (|| -> Result<Session> {
+            let count = pf_vaadec::surface_count(shape.max_dpb_frames);
+            let mut surfaces: Vec<VaSurfaceId> = vec![VA_INVALID_ID; count];
+            let mut pixel = VaSurfaceAttrib {
+                kind: VA_SURFACE_ATTRIB_PIXEL_FORMAT,
+                flags: VA_SURFACE_ATTRIB_SETTABLE,
+                value: VaGenericValue {
+                    kind: VA_GENERIC_VALUE_TYPE_INTEGER,
+                    _pad: 0,
+                    // The fourcc is an i32 in libva's integer arm; the top bit is
+                    // clear for every fourcc here, so the cast is value-preserving.
+                    i: fourcc as i32,
+                    _rest: 0,
+                },
+            };
+            // Surfaces are allocated at the CODED size. The conformance window is a
+            // display-time crop, and a pool sized to the display region would be
+            // short by the codec's granule padding — the scar that smears rows.
+            // SAFETY: live display; the surface array and the attribute are locals
+            // that outlive the call and the counts match their lengths.
+            d.va.check("vaCreateSurfaces", unsafe {
+                (d.va.create_surfaces)(
+                    d.display,
+                    rt_format,
+                    shape.coded_width,
+                    shape.coded_height,
+                    surfaces.as_mut_ptr(),
+                    count as c_uint,
+                    &mut pixel,
+                    1,
+                )
+            })?;
+
+            let mut context: VaContextId = VA_INVALID_ID;
+            // SAFETY: live display and the config/surfaces just created; `context` is
+            // a local that outlives the call. libva copies the surface array.
+            let status = unsafe {
+                (d.va.create_context)(
+                    d.display,
+                    config,
+                    shape.coded_width as c_int,
+                    shape.coded_height as c_int,
+                    VA_PROGRESSIVE as c_int,
+                    surfaces.as_mut_ptr(),
+                    count as c_int,
+                    &mut context,
+                )
+            };
+            if let Err(e) = d.va.check("vaCreateContext", status) {
+                // SAFETY: destroying the surfaces this closure just created, on the
+                // unwind path, before they are moved into a Session.
+                unsafe {
+                    (d.va.destroy_surfaces)(
+                        d.display,
+                        surfaces.as_mut_ptr(),
+                        surfaces.len() as c_int,
+                    )
+                };
+                return Err(e);
+            }
+
+            let slots = pf_vaadec::SlotMap::new(shape.max_dpb_frames);
+            let slot_count = slots.capacity();
+            tracing::info!(
+                node = %d.path,
+                va = format_args!("{}.{}", d.version.0, d.version.1),
+                profile = profile.name,
+                coded = format_args!("{}x{}", shape.coded_width, shape.coded_height),
+                display = format_args!("{}x{}", shape.display_width, shape.display_height),
+                bit_depth = shape.bit_depth,
+                surfaces = count,
+                dpb_slots = slot_count,
+                "native VAAPI decode session built"
+            );
+            Ok(Session {
+                shape,
+                config,
+                context,
+                surfaces,
+                held: vec![false; count],
+                slot_surface: vec![None; slot_count],
+                pending: Vec::new(),
+                slots,
+                fourcc,
+                generation: 0,
+            })
+        })();
+        if built.is_err() {
+            // SAFETY: destroying the config created above, on the unwind path; no
+            // Session took ownership of it.
+            unsafe { (d.va.destroy_config)(d.display, config) };
+        }
+        built
+    }
+}
+
+/// `VAConfigAttrib` — 8 bytes, `{type, value}` at 0 and 4 (measured).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VaConfigAttrib {
+    kind: c_int,
+    value: c_uint,
+}
+
+/// `VAConfigAttribRTFormat` — measured, and 0 is a real enumerator here rather than
+/// a "left unset", which is why it is named.
+const VA_CONFIG_ATTRIB_RT_FORMAT: c_int = 0;
+
+/// `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` — the export memory type that yields a
+/// [`pf_vaadec::VaDrmPrimeSurfaceDescriptor`]. Measured; the older
+/// `..._DRM_PRIME` (0x2000_0000) hands back a different, smaller structure.
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: c_uint = 0x4000_0000;
+
+const _: () = {
+    assert!(size_of::<VaConfigAttrib>() == 8);
+    assert!(std::mem::offset_of!(VaConfigAttrib, value) == 4);
+};
+
+// ---------------------------------------------------------------------------
+// The decoder
+// ---------------------------------------------------------------------------
+
+/// The native VAAPI rung.
+pub(crate) struct NativeVaapiDecoder {
+    display: Display,
+    planner: Planner,
+    session: Option<Session>,
+    health: DecodeHealth,
+    /// A concealed AU asks the pump for a re-anchor, through the same one throttle
+    /// every other ask uses. Drained by [`Self::take_recovery_request`].
+    recovery_request: bool,
+    generation: u64,
+    release_tx: mpsc::Sender<VaRelease>,
+    release_rx: mpsc::Receiver<VaRelease>,
+    /// Pool-index releases that arrived for a RETIRED generation, so the count of
+    /// what is still outstanding is honest in the log.
+    stale_releases: u64,
+}
+
+impl NativeVaapiDecoder {
+    /// Build the rung, refusing anything this device or this crate cannot decode
+    /// BEFORE the ladder commits to it.
+    ///
+    /// The refusal is at construction on purpose, and it is M3 WP-2's lesson: a
+    /// backend that accepts a session and then refuses its first access unit has
+    /// already cost the ladder its fall-through — the refusal arrives as a decode
+    /// error, burns the demotion streak, and lands the session on a rung far below
+    /// the one it would have had. So the negotiated [`StreamFormat`] is probed here,
+    /// where "no" simply means the next rung is tried.
+    pub(crate) fn new(codec: pf_vaadec::Codec, stream: StreamFormat) -> Result<NativeVaapiDecoder> {
+        let depth = stream.bit_depth;
+        pf_vaadec::profile_for(codec, stream.chroma_format_idc, depth)
+            .map_err(|e| anyhow!("{e}"))
+            .context("the negotiated stream shape has no VAAPI decode profile")?;
+        let va = Libva::load().context("libva")?;
+        let display = Display::open(va)?;
+        let planner = match codec {
+            pf_vaadec::Codec::H264 => Planner::H264(Box::new(pf_vaadec::H264Planner::new())),
+            pf_vaadec::Codec::H265 => Planner::H265(Box::new(pf_vaadec::H265Planner::new())),
+        };
+        let (release_tx, release_rx) = mpsc::channel();
+        Ok(NativeVaapiDecoder {
+            display,
+            planner,
+            session: None,
+            health: DecodeHealth {
+                // VAAPI has no per-picture decode-status query — there is no
+                // counterpart to Vulkan's `RESULT_STATUS_ONLY`, exactly as on
+                // D3D11VA. Saying so is what keeps "clean" and "unmeasured"
+                // distinguishable on the stats line: `failed` is structurally 0
+                // here, and `DecodeHealth::note` enforces that rather than trusting
+                // this rung to never pass a verdict it cannot have.
+                status_queries: false,
+                ..DecodeHealth::default()
+            },
+            recovery_request: false,
+            generation: 0,
+            release_tx,
+            release_rx,
+            stale_releases: 0,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.planner.name()
+    }
+
+    pub(crate) fn health(&self) -> DecodeHealth {
+        self.health
+    }
+
+    /// Drain the re-anchor request a concealed AU raised.
+    pub(crate) fn take_recovery_request(&mut self) -> bool {
+        std::mem::take(&mut self.recovery_request)
+    }
+
+    /// Return surfaces the consumer has finished with to the free list.
+    fn drain_releases(&mut self) {
+        drain_releases_into(
+            &self.release_rx,
+            self.session.as_mut(),
+            &mut self.stale_releases,
+        );
+    }
+
+    /// Decode one access unit.
+    ///
+    /// `Ok(None)` means "no picture from this AU", and covers three different
+    /// things, deliberately none of them errors:
+    ///
+    /// * the planner output nothing yet (reordering, or the very first AUs);
+    /// * the picture was CONCEALED — an integrity warning says a reference was
+    ///   substituted, so the output is released unshown, [`DecodeHealth::damaged`]
+    ///   records it and a re-anchor is requested through the pump's one throttle.
+    ///   Not an error, because three errors in a second demote the rung on exactly
+    ///   the lossy links it exists to diagnose, where an FFmpeg rung conceals the
+    ///   same event silently and keeps its job;
+    /// * an HEVC RASL picture skipped after an open-GOP join. `PlanError::RaslSkipped`
+    ///   is the spec's own answer (8.1.3 NOTE) and must NEVER reach the reanchor
+    ///   path — mapping it to an error would make every open-GOP join beg the host
+    ///   for a keyframe it has no reason to send.
+    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
+        self.drain_releases();
+        let result = if matches!(self.planner, Planner::H264(_)) {
+            self.decode_h264(au)
+        } else {
+            self.decode_h265(au)
+        };
+        // ONE verdict per access unit, folded here and nowhere else. Damage is
+        // reported by the codec arm rather than counted inside it, so a failure
+        // AFTER a clean plan (a submission, an export) is a refusal and only a
+        // refusal — not a clean AU that also refused, which would reset the run
+        // counter a support engineer reads first.
+        match &result {
+            Ok((_, damaged)) => self.health.note(*damaged, false, 0),
+            Err(_) => self.health.note(false, true, 0),
+        }
+        result.map(|(frame, _)| frame)
+    }
+
+    fn decode_h264(&mut self, au: &[u8]) -> Result<(Option<DmabufFrame>, bool)> {
+        let plan = match &mut self.planner {
+            Planner::H264(p) => p.plan_au(au).map_err(|e| anyhow!("{e:?}"))?,
+            Planner::H265(_) => unreachable!("dispatched on the planner's own arm"),
+        };
+        let shape = shape_of(
+            plan.picture.coded_width,
+            plan.picture.coded_height,
+            plan.picture.display_crop,
+            plan.picture.max_dpb_frames,
+            plan.picture.chroma_format_idc,
+            8 + plan.picture.bit_depth_luma_minus8,
+        )?;
+        let damaged = plan.warnings.iter().any(pf_vaadec::is_integrity_warning);
+        if !plan.warnings.is_empty() {
+            tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
+        }
+
+        let Self {
+            display, session, ..
+        } = self;
+        let s = ensure_session(
+            display,
+            session,
+            pf_vaadec::Codec::H264,
+            shape,
+            &mut self.generation,
+        )?;
+        let free = s
+            .free_surface()
+            .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
+        let target = s.surfaces[free];
+        let table = s.surface_table();
+        let converted = pf_vaadec::plan_to_va(&plan, au, &mut s.slots, &table, target)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        bind_setup(s, plan.dpb.stored, free);
+
+        let iq = Some(as_ptr(&converted.iq_matrix));
+        let slice_ptrs: Vec<(*const c_void, usize)> = converted.slices.iter().map(as_ptr).collect();
+        submit(
+            display,
+            s,
+            target,
+            as_ptr(&converted.pic_params),
+            iq,
+            &slice_ptrs,
+            &converted.slice_data,
+            au,
+        )?;
+
+        let frame = finish(
+            display,
+            s,
+            &plan.dpb.outputs,
+            &plan.dpb.removed,
+            damaged,
+            plan.picture.is_idr,
+            colour_of(&plan.picture.colour),
+            &mut self.recovery_request,
+            &self.release_tx,
+        )?;
+        Ok((frame, damaged))
+    }
+
+    fn decode_h265(&mut self, au: &[u8]) -> Result<(Option<DmabufFrame>, bool)> {
+        let plan = match &mut self.planner {
+            Planner::H265(p) => match p.plan_au(au) {
+                Ok(plan) => plan,
+                // The contract pf-bitstream's h265 module docs record for this
+                // wiring: a skipped RASL picture is an Ok-skip, never an error and
+                // never a re-anchor. See [`Self::decode`].
+                Err(pf_vaadec::PlanErrorH265::RaslSkipped { .. }) => return Ok((None, false)),
+                Err(e) => return Err(anyhow!("{e:?}")),
+            },
+            Planner::H264(_) => unreachable!("dispatched on the planner's own arm"),
+        };
+        let shape = shape_of(
+            plan.picture.coded_width,
+            plan.picture.coded_height,
+            plan.picture.display_crop,
+            plan.picture.max_dpb_frames,
+            plan.picture.chroma_format_idc,
+            8 + plan.picture.bit_depth_luma_minus8,
+        )?;
+        let damaged = plan
+            .warnings
+            .iter()
+            .any(pf_vaadec::is_integrity_warning_h265);
+        if !plan.warnings.is_empty() {
+            tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
+        }
+
+        let Self {
+            display, session, ..
+        } = self;
+        let s = ensure_session(
+            display,
+            session,
+            pf_vaadec::Codec::H265,
+            shape,
+            &mut self.generation,
+        )?;
+        let free = s
+            .free_surface()
+            .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
+        let target = s.surfaces[free];
+        let table = s.surface_table();
+        let converted = pf_vaadec::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        bind_setup(s, plan.dpb.stored, free);
+
+        // The IQ matrix is submitted ONLY where the sequence codes scaling lists.
+        // Handing the driver an all-zero matrix on a "use the defaults" stream is
+        // not a harmless extra buffer: the driver must apply what it is given, every
+        // residual dequantises to zero, and the picture drifts to flat prediction.
+        // (M5's review caught exactly this on the DXVA rung, where the buffer was
+        // unconditional. The conversion answers `None` here so the rung cannot.)
+        let iq = converted.iq_matrix.as_ref().map(as_ptr);
+        let slice_ptrs: Vec<(*const c_void, usize)> = converted.slices.iter().map(as_ptr).collect();
+        submit(
+            display,
+            s,
+            target,
+            as_ptr(&converted.pic_params),
+            iq,
+            &slice_ptrs,
+            &converted.slice_data,
+            au,
+        )?;
+
+        let frame = finish(
+            display,
+            s,
+            &plan.dpb.outputs,
+            &plan.dpb.removed,
+            damaged,
+            plan.picture.is_idr,
+            colour_of(&plan.picture.colour),
+            &mut self.recovery_request,
+            &self.release_tx,
+        )?;
+        Ok((frame, damaged))
+    }
+}
+
+impl Drop for NativeVaapiDecoder {
+    fn drop(&mut self) {
+        if self.stale_releases > 0 {
+            // Not an error — a renegotiated session's frames come home to a pool
+            // that no longer exists — but a count worth seeing, because the only
+            // other thing that produces it is release bookkeeping gone wrong.
+            tracing::debug!(
+                count = self.stale_releases,
+                "native VAAPI: releases for retired surface pools"
+            );
+        }
+        if let Some(s) = self.session.take() {
+            s.destroy(&self.display);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared decode plumbing (free functions: the two codec arms differ only in the
+// types their conversions produce, and splitting the borrow of `self` here is
+// what lets one implementation serve both)
+// ---------------------------------------------------------------------------
+
+/// Apply the consumer's finished-with tokens to the pool's holds.
+///
+/// A free function rather than a method so the rule can be tested without a
+/// `Display`: it is pure bookkeeping, and the one thing it must get right — refusing
+/// a token from a pool that no longer exists — is precisely what a test can check and
+/// hardware cannot.
+fn drain_releases_into(
+    rx: &mpsc::Receiver<VaRelease>,
+    mut session: Option<&mut Session>,
+    stale: &mut u64,
+) {
+    while let Ok(token) = rx.try_recv() {
+        let Some(s) = session.as_deref_mut() else {
+            *stale += 1;
+            continue;
+        };
+        if token.generation != s.generation {
+            // A retired pool's surface. Its whole session is gone, so there is
+            // nothing to free — and freeing that index in the CURRENT pool would hand
+            // a live surface to the decoder as a spare.
+            *stale += 1;
+            continue;
+        }
+        match s.held.get_mut(token.surface) {
+            Some(h) => *h = false,
+            None => *stale += 1,
+        }
+    }
+}
+
+/// A live struct as a `(pointer, size)` for `vaCreateBuffer`, which COPIES.
+fn as_ptr<T>(value: &T) -> (*const c_void, usize) {
+    ((value as *const T).cast::<c_void>(), size_of::<T>())
+}
+
+/// H.273 code points straight off the picture's ACTIVE SPS/VUI — per frame, never
+/// latched, because the Windows host switches an HDR desktop to PQ/BT.2020 IN-BAND
+/// with a new SPS while the Welcome still says SDR.
+fn colour_of(c: &pf_vaadec::ColourDescription) -> ColorDesc {
+    ColorDesc {
+        primaries: c.colour_primaries,
+        transfer: c.transfer_characteristics,
+        matrix: c.matrix_coefficients,
+        full_range: c.video_full_range,
+    }
+}
+
+/// Derive the session shape, refusing what the hand-off cannot express.
+fn shape_of(
+    coded_width: u32,
+    coded_height: u32,
+    crop: pf_vaadec::DisplayCrop,
+    max_dpb_frames: usize,
+    chroma_format_idc: u8,
+    bit_depth: u8,
+) -> Result<StreamShape> {
+    // A non-zero conformance-window ORIGIN would have to shift every plane's offset,
+    // and nothing downstream carries one: the dmabuf planes are handed over with the
+    // driver's own offsets and the consumer samples from (0,0). Refused rather than
+    // cropped from the wrong corner — the same latent gap M5 flagged on the D3D11
+    // rung, closed here instead of inherited. Our hosts emit origin (0,0); a stream
+    // that does not simply falls through to the next rung.
+    if crop.x != 0 || crop.y != 0 {
+        bail!(
+            "conformance window at ({}, {}) — this rung hands the surface over \
+             uncropped and cannot express a non-zero origin",
+            crop.x,
+            crop.y
+        );
+    }
+    Ok(StreamShape {
+        coded_width,
+        coded_height,
+        display_width: crop.width,
+        display_height: crop.height,
+        max_dpb_frames,
+        chroma_format_idc,
+        bit_depth,
+    })
+}
+
+/// The session for this shape, rebuilt whole if the stream renegotiated.
+fn ensure_session<'a>(
+    d: &Display,
+    slot: &'a mut Option<Session>,
+    codec: pf_vaadec::Codec,
+    shape: StreamShape,
+    generation: &mut u64,
+) -> Result<&'a mut Session> {
+    if slot.as_ref().is_some_and(|s| s.shape == shape) {
+        return Ok(slot.as_mut().expect("just matched"));
+    }
+    if let Some(old) = slot.take() {
+        tracing::info!(
+            from = ?old.shape,
+            to = ?shape,
+            "native VAAPI stream renegotiated — rebuilding the session"
+        );
+        // Dropped BEFORE the replacement is built so the old pool's video memory is
+        // released first; a 4K pool is on the order of a hundred megabytes.
+        //
+        // Surfaces the CONSUMER still holds are destroyed here too, and that is
+        // sound: an exported PRIME fd holds its own reference on the underlying
+        // buffer object, and the presenter dup'd every fd it imported. The pixels
+        // outlive the VASurface — which is the whole mechanism zero-copy rests on.
+        old.destroy(d);
+    }
+    // A NEW generation, always — this is what makes those outstanding frames safe to
+    // let go of. Their release tokens name surface indices in a pool that no longer
+    // exists, and applying one to the new pool would mark a live surface free and
+    // hand it to the decoder as a spare. The bump is here, at the one place a pool is
+    // ever replaced, rather than at the call sites.
+    *generation += 1;
+    let mut built = Session::build(d, codec, shape)?;
+    built.generation = *generation;
+    Ok(slot.insert(built))
+}
+
+/// Record which surface holds the picture just planned.
+///
+/// The slot bindings are re-derived from the ledger FIRST — the conversion has
+/// already applied this AU's removals, so a slot the planner released binds nothing
+/// — and only then is the setup picture bound, by asking the ledger where it landed.
+/// Asking rather than assuming is what handles the one awkward case: a non-reference
+/// picture with no free frame buffer is stored and evicted inside a single plan, so
+/// it holds NO slot when the conversion returns. Its surface is kept out of the free
+/// list by `pending` instead, until it has been output.
+fn bind_setup(s: &mut Session, stored: Option<u64>, surface: usize) {
+    s.sync_slot_bindings();
+    if let Some(id) = stored {
+        if let Some(slot) = s.slots.slot_of(id) {
+            s.slot_surface[usize::from(slot)] = Some(surface);
+        }
+        s.pending.push((id, surface));
+    }
+}
+
+/// One picture's buffers, in the order libavcodec's VAAPI path submits them: the
+/// parameter buffers in one `vaRenderPicture`, then the interleaved
+/// slice-parameter/slice-data pairs in another. Matching the path drivers are
+/// validated against is worth more than any tidier arrangement.
+#[allow(clippy::too_many_arguments)]
+fn submit(
+    d: &Display,
+    s: &Session,
+    target: VaSurfaceId,
+    pic: (*const c_void, usize),
+    iq: Option<(*const c_void, usize)>,
+    slices: &[(*const c_void, usize)],
+    slice_data: &[std::ops::Range<usize>],
+    au: &[u8],
+) -> Result<()> {
+    if slices.len() != slice_data.len() {
+        bail!(
+            "{} slice records for {} data ranges",
+            slices.len(),
+            slice_data.len()
+        );
+    }
+    let mut params: Vec<VaBufferId> = Vec::with_capacity(2);
+    let mut slice_buffers: Vec<VaBufferId> = Vec::with_capacity(slices.len() * 2);
+    // A picture that was BEGUN must be ended even if a step in between failed, or
+    // the context stays mid-picture and every later `vaBeginPicture` fails on a
+    // stream that was otherwise recoverable. libavcodec's VAAPI path has the same
+    // `fail_with_picture` label for the same reason.
+    let mut begun = false;
+    // Every buffer created below must be destroyed whatever happens next — libva
+    // does not reclaim them at `vaEndPicture` (see `Display::destroy_buffers`).
+    let result = (|| -> Result<()> {
+        params.push(
+            d.create_buffer(
+                s.context,
+                pf_vaadec::va::VA_PICTURE_PARAMETER_BUFFER_TYPE,
+                pic.1,
+                pic.0,
+            )
+            .context("picture parameter buffer")?,
+        );
+        if let Some((ptr, size)) = iq {
+            params.push(
+                d.create_buffer(
+                    s.context,
+                    pf_vaadec::va::VA_IQ_MATRIX_BUFFER_TYPE,
+                    size,
+                    ptr,
+                )
+                .context("IQ matrix buffer")?,
+            );
+        }
+        for (n, ((ptr, size), range)) in slices.iter().zip(slice_data).enumerate() {
+            let data = au.get(range.clone()).ok_or_else(|| {
+                anyhow!(
+                    "slice {n}: range {range:?} is outside a {}-byte access unit",
+                    au.len()
+                )
+            })?;
+            slice_buffers.push(
+                d.create_buffer(
+                    s.context,
+                    pf_vaadec::va::VA_SLICE_PARAMETER_BUFFER_TYPE,
+                    *size,
+                    *ptr,
+                )
+                .with_context(|| format!("slice {n} parameter buffer"))?,
+            );
+            slice_buffers.push(
+                d.create_buffer(
+                    s.context,
+                    pf_vaadec::va::VA_SLICE_DATA_BUFFER_TYPE,
+                    data.len(),
+                    data.as_ptr().cast::<c_void>(),
+                )
+                .with_context(|| format!("slice {n} data buffer"))?,
+            );
+        }
+
+        // SAFETY: a live display, context and target surface; both buffer arrays are
+        // locals that outlive their calls and their counts match their lengths.
+        unsafe {
+            d.va.check(
+                "vaBeginPicture",
+                (d.va.begin_picture)(d.display, s.context, target),
+            )?;
+            begun = true;
+            d.va.check(
+                "vaRenderPicture(parameters)",
+                (d.va.render_picture)(
+                    d.display,
+                    s.context,
+                    params.as_mut_ptr(),
+                    params.len() as c_int,
+                ),
+            )?;
+            d.va.check(
+                "vaRenderPicture(slices)",
+                (d.va.render_picture)(
+                    d.display,
+                    s.context,
+                    slice_buffers.as_mut_ptr(),
+                    slice_buffers.len() as c_int,
+                ),
+            )?;
+            begun = false;
+            d.va.check("vaEndPicture", (d.va.end_picture)(d.display, s.context))?;
+        }
+        Ok(())
+    })();
+    if begun {
+        // SAFETY: a live display and context with a picture open; the status is
+        // deliberately discarded — the real failure is `result`, and reporting this
+        // one would replace the cause with its consequence.
+        unsafe { (d.va.end_picture)(d.display, s.context) };
+    }
+    d.destroy_buffers(&params);
+    d.destroy_buffers(&slice_buffers);
+    result
+}
+
+/// Turn this AU's OUTPUT list into at most one shipped frame.
+///
+/// Display order, not decode order. `plan.dpb.outputs` is what the planner says is
+/// ready to be shown and in what order, and the surface for each is looked up by
+/// `PicId` — so a reordering stream presents correctly rather than in the order the
+/// pictures happened to decode. (The native D3D11VA rung does present in decode
+/// order; that is a known finding on a rung that blits its output away, and there
+/// was no reason to inherit it here where the display-order queue costs a lookup.)
+///
+/// Newest wins, which is the same rule the FFmpeg VAAPI rung applies inside its
+/// receive loop: on a live stream a picture already superseded is not worth a frame
+/// interval. Superseded outputs are released rather than exported.
+///
+/// The retirement rule is `pf_vkdecode`'s `settle_dpb`, reimplemented here over this
+/// rung's flat pending list rather than reasoned out again, because both halves of it
+/// are easy to get wrong:
+///
+/// * **`removed` retires a pending picture too.** A picture can leave the DPB without
+///   ever being output (`no_output_of_prior_pics` at an IDR is the everyday case), and
+///   a pending list that only shrinks on OUTPUT keeps its surface off the free list
+///   for the rest of the session — a slow, silent walk into pool exhaustion.
+/// * **An output naming no pending picture is a TRACE, not an error.** Ids planned
+///   before this decoder existed, or dropped across a session rebuild, are
+///   display-order gaps.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    d: &Display,
+    s: &mut Session,
+    outputs: &[u64],
+    removed: &[u64],
+    damaged: bool,
+    keyframe: bool,
+    color: ColorDesc,
+    recovery_request: &mut bool,
+    tx: &mpsc::Sender<VaRelease>,
+) -> Result<Option<DmabufFrame>> {
+    // A concealed picture is not shown: it was decoded from a substitute reference,
+    // so shipping it paints the substitution on screen. Nothing this AU output is
+    // shown, the pump is asked to re-anchor, and the caller records the damage.
+    let shown = if damaged {
+        None
+    } else {
+        outputs.last().copied()
+    };
+    // OUTPUTS FIRST, and the shown one is taken out before anything else runs.
+    // A picture is normally output and removed by the SAME access unit — that is
+    // what bumping is — so retiring `removed` before claiming the frame would
+    // discard the very picture about to be displayed, on essentially every AU.
+    let claimed = shown.and_then(|id| {
+        let found = s.pending.iter().position(|(pid, _)| *pid == id);
+        if found.is_none() {
+            tracing::trace!(id, "output id without a pending picture");
+        }
+        found.map(|index| s.pending.remove(index).1)
+    });
+    for id in outputs {
+        if Some(*id) != shown {
+            s.pending.retain(|(pid, _)| pid != id);
+        }
+    }
+    // Whatever left the DPB is retired from the pending list whether or not it was
+    // ever output. Its SURFACE only becomes free if nothing else holds it — a
+    // reference still bound to a slot, or a frame the consumer has, stays put.
+    for id in removed {
+        s.pending.retain(|(pid, _)| pid != id);
+    }
+    if damaged {
+        *recovery_request = true;
+        return Ok(None);
+    }
+    let Some(surface_index) = claimed else {
+        return Ok(None);
+    };
+    let surface = s.surfaces[surface_index];
+
+    // OWNED from here. `export` wraps the descriptor's fds the moment the call
+    // succeeds, so every refusal below closes them by dropping rather than by
+    // remembering to — an earlier draft leaked one fd per refused frame.
+    let (exported, fds) = export(d, surface)?;
+    if exported.fourcc != s.fourcc {
+        // The pool was created with an explicit pixel format; a surface exporting a
+        // different one means the driver silently substituted, and the consumer
+        // would import the wrong layout.
+        bail!(
+            "surface exported fourcc {:#010x}, the pool was created as {:#010x}",
+            exported.fourcc,
+            s.fourcc
+        );
+    }
+    if exported.planes.len() < 2 {
+        bail!(
+            "a two-plane surface exported {} plane(s) — the chroma is missing",
+            exported.planes.len()
+        );
+    }
+
+    s.held[surface_index] = true;
+    let planes = exported
+        .planes
+        .iter()
+        .map(|p| DmabufPlane {
+            fd: p.fd,
+            offset: p.offset,
+            stride: p.stride,
+        })
+        .collect();
+    Ok(Some(DmabufFrame {
+        // The DISPLAY region. The surface is allocated at the coded size and is
+        // taller/wider than the picture; handing over the coded size would show the
+        // codec's granule padding.
+        width: s.shape.display_width,
+        height: s.shape.display_height,
+        fourcc: exported.fourcc,
+        modifier: exported.modifier,
+        planes,
+        color,
+        keyframe,
+        guard: DrmFrameGuard::NativeVa(VaFrameGuard {
+            _fds: fds,
+            tx: tx.clone(),
+            release: VaRelease {
+                surface: surface_index,
+                generation: s.generation,
+            },
+        }),
+    }))
+}
+
+/// Wait for the decode and export the surface as DRM-PRIME dmabufs.
+///
+/// The `vaSyncSurface` is what makes the hand-off safe: VAAPI exposes no fence to
+/// the importer, so the accepted contract on this path — and what libavcodec's own
+/// VAAPI→DRM_PRIME mapping does — is to sync before the fds leave. It is a blocking
+/// wait on the pump thread, which is worth naming: at 60 fps against decodes of a
+/// millisecond or two it is slack, and the alternative is handing the presenter a
+/// surface the GPU has not finished writing.
+///
+/// Returns the flattened surface AND the fds it owns, together — so that from the
+/// instant the export succeeds those fds are RAII-owned and every later refusal
+/// closes them by dropping. `ExportedSurface::planes` still carries the raw fds,
+/// borrowed from these: several planes routinely name one object, and each object's
+/// fd must be closed exactly once.
+fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaadec::ExportedSurface, Vec<OwnedFd>)> {
+    // SAFETY: a live display and a surface from its own pool.
+    d.va.check("vaSyncSurface", unsafe {
+        (d.va.sync_surface)(d.display, surface)
+    })?;
+
+    let mut desc = pf_vaadec::VaDrmPrimeSurfaceDescriptor::zeroed();
+    // SAFETY: a live display and surface; `desc` is a local of exactly the layout
+    // `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` writes (measured by
+    // `pf-vaadec/layout-probe.c` and compile-asserted), and it outlives the call.
+    d.va.check("vaExportSurfaceHandle", unsafe {
+        (d.va.export_surface_handle)(
+            d.display,
+            surface,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            pf_vaadec::VA_EXPORT_SURFACE_SEPARATE_LAYERS | pf_vaadec::VA_EXPORT_SURFACE_READ_ONLY,
+            (&mut desc as *mut pf_vaadec::VaDrmPrimeSurfaceDescriptor).cast::<c_void>(),
+        )
+    })?;
+
+    match pf_vaadec::flatten(&desc) {
+        Ok(exported) => {
+            let fds = exported
+                .object_fds
+                .iter()
+                // SAFETY: each fd came out of a successful `vaExportSurfaceHandle`
+                // and is owned by this process exactly once. `flatten` lists one per
+                // OBJECT, so no fd is wrapped twice even where planes share it.
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+                .collect();
+            Ok((exported, fds))
+        }
+        Err(e) => {
+            // The export SUCCEEDED, so its fds belong to this process even though the
+            // descriptor cannot be read as a surface. Every writable slot is swept
+            // rather than the first `num_objects` — a refusal for a bogus
+            // `num_objects` is exactly the case where that count cannot be trusted to
+            // bound anything.
+            for object in &desc.objects {
+                if object.fd >= 0 {
+                    // SAFETY: an fd this process owns from the successful export;
+                    // wrapping it in an `OwnedFd` that immediately drops closes it once.
+                    drop(unsafe { OwnedFd::from_raw_fd(object.fd) });
+                }
+            }
+            Err(anyhow!("{e}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session whose libva handles are never used — every field exercised below is
+    /// plain bookkeeping, which is exactly why this rule can be tested at all without
+    /// a GPU. The pool is deliberately small so an exhausted free list is reachable.
+    fn session(surfaces: usize, slots: usize) -> Session {
+        Session {
+            shape: StreamShape {
+                coded_width: 64,
+                coded_height: 64,
+                display_width: 64,
+                display_height: 64,
+                max_dpb_frames: slots - 1,
+                chroma_format_idc: 1,
+                bit_depth: 8,
+            },
+            config: VA_INVALID_ID,
+            context: VA_INVALID_ID,
+            surfaces: (0..surfaces as u32).map(|i| 0x100 + i).collect(),
+            held: vec![false; surfaces],
+            slot_surface: vec![None; slots],
+            pending: Vec::new(),
+            slots: pf_vaadec::SlotMap::new(slots - 1),
+            fourcc: pf_vaadec::VA_FOURCC_NV12,
+            generation: 1,
+        }
+    }
+
+    /// The whole rule, in one test: a surface is free only when NOTHING claims it,
+    /// and the three claims end at different moments.
+    #[test]
+    fn a_surface_is_free_only_when_no_slot_no_output_and_no_consumer_claims_it() {
+        let mut s = session(4, 3);
+        assert_eq!(
+            s.free_surface(),
+            Some(0),
+            "a fresh pool starts at the front"
+        );
+
+        // 0: a live DPB reference. 1: decoded, still owing an output. 2: on screen.
+        s.slot_surface[0] = Some(0);
+        s.pending.push((7, 1));
+        s.held[2] = true;
+        assert_eq!(
+            s.free_surface(),
+            Some(3),
+            "the first three are each claimed a different way"
+        );
+
+        // Losing ONE claim is not enough when another still stands.
+        s.held[3] = true;
+        s.slot_surface[1] = Some(1);
+        assert_eq!(
+            s.free_surface(),
+            None,
+            "an exhausted pool must say so rather than hand out a claimed surface"
+        );
+
+        // Surface 1 is both slot-bound and pending: releasing only the output keeps
+        // it out, and only when the slot goes too does it come back.
+        s.pending.clear();
+        assert_eq!(s.free_surface(), None);
+        s.slot_surface[1] = None;
+        assert_eq!(s.free_surface(), Some(1));
+    }
+
+    /// The consumer's release is what ends the third claim — and it must be matched
+    /// to the generation that issued it, or a renegotiation hands a live surface out.
+    #[test]
+    fn a_release_from_a_retired_pool_never_frees_a_surface_in_the_new_one() {
+        let mut s = session(4, 3);
+        s.held[2] = true;
+        let (tx, rx) = mpsc::channel();
+        let mut stale = 0u64;
+
+        // A token from the pool that was retired before this one. Surface index 2
+        // exists in BOTH pools, which is what makes this dangerous: the index is
+        // valid, and only the generation says it means a different surface.
+        tx.send(VaRelease {
+            surface: 2,
+            generation: 0,
+        })
+        .expect("the receiver is alive");
+        drain_releases_into(&rx, Some(&mut s), &mut stale);
+        assert!(
+            s.held[2],
+            "a stale generation must not clear a hold in the CURRENT pool"
+        );
+        assert_eq!(stale, 1, "and it must be counted, not silent");
+
+        // The matching generation does free it.
+        tx.send(VaRelease {
+            surface: 2,
+            generation: 1,
+        })
+        .expect("the receiver is alive");
+        drain_releases_into(&rx, Some(&mut s), &mut stale);
+        assert!(!s.held[2]);
+        assert_eq!(stale, 1);
+
+        // An index the pool does not have is counted, never a panic.
+        tx.send(VaRelease {
+            surface: 99,
+            generation: 1,
+        })
+        .expect("the receiver is alive");
+        drain_releases_into(&rx, Some(&mut s), &mut stale);
+        assert_eq!(stale, 2);
+    }
+
+    /// The bindings follow the ledger: a slot the planner released binds nothing,
+    /// and the surface it held is only free if nothing else claims it.
+    #[test]
+    fn syncing_bindings_drops_the_slots_the_ledger_no_longer_holds() {
+        let mut s = session(4, 3);
+        s.slot_surface[0] = Some(0);
+        s.slot_surface[1] = Some(1);
+        s.slots.assign(11).expect("a free slot");
+        s.sync_slot_bindings();
+        assert_eq!(
+            s.slot_surface,
+            vec![Some(0), None, None],
+            "slot 0 is held by picture 11; slot 1's picture is gone"
+        );
+    }
+
+    /// A conformance window with a non-zero ORIGIN is refused, not cropped from the
+    /// wrong corner: nothing downstream carries an origin.
+    #[test]
+    fn a_non_zero_crop_origin_is_refused() {
+        let ok = shape_of(
+            1920,
+            1088,
+            pf_vaadec::DisplayCrop {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            4,
+            1,
+            8,
+        )
+        .expect("the ordinary 1088-coded 1080 picture");
+        assert_eq!((ok.display_width, ok.display_height), (1920, 1080));
+        assert_eq!((ok.coded_width, ok.coded_height), (1920, 1088));
+
+        assert!(shape_of(
+            1920,
+            1088,
+            pf_vaadec::DisplayCrop {
+                x: 8,
+                y: 0,
+                width: 1912,
+                height: 1080,
+            },
+            4,
+            1,
+            8,
+        )
+        .is_err());
+    }
+
+    /// A shape this rung cannot decode is refused BEFORE libva is even loaded.
+    ///
+    /// The ordering is the point, not the refusal. M3 WP-2's review caught the
+    /// opposite arrangement on the Vulkan rung: a backend that accepts a session and
+    /// then refuses its first access unit has already cost the ladder its
+    /// fall-through — the refusal arrives as a decode error, burns the demotion
+    /// streak, and lands the session several rungs lower than it would have been.
+    /// Asserting on the MESSAGE is what pins the order: this test passes on a machine
+    /// with libva and on one without, and only stays passing while the profile probe
+    /// comes first.
+    #[test]
+    fn a_shape_with_no_profile_is_refused_before_libva_is_loaded() {
+        let e = NativeVaapiDecoder::new(
+            pf_vaadec::Codec::H264,
+            StreamFormat {
+                chroma_format_idc: 3,
+                bit_depth: 8,
+            },
+        )
+        .err()
+        .expect("4:4:4 H.264 has no VAAPI profile in this rung's envelope");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("profile"),
+            "the refusal must name the stream shape, not whatever libva said: {text}"
+        );
+    }
+
+    /// On-glass probe: resolve every entry point against the REAL libva on this
+    /// machine, then say what each render node does.
+    ///
+    /// This is the one thing no gate can check. `dlsym` takes a STRING: a mistyped
+    /// entry point compiles, clippies and unit-tests perfectly and fails only on a
+    /// machine with libva — so the 19 names are worth exercising once against a real
+    /// runtime, and this test is how. It is also the honest report of a box's VAAPI
+    /// situation: a node that will not initialise is a legitimate outcome (NVIDIA has
+    /// no usable VAAPI driver), printed rather than failed, because the rung's claim
+    /// is that such a box REFUSES CLEANLY and lets the ladder fall through.
+    ///
+    /// `cargo test -p pf-client-core --lib probe_this_machines_libva -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a machine with a libva runtime"]
+    fn probe_this_machines_libva() {
+        let va = match Libva::load() {
+            Ok(va) => {
+                eprintln!("libva: every entry point resolved");
+                va
+            }
+            Err(e) => {
+                eprintln!("libva: NOT LOADED — {e:#}");
+                eprintln!("(this is the clean-refusal path; the ladder falls through here)");
+                return;
+            }
+        };
+
+        let mut nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")
+            .expect("/dev/dri")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("renderD"))
+            })
+            .collect();
+        nodes.sort();
+        eprintln!("render nodes: {nodes:?}");
+
+        let mut opened = 0;
+        for node in &nodes {
+            let path = node.to_string_lossy().into_owned();
+            match Display::probe(&va, &path) {
+                Ok((display, fd, version)) => {
+                    opened += 1;
+                    eprintln!("  {path}: VA-API {}.{}", version.0, version.1);
+                    let d = Display {
+                        va: Libva::load().expect("libva loaded once already"),
+                        display,
+                        node: Some(fd),
+                        path: path.clone(),
+                        version,
+                    };
+                    for (name, profile) in [
+                        ("H.264 High", pf_vaadec::config::VA_PROFILE_H264_HIGH),
+                        ("HEVC Main", pf_vaadec::config::VA_PROFILE_HEVC_MAIN),
+                        ("HEVC Main 10", pf_vaadec::config::VA_PROFILE_HEVC_MAIN10),
+                    ] {
+                        match d.require_entrypoint(profile) {
+                            Ok(()) => eprintln!("    {name}: VLD decode"),
+                            Err(e) => eprintln!("    {name}: no ({e})"),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("  {path}: {e:#}"),
+            }
+        }
+        eprintln!(
+            "{opened} of {} node(s) initialised a VAAPI display",
+            nodes.len()
+        );
+    }
+}

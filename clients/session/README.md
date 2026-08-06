@@ -62,7 +62,9 @@ tone-map in-shader to SDR when it doesn't (`PUNKTFUNK_TONEMAP_PEAK` tunes the ro
 default ≈1000 nits). The host still gates the upgrade behind its `PUNKTFUNK_10BIT`
 policy.
 
-Debug/bisect knobs: `PUNKTFUNK_DECODER=native-vulkan|vulkan|vaapi|d3d11va|software`, `PUNKTFUNK_PRESENT_MODE=
+Debug/bisect knobs: `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|native-d3d11va|vulkan|vaapi|d3d11va|software`
+(the three `native-*` values pin this program's own decoders; `native-vaapi` also takes
+`PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderDNNN` to choose the GPU), `PUNKTFUNK_PRESENT_MODE=
 mailbox|fifo|immediate|fifo_relaxed` (default MAILBOX, FIFO where the surface offers no
 MAILBOX — AMD on Windows), `PUNKTFUNK_VK_DEVICE=<index>` (multi-GPU), and
 `PUNKTFUNK_HW_FAULT=import` (fault every VAAPI dmabuf import — proves the three-strike

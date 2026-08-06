@@ -424,7 +424,7 @@ impl VulkanDecoder {
                 coded_height: ((*fc).height.max((*self.frame).height)) as u32,
                 color: ColorDesc::from_raw(self.frame),
                 keyframe: frame_is_keyframe(self.frame),
-                guard: DrmFrameGuard(clone),
+                guard: DrmFrameGuard::Av(clone),
             })
         }
     }

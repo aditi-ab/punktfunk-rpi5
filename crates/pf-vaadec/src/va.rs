@@ -48,6 +48,19 @@
 /// one vendor and not another, so both are always written together.
 pub const VA_INVALID_SURFACE: u32 = 0xffff_ffff;
 
+/// `VABufferType` for the four buffers a decode submits, measured off real headers
+/// by `layout-probe.c` rather than counted off the enum in the header.
+///
+/// ⚠ The last two are the trap: `VASliceParameterBufferType` is **4** and
+/// `VASliceDataBufferType` is **5**, not the 3 and 4 that counting from the top
+/// gives — `VABitPlaneBufferType` and `VASliceGroupMapBufferType` sit in between
+/// for the codecs that need them. Getting these wrong hands the driver a slice as
+/// if it were something else, which is not a decode error but a decode of garbage.
+pub const VA_PICTURE_PARAMETER_BUFFER_TYPE: u32 = 0;
+pub const VA_IQ_MATRIX_BUFFER_TYPE: u32 = 1;
+pub const VA_SLICE_PARAMETER_BUFFER_TYPE: u32 = 4;
+pub const VA_SLICE_DATA_BUFFER_TYPE: u32 = 5;
+
 /// Flags for [`VaPictureH264::flags`].
 pub const VA_PICTURE_H264_INVALID: u32 = 0x0000_0001;
 pub const VA_PICTURE_H264_TOP_FIELD: u32 = 0x0000_0002;

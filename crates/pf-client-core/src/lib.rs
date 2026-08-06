@@ -77,6 +77,12 @@ mod video_software;
 mod video_libav;
 #[cfg(target_os = "linux")]
 mod video_vaapi;
+// Native VAAPI decode (M6 of the native-decode program): pf-vaadec's plans driven
+// straight into libva, dlopen'd at runtime, exporting DRM-PRIME dmabufs the
+// presenter imports — the FFmpeg-free replacement for `video_vaapi`. Pin-only for
+// now (`PUNKTFUNK_DECODER=native-vaapi`).
+#[cfg(target_os = "linux")]
+pub mod video_vaapi_native;
 // Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
 // WP-2): pf-vkdecode's H.264/H.265 decoders on the presenter's shared device — auto's
 // rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision; the program is

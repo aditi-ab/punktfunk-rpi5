@@ -197,7 +197,7 @@ impl VaapiDecoder {
                 return Err(averr("av_hwframe_map", r));
             }
             let desc = (*drm).data[0] as *const ffi::AVDRMFrameDescriptor;
-            let guard = DrmFrameGuard(drm);
+            let guard = DrmFrameGuard::Av(drm);
             let d = &*desc;
             if d.nb_layers < 1 || d.nb_objects < 1 {
                 bail!("DRM descriptor without layers/objects");

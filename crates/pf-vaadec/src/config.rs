@@ -112,11 +112,25 @@ pub fn rt_format(chroma_format_idc: u8, depth: u8) -> Result<u32, ConfigError> {
     }
 }
 
-/// Headroom over the DPB for pictures the presenter still holds.
+/// Headroom over the DPB for pictures the CONSUMER still holds.
 ///
-/// A surface handed to the compositor is not free to decode into, and a pool sized
-/// exactly to the DPB stalls the decoder behind the display.
-pub const PRESENTER_HEADROOM: usize = 4;
+/// A surface handed to the presenter is not free to decode into — that is what
+/// zero-copy costs — and a pool sized exactly to the DPB stalls the decoder behind
+/// the display.
+///
+/// **8, matching `pf_vkdecode::images::HOLD_HEADROOM`, and for its measurement**:
+/// the real client pipeline holds roughly four to seven frames at steady state (two
+/// bounded(2) channels, the frame store's 1..=3 preroll, the in-flight present and
+/// the retired-frame slot), so eight leaves a frame of slack and a consumer holding
+/// more than that has earned an honest "pool exhausted" rather than a silent stall.
+/// The number was 4 when this module was written against no consumer; the native
+/// Vulkan rung had already measured the pipeline by then, and 4 would have run the
+/// pool dry on an ordinary stream.
+///
+/// (The FFmpeg VAAPI rung asks libavcodec for `extra_hw_frames = 4` and survives on
+/// it, but its pool is not this pool: `av_hwframe_get_buffer` BLOCKS until a surface
+/// frees, so its headroom buys latency where ours buys correctness.)
+pub const PRESENTER_HEADROOM: usize = 8;
 
 /// How many decode surfaces a session allocates: the DPB, plus the picture being
 /// decoded, plus [`PRESENTER_HEADROOM`].
@@ -168,7 +182,19 @@ mod tests {
 
     #[test]
     fn the_surface_pool_covers_dpb_plus_current_plus_headroom() {
-        assert_eq!(surface_count(4), 9);
-        assert_eq!(surface_count(16), 21);
+        assert_eq!(surface_count(4), 4 + 1 + PRESENTER_HEADROOM);
+        assert_eq!(surface_count(16), 16 + 1 + PRESENTER_HEADROOM);
+    }
+
+    /// The headroom must cover what the client pipeline actually holds, which the
+    /// native Vulkan rung measured before this crate existed. Pinning it to that
+    /// crate's constant means a future re-measurement moves both rungs together
+    /// instead of leaving this one quietly short.
+    #[test]
+    fn the_headroom_matches_the_pipeline_depth_the_vulkan_rung_measured() {
+        assert_eq!(
+            PRESENTER_HEADROOM,
+            pf_vkdecode::images::HOLD_HEADROOM as usize
+        );
     }
 }

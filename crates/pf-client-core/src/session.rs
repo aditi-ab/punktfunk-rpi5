@@ -892,6 +892,11 @@ fn pump(
                             DecodedImage::Cpu(_) => "software",
                             #[cfg(target_os = "linux")]
                             DecodedImage::Dmabuf(_) => "vaapi",
+                            // A separate VARIANT rather than a flag on the frame,
+                            // unlike the D3D11VA pair below — so this tag cannot be
+                            // forgotten, only written.
+                            #[cfg(target_os = "linux")]
+                            DecodedImage::NativeDmabuf(_) => "native-vaapi",
                             DecodedImage::VkFrame(_) => "vulkan",
                             // Both D3D11VA rungs deliver this variant — they share the
                             // hand-off ring on purpose — so the frame carries which one
@@ -915,6 +920,10 @@ fn pump(
                                 DecodedImage::Cpu(c) => (c.width, c.height, "software"),
                                 #[cfg(target_os = "linux")]
                                 DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
+                                #[cfg(target_os = "linux")]
+                                DecodedImage::NativeDmabuf(d) => {
+                                    (d.width, d.height, "native-vaapi-dmabuf")
+                                }
                                 DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                                 #[cfg(windows)]
                                 DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
