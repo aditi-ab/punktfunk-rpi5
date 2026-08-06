@@ -19,25 +19,14 @@
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
-	<!-- App Transport Security. We talk to the user's OWN host over HTTPS with a SELF-SIGNED
-	     certificate at a user-supplied address, and verify it by SHA-256 fingerprint pinning
-	     established during PIN pairing (LibraryTLSDelegate) — for a box on someone's LAN there is
-	     no CA that could vouch for it, so pinning is the stronger check, not a weaker one.
-	     Default ATS exempts only "local" destinations (.local, unqualified names, RFC1918 and
-	     link-local literals). Every other address gets the full policy, which a self-signed cert
-	     cannot satisfy — so the management API (game library) worked at 192.168.x but died at the
-	     TLS layer on Tailscale's 100.64/10 CGNAT range, a WireGuard peer, or a public IP. The QUIC
-	     stream plane never showed it: that is raw UDP and never enters the URL loading system.
-	     ⚠ This must stay the ONLY key in this dict. On iOS 10+/macOS 10.12+ the system IGNORES
-	     NSAllowsArbitraryLoads whenever NSAllowsLocalNetworking, NSAllowsArbitraryLoadsInWebContent
-	     or NSAllowsArbitraryLoadsForMedia is present alongside it — adding one silently restores
-	     the bug. Other origins (cover-art CDNs) keep full system trust evaluation regardless:
-	     LibraryTLSDelegate hands every non-host challenge to .performDefaultHandling. -->
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-	</dict>
+	<!-- NOTE: there is deliberately NO NSAppTransportSecurity dict here. ATS stays fully ON.
+	     The host is self-signed at a user-supplied address, which default ATS can never accept
+	     (it exempts only .local, unqualified names, and RFC1918/link-local literals — notably NOT
+	     Tailscale's 100.64/10 CGNAT range), so the management API talks over MgmtTransport
+	     (Network.framework), which is outside the URL loading system and pins the host by
+	     SHA-256 fingerprint instead. That leaves cover-art CDN fetches as the app's only
+	     URLSession traffic, and they keep the full ATS policy — which is the whole reason not to
+	     reach for NSAllowsArbitraryLoads here. See MgmtTransport.swift. -->
 	<!-- Background keep-alive (opt-in, iOS/iPadOS): the ONLY sanctioned way to keep the long-lived
 	     QUIC socket + pump-thread set alive while backgrounded is the audio background mode, backed
 	     by the session's real, audible remote audio (AVAudioEngine keeps rendering). Video decode is

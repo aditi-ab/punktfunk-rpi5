@@ -24,10 +24,9 @@ struct LibraryView: View {
     @State private var games: [GameEntry] = []
     @State private var loading = false
     @State private var errorText: String?
-    /// Authenticated session for cover-art fetches (the same paired identity + host pinning as the
-    /// list fetch, reused across every poster in the grid). Built alongside `games` in `load()`;
-    /// torn down on disappear since it isn't one-shot like `LibraryClient.fetch`'s own session.
-    @State private var imageSession: URLSession?
+    /// Cover-art loader (the same paired identity + host pinning as the list fetch, reused across
+    /// every poster in the grid). Built alongside `games` in `load()`; dropped on disappear.
+    @State private var artLoader: LibraryArtLoader?
     #if os(iOS) || os(macOS) || os(tvOS)
     // Gamepad-driven browsing — see ContentView's identical gate. With no controller (or the
     // setting off) every platform keeps the plain-grid presentation of this same view.
@@ -62,8 +61,11 @@ struct LibraryView: View {
             }
             .task { await load() }
             .onDisappear {
-                imageSession?.finishTasksAndInvalidate()
-                imageSession = nil
+                // Hand the loader off before clearing it, so its pooled connections are closed
+                // rather than left open on a screen the user has left.
+                let leaving = artLoader
+                artLoader = nil
+                Task { await leaving?.close() }
             }
             #if os(iOS) || os(macOS)
             // B closes the library even before the coverflow exists (loading / error / empty):
@@ -89,7 +91,7 @@ struct LibraryView: View {
         } else {
             if gamepadUIActive {
                 LibraryCoverflowView(
-                    games: games, imageSession: imageSession, onLaunch: onLaunch,
+                    games: games, artLoader: artLoader, onLaunch: onLaunch,
                     onDismiss: { (onClose ?? { dismiss() })() },
                     controllerActive: controllerActive)
             } else {
@@ -124,10 +126,10 @@ struct LibraryView: View {
         LazyVGrid(columns: columns, spacing: 18) {
             ForEach(entries) { game in
                 if let onLaunch {
-                    Button { onLaunch(game.id) } label: { GameCard(game: game, imageSession: imageSession) }
+                    Button { onLaunch(game.id) } label: { GameCard(game: game, artLoader: artLoader) }
                         .buttonStyle(.plain)
                 } else {
-                    GameCard(game: game, imageSession: imageSession)
+                    GameCard(game: game, artLoader: artLoader)
                 }
             }
         }
@@ -206,8 +208,7 @@ struct LibraryView: View {
                 keyPEM: identity.keyPEM,
                 hostFingerprint: current.pinnedSHA256
             ).launchersFirst
-            imageSession?.finishTasksAndInvalidate()
-            imageSession = try LibraryImageLoader.session(
+            artLoader = try LibraryArtLoader(
                 address: current.address,
                 port: current.effectiveMgmtPort,
                 certPEM: identity.certPEM,
@@ -249,11 +250,11 @@ private struct LibraryBackCatcher: View {
 /// (portrait → header → hero) and finally a text placeholder.
 private struct GameCard: View {
     let game: GameEntry
-    let imageSession: URLSession?
+    let artLoader: LibraryArtLoader?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            PosterImage(candidates: game.art.posterCandidates, title: game.title, session: imageSession)
+            PosterImage(candidates: game.art.posterCandidates, title: game.title, loader: artLoader)
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .frame(maxWidth: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))

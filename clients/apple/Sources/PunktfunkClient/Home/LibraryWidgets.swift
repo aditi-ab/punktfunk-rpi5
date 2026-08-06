@@ -60,8 +60,8 @@ private extension Image {
     }
 }
 
-/// Sequentially tries cover-art URLs over `session` (so a paired client can reach the host's own
-/// art proxy, not just public CDNs — see `LibraryImageLoader`), advancing past any that fail to
+/// Sequentially tries cover-art URLs over `loader` (so a paired client can reach the host's own
+/// art proxy, not just public CDNs — see `LibraryArtLoader`), advancing past any that fail to
 /// load, then a placeholder. The loaded image is hard-clipped to fill the card's actual frame
 /// regardless of its own aspect ratio: a portrait capsule fills it as intended, but a fallback
 /// banner (wide hero/header art, used when a title has no portrait capsule) would otherwise report
@@ -70,7 +70,7 @@ private extension Image {
 struct PosterImage: View {
     let candidates: [URL]
     let title: String
-    let session: URLSession?
+    let loader: LibraryArtLoader?
     /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
     /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
     /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
@@ -108,7 +108,7 @@ struct PosterImage: View {
             onLoaded?()
             return
         }
-        guard let session, let data = try? await session.data(from: candidates[index]).0,
+        guard let loader, let data = try? await loader.data(for: candidates[index]),
               let loaded = PlatformImage(data: data)
         else {
             index += 1 // advance to the next candidate (or past the end → placeholder)

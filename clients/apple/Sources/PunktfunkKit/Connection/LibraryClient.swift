@@ -83,6 +83,10 @@ public extension Array where Element == GameEntry {
 /// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").
 public enum LibraryError: LocalizedError {
     case unauthorized
+    /// The host's certificate didn't hash to the fingerprint pinned at pairing — an impostor, or
+    /// a host reinstalled/re-keyed since. Distinct from `unreachable` because the remedy is
+    /// completely different: re-pair, don't go hunting the network.
+    case pinMismatch
     case http(Int)
     case unreachable(String)
 
@@ -91,6 +95,9 @@ public enum LibraryError: LocalizedError {
         case .unauthorized:
             return "The host didn't recognize this device. Pair with the host first — it "
                 + "authorizes paired clients by their certificate (no token needed)."
+        case .pinMismatch:
+            return "The host's certificate doesn't match the one this device paired with. "
+                + "If the host was reinstalled, forget it here and pair again."
         case .http(let code):
             return "The management API returned HTTP \(code)."
         case .unreachable(let why):
@@ -122,47 +129,66 @@ public enum LibraryClient {
         keyPEM: String,
         hostFingerprint: Data?
     ) async throws -> [GameEntry] {
-        guard let url = URL(string: "https://\(address):\(port)/api/v1/library") else {
-            throw LibraryError.unreachable("invalid host address")
-        }
-        let identity: SecIdentity
-        do {
-            identity = try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        } catch {
-            throw LibraryError.unreachable(
-                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-        }
-        let delegate = LibraryTLSDelegate(
-            identity: identity, pinnedHostFingerprint: hostFingerprint, host: address, port: port)
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-
-        let req = URLRequest(url: url, timeoutInterval: 10)
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            throw LibraryError.unreachable(error.localizedDescription)
-        }
-        guard let http = response as? HTTPURLResponse else {
-            throw LibraryError.unreachable("not an HTTP response")
-        }
-        switch http.statusCode {
+        guard let base = URL(string: "\(baseURL(address: address, port: port))/api/v1/library")
+        else { throw LibraryError.unreachable("invalid host address") }
+        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        let response = try await send(
+            path: "/api/v1/library", address: address, port: port,
+            identity: identity, hostFingerprint: hostFingerprint)
+        switch response.status {
         case 200:
-            var games = try JSONDecoder().decode([GameEntry].self, from: data)
-            // Steam art now comes back as host-relative proxy paths (`/api/v1/library/art/...`,
-            // see the host's `library::steam_art`) so they work the same regardless of which
+            var games = try JSONDecoder().decode([GameEntry].self, from: response.body)
+            // Steam art comes back as host-relative proxy paths (`/api/v1/library/art/...`, see
+            // the host's `library::steam_art`) so they work the same regardless of which
             // interface/port the client reached the host on. Resolve them against THIS host now,
             // so every other consumer just sees ordinary absolute URLs.
-            let base = url
             for i in games.indices {
                 games[i].art = games[i].art.resolved(against: base)
             }
             return games
-        case 401:
+        // 403 joins 401 here: both are the host declining this certificate, and the remedy the
+        // user needs is the same one.
+        case 401, 403:
             throw LibraryError.unauthorized
         default:
-            throw LibraryError.http(http.statusCode)
+            throw LibraryError.http(response.status)
+        }
+    }
+
+    /// `https://addr:port`, IPv6 literals bracketed — the mirror of the Rust client's `base_url`.
+    static func baseURL(address: String, port: UInt16) -> String {
+        let bare = address.hasPrefix("[") && address.hasSuffix("]")
+            ? String(address.dropFirst().dropLast()) : address
+        return bare.contains(":") ? "https://[\(bare)]:\(port)" : "https://\(bare):\(port)"
+    }
+
+    /// Build the paired identity, restating any keychain failure in the UI's vocabulary.
+    static func clientIdentity(certPEM: String, keyPEM: String) throws -> SecIdentity {
+        do {
+            return try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        } catch {
+            throw LibraryError.unreachable(
+                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    /// One GET against the host, with transport failures mapped onto `LibraryError`.
+    static func send(
+        path: String, address: String, port: UInt16,
+        identity: SecIdentity, hostFingerprint: Data?
+    ) async throws -> HTTPResponse {
+        do {
+            return try await MgmtTransport.get(
+                host: address, port: port, path: path,
+                identity: identity, pinnedHostFingerprint: hostFingerprint)
+        } catch MgmtTransportError.pinMismatch {
+            throw LibraryError.pinMismatch
+        } catch MgmtTransportError.timedOut {
+            throw LibraryError.unreachable("timed out")
+        } catch let error as MgmtTransportError {
+            throw LibraryError.unreachable(String(describing: error))
+        } catch {
+            throw LibraryError.unreachable(error.localizedDescription)
         }
     }
 }
@@ -186,23 +212,57 @@ extension Artwork {
     }
 }
 
-/// Builds the authenticated `URLSession` the library UI uses to fetch cover-art images — the same
-/// paired identity + host pinning as [`LibraryClient.fetch`], reused across a whole grid's worth of
-/// poster loads (this session is NOT one-shot: callers own its lifetime and should invalidate it
-/// when the view goes away). Safe to use for every candidate URL a `GameEntry`'s `Artwork` carries:
-/// `LibraryTLSDelegate` only pins/presents-cert for the host itself, deferring to normal system
-/// trust + no client cert for any other origin (an external CDN URL).
-public enum LibraryImageLoader {
-    public static func session(
+/// Loads cover art for the library UI, routing each URL to the transport that suits its origin.
+///
+/// A `GameEntry`'s art candidates mix two very different things: the host's own art proxy
+/// (`/api/v1/library/art/...`, resolved to absolute URLs against this host) and public store CDN
+/// URLs carried verbatim on custom/GOG/Heroic entries. Host URLs go over [`MgmtTransport`] with
+/// the paired identity and the pinned fingerprint — outside the URL loading system, so App
+/// Transport Security can stay ON app-wide. Every other origin keeps ordinary `URLSession` with
+/// full system trust evaluation and no client certificate, which is exactly what it should get.
+///
+/// Built once per library screen and reused across a whole grid's worth of posters.
+public final class LibraryArtLoader: @unchecked Sendable {
+    private let address: String
+    private let port: UInt16
+    private let identity: SecIdentity
+    private let hostFingerprint: Data?
+    /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
+    /// system's normal certificate validation.
+    private let cdn = URLSession(configuration: .default)
+
+    public init(
         address: String,
         port: UInt16 = punktfunkDefaultMgmtPort,
         certPEM: String,
         keyPEM: String,
         hostFingerprint: Data?
-    ) throws -> URLSession {
-        let identity = try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        let delegate = LibraryTLSDelegate(
-            identity: identity, pinnedHostFingerprint: hostFingerprint, host: address, port: port)
-        return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+    ) throws {
+        self.address = address
+        self.port = port
+        self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        self.hostFingerprint = hostFingerprint
+    }
+
+    public func data(for url: URL) async throws -> Data {
+        guard isHostOrigin(url) else { return try await cdn.data(from: url).0 }
+        var path = url.path.isEmpty ? "/" : url.path
+        if let query = url.query { path += "?\(query)" }
+        let response = try await LibraryClient.send(
+            path: path, address: address, port: port,
+            identity: identity, hostFingerprint: hostFingerprint)
+        guard response.status == 200 else { throw LibraryError.http(response.status) }
+        return response.body
+    }
+
+    /// Does this URL point at the host's own art proxy? Compared on host + port rather than a
+    /// string prefix, so a differently-spelled but equivalent URL still takes the pinned path.
+    private func isHostOrigin(_ url: URL) -> Bool {
+        guard let host = url.host else { return false }
+        let bare = address.hasPrefix("[") && address.hasSuffix("]")
+            ? String(address.dropFirst().dropLast()) : address
+        let scheme = url.scheme?.lowercased()
+        return host.caseInsensitiveCompare(bare) == .orderedSame
+            && (url.port ?? (scheme == "http" ? 80 : 443)) == Int(port)
     }
 }

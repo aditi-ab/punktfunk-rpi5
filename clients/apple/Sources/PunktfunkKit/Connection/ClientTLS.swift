@@ -18,9 +18,6 @@
 import CryptoKit
 import Foundation
 import Security
-import os
-
-private let tlsLog = Logger(subsystem: "io.unom.punktfunk", category: "library-tls")
 
 enum ClientTLS {
     enum TLSError: LocalizedError {
@@ -134,62 +131,8 @@ enum ClientTLS {
     }
 }
 
-/// URLSession delegate that pins the host's self-signed cert (by the fingerprint the client
-/// already trusts) and presents the client identity for the mTLS client-cert challenge — but ONLY
-/// for challenges from `host`:`port` (the punktfunk host itself). A session built with this
-/// delegate is safe to reuse for OTHER origins too (e.g. a GOG/Heroic/Xbox cover-art CDN): a
-/// non-matching origin falls through to `.performDefaultHandling`, i.e. normal system trust
-/// evaluation and no client cert — exactly what `URLSession.shared` would have done. Without the
-/// host scoping, pinning would reject every external origin's cert (its fingerprint never matches
-/// the host's) and the client identity would leak to servers that didn't ask for it.
-final class LibraryTLSDelegate: NSObject, URLSessionDelegate {
-    private let identity: SecIdentity
-    private let pinnedHostFingerprint: Data? // SHA-256 of the host cert DER; nil = accept any (TOFU)
-    private let host: String
-    private let port: Int
-
-    init(identity: SecIdentity, pinnedHostFingerprint: Data?, host: String, port: UInt16) {
-        self.identity = identity
-        self.pinnedHostFingerprint = pinnedHostFingerprint
-        self.host = host
-        self.port = Int(port)
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
-        let space = challenge.protectionSpace
-        guard space.host == host, space.port == port else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        switch space.authenticationMethod {
-        case NSURLAuthenticationMethodServerTrust:
-            // Pin the host cert by fingerprint — the host is self-signed (the client trusts it the
-            // same way the QUIC session does). No pin yet (TOFU) → accept the presented leaf.
-            guard let trust = space.serverTrust,
-                  let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first
-            else {
-                completionHandler(.cancelAuthenticationChallenge, nil)
-                return
-            }
-            let der = SecCertificateCopyData(leaf) as Data
-            let fp = Data(SHA256.hash(data: der))
-            if let pinned = pinnedHostFingerprint, pinned != fp {
-                tlsLog.warning("library: host cert fingerprint mismatch — refusing")
-                completionHandler(.cancelAuthenticationChallenge, nil)
-                return
-            }
-            completionHandler(.useCredential, URLCredential(trust: trust))
-
-        case NSURLAuthenticationMethodClientCertificate:
-            completionHandler(.useCredential,
-                URLCredential(identity: identity, certificates: nil, persistence: .forSession))
-
-        default:
-            completionHandler(.performDefaultHandling, nil)
-        }
-    }
-}
+// The URLSession pinning delegate that used to live here is gone: the management API now speaks
+// over `MgmtTransport` (Network.framework), which states the same trust rule in a
+// `sec_protocol_options_set_verify_block` and — unlike the URL loading system — is not subject to
+// App Transport Security. That is what lets ATS stay ON for the cover-art CDN fetches, which are
+// the only URLSession traffic left in the app. See MgmtTransport.swift for the full rationale.
