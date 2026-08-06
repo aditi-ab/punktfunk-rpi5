@@ -1715,6 +1715,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 plane: crate::events::Plane::Native,
                 spec: target.detect.clone(),
                 nested,
+                launcher: target.launcher,
                 child,
                 launch_stamp,
             },
