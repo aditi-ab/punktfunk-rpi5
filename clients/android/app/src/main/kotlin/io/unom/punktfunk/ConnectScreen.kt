@@ -941,7 +941,7 @@ fun ConnectScreen(
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                             )
                             Text(
-                                "Android blocks punktfunk from finding or reaching hosts until you allow it.",
+                                "Android blocks Punktfunk from finding or reaching hosts until you allow it.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                                 textAlign = TextAlign.Center,

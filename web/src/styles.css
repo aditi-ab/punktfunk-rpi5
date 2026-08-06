@@ -9,7 +9,7 @@
    Tailwind 4 scan so their utilities aren't purged. */
 @source "../node_modules/@unom/ui/dist/**/*.{js,mjs}";
 
-/* ── punktfunk brand · violet product chrome ────────────────────────────────
+/* ── Punktfunk brand · violet product chrome ────────────────────────────────
    Two themes on one violet identity: LIGHT (lavender docs surface — the same
    palette the design/Scalar reference uses: white bg, faint-violet cards/borders,
    #6c5bf3 brand) is the :root default; DARK (the violet-tinted app-icon chrome
@@ -27,7 +27,7 @@
 :root {
 	--radius: 0.625rem;
 
-	/* Brand — the violet lens mark (from the punktfunk app icon). Theme-independent. */
+	/* Brand — the violet lens mark (from the Punktfunk app icon). Theme-independent. */
 	--pf-brand: #6c5bf3; /* deep violet — primary on light */
 	--pf-brand-light: #a79ff8; /* light violet — primary on dark */
 	--pf-highlight: #d2c9fb; /* lens highlight */

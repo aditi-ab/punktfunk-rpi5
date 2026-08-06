@@ -271,7 +271,7 @@ impl KwinFakeInjector {
         )?;
         // Authenticate (the legacy handshake; for an interface-authorized client KWin accepts it
         // without a dialog — same as krdpserver/krfb headless).
-        fake.authenticate("punktfunk".into(), "remote streaming input".into());
+        fake.authenticate("Punktfunk".into(), "remote streaming input".into());
         queue
             .roundtrip(&mut state)
             .context("fake_input authenticate roundtrip")?;

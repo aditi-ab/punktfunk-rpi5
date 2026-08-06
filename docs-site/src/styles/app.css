@@ -4,12 +4,12 @@
 
 /* Pull Fumadocs UI's own classes — and @unom/ui's compiled components — into
    the Tailwind 4 scan so their utilities aren't purged. @unom/ui is the shared
-   design-token system the punktfunk marketing site also builds on. */
+   design-token system the Punktfunk marketing site also builds on. */
 @source '../../node_modules/fumadocs-ui/dist/**/*.js';
 @source '../../node_modules/@unom/ui/dist/**/*.{js,mjs}';
 @source '../../node_modules/@unom/app-ui/dist/**/*.{js,mjs}';
 
-/* ── punktfunk brand ────────────────────────────────────────────────────────
+/* ── Punktfunk brand ────────────────────────────────────────────────────────
    The brand colour is the violet lens mark. (The marketing site's blue is just
    a page background, not the brand.) These values feed both @unom/ui's semantic
    token contract (--brand/--primary/--accent/--highlight) and the Fumadocs
@@ -61,7 +61,7 @@
 }
 
 @theme {
-  /* Geist — the punktfunk brand typeface, same as the marketing site
+  /* Geist — the Punktfunk brand typeface, same as the marketing site
      (the @fontsource-variable/geist face is loaded in __root.tsx). */
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
   --font-display: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
