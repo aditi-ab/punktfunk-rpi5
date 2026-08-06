@@ -67,9 +67,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
-    subframe_env_forced, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
+    max_forced_split_mode, plan_range_recovery, resolve_slices, resolve_split_mode,
+    resolve_split_subframe, resolve_subframe, store_ceiling, store_split_verdict,
+    subframe_env_forced, ArbAction, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -826,6 +828,11 @@ pub struct NvencCudaEncoder {
     /// a split wider than the hardware and silently encodes narrower, so this is the only honest
     /// source for how wide we may go (see `nvenc_core::max_forced_split_mode`).
     encoder_engines: u32,
+    /// Submit stamp for the split arbiter's per-frame cost (sync depth-1 path only).
+    last_submit_at: Option<std::time::Instant>,
+    /// The live split-mode experiment, when one is running. `None` = not arbitrating (gated off,
+    /// already decided this process, or the config is one we refuse to arbitrate).
+    arbiter: Option<SplitArbiter>,
     /// In-progress chunked readback of the front in-flight AU. See [`ChunkState`].
     chunk: Option<ChunkState>,
 }
@@ -915,6 +922,8 @@ impl NvencCudaEncoder {
             subframe_forced: false,
             subframe_chunks: false,
             encoder_engines: 0,
+            last_submit_at: None,
+            arbiter: None,
             chunk: None,
         })
     }
@@ -1345,8 +1354,25 @@ impl NvencCudaEncoder {
             // 2-way NVENC split-frame encoding (Ada dual-NVENC) — shared selector, see
             // [`resolve_split_mode`] for the precedence (env override / 10-bit / pixel rate).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 =
+            let mut split_mode: u32 =
                 resolve_split_mode(self.bit_depth, pixel_rate, self.encoder_engines);
+            // A verdict this process already measured for this exact config wins over the static
+            // rule — that is the whole point of arbitrating, and it lets later sessions skip the
+            // ~1 s experiment. An operator pin still beats both (checked inside `resolve_split_mode`,
+            // so only consult the cache when the knob is unset).
+            if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_none() {
+                if let Some(known) = cached_split_verdict(&self.split_key()) {
+                    if known != split_mode {
+                        tracing::info!(
+                            from = split_mode,
+                            to = known,
+                            "NVENC: using the split mode a previous arbitration measured as \
+                             fastest for this config"
+                        );
+                    }
+                    split_mode = known;
+                }
+            }
             // Split × sub-frame arbitration (Phase 8) BEFORE the ladder, the ceiling key and the
             // chunked-poll latch — all three must see the post-arbitration truth (a drop inside
             // build_init_params would leave poll_chunk busy-polling its whole budget per AU).
@@ -1659,7 +1685,137 @@ impl NvencCudaEncoder {
                 subframe = self.subframe_on,
                 "NVENC CUDA session ready"
             );
+            self.arm_split_arbiter();
             Ok(())
+        }
+    }
+
+    /// Decide whether this session may run a live split experiment, and arm it if so.
+    ///
+    /// Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`) while it earns trust. Every other gate is a
+    /// correctness condition, not a preference:
+    ///
+    /// - **Operator pin wins.** `PUNKTFUNK_SPLIT_ENCODE` set ⇒ never arbitrate; a pinned mode is an
+    ///   instruction, and an A/B that overrides it would make the knob useless for exactly the
+    ///   debugging it exists for.
+    /// - **Already decided.** A cached verdict for this config was applied at open; re-running the
+    ///   experiment every session would pay its cost forever.
+    /// - **Sync depth-1 only** (`async_rt.is_none()`), the same gate chunked poll uses: the
+    ///   per-frame cost is measured as submit → AU, which is only the encode on this path. Under
+    ///   pipelined retrieve that span includes queue depth and the comparison would be noise.
+    /// - **Needs a second engine**, and split must be applicable at all (never H.264).
+    /// - ⚠ **No sub-frame trade.** For HEVC, forcing split gives up sub-frame readback, which costs
+    ///   send/encode overlap the ENCODER CANNOT SEE — it measures encode time only, so it would
+    ///   reliably prefer split and silently make end-to-end latency worse. So we arbitrate only
+    ///   where nothing is traded: sub-frame already off, or AV1 (where both features are legal).
+    ///   Pricing that trade needs the host's send cost and is the next work package.
+    fn arm_split_arbiter(&mut self) {
+        if !matches!(
+            std::env::var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE").as_deref(),
+            Ok("1")
+        ) {
+            return;
+        }
+        if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_some()
+            || cached_split_verdict(&self.split_key()).is_some()
+            || self.async_rt.is_some()
+            || self.encoder_engines < 2
+            || self.codec == Codec::H264
+        {
+            return;
+        }
+        if self.subframe_on && self.codec != Codec::Av1 {
+            tracing::debug!(
+                "NVENC split arbitration skipped: sub-frame readback is on and this codec cannot \
+                 keep it while split, so the trade costs send overlap the encoder cannot measure"
+            );
+            return;
+        }
+        // Pick the challenger that tests the question worth asking: "are we leaving engines idle?"
+        // So anything that is not already the widest forced split is challenged BY the widest, and
+        // only a session already there is challenged by single-engine ("is splitting even helping
+        // here?").
+        //
+        // ⚠ Not "whatever we are not": with the fallthrough `AUTO` incumbent that a 4K60 session
+        // gets, the naive version challenged with DISABLE and spent the experiment re-proving that
+        // splitting beats not-splitting — while parking the session on the slow arm to do it.
+        let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let widest = max_forced_split_mode(self.encoder_engines);
+        let challenger = if self.split_mode == widest {
+            disable
+        } else {
+            widest
+        };
+        if challenger == self.split_mode {
+            return;
+        }
+        tracing::info!(
+            incumbent = self.split_mode,
+            challenger,
+            "NVENC split arbitration armed — measuring both arms on the live session (no IDR)"
+        );
+        self.arbiter = Some(SplitArbiter::new(self.split_mode, challenger));
+    }
+
+    /// The config identity this session's split verdict is cached under.
+    fn split_key(&self) -> SplitKey {
+        SplitKey {
+            gpu: self.cu_ctx as u64,
+            codec: self.codec,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bit_depth: self.bit_depth,
+            chroma_444: self.chroma_444,
+        }
+    }
+
+    /// Move the LIVE session to `mode` without an IDR — spike S1 proved `nvEncReconfigureEncoder`
+    /// takes a changed `splitEncodeMode` with `resetEncoder=0`, emits no keyframe, and actually
+    /// applies it. Reuses the bitrate reconfigure path at the CURRENT rate, so only the split mode
+    /// moves. Returns whether the driver accepted it; on refusal the field is restored so the
+    /// encoder's idea of its own session stays truthful.
+    fn apply_split_mode(&mut self, mode: u32) -> bool {
+        let previous = self.split_mode;
+        self.split_mode = mode;
+        if self.reconfigure_bitrate(self.bitrate_bps) {
+            true
+        } else {
+            tracing::warn!(
+                from = previous,
+                to = mode,
+                "NVENC split arbitration: driver refused the in-place split change — staying put"
+            );
+            self.split_mode = previous;
+            false
+        }
+    }
+
+    /// Feed one frame's encode cost to the split arbiter and act on its verdict.
+    fn feed_split_arbiter(&mut self, encode_us: u64) {
+        let Some(arb) = self.arbiter.as_mut() else {
+            return;
+        };
+        let action = arb.on_frame(encode_us);
+        let done = arb.is_done();
+        match action {
+            Some(ArbAction::SwitchTo(mode)) => {
+                if !self.apply_split_mode(mode) {
+                    // The experiment cannot proceed if the session will not move — abandon it
+                    // rather than compare two measurements of the same arm.
+                    self.arbiter = None;
+                    return;
+                }
+            }
+            Some(ArbAction::Settled(mode)) => {
+                store_split_verdict(self.split_key(), mode);
+            }
+            None => {}
+        }
+        if done {
+            // A "switch back to the incumbent" verdict settles on the mode now live.
+            store_split_verdict(self.split_key(), self.split_mode);
+            self.arbiter = None;
         }
     }
 
@@ -2037,6 +2193,10 @@ impl Encoder for NvencCudaEncoder {
                 // never emits an IDR on its own, so this matches the eventual pictureType.
                 is_idr,
             ));
+            // Stamp for the split arbiter's per-frame cost. Deliberately a single field rather
+            // than a sixth `pending` element: the arbiter only runs on the sync depth-1 path
+            // (`async_rt.is_none()`), where at most one encode is outstanding.
+            self.last_submit_at = Some(std::time::Instant::now());
         }
         if sample {
             tracing::info!(
@@ -2216,6 +2376,16 @@ impl Encoder for NvencCudaEncoder {
                 .map_err(|e| nvenc_status::call_err("unlock_bitstream", e))?;
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, map);
+            }
+            // One frame's encode cost, submit → AU complete. Only meaningful on this sync,
+            // depth-1 path (the arbiter is gated to it), where `lock_bitstream` above blocked
+            // until the ASIC finished, so the span is the encode rather than a queue wait.
+            let encode_us = self
+                .last_submit_at
+                .take()
+                .map(|t| t.elapsed().as_micros() as u64);
+            if let Some(us) = encode_us {
+                self.feed_split_arbiter(us);
             }
             Ok(Some(EncodedFrame {
                 data,
@@ -3611,6 +3781,103 @@ mod tests {
 
         std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
         std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
+    /// ON-HARDWARE — the live split arbitration end to end (WP3). Opens a 4K session that the
+    /// static rule leaves single-engine, lets the arbiter run, and asserts it converges to the
+    /// faster arm **without emitting a single IDR** and records a verdict other sessions can reuse.
+    ///
+    /// Sub-frame is pinned off so the arbiter's own no-trade gate lets it arm (see
+    /// `arm_split_arbiter`); this is the shape the first increment supports.
+    ///
+    /// Asserts behaviour, not timing: that it settles, that it lands on the arm the ~2× split
+    /// advantage implies, and — the load-bearing one — **zero keyframes after the opening IDR**,
+    /// which is the whole reason this design is allowed to exist. Run ALONE:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_split_arbitration_converges --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_split_arbitration_converges() {
+        const W: u32 = 3840;
+        const H: u32 = 2160;
+        let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+
+        std::env::set_var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE", "1");
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            400_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            4,
+        )
+        .expect("open NVENC CUDA session");
+
+        let mut keyframes = 0usize;
+        let mut aus = 0usize;
+        // Enough frames for measure + settle + measure with room to spare.
+        for i in 0..140u32 {
+            enc.submit_indexed(&frames[(i % 4) as usize], i)
+                .expect("submit");
+            while let Some(au) = enc.poll().expect("poll") {
+                aus += 1;
+                keyframes += au.keyframe as usize;
+            }
+        }
+        let final_mode = enc.split_mode;
+        let still_arbitrating = enc.arbiter.is_some();
+        let verdict = cached_split_verdict(&enc.split_key());
+        let enc_engines = enc.encoder_engines;
+        enc.flush().ok();
+
+        println!(
+            "arbitration: {aus} AUs, {keyframes} keyframes, final split_mode={final_mode}, \
+             cached verdict={verdict:?}, still running={still_arbitrating}"
+        );
+        assert!(aus > 100, "not enough AUs to complete an arbitration");
+        assert!(
+            !still_arbitrating,
+            "arbitration did not finish in 140 frames"
+        );
+        assert_eq!(
+            keyframes, 1,
+            "THE POINT OF THIS DESIGN: arbitration must cost ZERO extra IDRs — only the session's \
+             opening one"
+        );
+        assert_eq!(
+            verdict,
+            Some(final_mode),
+            "the winning arm must be cached so later sessions skip the experiment"
+        );
+        assert_ne!(
+            final_mode, disable,
+            "at 4K with two engines a splitting arm is ~2x faster, so single-engine must not win"
+        );
+        // The static rule leaves 4K60 on the fallthrough AUTO (497.7 Mpix/s is under
+        // SPLIT_FORCE_PIXEL_RATE), so the experiment is AUTO vs the widest forced split — the
+        // "are we leaving engines idle?" question. Either outcome is legitimate; what must NOT
+        // happen is landing on single-engine.
+        println!(
+            "  (incumbent was the static rule's choice; challenger was mode {})",
+            max_forced_split_mode(enc_engines)
+        );
+
+        std::env::remove_var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        // The verdict cache is process-global: leaving this session's result in it would steer
+        // every later test that opens the same config with the split env unset (the D5 legs do
+        // exactly that).
+        super::super::nvenc_core::clear_split_verdicts();
     }
 
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).

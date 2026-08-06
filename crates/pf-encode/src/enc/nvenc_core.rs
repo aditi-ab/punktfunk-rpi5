@@ -353,6 +353,153 @@ mod split_subframe_tests {
     }
 }
 
+// Split arbitration is wired into the Linux direct-SDK backend only for now, and
+// `nvenc_core` compiles on Windows too — so every item below is linux-gated or it trips
+// the item-level dead_code trap this file already carries a scar from (see
+// `subframe_env_forced`). Ungating is part of the Windows wiring, not a cleanup.
+#[cfg(target_os = "linux")]
+/// What the split arbiter wants the backend to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArbAction {
+    /// Reconfigure the live session to this split mode (in place — S1 proved this is IDR-free).
+    SwitchTo(u32),
+    /// Arbitration finished; this mode won and the arbiter will ask for nothing further.
+    Settled(u32),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArbState {
+    MeasuringIncumbent,
+    Settling,
+    MeasuringChallenger,
+    Done,
+}
+
+#[cfg(target_os = "linux")]
+/// Picks the faster of two NVENC split modes **on the live session**, by measuring both.
+///
+/// This exists because the alternative — predicting the right mode at open — cannot work: the
+/// decision depends on bits/frame, and for an Automatic client the host does not know the
+/// steady-state bitrate at open (ABR climbs in place afterwards). Spike S1 showed
+/// `nvEncReconfigureEncoder` accepts a changed `splitEncodeMode` with `resetEncoder=0`, emits **no
+/// IDR**, and genuinely takes effect — so the encoder can simply try both and keep the winner,
+/// with nothing visible on the wire.
+///
+/// Deliberately measures rather than models: hard-coded per-architecture constants are exactly how
+/// the rule this replaces went wrong (one 5120×1440@240 Ada datapoint generalised into a fleet-wide
+/// 10-bit veto). A measurement tracks driver updates for free.
+///
+/// ⚠ **`SETTLE_FRAMES` is load-bearing, not padding.** Split-encode does not reach steady state on
+/// the first frame — a *fresh* `TWO_FORCED` session measured early-half 3280 µs against late-half
+/// 1996 on `.21`. Judging an arm immediately after switching to it reads the transient, and does so
+/// **intermittently**, which is the worst failure mode: the verdict would be wrong only sometimes,
+/// and then be cached.
+pub(super) struct SplitArbiter {
+    state: ArbState,
+    incumbent: u32,
+    challenger: u32,
+    samples: Vec<u64>,
+    incumbent_us: u64,
+    settle_left: u32,
+}
+
+/// Frames discarded after a switch before the challenger is judged (measured — see the struct doc).
+#[cfg(target_os = "linux")]
+const SETTLE_FRAMES: u32 = 16;
+/// Frames measured per arm. Long enough to median out content variation, short enough that the
+/// whole arbitration is over in well under a second at 60 fps.
+#[cfg(target_os = "linux")]
+const SAMPLE_FRAMES: usize = 24;
+/// The challenger must beat the incumbent by this much to win. Switching is not free (a
+/// reconfigure, and for HEVC it costs sub-frame readback), so a coin-flip difference should leave
+/// the session where it already is.
+#[cfg(target_os = "linux")]
+const WIN_MARGIN_PCT: u64 = 10;
+
+#[cfg(target_os = "linux")]
+impl SplitArbiter {
+    pub(super) fn new(incumbent: u32, challenger: u32) -> Self {
+        Self {
+            state: ArbState::MeasuringIncumbent,
+            incumbent,
+            challenger,
+            samples: Vec::with_capacity(SAMPLE_FRAMES),
+            incumbent_us: 0,
+            settle_left: 0,
+        }
+    }
+
+    /// Feed one frame's encode time. Returns an action when the arbiter wants the session changed.
+    pub(super) fn on_frame(&mut self, us: u64) -> Option<ArbAction> {
+        match self.state {
+            ArbState::Done => None,
+            ArbState::Settling => {
+                self.settle_left = self.settle_left.saturating_sub(1);
+                if self.settle_left == 0 {
+                    self.state = ArbState::MeasuringChallenger;
+                    self.samples.clear();
+                }
+                None
+            }
+            ArbState::MeasuringIncumbent => {
+                self.samples.push(us);
+                if self.samples.len() < SAMPLE_FRAMES {
+                    return None;
+                }
+                self.incumbent_us = median(&mut self.samples);
+                self.state = ArbState::Settling;
+                self.settle_left = SETTLE_FRAMES;
+                Some(ArbAction::SwitchTo(self.challenger))
+            }
+            ArbState::MeasuringChallenger => {
+                self.samples.push(us);
+                if self.samples.len() < SAMPLE_FRAMES {
+                    return None;
+                }
+                let challenger_us = median(&mut self.samples);
+                self.state = ArbState::Done;
+                // Strictly better by the margin, or the incumbent keeps the session. Equal-ish is
+                // deliberately a win for the incumbent: we are already there.
+                let threshold = self
+                    .incumbent_us
+                    .saturating_sub(self.incumbent_us.saturating_mul(WIN_MARGIN_PCT) / 100);
+                if challenger_us < threshold {
+                    tracing::info!(
+                        winner = self.challenger,
+                        winner_us = challenger_us,
+                        loser = self.incumbent,
+                        loser_us = self.incumbent_us,
+                        "NVENC split arbitration: challenger wins — keeping it"
+                    );
+                    Some(ArbAction::Settled(self.challenger))
+                } else {
+                    tracing::info!(
+                        winner = self.incumbent,
+                        winner_us = self.incumbent_us,
+                        loser = self.challenger,
+                        loser_us = challenger_us,
+                        "NVENC split arbitration: incumbent held — switching back"
+                    );
+                    // The session is currently running the challenger, so returning to the
+                    // incumbent is an actual reconfigure, not a no-op.
+                    Some(ArbAction::SwitchTo(self.incumbent))
+                }
+            }
+        }
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        self.state == ArbState::Done
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn median(v: &mut [u64]) -> u64 {
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
 /// One session config's identity for the process-lifetime bitrate-ceiling cache
 /// ([`cached_ceiling`]/[`store_ceiling`]). Everything the driver's codec-level validation keys
 /// off: the GPU (different NVENC generations have different level ceilings), dims/fps (the luma
@@ -395,6 +542,55 @@ pub(super) fn cached_ceiling(key: &CeilingKey) -> Option<u64> {
 /// Record the clamp search's discovered max accepted bitrate (bps) for `key`.
 pub(super) fn store_ceiling(key: CeilingKey, bps: u64) {
     ceilings().lock().unwrap().insert(key, bps);
+}
+
+#[cfg(target_os = "linux")]
+/// A config's identity for the split-arbitration verdict cache — [`CeilingKey`] **minus
+/// `split_mode`**, because the split mode is the thing being decided. Including it would key each
+/// verdict under the arm that produced it and the cache could never answer "which arm should this
+/// config use?".
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct SplitKey {
+    pub gpu: u64,
+    pub codec: Codec,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bit_depth: u8,
+    pub chroma_444: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn split_verdicts() -> &'static std::sync::Mutex<std::collections::HashMap<SplitKey, u32>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<SplitKey, u32>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+#[cfg(target_os = "linux")]
+/// The split mode a previous arbitration found fastest for `key` this process lifetime.
+///
+/// Process-lifetime and advisory, exactly like [`cached_ceiling`]: a session that reads a verdict
+/// opens straight into the winning arm and skips the ~1 s exploration. It is NOT persisted — a
+/// driver update can change the answer, and a stale verdict on disk would outlive its evidence
+/// (persisting it needs the driver version in the key; see the plan's WP3).
+pub(super) fn cached_split_verdict(key: &SplitKey) -> Option<u32> {
+    split_verdicts().lock().unwrap().get(key).copied()
+}
+
+#[cfg(target_os = "linux")]
+/// Record an arbitration result for `key`.
+pub(super) fn store_split_verdict(key: SplitKey, mode: u32) {
+    split_verdicts().lock().unwrap().insert(key, mode);
+}
+
+#[cfg(target_os = "linux")]
+/// Drop every cached verdict. Test-only: the cache is process-global, so an on-hardware test that
+/// runs an arbitration would otherwise leak its verdict into every later test that opens the same
+/// config with `PUNKTFUNK_SPLIT_ENCODE` unset — which is exactly the shape the D5 legs use.
+#[cfg(test)]
+pub(super) fn clear_split_verdicts() {
+    split_verdicts().lock().unwrap().clear();
 }
 
 #[cfg(test)]
@@ -1039,5 +1235,117 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
             }
             Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod arbiter_tests {
+    use super::{ArbAction, SplitArbiter, SETTLE_FRAMES};
+    use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    /// Drive an arbiter with a fixed cost per arm and return every action it emitted.
+    fn drive(incumbent_us: u64, challenger_us: u64) -> (Vec<ArbAction>, u32) {
+        let (inc, chal) = (
+            M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        );
+        let mut arb = SplitArbiter::new(inc, chal);
+        let mut actions = Vec::new();
+        // Whatever the session is currently running; the harness follows the arbiter's switches
+        // so the cost it reports matches the arm actually in effect.
+        let mut live = inc;
+        for _ in 0..500 {
+            if arb.is_done() {
+                break;
+            }
+            let us = if live == inc {
+                incumbent_us
+            } else {
+                challenger_us
+            };
+            if let Some(a) = arb.on_frame(us) {
+                actions.push(a);
+                match a {
+                    ArbAction::SwitchTo(m) => live = m,
+                    ArbAction::Settled(m) => live = m,
+                }
+            }
+        }
+        (actions, live)
+    }
+
+    /// A clearly faster challenger is adopted, and the session ends up running it.
+    #[test]
+    fn arbiter_adopts_a_clearly_faster_challenger() {
+        let (actions, live) = drive(5000, 2400);
+        assert_eq!(
+            actions[0],
+            ArbAction::SwitchTo(M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32),
+            "must try the challenger before judging it"
+        );
+        assert_eq!(
+            actions.last(),
+            Some(&ArbAction::Settled(M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32))
+        );
+        assert_eq!(live, M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32);
+    }
+
+    /// A slower challenger is rejected and the session is put BACK — the arbiter is mid-experiment
+    /// when it decides, so "keep the incumbent" is a real reconfigure, not a no-op. Getting this
+    /// wrong would strand every losing arbitration on the losing arm.
+    #[test]
+    fn arbiter_restores_the_incumbent_when_the_challenger_loses() {
+        let (actions, live) = drive(2400, 5000);
+        assert_eq!(
+            actions.last(),
+            Some(&ArbAction::SwitchTo(M::NV_ENC_SPLIT_DISABLE_MODE as u32)),
+            "a losing experiment must be undone"
+        );
+        assert_eq!(live, M::NV_ENC_SPLIT_DISABLE_MODE as u32);
+    }
+
+    /// Within the margin the incumbent holds: switching costs a reconfigure and, on HEVC, sub-frame
+    /// readback, so a coin-flip difference must not move the session.
+    #[test]
+    fn arbiter_keeps_the_incumbent_inside_the_margin() {
+        // 5 % better — under WIN_MARGIN_PCT.
+        let (_, live) = drive(2400, 2280);
+        assert_eq!(live, M::NV_ENC_SPLIT_DISABLE_MODE as u32);
+    }
+
+    /// THE SETTLE CONTRACT: the challenger must not be judged on frames taken immediately after the
+    /// switch. Feed it a transient — slow for the whole settle window, fast afterwards — and it
+    /// must still see the fast steady state. Without the settle window this arbiter would read the
+    /// transient, reject a genuinely better arm, and cache that verdict.
+    #[test]
+    fn arbiter_ignores_the_post_switch_transient() {
+        let (inc, chal) = (
+            M::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+        );
+        let mut arb = SplitArbiter::new(inc, chal);
+        let mut switched_at = None;
+        let mut frame = 0usize;
+        let mut outcome = None;
+        while outcome.is_none() && frame < 500 {
+            let us = match switched_at {
+                None => 5000,
+                // The transient: as slow as the incumbent for exactly the settle window.
+                Some(s) if frame - s <= SETTLE_FRAMES as usize => 5000,
+                Some(_) => 2000,
+            };
+            match arb.on_frame(us) {
+                Some(ArbAction::SwitchTo(m)) if m == chal => switched_at = Some(frame),
+                Some(a) => outcome = Some(a),
+                None => {}
+            }
+            frame += 1;
+        }
+        assert_eq!(
+            outcome,
+            Some(ArbAction::Settled(chal)),
+            "the settle window must hide the post-switch transient — otherwise a better arm is \
+             rejected on its own warmup"
+        );
     }
 }
