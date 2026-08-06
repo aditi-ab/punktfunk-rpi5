@@ -67,8 +67,11 @@ pub(super) fn resolve_slices(codec: Codec, default_slices: u32) -> u32 {
 /// Resolved sub-frame readback (`enableSubFrameWrite` + `reportSliceOffsets`; sync sessions
 /// only, see [`build_init_params`]): `PUNKTFUNK_NVENC_SUBFRAME` tri-state — `0` = never (the
 /// default-on escape), `1` = force (even where the caps probe says unsupported — an operator
-/// explicitly testing), unset = the backend's `default_on` (Linux direct-NVENC passes its
-/// SUBFRAME_READBACK caps-probe result since Phase 3; Windows passes `false`).
+/// explicitly testing), unset = the backend's `default_on` — which is the GPU's
+/// `SUBFRAME_READBACK` caps-probe result on **both** backends now (Linux since Phase 3, Windows
+/// since the 2026-07-31 `.173` A/B). This comment used to say "Windows passes `false`"; it had
+/// been stale since that flip, which mattered because it made the AUTO-plus-sub-frame dead
+/// combination look Linux-only when it is fleet-wide.
 pub(super) fn resolve_subframe(default_on: bool) -> bool {
     match std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() {
         Ok("0") => false,
@@ -91,10 +94,15 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
 ///    ([`max_forced_split_mode`]), not a hard-coded 2 (AUTO never engages below ~2112 px height,
 ///    so 4K120 must be forced onto the other engines; and a 3-NVENC part left at 2-way wastes a
 ///    third of its encode silicon).
-/// 4. Else AUTO — ⚠ which measurably means **never split** whenever sub-frame readback is on, i.e.
-///    the whole default Linux/Windows fleet (4K: AUTO+sub-frame 4904 µs vs DISABLE+sub-frame 5062
-///    vs TWO_FORCED 3464, measured on `.21`). Kept for now because changing it is a behaviour
-///    change beyond the engine-count fix; the plan's WP1 retires this arm.
+/// 4. Else AUTO — ⚠ whose behaviour is **conditional on sub-frame**, measured on `.21` at 4K:
+///    - sub-frame **ON** (the fleet default): AUTO **does not split** — 5023/5157 µs against
+///      DISABLE's 4979/5000. Split and sub-frame are mutually unsupported for HEVC, so the driver
+///      resolves AUTO to no-split and this arm silently means DISABLE.
+///    - sub-frame **OFF**: AUTO **does split** — 2401/2352 µs against TWO_FORCED's 2319/2378.
+///
+///    So AUTO is NOT dead in general and must not be retired: doing so would lose a real split on
+///    every sub-frame-off session. It is dead only in the sub-frame-on combination, which
+///    [`resolve_split_subframe`] logs rather than silently accepting.
 ///
 /// The caller still owns the rejection fallback (retry split-disabled) — a codec/config that
 /// rejects the chosen mode downgrades at open, not here.
@@ -238,6 +246,20 @@ pub(super) fn resolve_split_subframe(
         }
         return (split_mode, false);
     }
+    // The silently-inert combination, made visible. HEVC + plain AUTO + sub-frame: the driver
+    // cannot split (mutually unsupported) so it resolves AUTO to no-split — MEASURED on `.21` at
+    // 4K, AUTO+sub-frame 5023/5157 µs vs DISABLE's 4979/5000, while the same AUTO with sub-frame
+    // OFF splits at 2401/2352 vs TWO_FORCED's 2319/2378. This is the fleet's default shape, so
+    // "split_mode=AUTO" in a log has meant "no split" for every default session and nothing said
+    // so. Deliberately NOT rewritten to DISABLE: the mode we pass is what the driver was actually
+    // given, and the ceiling-cache key must keep describing that.
+    if codec == Codec::H265 && subframe && split_mode == M::NV_ENC_SPLIT_AUTO_MODE as u32 {
+        tracing::debug!(
+            "NVENC: split-encode AUTO with sub-frame readback on — the driver cannot split HEVC \
+             in this combination, so this session runs SINGLE-ENGINE (measured). Set \
+             PUNKTFUNK_NVENC_SUBFRAME=0 to trade sub-frame for a real split."
+        );
+    }
     (split_mode, subframe)
 }
 
@@ -295,6 +317,28 @@ mod split_subframe_tests {
         assert_eq!(
             resolve_split_subframe(Codec::H264, AUTO, false, false),
             (DISABLE, false)
+        );
+    }
+
+    /// ⚠ DO NOT "SIMPLIFY" THE `AUTO` ARM AWAY. Measured on `.21` at 4K, plain `AUTO` is
+    /// conditional, not dead:
+    ///   sub-frame ON  → 5023/5157 µs ≈ DISABLE 4979/5000   (cannot split — mutually unsupported)
+    ///   sub-frame OFF → 2401/2352 µs ≈ TWO_FORCED 2319/2378 (DOES split)
+    /// An earlier read of the sub-frame-ON measurement alone concluded "AUTO never splits, retire
+    /// it" — that would have silently cost every sub-frame-off session its second engine. This
+    /// test pins the arbitration's half of the contract: AUTO must survive both ways.
+    #[test]
+    fn auto_survives_the_arbitration_in_both_subframe_states() {
+        // Sub-frame on: kept as AUTO (inert, but that is the driver's call, and rewriting it to
+        // DISABLE would lie to the ceiling-cache key about what the session was given).
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, AUTO, true, false),
+            (AUTO, true)
+        );
+        // Sub-frame off: still AUTO, and here it is a REAL split — the arm must not be demoted.
+        assert_eq!(
+            resolve_split_subframe(Codec::H265, AUTO, false, false),
+            (AUTO, false)
         );
     }
 

@@ -3456,11 +3456,29 @@ mod tests {
         let (auto_us, auto_sub) = run(None, None);
         let (dis_us, dis_sub) = run(Some("0"), None);
         let (two_us, two_sub) = run(Some("2"), Some("0"));
+        // The leg that decides whether the `AUTO` arm can simply be RETIRED: D5 proves AUTO does
+        // not split while sub-frame is on, but retiring it would also change sub-frame-OFF
+        // sessions, where AUTO is free to split and might. Measure before removing.
+        let (auto_nosub_us, auto_nosub_sub) = run(None, Some("0"));
 
         println!("D5 confirm @ {W}x{H}@60 HEVC 8-bit:");
         println!("  AUTO (unset) + sub-frame({auto_sub}) : {auto_us:>6} us/frame");
         println!("  DISABLE      + sub-frame({dis_sub}) : {dis_us:>6} us/frame");
         println!("  TWO_FORCED,   no sub-frame({two_sub}): {two_us:>6} us/frame");
+        println!("  AUTO (unset), no sub-frame({auto_nosub_sub}): {auto_nosub_us:>6} us/frame");
+        println!(
+            "  ⇒ with sub-frame OFF, AUTO is nearer {} — retiring the AUTO arm {}",
+            if auto_nosub_us.abs_diff(two_us) < auto_nosub_us.abs_diff(dis_us) {
+                "TWO_FORCED (it DOES split)"
+            } else {
+                "DISABLE (it does not split either way)"
+            },
+            if auto_nosub_us.abs_diff(two_us) < auto_nosub_us.abs_diff(dis_us) {
+                "would LOSE a real split on sub-frame-off sessions"
+            } else {
+                "is behaviour-neutral"
+            }
+        );
         assert!(
             auto_sub,
             "the AUTO leg resolved sub-frame OFF — it is not testing D5's fleet shape"

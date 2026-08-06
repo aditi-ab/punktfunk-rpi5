@@ -1412,6 +1412,15 @@ impl NvencD3d11Encoder {
             }
             self.inited = true;
             tracing::info!(
+                // Parity with the Linux session-ready line. `split_mode` is the FINAL mode (post
+                // any rejection fallback) and `engines` the ceiling it was chosen from — the mode
+                // alone is ambiguous between "used every engine" and "left one idle", and the
+                // driver honours an over-wide request without complaint, so neither number means
+                // much without the other. `subframe` because AUTO + sub-frame is a measurably
+                // single-engine combination that reads like a split in a log.
+                split_mode = self.split_mode,
+                engines = self.encoder_engines,
+                subframe = self.subframe_on,
                 "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",
                 self.width,
                 self.height,
