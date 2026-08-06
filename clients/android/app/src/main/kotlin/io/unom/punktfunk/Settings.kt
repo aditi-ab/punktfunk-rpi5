@@ -106,6 +106,16 @@ data class Settings(
      */
     val libraryEnabled: Boolean = true,
     /**
+     * Which colour family the console (gamepad) UI's living backdrop drifts through — the
+     * cross-client `ui_palette` key: `"violet"` (the brand default), `"tide"`, `"forest"`,
+     * `"ember"`, `"rose"`, `"graphite"`. See [GamepadPalette], whose table and maths mirror the
+     * desktop console's and the Apple client's under the same names. Presentation only: nothing
+     * about a stream depends on it, so it is a device preference and never part of a profile.
+     * An unknown value reads as the default rather than failing — a newer client may have shipped
+     * a palette this build doesn't know.
+     */
+    val uiPalette: String = "violet",
+    /**
      * "Low-latency mode" — the master switch over the latency pipeline: the async decode loop
      * (native; burst-feed + present-newest-per-vsync, the Apple client's discipline), decoder ranking
      * + per-SoC vendor keys, pipeline thread boosts + ADPF max-performance, game-tagged AAudio, DSCP
@@ -284,6 +294,7 @@ class SettingsStore(context: Context) {
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
+        uiPalette = prefs.getString(K_UI_PALETTE, "violet") ?: "violet",
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
         presentPriority = prefs.getString(K_PRESENT_PRIORITY, "latency") ?: "latency",
         smoothBuffer = prefs.getInt(K_SMOOTH_BUFFER, 0),
@@ -323,6 +334,7 @@ class SettingsStore(context: Context) {
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
+            .putString(K_UI_PALETTE, s.uiPalette)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
             .putString(K_PRESENT_PRIORITY, s.presentPriority)
             .putInt(K_SMOOTH_BUFFER, s.smoothBuffer)
@@ -361,6 +373,7 @@ class SettingsStore(context: Context) {
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
         const val K_LIBRARY = "library_enabled"
+        const val K_UI_PALETTE = "ui_palette"
 
         /**
          * Bumped AGAIN to restart every install at the new default (ON). History: the original

@@ -84,6 +84,9 @@ pub(crate) struct MenuList {
     bump: Spring,
     scroll: f64,
     focus: Vec<f64>,
+    /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
+    /// [`MenuList::jump_to`].
+    snap: bool,
 }
 
 impl MenuList {
@@ -93,7 +96,16 @@ impl MenuList {
             bump: Spring::rest(0.0),
             scroll: 0.0,
             focus: Vec::new(),
+            snap: true,
         }
+    }
+
+    /// Move the cursor WITHOUT the scroll gliding there. For a tab switch, where the whole
+    /// row set is replaced: chasing would sweep the viewport through rows that no longer
+    /// exist, which reads as a glitch rather than as motion.
+    pub(crate) fn jump_to(&mut self, cursor: usize) {
+        self.cursor = cursor;
+        self.snap = true;
     }
 
     /// Route a menu event. Up/down move focus (Boundary = recoil), left/right become
@@ -136,10 +148,19 @@ impl MenuList {
         dt: f64,
         active: bool,
     ) {
+        if self.snap {
+            // A replaced row set has no shared history with the old one — start every row's
+            // focus ease from scratch so the new cursor is simply THERE.
+            self.focus.clear();
+        }
         self.focus.resize(rows.len(), 0.0);
         for (i, f) in self.focus.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
-            *f = approach(*f, target, dt, 0.06);
+            *f = if self.snap {
+                target
+            } else {
+                approach(*f, target, dt, 0.06)
+            };
         }
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
@@ -160,7 +181,11 @@ impl MenuList {
         // The scroll chases the focused row into the middle band, clamped to content.
         let focused_center = tops.get(self.cursor).map_or(0.0, |t| (t + ROW_H / 2.0) * k);
         let target = (focused_center - view_h / 2.0).clamp(0.0, (content_h - view_h).max(0.0));
-        self.scroll = approach(self.scroll, target, dt, 0.08);
+        self.scroll = if std::mem::take(&mut self.snap) {
+            target
+        } else {
+            approach(self.scroll, target, dt, 0.08)
+        };
 
         let row_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k);
         let x0 = f64::from(rect.left) + (f64::from(rect.width()) - row_w) / 2.0;
@@ -269,6 +294,98 @@ impl MenuList {
             canvas.restore();
         }
         canvas.restore();
+    }
+}
+
+// --- Tab strip ---------------------------------------------------------------------------
+
+/// The strip's design height, including the air under it before the first row.
+pub(crate) const TAB_STRIP_H: f64 = 46.0;
+
+/// The horizontal section switcher above a menu list. Purely presentational — the SCREEN
+/// owns which tab is selected and what the shoulders do; this draws the pills and slides
+/// one highlight between them, so switching sections reads as travel rather than a swap.
+pub(crate) struct TabStrip {
+    /// Chased highlight geometry `(x, width)` in device px. `None` until the first render,
+    /// so a freshly opened screen doesn't animate its highlight in from x = 0.
+    indicator: Option<(f64, f64)>,
+}
+
+impl TabStrip {
+    pub(crate) fn new() -> TabStrip {
+        TabStrip { indicator: None }
+    }
+
+    /// Draw the pills centered in `rect`'s top band. Returns nothing — the caller already
+    /// knows the band is [`TAB_STRIP_H`] tall.
+    #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
+    pub(crate) fn render(
+        &mut self,
+        canvas: &Canvas,
+        rect: Rect,
+        labels: &[&str],
+        selected: usize,
+        fonts: &Fonts,
+        k: f64,
+        dt: f64,
+    ) {
+        if labels.is_empty() {
+            return;
+        }
+        let size = 13.0 * k;
+        let pad_x = 13.0 * k;
+        let gap = 7.0 * k;
+        let pill_h = 30.0 * k;
+        let widths: Vec<f64> = labels
+            .iter()
+            .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * pad_x)
+            .collect();
+        let total: f64 = widths.iter().sum::<f64>() + gap * (labels.len() - 1) as f64;
+        let mut x = f64::from(rect.left) + (f64::from(rect.width()) - total) / 2.0;
+        let top = f64::from(rect.top) + 2.0 * k;
+
+        // Where the highlight wants to be, then the eased position it actually draws at.
+        let sel = selected.min(labels.len() - 1);
+        let target = (
+            x + widths[..sel].iter().sum::<f64>() + gap * sel as f64,
+            widths[sel],
+        );
+        let (ix, iw) = match self.indicator {
+            None => target,
+            Some((cx, cw)) => (
+                approach(cx, target.0, dt, 0.07),
+                approach(cw, target.1, dt, 0.07),
+            ),
+        };
+        self.indicator = Some((ix, iw));
+        crate::theme::panel(
+            canvas,
+            Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
+            (pill_h / 2.0 / k) as f32,
+            Some(brand(0.85)),
+            PanelStroke::Plain(0.22),
+            k as f32,
+        );
+
+        let baseline = top + pill_h / 2.0 + size * 0.36;
+        for (i, label) in labels.iter().enumerate() {
+            // Fade each label toward white by how much the highlight actually covers it, so
+            // the two labels a sliding highlight passes between light up together.
+            let pill_x = x;
+            let overlap = (pill_x + widths[i]).min(ix + iw) - pill_x.max(ix);
+            let covered = (overlap / widths[i]).clamp(0.0, 1.0) as f32;
+            let tw = f64::from(fonts.measure(label, W::SemiBold, size));
+            fonts.draw(
+                canvas,
+                label,
+                pill_x + (widths[i] - tw) / 2.0,
+                baseline,
+                W::SemiBold,
+                size,
+                white(0.5 + 0.5 * covered),
+            );
+            x += widths[i] + gap;
+        }
     }
 }
 

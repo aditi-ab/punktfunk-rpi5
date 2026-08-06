@@ -14,6 +14,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -23,6 +25,9 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -31,7 +36,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -86,32 +93,53 @@ private val auroraBlobs = listOf(
     AuroraBlob(Color(0xFF3862DB), 0.72f, 0.14f, 0.10f, 0.08f, 1, 3, 1.2f, 0.48f, 0.40f), // cool blue
 )
 
+/** The deep base the field sits on — and, scaled, the [calm] lift that flattens it. */
+private val auroraBase = Color(0xFF131126)
+
 /**
- * The living console backdrop: soft violet-family blobs drifting over black on slow, seamless loops,
- * finished with a centre-pooling vignette and top/bottom legibility scrims. A Compose approximation
- * of the Apple client's MeshGradient aurora — same brand family, same "ambience, never content" role.
+ * The living console backdrop: soft brand-family blobs drifting over a deep base on slow, seamless
+ * loops, finished with a centre-pooling vignette and top/bottom legibility scrims. A Compose
+ * approximation of the Apple client's MeshGradient aurora — same colour family, same "ambience,
+ * never content" role, and the same [GamepadPalette] setting recolours both.
+ *
+ * [calm] is what the FORM screens wear: the pools dim onto the base so the glass rows keep real
+ * colour and luminance without the launcher's contrast. Motion is identical either way on purpose —
+ * only the contrast differs, so moving between screens can't make the field jump.
+ *
+ * Honours the system's "remove animations" accessibility setting by freezing at a fixed phase, the
+ * same courtesy the Apple client pays Reduce Motion.
  */
 @Composable
-fun GamepadAuroraBackground(modifier: Modifier = Modifier) {
+fun GamepadAuroraBackground(modifier: Modifier = Modifier, calm: Boolean = false) {
+    val palette = LocalGamepadPalette.current
+    val animated = animationsEnabled()
     val transition = rememberInfiniteTransition(label = "aurora")
     // A full 0..2π sweep over ~96 s; integer per-blob multipliers make sin/cos continuous at the wrap
     // so the field never visibly jumps when the animation restarts.
-    val angle by transition.animateFloat(
+    val swept by transition.animateFloat(
         initialValue = 0f,
         targetValue = (2 * PI).toFloat(),
         animationSpec = infiniteRepeatable(tween(96_000, easing = LinearEasing), RepeatMode.Restart),
         label = "angle",
     )
+    val angle = if (animated) swept else 0f
+    // Tinting is per-frame-cheap but not free, and the palette changes about once a year.
+    val blobs = remember(palette.id) { auroraBlobs.map { it to palette.tint(it.color) } }
+    val base = remember(palette.id) { palette.tint(auroraBase) }
     Canvas(modifier) {
-        drawRect(Color.Black)
+        drawRect(if (calm) base else Color.Black)
         val span = max(size.width, size.height)
-        for (b in auroraBlobs) {
+        for ((b, tinted) in blobs) {
             val cx = (b.baseX + b.driftX * sin(angle * b.sx + b.phase)) * size.width
             val cy = (b.baseY + b.driftY * cos(angle * b.sy + b.phase)) * size.height
             val r = span * b.radiusFrac
+            // Calm scales each blob's contribution rather than dimming the whole canvas: the base
+            // stays put and only the pools come down to meet it, which is the same "lower the
+            // contrast, keep the colour" the desktop console's `calm` uniform does.
+            val alpha = if (calm) b.alpha * 0.62f else b.alpha
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(b.color.copy(alpha = b.alpha), Color.Transparent),
+                    colors = listOf(tinted.copy(alpha = alpha), Color.Transparent),
                     center = Offset(cx, cy),
                     radius = r,
                 ),
@@ -120,10 +148,15 @@ fun GamepadAuroraBackground(modifier: Modifier = Modifier) {
                 blendMode = BlendMode.Plus,
             )
         }
-        // Cinematic vignette: pool light centre, sink the corners.
+        // Cinematic vignette: pool light centre, sink the corners. Halved under calm: a launcher's
+        // cards sit in the pooled centre, but a form screen's rows run out toward the edges, where
+        // crushing to black just eats them. (Matches the Apple client and the desktop console.)
         drawRect(
             Brush.radialGradient(
-                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.44f)),
+                colors = listOf(
+                    Color.Transparent,
+                    Color.Black.copy(alpha = if (calm) 0.22f else 0.44f),
+                ),
                 center = Offset(size.width / 2, size.height / 2),
                 radius = span * 0.92f,
             ),
@@ -141,33 +174,96 @@ fun GamepadAuroraBackground(modifier: Modifier = Modifier) {
 }
 
 /**
- * The calm backdrop for the console FORM screens (settings, add-host) — deliberately still and quiet
- * (unlike the launcher's drifting aurora), a deep indigo base with two soft brand glows so the glass
- * rows have some colour + luminance to sit on. Mirrors the Apple client's GamepadFormBackground.
+ * `false` when the user has turned animations off system-wide (Developer options' animator duration
+ * scale, or the accessibility "Remove animations" switch, which sets the same global). Read once
+ * per composition — it needs a settings trip to the system, and it changes about never.
+ */
+@Composable
+private fun animationsEnabled(): Boolean {
+    val context = LocalContext.current
+    return remember {
+        runCatching {
+            android.provider.Settings.Global.getFloat(
+                context.contentResolver,
+                android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,
+                1f,
+            ) != 0f
+        }.getOrDefault(true)
+    }
+}
+
+/**
+ * The backdrop for the console FORM screens (settings, add-host). It used to be a STILL deep-indigo
+ * base with two soft glows; it is now the launcher's own living field at `calm`, which keeps that
+ * colour and luminance under the glass rows, honours the palette setting on every screen rather
+ * than only the launcher, and leaves nothing in the console UI backed by a static image. Mirrors
+ * the Apple client's GamepadFormBackground, which made the same substitution.
  */
 @Composable
 fun GamepadFormBackground(modifier: Modifier = Modifier) {
-    Canvas(modifier) {
-        val span = max(size.width, size.height)
-        drawRect(Color(0xFF131126))
-        drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(Color(0xE6635AAE), Color.Transparent),
-                center = Offset(size.width * 0.24f, size.height * 0.12f),
-                radius = span * 0.7f,
-            ),
-            center = Offset(size.width * 0.24f, size.height * 0.12f),
-            radius = span * 0.7f,
-        )
-        drawCircle(
-            brush = Brush.radialGradient(
-                colors = listOf(Color(0xBF343E96), Color.Transparent),
-                center = Offset(size.width * 0.82f, size.height * 0.9f),
-                radius = span * 0.7f,
-            ),
-            center = Offset(size.width * 0.82f, size.height * 0.9f),
-            radius = span * 0.7f,
-        )
+    GamepadAuroraBackground(modifier, calm = true)
+}
+
+/**
+ * The horizontal section switcher above a console list. Purely presentational — the SCREEN owns
+ * which tab is selected and what the shoulders do. Scrollable so a narrow phone in landscape never
+ * has to squeeze the pills, and the selected one is always brought into view whether it was reached
+ * by shoulder button or tap.
+ */
+@Composable
+fun ConsoleTabStrip(
+    titles: List<String>,
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    /**
+     * The strip itself holds the cursor (the caller moved focus UP out of its list). Draws a ring
+     * on the selected pill so it's clear left/right now walks sections rather than values — the
+     * route a D-pad remote, which has no shoulder buttons, needs.
+     */
+    focused: Boolean = false,
+) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(selected) {
+        runCatching { listState.animateScrollToItem(selected.coerceAtLeast(0)) }
+    }
+    LazyRow(
+        state = listState,
+        modifier = modifier,
+        contentPadding = PaddingValues(horizontal = ConsoleEdgeInset),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        itemsIndexed(titles) { i, title ->
+            val active = i == selected
+            val background by animateColorAsState(
+                if (active) Color(0xD96656F2) else Color(0x14FFFFFF),
+                tween(180),
+                label = "tabBg",
+            )
+            val ink by animateColorAsState(
+                Color.White.copy(alpha = if (active) 1f else 0.55f),
+                tween(180),
+                label = "tabInk",
+            )
+            val ring by animateColorAsState(
+                Color.White.copy(alpha = if (active && focused) 0.85f else 0f),
+                tween(180),
+                label = "tabRing",
+            )
+            Text(
+                title,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = ink,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(background)
+                    .border(1.5.dp, ring, RoundedCornerShape(50))
+                    .clickable { onSelect(i) }
+                    .padding(horizontal = 14.dp, vertical = 7.dp),
+            )
+        }
     }
 }
 
@@ -176,7 +272,7 @@ fun GamepadFormBackground(modifier: Modifier = Modifier) {
  * sits in the SAME spot across Home / Settings / Add-Host and appears pinned while the content behind
  * it cross-fades between screens.
  */
-val ConsoleLegendInset = PaddingValues(start = 24.dp, bottom = 24.dp)
+val ConsoleLegendInset = PaddingValues(start = 24.dp, end = 24.dp, bottom = 24.dp)
 
 /** The shared horizontal inset for a console screen's heading (matches the legend's left edge). */
 val ConsoleEdgeInset = 24.dp
@@ -471,7 +567,12 @@ fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, haze
     Row(
         modifier = frosted
             .border(1.dp, Color.White.copy(alpha = 0.14f), shape)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+            // The pill still hugs its content when it fits; when it doesn't (a narrow phone, or a
+            // screen whose legend grew a cell) it scrolls rather than running off the edge and
+            // silently eating the last hint — which is exactly what the settings screen's new
+            // Section cell did on a 360 dp phone.
+            .horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(11.dp),
     ) {

@@ -1111,6 +1111,15 @@ pub struct Settings {
     /// Experimental: the game-library browser ("Browse library…" on saved cards) —
     /// mirrors the Apple client's "Show game library" toggle, default off.
     pub library_enabled: bool,
+    /// Which colour family the gamepad UI's living backdrop drifts through — the shared
+    /// `ui_palette` key (`"violet"` = the brand default, then `tide`/`forest`/`ember`/
+    /// `rose`/`graphite`; see `pf-console-ui`'s palette table, and the Apple/Android
+    /// clients' twins). Presentation only: nothing about a stream depends on it, which is
+    /// why it is a device preference and never part of a settings profile. An unknown
+    /// name reads as the default rather than erroring — a newer client may have shipped a
+    /// palette this binary doesn't know.
+    #[serde(default = "default_ui_palette")]
+    pub ui_palette: String,
     /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
     /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
     /// behavior before this became a setting. Off is for hosts reached over a VPN, where
@@ -1193,6 +1202,10 @@ fn default_present_priority() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ui_palette() -> String {
+    "violet".into()
 }
 
 fn default_pad_speaker() -> String {
@@ -1303,6 +1316,7 @@ impl Default for Settings {
             stats_verbosity: None,
             fullscreen_on_stream: true,
             library_enabled: false,
+            ui_palette: default_ui_palette(),
             auto_wake: true,
             invert_scroll: false,
             speaker_device: String::new(),

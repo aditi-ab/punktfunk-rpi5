@@ -166,7 +166,7 @@ impl Shell {
         canvas.save_layer_alpha_f(None, appear as f32);
         // Opaque aurora — the same living backdrop the home wears, so the takeover reads as the
         // console taking over rather than a card popping up.
-        self.draw_aurora(canvas, w, h, t);
+        self.draw_aurora(canvas, w, h, t, 0.0);
         // A soft pool of shade under the centre seats the white text against a bright aurora.
         let mut vignette = Paint::default();
         vignette.set_shader(gradient_shader::radial(

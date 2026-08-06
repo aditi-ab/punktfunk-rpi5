@@ -31,6 +31,7 @@ import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
+import io.unom.punktfunk.GamepadSettingsScreen
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsCategory
@@ -406,3 +407,13 @@ internal fun WakeTimedOutScene() =
 @Composable
 internal fun ConnectConsoleScene() =
     ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
+
+/**
+ * The real console settings screen — the section tab strip, the glass rows, the focused row's
+ * unfolded detail, and the living (calmed) backdrop behind them. The touch [SettingsScene] can't
+ * stand in for it: this is a different screen with different navigation, and the strip is the part
+ * a layout regression would eat first.
+ */
+@Composable
+internal fun ConsoleSettingsScene() =
+    GamepadSettingsScreen(initial = SHOT_SETTINGS, onChange = {}, onBack = {})

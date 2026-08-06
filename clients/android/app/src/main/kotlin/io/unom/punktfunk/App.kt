@@ -31,6 +31,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -98,6 +99,13 @@ fun App(forceGamepadUi: Boolean = false) {
         }
     }
 
+    // The console backdrop's colour family, published once from the live settings rather than
+    // threaded through every screen that draws a backdrop. Because it is read from the SAME
+    // `settings` state the gamepad settings screen writes, stepping the Background row recolours
+    // the field behind that very row.
+    CompositionLocalProvider(
+        LocalGamepadPalette provides GamepadPalette.named(settings.uiPalette),
+    ) {
     AnimatedContent(
         targetState = session,
         transitionSpec = {
@@ -201,7 +209,15 @@ fun App(forceGamepadUi: Boolean = false) {
             }
         }
     }
+    }
 }
+
+/**
+ * The console backdrop's colour family for everything under [App] — provided from the live
+ * settings so a change on the gamepad settings screen recolours every backdrop at once. Defaults
+ * to the brand violet, which is also what a preview or a test composition gets.
+ */
+val LocalGamepadPalette = compositionLocalOf { GamepadPalette.named("violet") }
 
 /** Which console screen the gamepad shell is showing. */
 private enum class GamepadScreen { Home, Settings, Library }

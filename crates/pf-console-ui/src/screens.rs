@@ -21,9 +21,10 @@ use skia_safe::{Canvas, Rect};
 /// What a screen draws over (the shell crossfades between them on push/pop).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Bg {
-    /// The living mesh aurora (home, library).
+    /// The living mesh aurora at full contrast (home, library).
     Aurora,
-    /// The quiet indigo form backdrop (settings, add-host, pair).
+    /// The SAME living mesh, calmed — dimmed pools, lifted corners (settings, add-host,
+    /// pair). Not a second backdrop: the shell chases one `calm` uniform between the two.
     Form,
 }
 
