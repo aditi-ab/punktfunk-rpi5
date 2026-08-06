@@ -671,9 +671,10 @@ mod tests {
         } else {
             "/home/u/.cache/lutris/coverart/cover.jpg".to_string()
         };
+        let url = file_url(std::path::Path::new(&path));
         let mut art = Artwork {
             portrait: Some(path.clone()),
-            hero: Some(format!("file://{path}")),
+            hero: Some(url),
             logo: Some("https://cdn/l.png".into()),
             header: None,
         };
@@ -757,7 +758,7 @@ mod tests {
         // half that matters for the extracted scanners: they emit `file://` values, so if the
         // conversion happened after the confinement check the check would be inspecting a string
         // that is not the path being read.
-        let as_url = format!("file://{}", cover.to_str().unwrap());
+        let as_url = file_url(&cover);
         assert_eq!(
             local_art_bytes(&as_url)
                 .expect("file:// reads the same cover")
@@ -766,15 +767,15 @@ mod tests {
         );
         // …and a `file://` value is confined exactly like a bare one — no bypass by spelling.
         assert!(
-            local_art_bytes(&format!("file://{}", elsewhere.to_str().unwrap())).is_none(),
+            local_art_bytes(&file_url(&elsewhere)).is_none(),
             "file:// must not escape the art roots"
         );
         // Percent-encoded traversal is decoded BEFORE canonicalization, so it cannot hide from the
         // `..` check.
         assert!(
             local_art_bytes(&format!(
-                "file://{}/%2e%2e/{}/cover.png",
-                dir.to_str().unwrap(),
+                "{}/%2e%2e/{}/cover.png",
+                file_url(&dir),
                 outside.file_name().unwrap().to_str().unwrap()
             ))
             .is_none(),
@@ -787,6 +788,21 @@ mod tests {
         std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Build a `file://` value the way the kit's `fileUrl` does, so these tests exercise the real
+    /// plugin contract on both platforms. A POSIX path keeps the two-slash form
+    /// (`file:///home/u/c.png` — empty authority, then the leading `/`); a Windows path becomes
+    /// `file:///C:/covers/c.png`, i.e. three slashes and forward separators. Building it as
+    /// `format!("file://{path}")` on Windows yields `file://C:\covers\c.png`, whose authority is
+    /// `C:` — that is a UNC reference, not a local file, and the parser is right to refuse it.
+    fn file_url(p: &std::path::Path) -> String {
+        let posix = p.to_str().unwrap().replace('\\', "/");
+        if posix.starts_with('/') {
+            format!("file://{posix}")
+        } else {
+            format!("file:///{posix}")
+        }
     }
 
     /// Write-time validation refuses what read-time would refuse, so an unservable path never even
