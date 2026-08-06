@@ -168,8 +168,7 @@ fun ConnectScreen(
             lnpPrompt = false
             // The browse started while blocked (its sockets failed or received nothing) — restart it
             // now that the grant makes them work.
-            discovery.stop()
-            discovery.start()
+            discovery.restart()
         } else {
             lnpPrompt = true // rationale + "Open settings" (a permanently-denied request returns instantly)
         }
@@ -191,12 +190,27 @@ fun ConnectScreen(
     // or otherwise notify the app — this observer is what turns the grant into a live discovery.
     DisposableEffect(Unit) {
         val lifecycle = (context as? LifecycleOwner)?.lifecycle
+        // Whether we've actually been away. ON_RESUME also fires on first entry, right after the
+        // effect below starts the browse — restarting it there would be pure churn.
+        var wasPaused = false
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME && !lnpGranted && hasLocalNetworkPermission(context)) {
-                lnpGranted = true
-                lnpPrompt = false
-                discovery.stop()
-                discovery.start()
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> wasPaused = true
+                Lifecycle.Event.ON_RESUME -> {
+                    if (!lnpGranted && hasLocalNetworkPermission(context)) {
+                        lnpGranted = true
+                        lnpPrompt = false
+                        discovery.restart()
+                    } else if (wasPaused) {
+                        // Coming back from the background: the browse may have been sitting idle
+                        // (or had its multicast socket torn out from under it) while we were away,
+                        // and its own re-query interval has kept doubling. Re-arm and ask again,
+                        // so returning to the screen is enough — no app restart.
+                        discovery.restart()
+                    }
+                    wasPaused = false
+                }
+                else -> {}
             }
         }
         lifecycle?.addObserver(obs)
@@ -1009,20 +1023,28 @@ fun ConnectScreen(
             // rather than looking idle/empty. Suppressed while local network access is denied —
             // a spinner would be a lie there (the browse can't receive anything); the banner above
             // owns that state.
-            if (lnpGranted && !connecting && discovered.isEmpty()) {
+            // Scan again is offered whether or not anything turned up: the case that sends people
+            // here is ONE expected host missing, not an empty list, and a browse that quietly went
+            // deaf (blocked when it started, or backed off to its hour-long re-query) looks
+            // exactly like a network without that host on it.
+            if (lnpGranted && !connecting) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            "Searching the local network…",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        if (discovered.isEmpty()) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Searching the local network…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        TextButton(onClick = { discovery.restart() }) { Text("Scan again") }
                     }
                 }
             }

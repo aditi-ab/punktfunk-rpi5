@@ -3,6 +3,12 @@
 //! results to the UI. Ported verbatim from the GTK client (`mdns-sd` is cross-platform).
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
+const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiscoveredHost {
@@ -24,10 +30,25 @@ pub struct DiscoveredHost {
     pub os: String,
 }
 
-/// Browse continuously for the app's lifetime. The thread exits when the receiver is
-/// dropped (the send fails) or the daemon dies.
-pub fn browse() -> async_channel::Receiver<DiscoveredHost> {
+/// Forces the running browse to re-query now — the hosts page's Refresh. Mirrors
+/// `pf_client_core::discovery::Rescan`; see there for why a client needs one (`mdns-sd` re-queries
+/// on a backoff that doubles out to an hour, so a long-lived browse is effectively passive).
+#[derive(Clone, Debug)]
+pub struct Rescan(Arc<AtomicBool>);
+
+impl Rescan {
+    /// Ask the browse thread to put a fresh query on the wire. Coalesces; returns immediately.
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Browse continuously for the app's lifetime, with a handle that forces an immediate re-query.
+/// The thread exits when the receiver is dropped (the send fails) or the daemon dies.
+pub fn browse() -> (async_channel::Receiver<DiscoveredHost>, Rescan) {
     let (tx, rx) = async_channel::unbounded();
+    let flag = Arc::new(AtomicBool::new(false));
+    let requested = flag.clone();
     std::thread::Builder::new()
         .name("punktfunk-mdns".into())
         .spawn(move || {
@@ -38,18 +59,45 @@ pub fn browse() -> async_channel::Receiver<DiscoveredHost> {
                     return;
                 }
             };
-            let receiver = match daemon.browse("_punktfunk._udp.local.") {
+            let mut receiver = match daemon.browse(SERVICE_TYPE) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(error = %e, "mDNS browse failed — discovery disabled");
                     return;
                 }
             };
-            while let Ok(event) = receiver.recv() {
+            loop {
+                // The worker has to notice that its consumer went away even when NOTHING is
+                // arriving — the normal state of a LAN with no hosts on it. The old blocking
+                // `recv()` only ever learned that from a failed send, so a bounded consumer (the
+                // wake-and-wait below spawns one browse per wake) left this thread and its daemon
+                // — another thread, and a socket bound to :5353 — running for the app's lifetime.
+                // Checked at the TOP so the `continue` arms below can't skip it either.
+                if tx.is_closed() {
+                    break;
+                }
+                // Re-browsing the same type replaces the daemon's listener: it replays the cache
+                // into the new channel, queries immediately, and resets the backoff.
+                if requested.swap(false, Ordering::Relaxed) {
+                    match daemon.browse(SERVICE_TYPE) {
+                        Ok(r) => receiver = r,
+                        Err(e) => tracing::warn!(error = %e, "mDNS rescan failed"),
+                    }
+                }
+                let event = match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(event) => event,
+                    Err(_) if receiver.is_disconnected() && receiver.is_empty() => break,
+                    Err(_) => continue, // timed out — go round and look for a rescan request
+                };
                 if let ServiceEvent::ServiceResolved(info) = event {
                     let props = info.get_properties();
                     let val = |k: &str| props.get_property_val_str(k).unwrap_or("").to_string();
-                    let Some(addr) = info.get_addresses().iter().next().map(|a| a.to_string())
+                    // IPv4 only, like every other client (`pf_client_core::discovery`): the core
+                    // dials `format!("{host}:{port}").parse::<SocketAddr>()`, which cannot parse a
+                    // bare IPv6 literal, and the host stack binds IPv4 sockets exclusively. Taking
+                    // an arbitrary first address here rendered cards that failed on every click,
+                    // because a host's OS responder commonly answers AAAA for its hostname.
+                    let Some(addr) = info.get_addresses_v4().iter().next().map(|a| a.to_string())
                     else {
                         continue;
                     };
@@ -85,5 +133,5 @@ pub fn browse() -> async_channel::Receiver<DiscoveredHost> {
             let _ = daemon.shutdown();
         })
         .expect("spawn mdns thread");
-    rx
+    (rx, Rescan(flag))
 }

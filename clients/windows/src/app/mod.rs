@@ -147,6 +147,10 @@ impl PartialEq for Svc {
 #[derive(Default)]
 pub(crate) struct Shared {
     pub(crate) target: Mutex<Target>,
+    /// Forces the app's single LAN browse to re-query — the hosts page's Refresh. Installed by
+    /// the discovery effect below; `None` until then (and if the browse never started, in which
+    /// case Refresh is simply inert rather than a second, competing browse).
+    pub(crate) rescan: Mutex<Option<discovery::Rescan>>,
     /// The live session child (spawn mode) — the status page's Disconnect and the
     /// request-access Cancel kill it. A FRESH handle is installed per spawn.
     pub(crate) session: Mutex<crate::spawn::SessionChild>,
@@ -459,8 +463,10 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
 
     cx.use_effect((), {
         let set_hosts = set_hosts.clone();
+        let ctx = ctx.clone();
         move || {
-            let rx = discovery::browse();
+            let (rx, rescan) = discovery::browse();
+            *ctx.shared.rescan.lock().unwrap() = Some(rescan);
             std::thread::spawn(move || {
                 let mut acc: Vec<DiscoveredHost> = Vec::new();
                 while let Ok(h) = rx.recv_blocking() {
