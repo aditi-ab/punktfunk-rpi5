@@ -67,6 +67,16 @@ const GOLDENS_H264: &str = include_str!("data/test-25fps.nv12.sha256");
 /// The H.265 twin, cross-checked between two independent FFmpeg builds (header).
 const GOLDENS_H265: &str = include_str!("data/test-25fps-h265.nv12.sha256");
 
+/// The ten-bit vector and its goldens. No hardware leg in this file consumes them
+/// yet — the D3D11VA rung is where the ten-bit parity leg currently runs — but the
+/// files live here, beside the other goldens, so the guard that keeps them honest
+/// belongs here too and runs on every platform rather than only on Windows.
+const TEST_MAIN10_H265: &[u8] = include_bytes!("data/test-main10.h265");
+const GOLDENS_MAIN10: &str = include_str!("data/test-main10.p010.sha256");
+
+/// The Main 10 vector is 50 display frames.
+const MAIN10_FRAME_COUNT: usize = 50;
+
 /// The H.264 vector's display (conformance-window) region; the goldens hash
 /// exactly this as tightly packed NV12.
 const DISPLAY_H264: (u32, u32) = (320, 240);
@@ -126,7 +136,17 @@ struct Readback {
     mapped: *const u8,
     /// The display region every read copies, and the crop it requires.
     display: (u32, u32),
-    /// `w * h * 3 / 2` — the tightly packed NV12 frame this buffer holds.
+    /// The picture format the pool must carry. Held here rather than read from a
+    /// module constant so the sizing below and the per-frame assertion come from
+    /// ONE source — a readback sized for eight bits that then accepted a ten-bit
+    /// frame would hash half a picture and blame the decoder.
+    format: vk::Format,
+    /// 1 for NV12, 2 for the `3PACK16` ten-bit family (its samples are 16-bit
+    /// words with the ten bits in the high end — the same layout P010 has, which
+    /// is why one golden file serves both this rung and the D3D11VA one).
+    bytes_per_sample: u32,
+    /// `w * h * 3 / 2 * bytes_per_sample` — the tightly packed frame this buffer
+    /// holds.
     frame_bytes: usize,
 }
 
@@ -142,16 +162,22 @@ impl Readback {
         device: &ash::Device,
         graphics_qf: u32,
         display: (u32, u32),
+        format: vk::Format,
     ) -> Self {
         let (width, height) = display;
-        // The two-plane copy below halves both dimensions for the R8G8 plane, so
+        // The two-plane copy below halves both dimensions for the chroma plane, so
         // an odd display region would silently drop a chroma row/column.
         assert_eq!(
             (width % 2, height % 2),
             (0, 0),
             "the display region must be chroma-aligned"
         );
-        let frame_bytes = (width * height * 3 / 2) as usize;
+        let bytes_per_sample = match format {
+            f if f == pf_vkdecode::NV12 => 1,
+            f if f == pf_vkdecode::P010 => 2,
+            other => panic!("readback has no sample size for {other:?}"),
+        };
+        let frame_bytes = (width * height * 3 / 2 * bytes_per_sample) as usize;
 
         // SAFETY: fn contract — live device, queue 0 of this family exists.
         let queue = unsafe { device.get_device_queue(graphics_qf, 0) };
@@ -219,6 +245,8 @@ impl Readback {
             memory,
             mapped,
             display,
+            format,
+            bytes_per_sample,
             frame_bytes,
         }
     }
@@ -309,7 +337,9 @@ impl Readback {
                 },
             },
             vk::BufferImageCopy {
-                buffer_offset: u64::from(width * height),
+                // A BYTE offset, unlike the extents above, which are texels: the
+                // luma plane occupies `w * h * bytes_per_sample` bytes.
+                buffer_offset: u64::from(width * height * self.bytes_per_sample),
                 buffer_row_length: 0,
                 buffer_image_height: 0,
                 image_subresource: layers(vk::ImageAspectFlags::PLANE_1),
@@ -440,8 +470,9 @@ fn consume_frame(
     // hash differently for a reason no mismatch report could explain
     // (`DecodedVkFrame::format` docs) — refuse it here instead.
     assert_eq!(
-        frame.format, EXPECTED_FORMAT,
-        "frame {index}: 8-bit 4:2:0 vector must decode into an NV12 pool"
+        frame.format, readback.format,
+        "frame {index}: the vector must decode into the pool format the readback \
+         was built for"
     );
     // SAFETY: the frame is delivered and unreleased on the readback's device;
     // the pool carries TRANSFER_SRC (PF_VKD_TEST_READBACK was set before the
@@ -573,6 +604,7 @@ fn h264_parity_run(aus: &[&[u8]], label: &str) {
                 &setup.device,
                 setup.graphics_qf,
                 DISPLAY_H264,
+                EXPECTED_FORMAT,
             )
         };
         let hashes = collect_hashes(&mut decoder, &readback, aus);
@@ -614,16 +646,24 @@ fn h264_four_byte_start_codes_decode_bit_identically() {
 
 /// The H.265 twin of [`h264_parity_run`]; see its docs for why the AUs are a
 /// parameter.
-fn h265_parity_run(aus: &[&[u8]], label: &str) {
+fn h265_parity_run(
+    aus: &[&[u8]],
+    goldens_file: &'static str,
+    expected_frames: usize,
+    bit_depth_luma_minus8: u8,
+    format: vk::Format,
+    display: (u32, u32),
+    label: &str,
+) {
     // As the H.264 leg: one codec at a time, `set_var` under the lock.
     let _gpu = common::gpu_lock();
 
     std::env::set_var("PF_VKD_TEST_READBACK", "1");
 
-    let goldens = golden_hashes(GOLDENS_H265);
+    let goldens = golden_hashes(goldens_file);
     assert_eq!(
         goldens.len(),
-        FRAME_COUNT,
+        expected_frames,
         "the golden file carries one hash per libavcodec frame"
     );
 
@@ -644,8 +684,10 @@ fn h265_parity_run(aus: &[&[u8]], label: &str) {
         // host the combination refuses here with a caps reason instead of failing
         // mid-stream.
         decoder
-            .probe_stream_support(1, 0)
-            .expect("the box must host H.265 Main 8-bit 4:2:0 (the vector's shape)");
+            .probe_stream_support(1, bit_depth_luma_minus8)
+            .unwrap_or_else(|e| {
+                panic!("{label}: the box must host this H.265 shape — {e:?}");
+            });
         // SAFETY: as the H.264 leg — live instance/device, queue 0 of
         // `graphics_qf` exists; destroyed at the end of this block.
         let readback = unsafe {
@@ -654,7 +696,8 @@ fn h265_parity_run(aus: &[&[u8]], label: &str) {
                 setup.pd,
                 &setup.device,
                 setup.graphics_qf,
-                DISPLAY_H265,
+                display,
+                format,
             )
         };
         let hashes = collect_hashes(&mut decoder, &readback, aus);
@@ -673,7 +716,37 @@ fn h265_parity_run(aus: &[&[u8]], label: &str) {
 #[test]
 #[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
 fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
-    h265_parity_run(&common::split_h265_aus(common::TEST_25FPS_H265), "H.265");
+    h265_parity_run(
+        &common::split_h265_aus(common::TEST_25FPS_H265),
+        GOLDENS_H265,
+        FRAME_COUNT,
+        0,
+        EXPECTED_FORMAT,
+        DISPLAY_H265,
+        "H.265",
+    );
+}
+
+/// The ten-bit path — the only leg in this file that is not eight-bit.
+///
+/// Every other golden set in this program is NV12, so no rung had pixel evidence
+/// for its ten-bit path: the HDR legs proved a Main10 session BUILDS and streams
+/// clean, which a stream decoding to garbage would also do. The goldens are P010
+/// and the Vulkan pool is `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`, whose
+/// samples are 16-bit words with the ten bits in the high end — the same layout,
+/// which is why one golden file serves this rung and the D3D11VA one.
+#[test]
+#[ignore = "needs a Vulkan Video H.265 Main 10 decode device (fleet boxes; see module docs)"]
+fn main10_every_frame_hashes_bit_identical_to_libavcodec() {
+    h265_parity_run(
+        &common::split_h265_aus(TEST_MAIN10_H265),
+        GOLDENS_MAIN10,
+        MAIN10_FRAME_COUNT,
+        2,
+        pf_vkdecode::P010,
+        (320, 240),
+        "HEVC Main 10",
+    );
 }
 
 /// The HEVC leg of the production prefix form — the one that would have caught
@@ -684,6 +757,11 @@ fn h265_four_byte_start_codes_decode_bit_identically() {
     let stream = common::h265_four_byte_start_codes(common::TEST_25FPS_H265);
     h265_parity_run(
         &common::split_h265_aus(&stream),
+        GOLDENS_H265,
+        FRAME_COUNT,
+        0,
+        EXPECTED_FORMAT,
+        DISPLAY_H265,
         "H.265 (4-byte start codes)",
     );
 }
@@ -840,6 +918,68 @@ fn h264_goldens_and_au_split_agree_with_the_planner() {
         outputs,
         goldens.len(),
         "the planner outputs {outputs} pictures but the goldens carry {} hashes",
+        goldens.len()
+    );
+}
+
+#[test]
+fn the_main10_vector_is_ten_bit_and_agrees_with_its_goldens() {
+    use pf_bitstream::h265::H265Planner;
+
+    let goldens = golden_hashes(GOLDENS_MAIN10);
+    assert_eq!(
+        goldens.len(),
+        MAIN10_FRAME_COUNT,
+        "data/test-main10.p010.sha256 must carry one hash per display frame"
+    );
+    assert!(
+        goldens
+            .iter()
+            .all(|line| line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit())),
+        "every golden line is a bare lowercase SHA-256 hex digest"
+    );
+
+    let aus = common::split_h265_aus(TEST_MAIN10_H265);
+    assert_eq!(
+        aus.len(),
+        MAIN10_FRAME_COUNT,
+        "the Main 10 vector is {MAIN10_FRAME_COUNT} access units"
+    );
+
+    let mut planner = H265Planner::new();
+    let mut outputs = 0usize;
+    for (index, au) in aus.iter().enumerate() {
+        let plan = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("AU {index}: the Main 10 vector must plan without errors, got {e:?}")
+        });
+        // The whole reason this vector exists. Every other golden set in this
+        // program is eight-bit; a regenerated vector that came out eight-bit would
+        // turn the ten-bit parity leg into a second run of the eight-bit path, and
+        // it would PASS, because its goldens would have been regenerated with it.
+        assert_eq!(
+            (
+                plan.picture.chroma_format_idc,
+                plan.picture.bit_depth_luma_minus8,
+                plan.picture.bit_depth_chroma_minus8,
+            ),
+            (1, 2, 2),
+            "AU {index}: the Main 10 vector must stay 4:2:0 at ten bits"
+        );
+        if index == 0 {
+            assert!(plan.picture.is_idr, "the vector opens with an IDR");
+            assert_eq!(
+                (plan.picture.coded_width, plan.picture.coded_height),
+                (320, 240),
+                "the goldens hash a 320x240 picture"
+            );
+        }
+        outputs += plan.dpb.outputs.len();
+    }
+    outputs += planner.flush().outputs.len();
+    assert_eq!(
+        outputs,
+        goldens.len(),
+        "the planner outputs {outputs} pictures but the goldens carry {}",
         goldens.len()
     );
 }

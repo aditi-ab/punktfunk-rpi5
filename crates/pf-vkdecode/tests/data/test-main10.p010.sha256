@@ -1,0 +1,83 @@
+# SHA-256 per decoded frame of test-main10.h265, DISPLAY order - 50 frames.
+#
+# Each frame is the 320x240 picture as tightly packed P010:
+#   Y plane   320*240 16-bit words = 153600 bytes
+#   UV plane  160*120 interleaved (U,V) 16-bit pairs = 76800 bytes
+#   total     230400 bytes/frame
+#
+# P010, NOT yuv420p10le: the ten bits sit in the HIGH bits of each little-endian
+# 16-bit word (15..6) with the low six zeroed, which is what a D3D11 P010 surface
+# and a Vulkan G10X6_B10X6R10X6 image both contain. Hashing yuv420p10le instead
+# would compare LSB-aligned samples against MSB-aligned ones and fail everywhere
+# for a reason that has nothing to do with the decode.
+#
+# This vector carries no conformance window - coded size IS display size.
+#
+# Why it exists: every other golden set in this program is 8-bit, so no rung had
+# pixel evidence for its ten-bit path. The HDR legs proved a Main10 session BUILDS
+# and runs clean, which is not the same claim - D3D11VA has no per-picture status
+# query, so a Main10 stream decoding to garbage would log exactly as cleanly.
+#
+# Generated 2026-08-06 from libavcodec's SOFTWARE decoder (HEVC decoding is exactly
+# specified - every conformant decoder is bit-identical), and CROSS-CHECKED between
+# two independent builds on two architectures that agreed on all 50 frames:
+#   ffmpeg 8.1.1        (Homebrew, macOS arm64)
+#   ffmpeg 8.0.1-3ubuntu2 (Ubuntu, x86_64)
+#
+# Vector generation (libx265, Main 10, 4:2:0, 2 s at 25 fps):
+#   ffmpeg -f lavfi -i testsrc2=size=320x240:rate=25:duration=2 \
+#     -c:v libx265 -pix_fmt yuv420p10le -x265-params "log-level=none:profile=main10" \
+#     -f hevc test-main10.h265
+#
+# Goldens:
+#   ffmpeg -i test-main10.h265 -f rawvideo -pix_fmt p010le - | <sha256 per 230400 bytes>
+fe40d5f2aac672155dd200cc64ae3c6c47dc90e6dfcc59f634db0603ea553068
+ba62cb199082881c76eca0bccdd41201fd9c1142e97ce89747ef64a836c31f4f
+2494e3695cb7be56aabedbfae3dddd10ba0c2e0ad08b51bbe03d7e2d26baccb8
+8195990eeb8475d01abd2f0c27cbf20a3abe8d2fc273996aa66528277070aec1
+ff45876b191c83688a37898e0fa9757b03215f2d2cf1a1a50f9899c837873a04
+a684b50bf67c59052c138cda318c83f85d55132c8f9e8e28a430ea6731fa59c5
+65e4dea6aaab1e73a942b3c3a9334cd2a215c36709a4338f3dfc71bf8dca5819
+9d8deda227c79a931be366370093c42c5e8ce417044069c883d144197eb089be
+48dbfe1702045aa13e3d6f7fa3f95aae2e863c0b792f77a444504c373bc28313
+f700d0bb43c2df17e49b036125f313ae41f31ee75f1d6ad895e36e7145a402ca
+ec351982a1e14ef5edaba99d578e9d77fa3644ffdd7101d5d3d95b484313b9f7
+0526ca0453f5eb05b9cfb694d5a0d30cdd3fdd9e7914b4a527b33fd0c2ad3cef
+07fdeeaeb8de894030c60a4fcfccf116488e9f9dbf19de59963f279c9b4bf3de
+ef15d30d0bbd9f2bb454a10d30451151ae4300b0b5844f8dda2c06f4feb41d40
+f8e7bf24d3d8c3938c4a3b0bf7f2d81af457ecedee22cbf0cfeed8e4e67baa95
+fb48d15f9462cf359acab5ae48c91176b7b2931a57755815d4539bc4f3e8ad4b
+a8bec00e24b39b55fcca51fde360fce130400202c1ac9370657c60578536acc4
+f3fe62e6ed17d4e59dc16b7c8627d494047163e14e5a0521792d3d9680a06fe1
+b811ebb99d9339e3fce4a2db070a315385ea7570f01a3d18275bc5a97a359850
+b38cd7adda00d5f8e33b7cb8e0d18fdc94686ab16e72bbc67ecb6521d19ab412
+cf7946c7be96da66e256e2235ee0f7b2a35e1e344fea2214e2045e8bd5b548c7
+635916c2a10c1086efccb71c505a71f4a77e2007f5df165f0be15ea1359eec5b
+e70cc81406480acfd686091d023ddb0b5315230fa2449a5d73ff403ea0f6d532
+825301a5c79ed4b28f503af92ae569fdb66c53de60c661b93d96467cc2ed6b8d
+9739d731f87ad1dd21d26331bb4f2d28857815ed4c2b1d45dde2744da1efa60a
+313d001c0c2203eef18a2386c73e63fdf9ac0417dba4339fce95b11c73b68b84
+74597aa7d898c4ba79f88fff2c37cfb54dda2f9e9834cbc92b1b090ae730efa3
+ef22cd7812608173266162af239e845c66ef71d025ce17a4f815af33a8617760
+c6f5f5ce376f4b5dd82f9d01cc16081a352736051eb00b352cf3f4d15ca5de17
+a854b63bd8d288734548ddc792c3d67c5e3ec744264038b5f0a319038b129112
+f3a14d11678dbd8e4dcfbc8ea0b1cd3503cb2e695858f03cac1e9613744308b2
+8d6abe1632b2586ba830a69ea509c72645c1e7cb939adffba05ec846716d2ba9
+f809f1e5cff7402bbc281ef4651760858dc5e8feed6e815bdbe780972f03fe0d
+43c64be95cfd7512a96f8d82e48198766f7eab292023c2b84780075cae4d0544
+4e9e8f2336bafb17267c2deb18b9fd4fc561b2df3cc0ab63a6654d8946a0362a
+1003635166c1d34360bca984e31a06dea1583859d0cb515eac6c65f13629ffd2
+31ce8f6f38026317ed31bafc11c8ecdc5fa6c14cf72835126a6def695c4934d2
+eaeb25f2e4f6a881fc3d707a3076eab45c5605880c953f552591d199ba48ab0b
+ec6aa73e67516f2e6053cfb3ab6df304ee4093190ef6b52442b2ad2cf598f287
+f07f7d2d5e5d48d37804e33234a0fa029cc7abf60ca19d21663ef8435d9c3ad8
+a0f5d8dab08fe6764eb46c46eb4320a105329b805ab6dd0f4ce0758b4fc10409
+3f98a8dc1bd2c7eca8fc39945195b16de868db1ff0445d9ac2aa74dbcc370b8a
+0ca2d9f7251aa020c14a6548922e55cbf010d14c2c3a2a27db3eb8a9a4c185b8
+79b6e0898dfdddca8a878ace9742aa3607b3a968e56b95d3aef03dea3b11cf71
+59487538cdcd63a48a28e2682fd56cc6dbe67ca00c696ddf06b21f605dac91dd
+dc98f561f0ecc58824123fd8cfa5f0c2ce96bf4fafa56ca1d062b00df12f2d7f
+394804f6a890eeecf6ffbd7a54015cc248ced7e0a951e921a329d615522d3102
+7f8d56e2e57099e1cd456c9cb67748de521a398180b86f52e06bb6ef6ca8d816
+a860ede88b1f66e2d08a1755f6d49e70b553270c61e709ca0b1ca5adac3e1594
+c6b7df04a6292863041fe141f6a4cb4eaf0d27f267e733e1ba75a6fe3f8f05cc
