@@ -2911,6 +2911,272 @@ mod tests {
         println!("nvenc_cuda reconfigure smoke: 20→60→10 Mbps in place, zero IDRs");
     }
 
+    /// ON-HARDWARE — **spike S1** (`design/nvenc-split-encode-engagement-implementation-plan.md`):
+    /// can `splitEncodeMode` change via `nvEncReconfigureEncoder` with `resetEncoder=0`, WITHOUT
+    /// emitting an IDR?
+    ///
+    /// This is the gate on the whole split-engagement program. `splitEncodeMode` lives in
+    /// `NV_ENC_INITIALIZE_PARAMS`, and our own invariant says a reconfigure "must present the SAME
+    /// init params as the open" (`windows/nvenc.rs:620`) — but that is OUR rule, never tested
+    /// against the driver. A forced mid-stream IDR is not acceptable (user), so:
+    /// - **driver rejects the change** → the constraint is real; the split decision is
+    ///   once-per-session and must be predicted at open.
+    /// - **accepts it AND the next AU is not a keyframe** → mid-stream adaptation is free, and the
+    ///   engagement rule can simply be re-resolved whenever ABR moves.
+    /// - **accepts it but emits an IDR anyway** → same as a rejection for our purposes. This is the
+    ///   case a naive "did it return Ok?" check would get wrong, which is why the keyframe count
+    ///   below is the real assertion.
+    ///
+    /// Sub-frame is pinned OFF for the whole test: HEVC forced-split and sub-frame readback are
+    /// mutually unsupported (`resolve_split_subframe`), so leaving it on would have the driver
+    /// reject the reconfigure for the WRONG reason and read as a false negative.
+    ///
+    /// Reports rather than asserts the verdict — S1 is a measurement, and BOTH outcomes are
+    /// legitimate findings. It only asserts the things that would invalidate the measurement
+    /// itself (session came up, engines ≥ 2, the arms actually differ). Run ALONE (it sets env):
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_split_reconfigure_in_place --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_split_reconfigure_in_place() {
+        use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        const BPS: u64 = 40_000_000;
+        let disable = M::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+
+        // Isolate the split variable: sub-frame off, and open explicitly split-DISABLED so the
+        // switch below is a real change rather than a no-op.
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            BPS,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            4,
+        )
+        .expect("open NVENC CUDA session");
+
+        let submit_and_poll = |enc: &mut NvencCudaEncoder, range: std::ops::Range<u32>| {
+            let (mut aus, mut keyframes) = (0usize, 0usize);
+            for i in range {
+                let frame = nv12_frame(W, H, i);
+                enc.submit_indexed(&frame, i).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    aus += 1;
+                    keyframes += au.keyframe as usize;
+                }
+            }
+            (aus, keyframes)
+        };
+
+        // Frames first: the session is lazily created on the first submit, and
+        // `reconfigure_bitrate` short-circuits to `true` while `!inited` (no session to reconfigure
+        // yet), which would make the whole spike vacuous.
+        let (aus, kfs) = submit_and_poll(&mut enc, 0..4);
+        assert!(aus > 0, "no AUs before the reconfigure");
+        assert_eq!(kfs, 1, "exactly the opening IDR before the reconfigure");
+        assert!(
+            enc.inited,
+            "session must be live for the spike to mean anything"
+        );
+        assert_eq!(
+            enc.split_mode, disable,
+            "the spike needs to OPEN split-disabled so the switch is a real change"
+        );
+
+        // Engine count (WP1.1's probe, borrowed): forced-2 on a 1-NVENC GPU would be rejected for a
+        // reason that has nothing to do with reconfigure, so the verdict is only interpretable
+        // when the card actually has a second engine.
+        // SAFETY: `enc.encoder` is the live session (`inited` asserted above); `get_cap` only reads
+        // a cap through it and returns 0 on any driver error.
+        let engines = unsafe {
+            enc.get_cap(
+                enc.encoder,
+                nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES,
+            )
+        };
+        println!("S1: NV_ENC_CAPS_NUM_ENCODER_ENGINES = {engines}");
+        assert!(
+            engines >= 2,
+            "this GPU reports {engines} NVENC engine(s) — S1 is not interpretable here, run it on \
+             a 2-engine card"
+        );
+
+        // THE SPIKE: change ONLY splitEncodeMode (same bitrate, same everything else) and ask the
+        // driver to take it in place.
+        enc.split_mode = two;
+        let accepted = enc.reconfigure_bitrate(BPS);
+        println!("S1: reconfigure DISABLE→TWO_FORCED accepted = {accepted}");
+
+        let verdict = if !accepted {
+            // Restore the field so the encoder's idea of its own session stays truthful for the
+            // rest of the test (the live session is still split-disabled).
+            enc.split_mode = disable;
+            "FAIL — driver REJECTED the in-place splitEncodeMode change"
+        } else {
+            let (aus, kfs) = submit_and_poll(&mut enc, 4..8);
+            assert!(aus > 0, "no AUs after the accepted reconfigure");
+            if kfs == 0 {
+                "PASS — accepted with NO IDR: mid-stream split adaptation is free"
+            } else {
+                "FAIL — accepted but forced an IDR (silently), which is the same as a rejection"
+            }
+        };
+        println!("S1 VERDICT: {verdict}");
+
+        // The reverse direction only means something if the forward one worked.
+        if accepted {
+            enc.split_mode = disable;
+            let back = enc.reconfigure_bitrate(BPS);
+            let kfs = if back {
+                submit_and_poll(&mut enc, 8..12).1
+            } else {
+                usize::MAX
+            };
+            println!("S1: reverse TWO_FORCED→DISABLE accepted = {back}, keyframes after = {kfs}");
+        }
+
+        enc.flush().ok();
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
+    /// ON-HARDWARE — **spike S1b**, the other half of S1: an in-place `splitEncodeMode` change that
+    /// the driver ACCEPTS without an IDR is worthless if the driver then quietly ignores it, and
+    /// "accepted, no IDR" looks identical in both cases. So measure whether it took effect.
+    ///
+    /// Three legs at 4K (where split has something to bite on), same bitrate throughout:
+    ///   A. fresh session, split DISABLED
+    ///   B. fresh session, split TWO_FORCED
+    ///   C. session opened DISABLED, then reconfigured in place to TWO_FORCED
+    /// If C ≈ B and both differ from A, the reconfigure is real. If C ≈ A, the driver accepted the
+    /// parameter and dropped it on the floor.
+    ///
+    /// ⚠ **Reads out bytes/AU as well as timing, and that column is load-bearing**: these frames
+    /// are uninitialised device memory, so under CBR rate control can run out of things to code
+    /// and every leg collapses to the same trivially-cheap encode — which would make the A/B/C
+    /// comparison meaningless rather than negative. Tiny or identical byte counts ⇒ the run says
+    /// nothing, and the real answer needs the content path WP0 route (b) uses. Run ALONE:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_cuda_split_reconfigure_takes_effect --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_split_reconfigure_takes_effect() {
+        use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+        use std::time::Instant;
+        const W: u32 = 3840;
+        const H: u32 = 2160;
+        const BPS: u64 = 400_000_000;
+        const WARMUP: u32 = 8;
+        const MEASURED: u32 = 24;
+        let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+
+        // Separate buffers rotated per frame, so identical content can't let the encoder
+        // skip-code everything and erase the difference we are trying to measure.
+        // ⚠ MEASURED 2026-08-06: this does NOT work — the driver hands back zeroed VRAM, so all
+        // four are identical anyway and the legs come out at ~427 B/AU against an 833 KB CBR
+        // quota. What survives is the PIXEL-proportional half of the cost (motion estimation over
+        // 8.29 Mpix); the bits/frame half is untested by this harness. Read the printout's
+        // INCONCLUSIVE-on-content line before drawing any bitrate conclusion from it.
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
+
+        // Returns (p50 encode µs, median bytes/AU).
+        let run_leg = |open_split: &str, switch_to: Option<u32>| -> (u128, usize) {
+            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", open_split);
+            let mut enc = NvencCudaEncoder::open(
+                Codec::H265,
+                PixelFormat::Nv12,
+                W,
+                H,
+                60,
+                BPS,
+                true,
+                8,
+                ChromaFormat::Yuv420,
+                false,
+                4,
+            )
+            .expect("open NVENC CUDA session");
+
+            let (mut times, mut sizes) = (Vec::new(), Vec::new());
+            for i in 0..(WARMUP + MEASURED) {
+                // Flip to the target mode exactly once, after warmup, in place.
+                if i == WARMUP {
+                    if let Some(target) = switch_to {
+                        enc.split_mode = target;
+                        assert!(
+                            enc.reconfigure_bitrate(BPS),
+                            "in-place split switch must be accepted (S1a proved it is)"
+                        );
+                        continue;
+                    }
+                }
+                let t0 = Instant::now();
+                enc.submit_indexed(&frames[(i % 4) as usize], i)
+                    .expect("submit");
+                let mut got = 0usize;
+                while let Some(au) = enc.poll().expect("poll") {
+                    got = au.data.len();
+                }
+                let dt = t0.elapsed().as_micros();
+                if i >= WARMUP {
+                    times.push(dt);
+                    sizes.push(got);
+                }
+            }
+            enc.flush().ok();
+            times.sort_unstable();
+            sizes.sort_unstable();
+            (times[times.len() / 2], sizes[sizes.len() / 2])
+        };
+
+        let (a_us, a_bytes) = run_leg("0", None);
+        let (b_us, b_bytes) = run_leg("2", None);
+        let (c_us, c_bytes) = run_leg("0", Some(two));
+
+        println!("S1b @ {W}x{H}@60 HEVC 8-bit, {} Mbps CBR:", BPS / 1_000_000);
+        println!("  A fresh DISABLE      : {a_us:>6} us/frame, {a_bytes:>8} B/AU");
+        println!("  B fresh TWO_FORCED   : {b_us:>6} us/frame, {b_bytes:>8} B/AU");
+        println!("  C DISABLE→TWO in situ: {c_us:>6} us/frame, {c_bytes:>8} B/AU");
+
+        let want_bytes = (BPS / 60 / 8) as usize;
+        if a_bytes * 4 < want_bytes {
+            println!(
+                "  ⚠ INCONCLUSIVE on content: {a_bytes} B/AU is far below the {want_bytes} B/AU \
+                 CBR quota — rate control ran out of things to code, so these legs are not the \
+                 high-bits/frame regime the field case is in."
+            );
+        }
+        let (near_b, near_a) = (c_us.abs_diff(b_us), c_us.abs_diff(a_us));
+        println!(
+            "  ⇒ C is nearer {} (|C-B|={near_b} vs |C-A|={near_a}) — {}",
+            if near_b < near_a { "B" } else { "A" },
+            if near_b < near_a {
+                "the in-place split switch TOOK EFFECT"
+            } else {
+                "the driver appears to have IGNORED the in-place split change"
+            }
+        );
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        let _ = (a_bytes, b_bytes, c_bytes);
+    }
+
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).
     /// Needs no GPU session (it short-circuits on the null encoder / range checks), so it runs in the
     /// normal suite — but `open` gates on the NVENC `.so`, so it skips gracefully where the NVIDIA
