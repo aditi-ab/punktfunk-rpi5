@@ -79,6 +79,7 @@ fun GamepadAddHostScreen(
     suggestedMacs: List<String> = emptyList(),
     onSave: ((KnownHost) -> Unit)? = null,
 ) {
+    val ink = LocalGamepadInk.current
     val context = LocalContext.current
     val isTv = remember { isTvDevice(context) }
     val isEdit = editHost != null
@@ -245,7 +246,7 @@ fun GamepadAddHostScreen(
                             Text(
                                 "Hosts on this network appear automatically — add one by address for everything else.",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = Color.White.copy(alpha = 0.55f),
+                                color = ink.fg(0.55f),
                                 modifier = Modifier.widthIn(max = 520.dp).padding(bottom = 8.dp),
                             )
                         }
@@ -306,6 +307,7 @@ private fun TvAddHostForm(
     onAdd: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     BackHandler(onBack = onDismiss)
     val firstFocus = remember { FocusRequester() }
     Box(Modifier.fillMaxSize()) {
@@ -319,11 +321,11 @@ private fun TvAddHostForm(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text(title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = ink.fg)
             Text(
                 "Hosts on this network appear automatically — add one by address for everything else.",
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color.White.copy(alpha = 0.55f),
+                color = ink.fg(0.55f),
             )
             OutlinedTextField(
                 value = name, onValueChange = onName, singleLine = true,
@@ -362,6 +364,7 @@ private fun rowCols(row: Int): Int = if (row < KB_ACTIONS_ROW) KB_CHAR_ROWS[row]
 
 @Composable
 private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused || editing, editing = editing)
     val shape = RoundedCornerShape(14.dp)
     Row(
@@ -375,25 +378,26 @@ private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(f.label, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, color = Color.White)
+        Text(f.label, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, color = ink.fg)
         Spacer(Modifier.weight(1f))
         Text(
             f.value.ifEmpty { f.placeholder },
             style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-            color = if (f.value.isEmpty()) Color.White.copy(alpha = 0.35f) else Color.White,
+            color = if (f.value.isEmpty()) ink.fg(0.35f) else ink.fg,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        if (editing) Text(" |", color = Color(0xFF8678F5))
+        if (editing) Text(" |", color = ink.accent)
     }
 }
 
 @Composable
 private fun AddActionRow(label: String, enabled: Boolean, focused: Boolean, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused)
     val shape = RoundedCornerShape(14.dp)
     val labelColor by animateColorAsState(
-        if (enabled) Color(0xFF8678F5) else Color.White.copy(alpha = 0.35f),
+        if (enabled) ink.accent else ink.fg(0.35f),
         tween(160),
         label = "addLabel",
     )
@@ -425,6 +429,7 @@ private fun KeyboardGrid(
     bottomInset: Dp = 0.dp, // empty frame at the bottom of the glass for the floating legend to sit over
     onKey: (Int, Int) -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     val shape = RoundedCornerShape(20.dp)
     val gap = if (compact) 5.dp else 7.dp
     Column(
@@ -433,7 +438,7 @@ private fun KeyboardGrid(
             .widthIn(max = 640.dp)
             .clip(shape)
             .background(Color(0x1FFFFFFF))
-            .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
+            .border(1.dp, ink.fg(0.12f), shape)
             .padding(start = 12.dp, end = 12.dp, top = if (compact) 8.dp else 12.dp, bottom = 12.dp + bottomInset),
         verticalArrangement = Arrangement.spacedBy(gap),
     ) {
@@ -454,14 +459,15 @@ private fun KeyboardGrid(
 
 @Composable
 private fun Keycap(label: String, focused: Boolean, compact: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     // Fast tweens: the keyboard cursor hops many keys per second under hold-to-repeat, so the
     // trailing key must have faded before the cursor is two keys away — quick, but no longer a snap.
     val bg by animateColorAsState(
-        if (focused) Color(0xFF8678F5) else Color(0x14FFFFFF),
+        if (focused) ink.accent else ink.glass,
         tween(90),
         label = "keyBg",
     )
-    val fg by animateColorAsState(if (focused) Color.Black else Color.White, tween(90), label = "keyFg")
+    val fg by animateColorAsState(if (focused) Color.Black else ink.fg, tween(90), label = "keyFg")
     Box(
         modifier = modifier
             .height(if (compact) 34.dp else 44.dp)

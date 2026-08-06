@@ -8,7 +8,7 @@
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
 use crate::screens::{Ctx, Outbox};
-use crate::theme::{Fonts, DIM, W};
+use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -115,7 +115,7 @@ impl PinHostsScreen {
                 "No saved hosts yet — pair with a host first, then pin this profile to it.",
                 W::Regular,
                 14.0 * k,
-                DIM,
+                fg(0.55),
                 cx,
                 f64::from(rect.top) + f64::from(rect.height()) / 2.0,
                 f64::from(rect.width()) * 0.7,
@@ -157,7 +157,7 @@ impl PinHostsScreen {
             "A pinned profile appears as its own card on the host — one press connects with it.",
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             cx,
             f64::from(rect.bottom) - detail_h + 6.0 * k,
             f64::from(rect.width()) * 0.8,

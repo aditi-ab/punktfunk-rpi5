@@ -85,6 +85,7 @@ fun GamepadDialog(
     actions: List<DialogAction>,
     body: @Composable ColumnScope.() -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     // Focus the primary action; buttons are stacked full-width, navigated up/down (fits long labels
     // like "Request access" without the cramped-row wrapping a horizontal layout caused).
     var focus by remember { mutableIntStateOf(actions.indexOfFirst { it.primary }.coerceAtLeast(0)) }
@@ -117,11 +118,11 @@ fun GamepadDialog(
                 .heightIn(max = maxCardHeight)
                 .clip(RoundedCornerShape(24.dp))
                 .background(Color(0xF01A1730))
-                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(24.dp))
+                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = ink.fg)
             Column(
                 Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -139,6 +140,7 @@ fun GamepadDialog(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val scale by animateFloatAsState(
         if (focused) 1.02f else 1f,
         spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
@@ -152,19 +154,19 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
     // Focus sweeps up/down the stack — cross-fade the fills so it glides instead of snapping.
     val bg by animateColorAsState(
         when {
-            focused -> Color(0xFF6656F2)
-            primary -> Color(0x336656F2)
-            else -> Color(0x14FFFFFF)
+            focused -> ink.accent
+            primary -> ink.accent(0.20f)
+            else -> ink.glass
         },
         tween(160),
         label = "btnBg",
     )
     val fg by animateColorAsState(
         when {
-            !enabled -> Color.White.copy(alpha = 0.35f)
-            focused -> Color.White
-            primary -> Color(0xFF8678F5)
-            else -> Color.White.copy(alpha = 0.85f)
+            !enabled -> ink.fg(0.35f)
+            focused -> ink.fg
+            primary -> ink.accent
+            else -> ink.fg(0.85f)
         },
         tween(160),
         label = "btnFg",
@@ -198,7 +200,8 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
 /** Body text helper — a dimmed paragraph. */
 @Composable
 private fun DialogText(text: String) {
-    Text(text, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.7f))
+    val ink = LocalGamepadInk.current
+    Text(text, style = MaterialTheme.typography.bodyMedium, color = ink.fg(0.7f))
 }
 
 /**
@@ -271,6 +274,7 @@ fun GamepadPinHostsDialog(
     onToggle: (KnownHost) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     // 0..hosts.lastIndex = host rows, hosts.size = the Done button (with no hosts, index 0 IS
     // Done, so it starts focused).
     var focus by remember { mutableIntStateOf(0) }
@@ -304,7 +308,7 @@ fun GamepadPinHostsDialog(
                 .heightIn(max = maxCardHeight)
                 .clip(RoundedCornerShape(24.dp))
                 .background(Color(0xF01A1730))
-                .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(24.dp))
+                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -312,7 +316,7 @@ fun GamepadPinHostsDialog(
                 "Pin “$profileName”",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
-                color = Color.White,
+                color = ink.fg,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -350,6 +354,7 @@ fun GamepadPinHostsDialog(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused)
     // Inside the dialog's scroll region, like DialogButton: a focused row scrolled out of a short
     // landscape window pulls itself into view.
@@ -376,7 +381,7 @@ private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: ()
             label,
             style = MaterialTheme.typography.bodyLarge,
             fontWeight = FontWeight.SemiBold,
-            color = Color.White,
+            color = ink.fg,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -518,6 +523,7 @@ fun GamepadRequestAccessDialog(pt: PendingTrust, onRequestAccess: () -> Unit, on
 
 @Composable
 fun GamepadAwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
+    val ink = LocalGamepadInk.current
     GamepadDialog(
         title = "Waiting for approval",
         onDismiss = onCancel,
@@ -525,8 +531,8 @@ fun GamepadAwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
     ) {
         val deviceName = Build.MODEL ?: "this device"
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
-            Text("Approve this device on $hostLabel.", color = Color.White)
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = ink.fg)
+            Text("Approve this device on $hostLabel.", color = ink.fg)
         }
         DialogText(
             "Open the host's console (or web UI) and approve “$deviceName”. It connects automatically " +
@@ -542,6 +548,7 @@ fun GamepadAwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
  */
 @Composable
 fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: (String) -> Unit, onDismiss: () -> Unit) {
+    val ink = LocalGamepadInk.current
     val scope = rememberCoroutineScope()
     val digits = remember(pt) { mutableStateListOf(0, 0, 0, 0) }
     var slot by remember(pt) { mutableIntStateOf(0) } // 0..3 = digit slots, 4 = Pair button
@@ -587,16 +594,16 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
         Column(
             Modifier.padding(24.dp).widthIn(max = 460.dp).heightIn(max = maxCardHeight)
                 .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730)).border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(24.dp))
+                .background(Color(0xF01A1730)).border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
                 .verticalScroll(rememberScrollState())
                 .padding(28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            Text("Pair with PIN", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color.White)
+            Text("Pair with PIN", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = ink.fg)
             Text(
                 "Enter the 4-digit PIN shown on the host — D-pad ↑↓ sets a digit, ←→ moves.",
-                style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.7f), textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodyMedium, color = ink.fg(0.7f), textAlign = TextAlign.Center,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 repeat(4) { i -> PinSlot(digits[i], focused = slot == i && !pairing) }
@@ -615,13 +622,14 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
 
 @Composable
 private fun PinSlot(value: Int, focused: Boolean) {
+    val ink = LocalGamepadInk.current
     val shape = RoundedCornerShape(12.dp)
     Box(
         Modifier.size(54.dp, 66.dp).clip(shape)
-            .background(if (focused) Color(0x336656F2) else Color(0x14FFFFFF))
-            .border(if (focused) 2.dp else 1.dp, if (focused) Color(0xFF8678F5) else Color.White.copy(alpha = 0.1f), shape),
+            .background(if (focused) ink.accent(0.20f) else ink.glass)
+            .border(if (focused) 2.dp else 1.dp, if (focused) ink.accent else ink.fg(0.1f), shape),
         contentAlignment = Alignment.Center,
     ) {
-        Text(value.toString(), fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White, fontFamily = FontFamily.Monospace)
+        Text(value.toString(), fontSize = 30.sp, fontWeight = FontWeight.Bold, color = ink.fg, fontFamily = FontFamily.Monospace)
     }
 }

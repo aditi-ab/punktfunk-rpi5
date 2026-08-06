@@ -7,7 +7,7 @@
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{Fonts, DIM, ERROR, W};
+use crate::theme::{fg, Fonts, ERROR, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -297,7 +297,7 @@ impl PairScreen {
             intro,
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             cx,
             f64::from(rect.top) + 2.0 * k,
             f64::from(rect.width()) * 0.72,
@@ -336,7 +336,7 @@ impl PairScreen {
                 "Pairing… confirm the PIN on the host",
                 W::Regular,
                 13.0 * k,
-                DIM,
+                fg(0.55),
                 cx + 10.0 * k,
                 status_y,
                 f64::from(rect.width()) * 0.6,

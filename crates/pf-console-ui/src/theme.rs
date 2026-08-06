@@ -14,28 +14,117 @@ use skia_safe::{
     Point, RRect, Rect, TileMode, Typeface,
 };
 
-// --- Palette -----------------------------------------------------------------------------
+// --- Ink ----------------------------------------------------------------------------------
 
-/// The punktfunk brand violet — the DARK-appearance value (#8678F5); the console UI is
-/// always dark. (Light surfaces use #6656F2; nothing here is light.)
-pub(crate) const BRAND: Color4f = Color4f::new(0.525, 0.471, 0.961, 1.0);
-pub(crate) const WHITE: Color4f = Color4f::new(1.0, 1.0, 1.0, 1.0);
-pub(crate) const DIM: Color4f = Color4f::new(1.0, 1.0, 1.0, 0.55);
-pub(crate) const FAINT: Color4f = Color4f::new(1.0, 1.0, 1.0, 0.35);
-/// The error/status red (the GTK client's #ff938a).
+/// The error/status red (the GTK client's #ff938a). Fixed: a warning must not change meaning
+/// with the wallpaper.
 pub(crate) const ERROR: Color4f = Color4f::new(1.0, 0.576, 0.541, 1.0);
 pub(crate) const ONLINE_GREEN: Color4f = Color4f::new(0.20, 0.84, 0.29, 1.0);
 
-pub(crate) fn white(alpha: f32) -> Color4f {
-    Color4f::new(1.0, 1.0, 1.0, alpha)
+/// Everything about the console's look that follows the chosen background palette: which way
+/// the text runs, what the glass is made of, and the accent that marks focus.
+///
+/// The console UI was white-on-dark throughout, with the brand violet hardcoded as the accent.
+/// Both had to become palette-derived at once: a pale field needs dark text or it is
+/// unreadable, and a violet focus wash on a copper field is the clash this exists to fix.
+#[derive(Clone, Copy)]
+pub(crate) struct Ink {
+    /// Primary text/glyph colour, opaque.
+    fg: Color4f,
+    /// Focus wash, selected pill, caret — the palette's own accent.
+    accent: Color4f,
+    /// The base fill every glass panel starts from.
+    glass: Color4f,
+    /// What the vignette and legibility scrims tend toward — black under a dark field, white
+    /// under a pale one (darkening a pastel field would strand the dark text on it) — with the
+    /// alpha carrying HOW HARD. A pale field needs far less: mixing toward white at the dark
+    /// field's strength bleaches the chroma straight out of the gradient.
+    pub(crate) scrim: Color4f,
 }
 
-pub(crate) fn brand(alpha: f32) -> Color4f {
-    Color4f::new(BRAND.r, BRAND.g, BRAND.b, alpha)
+/// The shipped dark look — also what a test or a preview gets before any palette is applied.
+const DARK_INK: Ink = Ink {
+    fg: Color4f::new(1.0, 1.0, 1.0, 1.0),
+    // The punktfunk brand violet, DARK-appearance value (#8678F5).
+    accent: Color4f::new(0.525, 0.471, 0.961, 1.0),
+    glass: Color4f::new(0.086, 0.086, 0.125, 0.62),
+    scrim: Color4f::new(0.0, 0.0, 0.0, 1.0),
+};
+
+impl Ink {
+    /// The ink a palette calls for. On a pale field the text goes near-black (tinted toward the
+    /// palette's own ground so it doesn't read as a foreign grey) and the glass turns to white
+    /// frost, which is what keeps a row legible over a bright gradient.
+    pub(crate) fn of(p: &crate::library::Palette) -> Ink {
+        let accent = Color4f::new(p.accent.0 as f32, p.accent.1 as f32, p.accent.2 as f32, 1.0);
+        if !p.light {
+            return Ink { accent, ..DARK_INK };
+        }
+        let g = p.ground;
+        Ink {
+            fg: Color4f::new(
+                (g.0 * 0.16) as f32,
+                (g.1 * 0.14) as f32,
+                (g.2 * 0.20) as f32,
+                1.0,
+            ),
+            accent,
+            // More body than the dark glass carries: white frost over a bright gradient has
+            // far less to separate it from its backdrop than dark glass over a dark one.
+            glass: Color4f::new(1.0, 1.0, 1.0, 0.66),
+            scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
+        }
+    }
 }
 
-/// The dark-glass base fill every panel starts from.
-const GLASS_BASE: Color4f = Color4f::new(0.086, 0.086, 0.125, 0.62);
+thread_local! {
+    /// The ink the CURRENT frame draws with. A thread-local rather than a parameter because
+    /// every widget, glyph and panel in the crate reads it and the console renders on exactly
+    /// one thread — threading an `Ink` through ~90 call sites would be all cost and no safety.
+    /// [`crate::shell::Shell::render`] sets it once per frame, before anything draws.
+    static INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(DARK_INK) };
+}
+
+pub(crate) fn set_ink(ink: Ink) {
+    INK.with(|i| i.set(ink));
+}
+
+pub(crate) fn ink() -> Ink {
+    INK.with(std::cell::Cell::get)
+}
+
+/// The foreground at `alpha` — white on a dark palette, near-black on a pale one.
+pub(crate) fn fg(alpha: f32) -> Color4f {
+    let c = ink().fg;
+    Color4f::new(c.r, c.g, c.b, alpha)
+}
+
+/// The palette's accent at `alpha`.
+pub(crate) fn accent(alpha: f32) -> Color4f {
+    let c = ink().accent;
+    Color4f::new(c.r, c.g, c.b, alpha)
+}
+
+/// A wash laid UNDER text to seat it against the field — black on a dark palette, white on a
+/// pale one. `alpha` is the dark-field strength; a pale field needs less (see [`Ink::scrim`]),
+/// so it is scaled the same way the backdrop's own scrims are.
+pub(crate) fn shade(alpha: f32) -> Color4f {
+    let s = ink().scrim;
+    Color4f::new(s.r, s.g, s.b, alpha * s.a)
+}
+
+/// Ink that reads ON the accent (a filled key, a selected pill): whichever of black or white
+/// the accent has more room for. Chosen by luminance rather than by `light`, because an accent
+/// is picked for contrast against the GLASS, not against the field.
+pub(crate) fn on_accent() -> Color4f {
+    let a = ink().accent;
+    let luma = 0.2126 * a.r + 0.7152 * a.g + 0.0722 * a.b;
+    if luma > 0.55 {
+        Color4f::new(0.0, 0.0, 0.0, 1.0)
+    } else {
+        Color4f::new(1.0, 1.0, 1.0, 1.0)
+    }
+}
 
 // --- Panels (the Liquid Glass stand-in) --------------------------------------------------
 
@@ -61,7 +150,7 @@ pub(crate) fn panel(
     k: f32,
 ) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &Paint::new(GLASS_BASE, None));
+    canvas.draw_rrect(rr, &Paint::new(ink().glass, None));
     if let Some(tint) = tint {
         canvas.draw_rrect(rr, &Paint::new(tint, None));
     }
@@ -71,10 +160,10 @@ pub(crate) fn panel(
     sp.set_anti_alias(true);
     match stroke {
         PanelStroke::Plain(alpha) => {
-            sp.set_color4f(white(alpha), None);
+            sp.set_color4f(fg(alpha), None);
         }
         PanelStroke::Brand(alpha) => {
-            sp.set_color4f(brand(alpha), None);
+            sp.set_color4f(accent(alpha), None);
         }
         PanelStroke::Gradient | PanelStroke::GradientDashed => {
             sp.set_shader(gradient_shader::linear(
@@ -83,8 +172,8 @@ pub(crate) fn panel(
                     Point::new(rect.left, rect.bottom),
                 ),
                 gradient_shader::GradientShaderColors::Colors(&[
-                    white(0.22).to_color(),
-                    white(0.04).to_color(),
+                    fg(0.22).to_color(),
+                    fg(0.04).to_color(),
                 ]),
                 None,
                 TileMode::Clamp,
@@ -122,7 +211,7 @@ pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alph
 /// The loading/connecting spinner: a rotating 270° arc driven by the shell clock.
 pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
     let start = (t * 300.0) % 360.0;
-    let mut paint = Paint::new(white(0.85), None);
+    let mut paint = Paint::new(fg(0.85), None);
     paint.set_style(skia_safe::PaintStyle::Stroke);
     paint.set_stroke_width((r / 5.0) as f32);
     paint.set_stroke_cap(skia_safe::PaintCap::Round);

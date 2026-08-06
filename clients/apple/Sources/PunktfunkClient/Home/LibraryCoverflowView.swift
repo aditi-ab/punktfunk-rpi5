@@ -19,6 +19,7 @@ import SwiftUI
 import GameController
 
 struct LibraryCoverflowView: View {
+    @Environment(\.gamepadInk) private var ink
     let games: [GameEntry]
     let imageSession: URLSession?
     var onLaunch: ((String) -> Void)?
@@ -46,6 +47,9 @@ struct LibraryCoverflowView: View {
                 .padding(.vertical, compact ? 6 : 10)
         }
         .background { GamepadScreenBackground() }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
     }
 
     @ViewBuilder private func content(for size: CGSize) -> some View {
@@ -97,7 +101,7 @@ struct LibraryCoverflowView: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                    .strokeBorder(ink.fg(0.12), lineWidth: 1)
             }
             .shadow(color: .black.opacity(0.5), radius: 16, y: 12)
             .scrollTransition { content, phase in
@@ -131,7 +135,7 @@ struct LibraryCoverflowView: View {
         return Text(selected?.isLauncher == true ? "LAUNCHERS" : "GAMES")
             .font(.geist(11, .semibold, relativeTo: .caption2))
             .tracking(1.4)
-            .foregroundStyle(.white.opacity(0.45))
+            .foregroundStyle(ink.fg(0.45))
     }
 
     /// The centered title + store tag — empty (not hidden) so the layout doesn't jump.
@@ -140,18 +144,19 @@ struct LibraryCoverflowView: View {
         VStack(spacing: 6) {
             Text(game?.title ?? " ")
                 .font(.geist(compact ? 22 : 25, .bold, relativeTo: .title))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
                 .multilineTextAlignment(.center)
             if let game {
+                // main's richer store label, in the palette's ink.
                 Text(
                     game.isLauncher
                         ? "\(game.storeLabel.uppercased()) · LAUNCHER" : game.storeLabel.uppercased()
                 )
                 .font(.geist(11, .semibold, relativeTo: .caption2))
                 .tracking(1.2)
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(ink.fg(0.5))
             }
         }
         .frame(maxWidth: .infinity)

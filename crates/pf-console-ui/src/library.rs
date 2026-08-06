@@ -205,62 +205,158 @@ pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
 
 // --- Background palettes -------------------------------------------------------------------
 
-/// One background colour family for the console's living backdrop. A palette is NOT a second
-/// hand-tuned 16-colour grid: it is a hue rotation + saturation scale applied to
-/// [`MESH_COLORS`], so every palette inherits the field's structure (dark corners, bright
-/// interior pools, warm-left/cool-right) and the brand default is exactly the shipped look —
-/// `violet` is the identity transform. The Apple and Android clients carry the same table and
-/// the same [`tint`] math, so a palette reads as the same colour family on every client.
+/// One background colour family for the gamepad UI's living backdrop.
+///
+/// A palette is a short ordered ramp of [`Palette::stops`] — several DISTINCT hues, not one hue
+/// at several brightnesses. The 4×4 mesh samples that ramp diagonally with a per-cell offset
+/// ([`CELL_RAMP`]), so neighbouring cells land on different parts of it and the colours pool and
+/// swirl the way a real gradient poster does; the interior points' existing domain warp then
+/// drifts those pools around. An earlier version rotated ONE field's hue per palette, which is
+/// why every non-default palette read as flat and monotone.
+///
+/// A palette also owns the UI it sits under: [`Palette::accent`] is the focus wash / selected
+/// pill / switch colour, and [`Palette::light`] flips the ink (see [`crate::theme::Ink`]) so a
+/// pale field gets dark text instead of white. The Apple and Android clients carry the same
+/// table under the same ids, so one `ui_palette` value is one look everywhere.
 pub struct Palette {
     /// The stored `ui_palette` value (see `trust::Settings::ui_palette`).
     pub id: &'static str,
     /// What the settings row shows.
     pub name: &'static str,
-    /// Hue rotation about the grey axis, degrees — positive runs red → green → blue.
-    pub hue_deg: f64,
-    /// Saturation scale about luminance; `1.0` keeps the source saturation.
-    pub sat: f64,
+    /// The colour ramp, dark end first. `None` = use [`MESH_COLORS`] verbatim (the brand
+    /// default, kept bit-identical to what every install already sees).
+    pub stops: Option<&'static [(f64, f64, f64)]>,
+    /// The field's ground — what the corners settle onto and what the calm mix lifts toward.
+    pub ground: (f64, f64, f64),
+    /// The UI accent: focus wash, selected tab pill, switch track, caret.
+    pub accent: (f64, f64, f64),
+    /// A pale field: the UI flips to dark ink and the legibility scrims go white.
+    pub light: bool,
 }
 
-/// The six shipped palettes, in cycling order (the brand violet first, then cool → warm,
-/// then the neutral). Adding one here adds it to every console settings screen; the Apple
-/// and Android tables must gain the same entry to keep the `ui_palette` key portable.
-pub const PALETTES: [Palette; 6] = [
+/// Where each of the 16 mesh cells samples the ramp. The base is the diagonal
+/// `0.5·(x + y)` — top-left is the ramp's dark end, bottom-right its bright one, like both
+/// reference gradients — and the per-cell nudges break the banding that a pure diagonal would
+/// give, so hues pool instead of striping.
+#[rustfmt::skip]
+const CELL_RAMP: [f64; 16] = [
+     0.10, -0.06,  0.04, -0.12,
+    -0.08,  0.14, -0.10,  0.06,
+     0.06, -0.12,  0.16, -0.04,
+    -0.10,  0.08, -0.06,  0.12,
+];
+
+/// The twelve shipped palettes: the brand default, five more dark fields, then six pale ones.
+/// Cycling order runs dark → light, so stepping the row walks the whole range in one direction.
+/// Adding one here adds it to every console settings screen; the Apple and Android tables must
+/// gain the same entry to keep the `ui_palette` key portable.
+#[rustfmt::skip]
+pub const PALETTES: [Palette; 12] = [
+    // --- dark fields (white ink) ---
     Palette {
-        id: "violet",
-        name: "Violet",
-        hue_deg: 0.0,
-        sat: 1.0,
+        id: "violet", name: "Violet", stops: None,
+        ground: (0.075, 0.060, 0.160), accent: (0.525, 0.471, 0.961), light: false,
     },
     Palette {
-        id: "tide",
-        name: "Tide",
-        hue_deg: -70.0,
-        sat: 1.0,
+        // Deep indigo climbing through violet into a hot magenta.
+        id: "nebula", name: "Nebula",
+        stops: Some(&[
+            (0.07, 0.05, 0.20), (0.26, 0.14, 0.54), (0.52, 0.20, 0.72),
+            (0.82, 0.26, 0.62), (0.98, 0.46, 0.68),
+        ]),
+        ground: (0.055, 0.040, 0.135), accent: (0.95, 0.42, 0.72), light: false,
     },
     Palette {
-        id: "forest",
-        name: "Forest",
-        hue_deg: -130.0,
-        sat: 0.9,
+        // Ink-blue water: teal → cerulean → a violet undertow.
+        id: "abyss", name: "Abyss",
+        stops: Some(&[
+            (0.02, 0.10, 0.17), (0.04, 0.28, 0.42), (0.07, 0.46, 0.63),
+            (0.16, 0.38, 0.78), (0.26, 0.22, 0.58),
+        ]),
+        ground: (0.018, 0.070, 0.130), accent: (0.26, 0.76, 0.92), light: false,
     },
     Palette {
-        id: "ember",
-        name: "Ember",
-        hue_deg: 105.0,
-        sat: 1.0,
+        // Banked coals: plum embers → crimson → burnt orange → gold.
+        id: "ember", name: "Ember",
+        stops: Some(&[
+            (0.16, 0.03, 0.10), (0.45, 0.06, 0.12), (0.72, 0.18, 0.06),
+            (0.90, 0.42, 0.08), (0.95, 0.68, 0.18),
+        ]),
+        ground: (0.090, 0.035, 0.040), accent: (0.98, 0.62, 0.26), light: false,
     },
     Palette {
-        id: "rose",
-        name: "Rose",
-        hue_deg: 60.0,
-        sat: 0.95,
+        // Forest floor into moss and a lime break.
+        id: "moss", name: "Moss",
+        stops: Some(&[
+            (0.03, 0.11, 0.09), (0.06, 0.27, 0.20), (0.09, 0.45, 0.31),
+            (0.28, 0.61, 0.28), (0.58, 0.77, 0.31),
+        ]),
+        ground: (0.025, 0.085, 0.070), accent: (0.48, 0.86, 0.46), light: false,
     },
     Palette {
-        id: "graphite",
-        name: "Graphite",
-        hue_deg: 0.0,
-        sat: 0.12,
+        // Neutral, but never flat: barely-there saturation that still travels from a cool
+        // charcoal to a warm stone, so even the restrained option has somewhere to go.
+        id: "graphite", name: "Graphite",
+        stops: Some(&[
+            (0.06, 0.07, 0.11), (0.15, 0.18, 0.25), (0.30, 0.31, 0.35),
+            (0.45, 0.42, 0.38), (0.60, 0.56, 0.49),
+        ]),
+        ground: (0.055, 0.055, 0.070), accent: (0.78, 0.80, 0.86), light: false,
+    },
+    // --- pale fields (dark ink) ---
+    Palette {
+        // The holographic foil: rose → lilac → periwinkle → aqua, with a white bloom.
+        id: "holo", name: "Holo",
+        stops: Some(&[
+            (0.99, 0.72, 0.90), (0.80, 0.60, 0.98), (0.58, 0.62, 0.99),
+            (0.55, 0.86, 0.98), (0.94, 0.98, 1.00),
+        ]),
+        ground: (0.96, 0.92, 0.99), accent: (0.42, 0.28, 0.86), light: true,
+    },
+    Palette {
+        // The poster sunset: periwinkle → magenta → scarlet → tangerine → gold.
+        id: "sunset", name: "Sunset",
+        stops: Some(&[
+            (0.55, 0.45, 0.92), (0.86, 0.31, 0.66), (0.97, 0.26, 0.34),
+            (0.99, 0.51, 0.18), (1.00, 0.80, 0.22),
+        ]),
+        ground: (0.98, 0.74, 0.34), accent: (0.64, 0.13, 0.44), light: true,
+    },
+    Palette {
+        // Peach into blush and lilac — the softest of the set.
+        id: "bloom", name: "Bloom",
+        stops: Some(&[
+            (1.00, 0.86, 0.72), (0.99, 0.73, 0.79), (0.95, 0.65, 0.89),
+            (0.82, 0.68, 0.96), (0.73, 0.79, 0.99),
+        ]),
+        ground: (0.99, 0.90, 0.89), accent: (0.72, 0.24, 0.55), light: true,
+    },
+    Palette {
+        // First light: pale gold → coral → lilac.
+        id: "dawn", name: "Dawn",
+        stops: Some(&[
+            (1.00, 0.92, 0.70), (1.00, 0.80, 0.62), (0.99, 0.66, 0.62),
+            (0.90, 0.62, 0.78), (0.77, 0.69, 0.95),
+        ]),
+        ground: (1.00, 0.93, 0.82), accent: (0.82, 0.33, 0.28), light: true,
+    },
+    Palette {
+        // Sea glass: mint → aqua → a pale sky.
+        id: "mint", name: "Mint",
+        stops: Some(&[
+            (0.82, 0.98, 0.90), (0.62, 0.94, 0.88), (0.55, 0.88, 0.95),
+            (0.63, 0.82, 0.99), (0.82, 0.87, 1.00),
+        ]),
+        ground: (0.90, 0.98, 0.96), accent: (0.04, 0.42, 0.40), light: true,
+    },
+    Palette {
+        // Near-white, but iridescent rather than flat — rose, sky, mint and cream in turn.
+        id: "opal", name: "Opal",
+        stops: Some(&[
+            (0.98, 0.92, 0.96), (0.87, 0.93, 0.99), (0.91, 0.99, 0.95),
+            (0.99, 0.96, 0.88), (0.94, 0.90, 0.99),
+        ]),
+        ground: (0.97, 0.96, 0.99), accent: (0.36, 0.32, 0.44), light: true,
     },
 ];
 
@@ -270,34 +366,57 @@ pub fn palette(id: &str) -> &'static Palette {
     PALETTES.iter().find(|p| p.id == id).unwrap_or(&PALETTES[0])
 }
 
-/// Rotate `(r, g, b)` about the grey axis by `deg` (Rodrigues — the same rotation the shader
-/// already uses for the ±8° warm/cool sway) and scale its saturation about luminance. Clamped,
-/// because a large rotation can push a channel out of gamut. Ported verbatim to Swift and
-/// Kotlin: keep the three copies in step or the palettes drift apart between clients.
-pub fn tint(c: (f64, f64, f64), deg: f64, sat: f64) -> (f64, f64, f64) {
-    let (r, g, b) = c;
-    let a = deg.to_radians();
-    let (sn, cs) = a.sin_cos();
-    let inv_sqrt3 = 1.0 / 3.0f64.sqrt();
-    let grey = (r + g + b) / 3.0 * (1.0 - cs);
-    // The `sn` term is `cross(k, c)` with k = (1,1,1)/√3 — the SAME orientation the shader's
-    // own `hue()` uses, so a palette rotation and the ±8° sway agree on which way is warmer.
-    let rot = (
-        r * cs + (b - g) * inv_sqrt3 * sn + grey,
-        g * cs + (r - b) * inv_sqrt3 * sn + grey,
-        b * cs + (g - r) * inv_sqrt3 * sn + grey,
-    );
-    let luma = 0.2126 * rot.0 + 0.7152 * rot.1 + 0.0722 * rot.2;
-    let mix = |v: f64| (luma + (v - luma) * sat).clamp(0.0, 1.0);
-    (mix(rot.0), mix(rot.1), mix(rot.2))
+/// Sample an ordered colour ramp at `t` ∈ [0, 1] (linear between neighbouring stops). Ported
+/// verbatim to Swift and Kotlin — keep the three copies in step or a palette drifts between
+/// clients.
+pub fn ramp(stops: &[(f64, f64, f64)], t: f64) -> (f64, f64, f64) {
+    match stops.len() {
+        0 => (0.0, 0.0, 0.0),
+        1 => stops[0],
+        n => {
+            let x = t.clamp(0.0, 1.0) * (n - 1) as f64;
+            let i = (x.floor() as usize).min(n - 2);
+            let f = x - i as f64;
+            let (a, b) = (stops[i], stops[i + 1]);
+            (
+                a.0 + (b.0 - a.0) * f,
+                a.1 + (b.1 - a.1) * f,
+                a.2 + (b.2 - a.2) * f,
+            )
+        }
+    }
 }
 
 impl Palette {
-    /// [`MESH_COLORS`] under this palette's transform.
+    /// The 16 mesh colours for this palette: the ramp sampled per cell (see [`CELL_RAMP`]), or
+    /// [`MESH_COLORS`] verbatim for the brand default.
     pub fn mesh_colors(&self) -> [(f64, f64, f64); 16] {
-        core::array::from_fn(|i| tint(MESH_COLORS[i], self.hue_deg, self.sat))
+        let Some(stops) = self.stops else {
+            return MESH_COLORS;
+        };
+        core::array::from_fn(|i| {
+            let (x, y) = ((i % 4) as f64 / 3.0, (i / 4) as f64 / 3.0);
+            ramp(stops, 0.5 * (x + y) + CELL_RAMP[i])
+        })
+    }
+
+    /// Four drifting blob colours, for the clients that approximate the mesh with a blob field
+    /// (Android). Spread across the ramp so the field still shows several hues at once.
+    pub fn blob_colors(&self) -> [(f64, f64, f64); 4] {
+        let stops = self.stops.unwrap_or(&VIOLET_BLOBS);
+        core::array::from_fn(|i| ramp(stops, 0.15 + 0.25 * i as f64))
     }
 }
+
+/// The brand default's blob ramp — the four colours the pre-palette Android/legacy-Apple field
+/// used, kept so `violet` is unchanged there too.
+const VIOLET_BLOBS: [(f64, f64, f64); 5] = [
+    (0.53, 0.47, 0.96),
+    (0.24, 0.20, 0.72),
+    (0.62, 0.30, 0.80),
+    (0.22, 0.38, 0.86),
+    (0.53, 0.47, 0.96),
+];
 
 /// The mesh gradient as SkSL, palette + motion baked into the source (resolution, time and
 /// the calm mix are uniforms). A smooth bicubic blend of the 16 colours — a separable
@@ -337,6 +456,11 @@ pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
          // rgb = the palette's corner colour scaled for the calm lift; a is unused (float4\n\
          // so the uniform block stays 16-byte aligned under any packing rule).\n\
          uniform float4 u_lift;\n\
+         // rgb = what the vignette and scrims tend toward (black under a dark palette, white\n\
+         // under a pale one — darkening a pastel field would strand the dark text on it), and\n\
+         // a = how hard. A pale field needs far less: mixing toward white at the dark field's\n\
+         // strength bleaches the chroma straight out of the gradient.\n\
+         uniform float4 u_scrim;\n\
          \n\
          // Cubic-Bézier basis over four control values — the smooth 4-point blend per axis.\n\
          float bz(float t, float a, float b, float c, float d) {{\n\
@@ -380,15 +504,16 @@ pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
          \x20   // Halved under calm: a launcher's cards sit in the pooled centre, but a form\n\
          \x20   // screen's rows run out toward the edges, where crushing to black just eats them.\n\
          \x20   float2 e = (xy / u_res - 0.5) * 2.0;\n\
-         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0) * mix(0.42, 0.21, calm);\n\
-         \x20   col *= 1.0 - vig;\n\
+         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0)\n\
+         \x20             * mix(0.42, 0.21, calm) * u_scrim.a;\n\
+         \x20   col = mix(col, u_scrim.rgb, vig);\n\
          \n\
          \x20   // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n\
          \x20   float v = xy.y / u_res.y;\n\
          \x20   float s = v < 0.32 ? mix(0.38, 0.06, v / 0.32)\n\
          \x20           : v < 0.68 ? mix(0.06, 0.08, (v - 0.32) / 0.36)\n\
          \x20           : mix(0.08, 0.40, (v - 0.68) / 0.32);\n\
-         \x20   col *= 1.0 - s;\n\
+         \x20   col = mix(col, u_scrim.rgb, s * u_scrim.a);\n\
          \n\
          \x20   return half4(half3(col), 1.0);\n\
          }}\n",
@@ -661,49 +786,132 @@ mod tests {
         assert_eq!(src.matches('{').count(), src.matches('}').count());
     }
 
-    /// The brand default must be the IDENTITY transform — the shipped violet backdrop is
-    /// what every existing install already sees, and a palette table that quietly restyled
-    /// it would be a regression dressed as a feature.
+    /// The brand default must still be the SHIPPED field, colour for colour. Every install
+    /// already sees it, and a palette table that quietly restyled the default would be a
+    /// regression dressed as a feature.
     #[test]
     fn violet_is_the_untouched_shipped_field() {
         assert_eq!(PALETTES[0].id, "violet");
-        for (a, b) in palette("violet").mesh_colors().iter().zip(&MESH_COLORS) {
-            assert!((a.0 - b.0).abs() < 1e-9, "{a:?} vs {b:?}");
-            assert!((a.1 - b.1).abs() < 1e-9, "{a:?} vs {b:?}");
-            assert!((a.2 - b.2).abs() < 1e-9, "{a:?} vs {b:?}");
-        }
+        assert!(
+            PALETTES[0].stops.is_none(),
+            "the default is the explicit grid"
+        );
+        assert_eq!(palette("violet").mesh_colors(), MESH_COLORS);
         // An unknown name is a newer client's palette, not an error.
         assert_eq!(palette("chartreuse").id, "violet");
         assert_eq!(palette("").id, "violet");
     }
 
-    /// The transform's two knobs do what they claim: a rotation moves the hue while holding
-    /// roughly the same luminance, and the saturation scale collapses toward grey. These are
-    /// the numbers the Swift and Kotlin ports have to reproduce.
+    /// Hue angle in degrees, or `None` for something too grey to have one.
+    fn hue(c: (f64, f64, f64)) -> Option<f64> {
+        let (r, g, b) = c;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let d = max - min;
+        if d < 0.04 {
+            return None;
+        }
+        let h = if max == r {
+            60.0 * (((g - b) / d) % 6.0)
+        } else if max == g {
+            60.0 * ((b - r) / d + 2.0)
+        } else {
+            60.0 * ((r - g) / d + 4.0)
+        };
+        Some((h + 360.0) % 360.0)
+    }
+
+    /// A palette must read as SEVERAL hues, not one hue at several brightnesses — that was
+    /// exactly the complaint about the hue-rotation model this replaced. Measured as the
+    /// widest gap between any two of the 16 mesh colours' hue angles.
     #[test]
-    fn tint_rotates_hue_and_scales_saturation() {
-        let violet = MESH_COLORS[5]; // the brightest interior pool: blue dominates
-        assert!(violet.2 > violet.0 && violet.2 > violet.1);
-        // +105° (Ember) turns the blue-dominant pool red-dominant.
-        let ember = tint(violet, 105.0, 1.0);
-        assert!(ember.0 > ember.2, "{ember:?} should be warm");
-        // −130° (Forest) turns it green-dominant.
-        let forest = tint(violet, -130.0, 1.0);
-        assert!(forest.1 > forest.0 && forest.1 > forest.2, "{forest:?}");
-        // Graphite's saturation scale leaves the three channels nearly equal…
-        let grey = tint(violet, 0.0, 0.12);
-        let spread = grey.0.max(grey.1).max(grey.2) - grey.0.min(grey.1).min(grey.2);
-        assert!(spread < 0.08, "{grey:?} spread {spread}");
-        // …at about the source's luminance (it desaturates, it doesn't dim).
-        let luma = 0.2126 * violet.0 + 0.7152 * violet.1 + 0.0722 * violet.2;
-        assert!((grey.1 - luma).abs() < 0.05, "{grey:?} vs luma {luma}");
-        // Every palette stays in gamut on every mesh colour.
+    fn every_palette_is_multi_tone() {
         for p in &PALETTES {
-            for c in p.mesh_colors() {
+            let hues: Vec<f64> = p.mesh_colors().iter().filter_map(|c| hue(*c)).collect();
+            assert!(hues.len() >= 8, "{}: too few coloured cells", p.id);
+            let spread = hues
+                .iter()
+                .flat_map(|a| {
+                    hues.iter().map(move |b| {
+                        let d = (a - b).abs() % 360.0;
+                        d.min(360.0 - d)
+                    })
+                })
+                .fold(0.0f64, f64::max);
+            // Graphite and Opal are deliberately near-neutral; everything else must carry a
+            // real hue journey.
+            let floor = if matches!(p.id, "graphite" | "opal") {
+                20.0
+            } else {
+                45.0
+            };
+            assert!(spread >= floor, "{} spans only {spread:.0}° of hue", p.id);
+        }
+    }
+
+    /// Ids, order and the light/dark split are the cross-client contract — the Apple and
+    /// Android tables must match this exactly.
+    #[test]
+    fn table_matches_the_other_clients() {
+        let ids: Vec<&str> = PALETTES.iter().map(|p| p.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "violet", "nebula", "abyss", "ember", "moss", "graphite", "holo", "sunset",
+                "bloom", "dawn", "mint", "opal",
+            ]
+        );
+        // Dark fields lead, pale ones follow, so stepping the row walks one direction.
+        let first_light = PALETTES
+            .iter()
+            .position(|p| p.light)
+            .expect("some are light");
+        assert!(PALETTES[first_light..].iter().all(|p| p.light));
+        assert_eq!(first_light, 6);
+    }
+
+    /// Every colour a palette produces stays in gamut, and a pale palette really is pale —
+    /// its ink flips, so a mislabelled one would put dark text on a dark field.
+    #[test]
+    fn palettes_are_in_gamut_and_honest_about_lightness() {
+        let luma = |c: (f64, f64, f64)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+        for p in &PALETTES {
+            for c in p.mesh_colors().iter().chain(p.blob_colors().iter()) {
                 for v in [c.0, c.1, c.2] {
                     assert!((0.0..=1.0).contains(&v), "{} {c:?}", p.id);
                 }
             }
+            let mean = p.mesh_colors().iter().map(|c| luma(*c)).sum::<f64>() / 16.0;
+            if p.light {
+                assert!(mean > 0.5, "{} is flagged light but means {mean:.2}", p.id);
+                assert!(luma(p.ground) > 0.6, "{}'s ground is dark", p.id);
+            } else {
+                assert!(mean < 0.45, "{} is flagged dark but means {mean:.2}", p.id);
+                assert!(luma(p.ground) < 0.2, "{}'s ground is light", p.id);
+            }
+            // The accent tints glass of the OPPOSITE polarity to the field, so it has to be
+            // legible there: dark accents on white frost, bright ones on dark glass.
+            let a = luma(p.accent);
+            if p.light {
+                assert!(a < 0.45, "{}'s accent is too pale for white glass", p.id);
+            } else {
+                assert!(a > 0.25, "{}'s accent is too dark for dark glass", p.id);
+            }
         }
+    }
+
+    /// The ramp is the shared sampling rule the Swift and Kotlin ports reproduce.
+    #[test]
+    fn ramp_interpolates_between_stops() {
+        let stops = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0)];
+        assert_eq!(ramp(&stops, 0.0), (0.0, 0.0, 0.0));
+        assert_eq!(ramp(&stops, 1.0), (1.0, 1.0, 1.0));
+        assert_eq!(ramp(&stops, 0.5), (1.0, 0.0, 0.0));
+        let q = ramp(&stops, 0.25);
+        assert!((q.0 - 0.5).abs() < 1e-9 && q.1 == 0.0);
+        // Out of range clamps rather than panicking.
+        assert_eq!(ramp(&stops, -3.0), (0.0, 0.0, 0.0));
+        assert_eq!(ramp(&stops, 9.0), (1.0, 1.0, 1.0));
+        assert_eq!(ramp(&[], 0.5), (0.0, 0.0, 0.0));
     }
 }

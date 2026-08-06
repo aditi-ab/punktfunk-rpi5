@@ -64,6 +64,7 @@ private struct HomeTile: Identifiable {
 }
 
 struct GamepadHomeView: View {
+    @Environment(\.gamepadInk) private var ink
     @ObservedObject var store: HostStore
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
@@ -115,6 +116,9 @@ struct GamepadHomeView: View {
                 .padding(.top, compact ? 4 : 8)
         }
         .background { GamepadScreenBackground() }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
         .onAppear { discovery.start() }
         .onDisappear { discovery.stop() }
         // Reachability sweep (mDNS-independent) so routed/VPN hosts that never advertise still show
@@ -186,7 +190,7 @@ struct GamepadHomeView: View {
             statusChip(hidden: true)
             Text("Select a Host")
                 .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
                 .frame(maxWidth: .infinity)
@@ -355,6 +359,7 @@ struct GamepadHomeView: View {
 /// touch grid's `HostCardView`. Renders only its base look; the centered-tile pop is layered on by
 /// the caller's `.scrollTransition` so it always tracks the real scroll position.
 private struct GamepadHostTile: View {
+    @Environment(\.gamepadInk) private var ink
     let tile: HomeTile
     let size: CGSize
 
@@ -394,7 +399,7 @@ private struct GamepadHostTile: View {
                     if tile.isPaired {
                         Image(systemName: "lock.fill")
                             .font(.system(size: Self.statusFont, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.5))
+                            .foregroundStyle(ink.fg(0.5))
                     }
                     if tile.isOnline {
                         Circle()
@@ -407,7 +412,7 @@ private struct GamepadHostTile: View {
             Spacer(minLength: 0)
             Text(tile.title)
                 .font(.geist(Self.titleFont, .bold, relativeTo: .title2))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             if let profile = tile.profile {
@@ -417,7 +422,7 @@ private struct GamepadHostTile: View {
             }
             Text(tile.subtitle)
                 .font(.geist(Self.subtitleFont, relativeTo: .caption))
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(ink.fg(0.55))
                 .lineLimit(1)
                 .padding(.top, 2)
         }
@@ -427,12 +432,12 @@ private struct GamepadHostTile: View {
         // Add-Host tiles stay neutral glass with a dashed edge. Glass clips to the shape itself.
         .consoleGlass(
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous),
-            tint: tile.filled ? Color.brand.opacity(0.20) : nil)
+            tint: tile.filled ? ink.accent(0.20) : nil)
         .overlay {
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
                 .strokeBorder(
                     LinearGradient(
-                        colors: [.white.opacity(0.22), .white.opacity(0.04)],
+                        colors: [ink.fg(0.22), ink.fg(0.04)],
                         startPoint: .top, endPoint: .bottom),
                     style: StrokeStyle(lineWidth: 1, dash: tile.filled ? [] : [6, 5]))
         }
@@ -444,15 +449,15 @@ private struct GamepadHostTile: View {
         return ZStack {
             shape.fill(tile.filled
                 ? AnyShapeStyle(LinearGradient(
-                    colors: [Color.brand, Color.brand.opacity(0.68)],
+                    colors: [ink.accent, ink.accent(0.68)],
                     startPoint: .top, endPoint: .bottom))
-                : AnyShapeStyle(Color.brand.opacity(0.16)))
+                : AnyShapeStyle(ink.accent(0.16)))
             if tile.isConnecting {
-                ProgressView().tint(.white)
+                ProgressView().tint(ink.fg)
             } else if let icon = tile.icon {
                 Image(systemName: icon)
                     .font(.system(size: Self.iconFont, weight: .semibold))
-                    .foregroundStyle(Color.brand)
+                    .foregroundStyle(ink.accent)
             } else if let mark = osIconImage(for: tile.osChain) {
                 // The OS mark stands in for the initial (template asset — tints like the text it
                 // replaces), and carries the label, since nothing else on the tile names the OS.
@@ -460,18 +465,18 @@ private struct GamepadHostTile: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: Self.monogramFont, height: Self.monogramFont)
-                    .foregroundStyle(tile.filled ? .white : Color.brand)
+                    .foregroundStyle(tile.filled ? ink.fg : ink.accent)
                     .accessibilityLabel(tile.osChain ?? "")
             } else {
                 Text(monogram(tile.title))
                     .font(.geistFixed(Self.monogramFont, .bold))
-                    .foregroundStyle(tile.filled ? .white : Color.brand)
+                    .foregroundStyle(tile.filled ? ink.fg : ink.accent)
             }
         }
         .frame(width: Self.badgeSide, height: Self.badgeSide)
         .overlay {
             if !tile.filled {
-                shape.strokeBorder(Color.brand.opacity(0.5), lineWidth: 1)
+                shape.strokeBorder(ink.accent(0.5), lineWidth: 1)
             }
         }
     }

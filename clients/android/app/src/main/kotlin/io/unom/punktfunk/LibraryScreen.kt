@@ -90,6 +90,7 @@ fun LibraryScreen(
     onBack: () -> Unit,
     navActive: Boolean = true,
 ) {
+    val ink = LocalGamepadInk.current
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -177,8 +178,8 @@ fun LibraryScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
-                    CircularProgressIndicator(color = Color.White)
-                    Text("Launching…", color = Color.White, style = MaterialTheme.typography.bodyLarge)
+                    CircularProgressIndicator(color = ink.fg)
+                    Text("Launching…", color = ink.fg, style = MaterialTheme.typography.bodyLarge)
                 }
             }
         }
@@ -202,17 +203,19 @@ fun LibraryScreen(
 
 @Composable
 private fun LoadingState() {
+    val ink = LocalGamepadInk.current
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        CircularProgressIndicator(color = Color.White)
-        Text("Loading library…", color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodyLarge)
+        CircularProgressIndicator(color = ink.fg)
+        Text("Loading library…", color = ink.fg(0.7f), style = MaterialTheme.typography.bodyLarge)
     }
 }
 
 @Composable
 private fun MessageState(text: String) {
+    val ink = LocalGamepadInk.current
     Text(
         text,
-        color = Color.White.copy(alpha = 0.75f),
+        color = ink.fg(0.75f),
         style = MaterialTheme.typography.bodyLarge,
         textAlign = TextAlign.Center,
         modifier = Modifier.padding(horizontal = 24.dp),
@@ -226,6 +229,7 @@ private fun Coverflow(
     navActive: Boolean,
     onLaunch: (GameEntry) -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     BoxWithConstraints(Modifier.fillMaxSize()) {
         // Fit a 2:3 poster into the height the detail line leaves; clamp so it never dwarfs the screen.
         val coverHeight = (maxHeight * 0.72f).coerceAtMost(360.dp)
@@ -321,7 +325,7 @@ private fun Coverflow(
                     current?.title ?: " ",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
-                    color = Color.White,
+                    color = ink.fg,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -330,7 +334,7 @@ private fun Coverflow(
                         if (current.isLauncher) "${current.storeLabel.uppercase()} \u00B7 LAUNCHER"
                         else current.storeLabel.uppercase(),
                         style = MaterialTheme.typography.labelMedium,
-                        color = Color.White.copy(alpha = 0.5f),
+                        color = ink.fg(0.5f),
                         letterSpacing = 2.sp,
                     )
                 }
@@ -342,6 +346,7 @@ private fun Coverflow(
 /** One cover: walks the art candidates (portrait → header → hero) then a text placeholder. */
 @Composable
 private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Modifier) {
+    val ink = LocalGamepadInk.current
     val candidates = game.art.posterCandidates
     var idx by remember(game.id) { mutableStateOf(0) }
     val shape = RoundedCornerShape(16.dp)
@@ -349,7 +354,7 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
         modifier = modifier
             .clip(shape)
             .background(Color(0xFF241F3D))
-            .border(1.dp, Color.White.copy(alpha = 0.12f), shape),
+            .border(1.dp, ink.fg(0.12f), shape),
         contentAlignment = Alignment.Center,
     ) {
         if (idx < candidates.size) {
@@ -368,7 +373,7 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
                 if (game.isLauncher) game.storeLabel else game.title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = Color.White.copy(alpha = 0.75f),
+                color = ink.fg(0.75f),
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(12.dp),
             )
@@ -378,7 +383,7 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
             Text(
                 game.storeLabel,
                 style = MaterialTheme.typography.labelSmall,
-                color = Color.White,
+                color = ink.fg,
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
                     .background(

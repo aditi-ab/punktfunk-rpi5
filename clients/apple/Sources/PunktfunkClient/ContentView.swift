@@ -536,6 +536,9 @@ struct ContentView: View {
                 waker: waker,
                 gamepadUI: gamepadUIActive,
                 onCancelConnect: { model.disconnect() })
+                // The takeover mounts OUTSIDE the gamepad screens (it covers the whole home), so
+                // it publishes the palette's ink itself rather than inheriting it.
+                .gamepadPaletteInk()
         }
     }
 

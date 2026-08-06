@@ -1,81 +1,110 @@
 // The gamepad UI's background palettes. These assertions are the CONTRACT the Rust
-// (`pf-console-ui::library::tint`) and Kotlin (`GamepadPalette.tint`) ports have to reproduce —
-// the same ids, the same rotation orientation, the same in-gamut results — so one `ui_palette`
-// value names the same colour family on every client.
+// (`pf-console-ui::library`) and Kotlin (`GamepadPalette.kt`) ports reproduce — the same ids in
+// the same order, the same light/dark split, the same ramp — so one `ui_palette` value is one look
+// on every client.
 
 import XCTest
 import simd
 @testable import PunktfunkShared
 
 final class GamepadPaletteTests: XCTestCase {
-    /// The brightest interior pool of the mesh field — the colour a palette is judged by.
-    private let violetPool = SIMD3(0.49, 0.39, 0.95)
+    private func luma(_ c: SIMD3<Double>) -> Double {
+        0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+    }
 
-    /// The brand default must be the IDENTITY transform. Every existing install already sees the
-    /// shipped violet backdrop, and a palette table that quietly restyled it would be a
+    /// Hue angle in degrees, or nil for something too grey to have one.
+    private func hue(_ c: SIMD3<Double>) -> Double? {
+        let maxV = max(c.x, c.y, c.z)
+        let minV = min(c.x, c.y, c.z)
+        let d = maxV - minV
+        guard d >= 0.04 else { return nil }
+        let h: Double
+        if maxV == c.x {
+            h = 60 * (((c.y - c.z) / d).truncatingRemainder(dividingBy: 6))
+        } else if maxV == c.y {
+            h = 60 * ((c.z - c.x) / d + 2)
+        } else {
+            h = 60 * ((c.x - c.y) / d + 4)
+        }
+        return (h + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    /// The brand default must still be the SHIPPED field, colour for colour. Every install
+    /// already sees it, and a palette table that quietly restyled the default would be a
     /// regression dressed as a feature.
     func testVioletIsTheUntouchedShippedField() {
         let violet = GamepadPalette.named("violet")
         XCTAssertEqual(GamepadPalette.all.first?.id, "violet")
-        XCTAssertTrue(violet.isIdentity)
-        XCTAssertEqual(violet.tint(violetPool), violetPool)
+        XCTAssertTrue(violet.stops.isEmpty, "the default is the explicit grid")
+        XCTAssertEqual(violet.meshColors, GamepadPalette.violetMesh)
         // An unknown name is a newer client's palette, not an error.
         XCTAssertEqual(GamepadPalette.named("chartreuse").id, "violet")
         XCTAssertEqual(GamepadPalette.named("").id, "violet")
     }
 
-    /// The ids and their order are the cross-client contract (the strip order, and the order
-    /// L1/R1 and A cycle through).
+    /// Ids, order and the light/dark split are the cross-client contract.
     func testTableMatchesTheOtherClients() {
         XCTAssertEqual(
             GamepadPalette.all.map(\.id),
-            ["violet", "tide", "forest", "ember", "rose", "graphite"])
-        XCTAssertEqual(
-            GamepadPalette.all.map(\.name),
-            ["Violet", "Tide", "Forest", "Ember", "Rose", "Graphite"])
+            ["violet", "nebula", "abyss", "ember", "moss", "graphite",
+             "holo", "sunset", "bloom", "dawn", "mint", "opal"])
+        // Dark fields lead, pale ones follow, so stepping the row walks one direction.
+        let firstLight = GamepadPalette.all.firstIndex { $0.light }
+        XCTAssertEqual(firstLight, 6)
+        XCTAssertTrue(GamepadPalette.all.dropFirst(6).allSatisfy(\.light))
     }
 
-    /// A rotation moves the hue while roughly holding luminance, and the saturation scale
-    /// collapses toward grey — the same four checks the Rust test makes.
-    func testTintRotatesHueAndScalesSaturation() {
-        XCTAssertTrue(violetPool.z > violetPool.x && violetPool.z > violetPool.y, "blue-dominant")
-
-        // +105° (Ember) turns the blue-dominant pool red-dominant…
-        let ember = GamepadPalette.named("ember").tint(violetPool)
-        XCTAssertGreaterThan(ember.x, ember.z, "\(ember) should be warm")
-        // …−130° (Forest) turns it green-dominant…
-        let forest = GamepadPalette.named("forest").tint(violetPool)
-        XCTAssertTrue(forest.y > forest.x && forest.y > forest.z, "\(forest)")
-        // …and −70° (Tide) lands on a cyan whose green and blue both beat red.
-        let tide = GamepadPalette.named("tide").tint(violetPool)
-        XCTAssertTrue(tide.y > tide.x && tide.z > tide.x, "\(tide)")
-
-        // Graphite's saturation scale leaves the channels nearly equal…
-        let grey = GamepadPalette.named("graphite").tint(violetPool)
-        let spread = max(grey.x, grey.y, grey.z) - min(grey.x, grey.y, grey.z)
-        XCTAssertLessThan(spread, 0.08, "\(grey)")
-        // …at about the source's luminance (it desaturates, it doesn't dim).
-        let luma = 0.2126 * violetPool.x + 0.7152 * violetPool.y + 0.0722 * violetPool.z
-        XCTAssertEqual(grey.y, luma, accuracy: 0.05)
-    }
-
-    /// Every palette stays in gamut on every colour the field is built from — an out-of-range
-    /// channel would clamp differently on each platform's rasteriser.
-    func testEveryPaletteStaysInGamut() {
-        let field: [SIMD3<Double>] = [
-            SIMD3(0.075, 0.060, 0.160), SIMD3(0.34, 0.27, 0.72), SIMD3(0.30, 0.26, 0.74),
-            SIMD3(0.42, 0.20, 0.54), SIMD3(0.49, 0.39, 0.95), SIMD3(0.28, 0.31, 0.84),
-            SIMD3(0.16, 0.26, 0.64), SIMD3(0.45, 0.23, 0.60), SIMD3(0.53, 0.31, 0.75),
-            SIMD3(0.35, 0.35, 0.91), SIMD3(0.19, 0.28, 0.70), SIMD3(0.22, 0.18, 0.54),
-            SIMD3(0.24, 0.20, 0.58),
-        ]
-        for palette in GamepadPalette.all {
-            for c in field {
-                let t = palette.tint(c)
-                for v in [t.x, t.y, t.z] {
-                    XCTAssertTrue((0...1).contains(v), "\(palette.id) \(c) → \(t)")
+    /// A palette must read as SEVERAL hues, not one hue at several brightnesses — that was
+    /// exactly the complaint about the hue-rotation model this replaced.
+    func testEveryPaletteIsMultiTone() {
+        for p in GamepadPalette.all {
+            let hues = p.meshColors.compactMap(hue)
+            XCTAssertGreaterThanOrEqual(hues.count, 8, "\(p.id): too few coloured cells")
+            var spread = 0.0
+            for a in hues {
+                for b in hues {
+                    let d = abs(a - b).truncatingRemainder(dividingBy: 360)
+                    spread = max(spread, min(d, 360 - d))
                 }
             }
+            // Graphite and Opal are deliberately near-neutral; the rest must travel.
+            let floor = (p.id == "graphite" || p.id == "opal") ? 20.0 : 45.0
+            XCTAssertGreaterThanOrEqual(spread, floor, "\(p.id) spans only \(spread)° of hue")
         }
+    }
+
+    /// Every colour stays in gamut, and a pale palette really is pale — its ink flips, so a
+    /// mislabelled one would put dark text on a dark field.
+    func testPalettesAreInGamutAndHonestAboutLightness() {
+        for p in GamepadPalette.all {
+            for c in p.meshColors + p.blobColors {
+                for v in [c.x, c.y, c.z] {
+                    XCTAssertTrue((0...1).contains(v), "\(p.id) \(c)")
+                }
+            }
+            let mean = p.meshColors.map(luma).reduce(0, +) / Double(p.meshColors.count)
+            if p.light {
+                XCTAssertGreaterThan(mean, 0.5, "\(p.id) is flagged light")
+                XCTAssertGreaterThan(luma(p.ground), 0.6, "\(p.id)'s ground is dark")
+                XCTAssertLessThan(luma(p.accent), 0.45, "\(p.id)'s accent is too pale")
+            } else {
+                XCTAssertLessThan(mean, 0.45, "\(p.id) is flagged dark")
+                XCTAssertLessThan(luma(p.ground), 0.2, "\(p.id)'s ground is light")
+                XCTAssertGreaterThan(luma(p.accent), 0.25, "\(p.id)'s accent is too dark")
+            }
+        }
+    }
+
+    /// The ramp is the shared sampling rule the Rust and Kotlin ports reproduce.
+    func testRampInterpolatesBetweenStops() {
+        let stops = [SIMD3(0.0, 0.0, 0.0), SIMD3(1.0, 0.0, 0.0), SIMD3(1.0, 1.0, 1.0)]
+        XCTAssertEqual(GamepadPalette.ramp(stops, 0), SIMD3(0.0, 0.0, 0.0))
+        XCTAssertEqual(GamepadPalette.ramp(stops, 1), SIMD3(1.0, 1.0, 1.0))
+        XCTAssertEqual(GamepadPalette.ramp(stops, 0.5), SIMD3(1.0, 0.0, 0.0))
+        XCTAssertEqual(GamepadPalette.ramp(stops, 0.25).x, 0.5, accuracy: 1e-9)
+        // Out of range clamps rather than trapping.
+        XCTAssertEqual(GamepadPalette.ramp(stops, -3), SIMD3(0.0, 0.0, 0.0))
+        XCTAssertEqual(GamepadPalette.ramp(stops, 9), SIMD3(1.0, 1.0, 1.0))
+        XCTAssertEqual(GamepadPalette.ramp([], 0.5), SIMD3(0.0, 0.0, 0.0))
     }
 }

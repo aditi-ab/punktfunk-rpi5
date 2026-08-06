@@ -5,9 +5,9 @@
 //! no pad at all the legend swaps to keyboard keycaps — the console stays fully
 //! drivable either way.
 
-use crate::theme::{white, Fonts, W};
+use crate::theme::{fg, Fonts, W};
 use punktfunk_core::config::GamepadPref;
-use skia_safe::{Canvas, Color4f, Paint, Path, Point, RRect, Rect};
+use skia_safe::{Canvas, Paint, Path, Point, RRect, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlyphStyle {
@@ -94,13 +94,13 @@ pub(crate) fn hint_bar(
     let rect = Rect::from_xywh((x) as f32, (bottom - h) as f32, w as f32, h as f32);
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.30), None),
+        &Paint::new(crate::theme::shade(0.30), None),
     );
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &Paint::new(white(0.06), None),
+        &Paint::new(fg(0.06), None),
     );
-    let mut sp = Paint::new(white(0.12), None);
+    let mut sp = Paint::new(fg(0.12), None);
     sp.set_style(skia_safe::PaintStyle::Stroke);
     sp.set_stroke_width(1.0);
     sp.set_anti_alias(true);
@@ -122,7 +122,7 @@ pub(crate) fn hint_bar(
             cy + LABEL_SIZE * k * 0.36,
             W::SemiBold,
             LABEL_SIZE * k,
-            white(0.85),
+            fg(0.85),
         );
         pen += lw + gap_hint;
     }
@@ -199,8 +199,8 @@ fn draw_glyph(
         Resolved::Badge(face) => {
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
-            canvas.draw_circle(center, r as f32, &Paint::new(white(0.10), None));
-            let mut ring = Paint::new(white(0.32), None);
+            canvas.draw_circle(center, r as f32, &Paint::new(fg(0.10), None));
+            let mut ring = Paint::new(fg(0.32), None);
             ring.set_style(skia_safe::PaintStyle::Stroke);
             ring.set_stroke_width((1.2 * k) as f32);
             ring.set_anti_alias(true);
@@ -223,7 +223,7 @@ fn draw_glyph(
                     cy + size * 0.36,
                     W::SemiBold,
                     size,
-                    white(0.92),
+                    fg(0.92),
                 );
             }
         }
@@ -235,7 +235,7 @@ fn draw_glyph(
                 let rect = Rect::from_xywh(pen as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
-                    &Paint::new(white(0.10), None),
+                    &Paint::new(fg(0.10), None),
                 );
                 let size = 10.0 * k;
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
@@ -246,7 +246,7 @@ fn draw_glyph(
                     cy + size * 0.36,
                     W::SemiBold,
                     size,
-                    white(0.92),
+                    fg(0.92),
                 );
                 pen += w + 3.0 * k;
             }
@@ -257,7 +257,7 @@ fn draw_glyph(
             let (cx, cyf) = ((x + r) as f32, cy as f32);
             let (tw, th) = ((4.5 * k) as f32, (5.5 * k) as f32);
             let gap = (2.6 * k) as f32;
-            let paint = Paint::new(white(0.85), None);
+            let paint = Paint::new(fg(0.85), None);
             let mut left = Path::new();
             left.move_to((cx - gap, cyf - th));
             left.line_to((cx - gap - tw, cyf));
@@ -277,9 +277,9 @@ fn draw_glyph(
             let rect = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &Paint::new(white(0.10), None),
+                &Paint::new(fg(0.10), None),
             );
-            let mut ring = Paint::new(white(0.28), None);
+            let mut ring = Paint::new(fg(0.28), None);
             ring.set_style(skia_safe::PaintStyle::Stroke);
             ring.set_stroke_width(1.0);
             ring.set_anti_alias(true);
@@ -296,7 +296,7 @@ fn draw_glyph(
                 cy + size * 0.36,
                 W::SemiBold,
                 size,
-                white(0.92),
+                fg(0.92),
             );
         }
     }
@@ -305,7 +305,7 @@ fn draw_glyph(
 /// The PlayStation face shapes, stroked inside the badge: Confirm=✕, Back=○, X-position
 /// =□, Y-position=△ (the DualSense's physical layout).
 fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, stroke: f32) {
-    let mut p = Paint::new(white(0.92), None);
+    let mut p = Paint::new(fg(0.92), None);
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width(stroke);
     p.set_stroke_cap(skia_safe::PaintCap::Round);

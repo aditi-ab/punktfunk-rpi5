@@ -89,6 +89,7 @@ struct GamepadHint: Identifiable {
 /// worn as a self-contained Liquid Glass pill (like the top-bar controller chip) so it floats over
 /// the backdrop instead of dissolving into it.
 struct GamepadHintBar: View {
+    @Environment(\.gamepadInk) private var ink
     let hints: [GamepadHint]
 
     // 10-foot legend on tvOS, in-hand sizes elsewhere.
@@ -108,17 +109,17 @@ struct GamepadHintBar: View {
                 HStack(spacing: 7) {
                     Image(systemName: hint.glyph)
                         .font(.system(size: Self.glyphFont))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(ink.fg)
                     Text(hint.text)
                 }
                 .fixedSize() // keep glyph + label together; never truncate a hint mid-word
             }
         }
         .font(.geist(Self.textFont, .semibold, relativeTo: .subheadline))
-        .foregroundStyle(.white.opacity(0.85))
+        .foregroundStyle(ink.fg(0.85))
         .padding(Self.pad)
         .consoleGlass(Capsule())
-        .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1))
     }
 }
 
@@ -145,6 +146,7 @@ struct GamepadHintBar: View {
 /// can't inflate the caller's layout past the safe area (see the layout note in GamepadHomeView's
 /// header). Honors Reduce Motion by freezing the field at a fixed phase.
 struct GamepadScreenBackground: View {
+    @Environment(\.gamepadInk) private var ink
     /// Quiet the field for a form screen (see the type comment).
     var calm = false
 
@@ -171,36 +173,41 @@ struct GamepadScreenBackground: View {
     /// vignette, and the title/hints legibility scrim — in that order, matching the console
     /// shader's `composite` so the two platforms' backdrops stay the same picture.
     private func composite(at t: TimeInterval, palette: GamepadPalette) -> some View {
-        ZStack {
-            Color.black
+        // Where the scrims tend, and how hard. Mixing a PALE field toward white at the dark
+        // field's strength bleaches the chroma straight out of the gradient, so a pale palette
+        // gets under half — the same `u_scrim.a` the console shader carries.
+        let scrim: Color = palette.light ? ink.fg : .black
+        let strength = palette.light ? 0.45 : 1.0
+        return ZStack {
+            Self.color(palette.ground)
             colorField(at: t, palette: palette)
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
-                // Calm = col·0.6 + corner·0.4: over black, `.opacity` IS the multiply…
+                // Calm = col·0.6 + ground·0.4: over the ground, `.opacity` IS the multiply…
                 .opacity(calm ? 0.6 : 1)
             if calm {
-                // …and a plusLighter wash of the palette's own corner colour IS the add. Chosen so
-                // a corner lands exactly where it was and the bright pools come down to meet it.
-                Self.color(palette.tint(Self.cornerRGB))
+                // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
+                // ground lands exactly where it was and the bright pools come down to meet it.
+                Self.color(palette.ground)
                     .opacity(0.4)
                     .blendMode(.plusLighter)
             }
-            // Cinematic vignette: darker toward the edges so the cards sit in the pooled light.
-            // Soft (extends past the frame) so the corners deepen rather than crush to black.
-            // Halved under calm: a launcher's cards sit in the pooled centre, but a form screen's
-            // rows run out toward the edges, where crushing to black just eats them.
+            // Cinematic vignette: the edges settle toward the scrim so the cards sit in the
+            // pooled light. Soft (extends past the frame) so the corners deepen rather than
+            // crush. Halved under calm: a launcher's cards sit in the pooled centre, but a form
+            // screen's rows run out toward the edges, where crushing them just eats the list.
             EllipticalGradient(
-                colors: [.clear, .black.opacity(calm ? 0.21 : 0.42)],
+                colors: [.clear, scrim.opacity((calm ? 0.21 : 0.42) * strength)],
                 center: .center, startRadiusFraction: 0.25, endRadiusFraction: 1.15)
             // Legibility grounding for the pinned title (top) and hint pill (bottom). This one
-            // darkens the aurora itself (it's the backdrop's bottom layer — nothing behind it to
-            // blur), so it stays a gradient, just a light one now.
+            // works on the field itself (it's the backdrop's bottom layer — nothing behind it to
+            // blur), so it stays a gradient, just a light one.
             LinearGradient(
                 stops: [
-                    .init(color: .black.opacity(0.38), location: 0),
-                    .init(color: .black.opacity(0.06), location: 0.32),
-                    .init(color: .black.opacity(0.08), location: 0.68),
-                    .init(color: .black.opacity(0.40), location: 1),
+                    .init(color: scrim.opacity(0.38 * strength), location: 0),
+                    .init(color: scrim.opacity(0.06 * strength), location: 0.32),
+                    .init(color: scrim.opacity(0.08 * strength), location: 0.68),
+                    .init(color: scrim.opacity(0.40 * strength), location: 1),
                 ],
                 startPoint: .top, endPoint: .bottom)
         }
@@ -211,7 +218,7 @@ struct GamepadScreenBackground: View {
             MeshGradient(
                 width: 4, height: 4,
                 points: Self.meshPoints(at: t),
-                colors: Self.meshColors(palette),
+                colors: palette.meshColors.map(Self.color),
                 smoothsColors: true)
         } else {
             LegacyBlobField(t: t, palette: palette)
@@ -222,28 +229,6 @@ struct GamepadScreenBackground: View {
 
     static func color(_ c: SIMD3<Double>) -> Color {
         Color(red: c.x, green: c.y, blue: c.z)
-    }
-
-    /// The corner colour — the four pinned corners AND the calm lift's base.
-    static let cornerRGB = SIMD3(0.075, 0.060, 0.160)
-
-    /// Sixteen mesh colours (row-major, 4×4): dark-violet corners sink the frame, the edges carry
-    /// mid-tone violets, and the four interior points hold the bright brand family — a violet and a
-    /// blue-violet up top, a magenta-violet and a violet below — so warm pools on the left, cool on
-    /// the right, and the silk shifts temperature as those interior points drift. A palette rotates
-    /// the whole grid; `violet` is the identity, so this array IS what the default draws.
-    private static let baseMeshRGB: [SIMD3<Double>] = [
-        cornerRGB, SIMD3(0.34, 0.27, 0.72), SIMD3(0.30, 0.26, 0.74), cornerRGB,
-        SIMD3(0.42, 0.20, 0.54), SIMD3(0.49, 0.39, 0.95), SIMD3(0.28, 0.31, 0.84), SIMD3(0.16, 0.26, 0.64),
-        SIMD3(0.45, 0.23, 0.60), SIMD3(0.53, 0.31, 0.75), SIMD3(0.35, 0.35, 0.91), SIMD3(0.19, 0.28, 0.70),
-        cornerRGB, SIMD3(0.22, 0.18, 0.54), SIMD3(0.24, 0.20, 0.58), cornerRGB,
-    ]
-
-    /// `baseMeshRGB` under a palette. Recomputed per frame rather than cached — sixteen `tint`
-    /// calls at 30 Hz costs nothing next to rasterising the mesh, and the obvious cache would be
-    /// mutable global state on a type SwiftUI is free to evaluate off the main actor.
-    private static func meshColors(_ palette: GamepadPalette) -> [Color] {
-        baseMeshRGB.map { color(palette.tint($0)) }
     }
 
     /// The 4×4 control points at time `t`: every boundary point is PINNED to the frame (so the mesh
@@ -280,9 +265,9 @@ private struct LegacyBlobField: View {
     let palette: GamepadPalette
 
     /// One drifting color blob: a base position + drift ellipse (unit coordinates), angular speeds
-    /// (rad/s — periods of 30–90 s), and a radius that slowly breathes.
+    /// (rad/s — periods of 30–90 s), and a radius that slowly breathes. The COLOUR comes from the
+    /// palette's ramp at draw time (see `blobColors`), so an older OS honours the setting too.
     private struct Blob {
-        let rgb: SIMD3<Double>
         let center: CGPoint
         let drift: CGSize
         let speed: (x: Double, y: Double)
@@ -293,20 +278,16 @@ private struct LegacyBlobField: View {
     }
 
     private static let blobs: [Blob] = [
-        Blob(rgb: SIMD3(0.53, 0.47, 0.96), // brand violet
-             center: CGPoint(x: 0.30, y: 0.24), drift: CGSize(width: 0.16, height: 0.10),
+        Blob(center: CGPoint(x: 0.30, y: 0.24), drift: CGSize(width: 0.16, height: 0.10),
              speed: (0.111, 0.083), phase: (0.0, 1.9),
              radius: 0.52, breathe: (0.07, 0.061), opacity: 0.52),
-        Blob(rgb: SIMD3(0.24, 0.20, 0.72), // deep indigo
-             center: CGPoint(x: 0.78, y: 0.66), drift: CGSize(width: 0.13, height: 0.14),
+        Blob(center: CGPoint(x: 0.78, y: 0.66), drift: CGSize(width: 0.13, height: 0.14),
              speed: (0.071, 0.096), phase: (2.4, 0.7),
              radius: 0.58, breathe: (0.08, 0.049), opacity: 0.55),
-        Blob(rgb: SIMD3(0.62, 0.30, 0.80), // plum
-             center: CGPoint(x: 0.16, y: 0.82), drift: CGSize(width: 0.12, height: 0.09),
+        Blob(center: CGPoint(x: 0.16, y: 0.82), drift: CGSize(width: 0.12, height: 0.09),
              speed: (0.089, 0.067), phase: (4.1, 3.2),
              radius: 0.44, breathe: (0.09, 0.078), opacity: 0.42),
-        Blob(rgb: SIMD3(0.22, 0.38, 0.86), // cool blue
-             center: CGPoint(x: 0.70, y: 0.12), drift: CGSize(width: 0.10, height: 0.08),
+        Blob(center: CGPoint(x: 0.70, y: 0.12), drift: CGSize(width: 0.10, height: 0.08),
              speed: (0.059, 0.104), phase: (1.2, 5.0),
              radius: 0.40, breathe: (0.06, 0.055), opacity: 0.38),
     ]
@@ -316,19 +297,21 @@ private struct LegacyBlobField: View {
             let side = max(geo.size.width, geo.size.height)
             ZStack {
                 ForEach(Self.blobs.indices, id: \.self) { i in
-                    blobView(Self.blobs[i], in: geo.size, side: side)
+                    blobView(Self.blobs[i], tone: palette.blobColors[i], in: geo.size, side: side)
                 }
             }
             .drawingGroup()
         }
     }
 
-    private func blobView(_ blob: Blob, in size: CGSize, side: CGFloat) -> some View {
+    private func blobView(
+        _ blob: Blob, tone: SIMD3<Double>, in size: CGSize, side: CGFloat
+    ) -> some View {
         let x = blob.center.x + blob.drift.width * CGFloat(sin(t * blob.speed.x + blob.phase.x))
         let y = blob.center.y + blob.drift.height * CGFloat(cos(t * blob.speed.y + blob.phase.y))
         let r = side * blob.radius
             * (1 + blob.breathe.amount * CGFloat(sin(t * blob.breathe.speed + blob.phase.x)))
-        let color = GamepadScreenBackground.color(palette.tint(blob.rgb))
+        let color = GamepadScreenBackground.color(tone)
         return Circle()
             .fill(RadialGradient(
                 colors: [color, color.opacity(0)],
@@ -336,7 +319,9 @@ private struct LegacyBlobField: View {
             .frame(width: r, height: r)
             .position(x: x * size.width, y: y * size.height)
             .opacity(blob.opacity)
-            .blendMode(.plusLighter)
+            // Additive only works over a DARK ground; over a pale one every blob saturates to
+            // white and the field turns grey. Pale palettes tint instead.
+            .blendMode(palette.light ? .normal : .plusLighter)
     }
 }
 
@@ -346,15 +331,17 @@ private struct LegacyBlobField: View {
 /// the tray's text sits on a softly blurred backdrop that dissolves into the rows.
 struct GamepadTrayScrim: View {
     let edge: VerticalEdge
+    @Environment(\.gamepadInk) private var ink
 
     var body: some View {
         let fromEdge: UnitPoint = edge == .top ? .top : .bottom
         let toContent: UnitPoint = edge == .top ? .bottom : .top
         Rectangle()
             .fill(.ultraThinMaterial)
-            // These trays always sit on the dark console UI; force dark so the material frosts dark
-            // (white text stays legible) regardless of the system appearance.
-            .environment(\.colorScheme, .dark)
+            // Force the frost to match the PALETTE, not the system appearance: the tray exists
+            // to keep the pinned title legible, so it has to frost dark under white ink and
+            // light under dark ink.
+            .environment(\.colorScheme, ink.isLight ? .light : .dark)
             // Fade the whole blur out toward the content so it dissolves rather than ending on a line.
             .mask {
                 LinearGradient(
@@ -404,6 +391,7 @@ struct ConsoleBareButtonStyle: ButtonStyle {
 /// chip in the launcher's top bar. Callers observe GamepadManager already, so this re-renders
 /// when the pad or its battery state changes.
 struct ControllerStatusChip: View {
+    @Environment(\.gamepadInk) private var ink
     let controller: GamepadManager.DiscoveredController
 
     // Legible from the couch on tvOS, quiet in hand elsewhere.
@@ -428,15 +416,15 @@ struct ControllerStatusChip: View {
                 Image(systemName: batterySymbol(level))
                     .font(.system(size: Self.font))
                     .foregroundStyle(level <= 0.2 && !controller.isCharging
-                        ? AnyShapeStyle(.red) : AnyShapeStyle(.white.opacity(0.7)))
+                        ? AnyShapeStyle(.red) : AnyShapeStyle(ink.fg(0.7)))
             }
         }
         .font(.geist(Self.font, .medium, relativeTo: .caption))
-        .foregroundStyle(.white.opacity(0.7))
+        .foregroundStyle(ink.fg(0.7))
         .padding(.horizontal, Self.hPad)
         .padding(.vertical, Self.vPad)
-        .background(Capsule().fill(.white.opacity(0.08)))
-        .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+        .background(Capsule().fill(ink.fg(0.08)))
+        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1))
     }
 
     private func batterySymbol(_ level: Float) -> String {

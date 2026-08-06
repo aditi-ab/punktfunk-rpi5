@@ -247,9 +247,10 @@ fun GamepadHome(
 /** One dark-glass landscape console tile — bigger and bolder than the touch grid's HostCard. */
 @Composable
 private fun GamepadHostTile(tile: HomeTile, modifier: Modifier = Modifier) {
+    val ink = LocalGamepadInk.current
     val shape = RoundedCornerShape(26.dp)
     val wash = if (tile.filled) {
-        Brush.verticalGradient(listOf(Color(0x336656F2), Color(0x14100C2A)))
+        Brush.verticalGradient(listOf(ink.accent(0.20f), Color(0x14100C2A)))
     } else {
         Brush.verticalGradient(listOf(Color(0x1AFFFFFF), Color(0x0DFFFFFF)))
     }
@@ -258,7 +259,7 @@ private fun GamepadHostTile(tile: HomeTile, modifier: Modifier = Modifier) {
             .fillMaxWidth()
             .clip(shape)
             .background(wash)
-            .border(1.dp, Color.White.copy(alpha = 0.16f), shape)
+            .border(1.dp, ink.fg(0.16f), shape)
             .padding(22.dp),
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -269,7 +270,7 @@ private fun GamepadHostTile(tile: HomeTile, modifier: Modifier = Modifier) {
                     Icon(
                         Icons.Filled.Lock,
                         contentDescription = "Paired",
-                        tint = Color.White.copy(alpha = 0.7f),
+                        tint = ink.fg(0.7f),
                         modifier = Modifier.padding(end = 6.dp).size(15.dp),
                     )
                 }
@@ -286,14 +287,14 @@ private fun GamepadHostTile(tile: HomeTile, modifier: Modifier = Modifier) {
             tile.title,
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
-            color = Color.White,
+            color = ink.fg,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
         Text(
             tile.subtitle,
             style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.55f),
+            color = ink.fg(0.55f),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -302,9 +303,10 @@ private fun GamepadHostTile(tile: HomeTile, modifier: Modifier = Modifier) {
 
 @Composable
 private fun MonogramBadge(tile: HomeTile) {
+    val ink = LocalGamepadInk.current
     val shape = RoundedCornerShape(15.dp)
     val fill = if (tile.filled) {
-        Brush.verticalGradient(listOf(Color(0xFF6656F2), Color(0xFF8678F5)))
+        Brush.verticalGradient(listOf(ink.accent, ink.accent))
     } else {
         Brush.verticalGradient(listOf(Color(0x296656F2), Color(0x296656F2)))
     }
@@ -316,18 +318,18 @@ private fun MonogramBadge(tile: HomeTile) {
             tile.connecting -> CircularProgressIndicator(
                 modifier = Modifier.size(24.dp),
                 strokeWidth = 2.dp,
-                color = Color.White,
+                color = ink.fg,
             )
             tile.isAdd -> Icon(
                 Icons.Filled.Add,
                 contentDescription = null,
-                tint = if (tile.filled) Color.White else Color(0xFF8678F5),
+                tint = if (tile.filled) ink.fg else ink.accent,
             )
             else -> Text(
                 tile.title.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "•",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
-                color = if (tile.filled) Color.White else Color(0xFF8678F5),
+                color = if (tile.filled) ink.fg else ink.accent,
             )
         }
     }
