@@ -47,6 +47,56 @@
 //! presenter holds simply stays off the free list until its release token comes
 //! back. A surface is free when no live picture is bound to it AND no consumer holds
 //! it — two conditions, tracked separately, because they end at different times.
+//!
+//! # Why this rung is exempt from the decode-into-a-reference defect
+//!
+//! The D3D11VA and Vulkan rungs both had to grow a `release_after_decode` deferral:
+//! their conversions released the pictures an access unit displaces INSIDE the
+//! conversion, then assigned the decode target a slot, and [`pf_vaadec::SlotMap::assign`]
+//! handed back the slot just vacated — so one surface was named as both the decode
+//! target and one of that submission's own references. On H.264 that fired on **117 of
+//! 120** access units of a punktfunk host's low-delay output.
+//!
+//! `pf-vaadec`'s conversions still release inline and this rung is still exempt, for a
+//! reason that is a property of the interface rather than of any stream: **a slot is
+//! not a surface here.** `plan_to_va` never invents a surface — every reference it can
+//! name is read out of the `surfaces` table it is handed — and the decode target is a
+//! separate parameter the caller takes from OUTSIDE that table. Two things carry that,
+//! and both are load-bearing:
+//!
+//! * [`Session::acquire_target`] returns the target and the table **together, from one
+//!   snapshot**, because they are only safe together. A free surface is by construction
+//!   a surface no slot binds, and the table is exactly what the slots bind, so the
+//!   target cannot be in it. Taking the two at different moments — the table before
+//!   this access unit's removals, where references must resolve, and the free surface
+//!   after them, where the displaced picture's surface has become free — is precisely
+//!   the defect, and `taking_the_free_surface_after_the_removals_would_hand_out_a_
+//!   referenced_surface` shows it happening.
+//! * The conversion's half is pinned across every platform by `pf-vaadec`'s
+//!   `no_submission_names_its_decode_target_as_one_of_its_own_references`, driven over
+//!   the same low-delay stream, with
+//!   `taking_the_decode_target_from_the_slot_table_aliases_on_the_low_delay_stream` as
+//!   the counterfactual that shows the walk can see the defect when it is there.
+//!
+//! It holds for all three codecs and for the same one-line reason: `setup_surface`
+//! reaches the submission at exactly ONE field in each conversion — H.264 and H.265'
+//! `curr_pic.picture_id`, AV1's `current_frame`/`current_display_picture` — and every
+//! reference field is resolved through the `surfaces` table. HEVC is doubly covered:
+//! its per-slice `RefPicList` stores an INDEX into `reference_frames`, so it cannot
+//! name a surface that array does not already hold.
+//!
+//! ⚠ One documented exception, and it is not this defect: `plan_to_va_av1` substitutes
+//! a live surface for a reference slot the planner reports empty, and where the store
+//! resolved NOTHING at all the fallback is the decode target itself (that conversion's
+//! module docs say why, and prefer a resolved reference wherever one exists). It names
+//! the target only when there is no other live surface to name, on a frame that is
+//! already concealed and will not be shown.
+//!
+//! ⚠ And one assumption, stated because it is the only way the argument fails: the pool
+//! holds DISTINCT `VASurfaceID`s. Two pool entries with one id would let a free index
+//! resolve to a bound surface. `vaCreateSurfaces` cannot return duplicates — this rung
+//! also destroys each exactly once, which the same duplication would double-free — so
+//! it is an assumption about libva rather than about this file.
 
 use std::os::fd::AsRawFd as _;
 use std::os::fd::FromRawFd as _;
@@ -686,6 +736,29 @@ impl Session {
             .collect()
     }
 
+    /// The decode target — pool index and `VASurfaceID` — together with the reference
+    /// table the conversion resolves against. `None` when the pool is exhausted.
+    ///
+    /// **The three are returned together because they are only safe together**, and
+    /// that is this rung's whole exemption from the aliasing defect the other two
+    /// backends had to defer their way out of (module docs). A free surface is by
+    /// definition a surface no slot binds; [`Self::surface_table`] is exactly what the
+    /// slots bind; so a target drawn from the same snapshot cannot appear in the table,
+    /// and no reference the conversion resolves through that table can be the surface
+    /// it is about to write.
+    ///
+    /// ⚠ Taking the two at DIFFERENT moments is the defect. References must resolve
+    /// against the store as it stood BEFORE this access unit's removals, so the table
+    /// has to be the pre-removal one; and a free list consulted AFTER those removals
+    /// offers the displaced picture's surface, which the pre-removal table still names.
+    /// `taking_the_free_surface_after_the_removals_would_hand_out_a_referenced_surface`
+    /// is that mismatch, made to happen. Returning a tuple is what stops a future edit
+    /// from reintroducing it by moving one call and not the other.
+    fn acquire_target(&self) -> Option<(usize, VaSurfaceId, Vec<VaSurfaceId>)> {
+        let index = self.free_surface()?;
+        Some((index, self.surfaces[index], self.surface_table()))
+    }
+
     /// Release every libva object this session owns, in creation-reverse order.
     /// Called explicitly (a `Drop` here could not reach the display).
     fn destroy(mut self, d: &Display) {
@@ -1011,11 +1084,9 @@ impl NativeVaapiDecoder {
             shape,
             &mut self.generation,
         )?;
-        let free = s
-            .free_surface()
+        let (free, target, table) = s
+            .acquire_target()
             .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let target = s.surfaces[free];
-        let table = s.surface_table();
         let converted = pf_vaadec::plan_to_va(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
@@ -1087,11 +1158,9 @@ impl NativeVaapiDecoder {
             shape,
             &mut self.generation,
         )?;
-        let free = s
-            .free_surface()
+        let (free, target, table) = s
+            .acquire_target()
             .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let target = s.surfaces[free];
-        let table = s.surface_table();
         let converted = pf_vaadec::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
@@ -1237,11 +1306,9 @@ impl NativeVaapiDecoder {
             shape,
             &mut self.generation,
         )?;
-        let free = s
-            .free_surface()
+        let (free, target, table) = s
+            .acquire_target()
             .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let target = s.surfaces[free];
-        let table = s.surface_table();
         let converted = match pf_vaadec::plan_to_va_av1(plan, au, &mut s.slots, &table, target) {
             Ok(converted) => converted,
             Err(e) => {
@@ -2126,6 +2193,138 @@ mod tests {
             s.slot_surface,
             vec![Some(0), None, None],
             "slot 0 is held by picture 11; slot 1's picture is gone"
+        );
+    }
+
+    /// The decode target is never a surface the reference table names — swept over
+    /// every binding state a small pool can be in.
+    ///
+    /// This rung's exemption from the aliasing defect the D3D11VA and Vulkan rungs had
+    /// to defer their way out of (module docs), stated as the one thing it actually
+    /// rests on. `pf-vaadec` proves the conversion can only name surfaces out of the
+    /// table it is handed; this proves the table and the target cannot overlap.
+    ///
+    /// Swept rather than exemplified because the claim is structural — a free surface
+    /// is by definition one no slot binds, and the table is exactly what the slots bind
+    /// — so it should hold in states an ordinary run never reaches, and a sweep is what
+    /// says so. The `held` and `pending` masks are varied too even though they can only
+    /// ever REMOVE candidates from the free list: a future claim that could add one
+    /// back is exactly what this would catch.
+    #[test]
+    fn the_decode_target_can_never_be_a_surface_the_reference_table_names() {
+        const SURFACES: usize = 4;
+        const SLOTS: usize = 3;
+        let choices: Vec<Option<usize>> = std::iter::once(None)
+            .chain((0..SURFACES).map(Some))
+            .collect();
+
+        let (mut states, mut with_a_target, mut exhausted) = (0usize, 0usize, 0usize);
+        for a in &choices {
+            for b in &choices {
+                for c in &choices {
+                    let bound = [*a, *b, *c];
+                    // Two slots binding ONE surface is not a state the pool can reach —
+                    // `bind_setup` only ever binds a surface nothing else claims — and
+                    // asserting about it would be asserting about a defect elsewhere.
+                    let mut distinct: Vec<usize> = bound.iter().flatten().copied().collect();
+                    let claimed = distinct.len();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    if distinct.len() != claimed {
+                        continue;
+                    }
+                    for held_mask in 0..(1u32 << SURFACES) {
+                        for pending_mask in 0..(1u32 << SURFACES) {
+                            let mut s = session(SURFACES, SLOTS);
+                            s.slot_surface = bound.to_vec();
+                            s.held = (0..SURFACES).map(|i| held_mask >> i & 1 == 1).collect();
+                            s.pending = (0..SURFACES)
+                                .filter(|i| pending_mask >> i & 1 == 1)
+                                .map(|i| (100 + i as u64, i))
+                                .collect();
+                            states += 1;
+
+                            let Some((index, target, table)) = s.acquire_target() else {
+                                exhausted += 1;
+                                continue;
+                            };
+                            with_a_target += 1;
+                            assert_eq!(
+                                target, s.surfaces[index],
+                                "the target must be the pool's surface at the index it \
+                                 returned, or the caller binds one and submits another"
+                            );
+                            assert_eq!(table.len(), SLOTS, "one table entry per slot");
+                            assert!(
+                                !table.contains(&target),
+                                "bindings {bound:?}, held {held_mask:#06b}, pending \
+                                 {pending_mask:#06b}: the decode target {target:#x} is \
+                                 in the reference table {table:x?} — every submission \
+                                 built from that pair decodes into a surface it may be \
+                                 predicting from"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The sweep has to reach both answers, or it is asserting about one branch.
+        assert!(states > 1000, "only {states} states swept");
+        assert!(with_a_target > 0 && exhausted > 0);
+    }
+
+    /// The order the rung must NOT be written in, and the reason
+    /// [`Session::acquire_target`] hands the target and the table back together.
+    ///
+    /// The exemption above is not a property of the pool alone: it needs the target and
+    /// the table to come from ONE snapshot. Split them and this rung acquires the
+    /// D3D11VA/Vulkan defect exactly — because the table must be the PRE-removal one
+    /// (a reference an access unit names can be a picture the same access unit evicts,
+    /// which on a punktfunk host's own low-delay H.264 is 117 access units in 120),
+    /// while a free list consulted after those removals offers precisely the displaced
+    /// picture's surface.
+    #[test]
+    fn taking_the_free_surface_after_the_removals_would_hand_out_a_referenced_surface() {
+        let mut s = session(4, 3);
+
+        // Two decoded reference pictures, each in its own surface, both already
+        // displayed and returned by the presenter — so only the SLOT binding keeps
+        // their surfaces off the free list. That is the steady state of a low-delay
+        // stream, where a picture is output by its own access unit and evicted by the
+        // sliding window several units later.
+        s.slots.assign(11).expect("a free slot");
+        bind_setup(&mut s, Some(11), Some(0));
+        s.slots.assign(12).expect("a free slot");
+        bind_setup(&mut s, Some(12), Some(1));
+        s.pending.clear();
+
+        // What the conversion resolves its references through, taken BEFORE this access
+        // unit's removals — which is not a choice, it is where the references are.
+        let table = s.surface_table();
+        assert!(
+            table.contains(&s.surfaces[0]),
+            "picture 11's surface must still be a resolvable reference"
+        );
+
+        // The order the rung is written in: one snapshot, and the target cannot be in
+        // the table it came with.
+        let (_, target, same_table) = s.acquire_target().expect("the pool has spares");
+        assert_eq!(
+            same_table, table,
+            "acquire_target must not re-derive the table"
+        );
+        assert!(!table.contains(&target));
+
+        // The defect: the conversion applies the removal, the bindings follow it, and
+        // only THEN is the free list consulted.
+        s.slots.release(11);
+        s.sync_slot_bindings();
+        let late = s.free_surface().expect("the pool has spares");
+        assert_eq!(
+            s.surfaces[late], table[0],
+            "the late free list offers the surface of the picture this access unit just \
+             displaced, and the pre-removal table still names it as a reference — \
+             decode into that and the driver predicts from the picture it is writing"
         );
     }
 
