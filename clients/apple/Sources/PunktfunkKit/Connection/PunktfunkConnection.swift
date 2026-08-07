@@ -311,12 +311,69 @@ public final class PunktfunkConnection {
             default: return nil
             }
         }
+
+        /// Whether this backend has a motion plane at all — whether a `sendMotion` sample to a
+        /// host running it can reach the game, or is decoded and dropped. Mirrors the host's
+        /// `GamepadPref::has_motion`; the X-Box classes have no gyro in their HID contract.
+        ///
+        /// This answers for ONE backend. To ask it of a particular pad, go through
+        /// `PunktfunkConnection.motionReaches(declared:)` — `resolvedGamepad` is not that pad's
+        /// answer, because the host builds each virtual device from the pad's own
+        /// `gamepadArrival` and falls back to the session default only for a pad that never
+        /// declared one.
+        ///
+        /// `.auto` answers `true` on purpose: it means "unknown" — an older host that omitted the
+        /// echo, which may well have resolved a DualSense. Suppressing on unknown would silently
+        /// break a working gyro, which is the worse of the two failures.
+        public var hasMotion: Bool {
+            switch self {
+            case .auto: return true // unknown; assume it can, see above
+            case .xbox360, .xboxOne: return false
+            case .dualSense, .dualShock4, .dualSenseEdge, .switchPro,
+                 .steamController, .steamDeck, .steamController2:
+                return true
+            }
+        }
+
+        /// Whether motion sent for ONE pad can reach the game: `declared` is the kind that pad
+        /// announced in its `gamepadArrival`, `asked` is the session default the handshake carried,
+        /// and `resolved` is the host's echo. Mirrors punktfunk-core's `pad_motion_reaches`, which
+        /// carries the full argument; in short:
+        ///
+        /// - the host builds each virtual device from that pad's declaration, so the echo is simply
+        ///   not this pad's answer when the two differ (under "Automatic" the handshake carries the
+        ///   ACTIVE pad's kind, so a couch with an X-Box pad and a DualSense echoes X-Box 360 while
+        ///   the host builds the DualSense a working motion plane);
+        /// - the host FOLDS what it cannot build — a Switch Pro on Windows, a UHID backend on a
+        ///   host whose `/dev/uhid` is unusable — and nothing here can predict that;
+        /// - but the echo IS one observed sample of that fold, for the kind we asked about, so it
+        ///   is authoritative for a pad that declared exactly that.
+        ///
+        /// Static and pure so it can be tested without a live session; the connection's
+        /// `motionReaches(declared:)` is the call site that fills in the other two.
+        public static func motionReaches(
+            declared: GamepadType, asked: GamepadType, resolved: GamepadType
+        ) -> Bool {
+            declared == asked ? resolved.hasMotion : declared.hasMotion
+        }
     }
 
     /// The virtual gamepad backend the host actually resolved (the Welcome's echo of the
     /// requested `gamepad`). `.auto` = an older host that didn't say — assume Xbox 360, no
     /// DualSense feedback.
     public private(set) var resolvedGamepad: GamepadType = .auto
+
+    /// The session default this connection's handshake ASKED for, kept beside the host's answer
+    /// above. The pair is what makes the echo usable per pad — see `motionReaches(declared:)`.
+    public private(set) var requestedGamepad: GamepadType = .auto
+
+    /// Whether motion sent for ONE pad can reach the game, given the kind that pad DECLARED in its
+    /// `gamepadArrival` (`GamepadManager.declaredKind(for:)`) — this session's two halves of
+    /// `GamepadType.motionReaches(declared:asked:resolved:)`, which carries the reasoning.
+    public func motionReaches(declared: GamepadType) -> Bool {
+        GamepadType.motionReaches(
+            declared: declared, asked: requestedGamepad, resolved: resolvedGamepad)
+    }
 
     /// The compositor the host actually resolved for this session's virtual output (the
     /// Welcome's echo of the requested `compositor`, with `.auto` resolved to a concrete
@@ -572,6 +629,9 @@ public final class PunktfunkConnection {
         var gp: UInt32 = 0
         _ = punktfunk_connection_gamepad(handle, &gp)
         resolvedGamepad = GamepadType(rawValue: gp) ?? .auto
+        // What we asked for, straight off the parameter — the echo above only speaks for a pad
+        // that declared this same kind (see `motionReaches(declared:)`).
+        requestedGamepad = gamepad
         var comp: UInt32 = 0
         _ = punktfunk_connection_compositor(handle, &comp)
         resolvedCompositor = Compositor(rawValue: comp) ?? .auto

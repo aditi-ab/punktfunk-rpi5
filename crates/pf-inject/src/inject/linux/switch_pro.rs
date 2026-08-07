@@ -288,6 +288,14 @@ impl PadProto for SwitchProProto {
         }
     }
 
+    fn neutralize_gyro(&self, st: &mut SwitchState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut SwitchState) {
+        st.clear_rich();
+    }
+
     fn write_state(&self, pad: &mut SwitchProPad, st: &SwitchState) {
         let _ = pad.write_state(st);
     }

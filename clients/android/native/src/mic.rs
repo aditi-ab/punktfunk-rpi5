@@ -26,6 +26,15 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryS
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// What one capture open attempt yields: the stream, plus both halves of the PCM hand-off — the
+/// receiver the encode worker drains and the sender that returns emptied buffers for reuse. Note
+/// the pair is the mirror image of [`crate::audio::OpenedPlayback`]'s: here the callback produces
+/// and the worker consumes.
+///
+/// Named rather than written inline for the same reason as that one — `clippy::type_complexity`,
+/// now that the Android target is actually linted (`:kit:cargoNdkClippy`).
+type OpenedCapture = ndk::audio::Result<(AudioStream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>)>;
+
 const CHANNELS: usize = 1;
 const SAMPLE_RATE: i32 = 48_000;
 /// 10 ms per channel @ 48 kHz — half the desktop clients' 20 ms frame, trading a little Opus
@@ -84,13 +93,7 @@ impl MicCapture {
 
         // One open attempt at a given sharing mode (same pattern as [`crate::audio`]: `open_stream`
         // consumes the builder AND the callback, so each try rebuilds the channels it captures).
-        let try_open = |sharing: AudioSharingMode,
-                        voice: bool|
-         -> ndk::audio::Result<(
-            AudioStream,
-            Receiver<Vec<f32>>,
-            SyncSender<Vec<f32>>,
-        )> {
+        let try_open = |sharing: AudioSharingMode, voice: bool| -> OpenedCapture {
             let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
             // Recycle free-list, mirroring the playback path: the realtime capture callback must
             // not touch the allocator (Android's Scudo has unbounded malloc/free tail latency — an

@@ -189,6 +189,40 @@ pub enum GamepadPref {
 }
 
 impl GamepadPref {
+    /// Whether this backend has a motion plane at all — i.e. whether a `RichInput::Motion` sample
+    /// sent to a host running it can reach the game, or is decoded and dropped.
+    ///
+    /// The X-Box classes have no gyro in their HID contract, so a client whose local pad HAS one
+    /// is streaming ~250 Hz of datagrams into a void: the host parses each and discards it, and
+    /// the player sees a controller whose gyro silently does nothing.
+    ///
+    /// This answers for ONE backend. To ask it of a particular pad, go through
+    /// [`pad_motion_reaches`] — the session's [`Welcome::gamepad`](crate::quic::Welcome::gamepad)
+    /// echo is not that pad's answer, because the host builds each virtual device from the pad's
+    /// own `GamepadArrival` and falls back to the session default only for a pad that never
+    /// declared one.
+    ///
+    /// `Auto` answers `true` on purpose. It means "unknown": either a host too old to echo the
+    /// field, or one that hasn't resolved yet. Suppressing motion on unknown would silently break
+    /// gyro against every old host that did resolve to a DualSense, which is a worse failure than
+    /// sending datagrams nobody reads.
+    ///
+    /// Exhaustive by design — a new backend has to state its answer here rather than inherit one.
+    pub const fn has_motion(self) -> bool {
+        match self {
+            GamepadPref::Auto => true, // unknown; assume it can, see above
+            GamepadPref::Xbox360 | GamepadPref::XboxOne => false,
+            GamepadPref::DualSense
+            | GamepadPref::DualShock4
+            | GamepadPref::DualSenseEdge
+            | GamepadPref::SwitchPro
+            | GamepadPref::SteamController
+            | GamepadPref::SteamDeck
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck => true,
+        }
+    }
+
     /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
     /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
     /// `9 = SteamController2`, `10 = SteamController2Puck`.
@@ -270,6 +304,45 @@ impl GamepadPref {
             GamepadPref::SteamController2 => "steamcontroller2",
             GamepadPref::SteamController2Puck => "steamcontroller2puck",
         }
+    }
+}
+
+/// Whether motion sent for ONE pad can reach the game: `declared` is the kind that pad announced
+/// in its [`InputKind::GamepadArrival`](crate::input::InputKind::GamepadArrival), `asked` is the
+/// session default the Hello carried, and `resolved` is the host's
+/// [`Welcome::gamepad`](crate::quic::Welcome::gamepad) echo.
+///
+/// Three facts make this a per-pad question rather than a session one:
+///
+/// 1. The host builds each virtual device from that pad's arrival — `Pads::set_kind` — and uses
+///    the session default only for a pad that never declares. So the echo is simply not this
+///    pad's answer when the two differ.
+/// 2. The host FOLDS what it cannot build (`resolve_gamepad`/`resolve_pad_kind` share one
+///    `pick_gamepad`): a Switch Pro on a Windows host, or any UHID backend on a host whose
+///    `/dev/uhid` is unusable, lands on X-Box 360 with the motion plane gone. Nothing local can
+///    predict that.
+/// 3. But the echo IS one observed sample of that fold — for the kind the Hello asked about. When
+///    a pad declared exactly that kind, the host ran the same fold on the same input, so the echo
+///    is authoritative for it.
+///
+/// Hence: trust the echo for a pad that declared what we asked for, and otherwise fall back to
+/// what the declaration alone can tell us. That keeps both motivating cases: a generic pad under
+/// `Auto` (declares X-Box 360, no motion plane, suppressed) and an explicit Switch Pro folded to
+/// X-Box 360 by a Windows host (declared == asked, so the echo catches it).
+///
+/// The residual gap is a pad whose declared kind differs from the session's AND gets folded — we
+/// keep sending, and the host keeps dropping. That is the direction to be wrong in: the failure
+/// is wasted datagrams, where guessing the other way would silently kill a working gyro.
+pub const fn pad_motion_reaches(
+    declared: GamepadPref,
+    asked: GamepadPref,
+    resolved: GamepadPref,
+) -> bool {
+    // `==` on a fieldless enum, spelled as a match because PartialEq::eq is not const.
+    if declared.to_u8() == asked.to_u8() {
+        resolved.has_motion()
+    } else {
+        declared.has_motion()
     }
 }
 
@@ -752,6 +825,75 @@ mod tests {
         assert_eq!(CompositorPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto (forward-compatible).
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
+    }
+
+    /// Which backends a client may stream motion to. Pinned as a table because the answer decides
+    /// whether a player's gyro works at all, and getting it wrong in either direction is silent:
+    /// a false negative kills working motion, a false positive keeps ~250 Hz of datagrams flowing
+    /// into a host that drops every one.
+    #[test]
+    fn only_the_xbox_classes_lack_a_motion_plane() {
+        for p in [GamepadPref::Xbox360, GamepadPref::XboxOne] {
+            assert!(
+                !p.has_motion(),
+                "{} should have no motion plane",
+                p.as_str()
+            );
+        }
+        for p in [
+            GamepadPref::DualSense,
+            GamepadPref::DualShock4,
+            GamepadPref::DualSenseEdge,
+            GamepadPref::SwitchPro,
+            GamepadPref::SteamController,
+            GamepadPref::SteamDeck,
+            GamepadPref::SteamController2,
+            GamepadPref::SteamController2Puck,
+        ] {
+            assert!(p.has_motion(), "{} should carry motion", p.as_str());
+        }
+        // Unknown must not suppress: an old host that omitted the echo may well have resolved a
+        // DualSense, and silently killing its gyro is worse than sending into a void.
+        assert!(GamepadPref::Auto.has_motion());
+    }
+
+    /// The per-pad question, case by case. Each row is a session a player can actually sit down
+    /// to; the comment says which of the three inputs decides it.
+    #[test]
+    fn motion_reach_is_answered_per_pad_not_per_session() {
+        use GamepadPref::*;
+        // The case this predicate exists for, and the one a session-level check gets WRONG:
+        // "Automatic" with mixed pads. The Hello carries the active pad's kind (an X-Box pad), so
+        // the echo says X-Box 360 — but pad 1 declared a DualSense and the host built it one, with
+        // a motion plane. Reading the echo here kills a gyro that works.
+        assert!(pad_motion_reaches(DualSense, Xbox360, Xbox360));
+        // Its mirror: the pad that DID declare the X-Box kind still has nowhere to put motion.
+        assert!(!pad_motion_reaches(Xbox360, Xbox360, Xbox360));
+
+        // A generic pad (8BitDo &c.) under Automatic — the sweep's motivating case. Detection
+        // lands on X-Box 360, the pad declares it, and its gyro has no plane to reach.
+        assert!(!pad_motion_reaches(Xbox360, Xbox360, Xbox360));
+
+        // An explicit Switch Pro against a WINDOWS host, which folds it to X-Box 360. Declared ==
+        // asked, so the echo is this pad's answer and catches a fold nothing local could predict.
+        assert!(!pad_motion_reaches(SwitchPro, SwitchPro, Xbox360));
+        // The same declaration against a Linux host that builds it: unchanged, motion reaches.
+        assert!(pad_motion_reaches(SwitchPro, SwitchPro, SwitchPro));
+
+        // A DualSense wish on a host with no usable /dev/uhid degrades the same way.
+        assert!(!pad_motion_reaches(DualSense, DualSense, Xbox360));
+
+        // Nobody connected at dial time, so the Hello asked `Auto` and the host resolved it from
+        // its own env. A pad that shows up later declares its own kind and is judged on that —
+        // whichever way the session went.
+        assert!(pad_motion_reaches(DualSense, Auto, Xbox360));
+        assert!(!pad_motion_reaches(Xbox360, Auto, DualSense));
+
+        // An old host that echoes nothing leaves `Auto`, which must not suppress: it may well have
+        // resolved a DualSense, and silently killing gyro is the worse of the two failures.
+        assert!(pad_motion_reaches(DualSense, DualSense, Auto));
+        // Even then the declaration still speaks when it is the thing without a plane.
+        assert!(!pad_motion_reaches(Xbox360, DualSense, Auto));
     }
 
     #[test]

@@ -352,6 +352,12 @@ struct MicUserData {
 /// bursting out as stale audio when recording (re)starts.
 const MIC_STALE: Duration = Duration::from_secs(1);
 
+/// The graph quantum every punktfunk PipeWire stream asks for, in frames: 240 @ 48 kHz = 5 ms,
+/// one protocol audio frame. Named so the `NODE_LATENCY` request and the code that CHECKS whether
+/// the request was honoured cannot drift apart — the check is only meaningful while it compares
+/// against the same number the ask used.
+const CAPTURE_QUANTUM_FRAMES: u32 = 240;
+
 fn mic_pw_thread(
     pcm_rx: Receiver<(std::time::Instant, Vec<f32>)>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
@@ -722,12 +728,19 @@ fn pw_thread(
             channels: u32,
             stats: crate::audio::capture_policy::CaptureStats,
             last_stats: std::time::Instant,
+            /// Whether this OPEN has reported its negotiated buffer size yet. Per-open, not the
+            /// process-wide `static AtomicBool` this replaces: a host runs for days across many
+            /// sessions, so the old form reported the very first capture of the process and then
+            /// never again — the one number that identifies a clamped quantum, invisible on every
+            /// subsequent open (including every reopen after a device change).
+            reported_quantum: bool,
         }
         let ud = CapUd {
             tx,
             channels,
             stats: Default::default(),
             last_stats: std::time::Instant::now(),
+            reported_quantum: false,
         };
         let _listener = stream
             .add_local_listener_with_user_data(ud)
@@ -788,10 +801,36 @@ fn pw_thread(
                     let region = &buf[offset..(offset + size).min(buf.len())];
                     // Negotiated as F32LE; reinterpret the byte region as interleaved f32.
                     let n = region.len() / 4;
-                    static FIRST: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(true);
-                    if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(samples = n, "audio first capture buffer");
+                    if !ud.reported_quantum {
+                        ud.reported_quantum = true;
+                        // What we ASKED for vs what PipeWire actually handed us. Stating only the
+                        // result ("samples=2048") reads as a fact about the device; stating it
+                        // next to the request is what makes a clamp legible. A VM is the common
+                        // cause — stock `pipewire.conf` raises `default.clock.min-quantum` to
+                        // 1024 whenever `cpu.vm.name` is set, so a 5 ms ask silently becomes
+                        // 21.3 ms and the audio plane starts arriving in bursts. That cost a
+                        // whole field investigation to find; it should cost one log line.
+                        let frames = n / (ud.channels.max(1) as usize);
+                        let want = CAPTURE_QUANTUM_FRAMES as usize;
+                        if frames > want {
+                            tracing::warn!(
+                                requested_frames = want,
+                                negotiated_frames = frames,
+                                negotiated_ms =
+                                    format!("{:.1}", frames as f32 * 1000.0 / SAMPLE_RATE as f32),
+                                "the audio graph refused our low-latency quantum — capture arrives \
+                                 in bursts this size, and the client must buffer at least that \
+                                 much to play them smoothly. On a VM this is PipeWire's \
+                                 `default.clock.min-quantum = 1024` rule; check \
+                                 `pw-metadata -n settings`"
+                            );
+                        } else {
+                            tracing::info!(
+                                requested_frames = want,
+                                negotiated_frames = frames,
+                                "audio capture quantum negotiated"
+                            );
+                        }
                     }
                     let mut samples = Vec::with_capacity(n);
                     for i in 0..n {

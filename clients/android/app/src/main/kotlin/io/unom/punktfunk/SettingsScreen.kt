@@ -850,7 +850,8 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
             field = "gamepad",
             enabled = s.gamepadForwarding,
             caption = "The virtual pad the host creates. Automatic matches your controller; " +
-                "every connected one is forwarded as its own player.",
+                "every connected one is forwarded as its own player. An X-Box type has no " +
+                "gyroscope, so pick a DualSense-class one if you want motion.",
         ) { g -> update(s.copy(gamepad = g)) }
         SettingDropdown(
             label = "Guide button",

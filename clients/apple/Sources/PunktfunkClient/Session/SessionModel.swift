@@ -132,6 +132,17 @@ final class SessionModel: ObservableObject {
     /// and under stage-1.
     @Published var osFloorP50Ms = 0.0
     @Published var osFloorValid = false
+    /// The AUDIO plane's latency, from the playback ring (`SessionAudio.Stats`): how much decoded
+    /// audio is queued ahead of the speaker, and where that PUTS it relative to the picture
+    /// (positive = audio behind). `audioValid` is false until playback runs.
+    ///
+    /// Both numbers, never just the depth — a deep ring on a jittery link is the adaptive floor
+    /// doing its job, and only the offset separates that from audio simply being held late. They
+    /// existed nowhere a surface could render them until now, which is why a field report of "the
+    /// audio delay seems way too high" was triaged all the way to a conclusion without them.
+    @Published var audioBufferMs = 0
+    @Published var audioAvOffsetMs = 0
+    @Published var audioValid = false
 
     /// The floor-shaved values every HUD tier displays (raw − floor, never below 0). Identical
     /// to the raw values whenever no floor is measured.
@@ -153,6 +164,20 @@ final class SessionModel: ObservableObject {
     /// background's privacy mute never clears the user's choice. Local and instant: it gates
     /// capture on this device, nothing is sent to the host.
     @Published private(set) var micMuted = false
+    /// The kind a controller declared when it turned out this session cannot carry its motion —
+    /// set once per such pad, cleared after `motionHintSeconds`. Nil the rest of the time.
+    ///
+    /// It exists because the failure is otherwise entirely silent: the gyro simply does nothing,
+    /// with no way for the player to tell a dead sensor from a session that resolved a backend
+    /// without a motion plane. The fix is a settings change, so the hint has to name it.
+    @Published private(set) var motionUnreachableKind: PunktfunkConnection.GamepadType?
+    /// Drops `motionUnreachableKind` again — held so a second pad's hint replaces the first
+    /// cleanly, and so ending the session cancels a pending clear rather than letting it fire
+    /// into a torn-down model.
+    private var motionHintTimer: Task<Void, Never>?
+    /// How long the motion hint stays up — the start-of-stream shortcut banner's 6 s, since the
+    /// two share the bottom-centre stack and a player reads them the same way.
+    private static let motionHintSeconds: UInt64 = 6
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
@@ -524,6 +549,21 @@ final class SessionModel: ObservableObject {
         applyMicMute()
     }
 
+    /// A forwarded controller has a gyro this session cannot carry (see
+    /// `GamepadCapture.onMotionUnreachable`). Show it briefly, then let it go.
+    ///
+    /// Last pad wins, and its timer restarts: two such pads are the same one fact to a player, and
+    /// a second hint appearing under a still-visible first would only read as a stutter.
+    private func noteMotionUnreachable(_ kind: PunktfunkConnection.GamepadType) {
+        motionUnreachableKind = kind
+        motionHintTimer?.cancel()
+        motionHintTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.motionUnreachableKind = nil
+        }
+    }
+
     /// Push the EFFECTIVE mute — the user's choice OR the background keep-alive's privacy mute —
     /// onto the audio engine. The two reasons are composed here and nowhere else: whichever one
     /// changed, the other still holds, so returning from the background can't un-mute a user who
@@ -573,6 +613,11 @@ final class SessionModel: ObservableObject {
         // The mic mute is per-session and never persisted: the next stream starts live (if the
         // mic is enabled), rather than silently carrying a mute nobody remembers making.
         micMuted = false
+        // Cancel before clearing: a pending clear firing into a torn-down session would be
+        // harmless but pointless, and leaving the hint set would carry it into the next stream.
+        motionHintTimer?.cancel()
+        motionHintTimer = nil
+        motionUnreachableKind = nil
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the
@@ -628,6 +673,7 @@ final class SessionModel: ObservableObject {
         displayValid = false
         clientQueueValid = false
         osFloorValid = false
+        audioValid = false
         lostFrames = 0
         lostPct = 0
         mouseCaptured = false
@@ -702,7 +748,14 @@ final class SessionModel: ObservableObject {
             micUID: settings.micUID,
             micChannel: settings.micChannel,
             micEnabled: settings.micEnabled,
-            echoCancel: settings.echoCancel)
+            echoCancel: settings.echoCancel,
+            // The A/V sync reference: `endToEnd` is capture→on-glass, the one figure that says
+            // where the picture actually IS, and the audio ring steers its depth to land with it.
+            // The same meter object the presenter writes per presented frame, so audio reads the
+            // video plane's own measurement rather than a second estimate of it — and under the
+            // stage-1 fallback presenter, which stamps nothing, it stays empty and the loop
+            // correctly declines to correct.
+            videoLatency: endToEnd)
         self.audio = audio
         // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
         // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
@@ -722,6 +775,9 @@ final class SessionModel: ObservableObject {
         // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only
         // controller way out of a stream (B/Menu is swallowed during sessions; see ContentView).
         capture.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        // A pad with a gyro that this session cannot carry — say so once, briefly, and name the
+        // setting that fixes it. Already main-actor (GamepadCapture fires it there).
+        capture.onMotionUnreachable = { [weak self] kind in self?.noteMotionUnreachable(kind) }
         capture.start()
         gamepadCapture = capture
         let feedback = GamepadFeedback(connection: conn, manager: .shared)
@@ -860,6 +916,15 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.clientQueueValid = false
                 }
+                // The audio plane is a LEVEL, not a window: the ring's depth and the sync loop's
+                // smoothed offset are both current values, so they are read rather than drained.
+                if let a = self.audio?.stats {
+                    self.audioBufferMs = a.bufferMS
+                    self.audioAvOffsetMs = a.avOffsetMS
+                    self.audioValid = true
+                } else {
+                    self.audioValid = false
+                }
                 // Mirror the window to the unified log (see statsLog) — one line per second,
                 // stages in ms, only while frames actually flowed. `fps` counts RECEIVED AUs;
                 // `presents` counts frames that reached glass (the display meter's sample count)
@@ -875,7 +940,12 @@ final class SessionModel: ObservableObject {
                         // the whole line (a cascade error that also mis-blames the float args).
                         format: "fps=%lld presents=%lld e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
                             + "decode_p50=%.1f display_p50=%.1f lost=%lld "
-                            + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f queue_p50=%.1f",
+                            + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f queue_p50=%.1f "
+                            // Appended LAST, so every existing parser of this line is unaffected.
+                            // In the log as well as on the HUD because the overlay is only up when
+                            // someone thought to turn it on, and the reports that need these
+                            // numbers arrive after the fact.
+                            + "audio_buffer=%lld audio_av_offset=%lld",
                         frames,
                         displayWindow?.count ?? 0,
                         self.endToEndValid ? self.endToEndP50Ms : -1,
@@ -887,7 +957,9 @@ final class SessionModel: ObservableObject {
                         self.osFloorValid ? self.osFloorP50Ms : -1,
                         self.displayValid ? self.displayAdjP50Ms : -1,
                         self.endToEndValid ? self.endToEndAdjP50Ms : -1,
-                        self.clientQueueValid ? self.clientQueueP50Ms : -1)
+                        self.clientQueueValid ? self.clientQueueP50Ms : -1,
+                        self.audioValid ? self.audioBufferMs : -1,
+                        self.audioValid ? self.audioAvOffsetMs : 0)
                     statsLog.info("\(line, privacy: .public)")
                 }
             }

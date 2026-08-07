@@ -1,6 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { motion, stagger } from "motion/react";
 import { type FC, useEffect, useMemo } from "react";
 import {
 	getGetLibraryQueryKey,
@@ -8,7 +7,9 @@ import {
 	useGetLibrary,
 } from "@/api/gen/library/library";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
+import { Stagger } from "@/components/stagger";
 import { Card, CardContent } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";
@@ -29,6 +30,7 @@ export const LibraryGridSection: FC<{
 	onEntries?: (entries: GameEntry[]) => void;
 }> = ({ onEdit, providerFilter, onEntries }) => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const library = useGetLibrary();
 	const all = library.data;
 	useEffect(() => {
@@ -53,7 +55,13 @@ export const LibraryGridSection: FC<{
 	// answers 409 with what to do instead), and an un-caught `mutateAsync` rejection reported none
 	// of them — the card just stayed put as if nothing had been clicked.
 	const onDelete = async (entry: GameEntry) => {
-		if (!confirm(m.library_delete_confirm())) return;
+		const ok = await confirm({
+			title: m.library_delete_confirm(),
+			description: m.library_delete_body(),
+			confirmLabel: m.library_delete(),
+			destructive: true,
+		});
+		if (!ok) return;
 		try {
 			await remove.mutateAsync({ id: customId(entry) });
 		} catch (e) {
@@ -108,13 +116,9 @@ export const LibraryGrid: FC<{
 					<p className="pb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
 						{m.library_launchers_title()}
 					</p>
-					<motion.div
-						transition={{ delayChildren: stagger(0.1) }}
-						variants={{ enter: {}, from: {} }}
-						className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5"
-					>
+					<Stagger className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5">
 						{launchers.map(card)}
-					</motion.div>
+					</Stagger>
 				</div>
 			)}
 			{all.length === 0 ? (
@@ -136,13 +140,9 @@ export const LibraryGrid: FC<{
 			) : (
 				games.length > 0 && (
 					<div className="@container">
-						<motion.div
-							transition={{ delayChildren: stagger(0.1) }}
-							variants={{ enter: {}, from: {} }}
-							className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5"
-						>
+						<Stagger className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5">
 							{games.map(card)}
-						</motion.div>
+						</Stagger>
 					</div>
 				)
 			)}

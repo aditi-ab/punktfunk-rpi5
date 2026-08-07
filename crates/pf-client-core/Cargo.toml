@@ -165,11 +165,16 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "winuser",
 ] }
 
-[target.'cfg(windows)'.dev-dependencies]
-# The native D3D11VA rung's frame-hash parity test compares decoded surfaces against the
-# libavcodec goldens M5 captured — the same SHA-256 list, and the same crate, pf-vkdecode's
-# Vulkan parity legs use (already in the workspace lock). The goldens are checked-in
-# hashes; nothing links FFmpeg to read them.
+[target.'cfg(any(target_os = "linux", windows))'.dev-dependencies]
+# The two platform native rungs' frame-hash parity tests compare decoded surfaces against
+# the libavcodec goldens M5 captured — the same SHA-256 list, and the same crate,
+# pf-vkdecode's Vulkan parity legs use (already in the workspace lock). The goldens are
+# checked-in hashes; nothing links FFmpeg to read them.
+#
+# Windows was the only platform here until the VAAPI rung grew a readback: `cfg(windows)`
+# for `video_d3d11_native::parity`, now `cfg(linux)` as well for
+# `video_vaapi_native::parity`. A DEV dependency, so no shipped binary gains anything —
+# which is also part of why the VAAPI readback cannot reach the production video path.
 sha2 = "0.10"
 
 [features]

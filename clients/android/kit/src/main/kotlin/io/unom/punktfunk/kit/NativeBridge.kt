@@ -264,12 +264,12 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 33 doubles (unified stats spec, `design/stats-unification.md`):
+     * Returns 35 doubles (unified stats spec, `design/stats-unification.md`):
      * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
      * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
      * netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
      * e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
-     * feedP50Ms, codecP50Ms, skippedOverflowWindow]`
+     * feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs]`
      * (the flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
      * describe the negotiated video feed — bit depth 8/10, CICP primaries/transfer, and the HEVC
      * chroma_format_idc 1=4:2:0 / 3=4:4:4; 14/15 are the stage p50s tiling the headline —
@@ -285,7 +285,10 @@ object NativeBridge {
      * the window's on-glass confirm count, and whether the presenter is active at all; 30/31
      * split `decode` (15) the same way — `feed` = received→queued (hand-off + input-slot wait),
      * `codec` = queued→decoded, the decoder's own time; 32 is the parked-AU overflow subset of
-     * `skipped` (19), i.e. the decoder falling behind rather than benign newest-wins pacing).
+     * `skipped` (19), i.e. the decoder falling behind rather than benign newest-wins pacing;
+     * 33/34 are the AUDIO plane — the playback ring's live depth in ms and the A/V sync loop's
+     * smoothed offset in ms, positive meaning audio plays BEHIND the picture. Those two are live
+     * gauges, not windowed samples, and the offset reads 0 until the loop has a video reference).
      * Poll ~1 Hz; each call resets the measurement window.
      */
     external fun nativeVideoStats(handle: Long): DoubleArray?
@@ -515,6 +518,23 @@ object NativeBridge {
 
     /** Signal wire pad [pad] (0..15) was unplugged so the host tears its virtual device down. The core stamps the seq + re-sends. */
     external fun nativeSendGamepadRemove(handle: Long, pad: Int)
+
+    /**
+     * Whether motion sent for a pad that declared [declaredPref] (the [Gamepad].PREF_* byte passed
+     * to [nativeSendGamepadArrival]) can actually reach the game, or would be decoded and dropped
+     * by a host backend without a motion plane — the X-Box classes have no gyro in their HID
+     * contract.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_motion_reaches`, rather than
+     * reconstructed here from the session's requested/resolved prefs. The rule is subtler than it
+     * looks (the host builds each pad from its OWN declaration and folds what it cannot build, so
+     * neither the declaration nor the session echo answers it alone) and every way of getting it
+     * wrong is silent, so it lives in one place with one set of tests.
+     *
+     * Ask ONCE when a pad opens, not per sample. `true` when the session handle is dead — "don't
+     * suppress" is the safe answer whenever we cannot tell.
+     */
+    external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
 
     /**
      * One raw HID input report from a client-captured controller (the as-is Steam Controller 2

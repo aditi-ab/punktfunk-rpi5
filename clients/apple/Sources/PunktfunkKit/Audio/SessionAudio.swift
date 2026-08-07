@@ -62,6 +62,13 @@ public final class SessionAudio {
     /// not the ring, so the drain thread never has to be re-pointed). Main-thread confined,
     /// like every start path.
     private var ring: AudioRing?
+    /// The video plane's end-to-end meter (capture→on-glass), if the owner wired one — the
+    /// reference the A/V sync loop steers the ring against. `nil` leaves the loop inert and the
+    /// ring exactly as it was before sync existed, which is also what the stage-1 fallback
+    /// presenter gets: it decodes and presents inside the layer with no per-frame stamp, so it can
+    /// offer no reference, and a loop with no reference must not invent one. Main-thread confined,
+    /// like `ring`; the meter itself is internally locked and read from the drain thread.
+    private var videoLatency: LatencyMeter?
     #if !os(macOS)
     /// AVAudioSession `setCategory`/`setActive` are synchronous and block on the audio server, so
     /// they must not run on the main thread (UI stall — AVFoundation warns about it). PROCESS-WIDE
@@ -91,9 +98,16 @@ public final class SessionAudio {
     /// a later main-queue hop (gated by `!flag.isStopped`) — so playback is live shortly after, not
     /// on return. The mic may start later still if the permission prompt is pending.
     /// `echoCancel` picks the engine topology — see the header note and `wantsCombined`.
+    ///
+    /// `videoLatency` is the session's END-TO-END latency meter (capture→on-glass). Pass it to arm
+    /// A/V sync: it is the only thing that tells the audio plane where the picture actually is, and
+    /// without it the ring keeps today's free-running behaviour. Omit it for a playback-only or
+    /// stage-1 session, where no such figure is measured.
     public func start(
-        speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool
+        speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool,
+        videoLatency: LatencyMeter? = nil
     ) {
+        self.videoLatency = videoLatency
         #if os(macOS)
         // No AVAudioSession on macOS — start the engines directly (caller's thread, as before).
         startEngines(
@@ -305,6 +319,31 @@ public final class SessionAudio {
         }
     }
 
+    // MARK: - Stats
+
+    /// The playback plane's two latency numbers, for the stats overlay.
+    ///
+    /// Both, never just the depth: a deep ring on a jittery link is CORRECT behaviour — the
+    /// adaptive floor put it there because the link kept starving — and only the offset separates
+    /// that from a ring that is simply holding audio late. Before this pair existed the plane
+    /// published nothing any surface could render (depth and target lived in a periodic log line),
+    /// and a field investigation into "the audio delay seems way too high" ran all the way to its
+    /// conclusion without either number.
+    public struct Stats: Sendable {
+        /// Decoded audio queued ahead of the speaker (ms).
+        public let bufferMS: Int
+        /// The A/V sync loop's smoothed offset (ms): positive = audio playing BEHIND the picture.
+        /// `0` before the loop has evidence, with sync unwired, or genuinely aligned.
+        public let avOffsetMS: Int
+    }
+
+    /// A snapshot of `Stats`, or nil before playback starts. Main thread (`ring` is main-confined;
+    /// the ring's own numbers are taken under its lock, so they describe one instant).
+    public var stats: Stats? {
+        guard let s = ring?.stats else { return nil }
+        return Stats(bufferMS: s.bufferedMS, avOffsetMS: s.avOffsetMS)
+    }
+
     // MARK: - Playback (host → speaker)
 
     /// The playback jitter ring + the source node draining it — shared by the plain playback
@@ -401,9 +440,25 @@ public final class SessionAudio {
         }
         drainStarted = true
         stateLock.unlock()
+        // A/V sync. This thread is the only place that holds all three ingredients at once: the
+        // packet's host capture `ptsNs`, the ring depth, and the video plane's end-to-end figure.
+        // `ptsNs` was decoded into `AudioPCM` and then dropped on the floor right here for the
+        // plane's entire existence, which is why audio ran at whatever depth its jitter ring
+        // happened to settle at and nothing ever placed it against the picture.
+        //
+        // The escape hatch mirrors the Rust clients': a field regression in a loop that steers
+        // PLAYBACK should be bisectable without a rebuild. macOS honours it from the environment;
+        // elsewhere it simply never trips, which is the same as today's behaviour.
+        let syncEnabled = !["1", "true"].contains(
+            ProcessInfo.processInfo.environment["PUNKTFUNK_NO_AV_SYNC"] ?? "")
+        // nil disarms the loop entirely — no reference, no correction (see `videoLatency`).
+        let videoLatency = syncEnabled ? self.videoLatency : nil
+        if !syncEnabled { log.info("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC") }
+        let channels = Int(connection.resolvedAudioChannels)
         let thread = Thread { [connection, flag, drainDone] in
             defer { drainDone.signal() }
             var drained = 0
+            var av = AvSync(channels: channels)
             // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
             // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
             // Per-iteration autorelease pool: no runloop on this thread (see Stage2Pipeline).
@@ -417,6 +472,25 @@ public final class SessionAudio {
                     return false // session closed
                 }
                 guard let pcm, pcm.frameCount > 0 else { return true }
+                // Place this frame against the picture it belongs with BEFORE queueing it: the
+                // depth read here is everything that must still play first, which is exactly what
+                // delays it. Skipped wholesale when no meter was wired, so an un-armed session
+                // does not even read the ring.
+                if let videoLatency {
+                    let depth = ring.bufferedSamples
+                    var ts = timespec()
+                    clock_gettime(CLOCK_REALTIME, &ts)
+                    let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                    // Half a second of tolerance on the reference: long enough to ride out a
+                    // stalled or hitching present path, short enough that a backgrounded session
+                    // (video decode dropped, audio still playing) stops steering almost at once.
+                    av.observe(AvSync.Observation(
+                        ptsNs: pcm.ptsNs, nowLocalNs: nowNs,
+                        clockOffsetNs: connection.clockOffsetNs, bufferedAhead: depth,
+                        videoE2eNs: videoLatency.latestSample(asOfNs: nowNs, maxAgeMs: 500)))
+                    ring.setSyncTarget(av.desiredDepth(currentDepth: depth))
+                    ring.noteAvOffset(av.offsetMS)
+                }
                 pcm.samples.withUnsafeBufferPointer { p in
                     if let base = p.baseAddress {
                         ring.write(base, count: pcm.frameCount * pcm.channels)
@@ -430,7 +504,7 @@ public final class SessionAudio {
                 if drained % 2_000 == 0 {
                     let s = ring.stats
                     log.info(
-                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds)"
+                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS)"
                     )
                 }
                 return true

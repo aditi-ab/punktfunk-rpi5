@@ -89,6 +89,16 @@ pub(super) fn audio_thread(
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
     const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_MS / 1000; // 240
+    /// One protocol frame of wall time — the cadence paced sends aim for.
+    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(FRAME_MS as u64);
+    /// Ceiling on a single pacing sleep. The capture channel is finite and `next_chunk` has to be
+    /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at
+    /// the capturer, which is strictly worse (a drop is a click AND a permanent shift).
+    const PACE_MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+    /// How far behind schedule the pacer may fall before it stops trying to catch up and simply
+    /// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
+    /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
+    const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
     let want = punktfunk_core::audio::normalize_channels(channels);
     // Tier and redundancy are ONE decision, budgeted against the session's video bitrate — see
     // `handshake::audio_budget`. An unparseable `audio.quality` was already warned about there
@@ -151,6 +161,27 @@ pub(super) fn audio_thread(
     // continuity breaks (a capture reopen), so we never advertise a predecessor the client's
     // sequence numbering does not agree with.
     let mut prev_frame: Vec<u8> = Vec::new();
+    // W1.1/W1.2 — the audio SAMPLE clock, and the schedule frames leave on.
+    //
+    // `pts_ns` used to be `now_ns()` evaluated inside the drain loop below, which made it the
+    // instant we got round to ENCODING rather than the instant the samples were CAPTURED. Every
+    // frame carved out of one capture chunk therefore carried a near-identical timestamp, and the
+    // value drifted with encoder scheduling. That was harmless only for as long as nothing
+    // consumed it; a client-side A/V sync loop regulating against it would be regulating against
+    // a fiction, so this is a prerequisite for the whole overhaul, not a tidy-up.
+    //
+    // `pace_due` exists because a chunk is not a frame. A capture callback hands us a whole
+    // quantum (5 ms when the graph honours our ask, 21.3 ms on a VM that clamps it to 1024 —
+    // see `audio::linux`'s quantum warning), and the old loop drained all of it into
+    // back-to-back `send_datagram` calls. The wire then carried a 4-5 frame burst followed by
+    // ~21 ms of nothing, and a client ring can only absorb that by standing at least a burst
+    // period deep. Releasing frames on the audio clock instead costs no AVERAGE latency — the
+    // client was buffering those frames anyway — and removes the burst the ring was sized for.
+    // Uninitialised on purpose: every read is preceded by the re-anchor at the top of the chunk
+    // loop, and seeding it with a placeholder would just be a value the compiler correctly points
+    // out is never read.
+    let mut next_pts_ns: u64;
+    let mut pace_due: Option<std::time::Instant> = None;
     if capturer.is_some() {
         tracing::info!(
             channels = want,
@@ -194,10 +225,37 @@ pub(super) fn audio_thread(
                 continue;
             }
         };
+        // Anchor the sample clock on THIS chunk's arrival. PipeWire hands us a buffer of already
+        // captured audio, so the newest sample in `acc` is ~now and the oldest is one whole
+        // buffer-occupancy earlier. Re-deriving the anchor every chunk (rather than free-running
+        // a counter) keeps the stamp tied to the capture device's own cadence, so a drifting or
+        // resampling graph corrects itself instead of accumulating error over a long session.
+        let arrival_ns = now_ns();
         acc.extend_from_slice(&chunk);
+        let queued_frames = (acc.len() / want as usize) as u64;
+        next_pts_ns = arrival_ns.saturating_sub(queued_frames * 1_000_000_000 / SAMPLE_RATE as u64);
         while acc.len() >= frame_len {
+            // Hold each frame until its slot on the audio clock. The FIRST frame of a chunk is
+            // already due (its samples are the oldest we hold), so this only ever delays the
+            // tail of a multi-frame chunk — exactly the burst we are trying not to send. A
+            // schedule that has fallen more than one frame behind is re-anchored rather than
+            // chased, so a scheduling hiccup cannot turn into a permanent send-time debt.
+            let now = std::time::Instant::now();
+            match pace_due {
+                Some(due) if due > now => {
+                    let wait = due - now;
+                    // Never sleep longer than the audio we are holding: `next_chunk` has to be
+                    // serviced or the capture channel backs up and starts dropping.
+                    std::thread::sleep(wait.min(PACE_MAX_SLEEP));
+                }
+                Some(due) if now.duration_since(due) > PACE_REANCHOR => pace_due = None,
+                _ => {}
+            }
+            pace_due = Some(pace_due.unwrap_or_else(std::time::Instant::now) + FRAME_INTERVAL);
+
             let frame: Vec<f32> = acc.drain(..frame_len).collect();
-            let pts_ns = now_ns();
+            let pts_ns = next_pts_ns;
+            next_pts_ns += FRAME_MS as u64 * 1_000_000;
             match enc.encode_float(&frame, &mut opus_buf) {
                 Ok(n) => {
                     let opus = &opus_buf[..n];

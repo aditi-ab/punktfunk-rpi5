@@ -42,12 +42,13 @@ class DeviceGyroTest {
         }
     }
 
-    /** The wire contract, shared with pf-client-core / the Swift client: 20 LSB/°·s means
-     *  1 rad/s ⇒ ~1145.9 raw; 1 g ⇒ 10000 raw. */
+    /** The wire contract, shared with pf-client-core / the Swift client and now with every other
+     *  Android motion sender ([Gamepad.motionGyroWire]): 20 LSB/°·s means 1 rad/s ⇒ ~1145.9 raw;
+     *  1 g ⇒ 10000 raw. */
     @Test
     fun wireUnitConstants() {
-        assertEquals(20f * 180f / Math.PI.toFloat(), DeviceGyro.GYRO_LSB_PER_RAD_S, 0f)
-        assertEquals(1145.9156f, DeviceGyro.GYRO_LSB_PER_RAD_S, 0.001f)
-        assertEquals(10_000, DeviceGyro.ACCEL_LSB_PER_G)
+        assertEquals(20f * 180f / Math.PI.toFloat(), Gamepad.MOTION_GYRO_LSB_PER_RAD_S, 0f)
+        assertEquals(1145.9156f, Gamepad.MOTION_GYRO_LSB_PER_RAD_S, 0.001f)
+        assertEquals(10_000, Gamepad.MOTION_ACCEL_LSB_PER_G)
     }
 }

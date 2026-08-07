@@ -12,7 +12,6 @@ use ash::vk::native as hh;
 use pf_bitstream::h264::AuPlan;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::RefPic;
-use tracing::trace;
 
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
@@ -56,6 +55,35 @@ pub struct DecodePlanVk {
     pub setup_is_reference: bool,
     /// The unique referenced pictures across all slices, in first-appearance order.
     pub refs: Vec<VkRef>,
+    /// Slots this access unit's own end-of-picture bookkeeping retires while the
+    /// decode op still BINDS them. Release them once that op is recorded — never
+    /// inside the conversion, and never dropped.
+    ///
+    /// The H.264 twin of [`crate::pic_av1::DecodePlanVkAv1::release_after_decode`],
+    /// and it exists for exactly the same reason: [`SlotMap::assign`] takes the lowest
+    /// free slot, so a release here hands the setup assignment two lines later the
+    /// slot a reference of this very AU still occupies. `pf_bitstream`'s `H264Planner`
+    /// snapshots `dpb_refs` in `begin_picture`, BEFORE `finish_picture` runs 8.2.5's
+    /// marking and C.4.5.3's bump, so a picture the sliding window unmarks and the
+    /// bump evicts is in both `dpb_refs` and `dpb.removed` for one AU — which needs
+    /// the eviction to be of an already-OUTPUT picture, i.e. low-delay H.264.
+    ///
+    /// **Measured 2026-08-07 on this rung as well as the DXVA one:** 297 of 300 AUs of
+    /// every stream a punktfunk host emits, at 720p, 1080p and 2160p alike. See
+    /// [`pf_dxvadec::pic::DecodePlanDxva::release_after_decode`]'s docs for the full
+    /// measurement and for why `test-25fps.h264` measures zero.
+    ///
+    /// Both of this rung's DPB modes break on it, differently and neither loudly:
+    /// in DISTINCT mode `slot_view` hands the aliased reference the same DPB array
+    /// layer the setup writes, a read-write alias of one subresource; in COINCIDE mode
+    /// the binding sync clears `slot_image[setup]` (it is the setup slot now) and the
+    /// reference resolves to no bound image at all, dropping out of `pReferenceSlots`
+    /// with a `trace!` and nothing else.
+    ///
+    /// The caller must apply these on its FAILURE paths too. They are slot-ledger
+    /// bookkeeping the planner already committed, not something this AU's fate can
+    /// undo — dropping them leaks a slot per AU and reaches `SlotError::Full`.
+    pub release_after_decode: Vec<PicId>,
 }
 
 /// Conversion failures. Stream damage never lands here — pf-bitstream degrades it to
@@ -162,11 +190,14 @@ fn ref_info(rp: &RefPic) -> hh::StdVideoDecodeH264ReferenceInfo {
 ///    reference, e.g. the sliding window dropping the oldest short-term reference,
 ///    so `removed` must not be applied before the lists are mapped;
 /// 3. slice offsets are validated (read-only);
-/// 4. `removed` is applied — removals were real regardless of this AU's fate — and
-///    the setup slot is assigned last (its failures are caller bugs; nothing is ever
-///    half-applied). Released slots become assignable to later pictures; keeping the
-///    underlying images alive until in-flight decodes complete is WP-B's
-///    synchronization, not this map's.
+/// 4. the setup slot is assigned last (its failures are caller bugs; nothing is ever
+///    half-applied). `removed` is NOT applied here — it leaves as
+///    [`DecodePlanVk::release_after_decode`] for the caller to apply once the decode
+///    op is recorded, because applying it now would give the assignment back a slot
+///    this AU's own references occupy (that field's docs carry the measurement).
+///    Released slots become assignable to later pictures; keeping the underlying
+///    images alive until in-flight decodes complete is WP-B's synchronization, not
+///    this map's.
 pub fn plan_to_vk(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -276,24 +307,26 @@ pub fn plan_to_vk(
         );
     }
 
-    // Mutations LAST, after every fallible step above (fn docs). Removals first —
-    // they were real regardless of this AU's fate — then the setup assignment.
+    // Mutations LAST, after every fallible step above (fn docs).
+    //
+    // The removals are handed back rather than applied: releasing one here returns
+    // its slot to the setup assignment below, and this AU's own references sit in
+    // those slots (`DecodePlanVk::release_after_decode`).
     //
     // The AU's own picture can itself appear in `removed`: a non-reference picture
     // with no free frame buffer bypasses the DPB and is stored-and-evicted within
     // one plan. Its slot must still exist for the decode itself, so it is assigned
-    // here and released right after — see `DecodePlanVk::setup_is_reference`.
+    // here and released right after — see `DecodePlanVk::setup_is_reference`. That
+    // is the one removal that is NOT deferred: handing the caller the slot being
+    // decoded into is the very aliasing the deferral exists to prevent.
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            // Tolerated but never silent: reachable only when the caller skipped
-            // feeding an AU's plan through this map.
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
+    let release_after_decode: Vec<PicId> = plan
+        .dpb
+        .removed
+        .iter()
+        .copied()
+        .filter(|id| *id != setup_id)
+        .collect();
     let setup_slot = slots.assign(setup_id)?;
     if setup_evicted {
         slots.release(setup_id);
@@ -307,6 +340,7 @@ pub fn plan_to_vk(
         setup_id,
         setup_is_reference: pic.is_reference,
         refs,
+        release_after_decode,
     })
 }
 
@@ -398,7 +432,10 @@ mod tests {
             });
             let vk = plan_to_vk(&plan, slots, 0).expect("the clean vector converts");
 
-            // Binding sync: released slots unbind; the setup slot rebinds fresh.
+            // Binding sync: released slots unbind; the setup slot rebinds fresh. The
+            // deferred releases have deliberately NOT run yet — that is the whole
+            // point of `DecodePlanVk::release_after_decode`, and doing it in the wrong
+            // order here would unbind the images this AU's own references read.
             let setup = usize::from(vk.setup_slot);
             let mut held_slots = vec![false; slot_image.len()];
             for (slot, _id) in slots.held() {
@@ -424,6 +461,12 @@ mod tests {
             pictures[dst].bound = true;
             slot_image[setup] = Some(dst);
             pending.insert(vk.setup_id, dst);
+
+            // Post-submit: the slots the conversion held back, exactly where
+            // `Decoder::decode` applies them.
+            for id in &vk.release_after_decode {
+                assert!(slots.release(*id), "a deferred id held no slot");
+            }
 
             // Settle: outputs deliver to the consumer; removed-never-output free.
             for id in &plan.dpb.outputs {
@@ -522,10 +565,28 @@ mod tests {
             );
 
             // Mirror the map's bookkeeping: record the new picture, drop the removed.
+            //
+            // The removals are dropped only after the deferred releases run, because
+            // that is when the MAP drops them — before that the conversion is still
+            // holding them so this AU's submission can name their slots
+            // (`DecodePlanVk::release_after_decode`).
             let stored = plan.dpb.stored.unwrap();
             assert_eq!(vk.setup_id, stored);
             assert_eq!(vk.setup_is_reference, plan.picture.is_reference);
             held.insert(stored, vk.setup_slot);
+            assert_eq!(
+                vk.release_after_decode,
+                plan.dpb
+                    .removed
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != stored)
+                    .collect::<Vec<_>>(),
+                "the deferral is the plan's whole `removed` list less the stored id"
+            );
+            for id in &vk.release_after_decode {
+                assert!(slots.release(*id), "a deferred id held no slot");
+            }
             for id in &plan.dpb.removed {
                 held.remove(id);
             }
@@ -799,13 +860,22 @@ mod tests {
     fn a_full_dpb_bump_reuses_the_slot_but_the_pool_model_binds_a_fresh_image() {
         // Depth-1 DPB (Level 1 at 320x240 ⇒ max_dpb_frames 1, capacity 2): every
         // stored P evicts the previous picture, and that picture's id lands in
-        // BOTH `outputs` and `removed` of the SAME plan — so `plan_to_vk` frees
-        // the evicted slot and immediately re-assigns it as this AU's setup.
-        // That SLOT reuse is fine and expected; the picture-pool model's whole
-        // point is that the re-activated slot binds a DIFFERENT free image, so
-        // the delivered picture's image is never the new decode target while the
-        // consumer holds it (the HIGH overwrite bug of the adversarial round,
-        // and the .25 field failure's class).
+        // BOTH `outputs` and `removed` of the SAME plan.
+        //
+        // ⚠ This test used to assert that `plan_to_vk` freed the evicted slot and
+        // re-assigned it as THIS AU's setup, calling that "the planner's normal
+        // behaviour". It was not: AU1 is a P picture that REFERENCES the picture it
+        // was evicting, so the submission named one slot as both `pSetupReferenceSlot`
+        // and a reference — a decode into the surface being predicted from. The same
+        // defect the AV1 rung was fixed for on 2026-08-07, authored here in miniature
+        // and asserted as correct. `DecodePlanVk::release_after_decode` is the fix, and
+        // this depth-1 stream is its tightest possible case: capacity 2, so the setup
+        // has exactly one slot to go to and it is the spare.
+        //
+        // What the test still proves, and what it was really written for, is the pool
+        // decoupling: the delivered picture's IMAGE is never the new decode target
+        // while the consumer holds it (the HIGH overwrite bug of the adversarial
+        // round, and the .25 field failure's class).
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
             .profile_idc(Profile::Main)
@@ -851,16 +921,39 @@ mod tests {
             .unwrap();
         assert!(p1.dpb.outputs.contains(&vk0.setup_id) && p1.dpb.removed.contains(&vk0.setup_id));
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
-        assert_eq!(
+
+        // AU1 REFERENCES the very picture it evicts — so the eviction is deferred and
+        // the setup goes to the spare slot instead. Without the deferral these two
+        // assertions are what fails, and they are the whole defect in two lines.
+        assert!(
+            vk1.refs.iter().any(|r| r.id == vk0.setup_id),
+            "AU1 must reference the picture it evicts, or this proves nothing"
+        );
+        assert_ne!(
             vk1.setup_slot, vk0.setup_slot,
-            "slot reuse across the bump is the planner's normal behaviour"
+            "the setup must not take the slot of a picture this AU still references"
+        );
+        for r in &vk1.refs {
+            assert_ne!(r.slot, vk1.setup_slot, "a reference aliases the setup slot");
+        }
+        assert_eq!(
+            vk1.release_after_decode,
+            vec![vk0.setup_id],
+            "the eviction is handed back, not applied"
         );
 
-        // Binding sync: the re-activated slot drops its old binding; picture 0's
-        // image is now delivered to the consumer (held), NOT freed.
+        // Binding sync: the setup slot is fresh, so nothing is unbound for it;
+        // picture 0's image is delivered to the consumer (held), NOT freed. Its slot
+        // is still HELD at this point — which is exactly what keeps its image bound
+        // while the decode op reads it as a reference.
+        assert!(
+            slots
+                .held()
+                .any(|(slot, id)| slot == vk0.setup_slot && id == vk0.setup_id),
+            "the referenced picture must still hold its slot through the submission"
+        );
         bound[img0] = false;
         held[img0] += 1; // outputs → delivered, consumer holds it
-        slot_image[usize::from(vk1.setup_slot)] = None;
 
         // The pool hands the re-activated slot a FRESH image — never image 0.
         let img1 = free(&bound, &held).expect("headroom guarantees a free image");
@@ -871,6 +964,17 @@ mod tests {
         );
         bound[img1] = true;
         slot_image[usize::from(vk1.setup_slot)] = Some(img1);
+
+        // Post-submit: the deferred release lands, and NOW the evicted slot is free —
+        // a picture later than this submission may have it, which is the only thing
+        // the deferral ever postponed.
+        for id in &vk1.release_after_decode {
+            assert!(slots.release(*id));
+        }
+        assert!(
+            !slots.held().any(|(slot, _)| slot == vk0.setup_slot),
+            "the deferred release must actually free the slot"
+        );
 
         // Once the consumer releases frame 0, image 0 returns to the free list.
         held[img0] -= 1;

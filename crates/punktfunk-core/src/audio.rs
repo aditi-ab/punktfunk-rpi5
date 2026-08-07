@@ -494,6 +494,9 @@ const GROW_WINDOW_MS: u32 = 5_000;
 const GROW_STEP_MS: u32 = 10;
 /// Quiet time (no underrun) before a grown target relaxes one step back toward the base.
 const SHRINK_QUIET_MS: u32 = 30_000;
+/// The same, while the A/V sync loop is actively asking for a shallower ring — see the branch in
+/// [`JitterPolicy::note_read`] that selects between them.
+const SHRINK_QUIET_SYNC_MS: u32 = 5_000;
 
 /// The playback de-jitter state machine shared by every client's audio ring.
 ///
@@ -531,6 +534,11 @@ pub struct JitterPolicy {
     /// `want` from the most recent [`step`](Self::step), so [`note_read`](Self::note_read) can
     /// advance the sample-denominated timers without the caller repeating it.
     last_want: usize,
+    /// Depth the A/V sync loop would like, in interleaved samples ([`AvSync::desired_depth`]).
+    /// `None` — the default, and what every un-wired ring keeps — reproduces the pre-sync
+    /// behaviour exactly, which is what lets the four client rings adopt this one at a time
+    /// without diverging in the meantime.
+    sync_target: Option<usize>,
 }
 
 impl JitterPolicy {
@@ -549,7 +557,25 @@ impl JitterPolicy {
             window_run: 0,
             quiet_run: 0,
             last_want: 0,
+            sync_target: None,
         }
+    }
+
+    /// Hand the ring the depth the A/V sync loop wants ([`AvSync::desired_depth`]), or `None` to
+    /// run unsynchronised.
+    ///
+    /// This is a REQUEST, not a command. [`effective_target`](Self::effective_target) clamps it
+    /// between the underrun-driven adaptive floor and the hard cap, so sync can never starve the
+    /// ring: if the link's jitter needs more buffer than the picture is away, the floor wins and
+    /// the residual shows up on the HUD instead of as a dropout. That ordering is the whole safety
+    /// argument for steering playback depth from a network measurement at all.
+    pub fn set_sync_target(&mut self, target: Option<usize>) {
+        self.sync_target = target;
+    }
+
+    /// The sync loop is asking to run shallower than the adaptive target has grown to.
+    fn sync_wants_less(&self) -> bool {
+        self.sync_target.is_some_and(|s| s < self.target)
     }
 
     /// The live target depth in ms (grows under underrun pressure; never below the base).
@@ -577,7 +603,25 @@ impl JitterPolicy {
     /// quantum, a legacy AAudio path) lifts it to `want` plus one protocol frame rather than
     /// oscillating prime → dropout → re-prime forever.
     fn effective_target(&self, want: usize) -> usize {
-        self.target.max(want + FRAME_MS as usize * self.per_ms)
+        let floor = self.target.max(want + FRAME_MS as usize * self.per_ms);
+        match self.sync_target {
+            // Continuity outranks sync — see `set_sync_target`. The loop may pull the ring
+            // shallower to catch the picture up, or push it deeper when audio runs early, but
+            // never below what underrun pressure has proven this link needs, and never past the
+            // hard cap that bounds added latency.
+            //
+            // The ceiling is raised to the floor rather than passed to `clamp` as-is: a device
+            // whose callback quantum alone exceeds the preset's `hard_cap_ms` makes `floor > cap`,
+            // and `Ord::clamp` PANICS when min > max. That would be a panic in a realtime audio
+            // callback on exactly the awkward hardware this code exists to survive — and the same
+            // reasoning `step` already applies when it computes its own cap with `.max(target +
+            // want)`.
+            Some(s) => {
+                let cap = (self.tuning.hard_cap_ms as usize * self.per_ms).max(floor);
+                s.clamp(floor, cap)
+            }
+            None => floor,
+        }
     }
 
     /// Decide this callback: what to trim, and whether to play. Call BEFORE reading, with the
@@ -664,7 +708,19 @@ impl JitterPolicy {
         } else {
             self.empties = 0;
             self.quiet_run += want;
-            if self.quiet_run >= SHRINK_QUIET_MS as usize * self.per_ms {
+            // A grown target normally relaxes only after a long quiet spell, because without other
+            // evidence the only thing that can justify giving up hard-won slack is time. When the
+            // sync loop is asking to run shallower it IS that evidence — a measurement saying the
+            // extra depth is costing alignment right now — so test a smaller target sooner. Wrong
+            // guesses are cheap and self-correcting: one underrun and the growth path takes it
+            // straight back. Without this a ring that ratcheted to the ceiling during a transient
+            // would hold the audio a ceiling's worth late for minutes after the cause had gone.
+            let quiet_needed = if self.sync_wants_less() {
+                SHRINK_QUIET_SYNC_MS
+            } else {
+                SHRINK_QUIET_MS
+            };
+            if self.quiet_run >= quiet_needed as usize * self.per_ms {
                 // Long quiet spell: give a grown target one step back, so a single bad minute
                 // doesn't cost latency for the rest of the session.
                 self.quiet_run = 0;
@@ -747,6 +803,205 @@ pub fn spa_positions(channels: u8) -> &'static [u32] {
         6 => &C51,
         8 => &C71,
         _ => &STEREO,
+    }
+}
+
+/// The lock-free hand-off between the thread that knows the TIMESTAMPS (the decode/pull thread,
+/// which sees each packet's `pts_ns`) and the one that knows the RING (the realtime audio
+/// callback, which owns the depth and the [`JitterPolicy`]). Neither can do the job alone and the
+/// callback must not block, so they trade two words.
+///
+/// `usize::MAX` encodes "no target" rather than `0`, because `0` is a perfectly ordinary depth to
+/// ask for and conflating the two would silently mean "run the ring dry".
+#[derive(Debug)]
+pub struct AudioSyncCell {
+    depth: std::sync::atomic::AtomicUsize,
+    target: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for AudioSyncCell {
+    fn default() -> Self {
+        AudioSyncCell {
+            depth: std::sync::atomic::AtomicUsize::new(0),
+            target: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        }
+    }
+}
+
+impl AudioSyncCell {
+    /// Callback side: publish the ring's current depth in interleaved samples.
+    pub fn publish_depth(&self, depth: usize) {
+        self.depth
+            .store(depth, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Decode side: the ring depth as last seen by the audio callback.
+    pub fn depth(&self) -> usize {
+        self.depth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Decode side: ask the ring to aim for this depth (`None` = run unsynchronised).
+    pub fn set_target(&self, target: Option<usize>) {
+        self.target.store(
+            target.unwrap_or(usize::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Callback side: the depth the sync loop wants, if any.
+    pub fn target(&self) -> Option<usize> {
+        match self.target.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => None,
+            t => Some(t),
+        }
+    }
+}
+
+/// Smoothing time constant for the measured A/V offset, in ms of consumed audio. Long enough that
+/// network jitter and a single late datagram do not move it; short enough to track real drift.
+const AV_EWMA_TAU_MS: u32 = 2_000;
+/// Offsets inside this band are left alone. Correcting a few ms costs a (crossfaded, but real)
+/// discontinuity and buys nothing a listener can perceive — detectability for A/V misalignment sits
+/// an order of magnitude above it. The deadband is what keeps the loop from hunting forever around
+/// zero, which would be audible in a way the misalignment it was chasing was not.
+const AV_DEADBAND_MS: u32 = 10;
+/// Observations folded before the first correction is offered. The offset is derived from a clock
+/// skew estimate and a video figure that both need a moment to settle after connect; acting on the
+/// first sample would chase the handshake, not the stream.
+const AV_MIN_OBSERVATIONS: u32 = 100;
+/// An offset larger than this is not believed. A wall-clock step, a paused host, or a stale video
+/// figure can all produce an enormous apparent misalignment, and steering the ring by it would
+/// empty or overfill it outright. Beyond this the loop reports and waits rather than acting.
+const AV_SANE_LIMIT_MS: u32 = 1_000;
+
+/// The A/V synchronisation controller: turns "when will this audio actually play" and "when did the
+/// picture it belongs with reach the glass" into a ring depth the [`JitterPolicy`] should aim for.
+///
+/// **The defect it exists to fix.** The host stamps `pts_ns` on every audio datagram and the client
+/// decoded it into `AudioPacket` — and then never read it. Video's `pts_ns`, by contrast, is used
+/// end to end (the presenter computes a true glass-to-glass `displayed + clock_offset − pts`). So
+/// audio free-ran at whatever depth its jitter ring happened to settle at, video was presented on a
+/// wholly independent path, and nothing ever compared them: the A/V offset was an accident of
+/// buffer depths. It moved whenever the ring ratcheted under underrun pressure, and — the way this
+/// surfaced in the field — it got WORSE every time video got faster, because a quicker decoder
+/// lowers the video leg while leaving the audio leg exactly where it was.
+///
+/// **Video is the master.** In a game streamer the video leg is the input-feel budget and must
+/// never be inflated to satisfy the audio clock; audio tolerates small, crossfaded, rate-limited
+/// corrections that are inaudible, and [`crossfade_drop`] already applies them. So audio moves.
+///
+/// **Continuity outranks sync.** This type only ever proposes a depth. [`JitterPolicy`] clamps the
+/// proposal to its own underrun-driven floor, so a link whose jitter genuinely needs more buffer
+/// than the picture is away keeps its buffer and the residual is reported instead of being taken
+/// out of the listener's stream. See [`JitterPolicy::set_sync_target`].
+#[derive(Clone, Debug)]
+pub struct AvSync {
+    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    per_ms: usize,
+    /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
+    /// the picture it belongs with.
+    offset_avg_ns: f32,
+    observations: u32,
+    /// Set once an observation lands outside [`AV_SANE_LIMIT_MS`], for reporting.
+    implausible: bool,
+}
+
+/// One measurement handed to [`AvSync::observe`]. Every field is in the units its source already
+/// produces, so no caller has to do clock arithmetic to use it correctly.
+#[derive(Clone, Copy, Debug)]
+pub struct AvSyncObservation {
+    /// The host capture timestamp carried by the audio frame being queued (host clock).
+    pub pts_ns: u64,
+    /// Local wall-clock now, same basis the client's video latency math uses (CLOCK_REALTIME).
+    pub now_local_ns: i128,
+    /// Host clock minus client clock, from the skew handshake (`clock_offset_now_ns`).
+    pub clock_offset_ns: i64,
+    /// How much audio is already queued AHEAD of this frame, in interleaved samples — everything
+    /// that must play before it does.
+    pub buffered_ahead: usize,
+    /// The video plane's current end-to-end figure in ns: `displayed + clock_offset − pts`, as the
+    /// presenter already computes it. `None` while no frame has been presented yet.
+    pub video_e2e_ns: Option<u64>,
+}
+
+impl AvSync {
+    /// `channels` is the negotiated interleaved channel count (2/6/8).
+    pub fn new(channels: u8) -> AvSync {
+        AvSync {
+            per_ms: (SAMPLE_RATE_HZ / 1000) as usize * channels.max(1) as usize,
+            offset_avg_ns: 0.0,
+            observations: 0,
+            implausible: false,
+        }
+    }
+
+    /// Fold one measurement. Returns the smoothed offset in ns once there is enough evidence to
+    /// believe it (positive = audio late), or `None` while still settling.
+    ///
+    /// Rejecting the implausible rather than clamping it is deliberate: a wall-clock step or a
+    /// stale video figure produces a huge apparent offset, and a clamped-but-wrong value would be
+    /// acted on as though it were a small real one.
+    pub fn observe(&mut self, o: AvSyncObservation) -> Option<i64> {
+        // No frame on the glass yet ⇒ no reference to align against, so nothing to say.
+        let video_e2e_ns = o.video_e2e_ns?;
+        // When this frame's samples will actually reach the speaker, expressed in the host's
+        // capture clock — the same clock, and the same shape, as the video figure it is compared
+        // against.
+        let buffered_ns = (o.buffered_ahead / self.per_ms.max(1)) as i128 * 1_000_000;
+        let play_at_host = o.now_local_ns + buffered_ns + o.clock_offset_ns as i128;
+        let audio_e2e_ns = play_at_host - o.pts_ns as i128;
+        let offset_ns = audio_e2e_ns - video_e2e_ns as i128;
+
+        if offset_ns.unsigned_abs() > (AV_SANE_LIMIT_MS as u128) * 1_000_000 {
+            self.implausible = true;
+            return None;
+        }
+        self.implausible = false;
+
+        // Weight by one protocol frame so the time constant means the same thing regardless of how
+        // often the caller observes.
+        let alpha = (FRAME_MS as f32 / AV_EWMA_TAU_MS as f32).clamp(0.0, 1.0);
+        if self.observations == 0 {
+            self.offset_avg_ns = offset_ns as f32;
+        } else {
+            self.offset_avg_ns += (offset_ns as f32 - self.offset_avg_ns) * alpha;
+        }
+        self.observations = self.observations.saturating_add(1);
+        self.settled().then_some(self.offset_avg_ns as i64)
+    }
+
+    /// Enough evidence folded to act on.
+    pub fn settled(&self) -> bool {
+        self.observations >= AV_MIN_OBSERVATIONS
+    }
+
+    /// The smoothed offset in ms (positive = audio late), for the HUD. Reported as soon as it is
+    /// measured, including while still settling — a number the operator can watch converge is more
+    /// useful than a blank that hides whether the loop is working at all.
+    pub fn offset_ms(&self) -> i32 {
+        (self.offset_avg_ns / 1_000_000.0) as i32
+    }
+
+    /// The last observation was outside the believable range and was discarded.
+    pub fn implausible(&self) -> bool {
+        self.implausible
+    }
+
+    /// The ring depth that would place audio with the picture, given where the ring is now.
+    /// `None` while unsettled or inside the deadband — the caller then leaves the policy alone.
+    ///
+    /// Audio late (offset > 0) means there is too much queued: aim shallower. Audio early means
+    /// aim deeper.
+    pub fn desired_depth(&self, current_depth: usize) -> Option<usize> {
+        if !self.settled() {
+            return None;
+        }
+        let offset_ms = self.offset_avg_ns / 1_000_000.0;
+        if offset_ms.abs() < AV_DEADBAND_MS as f32 {
+            return None;
+        }
+        let delta = (offset_ms * self.per_ms as f32) as i64;
+        Some((current_depth as i64 - delta).max(0) as usize)
     }
 }
 
@@ -1446,5 +1701,240 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- A/V sync (audio latency overhaul) ----------------------------------------------
+
+    /// Build an observation whose measured offset is exactly `offset_ms` (positive = audio late).
+    fn obs(offset_ms: i64, depth: usize, per_ms: usize) -> AvSyncObservation {
+        // audio_e2e = buffered + (now + skew - pts); pin now/skew/pts so the only free term is the
+        // buffered depth, then choose video_e2e so the difference lands on `offset_ms`.
+        let buffered_ms = (depth / per_ms) as i64;
+        let audio_e2e_ms = buffered_ms + 40; // 40 ms of transport, arbitrary but fixed
+        let video_e2e_ms = audio_e2e_ms - offset_ms;
+        AvSyncObservation {
+            pts_ns: 1_000_000_000,
+            now_local_ns: 1_000_000_000i128 + 40 * 1_000_000,
+            clock_offset_ns: 0,
+            buffered_ahead: depth,
+            video_e2e_ns: Some((video_e2e_ms.max(0) as u64) * 1_000_000),
+        }
+    }
+
+    fn settle(sync: &mut AvSync, offset_ms: i64, depth: usize, per_ms: usize, n: u32) {
+        for _ in 0..n {
+            sync.observe(obs(offset_ms, depth, per_ms));
+        }
+    }
+
+    #[test]
+    fn av_sync_needs_evidence_before_acting() {
+        let pm = per_ms(2);
+        let mut s = AvSync::new(2);
+        // One sample is never enough — the skew estimate and the video figure both settle after
+        // connect, and acting on the first would chase the handshake.
+        assert!(s.observe(obs(50, 30 * pm, pm)).is_none());
+        assert!(!s.settled());
+        assert!(s.desired_depth(30 * pm).is_none());
+        settle(&mut s, 50, 30 * pm, pm, AV_MIN_OBSERVATIONS);
+        assert!(s.settled(), "should act once the evidence is in");
+    }
+
+    #[test]
+    fn av_sync_aims_shallower_when_audio_is_late() {
+        let pm = per_ms(2);
+        let depth = 60 * pm;
+        let mut s = AvSync::new(2);
+        settle(&mut s, 40, depth, pm, AV_MIN_OBSERVATIONS * 4);
+        let want = s
+            .desired_depth(depth)
+            .expect("a 40 ms offset is actionable");
+        assert!(
+            want < depth,
+            "audio late must aim shallower: {want} vs {depth}"
+        );
+        // The correction is the offset, not a guess at it.
+        let shed_ms = (depth - want) / pm;
+        assert!(
+            (35..=45).contains(&shed_ms),
+            "should aim to shed ~40 ms, got {shed_ms}"
+        );
+    }
+
+    #[test]
+    fn av_sync_aims_deeper_when_audio_is_early() {
+        let pm = per_ms(2);
+        let depth = 20 * pm;
+        let mut s = AvSync::new(2);
+        settle(&mut s, -30, depth, pm, AV_MIN_OBSERVATIONS * 4);
+        let want = s
+            .desired_depth(depth)
+            .expect("a 30 ms offset is actionable");
+        assert!(
+            want > depth,
+            "audio early must aim deeper: {want} vs {depth}"
+        );
+    }
+
+    #[test]
+    fn av_sync_deadbands_what_no_one_can_hear() {
+        let pm = per_ms(2);
+        let depth = 30 * pm;
+        let mut s = AvSync::new(2);
+        settle(
+            &mut s,
+            (AV_DEADBAND_MS - 2) as i64,
+            depth,
+            pm,
+            AV_MIN_OBSERVATIONS * 4,
+        );
+        assert!(
+            s.desired_depth(depth).is_none(),
+            "an offset inside the deadband must not provoke a (real, if crossfaded) discontinuity"
+        );
+    }
+
+    #[test]
+    fn av_sync_rejects_the_implausible_instead_of_clamping_it() {
+        let pm = per_ms(2);
+        let depth = 30 * pm;
+        let mut s = AvSync::new(2);
+        settle(&mut s, 30, depth, pm, AV_MIN_OBSERVATIONS * 4);
+        let before = s.offset_ms();
+        // A wall-clock step / stale video figure. Built directly rather than through `obs`: that
+        // helper floors the video figure at zero, which would cap the offset at a merely LARGE
+        // value and let this test pass without ever exercising the rejection.
+        let wild = AvSyncObservation {
+            pts_ns: 0,
+            now_local_ns: 5_000_000_000,
+            clock_offset_ns: 0,
+            buffered_ahead: depth,
+            video_e2e_ns: Some(40_000_000),
+        };
+        assert!(s.observe(wild).is_none());
+        assert!(s.implausible(), "a ~5 s offset must be refused, not folded");
+        assert_eq!(
+            before,
+            s.offset_ms(),
+            "an implausible sample must be discarded, not folded in"
+        );
+    }
+
+    #[test]
+    fn sync_can_never_starve_the_ring() {
+        // THE safety invariant: sync only ever proposes. Continuity — the underrun-driven floor —
+        // outranks it on every preset, or a lossy link would be "synced" into dropouts.
+        for (name, t) in [
+            ("PIPEWIRE", JitterTuning::PIPEWIRE),
+            ("WASAPI", JitterTuning::WASAPI),
+            ("COREAUDIO", JitterTuning::COREAUDIO),
+            ("AAUDIO", JitterTuning::AAUDIO),
+        ] {
+            let pm = per_ms(2);
+            let want = 5 * pm;
+            let mut p = JitterPolicy::new(t, 2);
+            let floor = p.effective_target(want);
+            // Ask for an absurdly shallow ring — zero.
+            p.set_sync_target(Some(0));
+            assert_eq!(
+                p.effective_target(want),
+                floor,
+                "{name}: sync pulled the target below the continuity floor"
+            );
+            // And it may not blow past the hard cap either.
+            p.set_sync_target(Some(usize::MAX / 2));
+            assert!(
+                p.effective_target(want) <= t.hard_cap_ms as usize * pm,
+                "{name}: sync pushed the target past the hard cap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_device_quantum_does_not_panic_the_clamp() {
+        // `Ord::clamp` panics when min > max. A device whose callback quantum alone exceeds the
+        // preset's hard cap pushes the continuity floor above the ceiling, and this runs inside a
+        // realtime audio callback — so the ceiling yields to the floor instead.
+        let t = JitterTuning::PIPEWIRE; // hard_cap 80 ms
+        let pm = per_ms(2);
+        let want = 500 * pm; // a 500 ms quantum: absurd, but not a reason to abort the process
+        let mut p = JitterPolicy::new(t, 2);
+        p.set_sync_target(Some(0));
+        let target = p.effective_target(want); // must not panic
+        assert!(
+            target >= want,
+            "the target must still be able to serve one callback"
+        );
+    }
+
+    #[test]
+    fn no_sync_target_leaves_the_policy_exactly_as_it_was() {
+        // The four rings adopt sync one at a time; an un-wired ring must behave bit-identically to
+        // before. `None` is the default, so this also pins the constructor.
+        let t = JitterTuning::PIPEWIRE;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut a = JitterPolicy::new(t, 2);
+        let mut b = JitterPolicy::new(t, 2);
+        b.set_sync_target(None);
+        assert_eq!(a.effective_target(want), b.effective_target(want));
+        for depth_ms in [0usize, 5, 15, 30, 60, 90, 200] {
+            let sa = a.step(depth_ms * pm, want);
+            let sb = b.step(depth_ms * pm, want);
+            assert_eq!(sa, sb, "depth {depth_ms} ms diverged with an explicit None");
+            a.note_read(sa.silence);
+            b.note_read(sb.silence);
+        }
+    }
+
+    #[test]
+    fn sync_pressure_relaxes_a_grown_target_sooner_than_time_alone() {
+        // A ring that ratcheted during a transient must not hold audio late for minutes after the
+        // cause is gone. With sync asking for less, the relax window is the short one.
+        let t = JitterTuning::PIPEWIRE;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+
+        let grow = |p: &mut JitterPolicy| {
+            // Drive underruns until the target has grown above the base. Each round hands `step` a
+            // DEEP ring first: `note_read` ignores everything while un-primed (a priming silence is
+            // not an underrun), and `deprime_after` short reads in a row un-prime the ring — so
+            // hammering a zero-depth ring would report nothing and grow nothing, forever.
+            for _ in 0..10_000 {
+                if p.target_ms() > t.base_target_ms {
+                    return;
+                }
+                p.step(200 * pm, want); // (re-)prime
+                p.note_read(true); // then one genuine short read
+            }
+            panic!("the adaptive floor never grew — the test cannot measure a relax");
+        };
+        // Quiet reads needed to relax one step, with and without sync pressure.
+        let quiet_to_relax = |p: &mut JitterPolicy| -> usize {
+            let start = p.target_ms();
+            let mut reads = 0usize;
+            while p.target_ms() == start && reads < 200_000 {
+                p.step(60 * pm, want);
+                p.note_read(false);
+                reads += 1;
+            }
+            reads
+        };
+
+        let mut slow = JitterPolicy::new(t, 2);
+        grow(&mut slow);
+        slow.set_sync_target(None);
+        let slow_reads = quiet_to_relax(&mut slow);
+
+        let mut fast = JitterPolicy::new(t, 2);
+        grow(&mut fast);
+        // Ask for something strictly shallower than the grown target.
+        fast.set_sync_target(Some(pm));
+        let fast_reads = quiet_to_relax(&mut fast);
+
+        assert!(
+            fast_reads < slow_reads,
+            "sync pressure should relax sooner: {fast_reads} vs {slow_reads} quiet reads"
+        );
     }
 }

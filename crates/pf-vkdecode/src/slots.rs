@@ -44,7 +44,19 @@ impl std::fmt::Display for SlotError {
 impl std::error::Error for SlotError {}
 
 /// The slot ledger. One per decode session; feed it every [`DpbUpdate`] in decode
-/// order (via [`Self::apply`] or `plan_to_vk`, which applies internally).
+/// order.
+///
+/// [`Self::apply`] does that whole-update. `plan_to_vk` and `plan_to_vk_av1` do it in
+/// two halves instead: they ASSIGN the stored picture and hand the removals back as a
+/// `release_after_decode` list for the caller to apply once the decode op is issued.
+/// The split is not a convenience — releasing a removal before the assignment lets
+/// [`Self::assign`] return the slot this AU's own submission still names, which is a
+/// picture decoding into one it predicts from. A caller that drops the list leaks a
+/// slot per AU.
+///
+/// `plan_to_vk_h265` still applies its removals internally, and that is safe rather
+/// than lucky: `H265Planner` snapshots `dpb_refs` AFTER `decode_rps`, so a picture
+/// this AU's RPS dropped is never in the set its reference lists are built from.
 ///
 /// Invariants (unit-tested):
 /// - a [`PicId`] keeps its slot from [`Self::assign`] until [`Self::release`];
@@ -134,8 +146,9 @@ impl SlotMap {
     /// as the planner's DPB holds the picture — as a reference OR as a decoded
     /// picture awaiting output — and that residency ends only when a
     /// [`DpbUpdate::removed`] entry reports it. This method is that report's
-    /// primitive: `plan_to_vk` and [`Self::apply`] call it with the planner's
-    /// `removed` ids and nothing else may release a slot.
+    /// primitive: [`Self::apply`] calls it with the planner's `removed` ids, and so
+    /// do the conversions' callers via `release_after_decode` — one AU's removals,
+    /// deferred until its decode op is issued. Nothing else may release a slot.
     ///
     /// Releasing is CPU-side bookkeeping (the slot becomes assignable to a later
     /// picture); keeping the released slot's IMAGE out of reuse until in-flight

@@ -39,11 +39,13 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Motion scale constants, shared convention with the Swift client (`GamepadWire`):
-/// derived from hid-playstation's math over the host's fixed calibration blob. SDL hands
-/// us gyro in rad/s and accel in m/s²; the DualSense report wants raw LSBs.
-const GYRO_LSB_PER_RAD_S: f32 = 20.0 * 180.0 / std::f32::consts::PI;
-const ACCEL_LSB_PER_G: f32 = 10_000.0;
+/// Motion scale constants, shared convention with the Swift client (`GamepadWire`): the wire's
+/// units ([`wire::MOTION_GYRO_LSB_PER_DEG_S`] / [`wire::MOTION_ACCEL_LSB_PER_G`]), which the host's
+/// fixed calibration blobs declare back to their own consumers. SDL hands us gyro in rad/s and
+/// accel in m/s²; the DualSense report wants raw LSBs.
+const GYRO_LSB_PER_RAD_S: f32 =
+    wire::MOTION_GYRO_LSB_PER_DEG_S as f32 * 180.0 / std::f32::consts::PI;
+const ACCEL_LSB_PER_G: f32 = wire::MOTION_ACCEL_LSB_PER_G as f32;
 const G: f32 = 9.80665;
 
 /// The controller "escape" chord (Moonlight convention): L1 + R1 + Start + Select held
@@ -842,6 +844,12 @@ struct Slot {
     /// Resolved controller kind (captured at open) — selects the Deck rumble keep-alive and the
     /// DualSense raw-effect feedback path without re-querying SDL metadata under a `&mut` borrow.
     pref: GamepadPref,
+    /// The kind this slot DECLARED to the host in its [`InputKind::GamepadArrival`]
+    /// ([`declared_kind`] of the setting and `pref`) — what the host actually built this pad from,
+    /// which under `Auto` differs per pad. Captured at open beside `pref` for the same reason, and
+    /// kept distinct from it because the two answer different questions: `pref` is the controller
+    /// in the user's hands (local feedback), this is the one the host is pretending to have.
+    declared: GamepadPref,
     /// Wire axis state — zeroed on the wire when this slot closes (detach / unplug).
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
@@ -858,6 +866,13 @@ struct Slot {
     /// close lift a click held across detach/unplug.
     held_clicks: [bool; 2],
     last_accel: [i16; 3],
+    /// This slot has put at least one motion sample on the wire, so the host is holding one.
+    /// Gates the zero-gyro park in [`Worker::flush_slot`] — a pad with no gyro must not start
+    /// looking like one just because it closed.
+    sent_motion: bool,
+    /// The "your gyro can't reach this session" notice fired for this slot (log once, not per
+    /// sample — this path runs at the pad's sensor rate).
+    motion_unreachable_logged: bool,
     /// Hold-Select→guide state ([`SelectGesture`]) — only fed while the worker's
     /// `guide_gesture` policy is on.
     gesture: SelectGesture,
@@ -872,18 +887,27 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(id: u32, index: u8, pref: GamepadPref, pad: sdl3::gamepad::Gamepad) -> Slot {
+    fn new(
+        id: u32,
+        index: u8,
+        pref: GamepadPref,
+        declared: GamepadPref,
+        pad: sdl3::gamepad::Gamepad,
+    ) -> Slot {
         Slot {
             id,
             index,
             pad,
             pref,
+            declared,
             last_axis: [i32::MIN; 6],
             held_buttons: Vec::new(),
             held_touches: std::collections::HashSet::new(),
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
+            sent_motion: false,
+            motion_unreachable_logged: false,
             gesture: SelectGesture::default(),
             audio_caps: 0,
             rumble_suppressed_logged: false,
@@ -1231,7 +1255,7 @@ impl Worker {
         let declared = declared_kind(self.kind_override, pref);
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
-                let mut slot = Slot::new(id, index, pref, pad);
+                let mut slot = Slot::new(id, index, pref, declared, pad);
                 Self::set_slot_sensors(&mut slot, true);
                 slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
                 // Declare this pad's kind BEFORE any of its input, so the host builds a matching
@@ -1479,6 +1503,19 @@ impl Worker {
                 }
             };
             let _ = c.send_rich_input(rich);
+        }
+        // Park motion. Gyro is level-triggered host-side — the last sample is preserved across
+        // button frames and re-emitted by the pad heartbeat — so a slot closing mid-rotation
+        // leaves the virtual pad turning, and a game integrating gyro aim turns with it. The host
+        // has an idle watchdog for the cases nobody can flush (a dropped link); this is the case
+        // we can, so take it immediately. Acceleration is kept: gravity doesn't stop when the
+        // session does.
+        if std::mem::take(&mut slot.sent_motion) {
+            let _ = c.send_rich_input(RichInput::Motion {
+                pad,
+                gyro: [0; 3],
+                accel: slot.last_accel,
+            });
         }
     }
 
@@ -1988,10 +2025,38 @@ impl Worker {
                         }
                     }
                     SensorType::Gyroscope => {
+                        // An X-Box class pad has no motion plane, so every sample below would be
+                        // decoded and dropped. Say so once — the player's gyro is silently doing
+                        // nothing and the fix is the controller-type setting — and stop paying to
+                        // send ~250 Hz of them.
+                        //
+                        // Asked PER PAD, off this slot's own declaration. The session echo alone is
+                        // the wrong question: under `Auto` the Hello carries the active pad's kind,
+                        // so a couch with an X-Box pad on 0 and a DualSense on 1 echoes X-Box 360
+                        // while the host builds pad 1 a DualSense with a working gyro.
+                        if !punktfunk_core::config::pad_motion_reaches(
+                            slot.declared,
+                            c.requested_gamepad,
+                            c.resolved_gamepad,
+                        ) {
+                            if !slot.motion_unreachable_logged {
+                                slot.motion_unreachable_logged = true;
+                                tracing::warn!(
+                                    pad = slot.index,
+                                    declared = ?slot.declared,
+                                    resolved = ?c.resolved_gamepad,
+                                    "this controller has a gyro but the host built it a backend \
+                                     without one — motion will not reach the game; pick a \
+                                     DualSense-class controller type to get it"
+                                );
+                            }
+                            return;
+                        }
                         let mut gyro = [0i16; 3];
                         for (i, v) in data.iter().enumerate() {
                             gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
                         }
+                        slot.sent_motion = true;
                         let _ = c.send_rich_input(RichInput::Motion {
                             pad: slot.index,
                             gyro,

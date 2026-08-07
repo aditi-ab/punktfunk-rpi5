@@ -320,7 +320,8 @@ impl GamepadManager {
                 }
                 // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
                 // on a later `pump_rumble` tick — this frame is the only one the producer sends).
-                let swept = self.slots.sweep(f.active_mask);
+                // XUSB pads carry no rich plane, so a grace re-claim has nothing to clear.
+                let swept = self.slots.sweep(f.active_mask).dropped;
                 self.reset_swept(swept);
                 if f.active_mask & (1 << idx) == 0 {
                     return;

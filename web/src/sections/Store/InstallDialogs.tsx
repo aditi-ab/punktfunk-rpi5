@@ -1,8 +1,8 @@
-import { Checkbox } from "@unom/ui/form/checkbox";
 import { BadgeCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
 import type { StoreEntry } from "@/api/store";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	Dialog,
 	DialogContent,

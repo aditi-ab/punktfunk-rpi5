@@ -450,6 +450,15 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
    host injects it into the matching virtual pad; the Deck's trackpads ride the same touchpad
    surface. On the Apple clients rich capture is gated to the DualSense/DualShock 4 family, so
    other pads there really do get rumble only.
+
+   **But motion only lands if the virtual pad the host builds has somewhere to put it.** The Xbox
+   360 and Xbox One backends have no gyro in their HID contract, so a session that resolves to one
+   parses every motion sample and discards it. That is what *Automatic* does for any controller it
+   doesn't recognise as Sony or Valve — an 8BitDo with a perfectly good gyro included — and it is
+   also where a Switch Pro lands on a Windows host, which has no `hid-nintendo` backend to fold it
+   into. Set **Controller type** to a DualSense-class preset to get motion in those cases; the
+   clients now say so on-screen when they detect it, rather than leaving you to guess why tilting
+   does nothing. See [Gamepad type](/docs/client-settings#gamepad-type).
 3. No desktop client sends pen input, even though the desktop hosts can inject it.
 4. All three touch modes exist in the shared code and the picker is there, but nobody has confirmed
    them on a Windows 2-in-1. Only meaningful on a touchscreen anyway.

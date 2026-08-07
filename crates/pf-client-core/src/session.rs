@@ -178,6 +178,22 @@ pub struct Stats {
     /// is actually going out — the muted case has its own badge, which does not need stats on.
     pub mic_sent: u32,
     pub mic_dropped: u32,
+    /// How much decoded audio is queued ahead of the speaker right now (ms) — the playback
+    /// ring's depth.
+    ///
+    /// The audio plane used to publish nothing any surface could render: depth and target existed
+    /// only as a `tracing::debug!` line, and on a Steam Deck the client runs under Steam's
+    /// `reaper` with its stdout on a pipe, so the one number that identifies a deep ring was
+    /// unobtainable on the device reporting the latency. A field investigation ran to its
+    /// conclusion without it. That is the gap this closes.
+    pub audio_buffer_ms: u32,
+    /// The A/V sync loop's smoothed offset (ms): **positive = audio playing BEHIND the picture**,
+    /// negative = ahead of it. `0` before the loop has evidence, or with sync disabled.
+    ///
+    /// This is the figure that says whether audio is placed correctly, and it is the one the
+    /// overhaul is judged by — an absolute buffer depth cannot distinguish "deep because the link
+    /// needs it" from "deep and therefore late".
+    pub audio_av_offset_ms: i32,
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
@@ -1407,6 +1423,8 @@ fn pump(
                 },
                 mic_sent,
                 mic_dropped,
+                audio_buffer_ms: connector.audio_buffer_ms(),
+                audio_av_offset_ms: connector.audio_av_offset_ms() as i32,
                 decoder: dec_path,
                 target_kbps: connector.current_bitrate_kbps(),
                 auto_rate,
@@ -1523,15 +1541,59 @@ fn spawn_audio(
     let mut dec = AudioDec::new(channels)
         .map_err(|e| tracing::warn!(error = %e, "opus decoder failed — audio disabled"))
         .ok()?;
+    // A/V sync (audio latency overhaul). This thread is the only place that holds all three
+    // ingredients at once: the packet's host capture `pts_ns`, the ring depth (via the sync cell)
+    // and the video plane's end-to-end figure. `pts_ns` was decoded into `AudioPacket` and then
+    // dropped on the floor here for the plane's entire existence, which is why audio ran at
+    // whatever depth its jitter ring happened to settle at and nothing ever placed it against the
+    // picture.
+    //
+    // The escape hatch is deliberate: a field regression in a loop that steers PLAYBACK should be
+    // bisectable without a rebuild, the same way `PUNKTFUNK_MIC_LEGACY_BUFFER` covers the uplink.
+    let av_sync_enabled = !matches!(
+        std::env::var("PUNKTFUNK_NO_AV_SYNC").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let sync_cell = player.sync_cell();
+    let video_e2e = connector.video_e2e_shared();
+    let av_offset_out = connector.audio_av_offset_shared();
+    let buffer_ms_out = connector.audio_buffer_ms_shared();
+    // Interleaved samples per ms, to report the ring depth in the unit a human reads.
+    let per_ms = 48 * channels.max(1) as usize;
     std::thread::Builder::new()
         .name("punktfunk-audio-rx".into())
         .spawn(move || {
             let mut pcm = vec![0f32; 5760 * channels as usize]; // scratch: max Opus frame (120 ms) × channels
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
             let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
+            let mut av = punktfunk_core::audio::AvSync::new(channels);
+            if !av_sync_enabled {
+                tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
+            }
             while !stop.load(Ordering::SeqCst) {
                 match connector.next_audio(Duration::from_millis(100)) {
                     Ok(pkt) => {
+                        // Place this frame against the picture it belongs with, BEFORE it is
+                        // queued: `buffered_ahead` is everything that must still play first, so
+                        // the depth read here is exactly what delays it.
+                        let depth = sync_cell.depth();
+                        // Published unconditionally — the ring's depth is worth seeing even with
+                        // sync off, and it is what makes a "too much latency" report triageable.
+                        buffer_ms_out.store((depth / per_ms) as u32, Ordering::Relaxed);
+                        if av_sync_enabled {
+                            let ve2e = video_e2e.load(Ordering::Relaxed);
+                            let o = punktfunk_core::audio::AvSyncObservation {
+                                pts_ns: pkt.pts_ns,
+                                now_local_ns: punktfunk_core::client::now_realtime_ns(),
+                                clock_offset_ns: connector.clock_offset_now_ns(),
+                                buffered_ahead: depth,
+                                // 0 = nothing on the glass yet; no reference, no correction.
+                                video_e2e_ns: (ve2e > 0).then_some(ve2e),
+                            };
+                            av.observe(o);
+                            sync_cell.set_target(av.desired_depth(depth));
+                            av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
+                        }
                         // Conceal lost packets (a seq gap) with libopus PLC before decoding the one
                         // that arrived: empty input synthesizes `frame_samples` of interpolation per
                         // missing packet — an inaudible fade instead of the click a hard gap makes.

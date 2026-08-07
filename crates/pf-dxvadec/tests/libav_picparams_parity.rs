@@ -145,6 +145,47 @@
 //! while every other byte still looks right. If the macro is spelled differently in the tree,
 //! any expression yielding the negotiated config's `ConfigBitstreamRaw` will do.
 //!
+//! **5b. AV1.** The identical `PFPP` block goes at the very END of
+//! `ff_dxva2_av1_fill_picture_parameters` (`dxva2_av1.c:60`), with `h264` replaced by `av1` —
+//! after the film-grain block, so every field is final. Three things differ from the two codecs
+//! above and each of them changes what a capture MEANS:
+//!
+//! * **The AU index is a FRAME, not a temporal unit.** `ff_dxva2_common_end_frame` runs once per
+//!   submitted picture and an AV1 temporal unit may decode several, so `pf_au_index` walks
+//!   decoded frames. This crate's [`our_av1_submissions`] emits one entry per decoded frame for
+//!   the same reason, and the vendored vector is **274** frames in 250 units — a capture with
+//!   250 `PFPP av1` lines is a capture of something else. (A `show_existing_frame` unit submits
+//!   nothing on either side; this vector has none.)
+//! * **No `PFQM` line and no matrix buffer.** `dxva2_av1_end_frame` passes `NULL, 0` for the qm
+//!   pair, so the `qm_size > 0` branch of the block in step 4 logs `absent` on every frame. That
+//!   is the expected reading, not a missed patch site.
+//! * **No `PFCFG` check.** [`preflight`]'s `ConfigBitstreamRaw` assertion is about the two short
+//!   slice-control formats; AV1's slice-control record is `DXVA_Tile_AV1` and has no short/long
+//!   pair, so a captured `PFCFG av1` line is ignored rather than compared.
+//!
+//! The stream is the vendored IVF at
+//! `crates/pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1`:
+//!
+//! ```text
+//! ffmpeg -hwaccel d3d11va -hwaccel_output_format d3d11 -i test-25fps.ivf.av1 -f null - 2> av1.log
+//! grep -oE 'PF(PP|QM|BD|CFG) .*' av1.log > libav-av1.capture
+//! ```
+//!
+//! ⚠ Add `-export_side_data +film_grain` to NOTHING: `apply_grain` and `pp->coding.film_grain`
+//! both turn OFF when film grain is exported as side data, and this crate always applies it in
+//! the decoder. The vendored vector codes no grain either way.
+//!
+//! **No such capture has been taken.** As of 2026-08-07 the AV1 comparison
+//! (`our_av1_picture_parameters_match_libavcodecs`) has never run against libavcodec's bytes,
+//! and the reason is stated rather than left as an absent result: `.221`, the only box in this
+//! fleet with a D3D11VA GPU to spare, has no MSYS2, no gcc and no make, so producing a patched
+//! FFmpeg there is a toolchain bring-up rather than a build. What DID localise the AV1 defect
+//! of 2026-08-07 was `video_d3d11_native`'s frame-hash parity harness plus a CPU invariant
+//! (`no_av1_submission_names_its_decode_surface_in_the_reference_store`, below) — so this file's
+//! AV1 half is currently the no-capture half only, and every claim it makes about libavcodec's
+//! AV1 side is READ out of `dxva2_av1.c` (n8.1) rather than measured. Tier one, in the
+//! provenance section's terms, for all of it.
+//!
 //! **6. Run it.** `--enable-d3d11va` is on by default on Windows. Decode the SAME elementary
 //! streams this test plans — the vendored vectors, in the repository at
 //! `crates/pf-bitstream/vendor/cros-codecs/src/codec/{h264,h265}/test_data/test-25fps.{h264,h265}`:
@@ -167,6 +208,7 @@
 //!
 //! ```text
 //! PF_LIBAV_CAPTURE_H264=libav-h264.capture PF_LIBAV_CAPTURE_HEVC=libav-hevc.capture \
+//!     PF_LIBAV_CAPTURE_AV1=libav-av1.capture \
 //!     cargo test -p pf-dxvadec --test libav_picparams_parity -- --ignored --nocapture
 //! ```
 //!
@@ -352,19 +394,30 @@ use pf_dxvadec::dxva::QmatrixHevc;
 use pf_dxvadec::dxva::SliceH264Short;
 use pf_dxvadec::dxva::SliceHevcShort;
 use pf_dxvadec::dxva::UNUSED_ENTRY;
+use pf_dxvadec::dxva_av1::PicEntryAv1;
+use pf_dxvadec::dxva_av1::UNUSED_INDEX;
 use pf_dxvadec::AuPlan;
+use pf_dxvadec::Av1Planner;
 use pf_dxvadec::BufferDescriptor;
 use pf_dxvadec::Codec;
 use pf_dxvadec::H264Planner;
 use pf_dxvadec::H265Planner;
+use pf_dxvadec::PicParamsAv1;
 use pf_dxvadec::SliceRecord;
 use pf_dxvadec::SlotMap;
+use pf_dxvadec::TileAv1;
+use pf_dxvadec::NUM_REF_SLOTS;
 
 const TEST_25FPS_H264: &[u8] = include_bytes!(
     "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
 );
 const TEST_25FPS_H265: &[u8] = include_bytes!(
     "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
+);
+/// The AV1 vector is an IVF container, and its unit of comparison is the TEMPORAL UNIT rather
+/// than the access unit: one IVF packet may decode several frames, of which at most one shows.
+const TEST_25FPS_AV1: &[u8] = include_bytes!(
+    "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
 );
 
 /// Both vendored vectors carry exactly this many access units — pf-bitstream's own golden, and
@@ -453,8 +506,12 @@ struct OurSubmission {
     qmatrix: Option<Vec<u8>>,
     /// The descriptor set, in submission order.
     descriptors: Vec<BufferDescriptor>,
-    /// The packer's slice records, for the internal-consistency checks.
+    /// The packer's slice records, for the internal-consistency checks. Empty on AV1, whose
+    /// slice-control buffer holds [`Self::tiles`] instead.
     records: Vec<SliceRecord>,
+    /// AV1's slice-control records — one `DXVA_Tile_AV1` per TILE, not per tile group. Empty
+    /// on H.264 and H.265.
+    tiles: Vec<TileAv1>,
     /// Bytes the packer wrote BEFORE the tail padding.
     unpadded: u32,
     /// `mb_width * mb_height` (H.264) or 0 (HEVC) — the value the descriptors must carry.
@@ -483,6 +540,19 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
         // libavcodec's `1 + report_id++` produces for a decoder that saw only this stream.
         let dxva = pf_dxvadec::plan_to_dxva(&plan, map, out.len() as u32 + 1)
             .unwrap_or_else(|e| panic!("AU {i} must convert: {e}"));
+        // The conversion's half of the deferral contract
+        // ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]): a loop that converts
+        // AU after AU without applying it holds a surface per AU and runs the ledger
+        // dry. The vendored vector never puts a picture in both `RefFrameList` and
+        // `removed`, so this list is always empty HERE — applied anyway, because a
+        // harness that mirrors the caller only on the streams where it does not matter
+        // is a harness that would not notice the caller being wrong.
+        for &id in &dxva.release_after_decode {
+            assert!(
+                map.release(id),
+                "AU {i}: a deferred release named a picture holding no surface"
+            );
+        }
         let packed = pf_dxvadec::pack(au, &dxva.slice_ranges, &mut mapping)
             .unwrap_or_else(|e| panic!("AU {i} must pack: {e}"));
         let unpadded = pf_dxvadec::packed_size(au, &dxva.slice_ranges).expect("packed size") as u32;
@@ -491,6 +561,7 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
             qmatrix: Some(pf_dxvadec::as_bytes(&dxva.qmatrix).to_vec()),
             descriptors: pf_dxvadec::descriptors_h264(&dxva, &packed),
             records: packed.records,
+            tiles: Vec::new(),
             unpadded,
             mb_count: dxva.mb_count,
         });
@@ -527,11 +598,91 @@ fn our_hevc_submissions() -> Vec<OurSubmission> {
                 .map(|qm| pf_dxvadec::as_bytes(qm).to_vec()),
             descriptors: pf_dxvadec::descriptors_h265(&dxva, &packed),
             records: packed.records,
+            tiles: Vec::new(),
             unpadded,
             mb_count: 0,
         });
     }
     assert_eq!(out.len(), VENDORED_AUS);
+    out
+}
+
+/// Every AV1 FRAME the vendored vector decodes — 274, of which 250 are displayed.
+///
+/// The unit of comparison is the frame and not the temporal unit, because that is what
+/// libavcodec's hwaccel counts: `ff_dxva2_common_end_frame` runs once per submitted PICTURE, so
+/// a capture's AU index walks decoded frames. A `show_existing_frame` unit submits nothing and
+/// appears on neither side; this vector has none.
+const VENDORED_AV1_FRAMES: usize = 274;
+
+/// Plan, convert and pack the whole vendored AV1 vector, one entry per decoded FRAME.
+///
+/// ⚠ This is the only one of the three that has to speak the conversion's DEFERRED RELEASE
+/// contract ([`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`]). A loop that converts
+/// without it holds a surface on 268 of these 274 frames and runs the nine-slot ledger dry
+/// inside ten — and, worse for a harness, it would compare a submission built by a caller that
+/// is not the rung.
+fn our_av1_submissions() -> Vec<OurSubmission> {
+    let mut planner = Av1Planner::new();
+    let mut slots = SlotMap::new(NUM_REF_SLOTS);
+    let mut mapping = vec![0u8; MAPPING_BYTES];
+    let mut out = Vec::new();
+    for (i, unit) in split_ivf(TEST_25FPS_AV1).into_iter().enumerate() {
+        let plans = planner
+            .plan_au(unit)
+            .unwrap_or_else(|e| panic!("unit {i} of the vendored AV1 vector must plan: {e}"));
+        for plan in &plans {
+            if plan.dpb.stored.is_none() {
+                continue; // `show_existing_frame`: no submission at all
+            }
+            let dxva = pf_dxvadec::plan_to_dxva_av1(unit, plan, &mut slots)
+                .unwrap_or_else(|e| panic!("unit {i} must convert: {e}"));
+            let packed = pf_dxvadec::pack_av1(unit, &dxva.bitstream, &dxva.tiles, &mut mapping)
+                .unwrap_or_else(|e| panic!("unit {i} must pack: {e}"));
+            let unpadded = pf_dxvadec::packed_size_av1(&dxva.bitstream) as u32;
+            out.push(OurSubmission {
+                pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
+                // AV1 transmits no quantization matrix at all: its matrices are SELECTED by
+                // index out of tables the decoder already has, and `dxva2_av1_end_frame`
+                // passes `NULL, 0` for the pair. `None` here is a fact about the codec, not a
+                // condition on the stream the way HEVC's is.
+                qmatrix: None,
+                descriptors: pf_dxvadec::descriptors_av1(&packed),
+                // AV1's slice-control records are `DXVA_Tile_AV1`, a different struct with a
+                // different size; the shared `SliceRecord` checks do not apply to them, and
+                // the tile records get their own test rather than a coerced one.
+                records: Vec::new(),
+                tiles: packed.tiles.clone(),
+                unpadded,
+                mb_count: 0,
+            });
+            for &id in &dxva.release_after_decode {
+                assert!(
+                    slots.release(id),
+                    "unit {i}: a deferred release named a picture holding no surface"
+                );
+            }
+        }
+    }
+    assert_eq!(out.len(), VENDORED_AV1_FRAMES);
+    out
+}
+
+/// The IVF frame walk — the same one `video_d3d11_native`'s parity module and every AV1 test in
+/// this program use: a 32-byte file header, then a 12-byte header per packet carrying its size.
+fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut at = 32usize;
+    while at + 12 <= stream.len() {
+        let size = u32::from_le_bytes([stream[at], stream[at + 1], stream[at + 2], stream[at + 3]])
+            as usize;
+        at += 12;
+        if at + size > stream.len() {
+            break;
+        }
+        out.push(&stream[at..at + size]);
+        at += size;
+    }
     out
 }
 
@@ -543,9 +694,12 @@ fn our_hevc_submissions() -> Vec<OurSubmission> {
 /// order, built from the field IDENTIFIERS so a name and the offset it reports cannot drift
 /// apart — the whole point of the table is to turn a differing byte into a field name, and a
 /// table with a copy-pasted mismatch would name the wrong one.
+/// Nested paths (`tiles.cols`) are accepted as well as plain identifiers, and are named by
+/// the whole path — AV1's picture parameters are eight nested blocks, and a table that could
+/// only reach the outer members would report "segmentation differs" for a 140-byte struct.
 macro_rules! field_table {
-    ($ty:ty, $($field:ident),+ $(,)?) => {
-        &[$((stringify!($field), offset_of!($ty, $field))),+]
+    ($ty:ty, $($($field:ident).+),+ $(,)?) => {
+        &[$((stringify!($($field).+), offset_of!($ty, $($field).+))),+]
     };
 }
 
@@ -668,6 +822,87 @@ const HEVC_QMATRIX_FIELDS: &[(&str, usize)] = field_table!(
     ucScalingLists3,
     ucScalingListDCCoefSizeID2,
     ucScalingListDCCoefSizeID3,
+);
+
+/// Every field of `DXVA_PicParams_AV1`, same construction — but reaching INTO the eight nested
+/// blocks, because they are where AV1 keeps almost the whole frame header. `tiles` alone is 260
+/// bytes and `segmentation` 140; a table stopping at the outer members would turn every finding
+/// in them into one useless name.
+///
+/// Three members stay whole on purpose. `frame_refs` is seven 36-byte entries which — unlike
+/// the other two codecs' reference arrays — carry NO surface index and so compare byte for
+/// byte: `Index` is `ref_frame_idx[name]`, an AV1 SLOT both sides read out of the same frame
+/// header. `ref_frame_map_texture_index` is the surface array, which cannot be compared by
+/// value at all ([`av1_reference_store`]). And `film_grain` is 158 bytes neither vendored
+/// vector codes.
+const AV1_FIELDS: &[(&str, usize)] = field_table!(
+    PicParamsAv1,
+    width,
+    height,
+    max_width,
+    max_height,
+    curr_pic_texture_index,
+    superres_denom,
+    bitdepth,
+    seq_profile,
+    tiles.cols,
+    tiles.rows,
+    tiles.context_update_id,
+    tiles.widths,
+    tiles.heights,
+    coding,
+    format,
+    primary_ref_frame,
+    order_hint,
+    order_hint_bits,
+    frame_refs,
+    ref_frame_map_texture_index,
+    loop_filter.filter_level,
+    loop_filter.filter_level_u,
+    loop_filter.filter_level_v,
+    loop_filter.sharpness_level,
+    loop_filter.control_flags,
+    loop_filter.ref_deltas,
+    loop_filter.mode_deltas,
+    loop_filter.delta_lf_res,
+    loop_filter.frame_restoration_type,
+    loop_filter.log2_restoration_unit_size,
+    loop_filter.reserved16,
+    quantization.control_flags,
+    quantization.base_qindex,
+    quantization.y_dc_delta_q,
+    quantization.u_dc_delta_q,
+    quantization.v_dc_delta_q,
+    quantization.u_ac_delta_q,
+    quantization.v_ac_delta_q,
+    quantization.qm_y,
+    quantization.qm_u,
+    quantization.qm_v,
+    quantization.reserved16,
+    cdef.control_flags,
+    cdef.y_strengths,
+    cdef.uv_strengths,
+    interp_filter,
+    segmentation.control_flags,
+    segmentation.reserved24,
+    segmentation.feature_mask,
+    segmentation.feature_data,
+    film_grain,
+    reserved32,
+    status_report_feedback_number,
+);
+
+/// `DXVA_Tile_AV1` — AV1's slice-control record, and the one this crate had to derive rather
+/// than measure (`dxva.h` declares it; the SIZE is what the descriptor states).
+const AV1_TILE_FIELDS: &[(&str, usize)] = field_table!(
+    TileAv1,
+    data_offset,
+    data_size,
+    row,
+    column,
+    reserved16,
+    anchor_frame,
+    reserved8,
 );
 
 /// Turn a field table into `(name, byte range)`, the last field running to `total`.
@@ -1038,6 +1273,37 @@ fn hevc_ref_entries(pp: &[u8]) -> Vec<(u8, RefEntry)> {
         .collect()
 }
 
+/// One side's AV1 reference store, read out of the SUBMITTED BYTES: `(CurrPicTextureIndex,
+/// RefFrameMapTextureIndex[8], frame_refs[name].Index for the seven names)`.
+///
+/// AV1's reference numbering is two arrays that mean different things at once and the split is
+/// exactly what a comparison has to respect. `frame_refs[i].Index` is an AV1 reference SLOT —
+/// `ref_frame_idx[i]`, which both sides read out of the same frame header — so it is a VALUE
+/// that must match libavcodec's exactly, and it is compared as part of the `frame_refs` field.
+/// `RefFrameMapTextureIndex[slot]` and `CurrPicTextureIndex` are SURFACES, which come from each
+/// side's own pool and are only ever a bijection.
+///
+/// So the store is compared as a SHAPE: which slots are occupied, and whether the decode target
+/// collides with any of them.
+fn av1_reference_store(pp: &[u8]) -> (u8, [u8; 8], [u8; 7]) {
+    let curr = pp[offset_of!(PicParamsAv1, curr_pic_texture_index)];
+    let mut store = [UNUSED_INDEX; 8];
+    let base = offset_of!(PicParamsAv1, ref_frame_map_texture_index);
+    store.copy_from_slice(&pp[base..base + 8]);
+    let mut names = [UNUSED_INDEX; 7];
+    // The stride and the member offset come from the TYPE, never from the two numbers
+    // `dxva_av1.rs` measured (36 and 33). Those are pinned there as compile-time assertions
+    // against the Windows SDK's own header, and re-typing them here would be a second copy that
+    // can drift from the first — which for a reader of this array is the difference between a
+    // reference slot and a warp coefficient.
+    for (name, slot) in names.iter_mut().enumerate() {
+        *slot = pp[offset_of!(PicParamsAv1, frame_refs)
+            + name * size_of::<PicEntryAv1>()
+            + offset_of!(PicEntryAv1, index)];
+    }
+    (curr, store, names)
+}
+
 /// The surface mapping between the two sides, tracked per PICTURE.
 ///
 /// A global index-to-index bijection over a whole stream is the wrong model: both sides reuse a
@@ -1287,10 +1553,17 @@ fn preflight(capture: &Capture, ours: usize, codec: &str, reserved16: Option<usi
     }
     // A `PFCFG` line is optional, but a wrong one voids the slice-control comparison: it means
     // the driver read the other slice-control struct entirely.
-    let want = pf_dxvadec::short_slice_config(match codec {
-        "h264" => Codec::H264,
-        _ => Codec::H265,
-    });
+    //
+    // ⚠ AV1 is exempt, and not because the check is inconvenient: `ConfigBitstreamRaw`'s short
+    // format is a property of the two SHORT SLICE-CONTROL structs, and AV1's slice-control
+    // record is `DXVA_Tile_AV1`, which has no short/long pair for a config to select between.
+    // Comparing an AV1 capture's number against HEVC's 1 — which a `_ =>` arm would do — is a
+    // check of nothing that fails on anything.
+    let want = match codec {
+        "h264" => pf_dxvadec::short_slice_config(Codec::H264),
+        "hevc" => pf_dxvadec::short_slice_config(Codec::H265),
+        _ => return,
+    };
     for (au, &raw) in &capture.config_bitstream_raw {
         assert_eq!(
             raw, want,
@@ -1566,6 +1839,108 @@ fn hevc_rps_pictures(pp: &[u8], array: usize, entries: &[(u8, RefEntry)]) -> Vec
                 .map(|&(_, entry)| entry)
         })
         .collect()
+}
+
+/// The whole AV1 picture-parameter comparison.
+///
+/// Structurally simpler than the other two and the reason is worth stating: AV1 puts NO surface
+/// index in its reference entries. `frame_refs[i].Index` is `ref_frame_idx[i]`, an AV1 SLOT both
+/// sides read out of the same frame header, so the seven 36-byte entries — sizes, warp
+/// parameters, warp type and slot alike — compare byte for byte with no re-indexing, no set
+/// comparison and no allowance. Only two members carry surfaces, and they are handled as the
+/// SHAPE of the store rather than by value ([`av1_reference_store`]).
+///
+/// There is no POC base to derive either: AV1's `order_hint` is a coded field, not a decoder's
+/// running count, so libavcodec has nothing to seed it with.
+///
+/// ⚠ **`width`/`height` is a divergence waiting to be measured, and this comparison will
+/// report it rather than absorb it.** libavcodec sends `avctx->width`, which
+/// `update_context_with_frame_header` sets from `frame_width_minus_1 + 1` — FrameWidth, the
+/// PRE-superres coded width — and the same for `frame_refs[i].width` off the reference's
+/// `AVFrame`; this crate sends `UpscaledWidth`. With superres off the two are equal by
+/// definition (7.20), which is every frame of the vendored vector and every frame a punktfunk
+/// host emits, so a capture made from this vector cannot tell them apart. Deliberately given no
+/// allowance: if a superres capture ever reaches this harness, the difference must be a finding
+/// somebody reads, not a line somebody already excused. See `pic_av1.rs`'s note at `pp.width`.
+fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings {
+    let ranges = field_ranges(AV1_FIELDS, size_of::<PicParamsAv1>());
+    // The two surface arrays, and nothing else: every other byte of this struct is a fact about
+    // the bitstream that both sides derive from the same frame header.
+    let structural = ["curr_pic_texture_index", "ref_frame_map_texture_index"];
+    let mut findings = Findings::default();
+    for (au, sub) in ours.iter().enumerate() {
+        let Some(theirs) = capture.pic_params.get(&au) else {
+            findings.note(
+                "<no capture>",
+                au,
+                "the capture holds no PFPP line for this frame",
+            );
+            continue;
+        };
+        if theirs.len() != sub.pic_params.len() {
+            findings.note(
+                "<struct size>",
+                au,
+                format!(
+                    "the capture's picture parameters are {} bytes and ours are {}",
+                    theirs.len(),
+                    sub.pic_params.len()
+                ),
+            );
+            continue;
+        }
+        compare_scalars(
+            au,
+            &sub.pic_params,
+            theirs,
+            &ranges,
+            &structural,
+            no_allowance,
+            &mut findings,
+        );
+
+        // The store, as a shape. Which SLOTS hold a picture is a fact about the bitstream and
+        // must agree; which SURFACE each holds is each side's own pool and never can.
+        let (our_curr, our_store, _) = av1_reference_store(&sub.pic_params);
+        let (their_curr, their_store, _) = av1_reference_store(theirs);
+        for slot in 0..8 {
+            let ours_occupied = our_store[slot] != UNUSED_INDEX;
+            let theirs_occupied = their_store[slot] != UNUSED_INDEX;
+            if ours_occupied != theirs_occupied {
+                findings.note(
+                    format!("ref_frame_map_texture_index[{slot}][occupied]"),
+                    au,
+                    format!("ours {ours_occupied}, libav {theirs_occupied}"),
+                );
+            }
+        }
+        // The decode target must hold no store entry's surface. libavcodec cannot produce a
+        // collision — it fills the store from `h->ref[i]`, which the reference update has not
+        // run on yet, and takes `CurrPicTextureIndex` from `h->cur_frame.f` — so a collision on
+        // our side is a defect however the surfaces are numbered. This is the check that names
+        // the 2026-08-07 defect.
+        //
+        // ⚠ Note what is deliberately NOT checked: that two slots hold different surfaces. One
+        // picture in several reference slots is ordinary AV1 and this very vector does it —
+        // the key frame sits in BWDREF and ALTREF2 for the stream's whole length — so a
+        // "duplicate surface" check would fire on 273 of 274 frames of a correct conversion.
+        for (label, curr, store) in [
+            ("ours", our_curr, our_store),
+            ("libav", their_curr, their_store),
+        ] {
+            if store.contains(&curr) {
+                findings.note(
+                    "curr_pic_texture_index[aliases the store]",
+                    au,
+                    format!(
+                        "{label}: surface {curr} is both the decode target and a reference \
+                         store entry — the frame decodes into a picture it predicts from"
+                    ),
+                );
+            }
+        }
+    }
+    findings
 }
 
 /// The whole HEVC picture-parameter comparison.
@@ -1970,6 +2345,13 @@ fn every_hand_declared_dxva_struct_is_tiled_exactly_by_its_fields() {
             HEVC_SLICE_FIELDS,
             size_of::<SliceHevcShort>(),
         ),
+        // AV1's two. `PicParamsAv1` is the one struct in this crate whose offsets were
+        // MEASURED rather than mirrored — `layout-probe-av1.c` compiled with MSVC against the
+        // Windows SDK's own `dxva.h` — and `dxva_av1.rs` pins every one at compile time. What
+        // this adds is the other half: that the TABLE above reaches all 912 bytes, so a
+        // capture comparison can name every one of them.
+        ("PicParamsAv1", AV1_FIELDS, size_of::<PicParamsAv1>()),
+        ("TileAv1", AV1_TILE_FIELDS, size_of::<TileAv1>()),
     ] {
         assert_eq!(fields[0].1, 0, "{what}: the first field must start at 0");
         let ranges = field_ranges(fields, total);
@@ -2004,6 +2386,196 @@ fn every_h264_au_submits_four_buffers_in_libavcodecs_order() {
             "AU {au}"
         );
     }
+}
+
+/// **No AV1 submission names its decode surface anywhere in the reference store**, and every
+/// reference NAME resolves through a slot that holds one.
+///
+/// This is the defect the Windows parity harness caught on 2026-08-07 and the one nothing on
+/// the CPU could see, stated over the SUBMITTED BYTES — which is where a libavcodec capture
+/// would see it too, and the reason it belongs in this file as well as in `pic_av1`'s own
+/// tests. `plan_to_dxva_av1` released the picture this frame's own `refresh_frame_flags`
+/// displaces before assigning the decode target a slot, and `SlotMap::assign` hands back the
+/// slot just vacated — so `CurrPicTextureIndex` and one `RefFrameMapTextureIndex` entry were
+/// the same surface on 268 of these 274 frames: decode into the picture you predict from.
+/// Intel Arc followed the aliased surface and got 245 of 250 delivered frames wrong; NVIDIA
+/// tolerated it for 63 frames and then lost one 16x24 luma block at the `order_hint` wrap.
+///
+/// libavcodec cannot produce this shape and that is the whole argument for calling it a defect
+/// rather than a convention: `ff_dxva2_av1_fill_picture_parameters` fills
+/// `RefFrameMapTextureIndex` from `h->ref[i]`, the pre-refresh store, and takes
+/// `CurrPicTextureIndex` from `h->cur_frame.f`, a frame the reference-frame update has not run
+/// on yet. The two cannot be one surface.
+///
+/// The counts are asserted, not printed. At zero references this test would pass against a
+/// conversion that named nothing at all.
+#[test]
+fn no_av1_submission_names_its_decode_surface_in_the_reference_store() {
+    let subs = our_av1_submissions();
+    let (mut with_store, mut named_refs) = (0usize, 0usize);
+    for (frame, sub) in subs.iter().enumerate() {
+        let (curr, store, names) = av1_reference_store(&sub.pic_params);
+        assert!(
+            store.iter().all(|surface| *surface != curr),
+            "frame {frame}: surface {curr} is both CurrPicTextureIndex and a \
+             RefFrameMapTextureIndex entry"
+        );
+        if store.iter().any(|s| *s != UNUSED_INDEX) {
+            with_store += 1;
+        }
+        for (name, slot) in names.iter().enumerate() {
+            if *slot == UNUSED_INDEX {
+                continue;
+            }
+            named_refs += 1;
+            assert!(
+                usize::from(*slot) < store.len(),
+                "frame {frame}, reference name {name}: slot {slot} is outside the eight-entry \
+                 store — `Index` is an AV1 reference SLOT, not a surface"
+            );
+            assert_ne!(
+                store[usize::from(*slot)],
+                UNUSED_INDEX,
+                "frame {frame}, reference name {name}: slot {slot} holds no surface, so the \
+                 driver would follow `Index` into an empty entry"
+            );
+        }
+    }
+    assert_eq!(
+        with_store, 273,
+        "every frame but the opening key frame carries a populated reference store"
+    );
+    assert!(
+        named_refs > 0,
+        "no frame named a reference, so every check above was skipped"
+    );
+}
+
+/// AV1 submits THREE buffers and never a quantization matrix, on every frame of the vector.
+///
+/// The codec asymmetry the H.264 and HEVC tests above are about, taken to its third case.
+/// H.264 submits the matrix unconditionally, HEVC only under `scaling_list_enabled_flag`, and
+/// AV1 has no matrix BUFFER at all: its quantiser matrices are SELECTED by index
+/// (`qm_y`/`qm_u`/`qm_v`) out of tables the decoder already holds, and `dxva2_av1_end_frame`
+/// passes `NULL, 0` for the qm pair so the generic layer submits nothing. A fourth descriptor
+/// here would be a buffer the driver has no `DXVA_Qmatrix_AV1` to read it as.
+#[test]
+fn every_av1_frame_submits_three_buffers_and_never_a_quantization_matrix() {
+    for (frame, sub) in our_av1_submissions().iter().enumerate() {
+        assert_eq!(
+            sub.descriptors
+                .iter()
+                .map(|d| d.buffer_type)
+                .collect::<Vec<_>>(),
+            vec![
+                BUFFER_PICTURE_PARAMETERS,
+                BUFFER_BITSTREAM,
+                BUFFER_SLICE_CONTROL,
+            ],
+            "frame {frame}"
+        );
+        assert!(sub.qmatrix.is_none(), "frame {frame}");
+    }
+}
+
+/// No AV1 descriptor carries a macroblock count. AV1 has no macroblocks and `dxva2_av1.c`
+/// never touches the field — the same statement `no_hevc_descriptor_ever_carries_a_macroblock_count`
+/// makes, and the same defect class review 13 found on the H.264 side in the other direction.
+#[test]
+fn no_av1_descriptor_ever_carries_a_macroblock_count() {
+    for (frame, sub) in our_av1_submissions().iter().enumerate() {
+        assert_eq!(sub.mb_count, 0, "frame {frame}");
+        for desc in &sub.descriptors {
+            assert_eq!(
+                desc.num_mbs_in_buffer,
+                0,
+                "frame {frame}, {}",
+                buffer_name(desc.buffer_type)
+            );
+        }
+    }
+}
+
+/// AV1's slice-control buffer is `16 * tile count`, its bitstream descriptor is the packer's
+/// PADDED size, and the tile records tile the unpadded window exactly — in order, without gaps
+/// and without overlaps.
+///
+/// The last part is what distinguishes AV1 from the other two codecs here and is the reason
+/// this cannot reuse `the_bitstream_descriptor_is_the_packers_padded_size_and_the_slice_records_tile_it_exactly`:
+/// a `DXVA_Tile_AV1` addresses a TILE PAYLOAD, which is the bytes after that tile's
+/// `tile_size_minus_1` field — so consecutive records are separated by those size fields and do
+/// NOT abut, unlike H.264/HEVC slice records which tile their buffer with no gaps. What must
+/// hold is weaker and still exact: strictly increasing, non-overlapping, inside the unpadded
+/// window, and never starting at a tile-group OBU's first byte (which would hand the driver an
+/// OBU header as entropy-coded tile data).
+///
+/// ⚠ The padding is charged to NO record. H.264 and HEVC add the tail padding to their last
+/// slice record's `SliceBytesInBuffer`; `pack_av1` does not, because a tile's size is the
+/// tile's, and the descriptor is the only place AV1's padding is accounted at all.
+#[test]
+fn the_av1_bitstream_descriptor_is_padded_and_the_tile_records_tile_it_without_overlapping() {
+    let mut frames_with_padding = 0usize;
+    for (frame, sub) in our_av1_submissions().iter().enumerate() {
+        let bitstream = sub
+            .descriptors
+            .iter()
+            .find(|d| d.buffer_type == BUFFER_BITSTREAM)
+            .unwrap_or_else(|| panic!("frame {frame} submits no bitstream buffer"));
+        assert_eq!(
+            bitstream.data_size % 128,
+            0,
+            "frame {frame}: the bitstream descriptor states the PADDED size"
+        );
+        // ⚠ `1..=128`, not `0..128`. `pack_av1` writes libavcodec's expression verbatim —
+        // `BITSTREAM_ALIGN - (cursor % BITSTREAM_ALIGN)` — so data that is ALREADY on the
+        // granule gets a whole 128-byte block rather than none (`pack_av1`'s
+        // `data_already_on_the_granule_still_gets_a_full_padding_block`). This vector never
+        // lands on the granule, which is exactly why the bound has to come from the rule and
+        // not from the measurement.
+        let padding = bitstream.data_size - sub.unpadded;
+        assert!(
+            (1..=128).contains(&padding),
+            "frame {frame}: {padding} bytes of padding"
+        );
+        frames_with_padding += 1;
+
+        let slice_control = sub
+            .descriptors
+            .iter()
+            .find(|d| d.buffer_type == BUFFER_SLICE_CONTROL)
+            .unwrap_or_else(|| panic!("frame {frame} submits no slice-control buffer"));
+        assert_eq!(
+            slice_control.data_size as usize,
+            size_of::<TileAv1>() * sub.tiles.len(),
+            "frame {frame}: sixteen bytes per TILE"
+        );
+        assert!(!sub.tiles.is_empty(), "frame {frame}: a frame has tiles");
+
+        let mut previous_end = 0u32;
+        for (i, tile) in sub.tiles.iter().enumerate() {
+            // `#[repr(packed)]` — copy the fields out before using them.
+            let (offset, size) = (tile.data_offset, tile.data_size);
+            assert!(size > 0, "frame {frame}, tile {i}: an empty tile payload");
+            assert!(
+                offset >= previous_end,
+                "frame {frame}, tile {i}: starts at {offset}, inside the previous tile which \
+                 ends at {previous_end}"
+            );
+            assert!(
+                offset + size <= sub.unpadded,
+                "frame {frame}, tile {i}: runs past the bytes the packer wrote"
+            );
+            previous_end = offset + size;
+            assert_eq!(
+                tile.anchor_frame, UNUSED_INDEX,
+                "frame {frame}, tile {i}: large-scale-tile anchors are libavcodec's 0xFF"
+            );
+        }
+    }
+    assert_eq!(
+        frames_with_padding, VENDORED_AV1_FRAMES,
+        "every frame is padded — the rule is unconditional"
+    );
 }
 
 #[test]
@@ -2281,6 +2853,7 @@ fn the_picture_parameter_buffer_is_the_whole_hand_declared_struct_for_both_codec
     for (codec, subs, size) in [
         ("h264", our_h264_submissions(), size_of::<PicParamsH264>()),
         ("hevc", our_hevc_submissions(), size_of::<PicParamsHevc>()),
+        ("av1", our_av1_submissions(), size_of::<PicParamsAv1>()),
     ] {
         for (au, sub) in subs.iter().enumerate() {
             assert_eq!(sub.pic_params.len(), size, "{codec} AU {au}");
@@ -2347,6 +2920,7 @@ fn hevc_case(enabled: bool, sps_coded: Option<u8>, pps_coded: Option<u8>) -> Our
             .map(|qm| pf_dxvadec::as_bytes(qm).to_vec()),
         descriptors: pf_dxvadec::descriptors_h265(&dxva, &packed),
         records: packed.records,
+        tiles: Vec::new(),
         unpadded,
         mb_count: 0,
     }
@@ -2508,6 +3082,35 @@ fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_oursel
     // The HEVC matrices are `absent` on this vector, and the parser must carry that fact rather
     // than losing it — the whole of review 13's defect is the difference between the two.
     assert!(capture.qmatrix.values().all(Option::is_none));
+
+    // AV1, on all 274 FRAMES. Nothing here has ever been run against libavcodec's own bytes
+    // (module docs say why), so this self-comparison is the only thing standing between
+    // `compare_av1_picparams` and a first capture: it proves the 912-byte field table reaches
+    // every byte, that `av1_reference_store` reads `CurrPicTextureIndex` and the eight-entry
+    // store from the offsets it thinks it does — a wrong one would report a false alias on a
+    // correct submission — and that the comparison invents nothing on identical input.
+    let ours = our_av1_submissions();
+    let capture = parse_capture(&dump("av1", &ours), "av1");
+    preflight(&capture, ours.len(), "av1", None);
+    assert_eq!(capture.pic_params.len(), VENDORED_AV1_FRAMES);
+    for findings in [
+        compare_av1_picparams(&ours, &capture),
+        compare_descriptors(&ours, &capture),
+    ] {
+        assert!(
+            findings.is_empty(),
+            "comparing our own AV1 bytes against themselves must find nothing, got {:?}",
+            findings.fields()
+        );
+        assert!(
+            findings.documented_fields().is_empty(),
+            "identical bytes documented a divergence: {:?}",
+            findings.documented_fields()
+        );
+    }
+    // AV1 reports `absent` on every frame — it has no matrix BUFFER at all, unlike HEVC where
+    // the same spelling is a per-sequence decision.
+    assert!(capture.qmatrix.values().all(Option::is_none));
 }
 
 /// A submission holding only what [`compare_descriptors`] reads, for the bitstream-size
@@ -2527,6 +3130,7 @@ fn descriptor_only_submission(unpadded: u32, padded: u32, slices: usize) -> OurS
     OurSubmission {
         pic_params: vec![0u8; size_of::<PicParamsH264>()],
         qmatrix: None,
+        tiles: Vec::new(),
         descriptors: vec![
             BufferDescriptor {
                 buffer_type: BUFFER_BITSTREAM,
@@ -2698,6 +3302,7 @@ fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_noth
                 qmatrix: sub.qmatrix.clone(),
                 descriptors: sub.descriptors.clone(),
                 records: sub.records.clone(),
+                tiles: sub.tiles.clone(),
                 unpadded: sub.unpadded,
                 mb_count: sub.mb_count,
             }
@@ -3081,11 +3686,27 @@ fn renumber_h264_surfaces(pp: &[u8], f: impl Fn(u8) -> u8) -> Vec<u8> {
 /// Emit this crate's whole submission — both codecs — in the capture's own format, so the two
 /// files can be diffed by any tool without a capture at all.
 #[test]
+#[ignore = "needs a libavcodec capture: PF_LIBAV_CAPTURE_AV1=<file> (see the module docs)"]
+fn our_av1_picture_parameters_match_libavcodecs() {
+    let capture = capture_from_env("PF_LIBAV_CAPTURE_AV1", "av1")
+        .expect("PF_LIBAV_CAPTURE_AV1=<file> names a capture (see the module docs)");
+    let ours = our_av1_submissions();
+    // No `Reserved16Bits` preflight: both libavcodec workarounds are H.264-only
+    // (`dxva2_h264.c`), and `DXVA_PicParams_AV1` has no such field to test.
+    preflight(&capture, ours.len(), "av1", None);
+    compare_av1_picparams(&ours, &capture).verdict("AV1 picture parameters", ours.len());
+}
+
+#[test]
 #[ignore = "writes a dump: PF_DXVA_DUMP=<path>"]
 fn dump_our_submission_in_the_captures_own_format() {
     let path = std::env::var("PF_DXVA_DUMP").expect("PF_DXVA_DUMP=<path> names the output file");
     let mut text = dump("h264", &our_h264_submissions());
     text.push_str(&dump("hevc", &our_hevc_submissions()));
+    // AV1 too, and it is the codec that needs this most: no libavcodec AV1 capture has
+    // ever been taken (module docs say why), so for that codec this dump is the only
+    // way to read what the driver is being handed at all.
+    text.push_str(&dump("av1", &our_av1_submissions()));
     std::fs::write(&path, text).expect("write the dump");
     println!("wrote {path}");
 }

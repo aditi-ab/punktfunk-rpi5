@@ -32,6 +32,12 @@ use crate::{Av1PlanWarning, H265PlanWarning, PlanWarning};
 /// full (the plan holds the pre-rebase 8.2.1 values; later AUs reference the
 /// rebased ones).
 ///
+/// `LevelDerivedDpb` does not either: the picture is intact and fully planned. It
+/// reports that the SPS never declared its DPB depth, so the plan had to size from
+/// A.3.1's level ceiling and the result will not fit a mainstream slot pool — a
+/// property of the STREAM's signalling, which the decoder answers by failing to open
+/// a session, not by showing a damaged frame.
+///
 /// Written as an EXHAUSTIVE match with no wildcard, deliberately. A `matches!` (or
 /// a `_ => false`) makes "damage" the opt-in and silence the default, so a
 /// `PlanWarning` added later — by definition one nobody here has classified —
@@ -43,7 +49,7 @@ pub fn is_integrity_warning(w: &PlanWarning) -> bool {
         PlanWarning::FrameNumGap { .. }
         | PlanWarning::MissingReference { .. }
         | PlanWarning::TruncatedAu { .. } => true,
-        PlanWarning::Mmco5Rebase => false,
+        PlanWarning::Mmco5Rebase | PlanWarning::LevelDerivedDpb { .. } => false,
     }
 }
 

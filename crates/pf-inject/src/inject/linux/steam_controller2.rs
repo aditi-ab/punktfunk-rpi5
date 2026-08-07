@@ -346,6 +346,12 @@ impl PadProto for TritonProto {
         // and the synth fallback has no surface for them.
     }
 
+    // `neutralize_gyro` / `clear_rich` stay the no-op defaults: this backend never sees a
+    // `RichInput::Motion` to go stale, and its motion lives inside an opaque passthrough report
+    // whose bytes we would have to reach into blind. A raw feed that stops is the client's own
+    // device report stopping, so the same last-report re-emission applies here — worth revisiting
+    // if SC2 gyro ever shows the phantom-rotation signature the DualSense family had.
+
     fn write_state(&self, pad: &mut TritonTransport, st: &TritonState) {
         pad.write_state(st);
     }
