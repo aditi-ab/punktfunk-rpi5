@@ -189,6 +189,36 @@ pub enum GamepadPref {
 }
 
 impl GamepadPref {
+    /// Whether this backend has a motion plane at all — i.e. whether a `RichInput::Motion` sample
+    /// sent to a host running it can reach the game, or is decoded and dropped.
+    ///
+    /// The X-Box classes have no gyro in their HID contract, so a client whose local pad HAS one
+    /// is streaming ~250 Hz of datagrams into a void: the host parses each and discards it, and
+    /// the player sees a controller whose gyro silently does nothing. Read this off
+    /// [`Welcome::gamepad`](crate::quic::Welcome::gamepad) — the backend the host actually
+    /// resolved, which is not necessarily the one the client asked for.
+    ///
+    /// `Auto` answers `true` on purpose. It means "unknown": either a host too old to echo the
+    /// field, or one that hasn't resolved yet. Suppressing motion on unknown would silently break
+    /// gyro against every old host that did resolve to a DualSense, which is a worse failure than
+    /// sending datagrams nobody reads.
+    ///
+    /// Exhaustive by design — a new backend has to state its answer here rather than inherit one.
+    pub const fn has_motion(self) -> bool {
+        match self {
+            GamepadPref::Auto => true, // unknown; assume it can, see above
+            GamepadPref::Xbox360 | GamepadPref::XboxOne => false,
+            GamepadPref::DualSense
+            | GamepadPref::DualShock4
+            | GamepadPref::DualSenseEdge
+            | GamepadPref::SwitchPro
+            | GamepadPref::SteamController
+            | GamepadPref::SteamDeck
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck => true,
+        }
+    }
+
     /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
     /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
     /// `9 = SteamController2`, `10 = SteamController2Puck`.
@@ -752,6 +782,36 @@ mod tests {
         assert_eq!(CompositorPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto (forward-compatible).
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
+    }
+
+    /// Which backends a client may stream motion to. Pinned as a table because the answer decides
+    /// whether a player's gyro works at all, and getting it wrong in either direction is silent:
+    /// a false negative kills working motion, a false positive keeps ~250 Hz of datagrams flowing
+    /// into a host that drops every one.
+    #[test]
+    fn only_the_xbox_classes_lack_a_motion_plane() {
+        for p in [GamepadPref::Xbox360, GamepadPref::XboxOne] {
+            assert!(
+                !p.has_motion(),
+                "{} should have no motion plane",
+                p.as_str()
+            );
+        }
+        for p in [
+            GamepadPref::DualSense,
+            GamepadPref::DualShock4,
+            GamepadPref::DualSenseEdge,
+            GamepadPref::SwitchPro,
+            GamepadPref::SteamController,
+            GamepadPref::SteamDeck,
+            GamepadPref::SteamController2,
+            GamepadPref::SteamController2Puck,
+        ] {
+            assert!(p.has_motion(), "{} should carry motion", p.as_str());
+        }
+        // Unknown must not suppress: an old host that omitted the echo may well have resolved a
+        // DualSense, and silently killing its gyro is worse than sending into a void.
+        assert!(GamepadPref::Auto.has_motion());
     }
 
     #[test]

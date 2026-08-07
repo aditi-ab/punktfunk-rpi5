@@ -864,6 +864,9 @@ struct Slot {
     /// Gates the zero-gyro park in [`Worker::flush_slot`] — a pad with no gyro must not start
     /// looking like one just because it closed.
     sent_motion: bool,
+    /// The "your gyro can't reach this session" notice fired for this slot (log once, not per
+    /// sample — this path runs at the pad's sensor rate).
+    motion_unreachable_logged: bool,
     /// Hold-Select→guide state ([`SelectGesture`]) — only fed while the worker's
     /// `guide_gesture` policy is on.
     gesture: SelectGesture,
@@ -891,6 +894,7 @@ impl Slot {
             held_clicks: [false; 2],
             last_accel: [0; 3],
             sent_motion: false,
+            motion_unreachable_logged: false,
             gesture: SelectGesture::default(),
             audio_caps: 0,
             rumble_suppressed_logged: false,
@@ -2008,6 +2012,24 @@ impl Worker {
                         }
                     }
                     SensorType::Gyroscope => {
+                        // The host echoes the backend it actually RESOLVED, which is not
+                        // necessarily the one we asked for: an X-Box class pad has no motion plane,
+                        // so every sample below would be decoded and dropped. Say so once — the
+                        // player's gyro is silently doing nothing and the fix is the controller-type
+                        // setting — and stop paying to send ~250 Hz of them.
+                        if !c.resolved_gamepad.has_motion() {
+                            if !slot.motion_unreachable_logged {
+                                slot.motion_unreachable_logged = true;
+                                tracing::warn!(
+                                    pad = slot.index,
+                                    resolved = ?c.resolved_gamepad,
+                                    "this controller has a gyro but the host session resolved a \
+                                     backend without one — motion will not reach the game; pick a \
+                                     DualSense-class controller type to get it"
+                                );
+                            }
+                            return;
+                        }
                         let mut gyro = [0i16; 3];
                         for (i, v) in data.iter().enumerate() {
                             gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
