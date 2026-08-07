@@ -1,5 +1,7 @@
 package io.unom.punktfunk.kit
 
+import kotlin.math.abs
+
 /**
  * Sony DualSense / DualSense Edge / DualShock 4 **USB** protocol constants: the input-report
  * parser and the output-report builders the capture link ([DsCapture]) needs. Unlike the SC2's
@@ -17,11 +19,6 @@ package io.unom.punktfunk.kit
  * reaches this code — an uncaptured pad stays on the ordinary InputDevice path.
  */
 object DsDevice {
-    /** The pads' native acceleration resolution — `hid-playstation`'s `DS_ACC_RES_PER_G`. */
-    private const val DS_RAW_ACCEL_LSB_PER_G = 8192L
-    /** The wire's, from `punktfunk_core::input::gamepad::MOTION_ACCEL_LSB_PER_G`. */
-    private const val WIRE_ACCEL_LSB_PER_G = 10000L
-
     const val VID_SONY = 0x054C
     const val PID_DUALSENSE = 0x0CE6
     const val PID_DUALSENSE_EDGE = 0x0DF2
@@ -33,14 +30,159 @@ object DsDevice {
     /**
      * One captured model: its `GamepadPref` wire byte (the virtual pad the host builds — matching
      * the physical one), its output-report size (the descriptor-declared size the firmware
-     * expects: DS5 48 = id + 47, Edge 64 = id + 63, DS4 32 = id + 31), and its touchpad extent
+     * expects: DS5 48 = id + 47, Edge 64 = id + 63, DS4 32 = id + 31), its touchpad extent
      * (`dualsense_proto::DS_TOUCH_W/H`, `dualshock4_proto::DS4_TOUCH_*`) for normalizing touches
-     * onto the wire's 0..65535 space.
+     * onto the wire's 0..65535 space, and the IMU-calibration feature report it answers
+     * ([MotionCal]): DS5/Edge `0x05` (id + 40 B), DS4 over USB `0x02` (id + 36 B).
      */
-    enum class Model(val pref: Int, val outputSize: Int, val touchW: Int, val touchH: Int) {
-        DUALSENSE(Gamepad.PREF_DUALSENSE, 48, 1920, 1080),
-        DUALSENSE_EDGE(Gamepad.PREF_DUALSENSEEDGE, 64, 1920, 1080),
-        DUALSHOCK4(Gamepad.PREF_DUALSHOCK4, 32, 1920, 942),
+    enum class Model(
+        val pref: Int,
+        val outputSize: Int,
+        val touchW: Int,
+        val touchH: Int,
+        val calReportId: Int,
+        val calReportLen: Int,
+    ) {
+        DUALSENSE(Gamepad.PREF_DUALSENSE, 48, 1920, 1080, 0x05, 41),
+        DUALSENSE_EDGE(Gamepad.PREF_DUALSENSEEDGE, 64, 1920, 1080, 0x05, 41),
+        DUALSHOCK4(Gamepad.PREF_DUALSHOCK4, 32, 1920, 942, 0x02, 37),
+    }
+
+    /**
+     * One pad's own IMU calibration: the factory scale factors that turn its raw motion counts
+     * into the wire's fixed units (`punktfunk_core::input::gamepad` — 20 LSB per °/s, 10000 LSB
+     * per g), read out of the calibration feature report the pad serves on EP0.
+     *
+     * **Why the pad's blob and not a constant.** Measured on glass 2026-08-07: a DualSense flat
+     * and face up arrived as 0.811 g where 1.000 was owed, because this path forwarded the raw
+     * i16s verbatim. The nominal ×10000/8192 rescale that first closed that gap ([NOMINAL]) still
+     * leaves that unit's factory bias — about 1 % — on acceleration, and provably cannot fix gyro
+     * at all: the same still-average showed this pad's gyro calibration is nowhere near identity,
+     * and a near-identity one would mean 1024 LSB per °/s, i.e. ±32 °/s full scale, which no
+     * controller has. The scale is per unit; only the pad knows it.
+     *
+     * The arithmetic is `hid-playstation`'s, and the host's contract test
+     * (`crates/pf-inject/tests/motion_contract.rs`, `SonyImuCalibration`) is the same math read
+     * from the other end — it applies it to the blobs our *virtual* pads declare and asserts they
+     * land on the wire constants. Per axis: gyro `raw × speed_2x × 20 / (|plus − bias| +
+     * |minus − bias|)`, accel `(raw − (plus − range/2)) × 20000 / range`, where `range = plus −
+     * minus` spans 2 g.
+     */
+    class MotionCal private constructor(
+        /** Per axis: `speed_2x × 20`, over `|plus − bias| + |minus − bias|`. */
+        private val gyroNumer: LongArray,
+        private val gyroDenom: LongArray,
+        /** Per axis: the raw count the pad reads at 0 g, and the raw span of 2 g. */
+        private val accelBias: LongArray,
+        private val accelRange: LongArray,
+    ) {
+        /** Raw gyro count on [axis] (0 = pitch, 1 = yaw, 2 = roll) → the wire's 20 LSB per °/s. */
+        fun gyroToWire(axis: Int, raw: Int): Int =
+            clampWire(raw.toLong() * gyroNumer[axis] / gyroDenom[axis])
+
+        /** Raw acceleration count on [axis] → the wire's 10000 LSB per g, zero point removed. */
+        fun accelToWire(axis: Int, raw: Int): Int =
+            clampWire((raw - accelBias[axis]) * ACCEL_NUMER / accelRange[axis])
+
+        /**
+         * The derived resolutions, for the capture's one-line claim log — the number that says
+         * whether a pad's blob was actually read (a real DualSense declares ≈16 LSB/°·s and ≈8192
+         * LSB/g; the [NOMINAL] fallback reads back as exactly 20 and 8192).
+         */
+        override fun toString(): String = buildString {
+            append("gyro ")
+            for (i in 0 until 3) {
+                if (i > 0) append('/')
+                append(gyroDenom[i] * WIRE_GYRO_LSB_PER_DEG_S / gyroNumer[i])
+            }
+            append(" LSB/°·s, accel ")
+            for (i in 0 until 3) {
+                if (i > 0) append('/')
+                append(accelRange[i] / 2)
+            }
+            append(" LSB/g at ")
+            append(accelBias.joinToString("/"))
+        }
+
+        /**
+         * Both conversions are a >1 multiplier on every pad measured so far, so a real ±4 g slam
+         * or a fast flick near full scale would otherwise wrap the i16 and read as an impossible
+         * motion in the opposite direction.
+         */
+        private fun clampWire(v: Long): Int = v.coerceIn(-32768L, 32767L).toInt()
+
+        companion object {
+            /** The pads' nominal acceleration resolution — `hid-playstation`'s `DS_ACC_RES_PER_G`. */
+            private const val RAW_ACCEL_LSB_PER_G = 8192L
+            /** `punktfunk_core::input::gamepad::MOTION_GYRO_LSB_PER_DEG_S`. */
+            private const val WIRE_GYRO_LSB_PER_DEG_S = 20L
+            /** `MOTION_ACCEL_LSB_PER_G`, doubled — the declared accel range spans 2 g, not 1. */
+            private const val ACCEL_NUMER = 2 * 10000L
+            /** Bytes the layout below reads; the reports themselves are longer (41 / 37). */
+            private const val MIN_LEN = 35
+
+            /**
+             * What an unreadable pad gets: gyro straight through and accel on the nominal 8192
+             * LSB/g. Wrong by that unit's factory bias, and for gyro wrong by however far its
+             * scale sits from the wire's 20 — but a pad whose calibration cannot be read is far
+             * better off slightly mis-scaled than silent, so this never zeroes motion.
+             */
+            val NOMINAL = MotionCal(
+                LongArray(3) { 1 },
+                LongArray(3) { 1 },
+                LongArray(3),
+                LongArray(3) { 2 * RAW_ACCEL_LSB_PER_G },
+            )
+
+            /**
+             * Parse a calibration feature report ([Model.calReportId]) — all little-endian i16:
+             * `[0]` report id, `[1..7)` gyro bias (pitch, yaw, roll), `[7..19)` gyro plus/minus
+             * INTERLEAVED (pitch+, pitch−, yaw+, yaw−, roll+, roll−), `[19..23)` the two speed
+             * words, `[23..35)` accel plus/minus (x+, x−, y+, y−, z+, z−).
+             *
+             * ⚠ Interleaved is the **USB** order. A Bluetooth DualShock 4 groups the three plusses
+             * before the three minuses and consumers switch layout on the transport — this path is
+             * USB-only by construction (see the file header), so do not "generalise" it.
+             *
+             * Falls back to [NOMINAL] for a failed read (null), a truncated or foreign reply, and
+             * per axis for a degenerate declaration — a clone or broken pad that declares zeroes
+             * would otherwise divide by zero (`hid-playstation` guards the same case, for the same
+             * reason).
+             */
+            fun parse(blob: ByteArray?, reportId: Int): MotionCal {
+                if (blob == null || blob.size < MIN_LEN) return NOMINAL
+                if ((blob[0].toInt() and 0xFF) != reportId) return NOMINAL
+                val w = { o: Int ->
+                    ((blob[o + 1].toInt() shl 8) or (blob[o].toInt() and 0xFF)).toShort().toLong()
+                }
+                val speed2x = w(19) + w(21)
+                val gyroNumer = LongArray(3)
+                val gyroDenom = LongArray(3)
+                val accelBias = LongArray(3)
+                val accelRange = LongArray(3)
+                for (i in 0 until 3) {
+                    val bias = w(1 + 2 * i)
+                    val denom = abs(w(7 + 4 * i) - bias) + abs(w(9 + 4 * i) - bias)
+                    if (speed2x > 0 && denom > 0) {
+                        gyroNumer[i] = speed2x * WIRE_GYRO_LSB_PER_DEG_S
+                        gyroDenom[i] = denom
+                    } else {
+                        gyroNumer[i] = 1 // passthrough, as before any calibration existed
+                        gyroDenom[i] = 1
+                    }
+                    val plus = w(23 + 4 * i)
+                    val range = plus - w(25 + 4 * i)
+                    if (range > 0) {
+                        accelBias[i] = plus - range / 2
+                        accelRange[i] = range
+                    } else {
+                        accelBias[i] = 0 // nominal, as NOMINAL above
+                        accelRange[i] = 2 * RAW_ACCEL_LSB_PER_G
+                    }
+                }
+                return MotionCal(gyroNumer, gyroDenom, accelBias, accelRange)
+            }
+        }
     }
 
     /** The captured [Model] for a USB PID, or null for anything we don't capture. */
@@ -55,8 +197,9 @@ object DsDevice {
      * The client-consumed fields of one input report. `buttons` is already the WIRE bitmask
      * (`Gamepad.BTN_*`) — the parse maps device bits straight to the wire, the exact inverse of
      * the host's `DsState::from_gamepad` (BTN_A ↔ cross, BTN_B ↔ circle, BTN_X ↔ square,
-     * BTN_Y ↔ triangle; positional, not glyph-order). Gyro/accel stay in raw device units — the
-     * wire's `Motion` is a unit passthrough into the virtual pad's report. Touch coordinates stay
+     * BTN_Y ↔ triangle; positional, not glyph-order). Gyro/accel arrive in WIRE units — the wire's
+     * `Motion` is a unit passthrough into the virtual pad's report, so the pad's raw counts are
+     * rescaled during the parse by the [MotionCal] handed to [parseState]. Touch coordinates stay
      * device-raw here; [DsCapture] normalizes against the model's extent when forwarding.
      */
     class State {
@@ -64,8 +207,8 @@ object DsDevice {
         var lsX = 0; var lsY = 0 // wire i16, +y = up (device is +y down — inverted in the parse)
         var rsX = 0; var rsY = 0
         var lt = 0; var rt = 0 // 0..255
-        val gyro = IntArray(3) // raw i16 units (pitch/yaw/roll)
-        val accel = IntArray(3)
+        val gyro = IntArray(3) // wire i16: 20 LSB per °/s (pitch/yaw/roll)
+        val accel = IntArray(3) // wire i16: 10000 LSB per g
         val touchActive = BooleanArray(2)
         val touchX = IntArray(2) // raw device coords (0..touchW-1 / 0..touchH-1)
         val touchY = IntArray(2)
@@ -113,15 +256,25 @@ object DsDevice {
      * short read (the pad also emits `0x09`-family getMAC responses etc. on EP0 — those never hit
      * the interrupt endpoint, but be defensive). Motion/touch fields update only when the report
      * is long enough to carry them (it always is on glass — 64-byte interrupt transfers).
+     *
+     * [cal] is this pad's own motion calibration, read once when the capture claims it; the
+     * default is the nominal fallback, which is all a caller without a live pad (the tests) can
+     * have.
      */
-    fun parseState(model: Model, report: ByteArray, len: Int, out: State): Boolean =
+    fun parseState(
+        model: Model,
+        report: ByteArray,
+        len: Int,
+        out: State,
+        cal: MotionCal = MotionCal.NOMINAL,
+    ): Boolean =
         if (model == Model.DUALSHOCK4) {
-            parseDs4(report, len, out)
+            parseDs4(report, len, out, cal)
         } else {
-            parseDs5(model, report, len, out)
+            parseDs5(model, report, len, out, cal)
         }
 
-    private fun parseDs5(model: Model, r: ByteArray, len: Int, out: State): Boolean {
+    private fun parseDs5(model: Model, r: ByteArray, len: Int, out: State, cal: MotionCal): Boolean {
         if (len < 11 || (r[0].toInt() and 0xFF) != DS5_INPUT_ID) return false
         out.lsX = stickX(u8(r, 1))
         out.lsY = stickY(u8(r, 2))
@@ -157,8 +310,8 @@ object DsDevice {
         }
         out.buttons = w
         if (len >= 28) {
-            for (i in 0 until 3) out.gyro[i] = i16(r, 16 + 2 * i)
-            for (i in 0 until 3) out.accel[i] = accelToWire(i16(r, 22 + 2 * i))
+            for (i in 0 until 3) out.gyro[i] = cal.gyroToWire(i, i16(r, 16 + 2 * i))
+            for (i in 0 until 3) out.accel[i] = cal.accelToWire(i, i16(r, 22 + 2 * i))
         }
         if (len >= 41) {
             unpackTouch(r, 33, out, 0)
@@ -167,7 +320,7 @@ object DsDevice {
         return true
     }
 
-    private fun parseDs4(r: ByteArray, len: Int, out: State): Boolean {
+    private fun parseDs4(r: ByteArray, len: Int, out: State, cal: MotionCal): Boolean {
         if (len < 10 || (r[0].toInt() and 0xFF) != DS5_INPUT_ID) return false // DS4 shares id 0x01
         out.lsX = stickX(u8(r, 1))
         out.lsY = stickY(u8(r, 2))
@@ -193,8 +346,8 @@ object DsDevice {
         if (b7 and DS4_TOUCHPAD != 0) w = w or Gamepad.BTN_TOUCHPAD
         out.buttons = w
         if (len >= 25) {
-            for (i in 0 until 3) out.gyro[i] = i16(r, 13 + 2 * i)
-            for (i in 0 until 3) out.accel[i] = accelToWire(i16(r, 19 + 2 * i))
+            for (i in 0 until 3) out.gyro[i] = cal.gyroToWire(i, i16(r, 13 + 2 * i))
+            for (i in 0 until 3) out.accel[i] = cal.accelToWire(i, i16(r, 19 + 2 * i))
         }
         if (len >= 43) {
             unpackTouch(r, 35, out, 0)
@@ -231,28 +384,6 @@ object DsDevice {
 
     private fun i16(r: ByteArray, o: Int): Int =
         ((r[o + 1].toInt() shl 8) or (r[o].toInt() and 0xFF)).toShort().toInt()
-
-    /**
-     * Raw DualSense/DualShock 4 acceleration → the wire's units.
-     *
-     * The pad reports acceleration in its own device units; the wire is fixed at
-     * `MOTION_ACCEL_LSB_PER_G` = 10000 LSB per g (`punktfunk_core::input::gamepad`). Forwarding the
-     * raw value verbatim — which this path did until 2026-08-07 — hands the host a number ~18 %
-     * short, because the pad's native resolution is the 8192 LSB/g that `hid-playstation` calls
-     * `DS_ACC_RES_PER_G`. Measured on glass: a DualSense flat and face up arrived as 0.811 g where
-     * 1.000 was owed, against 8192/10000 = 0.819 predicted.
-     *
-     * The residual ~1 % is this unit's factory bias, which only its calibration feature report can
-     * remove — that read is still owed (it also fixes gyro, whose factory calibration is emphatically
-     * NOT near-identity and so cannot be corrected by a nominal constant like this one).
-     *
-     * Clamped because the rescale is a >1 multiplier: a real ±4 g slam near full scale would
-     * otherwise wrap the i16 and read as an impossible acceleration in the opposite direction.
-     */
-    private fun accelToWire(raw: Int): Int =
-        ((raw.toLong() * WIRE_ACCEL_LSB_PER_G) / DS_RAW_ACCEL_LSB_PER_G)
-            .coerceIn(-32768L, 32767L)
-            .toInt()
 
     // Device stick byte (0..255, centre 0x80, +y down) → wire i16 (+y up) — the exact inverse of
     // the host's `to_u8` mapping (`lx = to_u8(x)`, `ly = 255 - to_u8(y)`).

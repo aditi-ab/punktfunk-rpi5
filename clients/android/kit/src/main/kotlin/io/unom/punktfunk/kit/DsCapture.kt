@@ -22,10 +22,10 @@ import android.view.InputDevice
  *
  * Input: parse ([DsDevice.parseState]) → typed mirror on an [GamepadRouter.ExternalPad] (buttons
  * diffed, axes on-change — the exit chord participates like any pad) + the rich plane (touch
- * normalized to the wire's 0..65535 screen space on-change; motion forwarded per report in raw
- * device units, the wire's contract). The wire slot is claimed when the capture engages, with the
- * first parsed report as the fallback for a claim that found no free index, and freed on
- * unplug/[stop], so indices never leak.
+ * normalized to the wire's 0..65535 screen space on-change; motion forwarded per report, rescaled
+ * into the wire's units by this pad's own calibration, read once at claim). The wire slot is
+ * claimed when the capture engages, with the first parsed report as the fallback for a claim that
+ * found no free index, and freed on unplug/[stop], so indices never leak.
  *
  * Feedback: implements [GamepadFeedback.PadFeedbackSink] — rumble / trigger / lightbar / player
  * LED events addressed to this pad's wire index become USB output reports on the physical pad
@@ -54,6 +54,10 @@ class DsCapture(
 
     @Volatile private var model: DsDevice.Model? = null
     @Volatile private var pad: GamepadRouter.ExternalPad? = null
+
+    /** This pad's factory motion scale, read once per capture (see [readMotionCal]). Written on
+     *  the claiming thread before [model], which is what the link thread's parse reads it under. */
+    @Volatile private var motionCal = DsDevice.MotionCal.NOMINAL
 
     // Typed-mirror diff state (wire units) + rich-plane on-change mirrors. Link thread only.
     private val state = DsDevice.State()
@@ -124,6 +128,9 @@ class DsCapture(
         if (model != null) return false
         val m = DsDevice.modelFor(dev.productId) ?: return false
         if (!usb.start(dev)) return false
+        // Before `model`, which is what gates the link thread's parse: a report must never be
+        // scaled by the previous pad's calibration, or by the fallback once the real one is known.
+        motionCal = readMotionCal(m)
         model = m
         for (id in InputDevice.getDeviceIds()) {
             val d = InputDevice.getDevice(id) ?: continue
@@ -136,6 +143,34 @@ class DsCapture(
         ensureSlot(m)
         onActiveChanged?.invoke(true)
         return true
+    }
+
+    /**
+     * Read this pad's IMU calibration, ONCE, while claiming it — the feature report that says how
+     * many raw counts this individual unit puts on a °/s and on a g ([DsDevice.MotionCal]).
+     *
+     * At claim time and nowhere else: the read is a blocking EP0 control transfer (bounded by the
+     * link's write timeout, answered in about a millisecond by a pad that is there), and the
+     * calibration is fixed for the life of the connection, so doing it per input report would buy
+     * nothing and cost the capture its latency. A pad that refuses keeps the nominal scaling
+     * rather than losing motion altogether.
+     */
+    private fun readMotionCal(m: DsDevice.Model): DsDevice.MotionCal {
+        val blob = usb.getReport(HidUsbLink.REPORT_TYPE_FEATURE, m.calReportId, m.calReportLen)
+        val cal = DsDevice.MotionCal.parse(blob, m.calReportId)
+        // Worth a line either way: this is the number the owed on-glass check reads back — a pad
+        // whose blob was read declares its own resolution, the fallback declares the wire's.
+        if (cal === DsDevice.MotionCal.NOMINAL) {
+            Log.w(
+                TAG,
+                "motion calibration 0x%02x unreadable (%d/%d B) — nominal scaling (%s)".format(
+                    m.calReportId, blob?.size ?: 0, m.calReportLen, cal,
+                ),
+            )
+        } else {
+            Log.i(TAG, "motion calibration 0x%02x: %s".format(m.calReportId, cal))
+        }
+        return cal
     }
 
     /** Stop the link and free the wire slot (host tears the virtual pad down). Idempotent. */
@@ -168,7 +203,7 @@ class DsCapture(
 
     private fun onReport(report: ByteArray, len: Int) {
         val m = model ?: return
-        if (!DsDevice.parseState(m, report, len, state)) return
+        if (!DsDevice.parseState(m, report, len, state, motionCal)) return
         // Normally claimed already, at capture time; this is the retry for a capture that engaged
         // while every wire index was taken.
         val p = pad ?: ensureSlot(m) ?: return // all 16 taken — drop until one frees
@@ -310,8 +345,8 @@ class DsCapture(
 
     /**
      * The rich plane: touch contacts normalized to the wire's 0..65535 screen space, forwarded
-     * on change per slot; motion forwarded every report (raw device units — the wire is a unit
-     * passthrough into the host's virtual pad, and sensor noise makes per-report dedup pointless).
+     * on change per slot; motion forwarded every report (already in wire units — the parse applies
+     * this pad's calibration, and sensor noise makes per-report dedup pointless).
      */
     private fun mirrorRich(p: GamepadRouter.ExternalPad, m: DsDevice.Model) {
         for (f in 0 until 2) {

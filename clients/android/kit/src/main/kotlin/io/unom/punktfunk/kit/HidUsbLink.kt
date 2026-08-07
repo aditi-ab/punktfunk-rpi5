@@ -443,6 +443,42 @@ class HidUsbLink(
     }
 
     /**
+     * Read one report back OUT of the device — HID `GET_REPORT`, the EP0 mirror of [sendReport].
+     * [type] is [REPORT_TYPE_FEATURE] (or output), [id] the report number, [len] the report's full
+     * declared size INCLUDING its leading id byte, which a numbered report echoes back in byte 0
+     * (hidapi framing). Returns what arrived — truncated if the device answered short — or null
+     * when the device refuses the request or the link is down.
+     *
+     * ⚠ **Once, at claim time; never per input report.** EP0 is independent of the interrupt
+     * endpoints (see [sendReport]), so this is safe alongside the reader thread — but it BLOCKS the
+     * calling thread for up to [WRITE_TIMEOUT_MS], and a blocking control transfer in the report
+     * path would wreck capture latency. The one caller reads a Sony pad's fixed motion calibration
+     * when the capture engages ([DsCapture]).
+     */
+    fun getReport(type: Int, id: Int, len: Int): ByteArray? {
+        if (len <= 0) return null
+        val conn = connection ?: return null
+        val ifId = (activeClaim ?: claims.firstOrNull())?.iface?.id ?: return null
+        val buf = ByteArray(len)
+        val n = runCatching {
+            conn.controlTransfer(
+                0xA1, // device→host, class, interface
+                0x01, // GET_REPORT
+                (type shl 8) or id,
+                ifId,
+                buf,
+                buf.size,
+                WRITE_TIMEOUT_MS,
+            )
+        }.getOrDefault(-1)
+        return when {
+            n >= len -> buf
+            n > 0 -> buf.copyOf(n)
+            else -> null
+        }
+    }
+
+    /**
      * Stop the read loop and release the interfaces. Idempotent; does not fire [onClosed].
      *
      * Safe to call from the `onClosed` handler itself — that is how an unplug now gets cleaned up,
@@ -469,12 +505,13 @@ class HidUsbLink(
         device = null
     }
 
-    private companion object {
-        const val READ_TIMEOUT_MS = 100L
-        const val WRITE_TIMEOUT_MS = 250
+    companion object {
+        private const val READ_TIMEOUT_MS = 100L
+        private const val WRITE_TIMEOUT_MS = 250
         /** Hard `requestWait` ERRORS (not timeouts) persisting this long = the fd is dead. */
-        const val ERROR_UNPLUG_MS = 2000L
-        const val REPORT_TYPE_OUTPUT = 0x02
+        private const val ERROR_UNPLUG_MS = 2000L
+        private const val REPORT_TYPE_OUTPUT = 0x02
+        /** HID feature-report type — public for [getReport] callers ([writeRaw] takes a kind). */
         const val REPORT_TYPE_FEATURE = 0x03
     }
 }
