@@ -607,6 +607,20 @@ impl NativeD3d11Decoder {
         // with the frames after the failure, which is the pump's question and not this
         // function's, and the failure already ends in a keyframe request.
         let shown = self.decode_and_present_av1(au, &sub, damaged);
+        if shown.is_err() {
+            // The surface's `held` entry, on the path that now CONTINUES rather than
+            // returning early. The slot map says this surface holds THIS picture while
+            // the surface still carries whatever the previous occupant decoded, so a
+            // later `show_existing_frame` naming it would blit the old picture's pixels
+            // with the old picture's geometry and colour. The `damaged` path has
+            // cleared it for that reason since M7; the failure path never reached this
+            // far before.
+            if let Some(session) = self.session.as_mut() {
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = None;
+                }
+            }
+        }
 
         // The surfaces this frame's own refresh displaced while its submission still
         // NAMED them (fn docs). Released here for the same reason the block below
