@@ -23,9 +23,10 @@ import android.view.InputDevice
  * Input: parse ([DsDevice.parseState]) → typed mirror on an [GamepadRouter.ExternalPad] (buttons
  * diffed, axes on-change — the exit chord participates like any pad) + the rich plane (touch
  * normalized to the wire's 0..65535 screen space on-change; motion forwarded per report, rescaled
- * into the wire's units by this pad's own calibration, read once at claim). The wire slot is
- * claimed when the capture engages, with the first parsed report as the fallback for a claim that
- * found no free index, and freed on unplug/[stop], so indices never leak.
+ * into the wire's units by this pad's own calibration — read once per claim, off the claiming
+ * thread, so parsing starts a millisecond in rather than the UI waiting on a control transfer).
+ * The wire slot is claimed when the capture engages, with the first parsed report as the fallback
+ * for a claim that found no free index, and freed on unplug/[stop], so indices never leak.
  *
  * Feedback: implements [GamepadFeedback.PadFeedbackSink] — rumble / trigger / lightbar / player
  * LED events addressed to this pad's wire index become USB output reports on the physical pad
@@ -55,9 +56,12 @@ class DsCapture(
     @Volatile private var model: DsDevice.Model? = null
     @Volatile private var pad: GamepadRouter.ExternalPad? = null
 
-    /** This pad's factory motion scale, read once per capture (see [readMotionCal]). Written on
-     *  the claiming thread before [model], which is what the link thread's parse reads it under. */
-    @Volatile private var motionCal = DsDevice.MotionCal.NOMINAL
+    /** This pad's factory motion scale, read once per capture on [calReader] and handed to the
+     *  link thread. Null until that read lands — see [MotionCalHandoff] and [onReport]. */
+    private val motionCal = MotionCalHandoff()
+
+    /** The thread doing the claim-time calibration read, kept for the teardown wait. */
+    @Volatile private var calReader: Thread? = null
 
     // Typed-mirror diff state (wire units) + rich-plane on-change mirrors. Link thread only.
     private val state = DsDevice.State()
@@ -128,9 +132,10 @@ class DsCapture(
         if (model != null) return false
         val m = DsDevice.modelFor(dev.productId) ?: return false
         if (!usb.start(dev)) return false
-        // Before `model`, which is what gates the link thread's parse: a report must never be
-        // scaled by the previous pad's calibration, or by the fallback once the real one is known.
-        motionCal = readMotionCal(m)
+        // Before `model`, which is what lets the link thread into the parse at all: opening the
+        // claim forgets the last pad's calibration, so no report can be scaled by it while this
+        // pad's own read (below, off this thread) is in flight.
+        val claim = motionCal.begin()
         model = m
         for (id in InputDevice.getDeviceIds()) {
             val d = InputDevice.getDevice(id) ?: continue
@@ -142,18 +147,68 @@ class DsCapture(
         Log.i(TAG, "Sony pad captured over USB: PID=0x%04x model=%s".format(dev.productId, m))
         ensureSlot(m)
         onActiveChanged?.invoke(true)
+        readMotionCalAsync(m, claim)
         return true
     }
 
     /**
-     * Read this pad's IMU calibration, ONCE, while claiming it — the feature report that says how
-     * many raw counts this individual unit puts on a °/s and on a g ([DsDevice.MotionCal]).
+     * Start this claim's calibration read, on its own thread.
      *
-     * At claim time and nowhere else: the read is a blocking EP0 control transfer (bounded by the
-     * link's write timeout, answered in about a millisecond by a pad that is there), and the
-     * calibration is fixed for the life of the connection, so doing it per input report would buy
-     * nothing and cost the capture its latency. A pad that refuses keeps the nominal scaling
-     * rather than losing motion altogether.
+     * Off the caller's thread because [startUsb] runs on the main one — stream setup, and the
+     * USB-permission broadcast — and the read is a blocking EP0 control transfer: a pad that is
+     * there answers in about a millisecond, but one that is stalling takes the link's whole write
+     * timeout, and the interface must wait for neither. The pad goes live a millisecond later
+     * instead, because the link thread parses nothing until the calibration lands ([onReport]);
+     * a pathological stall then delays motion rather than freezing the UI.
+     *
+     * One thread per claim, daemon and named, matching how [HidUsbLink] runs its reader; it is
+     * awaited by [awaitCalRead] before the connection it reads from can be closed.
+     */
+    private fun readMotionCalAsync(m: DsDevice.Model, claim: Int) {
+        val t = Thread({
+            // Never leave the gate shut: a read that fails or throws still has to publish
+            // something, or this capture would forward no motion at all for its whole life.
+            val cal = runCatching { readMotionCal(m) }.getOrElse {
+                Log.w(TAG, "motion calibration read failed — nominal scaling", it)
+                DsDevice.MotionCal.NOMINAL
+            }
+            // Discarded when the claim is already over (unplug, stop, or a re-claim beat us here):
+            // scaling the NEXT pad by this one's factory numbers would be worse than not reading.
+            if (!motionCal.publish(claim, cal)) {
+                Log.i(TAG, "motion calibration arrived after the claim ended — discarded")
+            }
+        }, "pf-ds-cal")
+        calReader = t
+        t.isDaemon = true
+        t.start()
+    }
+
+    /**
+     * Wait for an in-flight calibration read to let go of the USB connection, before a teardown
+     * closes it.
+     *
+     * Not politeness: the read is a control transfer on the very connection [HidUsbLink.stop] is
+     * about to close, and closing a descriptor with a transfer in flight pulls it out from under
+     * the kernel — the same rule the pad-audio borrow follows. Bounded, and in every case but a
+     * pad that has stopped answering the thread is long gone, so this returns immediately. It can
+     * never deadlock: the reading thread waits on nothing this one holds ([MotionCalHandoff] has
+     * its own monitor, and the read itself takes no lock).
+     */
+    private fun awaitCalRead() {
+        val t = calReader ?: return
+        calReader = null
+        if (!t.isAlive) return
+        runCatching { t.join(CAL_JOIN_MS) }
+        if (t.isAlive) Log.w(TAG, "calibration read still in flight at teardown")
+    }
+
+    /**
+     * Read this pad's IMU calibration — the feature report that says how many raw counts this
+     * individual unit puts on a °/s and on a g ([DsDevice.MotionCal]).
+     *
+     * Once, at claim time, and nowhere else: the calibration is fixed for the life of the
+     * connection, so doing it per input report would buy nothing and cost the capture its latency.
+     * A pad that refuses keeps the nominal scaling rather than losing motion altogether.
      */
     private fun readMotionCal(m: DsDevice.Model): DsDevice.MotionCal {
         val blob = usb.getReport(HidUsbLink.REPORT_TYPE_FEATURE, m.calReportId, m.calReportLen)
@@ -192,6 +247,10 @@ class DsCapture(
             resetRichFeedback(m)
         }
         disarmBackstop()
+        // End the claim before waiting on it: a calibration that lands after this publishes
+        // nothing, and then the wait makes sure nothing is still reading the connection below.
+        motionCal.end()
+        awaitCalRead()
         usb.stop()
         val wasActive = model != null
         model = null
@@ -203,7 +262,11 @@ class DsCapture(
 
     private fun onReport(report: ByteArray, len: Int) {
         val m = model ?: return
-        if (!DsDevice.parseState(m, report, len, state, motionCal)) return
+        // This claim's calibration read is still in flight. Dropping the report beats parsing it
+        // with a fallback that is about to be replaced: the reports carry absolute state, so the
+        // next one (1–4 ms away) says everything this one would have.
+        val cal = motionCal.current ?: return
+        if (!DsDevice.parseState(m, report, len, state, cal)) return
         // Normally claimed already, at capture time; this is the retry for a capture that engaged
         // while every wire index was taken.
         val p = pad ?: ensureSlot(m) ?: return // all 16 taken — drop until one frees
@@ -314,6 +377,10 @@ class DsCapture(
         val wasActive = model != null
         model = null
         releaseSlot()
+        // As in stop(): end the claim so a late calibration publishes nothing, then wait for the
+        // read to let go of the connection the line below closes.
+        motionCal.end()
+        awaitCalRead()
         // Release the transport too: the link only *signals* the drop, so without this an unplug
         // left its connection open, its interfaces claimed and its detach receiver registered.
         usb.stop()
@@ -518,5 +585,9 @@ class DsCapture(
         /** How soon to retry a rumble stop whose write was rejected. Short: the motors are running
          *  and the host has already moved on, so nothing else is coming to silence them. */
         const val STOP_RETRY_MS = 100L
+
+        /** Teardown's budget for an in-flight calibration read. Comfortably past the link's own
+         *  EP0 timeout, so it only ever elapses for a pad that has stopped answering entirely. */
+        const val CAL_JOIN_MS = 500L
     }
 }
