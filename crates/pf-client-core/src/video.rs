@@ -51,8 +51,7 @@
 //! | native Vulkan Video | | AV1 | **yes** — 250/250 bit-identical to libavcodec on an RTX 5070 Ti (M7); ONE vendor, no soak |
 //! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5), re-confirmed 250/250 (+ 50/50 Main 10) on an RTX 3500 Ada and an Intel Arc on 2026-08-07 |
 //! | native D3D11VA | | AV1 | **yes** — 250/250 delivered frames bit-identical to libavcodec on an RTX 3500 Ada AND an Intel Arc (2026-08-07). It got there from 186/250 and 245/250 DIVERGING frames on those same two GPUs: `plan_to_dxva_av1` released the picture this frame's own refresh displaces before assigning the decode target its slot, and `SlotMap::assign` hands back the slot just vacated — so 268 of the vector's 274 frames named one surface as both `CurrPicTextureIndex` and a `RefFrameMapTextureIndex` entry. Intel followed the aliased surface (structurally wrong from display frame 4); NVIDIA tolerated it until the `order_hint` wrap at 64 made one 16x24 luma block depend on it. ONE defect, two driver tolerances — the two unlike signatures were not two bugs. TWO vendors, still NO soak on the goldens: the 5-minute 4K60 soak this row used to cite measured throughput, and "streams cleanly" was true throughout the failure |
-//! | native VAAPI | [`crate::video_vaapi_native`] | AV1 | **not proven** — but it has now DECODED: 250/250 frames of the vendored AV1 vector on `.25` (Radeon 780M, RDNA3, Mesa 26.0.3) on 2026-08-07, NV12 on a tiled AMD modifier, and `probe_this_machines_libva` reports `AV1 Profile 0: VLD decode`. Never frame-hash parity-checked: the rung exports a tiled dmabuf with no CPU-readable image, so parity needs a readback path that does not exist yet |
-//! | native VAAPI | | H.264, H.265 (Main / Main 10) | **not proven** — but all three have now DECODED, on `.25` (Radeon 780M, RDNA3, radeonsi, Mesa 26.0.3, VA-API 1.23) on 2026-08-07: every access unit of the vendored H.264 (250), H.265 (250) and HEVC Main 10 (50) vectors was accepted with no decode error, **250/250/50 frames delivered**, NV12 for the 8-bit legs and **P010** for Main 10, all on the same tiled AMD modifier, and `probe_this_machines_libva` reports VLD decode for H.264 High, HEVC Main and HEVC Main 10. The counts were 225/204/45 when these legs were first written, and that was the RUNG rather than the driver: `finish` showed `outputs.last()` and retired the rest unshown, and nothing flushed the DPB at end of stream. Both are fixed — `video_vaapi_native` grew a bounded deliverable queue and a flush, and the keyframe flag now travels with the PICTURE rather than with the access unit that displays it (the pump's post-loss re-anchor signal, mislabelled on every one of these legs' first frames). Never frame-hash parity-checked, for the same reason as AV1: the rung exports a tiled dmabuf with no CPU-readable image |
+//! | native VAAPI | [`crate::video_vaapi_native`] | H.264, H.265 (Main / Main 10), AV1 | **frame-hash parity-proven, ON ONE VENDOR** — 7 legs bit-identical to libavcodec on `.25` (Radeon 780M, RDNA3, radeonsi, Mesa 26.0.3, VA-API 1.23) on 2026-08-08: vendored H.264 250/250, our host's low-delay H.264 120/120, vendored H.265 250/250, host low-delay H.265 120/120, HEVC Main 10 50/50 (P010), vendored AV1 250/250 of 274 decoded, host low-delay 4K two-tile AV1 60/60. The readback that made it possible is `vaDeriveImage` with a `vaCreateImage`+`vaGetImage` fallback, and it is `#[cfg(test)]`-only by construction — the production [`video_vaapi_native::Libva`] gains no entry point and a CPU test scans this crate's own source to keep it that way. **Not `verified`, and the reason is no longer parity**: one vendor and no soak. Flipping it moves `auto` on Linux AMD/Intel from Vulkan Video to VAAPI ([`native_rung_admitted`]) — an evidence-backed change, but a routing change, so it is made on purpose or not at all |
 //! | software | `video_software` | H.264, AV1 | **not proven** — openh264 has never run on glass; rav1d HAS now decoded 1080p and 4K60 AV1 there (2026-08-07, .21) and recovers in-session from a mid-stream reference loss, but with no parity check and no soak. Its 4K "abort" was never about 4K: rav1d 1.1.0 kills the process on ANY decode error while it holds a single frame context, so `video_software` opens it with two — see [`crate::video_software`] |
 //!
 //! The software rung's evidence is recorded for the same reason but does not gate
@@ -1157,22 +1156,27 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
         // them and must not be printed. The arm stays split only because AV1's note carries
         // its own frame count; both halves say the same thing about parity.
         //
-        // Not `verified`, and for a reason the AV1 row above makes vivid: a rung can decode
-        // 250 frames and still produce wrong pixels. Parity is what tells them apart, and
-        // this rung exports a TILED dmabuf with no CPU-readable image, so it needs a readback
-        // path nothing has written yet.
-        (NativeRung::Vaapi, CODEC_AV1) => (
-            false,
-            "decoded 250/250 frames of the vendored AV1 vector on RDNA3 (Mesa 26.0.3, \
-             2026-08-07) - its first frames on any hardware - but has never been frame-hash \
-             parity-checked: the rung exports a tiled dmabuf with no CPU-readable image (M7)",
-        ),
+        // 2026-08-08: parity finally exists here. A `#[cfg(test)]` readback
+        // (`vaDeriveImage`, falling back to `vaCreateImage` + `vaGetImage`) hashes the
+        // decoded surface, and all SEVEN legs came back bit-identical to libavcodec — the
+        // conformance vectors and our own host's low-delay streams, H.264 through AV1.
+        //
+        // So the old reason for `false` is gone, and the arm is no longer split: every leg
+        // has the same evidence. What is left is narrower and worth stating exactly, because
+        // the D3D11VA AV1 row above is a rung that decoded 250 frames and produced wrong
+        // pixels for every one of them — parity is what separated them, and this rung now
+        // has it. It stays `false` on ONE VENDOR and NO SOAK, and because flipping it is a
+        // routing change, not a bookkeeping one: `native_rung_admitted` would then let `auto`
+        // pick VAAPI ahead of Vulkan Video on every Linux AMD and Intel client, the Steam
+        // Deck included. That is defensible on this evidence and should be done deliberately,
+        // not as a side effect of recording a parity result.
         (NativeRung::Vaapi, _) => (
             false,
-            "decoded every access unit of the vendored H.264, H.265 and HEVC Main 10 \
-             vectors on RDNA3 (Mesa 26.0.3, 2026-08-07) - their first frames on any \
-             hardware - but has never been frame-hash parity-checked: the rung exports \
-             a tiled dmabuf with no CPU-readable image (M6/M7)",
+            "7 legs bit-identical to libavcodec on RDNA3 (Mesa 26.0.3, 2026-08-08) - H.264, \
+             H.265, HEVC Main 10 and AV1, on both the conformance vectors and our own host's \
+             low-delay streams - but has NEVER run on a second vendor and has never been \
+             soaked, and `verified` here would move `auto` off Vulkan Video on every Linux \
+             AMD/Intel client (M6/M7)",
         ),
         // The 4K AV1 abort recorded here on 2026-08-07 is FIXED, and it was never about 4K.
         // rav1d 1.1.0 aborts the process on ANY decode error while it holds a single frame
