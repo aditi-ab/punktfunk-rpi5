@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiEnumDeviceInfo, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DEV, SPDRP_HARDWAREID,
+    SetupDiEnumDeviceInfo, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DEV,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegQueryValueExW, RegSetValueExW, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
@@ -70,7 +70,36 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             probe_sss_primary(secs)
         }
         Some("cleanup") => cleanup(),
-        _ => bail!("usage: punktfunk-host audio-probe <ssm|sink|sss-primary|cleanup> [--keep]"),
+        // The provider's synchronous pass: mint (or re-find) "Punktfunk Speakers/Microphone"
+        // and publish them for THIS process — `plan` then shows the tier-0 pick.
+        Some("mint") => super::minted::devtest_mint(),
+        // One real wiring pass (no default parking) + the verdict, readiness included — the
+        // field-triage "what would the host do right now" command.
+        Some("plan") => {
+            let plan = super::audio_control::wire_now_full(false);
+            let w = &plan.wiring;
+            let show = |ep: &Option<super::wiring_plan::Endpoint>| match ep {
+                Some((name, id)) => format!("{name:?} ({id})"),
+                None => "-".into(),
+            };
+            println!("audio-plan: mic_render    = {}", show(&w.mic_render));
+            println!("audio-plan: mic_capture   = {}", show(&w.mic_capture));
+            println!("audio-plan: loopback      = {}", show(&w.loopback_render));
+            println!("audio-plan: last_resort   = {}", w.loopback_last_resort);
+            println!("audio-plan: mic_withheld  = {}", w.mic_withheld);
+            println!(
+                "audio-plan: narrowing     = {}",
+                w.loopback_narrowing.as_deref().unwrap_or("-")
+            );
+            println!(
+                "audio-plan: readiness     = {:?}",
+                super::wiring_plan::readiness(w)
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "usage: punktfunk-host audio-probe <ssm|sink|sss-primary|mint|plan|cleanup> [--keep]"
+        ),
     }
 }
 
@@ -243,57 +272,9 @@ fn probe_sss_primary(secs: u32) -> Result<()> {
     Ok(())
 }
 
-// --- driver discovery ----------------------------------------------------------------------
+// --- driver discovery — shared with the minted provider -------------------------------------
 
-/// Find the (exact hardware id, INF path) for a Steam streaming driver: prefer any installed
-/// devnode whose hardware-id list contains `needle` (its `oemNN.inf` is the driver Windows
-/// already trusts), else fall back to Steam's driver directory.
-fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)> {
-    let set = pe::media_class_devs()?;
-    for i in 0.. {
-        let mut did = pe::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break;
-        }
-        let Some(hwid) = pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)
-            .into_iter()
-            .find(|h| h.to_lowercase().contains(needle))
-        else {
-            continue;
-        };
-        if let Some(inf) = pe::devnode_inf_path(&set, &did) {
-            let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-            let full = format!(r"{windir}\INF\{inf}");
-            if std::path::Path::new(&full).exists() {
-                return Ok((hwid, full));
-            }
-        }
-        // Devnode exists but its INF is gone — keep its exact hwid, try Steam's directory.
-        if let Some(w) = super::wasapi_mic::steam_driver_inf_path(inf_name) {
-            let s = String::from_utf16_lossy(&w)
-                .trim_end_matches('\0')
-                .to_string();
-            if std::path::Path::new(&s).exists() {
-                return Ok((hwid, s));
-            }
-        }
-    }
-    // No installed devnode at all: canonical hwid + Steam's directory.
-    if let Some(w) = super::wasapi_mic::steam_driver_inf_path(inf_name) {
-        let s = String::from_utf16_lossy(&w)
-            .trim_end_matches('\0')
-            .to_string();
-        if std::path::Path::new(&s).exists() {
-            let hwid = format!("ROOT\\{}", inf_name.trim_end_matches(".inf"));
-            return Ok((hwid, s));
-        }
-    }
-    bail!(
-        "no installed devnode matches {needle:?} and Steam's driver directory has no \
-         {inf_name} — install Steam (it never needs to run)"
-    )
-}
+use super::minted::discover_driver;
 
 // --- probe devnode marker + cleanup --------------------------------------------------------
 

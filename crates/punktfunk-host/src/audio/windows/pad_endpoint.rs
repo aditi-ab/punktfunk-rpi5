@@ -571,9 +571,14 @@ pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Optio
     (len > 0).then(|| String::from_utf16_lossy(&units[..len]))
 }
 
-/// The persisted pad slot of a devnode (the `PunktfunkPadIndex` value under its
-/// `Device Parameters` key), or `None` for foreign devnodes.
-fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
+/// Read a REG_DWORD from a devnode's `Device Parameters` key — the durable owner-marker
+/// mechanism every punktfunk-minted devnode family uses (pad slot, minted-audio role, probe
+/// marker). `None`: no key, no value, or wrong type — a foreign devnode.
+pub(crate) fn read_devparam_dword(
+    set: &DevInfoSet,
+    did: &SP_DEVINFO_DATA,
+    value_name: &str,
+) -> Option<u32> {
     // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
     let hkey = unsafe {
         SetupDiOpenDevRegKey(
@@ -586,7 +591,7 @@ fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
         )
     }
     .ok()?;
-    let name = wide(PAD_INDEX_VALUE);
+    let name = wide(value_name);
     let mut data = [0u8; 4];
     let mut len = data.len() as u32;
     let mut ty = REG_VALUE_TYPE(0);
@@ -607,6 +612,67 @@ fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
         let _ = RegCloseKey(hkey);
     }
     (rc.is_ok() && ty == REG_DWORD && len == 4).then(|| u32::from_le_bytes(data))
+}
+
+/// Write a REG_DWORD into a devnode's `Device Parameters` key, creating the key on a fresh
+/// devnode — the write side of [`read_devparam_dword`].
+pub(crate) fn write_devparam_dword(
+    set: &DevInfoSet,
+    did: &mut SP_DEVINFO_DATA,
+    value_name: &str,
+    value: u32,
+) -> Result<()> {
+    // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
+    let opened = unsafe {
+        SetupDiOpenDevRegKey(
+            set.0,
+            did,
+            DICS_FLAG_GLOBAL.0,
+            0,
+            DIREG_DEV,
+            KEY_SET_VALUE.0,
+        )
+    };
+    let hkey = match opened {
+        Ok(k) => k,
+        // SAFETY: same set + element; a fresh devnode has no Device Parameters key yet, so
+        // create it (no INF association).
+        Err(_) => unsafe {
+            SetupDiCreateDevRegKeyW(
+                set.0,
+                did,
+                DICS_FLAG_GLOBAL.0,
+                0,
+                DIREG_DEV,
+                None,
+                PCWSTR::null(),
+            )
+        }
+        .with_context(|| format!("create the Device Parameters key for {value_name}"))?,
+    };
+    let name = wide(value_name);
+    // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
+    // with the slice.
+    let rc = unsafe {
+        RegSetValueExW(
+            hkey,
+            PCWSTR(name.as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&value.to_le_bytes()),
+        )
+    };
+    // SAFETY: closing the key opened/created above, exactly once.
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    rc.ok().with_context(|| format!("write {value_name}"))
+}
+
+/// The persisted pad slot of a devnode (the `PunktfunkPadIndex` value under its
+/// `Device Parameters` key), or `None` for foreign devnodes.
+fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
+    read_devparam_dword(set, did, PAD_INDEX_VALUE)
 }
 
 /// Find the devnode previously created for `pad_index` (see the module doc: the persisted
@@ -688,51 +754,7 @@ fn create_devnode(pad_index: u8) -> Result<String> {
 
 /// Persist `pad_index` in the devnode's `Device Parameters` key (created on a fresh devnode).
 fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -> Result<()> {
-    // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
-    let opened = unsafe {
-        SetupDiOpenDevRegKey(
-            set.0,
-            did,
-            DICS_FLAG_GLOBAL.0,
-            0,
-            DIREG_DEV,
-            KEY_SET_VALUE.0,
-        )
-    };
-    let hkey = match opened {
-        Ok(k) => k,
-        // SAFETY: same set + element; a fresh devnode has no Device Parameters key yet, so
-        // create it (no INF association).
-        Err(_) => unsafe {
-            SetupDiCreateDevRegKeyW(
-                set.0,
-                did,
-                DICS_FLAG_GLOBAL.0,
-                0,
-                DIREG_DEV,
-                None,
-                PCWSTR::null(),
-            )
-        }
-        .context("create the devnode's Device Parameters key")?,
-    };
-    let name = wide(PAD_INDEX_VALUE);
-    // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
-    // with the slice.
-    let rc = unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(name.as_ptr()),
-            None,
-            REG_DWORD,
-            Some(&(pad_index as u32).to_le_bytes()),
-        )
-    };
-    // SAFETY: closing the key opened/created above, exactly once.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-    rc.ok().context("write PunktfunkPadIndex")
+    write_devparam_dword(set, did, PAD_INDEX_VALUE, pad_index as u32)
 }
 
 /// The Steam Streaming Speakers INF to feed `UpdateDriverForPlugAndPlayDevices`: prefer the

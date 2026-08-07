@@ -198,6 +198,14 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
         // cannot carry stereo cannot carry 5.1 either.
         2,
         &pad_ids,
+        // The minted "Punktfunk Speakers/Microphone" ids — tier-0 identity, empty until the
+        // provider latches. The ensure hook makes a box where Steam arrives later mint on a
+        // wiring pass instead of at the next reboot (cheap once latched; cooled-down retries
+        // while not).
+        &{
+            super::minted::ensure_provisioned();
+            super::minted::minted_ids()
+        },
     );
     let done = |wiring: Wiring| WiredPlan {
         wiring,
@@ -220,6 +228,7 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
             loopback_render = wiring.loopback_render.as_ref().map(|(n, _)| n.as_str()),
             loopback_last_resort = wiring.loopback_last_resort,
             mic_withheld = wiring.mic_withheld,
+            readiness = ?wiring_plan::readiness(&wiring),
             renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             "audio wiring plan"
         );
@@ -265,7 +274,16 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     if let Some((mic_name, mic_id)) = &wiring.mic_render {
         if default_render_id().as_deref() == Some(mic_id.as_str()) {
             // Audible preference = the host_audio plan's loopback pick (real hardware first).
-            match plan(&renders, &captures, want.as_deref(), true, &pad_ids).loopback_render {
+            match plan(
+                &renders,
+                &captures,
+                want.as_deref(),
+                true,
+                &pad_ids,
+                &super::minted::minted_ids(),
+            )
+            .loopback_render
+            {
                 Some((name, id)) => match set_default_endpoint(&id) {
                     Ok(()) => tracing::info!(mic = %mic_name, device = %name,
                         "default playback was the virtual-mic target — moved it so desktop \
