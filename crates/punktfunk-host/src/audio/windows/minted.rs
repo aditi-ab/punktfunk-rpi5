@@ -109,20 +109,17 @@ static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The wiring plan's tier-0 input: the minted ids, or all-empty while nothing is provisioned.
 ///
-/// **The mic ids are deliberately NOT published** (2026-08-07 pitch measurements): the SSM
-/// driver's pins are format-locked (render stereo-only, capture mono-only) and the crossing
-/// is a RAW byte pass, so voice fed through the render endpoint reads back an octave low and
-/// no stamp can fix it — S3's peak-based PASS was a false pass. The mic therefore falls back
-/// to the name ladder (a virtual cable) per the design's revert clause, while the SPEAKERS
-/// substrate — which involves no driver crossing, just an engine loopback tap — stays tier-0.
-/// The mic endpoints are still minted and recorded ([`provisioned`]) for the `micpitch`
-/// probe and for a future transport that bypasses the render path.
+/// The mic ids were briefly unpublished during the 2026-08-07 pitch investigation ("voice an
+/// octave low") — the eventual measured truth: both pins run stereo/48 kHz fine, the octave
+/// came from the driver's DEFAULT endpoints disagreeing (stereo render vs mono capture), and
+/// the per-direction stamp sets in [`stamp_identity`] fix it permanently
+/// (`audio-probe micpitch`: 440 Hz in → 440 Hz out, peak exact). Full tier-0 restored.
 pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
     match PROVISIONED.get() {
         Some(m) => wiring_plan::MintedIds {
             speakers_render: m.speakers_render.clone(),
-            mic_render: None,
-            mic_capture: None,
+            mic_render: m.mic_render.clone(),
+            mic_capture: m.mic_capture.clone(),
         },
         None => wiring_plan::MintedIds::default(),
     }
