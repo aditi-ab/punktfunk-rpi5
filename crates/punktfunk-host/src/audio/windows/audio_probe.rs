@@ -105,8 +105,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         // ~220 Hz = a link runs at half the declared rate (the octave-down voice).
         Some("micpitch") => {
             super::minted::ensure_blocking();
-            let ids = super::minted::minted_ids();
-            let (Some(render), Some(capture)) = (ids.mic_render, ids.mic_capture) else {
+            // The RAW provisioning record: the wiring-facing `minted_ids` deliberately hides
+            // the mic pair (raw crossing, octave-low — this probe is how that was measured).
+            let Some(m) = super::minted::provisioned() else {
+                bail!("nothing minted on this box — run `audio-probe mint` first");
+            };
+            let (Some(render), Some(capture)) = (m.mic_render.clone(), m.mic_capture.clone())
+            else {
                 bail!("no minted microphone pair on this box — run `audio-probe mint` first");
             };
             println!("audio-probe micpitch: render={render}");

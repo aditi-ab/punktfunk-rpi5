@@ -108,15 +108,30 @@ static PROVISIONING: AtomicBool = AtomicBool::new(false);
 static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The wiring plan's tier-0 input: the minted ids, or all-empty while nothing is provisioned.
+///
+/// **The mic ids are deliberately NOT published** (2026-08-07 pitch measurements): the SSM
+/// driver's pins are format-locked (render stereo-only, capture mono-only) and the crossing
+/// is a RAW byte pass, so voice fed through the render endpoint reads back an octave low and
+/// no stamp can fix it — S3's peak-based PASS was a false pass. The mic therefore falls back
+/// to the name ladder (a virtual cable) per the design's revert clause, while the SPEAKERS
+/// substrate — which involves no driver crossing, just an engine loopback tap — stays tier-0.
+/// The mic endpoints are still minted and recorded ([`provisioned`]) for the `micpitch`
+/// probe and for a future transport that bypasses the render path.
 pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
     match PROVISIONED.get() {
         Some(m) => wiring_plan::MintedIds {
             speakers_render: m.speakers_render.clone(),
-            mic_render: m.mic_render.clone(),
-            mic_capture: m.mic_capture.clone(),
+            mic_render: None,
+            mic_capture: None,
         },
         None => wiring_plan::MintedIds::default(),
     }
+}
+
+/// The raw provisioning record — the probe's view (unlike [`minted_ids`], the mic ids are
+/// visible here).
+pub(crate) fn provisioned() -> Option<Arc<MintedAudio>> {
+    PROVISIONED.get().cloned()
 }
 
 /// Spawn the provisioning worker (idempotent; returns immediately). Called at host start next
@@ -303,6 +318,20 @@ const WFX_F32_2CH_48K: [u8; 40] = [
     0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
     0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 ];
+/// The capture pin's one format: 1 ch / 48 kHz / 32-bit float, mask 0x4 (FRONT_CENTER).
+const WFX_F32_1CH_48K: [u8; 40] = [
+    0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
+    0x01, 0x00, // nChannels = 1
+    0x80, 0xbb, 0x00, 0x00, // nSamplesPerSec = 48000
+    0x00, 0xee, 0x02, 0x00, // nAvgBytesPerSec = 192000
+    0x04, 0x00, // nBlockAlign = 4
+    0x20, 0x00, // wBitsPerSample = 32
+    0x16, 0x00, // cbSize = 22
+    0x20, 0x00, // wValidBitsPerSample = 32
+    0x04, 0x00, 0x00, 0x00, // dwChannelMask = SPEAKER_FRONT_CENTER
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+    0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+];
 
 /// Best-effort: write the role's display name — plus, on the mic RENDER, the mono format set —
 /// onto one endpoint and wait for the audio stack to SERVE it. Never fails the role — an
@@ -320,31 +349,37 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
             value: pe::StampValue::Str("Punktfunk"),
         },
     ];
-    // Both sides of the mic pair declare the SAME stereo float format (see WFX_F32_2CH_48K:
-    // the crossing is raw and the render pin is stereo-only, so stereo-everywhere is the one
-    // coherent choice). `capture` is accepted for symmetry — both directions get the set.
-    let _ = capture;
+    // Format stamps pin each mic-pair side to ITS pin's one supported format — measured: the
+    // render pin is stereo-only and the capture pin mono-only (stamping either differently
+    // makes the endpoint unopenable, 0x88890008 on every Initialize). These stamps exist to
+    // HEAL endpoints an earlier build of this branch mis-stamped, and to keep the pair pinned
+    // against drift; they cannot fix the raw crossing (see [`minted_ids`]).
     if role == Role::Mic {
+        let wfx: &'static [u8; 40] = if capture {
+            &WFX_F32_1CH_48K
+        } else {
+            &WFX_F32_2CH_48K
+        };
         stamps.extend([
             pe::Stamp {
                 label: "device-format",
                 key: pe::PKEY_DEVICE_FORMAT,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                value: pe::StampValue::Format(wfx),
             },
             pe::Stamp {
                 label: "mix-format-2",
                 key: pe::PKEY_MIX_FORMAT_2,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                value: pe::StampValue::Format(wfx),
             },
             pe::Stamp {
                 label: "mix-format-3",
                 key: pe::PKEY_MIX_FORMAT_3,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                value: pe::StampValue::Format(wfx),
             },
             pe::Stamp {
                 label: "host-format",
                 key: pe::PKEY_HOST_FORMAT,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                value: pe::StampValue::Format(wfx),
             },
         ]);
     }
