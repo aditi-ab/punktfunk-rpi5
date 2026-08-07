@@ -353,6 +353,20 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
 }
 
 /// `audio-probe mint` devtest body: one synchronous provisioning pass, results printed.
+/// Synchronous provisioning for devtests: a fresh CLI process has no startup worker to have
+/// finished yet, so `audio-probe plan` would otherwise RACE the background thread and print
+/// the name ladder instead of tier-0. Existing marker devnodes re-resolve in milliseconds.
+pub(crate) fn ensure_blocking() {
+    if PROVISIONED.get().is_some() {
+        return;
+    }
+    if let Ok(m) = ensure_all() {
+        if m.any() {
+            let _ = PROVISIONED.set(Arc::new(m));
+        }
+    }
+}
+
 pub(crate) fn devtest_mint() -> Result<()> {
     let m = ensure_all()?;
     println!(

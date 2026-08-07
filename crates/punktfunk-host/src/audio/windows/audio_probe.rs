@@ -74,8 +74,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         // and publish them for THIS process — `plan` then shows the tier-0 pick.
         Some("mint") => super::minted::devtest_mint(),
         // One real wiring pass (no default parking) + the verdict, readiness included — the
-        // field-triage "what would the host do right now" command.
+        // field-triage "what would the host do right now" command. Provisioning runs
+        // synchronously first: a fresh CLI process would otherwise race its own worker.
         Some("plan") => {
+            super::minted::ensure_blocking();
             let plan = super::audio_control::wire_now_full(false);
             let w = &plan.wiring;
             let show = |ep: &Option<super::wiring_plan::Endpoint>| match ep {
