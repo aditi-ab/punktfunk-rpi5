@@ -1485,11 +1485,13 @@ pub fn decodable_codecs() -> u8 {
 /// * the presenter's Vulkan device advertises `DECODE_AV1` in its decode queue
 ///   family's codec operations, or
 /// * (Windows) the presenter can import D3D11 textures — the native DXVA rung then decodes
-///   AV1 Profile 0 through the adapter's profile GUID, and `auto` reaches it. ⚠⚠ That leg
-///   decodes WRONG PIXELS — measured against libavcodec on two GPUs on 2026-08-07
-///   ([`native_evidence`]); the session says so at `warn`. Advertising AV1 is still answered
-///   from device facts here, deliberately: withdrawing the codec would be a product call
-///   about what a Windows Intel box streams instead, not a fact about the device.
+///   AV1 Profile 0 through the adapter's profile GUID, and `auto` reaches it. That leg is
+///   frame-hash parity-proven on two vendors since 2026-08-07 ([`native_evidence`]); until
+///   that run it was measured decoding WRONG PIXELS on both, and advertising AV1 was still
+///   answered from device facts here — deliberately, because withdrawing the codec would be
+///   a product call about what a Windows Intel box streams instead, not a fact about the
+///   device. That reasoning is kept rather than deleted: it is the shape this arm has to
+///   hold the next time a leg's evidence goes bad.
 ///   Before M10 this arm was conditional, because the leg was kept out of `auto` while
 ///   libavcodec's DXVA rung was still below it — with that rung deleted there is no
 ///   condition left to write.
@@ -1594,9 +1596,9 @@ fn report_au_fault_env(native_rung: bool) {
 /// a frame through it for this codec.
 ///
 /// This is the program's honesty surface, and M10 is where it earns its keep: every rung
-/// is now native, one of them still has legs that have never decoded anything anywhere,
-/// another has a leg that decodes wrong pixels, and there is no
-/// libavcodec twin left underneath to catch a session that lands wrong. A field report of
+/// is now native, one of them still has legs that have never decoded anything anywhere, one
+/// leg that was measured decoding wrong pixels has since been fixed and proven, and there is
+/// no libavcodec twin left underneath to catch a session that lands wrong. A field report of
 /// the form "M10 broke my stream" is only actionable if the log distinguishes *the rung
 /// with three drivers and a 92-minute soak behind it* from *the rung nothing has ever
 /// run*, and the `stats:` decode-path tag — which is a machine interface and stays
@@ -2022,19 +2024,18 @@ impl Decoder {
             // legs are verified anyway, which is what the first clause of
             // [`native_rung_admitted`] answers.
             //
-            // ⚠⚠ OPEN, 2026-08-07: for AV1 this now admits a rung MEASURED to decode wrong
-            // pixels (186/250 and 245/250 diverging frames — [`native_evidence`]), and on
-            // Intel it is the arm that actually fires, because that vendor advertises no
-            // SAMPLED usage on any decode profile so zero-copy Vulkan Video cannot run
-            // there. The filter is behaving as written — "unproven yields only to PROVEN
-            // code below", and below here is the CPU — but the premise has changed: this is
-            // no longer a rung with no evidence, it is a rung with BAD evidence, and the
-            // rule was never asked that question. Deliberately NOT changed here: barring it
-            // trades visibly-wrong AV1 for the software rung, which cannot keep up at 4K
-            // (see [`crate::video_software`]) and is itself unproven, so which way that
-            // trade should go is a product call and not this function's to make silently.
-            // Every such session says so at `warn` via [`log_rung`], and the note now names
-            // the parity failure rather than merely the absence of a check.
+            // CLOSED, 2026-08-07 (opened and closed the same day): for a few hours this
+            // admitted a rung MEASURED to decode wrong pixels — 186/250 and 245/250
+            // diverging frames — and on Intel it is the arm that actually fires, because
+            // that vendor advertises no SAMPLED usage on any decode profile so zero-copy
+            // Vulkan Video cannot run there. The question it raised is worth keeping even
+            // though the answer expired: the filter asks "has this rung any evidence", and
+            // a rung with BAD evidence is a case the rule was never posed. It was left
+            // admitted rather than barred, because barring it trades visibly-wrong AV1 for
+            // the software rung, which cannot keep up at 4K (see [`crate::video_software`])
+            // and is itself unproven. The AV1 leg is now parity-proven on both vendors
+            // ([`native_evidence`]) so this arm admits a PROVEN rung today, and
+            // `native_rung_admitted`'s first clause would admit it whatever were below.
             && native_rung_admitted(NativeRung::D3d11va, wire, None)
         {
             d3d11_tried = true;
@@ -3293,8 +3294,8 @@ mod tests {
     ///
     /// This test is the reason the table can be trusted a milestone from now. M9 turned
     /// native rungs on by default and M10 deleted every libavcodec rung beneath them; the
-    /// argument for doing that honestly rests entirely on the claim "these five pairs are
-    /// proven and these six are not", and on the session log saying so. A
+    /// argument for doing that honestly rests entirely on the claim "these six pairs are
+    /// proven and these five are not", and on the session log saying so. A
     /// table nobody checks drifts into a table that says everything is fine — which is
     /// the exact failure this whole program exists to end, one layer up.
     #[test]
@@ -3313,6 +3314,11 @@ mod tests {
             ),
             (NativeRung::D3d11va, CODEC_H264, "native D3D11VA H.264 (M5)"),
             (NativeRung::D3d11va, CODEC_HEVC, "native D3D11VA H.265 (M5)"),
+            (
+                NativeRung::D3d11va,
+                CODEC_AV1,
+                "native D3D11VA AV1 (M7, RTX 3500 Ada + Intel Arc, 2026-08-07)",
+            ),
         ] {
             assert!(
                 native_evidence(rung, codec).verified,
@@ -3320,11 +3326,6 @@ mod tests {
             );
         }
         for (rung, codec, why) in [
-            (
-                NativeRung::D3d11va,
-                CODEC_AV1,
-                "the DXVA AV1 leg FAILS parity on two GPUs (M7)",
-            ),
             (
                 NativeRung::Vaapi,
                 CODEC_H264,

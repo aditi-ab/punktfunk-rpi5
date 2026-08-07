@@ -1915,7 +1915,7 @@ fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings 
             ("ours", our_curr, our_store),
             ("libav", their_curr, their_store),
         ] {
-            if store.iter().any(|surface| *surface == curr) {
+            if store.contains(&curr) {
                 findings.note(
                     "curr_pic_texture_index[aliases the store]",
                     au,
