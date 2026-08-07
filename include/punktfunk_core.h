@@ -2594,6 +2594,13 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 // [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
 // not both (they share the underlying queue).
 //
+// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
+// recovery has had its chance) are synthesized via libopus packet-loss concealment and returned
+// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
+// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
+// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
+// pre-healed, exactly as they do on the clients that decode outside core.
+//
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
 PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
