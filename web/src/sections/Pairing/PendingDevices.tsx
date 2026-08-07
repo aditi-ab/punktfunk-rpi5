@@ -1,5 +1,4 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@unom/ui/button";
 import { UserPlus, X } from "lucide-react";
 import type { FC } from "react";
 import type { PendingDevice } from "@/api/gen/model";
@@ -11,6 +10,7 @@ import {
 	useListPendingDevices,
 } from "@/api/gen/native/native";
 import { QueryState } from "@/components/query-state";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import type { Loadable } from "@/lib/query";

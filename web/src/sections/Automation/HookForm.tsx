@@ -1,7 +1,7 @@
-import { Checkbox } from "@unom/ui/form/checkbox";
 import { type FC, useEffect, useState } from "react";
 import type { HookEntry } from "@/api/gen/model/hookEntry";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	Dialog,
 	DialogContent,
@@ -11,7 +11,15 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { InputNumber } from "@/components/ui/input-number";
 import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { m } from "@/paraglide/messages";
 
 /** The event kinds the host publishes, plus the `domain.*` wildcards the hook filter accepts.
@@ -104,18 +112,21 @@ export const HookForm: FC<{
 
 				<div className="space-y-2">
 					<Label htmlFor="hook-on">{m.automation_field_on()}</Label>
-					<select
-						id="hook-on"
-						value={draft.on}
-						onChange={(e) => set({ on: e.target.value })}
-						className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-					>
-						{EVENT_KINDS.map((k) => (
-							<option key={k} value={k}>
-								{k}
-							</option>
-						))}
-					</select>
+					{/* The event kinds are IDENTIFIERS, not prose — deliberately not routed through
+					    i18n, and shown in the host's own `domain.event` spelling so what you pick here
+					    reads the same as what you'd type into the SSE `?kinds=` filter. */}
+					<Select value={draft.on} onValueChange={(on) => set({ on })}>
+						<SelectTrigger id="hook-on">
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent>
+							{EVENT_KINDS.map((k) => (
+								<SelectItem key={k} value={k}>
+									{k}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
 					<p className="text-xs text-muted-foreground">
 						{m.automation_field_on_help()}
 					</p>
@@ -222,14 +233,11 @@ export const HookForm: FC<{
 						<Label htmlFor="hook-debounce">
 							{m.automation_field_debounce()}
 						</Label>
-						<Input
+						<InputNumber
 							id="hook-debounce"
-							type="number"
 							min={0}
 							value={draft.debounce_ms ?? 0}
-							onChange={(e) =>
-								set({ debounce_ms: Number(e.target.value) || 0 })
-							}
+							onChange={(debounce_ms) => set({ debounce_ms })}
 						/>
 					</div>
 					{kind === "run" && (
@@ -237,15 +245,14 @@ export const HookForm: FC<{
 							<Label htmlFor="hook-timeout">
 								{m.automation_field_timeout()}
 							</Label>
-							<Input
+							{/* 600 is the host's own ceiling — the old field let 900 through, and the
+							    hook then failed at run time rather than at the point of typing it. */}
+							<InputNumber
 								id="hook-timeout"
-								type="number"
 								min={1}
 								max={600}
 								value={draft.timeout_s ?? 30}
-								onChange={(e) =>
-									set({ timeout_s: Number(e.target.value) || 30 })
-								}
+								onChange={(timeout_s) => set({ timeout_s })}
 							/>
 						</div>
 					)}

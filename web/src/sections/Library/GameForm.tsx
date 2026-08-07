@@ -10,6 +10,7 @@ import type { CustomInput } from "@/api/gen/model/customInput";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiErrorMessage } from "@/lib/errors";
@@ -313,12 +314,11 @@ export const GameForm: FC<{
 					    "Heroic" or "Lutris" tile without installing that source's plugin. */}
 					<div className="space-y-2">
 						<div className="flex items-center gap-2">
-							<input
+							<Checkbox
 								id="lib-isLauncher"
-								type="checkbox"
 								checked={form.isLauncher}
-								onChange={(e) =>
-									setForm((f) => ({ ...f, isLauncher: e.target.checked }))
+								onCheckedChange={(next) =>
+									setForm((f) => ({ ...f, isLauncher: next === true }))
 								}
 							/>
 							<Label htmlFor="lib-isLauncher">{m.library_field_role()}</Label>

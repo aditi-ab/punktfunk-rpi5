@@ -1,6 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useBlocker } from "@tanstack/react-router";
-import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
@@ -38,7 +37,9 @@ import type {
 	Topology,
 } from "@/api/gen/model";
 import { QueryState } from "@/components/query-state";
+import { Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -243,7 +244,11 @@ const PRESET_ORDER = [
 	"custom",
 ] as const;
 
-const DisplayForm: FC<{
+/**
+ * The policy form itself — pure, so Storybook can render it (with the `<Card>` wrapper the page puts
+ * around it, which is also its motion parent) without a host answering `/display/settings`.
+ */
+export const DisplayForm: FC<{
 	draft: DisplayPolicy;
 	setDraft: (p: DisplayPolicy) => void;
 	presets: { id: string; summary: string; fields: EffectivePolicy }[];
@@ -431,7 +436,11 @@ const DisplayForm: FC<{
 				<Label className="mb-1 block text-base font-semibold">
 					{m.display_preset()}
 				</Label>
-				<div className="grid gap-3 sm:grid-cols-2">
+				{/* The preset tiles are cards nested INSIDE this page's config card, so their motion
+				    parent is that card — which sets no `delayChildren` and therefore landed all six
+				    on the same frame, unlike every other card grid in the console. `Stagger` gives
+				    the group its own cadence back (see components/stagger.tsx). */}
+				<Stagger className="grid gap-3 sm:grid-cols-2">
 					{PRESET_ORDER.map((id) => {
 						const p = presets.find((x) => x.id === id);
 						const fields = id === "custom" ? undefined : p?.fields;
@@ -506,7 +515,7 @@ const DisplayForm: FC<{
 							</Card>
 						);
 					})}
-				</div>
+				</Stagger>
 			</div>
 
 			{/* Custom presets — the operator's saved field-bundles, rendered like the built-ins but
@@ -527,7 +536,7 @@ const DisplayForm: FC<{
 					</Button>
 				</div>
 				{customPresets.length > 0 && (
-					<div className="grid gap-3 sm:grid-cols-2">
+					<Stagger className="grid gap-3 sm:grid-cols-2">
 						{customPresets.map((p) => (
 							<CustomPresetCard
 								key={p.id}
@@ -540,7 +549,7 @@ const DisplayForm: FC<{
 								onDelete={() => removePreset(p)}
 							/>
 						))}
-					</div>
+					</Stagger>
 				)}
 				{presetError && (
 					<p className="text-sm text-amber-600 dark:text-amber-500">
