@@ -168,8 +168,19 @@ pub struct SteamState {
 }
 
 impl SteamState {
+    /// A fresh pad — and one that is sitting STILL, not falling.
+    ///
+    /// Acceleration is 1 g up, for the reason spelled out on [`gs::MOTION_NEUTRAL_ACCEL`]: zero is
+    /// free fall, which is a claim about the world that is never true of a controller. It is put
+    /// through [`super::steam_remap::motion_wire_to_deck`] rather than written out in Deck units,
+    /// so the neutral and every real sample can never disagree about what 1 g is — the Deck's
+    /// `hid-steam` resolution lives in exactly one place.
     pub fn neutral() -> SteamState {
-        SteamState::default()
+        let (_, accel) = super::steam_remap::motion_wire_to_deck([0; 3], gs::MOTION_NEUTRAL_ACCEL);
+        SteamState {
+            accel,
+            ..SteamState::default()
+        }
     }
 
     /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and

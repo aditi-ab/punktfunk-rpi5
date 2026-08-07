@@ -12,6 +12,7 @@
 //! `src/uhid/include/uhid/ps5.hpp`), so `hid-playstation` (Linux) and `hidclass` (Windows) bind the
 //! same as a real USB DualSense.
 
+use punktfunk_core::input::gamepad as gs;
 use punktfunk_core::quic::{HidOutput, RichInput};
 
 // Feature reports the host stack GET_REPORTs during init — without these replies the kernel
@@ -222,7 +223,15 @@ pub struct DsState {
 }
 
 impl DsState {
-    /// A centered, nothing-pressed state (sticks 0x80, dpad neutral).
+    /// A centered, nothing-pressed state (sticks 0x80, dpad neutral) — and, crucially, a pad that
+    /// is sitting STILL rather than falling.
+    ///
+    /// Acceleration is 1 g up ([`gs::MOTION_NEUTRAL_ACCEL`]), not zero. `[0, 0, 0]` reads as free
+    /// fall to anything that interprets the accelerometer, which is a definite lie about the
+    /// physical world; a pad that has sent no motion yet — or has none at all — is on a desk or in
+    /// someone's hands, and both read 1 g up. This is what `switch_proto`'s neutral has always done
+    /// on its own up axis, and the DualSense family now does on the axis a real DualSense was
+    /// measured to use. The DS4 reuses this state, so it is covered by the same line.
     pub fn neutral() -> DsState {
         DsState {
             lx: 0x80,
@@ -230,6 +239,7 @@ impl DsState {
             rx: 0x80,
             ry: 0x80,
             dpad: 8,
+            accel: gs::MOTION_NEUTRAL_ACCEL,
             ..Default::default()
         }
     }

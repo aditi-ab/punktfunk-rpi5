@@ -29,7 +29,9 @@ use pf_inject::dualshock4_proto::{
 use pf_inject::steam_proto::SteamState;
 use pf_inject::steam_remap::motion_wire_to_deck;
 use pf_inject::switch_proto::SwitchState;
-use punktfunk_core::input::gamepad::{MOTION_ACCEL_LSB_PER_G, MOTION_GYRO_LSB_PER_DEG_S};
+use punktfunk_core::input::gamepad::{
+    MOTION_ACCEL_LSB_PER_G, MOTION_GYRO_LSB_PER_DEG_S, MOTION_NEUTRAL_ACCEL,
+};
 use punktfunk_core::quic::RichInput;
 
 /// The Sony IMU-calibration feature report, whose layout is the same for the DualSense (report
@@ -262,6 +264,66 @@ fn neutralizing_motion_keeps_gravity() {
     assert!(deck.neutralize_gyro());
     assert_eq!(deck.gyro, [0; 3]);
     assert_eq!(deck.accel, [0, 0, 16384], "Deck gravity must survive too");
+}
+
+/// A virtual pad that has received no motion must read as STILL, not as falling.
+///
+/// `[0, 0, 0]` is not "no information": zero proper acceleration is free fall, a claim about the
+/// physical world that is never true of a controller on a desk. Anything deriving orientation from
+/// the accelerometer gets a confident wrong answer rather than a boring right one — and the pads
+/// this affects most are the ones with no gyro at all, which sit on that neutral for the whole
+/// session.
+///
+/// Each backend is checked in ITS OWN units, because the value differs per backend and hard-coding
+/// "1 g" three times is how the two halves of a unit contract drift apart.
+#[test]
+fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
+    // The wire's own answer, measured from a real DualSense on 2026-08-07: axis 1 is UP.
+    assert_eq!(MOTION_NEUTRAL_ACCEL, [0, MOTION_ACCEL_LSB_PER_G as i16, 0]);
+
+    let ds = DsState::neutral();
+    assert_eq!(
+        ds.accel, MOTION_NEUTRAL_ACCEL,
+        "a fresh DualSense/DS4 must report 1 g up, not free fall"
+    );
+    assert_eq!(ds.gyro, [0; 3], "and it must not be turning");
+
+    // The Deck rescales, so its neutral is the wire's put through the same conversion a real
+    // sample takes — asserted against the resolution `hid-steam` actually fixes (16384 LSB/g),
+    // so a change to either side has to face this line.
+    let deck = SteamState::neutral();
+    assert_eq!(
+        deck.accel,
+        motion_wire_to_deck([0; 3], MOTION_NEUTRAL_ACCEL).1,
+        "the Deck neutral must be the wire neutral, rescaled — not a second opinion about 1 g"
+    );
+    assert_eq!(deck.accel, [0, 16384, 0]);
+    assert_eq!(deck.gyro, [0; 3]);
+
+    // The Switch Pro already did this correctly and is deliberately NOT touched: it is a different
+    // device (hid-nintendo), its up axis is its own, and nobody has measured its frame. Pinned so
+    // that a well-meaning sweep does not "make it consistent" with the DualSense on no evidence.
+    let sw = SwitchState::neutral();
+    assert_eq!(
+        sw.accel,
+        [0, 0, 4096],
+        "switch_proto's neutral is its own device's; do not align it to the DualSense unmeasured"
+    );
+
+    // The property that actually matters, stated once per backend: none of them is in free fall.
+    for (what, accel) in [
+        ("dualsense", ds.accel),
+        ("deck", deck.accel),
+        ("switch", sw.accel),
+    ] {
+        assert_ne!(accel, [0; 3], "{what} neutral reads as free fall");
+        let mag = accel
+            .iter()
+            .map(|&v| (v as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(mag > 0.0, "{what} neutral has no gravity at all");
+    }
 }
 
 // ---- the Windows UMDF driver's copies ----
