@@ -114,10 +114,19 @@ object DsDevice {
         companion object {
             /** The pads' nominal acceleration resolution — `hid-playstation`'s `DS_ACC_RES_PER_G`. */
             private const val RAW_ACCEL_LSB_PER_G = 8192L
-            /** `punktfunk_core::input::gamepad::MOTION_GYRO_LSB_PER_DEG_S`. */
-            private const val WIRE_GYRO_LSB_PER_DEG_S = 20L
+            /**
+             * The wire's gyro scale, taken from [Gamepad] rather than restated. These were literal
+             * `20L` / `10000L` until the sensor path hoisted the same numbers into one place; a
+             * second copy of a unit constant is precisely the defect this whole program opened
+             * with, and two of them in one module would be worse than the original.
+             *
+             * `val`, not `const val`, only because the widening to Long is not a compile-time
+             * constant expression. Long here on purpose: the arithmetic below multiplies raw counts
+             * by the calibration's speed term before dividing, which overflows an Int.
+             */
+            private val WIRE_GYRO_LSB_PER_DEG_S = Gamepad.MOTION_GYRO_LSB_PER_DEG_S.toLong()
             /** `MOTION_ACCEL_LSB_PER_G`, doubled — the declared accel range spans 2 g, not 1. */
-            private const val ACCEL_NUMER = 2 * 10000L
+            private val ACCEL_NUMER = 2L * Gamepad.MOTION_ACCEL_LSB_PER_G
             /** Bytes the layout below reads; the reports themselves are longer (41 / 37). */
             private const val MIN_LEN = 35
 

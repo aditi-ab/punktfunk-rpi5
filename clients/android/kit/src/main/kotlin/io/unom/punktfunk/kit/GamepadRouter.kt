@@ -71,7 +71,18 @@ class GamepadRouter(
 ) {
 
     /** One forwarded controller: its stable wire pad index, per-device axis state, and held buttons. */
-    private class Slot(val index: Int, val mapper: Gamepad.AxisMapper) {
+    private class Slot(
+        val index: Int,
+        val mapper: Gamepad.AxisMapper,
+        /**
+         * Whether motion sent for this pad can reach the game at all, asked once at open off the
+         * kind it declared ([NativeBridge.nativePadMotionReaches]). False means the host built it a
+         * backend with no motion plane, so [deviceMotion] drops the sample here rather than paying
+         * to send one the host will decode and discard — at a controller's full sensor rate, for
+         * the whole session. The capture-link pads carry the same flag on [ExternalPad].
+         */
+        val motionReaches: Boolean = true,
+    ) {
         /** Forwarded button bits currently held (Gamepad.BTN_*) — for release-on-close + chord detection. */
         var held = 0
 
@@ -378,6 +389,12 @@ class GamepadRouter(
      */
     fun setDeviceHasSensorMotion(deviceId: Int, has: Boolean) {
         if (has) sensorDevices.add(deviceId) else sensorDevices.remove(deviceId)
+        // This is the first moment we know a Bluetooth pad actually HAS a gyro — `openSlot` only
+        // knows what kind it declared. So it is the honest place to raise the notice when that
+        // gyro has nowhere to go, and the only one that cannot nag about a pad that never had one.
+        if (has && forwarding && slots[deviceId]?.motionReaches == false) {
+            onMotionUnreachable?.invoke()
+        }
     }
 
     /**
@@ -390,6 +407,11 @@ class GamepadRouter(
     fun deviceMotion(deviceId: Int, gyro: IntArray, accel: IntArray) {
         val slot = slots[deviceId] ?: return
         if (!forwarding) return
+        // The same gate the USB capture path takes: a backend with no motion plane decodes every
+        // sample and discards it, so sending is pure cost. Notified once per pad by
+        // [setDeviceHasSensorMotion], which is where we first know the controller HAS a gyro to
+        // lose — a pad without one must not produce a warning about motion.
+        if (!slot.motionReaches) return
         NativeBridge.nativeSendPadMotion(
             handle, slot.index,
             gyro[0], gyro[1], gyro[2],
@@ -540,7 +562,14 @@ class GamepadRouter(
         // to that type (a single global choice — matches the handshake's session-default pref).
         val pref = if (setting == Gamepad.PREF_AUTO) Gamepad.prefFor(dev) else setting
         if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
-        val slot = Slot(index, Gamepad.AxisMapper(handle, index))
+        // Asked here, off the kind this pad just DECLARED — not off the session's resolved backend,
+        // which under Automatic answers for whichever pad happened to be active at dial time. Held
+        // for the slot's life; the sensor path reads it on every sample.
+        val slot = Slot(
+            index,
+            Gamepad.AxisMapper(handle, index),
+            NativeBridge.nativePadMotionReaches(handle, pref),
+        )
         slots[dev.id] = slot
         // After the table holds the slot, so a listener that sends on this device the moment it is
         // told ([PadSensors]) finds an index to send on rather than dropping its first samples.
