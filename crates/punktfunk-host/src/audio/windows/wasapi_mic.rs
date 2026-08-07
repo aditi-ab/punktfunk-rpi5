@@ -4,7 +4,8 @@
 //! **capture** endpoint then surfaces as a microphone that host apps can record from.
 //!
 //! The target comes from the [`audio_control::wire_now`] plan (recomputed on every open): VB-Audio
-//! "CABLE Input" (bundled by the installer — the dedicated mic target), the Steam Streaming
+//! the minted "Punktfunk Microphone" (tier-0, see `super::minted`), then by name: VB-Audio
+//! "CABLE Input" (bundled by installers until the audio-substrate change), the Steam Streaming
 //! Microphone, VoiceMeeter, or anything with "virtual" in the name; `PUNKTFUNK_MIC_DEVICE` overrides.
 //! The plan reserves the mic target and points the desktop-audio loopback at a DIFFERENT endpoint, so
 //! injecting here can never echo into the host→client audio stream (see
@@ -238,9 +239,10 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
             );
         }
         anyhow::bail!(
-            "no virtual-mic render endpoint on this box. Install VB-Audio Virtual Cable (the host \
-             installer bundles it) or enable Steam Remote Play's microphone (Steam Streaming \
-             Microphone), or set PUNKTFUNK_MIC_DEVICE=<friendly-name substring>."
+            "no virtual-mic render endpoint on this box. Install Steam (the host mints its own \
+             microphone endpoint from Steam's streaming drivers — Steam never needs to run), or \
+             install VB-Audio Virtual Cable, or set PUNKTFUNK_MIC_DEVICE=<friendly-name \
+             substring>."
         );
     };
     let name = ep.0.clone();

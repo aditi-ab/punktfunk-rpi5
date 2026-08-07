@@ -12,12 +12,15 @@
 //!
 //! WASAPI loopback captures *everything* an endpoint renders — including what the virtual mic
 //! writes — so if both land on the same device the client's voice echoes straight back into the
-//! client's own audio stream. The plan therefore assigns the mic its endpoint FIRST (VB-CABLE is
-//! bundled by the installer for exactly this) and gives the loopback a *different* one; when only
+//! client's own audio stream. **Tier-0** avoids the collision by construction: the host mints
+//! its OWN pair from Steam's streaming drivers ([`MintedIds`] — "Punktfunk Microphone" for the
+//! mic, "Punktfunk Speakers" for the loopback, matched by ID because their names are identical
+//! to Steam's primaries). Below tier-0, the name ladder keeps the old discipline: the mic is
+//! assigned FIRST (VB-CABLE was bundled by installers until the audio-substrate change; a
+//! user-installed cable still serves) and the loopback gets a *different* endpoint; when only
 //! the cable exists (headless box, no other output), the MIC wins and the loopback is honestly
 //! unavailable. The old code did the opposite — the mic refused the cable because it was the
-//! default render endpoint — which permanently killed mic passthrough in the exact configuration
-//! the installer ships (VB-CABLE as the only render device).
+//! default render endpoint — which permanently killed mic passthrough on exactly that box.
 //!
 //! **One exception to mic-first — game audio outranks the mic.** The Steam Streaming
 //! Microphone's render side is ALSO the only silent client-only loopback sink, so the mic may
@@ -192,9 +195,11 @@ impl Wiring {
 }
 
 /// Render-endpoint friendly-name substrings (lowercased) usable as the virtual-mic write target,
-/// ordered by preference. VB-CABLE first: the installer bundles it for this exact purpose.
+/// ordered by preference — the NAME ladder below the minted tier-0 ([`MintedIds`] outranks all
+/// of these). VB-CABLE first among the names: installers bundled it for the mic until the
+/// audio-substrate change, and a user-installed cable still serves.
 const MIC_CANDIDATES: &[&str] = &[
-    "cable input", // VB-Audio Virtual Cable — bundled by the installer
+    "cable input", // VB-Audio Virtual Cable — user-installed / from older bundled installs
     "steam streaming microphone",
     "voicemeeter input",
     "voicemeeter aux input",

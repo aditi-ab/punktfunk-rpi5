@@ -36,16 +36,15 @@ Documentations:
 
 # Shown BEFORE download/install; the user must accept or the install does not proceed. This is what
 # carries — on the unattended path, where no wizard page is on screen — the disclosures the wizard
-# puts in its task text. VB-Audio's bundling grant specifically requires the end user to see
-# VB-CABLE's origin + donationware status at install time.
+# surfaces interactively.
 Agreements:
-  - AgreementLabel: Bundled virtual audio (VB-CABLE by VB-Audio)
+  - AgreementLabel: Audio requires Steam installed on this PC
     Agreement: >-
-      Punktfunk's streaming microphone uses VB-CABLE by VB-Audio (www.vb-cable.com), which this
-      installer bundles and installs. VB-CABLE is donationware — all participations welcome. It is
-      redistributed under VB-Audio's bundling grant; the full notice is installed to
-      %ProgramFiles%\punktfunk\licenses\VB-CABLE-NOTICE.txt.
-    AgreementUrl: https://vb-audio.com/Cable/
+      Punktfunk streams game audio and microphone passthrough through its own instances of
+      Steam's streaming audio drivers. Steam only needs to be installed — it never has to run.
+      Without Steam, this host streams video only; installing Steam later is picked up
+      automatically.
+    AgreementUrl: https://store.steampowered.com/about/
   - AgreementLabel: GameStream (Moonlight) compatibility is OFF by default
     Agreement: >-
       Punktfunk's own clients work out of the box. Support for stock Moonlight clients is a separate,

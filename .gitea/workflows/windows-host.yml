@@ -148,13 +148,6 @@ jobs:
           if (-not $env:FFMPEG_DIR) {
             "FFMPEG_DIR=C:\Users\Public\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
-          # VBCABLE_DIR: the pinned official VB-CABLE package (provisioned by
-          # provision-windows-punktfunk-extras.ps1) -> pack-host-installer.ps1 bundles the
-          # streaming virtual microphone. Same daemon-env-or-fallback pattern as FFMPEG_DIR
-          # (the daemon env only refreshes on a runner-task restart).
-          if (-not $env:VBCABLE_DIR) {
-            "VBCABLE_DIR=C:\Users\Public\vbcable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
           $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $env:GITHUB_REF_NAME -replace '^v', ''
@@ -404,7 +397,6 @@ jobs:
             @{ n = 'bun runtime (BUN_EXE)';           p = $env:BUN_EXE;          f = '' }
             @{ n = 'plugin runner (SCRIPTING_BUNDLE)';p = $env:SCRIPTING_BUNDLE; f = '' }
             @{ n = 'FFmpeg DLLs (FFMPEG_DIR\bin)';    p = $env:FFMPEG_DIR;       f = 'bin' }
-            @{ n = 'VB-CABLE (VBCABLE_DIR)';          p = $env:VBCABLE_DIR;      f = 'VBCABLE_Setup_x64.exe' }
           )
           $missing = @()
           foreach ($x in $need) {

@@ -3,7 +3,10 @@
 //!
 //! A headless host has no real audio output, so BOTH the desktop-audio loopback ([`super::wasapi_cap`])
 //! and the virtual mic ([`super::wasapi_mic`]) must run on VIRTUAL audio cables — and on DIFFERENT
-//! ones, or the loopback re-captures the injected mic (an infinite echo). The installer bundles
+//! ones, or the loopback re-captures the injected mic (an infinite echo). The host mints its own
+//! endpoint pair from Steam's streaming drivers (see [`super::minted`] — the plan's tier-0); the
+//! name-based ladder below covers boxes where minting is unavailable. Historically the installer
+//! bundled
 //! VB-Audio Virtual Cable (the mic target: its "CABLE Input" render endpoint → "CABLE Output" capture)
 //! and the host auto-installs the Steam Streaming pair (a loopback-capable render). This module wires
 //! them up so no manual Sound-settings fiddling is ever needed:
