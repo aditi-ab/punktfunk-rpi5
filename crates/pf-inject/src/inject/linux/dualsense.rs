@@ -17,6 +17,7 @@ use super::dualsense_proto::{
     DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT,
     DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
+use crate::sensor_clock::SensorClock;
 use crate::uhid_abi::{
     put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
     UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
@@ -28,6 +29,7 @@ use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::Instant;
 
 /// The UHID identity a [`DualSensePad`] is created with — the plain DualSense or the Edge (same
 /// driver, same report codec; the Edge differs by PID + descriptor and carries the four extra
@@ -71,7 +73,7 @@ impl DsUhidIdentity {
 pub struct DualSensePad {
     fd: File,
     seq: u8,
-    ts: u32,
+    clock: SensorClock,
 }
 
 impl DualSensePad {
@@ -86,7 +88,11 @@ impl DualSensePad {
             .with_context(|| {
                 format!("open {UHID_PATH} (is the 60-punktfunk.rules uhid rule installed + are you in 'input'?)")
             })?;
-        let mut ds = DualSensePad { fd, seq: 0, ts: 0 };
+        let mut ds = DualSensePad {
+            fd,
+            seq: 0,
+            clock: SensorClock::dualsense(),
+        };
         ds.send_create2(index, id)
             .context("UHID_CREATE2 DualSense")?;
         Ok(ds)
@@ -116,9 +122,9 @@ impl DualSensePad {
     /// Serialize `st` into report `0x01` and write it to the kernel (UHID_INPUT2).
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
         self.seq = self.seq.wrapping_add(1);
-        self.ts = self.ts.wrapping_add(1); // monotonic sensor timestamp is all the kernel needs
+        let ts = self.clock.ds_ticks(Instant::now());
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, self.ts);
+        serialize_state(&mut r, st, self.seq, ts);
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
@@ -275,6 +281,14 @@ impl PadProto for DsLinuxProto {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
 
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
+    }
+
     fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {
         let _ = pad.write_state(st);
     }
@@ -366,6 +380,14 @@ impl PadProto for DsEdgeLinuxProto {
     /// split the one touchpad left/right, pad clicks ride touch_click.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
+    }
+
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {

@@ -189,6 +189,20 @@ explicit choice declares your choice — and the host builds each virtual pad fr
 host has no backend for degrades to an Xbox 360 pad rather than failing: Xbox One on a Windows host,
 for instance, or any Sony pad on a Linux host that can't open `/dev/uhid`.
 
+That degrade is the one thing worth knowing about **motion**. An Xbox-class virtual pad has no
+gyroscope in its HID contract, so a session that ends up on one throws every motion sample away —
+your controller's gyro simply does nothing, which from the couch is indistinguishable from a broken
+sensor. Automatic lands there for any controller punktfunk doesn't recognise as Sony or Valve (an
+8BitDo with a gyro, say), and so does a Switch Pro streaming to a Windows host, which has no
+Nintendo backend to build. **If you want motion, pick a DualSense-class type** — DualSense,
+DualSense Edge, DualShock 4, Switch Pro or Steam Deck all carry a motion plane. The clients detect
+this case and say so on-screen for a few seconds when it happens; the setting applies from the next
+session, not the one you are in.
+
+On a **Steam Deck as the client**, motion also needs Steam Input switched off for punktfunk — with
+it on, Steam hands the app its own virtual Xbox pad, which has no gyro to forward no matter which
+type you pick.
+
 **Forwarded controller** (*Use controller* on Apple and the console home) — *default: Automatic*,
 which forwards *every* connected controller, each as its own player, on Linux, Windows, Apple and the
 console home. Pinning one restricts the session to that controller alone — single-player. The Android

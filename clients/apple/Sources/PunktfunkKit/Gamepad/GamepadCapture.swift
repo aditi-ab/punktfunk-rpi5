@@ -66,7 +66,6 @@ public final class GamepadCapture {
         var buttons: UInt32 = 0
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
         var fingerActive: [Bool] = [false, false]
-        var lastMotionNs: UInt64 = 0
         /// A motion sample went out on this pad — `flush` then owes the wire a zero-gyro
         /// sample: the host holds motion as STATE and re-emits it, so a nonzero angular
         /// velocity left behind reads as endless rotation (the gyro-sweep latch).
@@ -95,9 +94,6 @@ public final class GamepadCapture {
     /// Open forwarded controllers, one Slot per physical pad on its own wire index. Reconciled
     /// against `manager.forwarded` (empty until a session's `start`, cleared by `stop`).
     private var slots: [Slot] = []
-
-    /// Motion forwarding floor: ≥ 4 ms between samples (≈ 250 Hz, the DualSense's own rate).
-    private static let motionIntervalNs: UInt64 = 4_000_000
 
     /// The cross-client controller escape chord (pf-client-core's `ESCAPE_CHORD`):
     /// L1+R1+Start+Select held together — four simultaneous buttons no game uses, so normal
@@ -134,6 +130,15 @@ public final class GamepadCapture {
     /// stream with a controller: B/Menu presses are deliberately swallowed during a session so
     /// gameplay can't end it (see ContentView's tvOS session branch).
     public var onDisconnectRequest: (() -> Void)?
+
+    /// Fired ON MAIN, once per slot at open, when a controller that HAS a gyro was given a host
+    /// backend without a motion plane — its motion is not being sent, because every sample would
+    /// be decoded and dropped. The argument is the kind this pad declared, so the UI can name it.
+    ///
+    /// It fires at open rather than on the first sample precisely because nothing is sampled: the
+    /// IMU is never powered in this case (see `openSlot`), which is also what stops the pad
+    /// burning battery streaming gyro nobody reads.
+    public var onMotionUnreachable: ((PunktfunkConnection.GamepadType) -> Void)?
 
     /// Forward this device's controllers to the host at all (`Settings.gamepadForwarding`,
     /// default true). Off is for a couch whose controller reaches the host another way — USB
@@ -335,10 +340,43 @@ public final class GamepadCapture {
         // local feature reads it. Powering the IMU anyway costs the pad real battery (it streams
         // gyro + accel continuously over Bluetooth, which is why `closeSlot` is careful to power
         // it back down), so with nothing to forward we simply never turn it on.
-        if forwarding, let motion = c.motion {
-            if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
-            motion.valueChangedHandler = { [weak self, weak slot] m in
-                MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
+        //
+        // A host that built this pad a backend WITHOUT a motion plane is the same situation: every
+        // sample would be decoded and dropped, so there is equally nothing to forward. Asked per
+        // pad off what this slot declared, not off the session echo — under "Automatic" a couch
+        // with an X-Box pad on 0 and a DualSense on 1 echoes X-Box 360 while the host builds pad 1
+        // a DualSense whose gyro works.
+        //
+        // Gated on `hasRotationRate`, not on `motion != nil`. An X-Box controller exposes a
+        // `GCMotion` that reports gravity and NOTHING else — attaching to it streamed a
+        // permanently-zero `rotationRate` to the host as authoritative gyro, under a declaration
+        // that says this pad has one. A game reading it sees a controller being held perfectly
+        // still forever, which is worse than seeing no motion plane at all: there is nothing to
+        // fall back to and nothing to notice.
+        let motionCanReach = connection.motionReaches(declared: slot.pref)
+        if forwarding, let motion = c.motion, motion.hasRotationRate {
+            if motionCanReach {
+                if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
+                // Delivered on the MAIN queue, like every other handler here, and deliberately so
+                // even though ~250 Hz of samples on main is not free.
+                //
+                // GameController's `handlerQueue` is a property of the CONTROLLER, not of an
+                // element, so there is no way to move motion off main without moving buttons,
+                // sticks, the touchpad and the escape chord with it. This whole class is
+                // `@MainActor` — eight `assumeIsolated` sites, the slot table, the gesture timers
+                // — so that is a rewrite of the isolation model, not a queue assignment. It would
+                // also put the tvOS escape chord (the ONLY controller way out of a stream there)
+                // on a background queue, which is a real risk taken for a speculative gain.
+                //
+                // If main-queue contention ever shows up as motion jitter, the measurement to make
+                // first is `motion_cadence`'s per-pad inter-arrival histogram on the host — it
+                // already reports exactly this, and would say whether the delay is here or on the
+                // wire before anyone restructures the class for it.
+                motion.valueChangedHandler = { [weak self, weak slot] m in
+                    MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
+                }
+            } else {
+                onMotionUnreachable?(slot.pref)
             }
         }
     }
@@ -604,34 +642,70 @@ public final class GamepadCapture {
         // would keep stomping the mirror's gyro with zeros.
         if slot.pad == 0, deviceGyro?.isRunning == true { return }
         #endif
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard now &- slot.lastMotionNs >= Self.motionIntervalNs else { return }
-        slot.lastMotionNs = now
-        // Total acceleration in g: gravity + user when split, else the raw vector.
+        // Every sample goes out. There used to be a 4 ms floor here, and it was a DROP: a sample
+        // arriving 3.9 ms after the last one was discarded outright.
+        //
+        // That is the wrong shape for this signal. Buttons and sticks are absolute state, so a
+        // dropped frame costs nothing — the next one says everything it would have. Angular
+        // velocity is a RATE, and a consumer integrates it into an angle; a dropped sample is
+        // rotation that happened and can never be recovered. GameController's delivery is jittery
+        // around the pad's own ~250 Hz, so a floor set AT that rate does not shed a rare extra
+        // sample, it sheds a steady fraction of every turn — and the error is one-signed, so it
+        // accumulates into aim drifting short rather than into noise.
+        //
+        // Nothing needed the ceiling: GC delivers at the sensor's rate rather than faster, the SDL
+        // client has always forwarded every sample, and the host's own idle watchdog runs on a
+        // 100 ms timeout this cannot outpace. The throttle's `lastMotionNs`/`motionIntervalNs` went
+        // with it rather than being left set-but-unread — nothing else consumed either.
+        // Total acceleration in g: gravity + user when split, else the raw vector — then NEGATED
+        // into the wire's convention.
+        //
+        // Apple reports acceleration as the gravity VECTOR: a device lying flat face-up reads
+        // z = −1, because gravity points down. An accelerometer physically measures proper
+        // acceleration, which at rest is the +1 g normal force pushing UP, and that is what a
+        // DualSense's report — the wire's convention — carries. The two are exact negatives, so
+        // every sample we sent was upside down, on both branches (`m.acceleration` follows the
+        // same Apple convention as the gravity/user split).
+        //
+        // Measured on glass 2026-08-07 (G16): a DualSense flat and face-up, streamed from an
+        // iPhone to a Linux host, arrived at hid-playstation as z = −0.99 g where +1.00 was owed.
+        // Magnitude was 1.006 g, so the SCALE was already right — this is purely direction.
+        // `rotationRate` is a true angular rate and needs no flip; the same session confirmed yaw
+        // came through with the correct sign.
         let ax: Float
         let ay: Float
         let az: Float
         if m.hasGravityAndUserAcceleration {
-            ax = Float(m.gravity.x + m.userAcceleration.x)
-            ay = Float(m.gravity.y + m.userAcceleration.y)
-            az = Float(m.gravity.z + m.userAcceleration.z)
+            ax = -Float(m.gravity.x + m.userAcceleration.x)
+            ay = -Float(m.gravity.y + m.userAcceleration.y)
+            az = -Float(m.gravity.z + m.userAcceleration.z)
         } else {
-            ax = Float(m.acceleration.x)
-            ay = Float(m.acceleration.y)
-            az = Float(m.acceleration.z)
+            ax = -Float(m.acceleration.x)
+            ay = -Float(m.acceleration.y)
+            az = -Float(m.acceleration.z)
         }
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
+        // Into the DualSense report frame. GameController and the pad's own report do not agree
+        // about which slot is which axis — measured, both from the same controller, on 2026-08-07
+        // — so forwarding GC's x/y/z straight through sent yaw where the game reads roll. See
+        // `GamepadWire.appleMotionToWire`. One change of basis, applied to both planes.
+        let g = GamepadWire.appleMotionToWire(
+            (Float(m.rotationRate.x), Float(m.rotationRate.y), Float(m.rotationRate.z)))
+        let a = GamepadWire.appleMotionToWire((ax, ay, az))
         let gyro = (
-            GamepadWire.motionRaw(Float(m.rotationRate.x), scale: gs),
-            GamepadWire.motionRaw(Float(m.rotationRate.y), scale: gs),
-            GamepadWire.motionRaw(Float(m.rotationRate.z), scale: gs)
+            GamepadWire.motionRaw(g.0, scale: gs),
+            GamepadWire.motionRaw(g.1, scale: gs),
+            GamepadWire.motionRaw(g.2, scale: gs)
         )
         let accel = (
-            GamepadWire.motionRaw(ax, scale: as_),
-            GamepadWire.motionRaw(ay, scale: as_),
-            GamepadWire.motionRaw(az, scale: as_)
+            GamepadWire.motionRaw(a.0, scale: as_),
+            GamepadWire.motionRaw(a.1, scale: as_),
+            GamepadWire.motionRaw(a.2, scale: as_)
         )
+        // Recorded AFTER the frame conversion, deliberately: `flush` replays `lastAccel` beside a
+        // zero gyro, so it has to be the vector that actually went on the wire. Stashing the
+        // pre-conversion one would park a still pad's gravity in the wrong axis.
         if wire != nil {
             slot.motionSent = true
             slot.lastAccel = accel

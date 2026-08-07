@@ -9,15 +9,17 @@
 //! button (the DS4 hardware has none), so the only feedback it surfaces is motor rumble (universal
 //! 0xCA plane) and the lightbar (HID-output 0xCD `Led`). The button/stick/dpad/touchpad mapping is
 //! identical to the DualSense, so we reuse its pure [`DsState`] + [`DsState::from_gamepad`]; the
-//! report codec (input `0x01` serializer, output `0x05` parser, touch dims) is the pure
-//! [`super::dualshock4_proto`], shared with the Windows UMDF backend — this module is only the
-//! `/dev/uhid` transport plus the report descriptor + feature-report handshake the kernel needs.
+//! report codec (input `0x01` serializer, output `0x05` parser, touch dims, and the feature blobs
+//! the kernel GET_REPORTs) is the pure [`super::dualshock4_proto`], shared with the Windows UMDF
+//! backend — this module is only the `/dev/uhid` transport plus the report descriptor and the
+//! handshake that answers those GET_REPORTs.
 
 use super::dualsense_proto::DsState;
 use super::dualshock4_proto::{
-    parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_TOUCH_H,
-    DS4_TOUCH_W, DS4_VENDOR,
+    ds4_pairing_reply, parse_ds4_output, serialize_state, Ds4Feedback, DS4_FEATURE_CALIBRATION,
+    DS4_FEATURE_FIRMWARE, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_TOUCH_H, DS4_TOUCH_W, DS4_VENDOR,
 };
+use crate::sensor_clock::SensorClock;
 use crate::uhid_abi::{
     put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
     UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
@@ -29,60 +31,7 @@ use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-
-// Feature reports `hid-playstation` GET_REPORTs during DS4 init. The PAIRING report (0x12) is
-// MANDATORY — without a valid reply `dualshock4_create()` aborts and creates NO input devices; the
-// kernel reads the 6-byte device MAC from bytes 1..7. CALIBRATION (0x02) and FIRMWARE (0xa3) are
-// non-fatal (the kernel warns + falls back to identity IMU calibration), but we answer them for
-// correct motion scaling. Each array's first byte is the report id (the kernel hard-checks it).
-#[rustfmt::skip]
-const DS4_FEATURE_PAIRING: &[u8] = &[ // report 0x12 (MAC at bytes 1..7, LE → DE:AD:BE:EF:00:01)
-    0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-
-/// The pairing reply for wire pad `pad`: [`DS4_FEATURE_PAIRING`] with the MAC's low octet offset
-/// by the pad index — same per-pad-serial contract as the DualSense's
-/// [`ds_pairing_reply`](super::dualsense_proto::ds_pairing_reply): the kernel adopts the MAC as
-/// the HID uniq, and SDL/Steam dedup controllers by that serial.
-fn ds4_pairing_reply(pad: u8) -> [u8; 16] {
-    let mut r = [0u8; 16];
-    r.copy_from_slice(DS4_FEATURE_PAIRING);
-    r[1] = r[1].wrapping_add(pad); // MAC lives at bytes 1..7, LSB first
-    r
-}
-#[rustfmt::skip]
-const DS4_FEATURE_CALIBRATION: &[u8] = &[ // report 0x02 (IMU calibration; all signed le16 words)
-    0x02,
-    0x00, 0x00, // gyro_pitch_bias  = 0
-    0x00, 0x00, // gyro_yaw_bias    = 0
-    0x00, 0x00, // gyro_roll_bias   = 0
-    0x10, 0x00, // gyro_pitch_plus  = +16
-    0xF0, 0xFF, // gyro_pitch_minus = -16
-    0x10, 0x00, // gyro_yaw_plus    = +16
-    0xF0, 0xFF, // gyro_yaw_minus   = -16
-    0x10, 0x00, // gyro_roll_plus   = +16
-    0xF0, 0xFF, // gyro_roll_minus  = -16
-    0x20, 0x00, // gyro_speed_plus  = +32
-    0x20, 0x00, // gyro_speed_minus = +32
-    0x00, 0x20, // acc_x_plus  = +8192
-    0x00, 0xE0, // acc_x_minus = -8192
-    0x00, 0x20, // acc_y_plus  = +8192
-    0x00, 0xE0, // acc_y_minus = -8192
-    0x00, 0x20, // acc_z_plus  = +8192
-    0x00, 0xE0, // acc_z_minus = -8192
-    0x00, 0x00, // trailing pad (descriptor declares 36 data bytes)
-];
-#[rustfmt::skip]
-const DS4_FEATURE_FIRMWARE: &[u8] = &[ // report 0xa3 (build date string + hw/fw versions; cosmetic)
-    0xA3, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, // "Aug  3 2013"
-    0x00, 0x00, 0x00, 0x00, 0x00,
-    0x30, 0x37, 0x3A, 0x30, 0x31, 0x3A, 0x31, 0x32, // "07:01:12"
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xA0, // hw_version = 0xA000 (buf[35])
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x01, // fw_version = 0x0100 (buf[41])
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // trailing pad (buf[43..49]) → 49 bytes total
-];
+use std::time::Instant;
 
 /// Sony DualShock 4 v2 USB HID report descriptor (507 bytes) — a verbatim real-device capture
 /// (CUH-ZCT2E, `054C:09CC`). Declares input `0x01` (64 B), output `0x05` (32 B), and the feature
@@ -140,7 +89,7 @@ const DS4_RDESC: &[u8] = &[
 pub struct DualShock4Pad {
     fd: File,
     counter: u8,
-    ts: u16,
+    clock: SensorClock,
 }
 
 impl DualShock4Pad {
@@ -157,7 +106,7 @@ impl DualShock4Pad {
         let mut ds = DualShock4Pad {
             fd,
             counter: 0,
-            ts: 0,
+            clock: SensorClock::dualshock4(),
         };
         ds.send_create2(index).context("UHID_CREATE2 DualShock4")?;
         Ok(ds)
@@ -187,9 +136,9 @@ impl DualShock4Pad {
     /// Serialize `st` into report `0x01` and write it to the kernel (UHID_INPUT2).
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
         self.counter = self.counter.wrapping_add(1);
-        self.ts = self.ts.wrapping_add(188); // ~1ms in the DS4's 5.33µs sensor-clock units
+        let ts = self.clock.ds4_ticks(Instant::now());
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.counter, self.ts);
+        serialize_state(&mut r, st, self.counter, ts);
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
@@ -346,6 +295,14 @@ impl PadProto for Ds4LinuxProto {
         st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
     }
 
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
+    }
+
     fn write_state(&self, pad: &mut DualShock4Pad, st: &DsState) {
         let _ = pad.write_state(st);
     }
@@ -383,6 +340,7 @@ pub type DualShock4Manager = UhidManager<Ds4LinuxProto>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dualshock4_proto::DS4_FEATURE_PAIRING;
 
     // The report 0x01 serializer + output 0x05 parser are covered in `dualshock4_proto` (the codec
     // is shared with the Windows backend); only the UHID-transport-specific pieces are tested here.

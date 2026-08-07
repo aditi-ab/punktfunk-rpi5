@@ -84,6 +84,30 @@ pub trait PadProto {
     fn force_heartbeat(&self, _pad: &Self::Pad) -> bool {
         false
     }
+
+    /// Zero this state's **angular velocity**, keeping everything else — acceleration included.
+    /// Returns whether anything actually changed, so a pad already at rest costs no write.
+    ///
+    /// Motion is a level-triggered plane: [`merge_frame`](Self::merge_frame) preserves the last
+    /// sample and the heartbeat re-emits it with a fresh sequence, so a client that stops sending
+    /// Motion — backgrounded app, a suspended session, a controller swapped for one with no gyro —
+    /// leaves the virtual pad reporting a constant rotation that anything integrating gyro aim
+    /// will happily spin on forever. Rumble and the pen plane each have an idle watchdog; this is
+    /// motion's, driven from [`MOTION_IDLE_TIMEOUT`].
+    ///
+    /// Acceleration is deliberately NOT zeroed: gravity is legitimately persistent, so a still pad
+    /// reporting 1 g down stays correct while a still pad reporting 200 °/s does not.
+    ///
+    /// Backends with no motion plane leave this a no-op and never take the extra write.
+    fn neutralize_gyro(&self, _st: &mut Self::State) -> bool {
+        false
+    }
+
+    /// Reset the rich-plane fields (touchpad contacts + motion) to what a fresh pad carries,
+    /// leaving buttons, sticks and every feedback cursor alone — for the replug-grace re-claim
+    /// ([`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed)), where a different controller
+    /// inherits a live virtual pad without passing through the manager's `reset_pad`.
+    fn clear_rich(&self, _st: &mut Self::State) {}
 }
 
 /// All virtual pads of one stateful backend, driven from decoded controller events — the shared
@@ -107,6 +131,10 @@ pub struct UhidManager<B: PadProto> {
     /// [`RUMBLE_IDLE_TIMEOUT`] against this is a residual the game abandoned — see
     /// [`pump`](Self::pump).
     last_active: Vec<Instant>,
+    /// When each pad last received a `RichInput::Motion`. `None` before the first sample and again
+    /// once the gyro has been neutralized, so a pad with no motion feed costs nothing per tick —
+    /// see [`MOTION_IDLE_TIMEOUT`].
+    last_motion: Vec<Option<Instant>>,
     /// Per-pad rate limiter for the ring-overflow WARN — see [`OverflowWarn`].
     overflow_warn: Vec<OverflowWarn>,
 }
@@ -182,6 +210,14 @@ impl OverflowWarn {
 /// titles actually hit; the hatch below exists for exactly that experiment.
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
+/// How long a pad's motion feed may go quiet before its angular velocity is zeroed — see
+/// [`PadProto::neutralize_gyro`]. Wide enough to ride out a hiccup in a 250 Hz feed (~25 missed
+/// samples, and the client's own capture floors are ~4 ms), tight enough that a feed which stops
+/// for good doesn't hand the game a visible spin. Unlike [`RUMBLE_IDLE_TIMEOUT`] there is no
+/// "legitimately held" case to protect: a still controller sends a zero sample, it does not stop
+/// sending.
+const MOTION_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// The abandoned-rumble force-off window, env-hatched: `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
 /// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables the watchdog entirely (the pre-watchdog behavior, for
 /// bisecting field reports). Non-zero overrides are floored just above SDL's ~2 s resend so the
@@ -222,6 +258,7 @@ impl<B: PadProto> UhidManager<B> {
             hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             last_active: vec![Instant::now(); MAX_PADS],
+            last_motion: vec![None; MAX_PADS],
             overflow_warn: vec![OverflowWarn::default(); MAX_PADS],
         }
     }
@@ -240,8 +277,9 @@ impl<B: PadProto> UhidManager<B> {
                 }
                 // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
                 // on a later `pump` tick — this frame is the only one the producer sends).
-                let swept = self.slots.sweep(f.active_mask);
-                self.reset_swept(swept);
+                let sweep = self.slots.sweep(f.active_mask);
+                self.reset_swept(sweep.dropped);
+                self.clear_reclaimed_rich(sweep.reclaimed);
                 if f.active_mask & (1 << idx) == 0 {
                     return; // this event WAS the unplug
                 }
@@ -267,6 +305,9 @@ impl<B: PadProto> UhidManager<B> {
         if idx >= MAX_PADS || self.slots.get(idx).is_none() {
             return;
         }
+        if matches!(rich, RichInput::Motion { .. }) {
+            self.last_motion[idx] = Some(Instant::now());
+        }
         self.backend.apply_rich(&mut self.state[idx], rich);
         self.write(idx);
     }
@@ -281,9 +322,17 @@ impl<B: PadProto> UhidManager<B> {
             let Some(pad) = self.slots.get(i) else {
                 continue;
             };
-            if self.backend.force_heartbeat(pad)
-                || now.duration_since(self.last_write[i]) >= max_gap
-            {
+            let forced = self.backend.force_heartbeat(pad);
+            // A motion feed that stopped must not keep re-emitting its last angular velocity: the
+            // heartbeat below re-sends the current report forever, and with a real sensor clock
+            // each re-send carries an honestly larger dt — precisely the shape of phantom
+            // rotation. Zero the gyro once and stop watching until the feed comes back.
+            let mut neutralized = false;
+            if self.last_motion[i].is_some_and(|t| now.duration_since(t) >= MOTION_IDLE_TIMEOUT) {
+                self.last_motion[i] = None;
+                neutralized = self.backend.neutralize_gyro(&mut self.state[i]);
+            }
+            if neutralized || forced || now.duration_since(self.last_write[i]) >= max_gap {
                 self.write(i);
             }
         }
@@ -403,6 +452,19 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
+    /// Clear the rich-plane state of every slot a sweep re-claimed inside its grace window (see
+    /// [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed)). Rich fields only: rumble and the
+    /// hidout dedup deliberately survive a removal, and buttons/sticks arrive on the very frame
+    /// that re-set the mask bit.
+    fn clear_reclaimed_rich(&mut self, reclaimed: u16) {
+        for i in 0..MAX_PADS {
+            if reclaimed & (1 << i) != 0 {
+                self.backend.clear_rich(&mut self.state[i]);
+                self.last_motion[i] = None;
+            }
+        }
+    }
+
     /// Reset one pad's sibling state (on create and unplug) so the first frame/feedback after a
     /// (re)connect starts from scratch and is always forwarded.
     fn reset_pad(&mut self, idx: usize) {
@@ -411,6 +473,17 @@ impl<B: PadProto> UhidManager<B> {
         self.hidout_dedup[idx].clear();
         self.last_write[idx] = Instant::now();
         self.last_active[idx] = Instant::now();
+        self.last_motion[idx] = None;
+    }
+
+    /// Backdate every pad's motion clock past [`MOTION_IDLE_TIMEOUT`], so the next
+    /// [`heartbeat`](Self::heartbeat) neutralizes a stale gyro without a wall-clock sleep — the
+    /// same test hatch `PadSlots::expire_grace` gives the unplug debounce. Test-only.
+    #[cfg(test)]
+    fn expire_motion(&mut self) {
+        for t in self.last_motion.iter_mut().flatten() {
+            *t -= MOTION_IDLE_TIMEOUT;
+        }
     }
 }
 
@@ -434,6 +507,10 @@ mod tests {
         /// Stands in for the rich-plane fields (touch/motion/clicks): set by `apply_rich`,
         /// must survive `merge_frame`.
         rich_marker: u16,
+        /// Stands in for angular velocity — zeroed by the idle-motion watchdog.
+        gyro: i16,
+        /// Stands in for acceleration, which the watchdog must NOT zero (gravity is persistent).
+        accel: i16,
     }
 
     /// Per-pad transport stub recording every state write.
@@ -463,13 +540,32 @@ mod tests {
         fn merge_frame(&self, prev: &MockState, f: &GamepadFrame) -> MockState {
             MockState {
                 buttons: f.buttons,
-                rich_marker: prev.rich_marker, // the preserve-rich-fields contract
+                // The preserve-rich-fields contract — and the reason a stale motion sample lives
+                // forever without a watchdog.
+                rich_marker: prev.rich_marker,
+                gyro: prev.gyro,
+                accel: prev.accel,
             }
         }
         fn apply_rich(&self, st: &mut MockState, rich: RichInput) {
-            if let RichInput::Touchpad { x, .. } = rich {
-                st.rich_marker = x;
+            match rich {
+                RichInput::Touchpad { x, .. } => st.rich_marker = x,
+                RichInput::Motion { gyro, accel, .. } => {
+                    st.gyro = gyro[0];
+                    st.accel = accel[2];
+                }
+                _ => {}
             }
+        }
+        fn neutralize_gyro(&self, st: &mut MockState) -> bool {
+            let changed = st.gyro != 0;
+            st.gyro = 0;
+            changed
+        }
+        fn clear_rich(&self, st: &mut MockState) {
+            st.rich_marker = 0;
+            st.gyro = 0;
+            st.accel = 0;
         }
         fn write_state(&self, pad: &mut MockPad, st: &MockState) {
             pad.writes.borrow_mut().push(*st);
@@ -506,8 +602,95 @@ mod tests {
         }
     }
 
+    fn motion(pad: u8, gyro_x: i16, accel_z: i16) -> RichInput {
+        RichInput::Motion {
+            pad,
+            gyro: [gyro_x, 0, 0],
+            accel: [0, 0, accel_z],
+        }
+    }
+
     fn mgr() -> UhidManager<MockProto> {
         UhidManager::new()
+    }
+
+    /// A motion feed that stops must not leave the pad rotating forever: past
+    /// [`MOTION_IDLE_TIMEOUT`] the heartbeat zeroes the angular velocity, keeps the acceleration,
+    /// and writes the corrected report. `max_gap` is huge here so the ONLY thing that can produce
+    /// a write is the neutralize.
+    #[test]
+    fn a_stalled_motion_feed_has_its_gyro_neutralized() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        m.apply_rich(motion(0, 900, 10_000));
+        assert_eq!(m.state[0].gyro, 900);
+
+        m.heartbeat(Duration::from_secs(3600));
+        assert_eq!(m.state[0].gyro, 900, "neutralized inside the idle window");
+
+        m.expire_motion();
+        m.heartbeat(Duration::from_secs(3600));
+        assert_eq!(
+            m.state[0].gyro, 0,
+            "stale angular velocity outlived the watchdog"
+        );
+        assert_eq!(
+            m.state[0].accel, 10_000,
+            "gravity must survive the neutralize"
+        );
+        let pad = m.slots.get(0).unwrap();
+        let writes = pad.writes.borrow();
+        assert_eq!(
+            writes.last().unwrap().gyro,
+            0,
+            "the neutralized state never reached the pad"
+        );
+    }
+
+    /// …and only when there is something to zero: a pad already at rest must not manufacture a
+    /// write on every tick.
+    #[test]
+    fn neutralizing_an_already_still_pad_writes_nothing() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        m.apply_rich(motion(0, 0, 10_000));
+        let before = m.slots.get(0).unwrap().writes.borrow().len();
+        m.expire_motion();
+        m.heartbeat(Duration::from_secs(3600));
+        m.heartbeat(Duration::from_secs(3600));
+        assert_eq!(m.slots.get(0).unwrap().writes.borrow().len(), before);
+    }
+
+    /// A controller that takes over a live pad inside the replug grace skips the create path, so
+    /// nothing else resets what the manager persists on the client's behalf. It must not inherit
+    /// the previous controller's finger or rotation — a pad with no gyro would carry that
+    /// rotation for the rest of the session, having no sample of its own to correct it with.
+    #[test]
+    fn a_grace_reclaim_clears_the_previous_pads_rich_state() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        m.apply_rich(touch(0, 4242));
+        m.apply_rich(motion(0, 900, 10_000));
+
+        m.handle(&frame(0, 0b0, 0)); // the unplug frame: arms the grace, drops nothing
+        assert!(m.slots.get(0).is_some(), "the grace must not drop it here");
+        m.handle(&frame(0, 0b1, 0)); // back inside the grace — same pad, new owner
+
+        assert_eq!(m.state[0].rich_marker, 0, "inherited the last pad's touch");
+        assert_eq!(m.state[0].gyro, 0, "inherited the last pad's rotation");
+    }
+
+    /// The re-claim clear keys off the grace clock, not off presence — a steady mask must never
+    /// trip it, or the client's touch and motion would be wiped on every state frame.
+    #[test]
+    fn a_steady_mask_never_clears_rich_state() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        m.apply_rich(touch(0, 4242));
+        for _ in 0..5 {
+            m.handle(&frame(0, 0b1, 0));
+        }
+        assert_eq!(m.state[0].rich_marker, 4242);
     }
 
     #[test]

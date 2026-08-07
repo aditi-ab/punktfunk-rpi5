@@ -1246,7 +1246,25 @@ pub mod gamepad {
         /// a pre-v2.2 driver that never writes it = [`OUT_RING_LEN`]. Carved from v2.1 reserved
         /// space (v2.2).
         pub out_ring_len: u32,
-        pub _reserved1: [u8; 88],
+        /// Seqlock generation over the [`PadShm::input`] slot (host-written): **odd** while a
+        /// report is mid-copy, **even** when the slot holds a whole one. The host bumps it to odd,
+        /// `Release`-fences, writes the 64 bytes, then `Release`-stores it even; a driver samples
+        /// it before and after its read and retries when it caught a write in flight.
+        ///
+        /// The input slot is a single unqueued buffer that both sides touch without a lock, so a
+        /// driver read landing mid-copy hands the game a report that is half the previous frame
+        /// and half the next. For buttons that is a one-tick glitch; for motion it is a spike in
+        /// angular velocity, and anything integrating gyro aim turns a spike into real aim
+        /// movement. (v2.3)
+        ///
+        /// Version posture, same as the ring's: an old driver never reads this and behaves exactly
+        /// as it does today, and against an old HOST the field stays 0 — a constant even value, so
+        /// a new driver's re-check always passes and it, too, behaves exactly as today. No
+        /// capability stamp is needed because "never written" and "no write in flight" are the
+        /// same observation. Carved from v2.2 reserved space, inside the v2 legacy region so even
+        /// the smallest cross-generation map covers it.
+        pub input_gen: u32,
+        pub _reserved1: [u8; 84],
         /// The lossless output-report ring — [`OUT_RING_LEN`] slots under a v2.1 negotiation,
         /// [`OUT_RING_LEN_V22`] under v2.2 (slots 8.. overlay what v2.1 called `_reserved2`,
         /// which no shipped binary ever read or wrote). See the struct docs and [`OutSlot`].
@@ -1295,6 +1313,11 @@ pub mod gamepad {
         // stays within the v2.1 slots' historical offsets (slot k at 256 + k*68), and the whole
         // struct is exactly the one page that keeps cross-generation views mappable.
         assert!(offset_of!(PadShm, out_ring_len) == 164);
+        // v2.3 input seqlock — 4-aligned (the atomic accessors check it) and inside the v2 legacy
+        // region, so every driver generation's map covers it whether or not it reads it.
+        assert!(offset_of!(PadShm, input_gen) == 168);
+        assert!(offset_of!(PadShm, input_gen) % 4 == 0);
+        assert!(offset_of!(PadShm, input_gen) < PAD_SHM_LEGACY_SIZE);
         assert!(
             PAD_SHM_LEGACY_SIZE + OUT_RING_LEN_USIZE * size_of::<OutSlot>() <= PAD_SHM_V21_SIZE
         );

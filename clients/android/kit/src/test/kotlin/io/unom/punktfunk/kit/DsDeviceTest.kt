@@ -151,6 +151,185 @@ class DsDeviceTest {
         assertFalse(DsDevice.parseState(DsDevice.Model.DUALSHOCK4, ds4Report(), 8, s))
     }
 
+    // ---- IMU calibration (the pad's own scale factors) ----
+
+    /**
+     * A calibration feature report in the pads' USB layout: report id, three gyro bias words, six
+     * INTERLEAVED gyro plus/minus words, the two speed words, six accel plus/minus words — all
+     * little-endian i16, exactly what [DsDevice.MotionCal.parse] reads and what
+     * `crates/pf-inject/tests/motion_contract.rs` writes from the other end.
+     */
+    private fun calBlob(
+        id: Int,
+        gyroBias: IntArray,
+        gyroPlus: IntArray,
+        gyroMinus: IntArray,
+        speed: Int,
+        accelPlus: IntArray,
+        accelMinus: IntArray,
+        len: Int = 41,
+    ): ByteArray = ByteArray(len).also { b ->
+        fun put(o: Int, v: Int) {
+            b[o] = (v and 0xFF).toByte()
+            b[o + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        b[0] = id.toByte()
+        for (i in 0 until 3) {
+            put(1 + 2 * i, gyroBias[i])
+            put(7 + 4 * i, gyroPlus[i])
+            put(9 + 4 * i, gyroMinus[i])
+            put(23 + 4 * i, accelPlus[i])
+            put(25 + 4 * i, accelMinus[i])
+        }
+        put(19, speed)
+        put(21, speed)
+    }
+
+    /**
+     * A realistic DualSense blob: gyro measured at 512 °/s each way over ±8192 counts about a
+     * small factory bias — 16384/1024 = 16 raw LSB per °/s, the ≈±2000 °/s full scale a real pad
+     * has — and accel spanning about ±8192 counts (`DS_ACC_RES_PER_G`) about a per-axis zero point
+     * that is NOT zero. Both are the shape a nominal constant cannot express.
+     */
+    private fun realisticCal(): DsDevice.MotionCal = DsDevice.MotionCal.parse(
+        calBlob(
+            id = 0x05,
+            gyroBias = intArrayOf(10, -6, 3),
+            gyroPlus = intArrayOf(10 + 8192, -6 + 8192, 3 + 8192),
+            gyroMinus = intArrayOf(10 - 8192, -6 - 8192, 3 - 8192),
+            speed = 512, // speed_plus + speed_minus = 1024
+            accelPlus = intArrayOf(8300, 8200, 8000),
+            accelMinus = intArrayOf(-8100, -8192, -8384),
+        ),
+        0x05,
+    )
+
+    @Test
+    fun calibrationRescalesRawCountsOntoTheWireUnits() {
+        val cal = realisticCal()
+        // 100 °/s at this pad's 16 LSB per °/s = 1600 raw → the wire's 20 LSB per °/s = 2000.
+        for (axis in 0 until 3) {
+            assertEquals(2000, cal.gyroToWire(axis, 1600))
+            assertEquals(-2000, cal.gyroToWire(axis, -1600))
+            assertEquals(0, cal.gyroToWire(axis, 0))
+        }
+        // 1 g = the axis's zero point plus half its declared 2 g range → 10000 wire units.
+        val zero = intArrayOf(100, 4, -192) // plus − range/2, per axis
+        val oneG = intArrayOf(8300, 8200, 8000) // = accelPlus
+        for (axis in 0 until 3) {
+            assertEquals(10000, cal.accelToWire(axis, oneG[axis]))
+            assertEquals(0, cal.accelToWire(axis, zero[axis]))
+            assertEquals(-10000, cal.accelToWire(axis, zero[axis] - (oneG[axis] - zero[axis])))
+        }
+        // Both rescales are >1 here, so full-scale raw must clamp rather than wrap the i16.
+        assertEquals(32767, cal.gyroToWire(0, 30000))
+        assertEquals(-32768, cal.gyroToWire(0, -30000))
+        assertEquals(32767, cal.accelToWire(0, 30000))
+        // The capture logs this, and it is the discriminator the owed on-glass check reads: a pad
+        // whose blob was read declares its own resolution, the fallback declares the wire's.
+        assertTrue(cal.toString().startsWith("gyro 16/16/16 LSB/°·s"))
+        assertTrue(DsDevice.MotionCal.NOMINAL.toString().startsWith("gyro 20/20/20 LSB/°·s"))
+    }
+
+    /**
+     * The host's own virtual pads declare `DS_FEATURE_CALIBRATION` (`dualsense_proto.rs`) — a blob
+     * that states the wire's units exactly. Reading it back must therefore be a passthrough: if
+     * this ever stops holding, the client and the host disagree about what a motion sample means.
+     */
+    @Test
+    fun theHostsOwnBlobIsAPassthrough() {
+        val cal = DsDevice.MotionCal.parse(
+            calBlob(
+                id = 0x05,
+                gyroBias = intArrayOf(0, 0, 0),
+                gyroPlus = intArrayOf(10000, 10000, 10000),
+                gyroMinus = intArrayOf(-10000, -10000, -10000),
+                speed = 500,
+                accelPlus = intArrayOf(10000, 10000, 10000),
+                accelMinus = intArrayOf(-10000, -10000, -10000),
+            ),
+            0x05,
+        )
+        for (axis in 0 until 3) {
+            assertEquals(2000, cal.gyroToWire(axis, 2000)) // 100 °/s
+            assertEquals(10000, cal.accelToWire(axis, 10000)) // 1 g
+            assertEquals(-1234, cal.gyroToWire(axis, -1234))
+        }
+    }
+
+    /**
+     * Anything unusable keeps the pre-calibration behaviour — accel on the nominal 8192 LSB/g,
+     * gyro straight through. A pad with no readable calibration is better off slightly mis-scaled
+     * than silent, so nothing here may zero motion.
+     */
+    @Test
+    fun unusableCalibrationFallsBackInsteadOfZeroing() {
+        val degenerate = calBlob(
+            id = 0x02,
+            gyroBias = intArrayOf(0, 0, 0),
+            gyroPlus = intArrayOf(0, 0, 0),
+            gyroMinus = intArrayOf(0, 0, 0),
+            speed = 0,
+            accelPlus = intArrayOf(0, 0, 0),
+            accelMinus = intArrayOf(0, 0, 0),
+            len = 37,
+        )
+        val cals = listOf(
+            DsDevice.MotionCal.NOMINAL,
+            DsDevice.MotionCal.parse(null, 0x05), // the GET_REPORT failed
+            DsDevice.MotionCal.parse(ByteArray(8) { if (it == 0) 0x05 else 0 }, 0x05), // short reply
+            DsDevice.MotionCal.parse(degenerate, 0x02), // a clone pad's zeroes
+            DsDevice.MotionCal.parse(degenerate, 0x05), // someone else's report id
+        )
+        for (cal in cals) {
+            for (axis in 0 until 3) {
+                assertEquals(1234, cal.gyroToWire(axis, 1234)) // passthrough
+                assertEquals(10000, cal.accelToWire(axis, 8192)) // 8192 raw LSB = 1 g
+                assertEquals(-10000, cal.accelToWire(axis, -8192))
+            }
+        }
+    }
+
+    /** The parse applies the calibration at the motion offsets, per model, and defaults to nominal. */
+    @Test
+    fun parseStateAppliesTheCalibration() {
+        val cal = realisticCal()
+        // DS5: gyro at [16..22), accel at [22..28). Pitch = 1600 raw (100 °/s), accel z = 8000 (1 g).
+        val ds5 = ds5Report {
+            it[16] = 0x40; it[17] = 0x06 // 1600
+            it[26] = 0x40; it[27] = 0x1F // 8000
+        }
+        val five = DsDevice.State()
+        assertTrue(DsDevice.parseState(DsDevice.Model.DUALSENSE, ds5, 64, five, cal))
+        assertEquals(2000, five.gyro[0])
+        assertEquals(10000, five.accel[2])
+        // DS4: gyro at [13..19), accel at [19..25). Same numbers, same answers.
+        val ds4 = ds4Report {
+            it[13] = 0x40; it[14] = 0x06
+            it[23] = 0x40; it[24] = 0x1F
+        }
+        val four = DsDevice.State()
+        assertTrue(DsDevice.parseState(DsDevice.Model.DUALSHOCK4, ds4, 64, four, cal))
+        assertEquals(2000, four.gyro[0])
+        assertEquals(10000, four.accel[2])
+        // No calibration argument = the nominal fallback: gyro through, accel ×10000/8192.
+        val nominal = DsDevice.State()
+        assertTrue(DsDevice.parseState(DsDevice.Model.DUALSENSE, ds5, 64, nominal))
+        assertEquals(1600, nominal.gyro[0])
+        assertEquals(8000L * 10000 / 8192, nominal.accel[2].toLong())
+    }
+
+    /** Each model asks for the feature report its firmware actually serves over USB. */
+    @Test
+    fun calibrationReportIdentityPerModel() {
+        assertEquals(0x05, DsDevice.Model.DUALSENSE.calReportId)
+        assertEquals(41, DsDevice.Model.DUALSENSE.calReportLen)
+        assertEquals(0x05, DsDevice.Model.DUALSENSE_EDGE.calReportId)
+        assertEquals(41, DsDevice.Model.DUALSENSE_EDGE.calReportLen)
+        assertEquals(0x02, DsDevice.Model.DUALSHOCK4.calReportId)
+        assertEquals(37, DsDevice.Model.DUALSHOCK4.calReportLen)
+    }
+
     // ---- output builders (offsets = the host parser's: `parse_ds_output` / `parse_ds4_output`) ----
 
     @Test

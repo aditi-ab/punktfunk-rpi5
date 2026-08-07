@@ -180,6 +180,43 @@ pub mod gamepad {
     /// Triggers: value range 0..255.
     pub const AXIS_LT: u32 = 4;
     pub const AXIS_RT: u32 = 5;
+
+    /// Motion wire units — the DualSense convention, raw `i16` LSBs, carried by
+    /// `RichInput::Motion`. Gyro is angular velocity, accel is proper acceleration.
+    ///
+    /// Every capture path scales *into* these units (`pf-client-core::gamepad`, Swift
+    /// `GamepadWire`, the Android `DeviceGyro`) and every host backend decodes *from* them —
+    /// but the two sides never meet in one crate, which is how a virtual pad shipped for
+    /// months telling its consumers to read the same bytes 40× too fast. The host's virtual
+    /// pads carry fixed calibration blobs, and the resolution a consumer derives from those
+    /// blobs must land back on exactly these numbers; pf-inject's `motion_contract` test is
+    /// what pins that, for every backend, against these constants.
+    ///
+    /// Gyro saturates at `i16::MAX / 20` ≈ ±1638 °/s, below a real DualSense's ±2000; accel at
+    /// ±3.28 g against its ±4 g. Lifting those is a wire-v2 question, not a scale to quietly
+    /// re-tune here.
+    pub const MOTION_GYRO_LSB_PER_DEG_S: i32 = 20;
+    /// See [`MOTION_GYRO_LSB_PER_DEG_S`].
+    pub const MOTION_ACCEL_LSB_PER_G: i32 = 10_000;
+
+    /// What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
+    /// axis** — which is index 1 — and nothing on the other two.
+    ///
+    /// This is a measured fact, not a convention we chose. On 2026-08-07 a real DualSense was read
+    /// over raw HID: at rest it reports `+0.997 g` on report axis 1, and the same session pinned
+    /// the frame as (Right, Up, Backward) — axis 0 carries pitch, 1 yaw, 2 roll. The wire is a unit
+    /// passthrough into that report, so the wire's up axis is the pad's.
+    ///
+    /// It exists because the alternative is worse than imprecise. A virtual pad that has never
+    /// received a motion sample used to report `[0, 0, 0]`, and zero acceleration is not "no
+    /// information" — it is a controller in **free fall**, which is a claim about the physical
+    /// world that is never true of a pad on a desk. A game deriving orientation from it gets a
+    /// definite wrong answer instead of a boring right one. `switch_proto`'s neutral has always
+    /// done this correctly (1 g on its own up axis); the DualSense family and the Deck did not.
+    ///
+    /// Backends whose units differ rescale this like any other sample rather than hard-coding
+    /// their own version of 1 g — see `steam_remap::motion_wire_to_deck`.
+    pub const MOTION_NEUTRAL_ACCEL: [i16; 3] = [0, MOTION_ACCEL_LSB_PER_G as i16, 0];
 }
 
 impl InputKind {

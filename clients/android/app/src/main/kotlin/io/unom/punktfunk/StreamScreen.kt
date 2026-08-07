@@ -73,6 +73,7 @@ import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.PadSensors
 import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
@@ -136,6 +137,19 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         if (micHint != null) {
             delay(1600)
             micHint = null
+        }
+    }
+    // A captured pad has a gyro this session's virtual controller cannot carry (see
+    // GamepadRouter.onMotionUnreachable). Shown briefly, then gone: the failure is otherwise
+    // completely silent — the gyro simply does nothing, which from the couch is indistinguishable
+    // from a broken sensor — and the fix is a setting, so the notice has to name it.
+    var motionHint by remember { mutableStateOf(false) }
+    LaunchedEffect(motionHint) {
+        if (motionHint) {
+            // Longer than the mic chord's 1.6 s: that one confirms something the user just did,
+            // this one explains something they did not, in a sentence they have to read.
+            delay(6000)
+            motionHint = false
         }
     }
     // The one place mute is toggled — Compose state + the native flag, always together.
@@ -360,6 +374,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Select + Y toggles the mic — the couch reach for the on-screen mute button, which a
         // gamepad/TV user has no pointer for. Ignored when no capture is running (there is nothing
         // to mute, and claiming otherwise would be the lie the control exists to avoid).
+        // A captured Sony pad whose motion this session cannot carry. Fires once per pad, at the
+        // moment it is claimed, on the main thread.
+        router.onMotionUnreachable = { motionHint = true }
         router.onMicChord = {
             if (micRunning) {
                 val next = !micMuted
@@ -459,16 +476,36 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // "Gyro from this phone" (opt-in): this device's IMU speaks for controller 1's motion
         // while wire pad 0 is a controller without a gyro of its own — the rumble mirror's
         // sibling, data flowing the other way. The mirror gates itself per sample (it stands
-        // down whenever a capture link — USB DualSense / SC2, pads with a real IMU — holds
-        // pad 0), so it composes with the captures below without coordination here.
+        // down whenever pad 0's controller has motion of its own — a capture link below, or a
+        // pad whose own sensors PadSensors is reading), so it composes without coordination here.
         val phoneGyro = if (initialSettings.gyroOnPhone && initialSettings.gamepadForwarding) {
             DeviceGyro(context, handle, router).also { it.start() }
         } else {
             null
         }
+        // A Bluetooth controller's OWN gyro, through the platform sensor framework (API 31+):
+        // a BT DualSense / DS4 / Switch Pro / 8BitDo is an ordinary InputDevice, so none of the
+        // capture links below ever sees it and its motion used to go nowhere at all. No separate
+        // setting — this is the pad's own IMU doing what the pad is for, and unlike the USB
+        // captures it claims nothing; forwarding being off is the only thing that silences it.
+        val padSensors = if (initialSettings.gamepadForwarding) {
+            PadSensors(router).also { it.start() }
+        } else {
+            null
+        }
         // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
-        // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
-        router.onSlotClosed = feedback::onDeviceRemoved
+        // session leaks until the session ends), and take its sensor listeners off with it — the
+        // same callback also fires when a USB capture below CLAIMS the pad, which is what keeps
+        // the claimed pad from being fed motion twice. The router owns hot-plug; the feedback owns
+        // the binds. Assigned before the captures are constructed, so their claims land on it.
+        router.onSlotClosed = { deviceId ->
+            feedback.onDeviceRemoved(deviceId)
+            padSensors?.onSlotClosed(deviceId)
+        }
+        // The other edge: a controller that arrives (or first speaks) mid-session gets its sensors
+        // read too. The pads already connected were swept by PadSensors.start() above — both run
+        // on the main thread with nothing between them, so no controller falls through the gap.
+        router.onSlotOpened = { deviceId -> padSensors?.onSlotOpened(deviceId) }
         // Steam Controller 2 as-is passthrough (opt-out): capture a wired/Puck USB pad — or an
         // already-paired BLE one — and forward its raw reports; the host mirrors a real
         // 28DE:1302 that its Steam drives directly, and Steam's rumble/settings writes come back
@@ -599,12 +636,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             feedback.sink = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
             phoneGyro?.stop() // join the sensor thread + park pad 0's rotation at zero, same ordering rule
+            // After the mirror, so it cannot resume writing pad 0 in the gap when a pad's own
+            // sensors let go of it; before the router is released, so the parks still find slots.
+            padSensors?.stop()
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
             dsUsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             ds?.stop() // rumble-stop on the physical pad + release the USB link + free the wire slot
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.onMicChord = null // same: no mute toggle on buttons released during teardown
+            router.onMotionUnreachable = null // same: no notice raised by a slot closing at teardown
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
             // Mouse/remote-pointer teardown: lift held buttons, drop the grab, restore the cursor.
@@ -865,6 +906,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         }
         // Chord confirmation (gamepad/TV) — the counterpart to the button changing under a finger.
         micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
+        // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
+        // notice landing on top of one of those would cost the user both.
+        if (motionHint) {
+            MotionUnreachableHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+        }
     }
 }
 
@@ -943,6 +989,28 @@ private fun MicMuteControl(muted: Boolean, onToggle: (() -> Unit)?, modifier: Mo
 private fun MicChordHint(text: String, modifier: Modifier = Modifier) {
     Text(
         text,
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
+}
+
+/**
+ * "This pad's gyro can't reach the game" — shown briefly when a captured controller with motion
+ * meets a session whose virtual pad has no motion plane (the X-Box classes have no gyro in their
+ * HID contract, so every sample would be decoded and dropped host-side).
+ *
+ * It names the setting because that is the whole point: without it the player has a gyro that
+ * silently does nothing and no way to tell that from a broken sensor. Not a control — the setting
+ * applies from the next session, so offering to change it here would promise something this stream
+ * cannot deliver. [GamepadRouter.onMotionUnreachable] raises it.
+ */
+@Composable
+private fun MotionUnreachableHint(modifier: Modifier = Modifier) {
+    Text(
+        "Motion won't reach this session — set Controller type to DualSense",
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
             .padding(horizontal = 14.dp, vertical = 8.dp),

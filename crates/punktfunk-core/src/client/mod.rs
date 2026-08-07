@@ -325,6 +325,14 @@ pub struct NativeClient {
     /// The virtual gamepad backend the host actually resolved ([`Welcome::gamepad`]).
     /// `Auto` = an older host that didn't say (assume X-Box 360, no DualSense feedback).
     pub resolved_gamepad: GamepadPref,
+    /// The session default this client's Hello ASKED for, kept beside the host's answer above.
+    ///
+    /// The pair is what makes the echo usable per pad: the host applies the same fold to a pad's
+    /// own declaration as it did to this, so `resolved` is that pad's answer exactly when the pad
+    /// declared `requested_gamepad` — and only a guess otherwise. See
+    /// [`pad_motion_reaches`](crate::config::pad_motion_reaches), which is the one place that
+    /// reasoning lives.
+    pub requested_gamepad: GamepadPref,
     /// The encoder bitrate the host actually configured ([`Welcome::bitrate_kbps`], kbps): our
     /// requested rate clamped to the host's range, or its default if we requested `0`. `0` = an
     /// older host that didn't report it.
@@ -704,6 +712,9 @@ impl NativeClient {
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: negotiated.compositor,
             resolved_gamepad: negotiated.gamepad,
+            // What we asked for, not what came back — the two together are what let a client ask
+            // the motion question per pad (see the field's doc).
+            requested_gamepad: gamepad,
             resolved_bitrate_kbps: negotiated.bitrate_kbps,
             shard_payload: negotiated.shard_payload,
             clock_offset_ns: negotiated.clock_offset_ns,

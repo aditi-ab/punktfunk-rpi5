@@ -472,7 +472,13 @@ fn build_triton_device(
         address: addr,
         attributes: 0x03,    // interrupt
         max_packet_size: 64, // wMaxPacketSize 0x0040
-        interval: 1,         // bInterval 1 — the real pad's 1 kHz
+        // bInterval 1 — the real pad's 1 kHz. ⚠ Do NOT "fix" this to 4: bInterval is only the
+        // 2^(n-1) × 125 µs exponent on a HIGH-speed device, and this one negotiates FULL speed
+        // (`dev.speed` below), where the field is a plain frame count in milliseconds. So 1 means
+        // 1 ms = 1 kHz, exactly as intended, and 4 would mean 4 ms = 250 Hz — a 4× cut to the
+        // motion rate a passed-through SC2 delivers. (A 2026-08-07 sweep read this as high-speed
+        // and called it an 8 kHz duplicate storm; it is neither.)
+        interval: 1,
     };
     let mut dev = UsbDevice::new(0);
     dev.vendor_id = TRITON_VENDOR;

@@ -172,11 +172,21 @@ static DS4_RDESC: [u8; 507] = [
 static DS4_FEATURE_PAIRING: [u8; 16] = [ // 0x12 pairing info (MAC at bytes 1..7)
     0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+// 0x02 IMU calibration. A consumer (SDL's `SDL_hidapi_ps4`, or `hid-playstation` when this pad
+// is read on Linux) DERIVES its motion scale from these words rather than assuming one: gyro
+// resolution = (|pitch_plus| + |pitch_minus|) / (speed_plus + speed_minus) LSB per °/s, accel
+// resolution = (acc_plus - acc_minus) / 2 LSB per g. So this blob is where the wire contract
+// (20 LSB/°·s, 10000 LSB/g) is declared on the DS4 device type, and it must state exactly what
+// the wire delivers — the pre-2026-08 values (±16 / speed 32 / ±8192) declared 0.5 LSB/°·s and
+// 8192 LSB/g, i.e. every DS4 session read gyro 40× too fast and accel 1.22× hot.
+// Mirrors inject/proto/dualshock4_proto.rs DS4_FEATURE_CALIBRATION; this WDK workspace can't
+// depend on pf-inject, so pf-inject's `motion_contract` test parses THIS file and re-derives the
+// units from it. Keep the two in sync.
 #[rustfmt::skip]
-static DS4_FEATURE_CALIBRATION: [u8; 37] = [ // 0x02 IMU calibration
-    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0xF0, 0xFF, 0x10, 0x00, 0xF0, 0xFF, 0x10,
-    0x00, 0xF0, 0xFF, 0x20, 0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0xE0, 0x00, 0x20, 0x00, 0xE0, 0x00,
-    0x20, 0x00, 0xE0, 0x00, 0x00,
+static DS4_FEATURE_CALIBRATION: [u8; 37] = [
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
+    0x27, 0xF0, 0xD8, 0xF4, 0x01, 0xF4, 0x01, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
+    0x27, 0xF0, 0xD8, 0x00, 0x00,
 ];
 #[rustfmt::skip]
 static DS4_FEATURE_FIRMWARE: [u8; 49] = [ // 0xa3 firmware/build info
@@ -327,6 +337,44 @@ const OFF_OUT_RING_VER: usize = core::mem::offset_of!(PadShm, out_ring_ver);
 const OFF_RING_HEAD: usize = core::mem::offset_of!(PadShm, ring_head);
 const OFF_OUT_RING_LEN: usize = core::mem::offset_of!(PadShm, out_ring_len);
 const OFF_OUT_RING: usize = core::mem::offset_of!(PadShm, out_ring);
+const OFF_INPUT_GEN: usize = core::mem::offset_of!(PadShm, input_gen);
+
+/// How many timer ticks separate two runs of the channel/health housekeeping. The tick itself is
+/// [`TIMER_PERIOD_MS`]; the pump, the `driver_proto` stamp and the heartbeat keep their historical
+/// ~8 ms cadence so nothing that watches them changes rate — only the input path got faster.
+const PUMP_EVERY_N_TICKS: u32 = 4;
+/// Timer period. Was 8 ms, which — with one pended READ_REPORT completed per tick — capped what a
+/// game could observe at ~125 Hz and added up to 8 ms of latency, while clients stream motion at
+/// ~250 Hz. 2 ms is about a real DualShock 4's Bluetooth cadence and leaves headroom above the
+/// client rate; the extra ticks only do the cheap half (read the input slot, complete one pended
+/// read), see [`PUMP_EVERY_N_TICKS`].
+const TIMER_PERIOD_MS: u32 = 2;
+
+/// Read the host's input report out of the section under the v2.3 seqlock, so a report caught
+/// mid-copy is retried instead of handed to a game.
+///
+/// The host takes `input_gen` odd before writing the 64 bytes and even after, so an odd sample or
+/// a changed one means the read straddled a write. One retry: the host publishes in microseconds
+/// and this runs on a 2 ms timer, so a second collision is not a thing that happens, and if it did,
+/// re-serving the previous whole report beats serving a torn one.
+///
+/// Against a pre-v2.3 host the field is never written, so it reads 0 — constant and even — and
+/// this accepts on the first pass, exactly as the driver behaved before the seqlock existed.
+/// `false` means "no whole report available"; the caller keeps what it had.
+fn read_input_report(view: &pf_umdf_util::section::MappedView, buf: &mut [u8; 64]) -> bool {
+    for _ in 0..2 {
+        let before = view.load_u32(OFF_INPUT_GEN, Ordering::Acquire);
+        if !before.is_multiple_of(2) {
+            continue; // a write is in flight right now
+        }
+        view.read_bytes(OFF_INPUT, buf);
+        // Acquire: the body reads above must not sink below this sample of the generation.
+        if view.load_u32(OFF_INPUT_GEN, Ordering::Acquire) == before {
+            return true;
+        }
+    }
+    false
+}
 const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
 const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
 const OUT_RING_LEN_V22: u32 = pf_driver_proto::gamepad::OUT_RING_LEN_V22;
@@ -413,6 +461,9 @@ static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd` ([`devtype_from_hwids`]);
 /// `u32::MAX` = not resolved. See [`device_type`] for why this exists.
 static PNP_DEVTYPE: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Timer ticks since load — picks the [`PUMP_EVERY_N_TICKS`] ticks that also do the channel
+/// handshake and health marks. Wrapping is fine: only its residue matters.
+static TICK: AtomicU32 = AtomicU32::new(0);
 
 /// Map a devnode's hardware-id list (lowercase, `;`-separated — see
 /// [`wdf::query_hardware_ids`](pf_umdf_util::wdf::query_hardware_ids)) to the `device_type` the host
@@ -649,7 +700,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     let mut tcfg: WDF_TIMER_CONFIG = unsafe { core::mem::zeroed() };
     tcfg.Size = core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG;
     tcfg.EvtTimerFunc = Some(evt_timer);
-    tcfg.Period = 8; // ms
+    tcfg.Period = TIMER_PERIOD_MS;
     tcfg.AutomaticSerialization = 1; // TRUE — UMDF requires a serialized timer (vhidmini2 pattern)
     // SAFETY: a zeroed WDF_OBJECT_ATTRIBUTES is a valid all-null attributes struct; we set Size + the
     // fields we use below.
@@ -669,8 +720,9 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         dbglog!("[pf-gamepad] WdfTimerCreate failed 0x{:08x}", st as u32);
         return st;
     }
-    // SAFETY: timer valid; -80000 == 8ms relative due time (100ns units, negative = relative).
-    let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -80000i64) };
+    let due = -(TIMER_PERIOD_MS as i64) * 10_000;
+    // SAFETY: timer valid; the due time is TIMER_PERIOD_MS in 100 ns units, negative = relative.
+    let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, due) };
 
     log("[pf-gamepad] device ready (DualSense 054C:0CE6)");
     STATUS_SUCCESS
@@ -1034,27 +1086,43 @@ fn device_type() -> u8 {
 }
 
 extern "C" fn evt_timer(timer: WDFTIMER) {
-    // One sealed-channel tick: publish our pid / adopt a delivery / detect host-gone, then pull the
-    // latest host input report from the attached DATA section (all safe, via pf_umdf_util).
-    match CHANNEL.pump(&channel_cfg()) {
+    // Two cadences on one timer. EVERY tick ([`TIMER_PERIOD_MS`]) does the cheap input half —
+    // read the section's report slot, complete one pended READ_REPORT — because that pair is what
+    // bounds the rate a game can observe, and at the old 8 ms it halved a 250 Hz motion stream.
+    // The channel handshake and the health marks stay on their historical ~8 ms
+    // ([`PUMP_EVERY_N_TICKS`]): they cost more, nothing about them wants to be faster, and the
+    // heartbeat's documented "+1 per ~8 ms tick" is what the host reads as liveness.
+    let tick = TICK.fetch_add(1, Ordering::Relaxed);
+    let housekeeping = tick.is_multiple_of(PUMP_EVERY_N_TICKS);
+    let view = if housekeeping {
+        // Publish our pid / adopt a delivery / detect host-gone.
+        CHANNEL.pump(&channel_cfg())
+    } else {
+        CHANNEL.data()
+    };
+    match view {
         Some(view) => {
-            // Keep the fallback identity fresh: `device_type()`'s last resort (channel detached,
-            // no PnP match) reads LAST_DEVTYPE, and this tick is the one place that always sees
-            // the attached section.
-            LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
             let mut buf = [0u8; 64];
-            view.read_bytes(OFF_INPUT, &mut buf);
-            if buf[0] == 0x01
+            // A torn read is dropped rather than served: `read_input_report` returns false only
+            // when it caught the host mid-publish, and the previous whole report stays in place.
+            if read_input_report(view, &mut buf)
+                && buf[0] == 0x01
                 && let Ok(mut g) = INPUT_REPORT.lock()
             {
                 *g = buf;
             }
-            // Health marks the host watches: driver_proto (attach signal, idempotent) and
-            // driver_heartbeat (+1 per ~8 ms tick = liveness). Lets the host tell "driver bound
-            // and alive" apart from "driver package missing/failed to bind".
-            view.write_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION);
-            let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
-            view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+            if housekeeping {
+                // Keep the fallback identity fresh: `device_type()`'s last resort (channel
+                // detached, no PnP match) reads LAST_DEVTYPE, and this tick is the one place that
+                // always sees the attached section.
+                LAST_DEVTYPE.store(view.read_u8(OFF_DEVICE_TYPE) as u32, Ordering::Relaxed);
+                // Health marks the host watches: driver_proto (attach signal, idempotent) and
+                // driver_heartbeat (+1 per ~8 ms = liveness). Lets the host tell "driver bound and
+                // alive" apart from "driver package missing/failed to bind".
+                view.write_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION);
+                let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
+                view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
+            }
         }
         None => {
             // Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral

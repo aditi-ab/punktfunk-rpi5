@@ -16,6 +16,22 @@ const _: () = assert!(MAX_PADS <= 16);
 /// quiet.
 const SWEEP_GRACE: Duration = Duration::from_millis(300);
 
+/// What one [`PadSlots::sweep`] changed, as bitmasks over the wire pad indices.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Sweep {
+    /// Slots whose pad was torn down because its grace ran out — the caller resets their
+    /// per-index sibling state.
+    pub dropped: u16,
+    /// Slots whose `active_mask` bit returned *inside* the grace window. The debounce did its job
+    /// and no devnode flapped — but the pad that comes back is not necessarily the pad that left:
+    /// unplug one controller and plug another into the same wire index within [`SWEEP_GRACE`] and
+    /// the new one drives the old one's live virtual pad, skipping the create path (and therefore
+    /// the manager's reset) entirely. Anything the manager persists on the client's behalf —
+    /// touch contacts, motion — is the previous controller's and has to go; a pad with no gyro
+    /// would otherwise inherit the last one's rotation and never send a sample to correct it.
+    pub reclaimed: u16,
+}
+
 /// The slot table + lifecycle every virtual-pad manager repeats: `Vec<Option<P>>` keyed by wire pad
 /// index, the `active_mask` unplug sweep, and the [`PadGate`]-guarded create. Extracted verbatim
 /// from seven copy-pasted managers (G12) so a lifecycle fix lands once, not seven times.
@@ -63,16 +79,16 @@ impl<P> PadSlots<P> {
     }
 
     /// Fold one state frame's `active_mask` into the grace clocks, then drop whatever has run out
-    /// (see [`Self::reap`]). Returns the dropped indices as a bitmask so the caller resets its
-    /// per-index sibling state; an index another manager owns is `None` here, so it is never
-    /// touched. The grace is the devnode-churn debounce: a mask that glitches clear for a few
-    /// frames and returns re-arms nothing.
+    /// (see [`Self::reap`]). Returns what changed so the caller can fix up its per-index sibling
+    /// state; an index another manager owns is `None` here, so it is never touched. The grace is
+    /// the devnode-churn debounce: a mask that glitches clear for a few frames and returns re-arms
+    /// nothing.
     ///
     /// A frame can only ARM the grace, never complete it — no time has passed at the instant the
     /// clock starts. Since the producer emits exactly ONE frame per detach, [`Self::reap`] on the
     /// manager's periodic pump is what actually finishes the unplug; a backend that only ever
     /// called `sweep` would keep the detached pad alive for the rest of the session.
-    pub fn sweep(&mut self, active_mask: u16) -> u16 {
+    pub fn sweep(&mut self, active_mask: u16) -> Sweep {
         self.sweep_at(active_mask, Instant::now())
     }
 
@@ -98,15 +114,24 @@ impl<P> PadSlots<P> {
 
     /// [`Self::sweep`] with an injectable clock (unit tests drive the grace window): arm or disarm
     /// each slot's clock from the mask, then reap whatever has already run out.
-    fn sweep_at(&mut self, active_mask: u16, now: Instant) -> u16 {
+    fn sweep_at(&mut self, active_mask: u16, now: Instant) -> Sweep {
+        let mut reclaimed = 0u16;
         for i in 0..MAX_PADS {
             if active_mask & (1 << i) != 0 {
-                self.inactive_since[i] = None; // active (again): a glitch never reaches the drop
+                // Active (again): a glitch never reaches the drop. If a clock WAS armed, this slot
+                // just handed a live pad to whatever controller is present now, without passing
+                // through `ensure` — see `Sweep::reclaimed`.
+                if self.inactive_since[i].take().is_some() {
+                    reclaimed |= 1 << i;
+                }
             } else if self.pads[i].is_some() && self.inactive_since[i].is_none() {
                 self.inactive_since[i] = Some(now); // newly inactive — start the grace
             }
         }
-        self.reap_at(now)
+        Sweep {
+            dropped: self.reap_at(now),
+            reclaimed,
+        }
     }
 
     /// [`Self::reap`] with an injectable clock. Deliberately arms nothing — it only ever reads
@@ -195,7 +220,7 @@ mod tests {
         assert!(s.ensure(2, |i| Ok(i as u32)));
         assert_eq!(
             s.sweep(0b0),
-            0,
+            Sweep::default(),
             "a frame arms the grace but cannot itself drop"
         );
         assert!(s.get(2).is_some());
@@ -227,14 +252,33 @@ mod tests {
         // comes back must not churn a PnP devnode.
         let mut s = slots();
         assert!(s.ensure(0, |i| Ok(i as u32)));
-        assert_eq!(s.sweep(0b0), 0); // bit clears — arms only
+        assert_eq!(s.sweep(0b0), Sweep::default()); // bit clears — arms only
         for _ in 0..5 {
             assert_eq!(s.reap(), 0, "dropped a pad inside its grace");
         }
-        assert_eq!(s.sweep(0b1), 0); // the bit returns — disarms
+        // The bit returns — disarms, and reports the re-claim: the pad survived, but whoever is
+        // driving it now may not be the controller that armed the clock.
+        assert_eq!(
+            s.sweep(0b1),
+            Sweep {
+                dropped: 0,
+                reclaimed: 1,
+            }
+        );
         s.expire_grace();
         assert_eq!(s.reap(), 0, "a returned bit must leave nothing armed");
         assert!(s.get(0).is_some());
+    }
+
+    #[test]
+    fn a_mask_that_never_went_clear_is_not_a_reclaim() {
+        // `reclaimed` must mean "came back inside the grace", not "is present" — a steady-state
+        // frame stream would otherwise clear the client's touch and motion on every single frame.
+        let mut s = slots();
+        assert!(s.ensure(0, |i| Ok(i as u32)));
+        for _ in 0..5 {
+            assert_eq!(s.sweep(0b1), Sweep::default());
+        }
     }
 
     #[test]
@@ -259,16 +303,25 @@ mod tests {
         // Mask keeps 2, clears 0 and 5; empty slots (1, 3, …) are untouched non-events. The
         // first sweep only ARMS the grace clock…
         let t0 = Instant::now();
-        assert_eq!(s.sweep_at(0b0000_0100, t0), 0);
+        assert_eq!(s.sweep_at(0b0000_0100, t0), Sweep::default());
         assert_eq!(s.get(0), Some(&0), "still inside the grace");
         // …and the drop lands once the bits have stayed clear for the whole grace.
         let swept = s.sweep_at(0b0000_0100, t0 + SWEEP_GRACE);
-        assert_eq!(swept, 0b0010_0001);
+        assert_eq!(
+            swept,
+            Sweep {
+                dropped: 0b0010_0001,
+                reclaimed: 0,
+            }
+        );
         assert_eq!(s.get(0), None);
         assert_eq!(s.get(2), Some(&2));
         assert_eq!(s.get(5), None);
         // A further identical sweep is a no-op: the indices were returned exactly once.
-        assert_eq!(s.sweep_at(0b0000_0100, t0 + SWEEP_GRACE * 2), 0);
+        assert_eq!(
+            s.sweep_at(0b0000_0100, t0 + SWEEP_GRACE * 2),
+            Sweep::default()
+        );
     }
 
     #[test]
@@ -278,9 +331,22 @@ mod tests {
         let mut s = slots();
         assert!(s.ensure(1, |_| Ok(7)));
         let t0 = Instant::now();
-        assert_eq!(s.sweep_at(0, t0), 0); // bit clears — grace armed
-        assert_eq!(s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE / 2), 0); // bit returns — disarmed
-        assert_eq!(s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE * 10), 0);
+        // The bit clears — grace armed.
+        assert_eq!(s.sweep_at(0, t0), Sweep::default());
+        // The bit returns: disarmed, and reported as a re-claim (the pad lives, but its owner may
+        // have changed — see `Sweep::reclaimed`).
+        assert_eq!(
+            s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE / 2),
+            Sweep {
+                dropped: 0,
+                reclaimed: 0b0000_0010,
+            }
+        );
+        // …and once, not on every subsequent frame.
+        assert_eq!(
+            s.sweep_at(0b0000_0010, t0 + SWEEP_GRACE * 10),
+            Sweep::default()
+        );
         assert_eq!(s.get(1), Some(&7), "the glitch never reached the drop");
     }
 

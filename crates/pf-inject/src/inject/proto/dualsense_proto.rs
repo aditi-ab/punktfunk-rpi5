@@ -12,6 +12,7 @@
 //! `src/uhid/include/uhid/ps5.hpp`), so `hid-playstation` (Linux) and `hidclass` (Windows) bind the
 //! same as a real USB DualSense.
 
+use punktfunk_core::input::gamepad as gs;
 use punktfunk_core::quic::{HidOutput, RichInput};
 
 // Feature reports the host stack GET_REPORTs during init — without these replies the kernel
@@ -222,7 +223,15 @@ pub struct DsState {
 }
 
 impl DsState {
-    /// A centered, nothing-pressed state (sticks 0x80, dpad neutral).
+    /// A centered, nothing-pressed state (sticks 0x80, dpad neutral) — and, crucially, a pad that
+    /// is sitting STILL rather than falling.
+    ///
+    /// Acceleration is 1 g up ([`gs::MOTION_NEUTRAL_ACCEL`]), not zero. `[0, 0, 0]` reads as free
+    /// fall to anything that interprets the accelerometer, which is a definite lie about the
+    /// physical world; a pad that has sent no motion yet — or has none at all — is on a desk or in
+    /// someone's hands, and both read 1 g up. This is what `switch_proto`'s neutral has always done
+    /// on its own up axis, and the DualSense family now does on the axis a real DualSense was
+    /// measured to use. The DS4 reuses this state, so it is covered by the same line.
     pub fn neutral() -> DsState {
         DsState {
             lx: 0x80,
@@ -230,8 +239,29 @@ impl DsState {
             rx: 0x80,
             ry: 0x80,
             dpad: 8,
+            accel: gs::MOTION_NEUTRAL_ACCEL,
             ..Default::default()
         }
+    }
+
+    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
+    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// `PadProto::neutralize_gyro`.
+    pub fn neutralize_gyro(&mut self) -> bool {
+        let changed = self.gyro != [0; 3];
+        self.gyro = [0; 3];
+        changed
+    }
+
+    /// Reset the rich-plane fields — touch contacts, pad clicks, motion — to a fresh pad's,
+    /// leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller that took over
+    /// this slot inside the replug grace must not inherit the last one's finger or rotation.
+    pub fn clear_rich(&mut self) {
+        let fresh = DsState::neutral();
+        self.touch = fresh.touch;
+        self.touch_click = fresh.touch_click;
+        self.gyro = fresh.gyro;
+        self.accel = fresh.accel;
     }
 
     /// Map a GameStream/XInput pad frame (button bitmask + i16 sticks + u8 triggers) into the
