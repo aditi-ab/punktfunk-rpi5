@@ -309,6 +309,111 @@ still `Default`, never an error.
   now boxed inside each owning wrapper, and create-time arrays are fields of the stored parameters
   assembled at their final address. The same shape was fixed pre-emptively in H.264/H.265.
 
+### A/V sync — it did not previously exist
+
+The host has always stamped `pts_ns` on every audio datagram. **Every client decoded it into
+`AudioPacket` / `AudioPCM` and never read it.** Video's `pts_ns` was used end to end; audio free-ran
+at whatever depth its jitter ring reached; nothing compared them. The A/V offset was an emergent
+property of buffer depths — it moved whenever the ring ratcheted under underrun pressure, and it got
+**worse every time video got faster**, because a quicker decoder lowers the video leg and leaves
+audio's where it was. That is why shaving milliseconds off the audio budget had never helped.
+
+Two host defects were prerequisites:
+- **`pts_ns` was stamped at encode time**, inside the loop draining an already-accumulated chunk, so
+  every frame of a chunk carried near-identical timestamps describing *when we got round to
+  encoding*. Now derived from the chunk's arrival instant minus queued-frame duration, re-anchored
+  per chunk.
+- **The host did not pace.** One capture callback hands over a whole quantum (5 ms honoured, **21.3 ms
+  on a VM**, where stock PipeWire raises `min-quantum` to 1024), drained into back-to-back
+  `send_datagram` calls — a 4–5 frame burst then ~21 ms of nothing, which a ring could only absorb by
+  standing a burst period deep. Frames now leave on the audio clock (`FRAME_INTERVAL` 5 ms,
+  `PACE_MAX_SLEEP` 10 ms, `PACE_REANCHOR` 100 ms). Costs no average latency.
+
+```
+audio_e2e = (now + buffered_ahead + clock_offset) − pts_ns
+av_offset = audio_e2e − video_e2e            (> 0 ⇒ audio behind the picture)
+```
+
+`AvSync` EWMAs it (`AV_EWMA_TAU_MS = 2000`), ignores anything inside `AV_DEADBAND_MS = 10`, waits
+`AV_MIN_OBSERVATIONS = 100` before a first correction, and **refuses rather than clamps** beyond
+`AV_SANE_LIMIT_MS = 1000` — a wall-clock step must not steer the ring.
+
+⭐ **Video is the master, and continuity outranks sync.** `JitterPolicy::set_sync_target` takes only a
+*request*, clamped between the existing underrun-driven adaptive floor and the hard cap: a link whose
+jitter genuinely needs more buffer than the picture is away keeps its buffer, and the residual is
+reported rather than forced. `None`/`nil` reproduces prior behaviour bit-identically, which is how
+the four rings adopted it one at a time.
+
+Per client: the Rust desktop reference is a new `video_e2e_ns` atomic beside `clock_offset`, written
+by the presenter and read by the audio thread. **Android** publishes `OnFrameRendered` — the one
+place that knows a frame *latched* — **raw, not floor-shaved** (the HUD shaves the OS present floor;
+sound must reach the ear when light reaches the eye), and stays inert below API 33 rather than
+substituting the release instant, which targets a future vsync 8–21 ms ahead of glass. **Apple**
+publishes its `LatencyMeter` sample as an *expiring level*, because that client has a backgrounded
+keep-alive that keeps audio playing while dropping video decode; its clamp raises the ceiling to the
+floor rather than `min(max(…))`, which on a device whose callback quantum alone exceeds the hard cap
+would otherwise hand back the cap, silently below the continuity floor.
+
+Escape hatches: `PUNKTFUNK_NO_AV_SYNC=1` everywhere, plus
+`adb shell setprop debug.punktfunk.no_av_sync 1` on Android (a launcher-started app inherits no
+environment). Observability: `buffer_ms`/`target_ms` had only ever been a `tracing::debug!` line —
+and on a Deck the client runs under Steam's `reaper` with stdout on a pipe nobody can read, so the
+one number identifying a deep ring was unobtainable *on the device reporting the latency*. Now on the
+HUD and in the 1 Hz stats log on every client.
+
+### Decode-target aliasing — caught before it shipped
+
+⚠ **None of this ever shipped.** `git ls-tree v0.24.0 crates/` has no `pf-vkdecode`, `pf-dxvadec`,
+`pf-vaadec` or `pf-bitstream`; v0.24.0's decode rungs were libavcodec. This was a ship-blocker for
+the new stack, cleared — not a field bug.
+
+Three of the four native rungs released a picture's surface **inside the plan→submission
+conversion**, then assigned the decode target a slot. `SlotMap::assign` returns the *lowest free
+slot* — the one just vacated. The submission then named one surface as both decode target and its own
+reference: `CurrPicTextureIndex == RefFrameMapTextureIndex[k]` on DXVA, or `pSetupReferenceSlot`
+sharing an array layer with `pReferenceSlots` on Vulkan. **Decode into the surface you are predicting
+from.**
+
+- **AV1 / D3D11VA** — AV1 applies `refresh_frame_flags` *after* decode (7.20), so "read a slot then
+  overwrite it" is the ordinary case: **268 of the vendored vector's 274 frames**, first at frame 6.
+- **H.264 / both Vulkan and D3D11VA** — `H264Planner` snapshots `dpb_refs` in `begin_picture`, before
+  8.2.5 marking and the C.4.5.3 bump, so a picture the sliding window unmarks and the bump evicts
+  lands in *both* `dpb_refs` and `dpb.removed`. Both conditions coincide only in low-delay H.264 —
+  and NVENC guarantees it (`max_num_ref_frames = 3` alongside `max_dec_frame_buffering = 3`, plus
+  `max_num_reorder_frames = 0`). Result: **297 of every 300 access units of every stream a punktfunk
+  host emits**, at every resolution, on both rungs.
+- **H.265 is exempt, now measured rather than argued** — 0 of 120 aliases, with a counterfactual that
+  moves the snapshot one call earlier and reproduces 115 of 120.
+- **VAAPI's exemption was incidental**: the precondition is fully present (117 of 120 AUs) but
+  `plan_to_va` never invents a surface. That held only because three call sites happened to write
+  `free_surface()` and `surface_table()` adjacently; `acquire_target` now returns index, surface and
+  table together so a later edit cannot split them.
+
+Fix is uniform: the plans grow `release_after_decode`, conversions hand removals back, callers
+release once the decode op is issued. Costs no slot (`SlotMap::new` allocates `max_dpb_frames + 1`).
+Both rungs hold the `Result` rather than `?`-ing it so the deferred release runs on failure paths —
+seven exits sat between conversion and release, each of which would have leaked a slot.
+
+**Why four gates missed it**, all recorded: the conformance vector is *structurally blind* (level 1.3,
+no VUI `bitstream_restriction` ⇒ a 7-frame DPB against 2 reference frames, and it reorders) and
+passed 250/250 for two milestones; **a test had encoded the bug as correct**; another assertion was
+*vacuous* (it asserted the decode target was never also a reference while handing every picture its
+own never-reused surface id — distinct integers cannot collide); and **it streamed clean** — *"the
+2026-08-07 field sessions that looked clean were looking at wrong pixels."*
+
+`gpu_parity` is now **11 legs** (not 9 — that note was written mid-PR): each decodes a vendored stream,
+reads back every output frame's NV12, crops to the display region and SHA-256s in *display order*
+against libavcodec goldens, frame count and flush tail included. The three new legs are our own
+encoder's output rather than conformance vectors — H.264 because the vector is blind to the shape,
+H.265 because an exemption with no stream behind it is how the H.264 defect survived two milestones,
+AV1 because the vector is one tile on all 274 frames while our encoder splits 4K into two tile rows,
+so every tile array the conversions fill had only ever been written at index 0. `video_vaapi_native`
+parity is new entirely: 7 legs, bit-identical on RDNA3.
+
+⚠ Promoting D3D11VA AV1 to `verified` **changes rung selection** on Windows Intel/unknown vendors, not
+just a label. VAAPI stays `verified = false` deliberately — one vendor, never soaked; flipping it
+would move `auto` off Vulkan Video on every Linux AMD/Intel client including the Deck.
+
 ### Windows audio substrate
 
 The host now mints its **own** devnodes from Valve's INFs (`SteamStreamingSpeakers.inf` /
