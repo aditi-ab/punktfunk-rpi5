@@ -55,6 +55,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// otherwise poll the SAME controller at once — driving both. The parent sets this false while
     /// something is presented on top so only the front-most carousel consumes the gamepad.
     var isActive: Bool = true
+    /// Whether the cards are worth showing off yet — the entrance holds until this is true. The
+    /// library passes "the first covers have their artwork" (see LibraryCoverflowView); anything
+    /// whose cards are ready the moment they mount leaves it alone.
+    var contentReady: Bool = true
     @ViewBuilder let card: (Item) -> Card
 
     @State private var input = GamepadMenuInput(manager: .shared)
@@ -89,9 +93,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// already. So it plays when a screen is entered: the launcher when the gamepad UI comes up,
     /// the coverflow each time the library opens (its layer mounts fresh).
     @State private var appeared = false
-    /// Which card the entrance fans out from — the cursor as it stood at mount, so a restored
-    /// selection assembles around where the eye already is instead of sweeping in from the left.
+    /// Which card the entrance fans out from — the cursor as it stood when the strip was armed,
+    /// so a restored selection assembles around where the eye already is instead of sweeping in
+    /// from the left.
     @State private var entranceAnchor = 0
+    /// The entrance has been scheduled; it plays exactly once per mount.
+    @State private var entranceArmed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Read-back from a touch drag is honoured only once the gamepad has been quiet this long
@@ -179,15 +186,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             reconcile()
             wire()
             if isActive { input.start() }
-            // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
-            entranceAnchor = cursor
-            // Deferred one runloop turn ON PURPOSE. A state change made inside `onAppear` lands
-            // in the same transaction as the insertion, where SwiftUI runs animations disabled —
-            // so the cards just WERE there, no entrance (the library, whose strip mounts late
-            // when the fetch lands, showed this every time). One hop later it is an ordinary
-            // state change and every card's `.animation(_:value:)` picks it up.
-            DispatchQueue.main.async { appeared = true }
+            armEntrance()
         }
+        // The cards became worth showing (the library's covers got their art) — play now.
+        .onChange(of: contentReady) { _, _ in armEntrance() }
         .onDisappear {
             input.stop()
             haptics.stop()
@@ -227,6 +229,19 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 
     // MARK: - Entrance
 
+    /// Fire the entrance, once, as soon as the strip is mounted AND its cards are worth showing.
+    ///
+    /// The flip is deferred one runloop turn ON PURPOSE: a state change made inside `onAppear`
+    /// lands in the same transaction as the view's insertion, where SwiftUI runs with animations
+    /// disabled — so the cards would simply BE there.
+    private func armEntrance() {
+        guard !entranceArmed, contentReady else { return }
+        entranceArmed = true
+        // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
+        entranceAnchor = cursor
+        DispatchQueue.main.async { appeared = true }
+    }
+
     /// The card's share of the strip's entrance: it swings in on the drum, the anchored card
     /// landing first and its neighbours fanning outward to either side.
     private func entrance(_ idx: Int) -> CardEntrance {
@@ -234,8 +249,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             shown: appeared,
             // Capped so a several-hundred-title library never queues a card behind a visibly long
             // wait — everything past the cap lands together, well off-screen anyway.
-            delay: min(0.36, Double(abs(idx - entranceAnchor)) * 0.055),
-            side: idx == entranceAnchor ? 0 : (idx < entranceAnchor ? -1 : 1),
+            delay: min(0.42, Double(abs(idx - entranceAnchor)) * 0.07),
+            // Never zero: the anchor is the card the eye is ON, so it must swing like the rest —
+            // giving it "no rotation" left the one card you actually watch merely sliding up.
+            side: idx < entranceAnchor ? -1 : 1,
             reduceMotion: reduceMotion)
     }
 
@@ -400,25 +417,39 @@ private struct CardEntrance: ViewModifier {
     let shown: Bool
     let delay: Double
     /// Which way the card swings in: -1 hinged on its trailing edge (it sits left of the anchor),
-    /// +1 hinged on its leading edge (right of it), 0 for the anchor card, which never turns.
+    /// +1 hinged on its leading edge (right of it). Never 0 — every card turns, including the
+    /// centred one.
     let side: Double
     let reduceMotion: Bool
 
     func body(content: Content) -> some View {
         let away = !shown && !reduceMotion
         content
-            .scaleEffect(away ? 0.82 : 1)
-            .rotation3DEffect(
-                .degrees(away ? side * 72 : 0),
-                axis: (x: 0, y: 1, z: 0),
-                anchor: side < 0 ? .trailing : .leading,
-                perspective: 0.6)
-            .offset(y: away ? 44 : 0)
+            // The fade runs on its OWN, much faster curve (this `.animation` only governs the
+            // modifiers above it). One shared curve meant the card spent the whole swing at
+            // near-zero opacity and only the last few degrees were visible — which is exactly
+            // why the entrance read as a small slide.
             .opacity(shown ? 1 : 0)
             .animation(
                 reduceMotion
                     ? .easeOut(duration: 0.25)
-                    : .spring(response: 0.58, dampingFraction: 0.74).delay(delay),
+                    : .easeOut(duration: 0.22).delay(delay),
+                value: shown)
+            // Deep turn, well down, well shrunk — the card is genuinely edge-on and travelling.
+            // The sign matches the coverflow's own recede (right of centre turns negative about
+            // its leading edge), so the arrival deepens the turn the card already wears at rest
+            // and unwinds into it, instead of swinging the opposite way.
+            .scaleEffect(away ? 0.74 : 1)
+            .rotation3DEffect(
+                .degrees(away ? side * -64 : 0),
+                axis: (x: 0, y: 1, z: 0),
+                anchor: side < 0 ? .trailing : .leading,
+                perspective: 0.65)
+            .offset(y: away ? 58 : 0)
+            .animation(
+                reduceMotion
+                    ? nil
+                    : .spring(response: 0.62, dampingFraction: 0.72).delay(delay),
                 value: shown)
     }
 }

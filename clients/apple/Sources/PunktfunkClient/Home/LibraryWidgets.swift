@@ -71,6 +71,10 @@ struct PosterImage: View {
     let candidates: [URL]
     let title: String
     let session: URLSession?
+    /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
+    /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
+    /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
+    var onLoaded: (() -> Void)?
     @State private var index = 0
     @State private var image: PlatformImage?
 
@@ -99,7 +103,11 @@ struct PosterImage: View {
     }
 
     private func loadCurrent() async {
-        guard index < candidates.count else { return }
+        // Past the end: the placeholder IS the final look, so this poster has settled.
+        guard index < candidates.count else {
+            onLoaded?()
+            return
+        }
         guard let session, let data = try? await session.data(from: candidates[index]).0,
               let loaded = PlatformImage(data: data)
         else {
@@ -107,6 +115,7 @@ struct PosterImage: View {
             return
         }
         image = loaded
+        onLoaded?()
     }
 
     private var placeholder: some View {
