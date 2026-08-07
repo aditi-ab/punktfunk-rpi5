@@ -372,10 +372,16 @@ fn capture_once(
     // driver INFs later appear (Steam installed mid-run) — files are invisible to the
     // endpoint-set fingerprint, so nothing else would ever retry.
     if assert_plan && !audio_control::host_audio_requested() {
+        // "Silent on the host" is true for the name-matched Streaming Microphone AND for the
+        // minted "Punktfunk Speakers" (identified by id — its NAME says Speakers, which the
+        // name rule rightly refuses). Without the id check, a session on the minted sink
+        // logged "desktop audio will also play on the host" (false) and re-attempted the
+        // Steam-pair install it doesn't need (observed live, first substrate session).
         let have_silent = |w: &wiring_plan::Wiring| {
-            w.loopback_render
-                .as_ref()
-                .is_some_and(|(n, _)| wiring_plan::silent_sink(&n.to_lowercase()))
+            w.loopback_render.as_ref().is_some_and(|(n, id)| {
+                wiring_plan::silent_sink(&n.to_lowercase())
+                    || super::minted::minted_ids().speakers_render.as_deref() == Some(id.as_str())
+            })
         };
         static TRIED_WITH_INFS: Mutex<Option<bool>> = Mutex::new(None);
         let should_try = !have_silent(&plan.wiring) && {
