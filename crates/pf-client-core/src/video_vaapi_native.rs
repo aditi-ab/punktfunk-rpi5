@@ -2548,4 +2548,472 @@ mod tests {
             "the vector displays 250 frames (274 coded, 24 hidden)"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // H.264 / H.265 — the two legs that had never decoded a frame anywhere
+    // ---------------------------------------------------------------------
+
+    /// The vendored H.264 vector: **250 access units** of 320x240 High 4:2:0 8-bit,
+    /// TWO slice NALUs per picture (500 slice NALs over 250 AUs, 4 IDRs). The same
+    /// file, at the same relative path, that `pf-vkdecode`'s Vulkan legs and
+    /// `video_d3d11_native`'s D3D11VA leg decode — so a count that disagrees with
+    /// theirs is this rung's problem rather than the vector's.
+    const H264_25FPS: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
+    );
+
+    /// The vendored H.265 twin: 250 access units, 320x240 Main 8-bit 4:2:0, ONE slice
+    /// per picture, one `IDR_N_LP` then 249 TRAIL pictures.
+    const H265_25FPS: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
+    );
+
+    /// HEVC **Main 10**: 50 access units of 320x240 4:2:0 ten-bit, from libx265.
+    ///
+    /// Worth a third leg rather than a variation on the second because ten bits is a
+    /// different VAAPI PROFILE (`VAProfileHEVCMain10`), a different render-target
+    /// format (`VA_RT_FORMAT_YUV420_10`) and a different surface fourcc (**P010**, not
+    /// NV12) — three branches of `Session::build` that no 8-bit leg reaches, on the
+    /// path every HDR session takes. `finish` refuses a surface whose exported fourcc
+    /// is not the one the pool was created with, so this leg is also the only thing
+    /// that would catch a driver quietly handing back NV12 for a ten-bit stream.
+    const MAIN10_H265: &[u8] = include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
+
+    /// Both 8-bit vectors are 250 access units.
+    const H26X_AU_COUNT: usize = 250;
+    /// The Main 10 vector is 50.
+    const MAIN10_AU_COUNT: usize = 50;
+
+    /// How many frames each vector can yield THROUGH THIS RUNG — which is not how many
+    /// frames it contains, and the gap is a property of the rung worth stating once
+    /// here rather than three times below.
+    ///
+    /// [`finish`] shows `outputs.last()` and never more: one frame per access unit, at
+    /// most. So an access unit whose plan bumps SEVERAL pictures out of the DPB — which
+    /// is what an IDR with `no_output_of_prior_pics_flag` clear does, and what ordinary
+    /// B-pyramid reordering does at every other picture — displays the last of them and
+    /// drops the rest, and an access unit whose plan outputs nothing yet displays
+    /// nothing. There is no end-of-stream flush either, so whatever is still in the DPB
+    /// when the vector ends never comes out.
+    ///
+    /// Measured on `.25` and reproduced exactly by
+    /// [`the_planner_already_says_how_many_frames_these_legs_can_deliver`], which is
+    /// what keeps these three numbers explanations rather than recordings:
+    ///
+    /// | vector | pictures the planner outputs | this rung delivers | dropped |
+    /// |---|---|---|---|
+    /// | H.264 | 243 (7 stranded in the DPB) | **225** | 18, at the 3 IDRs that drain the DPB |
+    /// | H.265 | 249 (1 stranded) | **204** | 45, one on each of the 45 AUs that bump two |
+    /// | Main 10 | 48 (2 stranded) | **45** | 3, likewise |
+    ///
+    /// ⚠ This does NOT bite punktfunk's own streams and is not what these legs exist to
+    /// find: hosts emit zero-reorder low-delay output with no B pictures, so `outputs`
+    /// never holds more than one picture and the rung is exact. It is the same
+    /// divergence `video_d3d11_native`'s parity module records for the D3D11VA rung,
+    /// and it is written down here for the same reason — a conformance vector reorders,
+    /// punktfunk does not, and a reader comparing 225 against "250 frames" needs to
+    /// know which of the two they are looking at.
+    const H264_DELIVERED: usize = 225;
+    const H265_DELIVERED: usize = 204;
+    const MAIN10_DELIVERED: usize = 45;
+
+    /// Byte offsets of every Annex-B NAL header in `stream`, in order.
+    ///
+    /// Emulation prevention guarantees `00 00 01` cannot appear inside a NAL payload,
+    /// so scanning for it finds start codes and nothing else; the header begins on the
+    /// byte after. Hand-rolled for the same reason [`split_ivf`] is — `pf-client-core`
+    /// does not depend on the vendored parser crate — and a VERBATIM port of
+    /// `video_d3d11_native`'s, so the two platform rungs are driven over the same
+    /// access units rather than over two splitters free to disagree. Kept honest by
+    /// the AU counts [`the_annex_b_splitters_still_cut_the_vendored_vectors`] asserts
+    /// on every ordinary Linux test run, which no plausible splitter bug survives.
+    fn nal_headers(stream: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 3 <= stream.len() {
+            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
+                out.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Split `stream` into access units, given a per-NAL `(is_slice, starts_a_picture)`
+    /// rule. A new AU begins at a non-VCL NALU following slices, or at a slice that
+    /// declares itself the first of a picture when the current AU already has slices —
+    /// the same rule pf-bitstream applies, spelled once for both codecs.
+    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
+        let mut aus = Vec::new();
+        let mut au_start = 0usize;
+        let mut au_has_slice = false;
+        for header in nal_headers(stream) {
+            let (is_slice, first_in_picture) = classify(stream, header);
+            // The start code owning this header: three bytes, plus the optional
+            // leading zero byte of the four-byte form.
+            let mut start = header - 3;
+            if start > 0 && stream[start - 1] == 0x00 {
+                start -= 1;
+            }
+            if au_has_slice && (!is_slice || first_in_picture) {
+                aus.push(&stream[au_start..start]);
+                au_start = start;
+                au_has_slice = false;
+            }
+            au_has_slice |= is_slice;
+        }
+        aus.push(&stream[au_start..]);
+        aus
+    }
+
+    /// H.264: one-byte NAL header, `nal_unit_type` in the low 5 bits (1 = non-IDR
+    /// slice, 5 = IDR slice), and `first_mb_in_slice == 0` is the top bit of the byte
+    /// after it. Load-bearing rather than decorative on this vector: it codes two
+    /// slices per picture, so without the flag every picture would be split in two.
+    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
+        split_aus(stream, |s, h| {
+            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
+            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
+            (is_slice, first)
+        })
+    }
+
+    /// H.265: TWO-byte NAL header, `nal_unit_type` in bits 1..7 of the first byte and
+    /// "is a slice" the numeric range `< 32`, so `first_slice_segment_in_pic_flag` is
+    /// the top bit of the byte at `+2` where H.264 reads `+1`. Getting either wrong
+    /// silently merges or splits AUs, which surfaces as a frame-count mismatch a long
+    /// way from its cause.
+    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
+        split_aus(stream, |s, h| {
+            let is_slice = (s[h] >> 1) & 0x3f < 32;
+            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
+            (is_slice, first)
+        })
+    }
+
+    /// The splitters cut both vendored vectors into the access units every other rung's
+    /// legs count, and the Main 10 vector really is ten-bit.
+    ///
+    /// NOT `#[ignore]`d, unlike everything below it: the splitters are pure CPU, they
+    /// are a hand-rolled copy of code that lives in two other crates, and a drift in
+    /// them would reach the hardware legs as a frame-count mismatch on a box someone
+    /// had to walk to. Ordinary `cargo test -p pf-client-core --lib` catches it here
+    /// instead.
+    ///
+    /// The ten-bit check is the same guard `video_d3d11_native` carries and for the
+    /// same reason: a regenerated vector that came out 8-bit would turn
+    /// [`hevc_main10_decodes_the_ten_bit_vector_on_this_machines_vaapi`] into a second
+    /// run of the 8-bit path wearing a ten-bit name, and it would pass.
+    #[test]
+    fn the_annex_b_splitters_still_cut_the_vendored_vectors() {
+        assert_eq!(
+            split_h264_aus(H264_25FPS).len(),
+            H26X_AU_COUNT,
+            "H.264 vector access units"
+        );
+        assert_eq!(
+            split_h265_aus(H265_25FPS).len(),
+            H26X_AU_COUNT,
+            "H.265 vector access units"
+        );
+
+        let main10 = split_h265_aus(MAIN10_H265);
+        assert_eq!(main10.len(), MAIN10_AU_COUNT, "Main 10 vector access units");
+
+        let mut planner = pf_vaadec::H265Planner::new();
+        let plan = planner
+            .plan_au(main10[0])
+            .expect("the Main 10 vector's first access unit must plan");
+        assert_eq!(
+            (
+                plan.picture.chroma_format_idc,
+                plan.picture.bit_depth_luma_minus8
+            ),
+            (1, 2),
+            "the Main 10 vector must be 4:2:0 at ten bits"
+        );
+    }
+
+    /// Access units whose plan outputs at least one picture — one delivered frame each,
+    /// and the ONLY thing that separates [`H264_DELIVERED`] and friends from the
+    /// vectors' frame counts.
+    ///
+    /// Two small walks rather than one generic one because the two planners share no
+    /// trait: `AuPlan` and `AuPlanH265` are different types with the same `dpb.outputs`
+    /// field, which is exactly the shape a macro would obscure for six saved lines.
+    fn output_bearing_aus_h264(aus: &[&[u8]]) -> usize {
+        let mut planner = pf_vaadec::H264Planner::new();
+        aus.iter()
+            .filter(|au| {
+                !planner
+                    .plan_au(au)
+                    .expect("the vendored H.264 vector plans")
+                    .dpb
+                    .outputs
+                    .is_empty()
+            })
+            .count()
+    }
+
+    /// [`output_bearing_aus_h264`] for HEVC. A skipped RASL picture counts as no
+    /// output, which is what the rung does with it too ([`NativeVaapiDecoder::decode`]).
+    fn output_bearing_aus_h265(aus: &[&[u8]]) -> usize {
+        let mut planner = pf_vaadec::H265Planner::new();
+        aus.iter()
+            .filter(|au| match planner.plan_au(au) {
+                Ok(plan) => !plan.dpb.outputs.is_empty(),
+                Err(pf_vaadec::PlanErrorH265::RaslSkipped { .. }) => false,
+                Err(e) => panic!("the vendored HEVC vector must plan: {e:?}"),
+            })
+            .count()
+    }
+
+    /// The three delivered-frame counts the hardware legs assert are what the PLANNER
+    /// implies, not what a hardware run happened to print.
+    ///
+    /// This is the difference between a number that explains itself and a number
+    /// somebody wrote down: it runs on any Linux box, with no GPU and no libva, and it
+    /// fails the moment a vector is regenerated or the planner's bumping changes —
+    /// which would otherwise show up as three mysterious hardware failures on a machine
+    /// somebody had to walk to. See [`H264_DELIVERED`] for why the counts are below the
+    /// vectors' frame counts at all.
+    #[test]
+    fn the_planner_already_says_how_many_frames_these_legs_can_deliver() {
+        assert_eq!(
+            output_bearing_aus_h264(&split_h264_aus(H264_25FPS)),
+            H264_DELIVERED,
+            "H.264: access units whose plan outputs a picture"
+        );
+        assert_eq!(
+            output_bearing_aus_h265(&split_h265_aus(H265_25FPS)),
+            H265_DELIVERED,
+            "H.265: access units whose plan outputs a picture"
+        );
+        assert_eq!(
+            output_bearing_aus_h265(&split_h265_aus(MAIN10_H265)),
+            MAIN10_DELIVERED,
+            "Main 10: access units whose plan outputs a picture"
+        );
+    }
+
+    /// The first frame a leg got back — enough to say the rung exported a real surface
+    /// of the right shape and pixel format, which is the most it can honestly claim.
+    #[derive(Clone, Copy)]
+    struct FirstFrame {
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: u64,
+        keyframe: bool,
+    }
+
+    /// Drive one Annex-B vector's access units through a freshly built rung and report
+    /// how many frames came back and what the first one was.
+    ///
+    /// Shared by all three H.26x legs so that "the H.265 leg proves the same thing the
+    /// H.264 leg does" is a fact about one function rather than a claim about three
+    /// hand-copied ones — the same reasoning `pf-vkdecode`'s `common` module records
+    /// for binding its three decoders to one driver.
+    ///
+    /// # What these legs prove, and what they do not
+    ///
+    /// Deliberately weaker than the Vulkan and D3D11VA H.26x legs, and the difference
+    /// is worth stating rather than hiding behind a test name: those hash every decoded
+    /// frame against libavcodec's goldens, because both can read their decoded surface
+    /// back. This rung hands out a **DRM-PRIME dmabuf** whose memory the driver tiles,
+    /// so there is no CPU-readable image to hash without adding a
+    /// `vaDeriveImage`/`vaGetImage` path that production does not use and does not
+    /// want. So this asserts what CAN be asserted honestly — that every access unit is
+    /// accepted, that the expected number of frames comes back, and that each one is a
+    /// real exported surface of the right shape and fourcc — and it is **NOT frame-hash
+    /// parity**. It is what turns "never decoded a frame anywhere" into a measurement;
+    /// promoting these legs to `verified` still wants parity, and parity wants a
+    /// readback path that does not exist yet.
+    ///
+    /// Fails loudly rather than skipping when the device has no entry point for the
+    /// profile: these legs are `#[ignore]`d, so they only run when someone deliberately
+    /// points them at a box that is supposed to have one, and a silent pass there is
+    /// the invisible-failure mode this whole program exists to end.
+    fn run_annex_b(
+        codec: pf_vaadec::Codec,
+        stream: StreamFormat,
+        aus: &[&[u8]],
+        label: &str,
+    ) -> (usize, FirstFrame) {
+        let mut decoder = NativeVaapiDecoder::new(codec, stream).unwrap_or_else(|e| {
+            panic!(
+                "{label}: this box is supposed to have a VAAPI {label} decode entry point: {e:#}"
+            )
+        });
+        eprintln!("VAAPI {label} rung constructed: {}", decoder.name());
+
+        let mut delivered = 0usize;
+        let mut first: Option<FirstFrame> = None;
+        for (index, au) in aus.iter().enumerate() {
+            match decoder.decode(au) {
+                Ok(Some(frame)) => {
+                    assert!(
+                        !frame.planes.is_empty(),
+                        "{label} AU {index}: a delivered frame exported no dmabuf planes"
+                    );
+                    if first.is_none() {
+                        first = Some(FirstFrame {
+                            width: frame.width,
+                            height: frame.height,
+                            fourcc: frame.fourcc,
+                            modifier: frame.modifier,
+                            keyframe: frame.keyframe,
+                        });
+                    }
+                    delivered += 1;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("{label} AU {index}: VAAPI decode failed: {e:#}"),
+            }
+        }
+
+        let first = first.unwrap_or_else(|| panic!("{label}: not one frame came back"));
+        let FirstFrame {
+            width,
+            height,
+            fourcc,
+            modifier,
+            keyframe,
+        } = first;
+        eprintln!(
+            "VAAPI {label}: {delivered} of {} access units delivered a frame, first \
+             {width}x{height} fourcc={:?} modifier={modifier:#x} keyframe={keyframe}",
+            aus.len(),
+            std::str::from_utf8(&fourcc.to_le_bytes()).unwrap_or("?"),
+        );
+        (delivered, first)
+    }
+
+    /// Does this machine's VAAPI actually DECODE H.264 — the question the evidence
+    /// table has answered "no hardware has ever tried" since M6.
+    ///
+    /// See [`run_annex_b`] for what this proves and, more importantly, what it does
+    /// not: it is a decode measurement, not frame-hash parity.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
+    fn h264_decodes_the_vendored_vector_on_this_machines_vaapi() {
+        let aus = split_h264_aus(H264_25FPS);
+        assert_eq!(aus.len(), H26X_AU_COUNT, "the H.264 vector is 250 AUs");
+
+        let (delivered, first) = run_annex_b(
+            pf_vaadec::Codec::H264,
+            StreamFormat::SDR_420_8,
+            &aus,
+            "H.264",
+        );
+        assert_eq!((first.width, first.height), (320, 240), "320x240");
+        assert_eq!(
+            first.fourcc,
+            pf_vaadec::VA_FOURCC_NV12,
+            "an 8-bit pool exports NV12"
+        );
+        assert_eq!(
+            delivered,
+            output_bearing_aus_h264(&aus),
+            "every access unit whose plan outputs a picture must deliver one"
+        );
+        assert_eq!(
+            delivered, H264_DELIVERED,
+            "see H264_DELIVERED for why this is 225 and not 250"
+        );
+
+        // ⚠ A DEFECT this leg found, asserted so that fixing it is noticed rather than
+        // so that it is preserved. `finish` is handed the CURRENT access unit's
+        // `is_idr`, not the flag of the picture it is about to display — and on a
+        // reordering stream those are different pictures. The first frame delivered
+        // here IS the IDR, bumped out several access units after it decoded, and it
+        // arrives flagged `keyframe: false`; conversely the AU that drains the DPB at a
+        // later IDR flags whichever OLD picture it displays as a keyframe. The flag is
+        // `DecodedImage::is_keyframe`, the pump's post-loss re-anchor signal, so a rung
+        // that mislabels it would keep asking for a keyframe it has already been sent.
+        // It cannot bite punktfunk today for the same reason the frame count cannot:
+        // hosts emit zero-reorder output, so the decoded picture and the displayed one
+        // are always the same picture. Fix it and this line is the one to delete.
+        assert!(
+            !first.keyframe,
+            "the rung labels the ACCESS UNIT, not the picture it delivers — if this \
+             now passes the label was fixed, which is good; delete this assertion"
+        );
+    }
+
+    /// The same question for H.265, whose leg has never decoded a frame either.
+    ///
+    /// Not a redundant copy of the H.264 leg: HEVC reaches an entirely different
+    /// conversion in `pf-vaadec` (its own picture parameters, its own reference-picture
+    /// set, its own slice header) and a different arm of [`NativeVaapiDecoder::decode`]
+    /// — including the `RaslSkipped` Ok-skip no other codec has.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an HEVC Main VLD entry point"]
+    fn h265_decodes_the_vendored_vector_on_this_machines_vaapi() {
+        let aus = split_h265_aus(H265_25FPS);
+        assert_eq!(aus.len(), H26X_AU_COUNT, "the H.265 vector is 250 AUs");
+
+        let (delivered, first) = run_annex_b(
+            pf_vaadec::Codec::H265,
+            StreamFormat::SDR_420_8,
+            &aus,
+            "H.265",
+        );
+        assert_eq!((first.width, first.height), (320, 240), "320x240");
+        assert_eq!(
+            first.fourcc,
+            pf_vaadec::VA_FOURCC_NV12,
+            "an 8-bit pool exports NV12"
+        );
+        assert_eq!(
+            delivered,
+            output_bearing_aus_h265(&aus),
+            "every access unit whose plan outputs a picture must deliver one"
+        );
+        assert_eq!(
+            delivered, H265_DELIVERED,
+            "see H264_DELIVERED for why this is 204 and not 250"
+        );
+        assert!(!first.keyframe, "the same mislabel the H.264 leg documents");
+    }
+
+    /// And the ten-bit leg, which is the one every HDR session lands on.
+    ///
+    /// The fourcc assertion is the point of running it at all: `Session::build` picks
+    /// P010 from the SPS's bit depth, and a pool that came out NV12 would be a ten-bit
+    /// stream decoded into an 8-bit surface.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an HEVC Main 10 VLD entry point"]
+    fn hevc_main10_decodes_the_ten_bit_vector_on_this_machines_vaapi() {
+        let aus = split_h265_aus(MAIN10_H265);
+        assert_eq!(aus.len(), MAIN10_AU_COUNT, "the Main 10 vector is 50 AUs");
+
+        let (delivered, first) = run_annex_b(
+            pf_vaadec::Codec::H265,
+            StreamFormat {
+                bit_depth: 10,
+                ..StreamFormat::SDR_420_8
+            },
+            &aus,
+            "HEVC Main 10",
+        );
+        assert_eq!((first.width, first.height), (320, 240), "320x240");
+        assert_eq!(
+            first.fourcc,
+            pf_vaadec::VA_FOURCC_P010,
+            "a ten-bit stream must build a P010 pool, not an 8-bit one"
+        );
+        assert_eq!(
+            delivered,
+            output_bearing_aus_h265(&aus),
+            "every access unit whose plan outputs a picture must deliver one"
+        );
+        assert_eq!(
+            delivered, MAIN10_DELIVERED,
+            "see H264_DELIVERED for why this is 45 and not 50"
+        );
+        assert!(!first.keyframe, "the same mislabel the H.264 leg documents");
+    }
 }
