@@ -55,7 +55,19 @@ pub(crate) fn video_decode_gate(
 /// hardware decode starts here: WHICH adapter, and does it advertise the codec.
 #[derive(Debug, Clone)]
 pub struct AdapterDecode {
-    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key.
+    /// The device's position in the RAW `vkEnumeratePhysicalDevices` order — and
+    /// therefore the value `PUNKTFUNK_VK_DEVICE` takes, because `pick_device` indexes the
+    /// unsorted list (`devices.get(i)`) before any ranking runs.
+    ///
+    /// ⚠ NOT the display position. This list is sorted discrete-first for readability,
+    /// while enumeration order puts the iGPU first on some hybrids — so the two disagree
+    /// on exactly the machines this probe exists to diagnose. Printing the display
+    /// position as if it were the env value would hand a hybrid-laptop reporter the
+    /// number for the other GPU.
+    pub index: usize,
+    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key. Not necessarily
+    /// unique: a hybrid can expose the same iGPU twice, and a name match then resolves to
+    /// whichever enumerates first.
     pub name: String,
     /// Discrete GPUs sort first, exactly as `pick_device` ranks them, so index 0 here is
     /// the device a default run will pick.
@@ -73,6 +85,16 @@ pub struct AdapterDecode {
     pub codec_exts: Vec<String>,
     /// [`video_decode_gate`] over the fields above.
     pub usable: bool,
+    /// What the driver answers about video image formats, verbatim — one row per
+    /// (profile, usage) question ([`pf_vkdecode::probe`]).
+    ///
+    /// This is the half of the report that says why a device which passes every gate
+    /// above still cannot host the decoder. The five conjuncts answer "is Vulkan Video
+    /// here at all"; this answers "can the pipeline actually use it", which on at least
+    /// one shipping driver (Intel Arc, Windows) is a different question with a different
+    /// answer. Empty when the gate already failed — there is nothing to ask a device
+    /// with no video queue.
+    pub formats: Vec<pf_vkdecode::probe::ProfileProbe>,
 }
 
 /// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: it postdates the Vulkan headers
@@ -743,7 +765,9 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     // filling locals returned by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
-    for pdev in devices {
+    // `enumerate()` BEFORE any filtering or sorting: this index is what
+    // `PUNKTFUNK_VK_DEVICE` selects, so it has to survive both.
+    for (raw_index, pdev) in devices.into_iter().enumerate() {
         // SAFETY: per the Vulkan contract above - a read-only query on the live
         // instance/device, filling locals returned by value.
         let props = unsafe { instance.get_physical_device_properties(pdev) };
@@ -831,9 +855,20 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             base_missing.is_empty(),
             !codec_exts.is_empty(),
         );
+        // Only where the gate passed: the format queries need `VK_KHR_video_queue`'s
+        // entry points, and asking a device that does not expose them produces a null
+        // dispatch, not an answer.
+        let formats = if usable {
+            // SAFETY: `instance` is the live instance created above and `pdev` one of
+            // the physical devices it enumerated; the probe only reads.
+            unsafe { pf_vkdecode::probe::probe_video_formats(&entry, &instance, pdev) }
+        } else {
+            Vec::new()
+        };
         out.push((
             rank,
             AdapterDecode {
+                index: raw_index,
                 name,
                 discrete: rank == 0,
                 api_1_3,
@@ -843,6 +878,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
                 base_missing,
                 codec_exts,
                 usable,
+                formats,
             },
         ));
     }

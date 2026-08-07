@@ -3196,6 +3196,7 @@ dependencies = [
  "ash",
  "async-channel",
  "pf-client-core",
+ "pf-vkdecode",
  "punktfunk-core",
  "sdl3",
  "tracing",

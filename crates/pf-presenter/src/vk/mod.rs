@@ -43,6 +43,11 @@ mod setup;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
+/// The video-format probe behind [`AdapterDecode::formats`], re-exported so a caller
+/// that prints the report does not need its own `pf-vkdecode` dependency (and cannot
+/// end up printing a DIFFERENT crate version's idea of the flag names).
+pub use pf_vkdecode::probe;
+
 /// One presenter iteration's video input.
 pub enum FrameInput<'a> {
     /// No new frame — re-composite the retained video image (expose/resize).

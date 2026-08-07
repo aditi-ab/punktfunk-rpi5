@@ -497,6 +497,7 @@ mod tests {
             format: NV12,
             image_usage: usage,
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
+            ..Default::default()
         };
         let raw = RawH264Caps {
             capability_flags: if layered {
