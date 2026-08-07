@@ -129,10 +129,10 @@ pub struct DecodePlanDxvaAv1 {
     /// AV1 applies `refresh_frame_flags` AFTER the frame is decoded (7.20), so
     /// `ref_frame_idx` resolves against the store as it stood BEFORE this frame and
     /// a frame that reads a slot it then overwrites is the ORDINARY case, not an
-    /// exotic one: **268 of the vendored vector's 274 frames** do it, first at frame
-    /// 6. Releasing such a picture inside this conversion — which is what the H.264
-    /// and H.265 siblings do with their whole `removed` list, and what this one did
-    /// until the parity harness caught it — hands its surface straight back to
+    /// exotic one: **268 of the vendored vector's 274 frames** do it, first at
+    /// frame 6. Releasing such a picture inside this conversion — which is what the
+    /// H.264 and H.265 siblings do with their whole `removed` list, and what this
+    /// one did until the parity harness caught it — hands its surface straight back to
     /// [`Self::setup_slot`], because [`SlotMap::assign`] takes the lowest free slot
     /// and the lowest free slot is the one just vacated. The submission then says
     /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` in the same
