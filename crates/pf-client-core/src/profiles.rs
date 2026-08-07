@@ -402,9 +402,7 @@ impl ProfilesFile {
     /// never an error: nothing about streaming may hinge on this file existing.
     pub fn load() -> ProfilesFile {
         Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|p| crate::trust::load_json_or_default(&p))
             .unwrap_or_default()
     }
 
