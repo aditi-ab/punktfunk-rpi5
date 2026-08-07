@@ -142,6 +142,13 @@ export const SessionGameCard: FC = () => {
 									htmlFor="session-grace-seconds"
 								>
 									<div className="flex items-center gap-2">
+										{/* Deliberately NOT `InputNumber`, unlike the numeric fields on
+										    the policy card next door. This one writes to the HOST on
+										    blur, and InputNumber commits while you type — so its own
+										    blur-time clamp would race the apply below, which still
+										    closes over the pre-clamp value. The host is the authority
+										    here regardless: it clamps to 10..=86400 on write and
+										    answers with what it actually stored. */}
 										<Input
 											id="session-grace-seconds"
 											type="number"

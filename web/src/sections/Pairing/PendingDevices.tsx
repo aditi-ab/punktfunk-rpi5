@@ -9,6 +9,7 @@ import {
 	useDenyPendingDevice,
 	useListPendingDevices,
 } from "@/api/gen/native/native";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,6 +28,7 @@ export const PendingDevicesSection: FC = () => {
 	// A knock arrives as a `pairing.pending` event (api/events.ts), so the timer is the fallback —
 	// but it stays reasonably brisk: this list is the one the operator is actively waiting on, and
 	// the rows carry an age that should not visibly lag.
+	const { promptText } = useDialogs();
 	const pending = useListPendingDevices({ query: { refetchInterval: 10_000 } });
 	const approve = useApprovePendingDevice();
 	const deny = useDenyPendingDevice();
@@ -35,8 +37,13 @@ export const PendingDevicesSection: FC = () => {
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
-	const onApprove = (id: number, currentName: string) => {
-		const name = prompt(m.pairing_pending_name_prompt(), currentName);
+	const onApprove = async (id: number, currentName: string) => {
+		const name = await promptText({
+			title: m.pairing_pending_name_title(),
+			label: m.pairing_pending_name_prompt(),
+			defaultValue: currentName,
+			confirmLabel: m.pairing_pending_approve(),
+		});
 		if (name == null) return; // operator cancelled
 		approve.mutate(
 			{ id, data: { name: name.trim() ? name.trim() : null } },

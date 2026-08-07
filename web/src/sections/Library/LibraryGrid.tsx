@@ -7,6 +7,7 @@ import {
 	useGetLibrary,
 } from "@/api/gen/library/library";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Stagger } from "@/components/stagger";
 import { Card, CardContent } from "@/components/ui/card";
@@ -29,6 +30,7 @@ export const LibraryGridSection: FC<{
 	onEntries?: (entries: GameEntry[]) => void;
 }> = ({ onEdit, providerFilter, onEntries }) => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const library = useGetLibrary();
 	const all = library.data;
 	useEffect(() => {
@@ -53,7 +55,13 @@ export const LibraryGridSection: FC<{
 	// answers 409 with what to do instead), and an un-caught `mutateAsync` rejection reported none
 	// of them — the card just stayed put as if nothing had been clicked.
 	const onDelete = async (entry: GameEntry) => {
-		if (!confirm(m.library_delete_confirm())) return;
+		const ok = await confirm({
+			title: m.library_delete_confirm(),
+			description: m.library_delete_body(),
+			confirmLabel: m.library_delete(),
+			destructive: true,
+		});
+		if (!ok) return;
 		try {
 			await remove.mutateAsync({ id: customId(entry) });
 		} catch (e) {

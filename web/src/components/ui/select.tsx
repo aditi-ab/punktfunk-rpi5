@@ -17,7 +17,7 @@ import {
 	Select,
 	SelectContent,
 	SelectGroup,
-	SelectItem,
+	SelectItem as SelectItemBase,
 	SelectLabel,
 	SelectScrollDownButton,
 	SelectScrollUpButton,
@@ -42,6 +42,21 @@ const SelectTrigger = ({
 	/>
 );
 SelectTrigger.displayName = "SelectTrigger";
+
+// The highlighted row. Upstream paints it `bg-main/25` — a neutral grey wash, since `--main` is the
+// foreground colour. Everywhere else in this console the "this is the one" wash is brand violet
+// (`bg-primary/15` on the nav's hover and active states, `ring-primary` on a chosen preset card), so
+// a grey row is the odd one out the moment a select sits next to any of them.
+const SelectItem = ({
+	className,
+	...props
+}: ComponentProps<typeof SelectItemBase>) => (
+	<SelectItemBase
+		className={cn("focus:bg-primary/15 focus:text-foreground", className)}
+		{...props}
+	/>
+);
+SelectItem.displayName = "SelectItem";
 
 export {
 	Select,

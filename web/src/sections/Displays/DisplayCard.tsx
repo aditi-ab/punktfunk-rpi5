@@ -36,12 +36,13 @@ import type {
 	Preset,
 	Topology,
 } from "@/api/gen/model";
+import { type ConfirmOptions, useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { InputNumber } from "@/components/ui/input-number";
 import { Label } from "@/components/ui/label";
 import { apiErrorMessage } from "@/lib/errors";
 import { cn } from "@/lib/utils";
@@ -55,6 +56,7 @@ import { m } from "@/paraglide/messages";
  */
 export const DisplaySection: FC = () => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const q = useGetDisplaySettings();
 	const save = useSetDisplaySettings();
 
@@ -164,8 +166,12 @@ export const DisplaySection: FC = () => {
 	// clicking "Host" in the sidebar is a client-side route change the browser never hears about,
 	// so the draft vanished with no prompt at all. The router's blocker covers in-app navigation
 	// AND still arms `beforeunload` for the reload case, so it replaces the listener outright.
+	//
+	// `shouldBlockFn` may return a promise, which is what lets this ask with the console's own
+	// dialog rather than the browser's. `enableBeforeUnload` stays native by necessity: a reload or
+	// a tab close is the browser's dialog to draw, and it will not wait on ours.
 	useBlocker({
-		shouldBlockFn: () => !confirm(m.display_discard_confirm()),
+		shouldBlockFn: async () => !(await confirm(discardPrompt())),
 		enableBeforeUnload: () => dirty,
 		disabled: !dirty,
 	});
@@ -234,6 +240,17 @@ export const DisplaySection: FC = () => {
 	);
 };
 
+/**
+ * The gate on anything that would throw unsaved Custom fields away — asked from three places (a
+ * preset click, applying a saved preset, and leaving the page), so it is written once. A function
+ * rather than a constant because the message is resolved per locale, at call time.
+ */
+const discardPrompt = (): ConfirmOptions => ({
+	title: m.display_discard_confirm(),
+	confirmLabel: m.common_discard(),
+	destructive: true,
+});
+
 /** Preset display order — Default first (the safe baseline), the situational ones, then Custom. */
 const PRESET_ORDER = [
 	"default",
@@ -284,6 +301,7 @@ export const DisplayForm: FC<{
 	error,
 }) => {
 	const qc = useQueryClient();
+	const { confirm, promptText } = useDialogs();
 	const createPreset = useCreateCustomPreset();
 	const updatePreset = useUpdateCustomPreset();
 	const deletePreset = useDeleteCustomPreset();
@@ -314,11 +332,10 @@ export const DisplayForm: FC<{
 
 	// The five named presets apply in ONE click; "Custom" reveals the fields, seeded from the current
 	// effective behavior (nothing changes until you Save).
-	const pickPreset = (id: string) => {
+	const pickPreset = async (id: string) => {
 		// A preset click overwrites the whole policy, so hand-edits that were never saved would
 		// vanish without a word — the same failure as not finding the Save button, one click later.
-		if (dirty && id !== "custom" && !confirm(m.display_discard_confirm()))
-			return;
+		if (dirty && id !== "custom" && !(await confirm(discardPrompt()))) return;
 		// Already hand-editing: re-seeding would fill in defaults for fields the stored policy
 		// leaves unset and flag "unsaved changes" for a click that changed nothing.
 		if (id === "custom" && isCustom) return;
@@ -349,8 +366,8 @@ export const DisplayForm: FC<{
 
 	// Applying a custom preset writes a `Custom` policy carrying its saved fields + game-session (the
 	// one axis a preset DOES set) — the host has no separate apply route (design/gamemode-and-…).
-	const applyCustomPreset = (p: CustomPreset) => {
-		if (dirty && !confirm(m.display_discard_confirm())) return;
+	const applyCustomPreset = async (p: CustomPreset) => {
+		if (dirty && !(await confirm(discardPrompt()))) return;
 		apply({
 			version: 1,
 			preset: "custom",
@@ -377,8 +394,13 @@ export const DisplayForm: FC<{
 	const anyCustomSelected = customPresets.some(customSelected);
 
 	// Save the currently-in-force behavior (built-in OR hand-edited) as a new named preset.
-	const saveAsPreset = () => {
-		const name = prompt(m.display_preset_name())?.trim();
+	const saveAsPreset = async () => {
+		const name = (
+			await promptText({
+				title: m.display_preset_save_title(),
+				label: m.display_preset_name(),
+			})
+		)?.trim();
 		if (!name) return; // cancelled or empty
 		createPreset.mutate(
 			{
@@ -391,8 +413,14 @@ export const DisplayForm: FC<{
 			{ onSuccess: invalidateSettings },
 		);
 	};
-	const renamePreset = (p: CustomPreset) => {
-		const name = prompt(m.display_preset_name(), p.name)?.trim();
+	const renamePreset = async (p: CustomPreset) => {
+		const name = (
+			await promptText({
+				title: m.display_preset_edit(),
+				label: m.display_preset_name(),
+				defaultValue: p.name,
+			})
+		)?.trim();
 		if (!name) return;
 		updatePreset.mutate(
 			{
@@ -418,8 +446,13 @@ export const DisplayForm: FC<{
 			},
 			{ onSuccess: invalidateSettings },
 		);
-	const removePreset = (p: CustomPreset) => {
-		if (!confirm(m.display_preset_delete_confirm())) return;
+	const removePreset = async (p: CustomPreset) => {
+		const ok = await confirm({
+			title: m.display_preset_delete_confirm(),
+			confirmLabel: m.display_preset_delete(),
+			destructive: true,
+		});
+		if (!ok) return;
 		deletePreset.mutate({ id: p.id }, { onSuccess: invalidateSettings });
 	};
 
@@ -618,16 +651,14 @@ export const DisplayForm: FC<{
 							</Button>
 							{ka.mode === "duration" && (
 								<div className="flex items-center gap-2">
-									<Input
+									<InputNumber
 										id="display-keep-alive-seconds"
 										aria-label={m.display_keep_alive_seconds()}
-										type="number"
 										min={0}
 										className="w-24"
 										value={ka.seconds}
 										disabled={busy}
-										onChange={(e) => {
-											const n = Math.max(0, Number(e.target.value) || 0);
+										onChange={(n) => {
 											setKeepSecs(n);
 											setDraft({
 												...draft,
@@ -691,23 +722,17 @@ export const DisplayForm: FC<{
 					/>
 
 					<Field label={m.display_max()} htmlFor="display-max">
-						<Input
+						{/* 1..=16 is the host's own clamp on write. InputNumber holds the field to it
+						    and — unlike the arithmetic this replaces — lets it be EMPTY on the way to
+						    a new number instead of snapping to 1 the moment you clear it. */}
+						<InputNumber
 							id="display-max"
-							type="number"
 							min={1}
 							max={16}
 							className="w-24"
 							value={draft.max_displays ?? 4}
 							disabled={busy}
-							onChange={(e) =>
-								setDraft({
-									...draft,
-									max_displays: Math.min(
-										16,
-										Math.max(1, Number(e.target.value) || 1),
-									),
-								})
-							}
+							onChange={(max_displays) => setDraft({ ...draft, max_displays })}
 						/>
 					</Field>
 
@@ -1208,28 +1233,27 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({
 							<Label className="text-xs" htmlFor={`disp-x-${slot}`}>
 								X
 							</Label>
-							<Input
+							{/* A screen left of or above the origin has a NEGATIVE coordinate, and the
+							    arithmetic this replaces made one almost untypable: `Number("-") || 0`
+							    is 0, so the lone minus sign was rewritten to "0" before the digits
+							    could be typed. InputNumber holds "-" as an incomplete draft instead.
+							    `Math.trunc` stays — positions are whole pixels. */}
+							<InputNumber
 								id={`disp-x-${slot}`}
-								type="number"
 								className="w-24"
 								value={p.x}
 								disabled={saveLayout.isPending}
-								onChange={(e) =>
-									setXY(slot, "x", Math.trunc(Number(e.target.value) || 0))
-								}
+								onChange={(n) => setXY(slot, "x", Math.trunc(n))}
 							/>
 							<Label className="text-xs" htmlFor={`disp-y-${slot}`}>
 								Y
 							</Label>
-							<Input
+							<InputNumber
 								id={`disp-y-${slot}`}
-								type="number"
 								className="w-24"
 								value={p.y}
 								disabled={saveLayout.isPending}
-								onChange={(e) =>
-									setXY(slot, "y", Math.trunc(Number(e.target.value) || 0))
-								}
+								onChange={(n) => setXY(slot, "y", Math.trunc(n))}
 							/>
 						</div>
 					);

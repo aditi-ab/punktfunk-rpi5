@@ -362,6 +362,12 @@ export const GameForm: FC<{
 								onChange={set("publisher")}
 							/>
 						</div>
+						{/* These two stay `type="number"` over a STRING field rather than becoming
+						    `InputNumber` like the policy card's numbers: both are OPTIONAL metadata
+						    where empty means "don't send it" (see `int()` above), and InputNumber's
+						    contract is `value: number` — it cannot express "unset", so adopting it
+						    would invent a year for every entry that hasn't got one. The type here
+						    only asks for a numeric keypad. */}
 						<div className="grid grid-cols-2 gap-4">
 							<Field
 								id="releaseYear"
