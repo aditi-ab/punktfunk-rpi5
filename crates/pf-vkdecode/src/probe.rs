@@ -30,14 +30,30 @@
 //! `TRANSFER_SRC|TRANSFER_DST|SAMPLED|DECODE_DST|DECODE_DPB|ENCODE_SRC|ENCODE_DPB` and
 //! `MUTABLE_FORMAT|EXTENDED_USAGE`, which is what makes the zero-copy path work there.
 //!
-//! The [`UsageProbe::image_format_support`] cross-check exists because of the ONE
-//! inconsistency in the above: asked for a usage it does not support, the Intel driver
-//! returns `VK_SUCCESS` with an entry that lacks the requested bit, where the spec says
-//! the returned `imageUsageFlags` "will contain at least the same set of image usage
-//! flags" (and `VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR` is the documented refusal). So
-//! the probe asks a SECOND, independent question — `vkGetPhysicalDeviceImageFormat-
-//! Properties2` with the same profile list chained — and prints both answers. Where the
-//! two disagree, the disagreement itself is the finding.
+//! The Intel answers carry one genuine conformance bug, which is what made the refusal
+//! read oddly: the driver ignores the REQUESTED `imageUsage` completely. Asked for
+//! `SAMPLED` alone it still returns that same decode envelope, where the spec says the
+//! returned `imageUsageFlags` "will contain at least the same set of image usage flags"
+//! and `VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR` is the documented refusal. That is why
+//! derivation reported "the NV12 entry does not advertise SAMPLED" (an entry was found)
+//! rather than "no NV12 in the coincide list" (nothing returned). It changes the error
+//! text, not the answer.
+//!
+//! # What the cross-check is, and is NOT
+//!
+//! [`UsageProbe::image_format_support`] asks `vkGetPhysicalDeviceImageFormatProperties2`
+//! the same question with the same profile list chained. It is deliberately kept, and
+//! deliberately NOT treated as authority, because measuring it settled what it is worth:
+//! on BOTH vendors it answers "creatable" for combinations the video-format query
+//! rejects — NVIDIA included, for `SAMPLED` alone, which is not a legal video image
+//! usage at all. So that entry point does not fully honour the video profile list on any
+//! driver measured here, and a "creatable" from it is NOT evidence that a decode picture
+//! can be sampled. It is reported because the question is otherwise re-asked by every
+//! person who reads the refusal; the answer is on the record instead.
+//!
+//! `vkGetPhysicalDeviceVideoFormatPropertiesKHR` remains the authority, and two
+//! independent implementations of it — this probe and `vulkaninfo --show-video-props` —
+//! agree on every value above.
 
 use ash::vk;
 use ash::vk::native as hh;
@@ -100,8 +116,10 @@ pub struct UsageProbe {
     /// to it by the shared query, exactly as derivation sees them.
     pub formats: Result<Vec<VideoFormat>, vk::Result>,
     /// `vkGetPhysicalDeviceImageFormatProperties2` for the SAME profile list, format
-    /// and usage — the independent second opinion (module docs). `Ok(())` means the
-    /// driver says an image of that shape is creatable.
+    /// and usage. `Ok(())` means that call says an image of the shape is creatable —
+    /// which, as the module docs record, is a WEAKER claim than it looks: measured on
+    /// both vendors, this entry point does not fully honour the chained video profile
+    /// list, so it must not be read as permission to create a video image.
     pub image_format_support: Result<(), vk::Result>,
 }
 
@@ -259,16 +277,22 @@ unsafe fn image_format_supported(
 /// line prints its mask: a reader must be able to check the names against the number,
 /// and a bit the tool has no word for must not silently vanish from a mask it reports.
 pub fn describe_usage(usage: vk::ImageUsageFlags) -> String {
-    const BITS: [(vk::ImageUsageFlags, &str); 9] = [
+    // The encode trio is here because NVIDIA advertises it on DECODE pictures (measured:
+    // 0xC000 beside the decode bits), and a mask printed as "unrecognised" invites the
+    // reader to wonder whether the tool is out of date rather than reading the answer.
+    const BITS: [(vk::ImageUsageFlags, &str); 12] = [
         (vk::ImageUsageFlags::TRANSFER_SRC, "TRANSFER_SRC"),
         (vk::ImageUsageFlags::TRANSFER_DST, "TRANSFER_DST"),
         (vk::ImageUsageFlags::SAMPLED, "SAMPLED"),
         (vk::ImageUsageFlags::STORAGE, "STORAGE"),
         (vk::ImageUsageFlags::COLOR_ATTACHMENT, "COLOR_ATTACHMENT"),
+        (vk::ImageUsageFlags::INPUT_ATTACHMENT, "INPUT_ATTACHMENT"),
         (vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR, "DECODE_DST"),
         (vk::ImageUsageFlags::VIDEO_DECODE_SRC_KHR, "DECODE_SRC"),
         (vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR, "DECODE_DPB"),
-        (vk::ImageUsageFlags::INPUT_ATTACHMENT, "INPUT_ATTACHMENT"),
+        (vk::ImageUsageFlags::VIDEO_ENCODE_DST_KHR, "ENCODE_DST"),
+        (vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR, "ENCODE_SRC"),
+        (vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR, "ENCODE_DPB"),
     ];
     describe_mask(usage.as_raw(), &BITS.map(|(f, n)| (f.as_raw(), n)))
 }

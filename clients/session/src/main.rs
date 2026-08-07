@@ -543,21 +543,25 @@ mod session_main {
                         .join("; "),
                 };
                 println!("       {:<24} {answer}", u.label);
-                // The independent second opinion, printed only where it DISAGREES with
-                // the format query. Agreement is the normal case and would be noise; a
-                // disagreement means one of the driver's two paths is wrong, which is
-                // the whole reason a second question gets asked at all.
+                // The second opinion, printed only where it differs from the video
+                // format query. Worded as "also asked" rather than "disagrees" on
+                // purpose: measured on both vendors this call answers "creatable" for
+                // combinations the video query rejects (NVIDIA included, for SAMPLED
+                // alone), so it does not honour the profile list and a difference here
+                // is NOT the driver contradicting itself. Printed anyway because the
+                // question gets re-asked by everyone who reads a refusal.
                 let listed = u
                     .wanted_entry(p.wanted)
                     .is_some_and(|f| f.image_usage.contains(u.usage));
                 if listed != u.image_format_support.is_ok() {
                     let second = match &u.image_format_support {
-                        Ok(()) => "says creatable".to_string(),
-                        Err(e) => format!("says {e:?}"),
+                        Ok(()) => "creatable".to_string(),
+                        Err(e) => format!("{e:?}"),
                     };
                     println!(
-                        "       {:<24} ^ DISAGREES: \
-                         vkGetPhysicalDeviceImageFormatProperties2 {second}",
+                        "       {:<24} (also asked: \
+                         vkGetPhysicalDeviceImageFormatProperties2 says {second} — that \
+                         call does not honour the profile list; not authority)",
                         ""
                     );
                 }

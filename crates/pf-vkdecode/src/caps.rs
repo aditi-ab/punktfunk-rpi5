@@ -288,12 +288,18 @@ pub enum CapsError {
     /// anyway would be a silent VUID violation.
     UsageUnsupported {
         mode: &'static str,
+        /// The picture format whose entry fell short — NOT always NV12 (a Main 10
+        /// stream is refused about P010), which is what this used to say regardless.
+        format: vk::Format,
         missing: vk::ImageUsageFlags,
     },
     /// The presenter-facing entry for `mode` does not allow `MUTABLE_FORMAT`, so
     /// the per-plane views the presenter samples through ([`plane_formats`])
     /// cannot exist on this device.
-    NoMutableFormat { mode: &'static str },
+    NoMutableFormat {
+        mode: &'static str,
+        format: vk::Format,
+    },
     /// The driver forces COINCIDE mode AND a layered DPB (one image array, no
     /// `SEPARATE_REFERENCE_IMAGES`): the picture-pool model — a re-activated slot
     /// binding a fresh free image, so delivered pictures are never decode targets
@@ -322,16 +328,36 @@ impl std::fmt::Display for CapsError {
             CapsError::NoPlaneMapping { format } => {
                 write!(f, "no per-plane view mapping for {format:?}")
             }
-            CapsError::UsageUnsupported { mode, missing } => {
+            CapsError::UsageUnsupported {
+                mode,
+                format,
+                missing,
+            } => {
                 write!(
                     f,
-                    "the {mode} NV12 entry does not advertise usage {missing:?}"
-                )
+                    "the {mode} {format:?} entry does not advertise usage {missing:?}"
+                )?;
+                // Name the CONSEQUENCE for the one missing bit that is not a passing
+                // driver quirk. Without `SAMPLED` nothing in a shader can read the
+                // decoded picture, so the zero-copy path this rung exists for cannot be
+                // built here at all — a fact worth stating in the log line rather than
+                // leaving a field reporter to work out from a flag name. Measured on
+                // Intel Arc (Windows 101.8861), where the whole advertised envelope is
+                // TRANSFER_SRC|DECODE_DST|DECODE_DPB with no image create flags:
+                // `punktfunk-session --probe-decode` prints the driver's own answer.
+                if missing.contains(vk::ImageUsageFlags::SAMPLED) {
+                    write!(
+                        f,
+                        " — no shader can read this device's decoded pictures, so the \
+                         zero-copy path cannot exist on it (see --probe-decode)"
+                    )?;
+                }
+                Ok(())
             }
-            CapsError::NoMutableFormat { mode } => {
+            CapsError::NoMutableFormat { mode, format } => {
                 write!(
                     f,
-                    "the {mode} NV12 entry does not allow MUTABLE_FORMAT (per-plane views)"
+                    "the {mode} {format:?} entry does not allow MUTABLE_FORMAT (per-plane views)"
                 )
             }
             CapsError::CoincideLayeredDpb => {
@@ -503,7 +529,14 @@ fn require_usage(
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(CapsError::UsageUnsupported { mode, missing })
+        // The entry's OWN format, not the caller's `wanted`: they are equal here (the
+        // entry was picked by format), and taking it from the driver's record keeps the
+        // message describing what the driver actually said.
+        Err(CapsError::UsageUnsupported {
+            mode,
+            format: entry.format,
+            missing,
+        })
     }
 }
 
@@ -514,7 +547,10 @@ fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsEr
     {
         Ok(())
     } else {
-        Err(CapsError::NoMutableFormat { mode })
+        Err(CapsError::NoMutableFormat {
+            mode,
+            format: entry.format,
+        })
     }
 }
 
@@ -961,8 +997,20 @@ mod tests {
             derive_caps(&raw).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "coincide (DPB|DST|SAMPLED)",
+                format: NV12,
                 missing: vk::ImageUsageFlags::SAMPLED
             }
+        );
+        // The missing bit is SAMPLED, so the message says what that COSTS — a field
+        // report carrying this line should not need a second round trip to learn that
+        // the device cannot host the rung at all.
+        assert!(
+            derive_caps(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("zero-copy path cannot exist"),
+            "a missing SAMPLED must name its consequence: {}",
+            derive_caps(&raw).unwrap_err()
         );
 
         // Same on the distinct output half.
@@ -972,9 +1020,38 @@ mod tests {
             derive_caps(&raw).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "output (DST|SAMPLED)",
+                format: NV12,
                 missing: vk::ImageUsageFlags::SAMPLED
             }
         );
+
+        // A 10-bit stream is refused about P010, not about NV12 — the message used to
+        // say "NV12" whatever the stream was, which sends a reader looking at the wrong
+        // format's support.
+        let mut raw = radv_like();
+        raw.coincide_formats = vec![entry(
+            P010,
+            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
+        )];
+        let err = crate::caps_h265::derive_caps_h265(
+            &crate::caps_h265::RawH265Caps {
+                capability_flags: raw.capability_flags,
+                decode_flags: raw.decode_flags,
+                coincide_formats: raw.coincide_formats.clone(),
+                ..Default::default()
+            },
+            P010,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CapsError::UsageUnsupported {
+                mode: "coincide (DPB|DST|SAMPLED)",
+                format: P010,
+                missing: vk::ImageUsageFlags::SAMPLED
+            }
+        );
+        assert!(err.to_string().contains("G10X6"), "{err}");
     }
 
     #[test]
@@ -989,7 +1066,8 @@ mod tests {
         assert_eq!(
             derive_caps(&raw).unwrap_err(),
             CapsError::NoMutableFormat {
-                mode: "coincide (DPB|DST|SAMPLED)"
+                mode: "coincide (DPB|DST|SAMPLED)",
+                format: NV12,
             }
         );
 

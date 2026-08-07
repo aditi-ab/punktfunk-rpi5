@@ -760,6 +760,7 @@ mod tests {
             derive_caps_h265(&raw, P010).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "coincide (DPB|DST|SAMPLED)",
+                format: P010,
                 missing: vk::ImageUsageFlags::SAMPLED
             }
         );
@@ -774,7 +775,8 @@ mod tests {
         assert_eq!(
             derive_caps_h265(&raw, P010).unwrap_err(),
             CapsError::NoMutableFormat {
-                mode: "coincide (DPB|DST|SAMPLED)"
+                mode: "coincide (DPB|DST|SAMPLED)",
+                format: P010,
             }
         );
     }

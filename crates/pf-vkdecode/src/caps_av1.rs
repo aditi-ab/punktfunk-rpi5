@@ -676,6 +676,7 @@ mod tests {
             derive_caps_av1(&raw, NV12).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "coincide (DPB|DST|SAMPLED)",
+                format: NV12,
                 missing: vk::ImageUsageFlags::SAMPLED
             }
         );
@@ -690,7 +691,8 @@ mod tests {
         assert_eq!(
             derive_caps_av1(&raw, NV12).unwrap_err(),
             CapsError::NoMutableFormat {
-                mode: "coincide (DPB|DST|SAMPLED)"
+                mode: "coincide (DPB|DST|SAMPLED)",
+                format: NV12,
             }
         );
     }
