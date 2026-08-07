@@ -354,6 +354,7 @@ mod tests {
             format,
             image_usage: usage,
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
+            ..Default::default()
         }
     }
 
@@ -638,6 +639,7 @@ mod tests {
                 format: P010,
                 image_usage: DPB_USAGE,
                 image_create_flags: vk::ImageCreateFlags::empty(),
+                ..Default::default()
             }],
             output_formats: vec![entry(NV12, OUTPUT_USAGE)],
             ..coincide_device(vec![])
@@ -683,6 +685,7 @@ mod tests {
             format: NV12,
             image_usage: COINCIDE_USAGE,
             image_create_flags: vk::ImageCreateFlags::empty(),
+            ..Default::default()
         }]);
         assert_eq!(
             derive_caps_av1(&raw, NV12).unwrap_err(),

@@ -86,7 +86,7 @@ pub const COINCIDE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
 /// plus the driver's advertised usage/create-flag envelope for it — creation must
 /// stay INSIDE that envelope (finding of the adversarial round: the flags used to
 /// be assumed, not honoured).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoFormat {
     pub format: vk::Format,
     /// `imageUsageFlags` the driver supports for this format under the queried
@@ -94,7 +94,38 @@ pub struct VideoFormat {
     pub image_usage: vk::ImageUsageFlags,
     /// `imageCreateFlags` the driver allows — per-plane views require
     /// `MUTABLE_FORMAT` to appear here.
+    ///
+    /// ⚠ This field is also the ONLY gate on `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`,
+    /// which is the spec's one escape hatch from `image_usage`: `supportedVideoFormat`
+    /// (VUID-VkImageCreateInfo-pNext-06811) admits a usage bit outside `image_usage`
+    /// only when `VkImageCreateInfo::flags` includes `EXTENDED_USAGE`, and admits that
+    /// flag only when it is "also set in `VkVideoFormatPropertiesKHR::imageCreateFlags`"
+    /// (or is `VIDEO_PROFILE_INDEPENDENT`, which needs `VK_KHR_video_maintenance1`).
+    /// So an EMPTY value here closes the escape hatch as well as the door — measured on
+    /// Intel Arc, where it is empty for every profile ([`crate::probe`] docs).
     pub image_create_flags: vk::ImageCreateFlags,
+    /// `imageType` — the image type this format may be created with. Part of the
+    /// `supportedVideoFormat` match (VUID-06811 compares it for EQUALITY), so it is
+    /// recorded rather than assumed; every fleet driver reports `TYPE_2D`, which is
+    /// what [`crate::images`] creates.
+    pub image_type: vk::ImageType,
+    /// `imageTiling` — likewise compared for equality by VUID-06811; every fleet
+    /// driver reports `OPTIMAL`.
+    pub image_tiling: vk::ImageTiling,
+}
+
+impl Default for VideoFormat {
+    /// The shape the pools create with (`TYPE_2D` + `OPTIMAL`), so a fixture that
+    /// names only the interesting fields still describes a creatable image.
+    fn default() -> Self {
+        Self {
+            format: vk::Format::UNDEFINED,
+            image_usage: vk::ImageUsageFlags::empty(),
+            image_create_flags: vk::ImageCreateFlags::empty(),
+            image_type: vk::ImageType::TYPE_2D,
+            image_tiling: vk::ImageTiling::OPTIMAL,
+        }
+    }
 }
 
 /// Everything the thin query copies out of the driver, hand-buildable for tests.
@@ -678,6 +709,36 @@ pub(crate) unsafe fn query_formats(
     decode_profile: DecodeProfile,
     usage: vk::ImageUsageFlags,
 ) -> Result<Vec<VideoFormat>, vk::Result> {
+    // SAFETY: the caller's DeviceHandles contract makes these two live, which is
+    // exactly what the physical-device form needs.
+    unsafe {
+        query_formats_on(
+            dev.video_queue_instance(),
+            dev.physical_device(),
+            decode_profile,
+            usage,
+        )
+    }
+}
+
+/// [`query_formats`] against a bare physical device — no `VkDevice` in sight.
+///
+/// Split out so [`crate::probe`] enumerates through the SAME code the session's caps
+/// query runs, rather than a second copy that would drift (the probe's whole value is
+/// that its answer is the one derivation will see). `vkGetPhysicalDeviceVideoFormat-
+/// PropertiesKHR` is an instance-level command over a physical device, so nothing here
+/// ever needed the logical device the old signature demanded.
+///
+/// # Safety
+///
+/// `video_queue_instance` must be loaded against a live `VkInstance`, and
+/// `physical_device` must be one of that instance's physical devices.
+pub(crate) unsafe fn query_formats_on(
+    video_queue_instance: &ash::khr::video_queue::Instance,
+    physical_device: vk::PhysicalDevice,
+    decode_profile: DecodeProfile,
+    usage: vk::ImageUsageFlags,
+) -> Result<Vec<VideoFormat>, vk::Result> {
     let mut chain = decode_profile.chain();
     let profile = chain.wire();
     let mut profile_list =
@@ -686,21 +747,13 @@ pub(crate) unsafe fn query_formats(
         .image_usage(usage)
         .push_next(&mut profile_list);
 
-    let fp = dev
-        .video_queue_instance()
+    let fp = video_queue_instance
         .fp()
         .get_physical_device_video_format_properties_khr;
     let mut count = 0u32;
     // SAFETY: live physical device; `info` roots a wired chain outliving the call;
     // null properties pointer is the spec's count-query form.
-    let r = unsafe {
-        fp(
-            dev.physical_device(),
-            &info,
-            &mut count,
-            std::ptr::null_mut(),
-        )
-    };
+    let r = unsafe { fp(physical_device, &info, &mut count, std::ptr::null_mut()) };
     match r {
         vk::Result::SUCCESS => {}
         // "This usage/profile combination has no formats" — an arrangement gap,
@@ -711,7 +764,7 @@ pub(crate) unsafe fn query_formats(
     }
     let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
     // SAFETY: as above, with a properties array of exactly the driver-reported count.
-    let r = unsafe { fp(dev.physical_device(), &info, &mut count, props.as_mut_ptr()) };
+    let r = unsafe { fp(physical_device, &info, &mut count, props.as_mut_ptr()) };
     if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
         return Err(r);
     }
@@ -722,6 +775,8 @@ pub(crate) unsafe fn query_formats(
             format: p.format,
             image_usage: p.image_usage_flags,
             image_create_flags: p.image_create_flags,
+            image_type: p.image_type,
+            image_tiling: p.image_tiling,
         })
         .collect())
 }
@@ -738,6 +793,7 @@ mod tests {
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT
                 | vk::ImageCreateFlags::ALIAS
                 | vk::ImageCreateFlags::EXTENDED_USAGE,
+            ..Default::default()
         }
     }
 
@@ -783,6 +839,7 @@ mod tests {
                 format: NV12,
                 image_usage: DPB_USAGE,
                 image_create_flags: vk::ImageCreateFlags::empty(),
+                ..Default::default()
             }],
             output_formats: vec![entry(NV12, OUTPUT_USAGE)],
             coincide_formats: vec![],
@@ -927,6 +984,7 @@ mod tests {
             format: NV12,
             image_usage: COINCIDE_USAGE,
             image_create_flags: vk::ImageCreateFlags::empty(),
+            ..Default::default()
         }];
         assert_eq!(
             derive_caps(&raw).unwrap_err(),

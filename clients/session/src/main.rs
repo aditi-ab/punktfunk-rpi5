@@ -510,6 +510,61 @@ mod session_main {
         );
     }
 
+    /// The driver's own answers about video images, printed with nothing in front of
+    /// them (`--probe-decode`).
+    ///
+    /// Passing the five conjuncts above only says Vulkan Video EXISTS on a device; this
+    /// says whether the zero-copy pipeline can be BUILT on it — a different question
+    /// with, on at least one shipping driver, a different answer. Verbatim on purpose:
+    /// the Intel Arc refusal was twice diagnosed from punktfunk's own error text and
+    /// twice the diagnosis was wrong, and what broke it open both times was reading what
+    /// the driver actually said.
+    fn print_video_formats(a: &pf_presenter::vk::AdapterDecode) {
+        use pf_presenter::vk::probe::{describe_create_flags, describe_usage};
+        for p in &a.formats {
+            println!("     {} (wants {:?}):", p.profile, p.wanted);
+            for u in &p.usages {
+                let answer = match &u.formats {
+                    Err(e) => format!("query failed: {e:?}"),
+                    Ok(entries) if entries.is_empty() => "no formats offered".to_string(),
+                    Ok(entries) => entries
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "{:?} usage={} create={} {:?} {:?}",
+                                f.format,
+                                describe_usage(f.image_usage),
+                                describe_create_flags(f.image_create_flags),
+                                f.image_type,
+                                f.image_tiling,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                println!("       {:<24} {answer}", u.label);
+                // The independent second opinion, printed only where it DISAGREES with
+                // the format query. Agreement is the normal case and would be noise; a
+                // disagreement means one of the driver's two paths is wrong, which is
+                // the whole reason a second question gets asked at all.
+                let listed = u
+                    .wanted_entry(p.wanted)
+                    .is_some_and(|f| f.image_usage.contains(u.usage));
+                if listed != u.image_format_support.is_ok() {
+                    let second = match &u.image_format_support {
+                        Ok(()) => "says creatable".to_string(),
+                        Err(e) => format!("says {e:?}"),
+                    };
+                    println!(
+                        "       {:<24} ^ DISAGREES: \
+                         vkGetPhysicalDeviceImageFormatProperties2 {second}",
+                        ""
+                    );
+                }
+            }
+        }
+    }
+
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines).
         tracing_subscriber::fmt()
@@ -628,6 +683,7 @@ mod session_main {
                         } else {
                             println!("     extensions:          {}", a.codec_exts.join(", "));
                         }
+                        print_video_formats(a);
                     }
                     if adapters.len() > 1 {
                         // The single most common misreading of this output: seeing a

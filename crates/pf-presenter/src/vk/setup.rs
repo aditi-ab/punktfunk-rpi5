@@ -85,6 +85,16 @@ pub struct AdapterDecode {
     pub codec_exts: Vec<String>,
     /// [`video_decode_gate`] over the fields above.
     pub usable: bool,
+    /// What the driver answers about video image formats, verbatim — one row per
+    /// (profile, usage) question ([`pf_vkdecode::probe`]).
+    ///
+    /// This is the half of the report that says why a device which passes every gate
+    /// above still cannot host the decoder. The five conjuncts answer "is Vulkan Video
+    /// here at all"; this answers "can the pipeline actually use it", which on at least
+    /// one shipping driver (Intel Arc, Windows) is a different question with a different
+    /// answer. Empty when the gate already failed — there is nothing to ask a device
+    /// with no video queue.
+    pub formats: Vec<pf_vkdecode::probe::ProfileProbe>,
 }
 
 /// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: it postdates the Vulkan headers
@@ -845,6 +855,16 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             base_missing.is_empty(),
             !codec_exts.is_empty(),
         );
+        // Only where the gate passed: the format queries need `VK_KHR_video_queue`'s
+        // entry points, and asking a device that does not expose them produces a null
+        // dispatch, not an answer.
+        let formats = if usable {
+            // SAFETY: `instance` is the live instance created above and `pdev` one of
+            // the physical devices it enumerated; the probe only reads.
+            unsafe { pf_vkdecode::probe::probe_video_formats(&entry, &instance, pdev) }
+        } else {
+            Vec::new()
+        };
         out.push((
             rank,
             AdapterDecode {
@@ -858,6 +878,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
                 base_missing,
                 codec_exts,
                 usable,
+                formats,
             },
         ));
     }

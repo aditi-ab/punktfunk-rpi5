@@ -133,6 +133,7 @@ pub mod params_h265;
 pub mod pic;
 pub mod pic_av1;
 pub mod pic_h265;
+pub mod probe;
 pub mod recovery;
 pub mod ring;
 pub mod session;
