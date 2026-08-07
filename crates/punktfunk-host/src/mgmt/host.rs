@@ -129,6 +129,55 @@ pub(crate) struct RuntimeStatus {
     /// any game whose session has ended and which is waiting out its reconnect window before being
     /// ended (`state: "grace"`). Empty when nothing was launched — a plain desktop stream has no game.
     games: Vec<ActiveGame>,
+    /// The audio wiring verdict (Windows hosts; absent on other platforms and before the first
+    /// wiring pass). Present even while idle — the wiring exists for the host's lifetime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<AudioWiring>,
+}
+
+/// The Windows host's audio wiring verdict — which endpoint carries each role. The names are
+/// the endpoints' friendly names as the Sound settings show them (on current hosts the minted
+/// "Punktfunk" instances of Steam's streaming drivers).
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AudioWiring {
+    /// `full` | `audio_only` | `mic_only` | `none` — whether desktop audio and mic passthrough
+    /// each have an endpoint at all.
+    #[schema(example = "full")]
+    readiness: String,
+    /// Friendly name of the desktop-audio loopback source; absent = desktop audio unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loopback: Option<String>,
+    /// Friendly name of the virtual-mic write target; absent = mic passthrough unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mic: Option<String>,
+    /// The mic was WITHHELD so game audio could keep the only working sink — mic passthrough
+    /// needs Steam installed (the host mints its own microphone) or a virtual cable.
+    mic_withheld: bool,
+    /// The loopback is the known-degraded last resort — desktop audio may be silent until the
+    /// endpoint set changes.
+    last_resort: bool,
+    /// Why the chosen loopback endpoint NARROWS the desktop mix (rate/channels), when it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    narrowing: Option<String>,
+}
+
+/// The wiring snapshot mapped for the API — `None` off-Windows or before the first pass.
+fn audio_wiring() -> Option<AudioWiring> {
+    use crate::audio::wiring_plan as wp;
+    crate::audio::wiring_snapshot().map(|w| AudioWiring {
+        readiness: match wp::readiness(&w) {
+            wp::AudioReadiness::Full => "full",
+            wp::AudioReadiness::AudioOnly => "audio_only",
+            wp::AudioReadiness::MicOnly => "mic_only",
+            wp::AudioReadiness::Nothing => "none",
+        }
+        .into(),
+        loopback: w.loopback_render.map(|(n, _)| n),
+        mic: w.mic_render.map(|(n, _)| n),
+        mic_withheld: w.mic_withheld,
+        last_resort: w.loopback_last_resort,
+        narrowing: w.loopback_narrowing,
+    })
 }
 
 /// One launched game, for the console's running-game card.
@@ -461,6 +510,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
                 grace_remaining_s: g.grace_remaining_s,
             })
             .collect(),
+        audio: audio_wiring(),
     })
 }
 

@@ -149,6 +149,17 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
     wire_now_full(set_playback).wiring
 }
 
+/// The most recent wiring verdict, as the LAST wiring pass computed it (the mic pump wires
+/// eagerly at host start and on every reopen, so this is fresh in the steady state). Change
+/// detection for the once-per-change log lives on the same cell.
+static LAST_WIRING: Mutex<Option<Wiring>> = Mutex::new(None);
+
+/// Read-only snapshot of [`LAST_WIRING`] for the status API — never triggers a wiring pass
+/// (a pass does COM work and IPolicyConfig writes; a status poll must do neither).
+pub(crate) fn last_wiring() -> Option<Wiring> {
+    LAST_WIRING.lock().unwrap().clone()
+}
+
 /// Endpoint ids among `renders` that are the host's own pad-audio endpoints — the exclusion
 /// data [`plan`] runs on. Detection lives in [`super::pad_endpoint`] (stamped PFDS container /
 /// devnode marker, registry-only reads); this is just the per-pass collection.
@@ -217,9 +228,8 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     };
 
     // Log assignment changes exactly once (first plan included).
-    static LAST: Mutex<Option<Wiring>> = Mutex::new(None);
     let changed = {
-        let mut last = LAST.lock().unwrap();
+        let mut last = LAST_WIRING.lock().unwrap();
         let changed = last.as_ref() != Some(&wiring);
         *last = Some(wiring.clone());
         changed

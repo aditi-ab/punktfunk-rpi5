@@ -217,3 +217,15 @@ pub(crate) mod capture_policy;
 mod mic_jitter;
 mod mic_pump;
 pub use mic_pump::{MicFrame, MicPump};
+
+/// The most recent audio wiring verdict — the LAST wiring pass's assignment on a Windows host,
+/// `None` elsewhere or before the first pass. A read-only snapshot for the status API; never
+/// triggers a pass.
+#[cfg(target_os = "windows")]
+pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
+    audio_control::last_wiring()
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
+    None
+}
