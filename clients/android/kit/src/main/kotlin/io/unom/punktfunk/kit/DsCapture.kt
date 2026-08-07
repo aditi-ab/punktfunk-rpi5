@@ -24,9 +24,10 @@ import android.view.InputDevice
  * diffed, axes on-change — the exit chord participates like any pad) + the rich plane (touch
  * normalized to the wire's 0..65535 screen space on-change; motion forwarded per report, rescaled
  * into the wire's units by this pad's own calibration — read once per claim, off the claiming
- * thread, so parsing starts a millisecond in rather than the UI waiting on a control transfer).
- * The wire slot is claimed when the capture engages, with the first parsed report as the fallback
- * for a claim that found no free index, and freed on unplug/[stop], so indices never leak.
+ * thread, with the nominal scaling standing in for the millisecond that read is in flight rather
+ * than the UI waiting on a control transfer). The wire slot is claimed when the capture engages,
+ * with the first parsed report as the fallback for a claim that found no free index, and freed on
+ * unplug/[stop], so indices never leak.
  *
  * Feedback: implements [GamepadFeedback.PadFeedbackSink] — rumble / trigger / lightbar / player
  * LED events addressed to this pad's wire index become USB output reports on the physical pad
@@ -57,7 +58,7 @@ class DsCapture(
     @Volatile private var pad: GamepadRouter.ExternalPad? = null
 
     /** This pad's factory motion scale, read once per capture on [calReader] and handed to the
-     *  link thread. Null until that read lands — see [MotionCalHandoff] and [onReport]. */
+     *  link thread, which scales nominally until it lands — see [MotionCalHandoff]. */
     private val motionCal = MotionCalHandoff()
 
     /** The thread doing the claim-time calibration read, kept for the teardown wait. */
@@ -133,8 +134,9 @@ class DsCapture(
         val m = DsDevice.modelFor(dev.productId) ?: return false
         if (!usb.start(dev)) return false
         // Before `model`, which is what lets the link thread into the parse at all: opening the
-        // claim forgets the last pad's calibration, so no report can be scaled by it while this
-        // pad's own read (below, off this thread) is in flight.
+        // claim forgets the last pad's calibration, so reports arriving while this pad's own read
+        // (below, off this thread) is in flight fall back to the nominal scaling rather than to
+        // another unit's factory numbers.
         val claim = motionCal.begin()
         model = m
         for (id in InputDevice.getDeviceIds()) {
@@ -157,17 +159,18 @@ class DsCapture(
      * Off the caller's thread because [startUsb] runs on the main one — stream setup, and the
      * USB-permission broadcast — and the read is a blocking EP0 control transfer: a pad that is
      * there answers in about a millisecond, but one that is stalling takes the link's whole write
-     * timeout, and the interface must wait for neither. The pad goes live a millisecond later
-     * instead, because the link thread parses nothing until the calibration lands ([onReport]);
-     * a pathological stall then delays motion rather than freezing the UI.
+     * timeout, and the interface must wait for neither. The pad is live throughout, its motion
+     * nominally scaled until this lands ([onReport]), so even a pad that never answers costs
+     * precision rather than the UI or the controller.
      *
      * One thread per claim, daemon and named, matching how [HidUsbLink] runs its reader; it is
      * awaited by [awaitCalRead] before the connection it reads from can be closed.
      */
     private fun readMotionCalAsync(m: DsDevice.Model, claim: Int) {
         val t = Thread({
-            // Never leave the gate shut: a read that fails or throws still has to publish
-            // something, or this capture would forward no motion at all for its whole life.
+            // A read that throws would otherwise leave the capture on the nominal scaling with
+            // nothing in the log to say why — the one outcome that looks identical to a pad whose
+            // calibration is genuinely nominal. Publish the fallback explicitly, and say so.
             val cal = runCatching { readMotionCal(m) }.getOrElse {
                 Log.w(TAG, "motion calibration read failed — nominal scaling", it)
                 DsDevice.MotionCal.NOMINAL
@@ -262,11 +265,10 @@ class DsCapture(
 
     private fun onReport(report: ByteArray, len: Int) {
         val m = model ?: return
-        // This claim's calibration read is still in flight. Dropping the report beats parsing it
-        // with a fallback that is about to be replaced: the reports carry absolute state, so the
-        // next one (1–4 ms away) says everything this one would have.
-        val cal = motionCal.current ?: return
-        if (!DsDevice.parseState(m, report, len, state, cal)) return
+        // Nominal scaling until this claim's calibration read lands (see MotionCalHandoff): for
+        // that millisecond the pad behaves as it did before the read existed, which nobody can
+        // feel — unlike a pad whose buttons wait on a control transfer.
+        if (!DsDevice.parseState(m, report, len, state, motionCal.effective)) return
         // Normally claimed already, at capture time; this is the retry for a capture that engaged
         // while every wire index was taken.
         val p = pad ?: ensureSlot(m) ?: return // all 16 taken — drop until one frees
