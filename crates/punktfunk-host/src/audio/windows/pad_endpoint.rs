@@ -91,6 +91,10 @@ const SSS_HWID: &str = "ROOT\\SteamStreamingSpeakers";
 const PAD_INDEX_VALUE: &str = "PunktfunkPadIndex";
 /// The endpoint store for render endpoints (each subkey = one endpoint GUID).
 const MMDEV_RENDER_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
+/// The capture-direction sibling of [`MMDEV_RENDER_PATH`] — where a paired device's microphone
+/// half registers (the `audio-probe` devtest's S3 lookup).
+const MMDEV_CAPTURE_PATH: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
 /// WASAPI endpoint-id prefix for render endpoints (`{0.0.0.00000000}.{guid}`).
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
 /// How long [`ensure`] waits for the new render endpoint to materialise after driver install.
@@ -261,7 +265,7 @@ fn active_stamps(pad_index: u8) -> Vec<Stamp> {
 // --- small encoding helpers ----------------------------------------------------------------
 
 /// NUL-terminated UTF-16.
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -468,7 +472,7 @@ fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
 // --- devnode management (SetupAPI) ----------------------------------------------------------
 
 /// Owns an HDEVINFO and destroys it on drop.
-struct DevInfoSet(HDEVINFO);
+pub(crate) struct DevInfoSet(pub(crate) HDEVINFO);
 impl Drop for DevInfoSet {
     fn drop(&mut self) {
         // SAFETY: the handle came from SetupDiGetClassDevsW/SetupDiCreateDeviceInfoList and is
@@ -479,7 +483,7 @@ impl Drop for DevInfoSet {
     }
 }
 
-fn media_class_devs() -> Result<DevInfoSet> {
+pub(crate) fn media_class_devs() -> Result<DevInfoSet> {
     // SAFETY: the class GUID is a static const; flags 0 (not DIGCF_PRESENT) so a created-but-
     // never-installed phantom from a previous run is still found and reused, not duplicated.
     let set = unsafe {
@@ -494,14 +498,14 @@ fn media_class_devs() -> Result<DevInfoSet> {
     Ok(DevInfoSet(set))
 }
 
-fn devinfo_data() -> SP_DEVINFO_DATA {
+pub(crate) fn devinfo_data() -> SP_DEVINFO_DATA {
     SP_DEVINFO_DATA {
         cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
         ..Default::default()
     }
 }
 
-fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut buf = [0u16; 200];
     // SAFETY: live devinfo set + element; the buffer length travels with the slice.
     unsafe { SetupDiGetDeviceInstanceIdW(set.0, did, Some(&mut buf), None) }.ok()?;
@@ -510,7 +514,7 @@ fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
 }
 
 /// A REG_MULTI_SZ SetupDi registry property (e.g. SPDRP_HARDWAREID) as strings.
-fn devnode_multi_sz_prop(
+pub(crate) fn devnode_multi_sz_prop(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
     prop: windows::Win32::Devices::DeviceAndDriverInstallation::SETUP_DI_REGISTRY_PROPERTY,
@@ -538,7 +542,7 @@ fn devnode_multi_sz_prop(
 
 /// The devnode's installed-driver INF filename (`DEVPKEY_Device_DriverInfPath`, e.g.
 /// `oem32.inf`) — absent on a devnode whose driver never installed.
-fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut ty = DEVPROPTYPE(0);
     let mut buf = vec![0u8; 1024];
     let mut req = 0u32;
@@ -628,15 +632,22 @@ fn find_devnode(pad_index: u8) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Create + register a fresh MEDIA-class root devnode carrying the Steam Streaming Speakers
-/// hardware id, and persist the pad slot in its `Device Parameters` key.
-fn create_devnode(pad_index: u8) -> Result<String> {
+/// Create + register a fresh MEDIA-class root devnode carrying `hwid`, then let `mark` write
+/// the caller's durable owner marker into its `Device Parameters` key (DeviceDesc only
+/// survives until the INF installs — see the module doc). Shared by the pad provisioner and
+/// the `audio-probe` devtest: the first slice of the shared minting surface the
+/// audio-substrate design (`windows-audio-endpoints-and-vbcable.md` §C1) extracts.
+pub(crate) fn create_media_devnode(
+    desc: &str,
+    hwid: &str,
+    mark: impl FnOnce(&DevInfoSet, &mut SP_DEVINFO_DATA) -> Result<()>,
+) -> Result<String> {
     // SAFETY: the class GUID is a static const.
     let set = unsafe { SetupDiCreateDeviceInfoList(Some(&GUID_DEVCLASS_MEDIA), None) }
         .context("SetupDiCreateDeviceInfoList(MEDIA)")?;
     let set = DevInfoSet(set);
     let mut did = devinfo_data();
-    let desc = wide(DEVNODE_DESC);
+    let desc = wide(desc);
     // SAFETY: name/class/description are live NUL-terminated buffers; DICD_GENERATE_ID makes
     // PnP mint the ROOT\MEDIA\00NN instance id; `did` receives the element.
     unsafe {
@@ -651,7 +662,7 @@ fn create_devnode(pad_index: u8) -> Result<String> {
         )
     }
     .context("SetupDiCreateDeviceInfo")?;
-    let hwid = multi_sz_bytes(&[SSS_HWID]);
+    let hwid = multi_sz_bytes(&[hwid]);
     // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
     unsafe { SetupDiSetDeviceRegistryPropertyW(set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
         .context("set SPDRP_HARDWAREID")?;
@@ -661,8 +672,16 @@ fn create_devnode(pad_index: u8) -> Result<String> {
     // SAFETY: live set + element; no compare callback.
     unsafe { SetupDiRegisterDeviceInfo(set.0, &mut did, 0, None, None, None) }
         .context("SetupDiRegisterDeviceInfo")?;
-    write_pad_index(&set, &mut did, pad_index)?;
-    let inst = instance_id(&set, &did).context("read the new devnode's instance id")?;
+    mark(&set, &mut did)?;
+    instance_id(&set, &did).context("read the new devnode's instance id")
+}
+
+/// Create + register a fresh MEDIA-class root devnode carrying the Steam Streaming Speakers
+/// hardware id, and persist the pad slot in its `Device Parameters` key.
+fn create_devnode(pad_index: u8) -> Result<String> {
+    let inst = create_media_devnode(DEVNODE_DESC, SSS_HWID, |set, did| {
+        write_pad_index(set, did, pad_index)
+    })?;
     tracing::info!(pad = pad_index, devnode = %inst, "created a pad-audio devnode");
     Ok(inst)
 }
@@ -755,12 +774,11 @@ fn resolve_sss_inf() -> Result<String> {
     )
 }
 
-/// Bind the SSS driver to every unbound devnode carrying its hardware id (i.e. the pad
-/// devnodes just created). Idempotent: "nothing needed an update" is success.
-fn install_sss_driver() -> Result<()> {
-    let inf = resolve_sss_inf()?;
-    let inf_w = wide(&inf);
-    let hwid_w = wide(SSS_HWID);
+/// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: "nothing needed an
+/// update" is success. Shared with the `audio-probe` devtest (§C1 minting surface).
+pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
+    let inf_w = wide(inf);
+    let hwid_w = wide(hwid);
     // SAFETY: both strings are NUL-terminated and outlive the call; a null parent HWND and no
     // reboot-required out-param are documented as accepted.
     let r = unsafe {
@@ -774,7 +792,7 @@ fn install_sss_driver() -> Result<()> {
     };
     match r {
         Ok(()) => {
-            tracing::info!(inf = %inf, "bound the Steam Streaming Speakers driver to the pad devnode(s)");
+            tracing::info!(hwid = %hwid, inf = %inf, "bound the driver to the unbound devnode(s)");
             Ok(())
         }
         // ERROR_NO_MORE_ITEMS (0x80070103): every matching devnode already runs this (or a
@@ -786,19 +804,36 @@ fn install_sss_driver() -> Result<()> {
     }
 }
 
+/// Bind the SSS driver to every unbound devnode carrying its hardware id (i.e. the pad
+/// devnodes just created). Idempotent: "nothing needed an update" is success.
+fn install_sss_driver() -> Result<()> {
+    bind_driver(SSS_HWID, &resolve_sss_inf()?)
+}
+
 // --- endpoint discovery + stamping ----------------------------------------------------------
 
 /// The render endpoint owned by `instance_id`, identified through the endpoint store's devnode
 /// link (`"{1}.<instance id>"` under `…\MMDevices\Audio\Render\{ep}\Properties`).
-fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+pub(crate) fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+    endpoint_for_devnode_in(MMDEV_RENDER_PATH, instance_id)
+}
+
+/// The CAPTURE endpoint owned by `instance_id` — the microphone half of a paired device like
+/// the Steam Streaming Microphone. Pad devices are render-only; the `audio-probe` devtest's
+/// S3 measurement is what needs this direction.
+pub(crate) fn find_capture_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+    endpoint_for_devnode_in(MMDEV_CAPTURE_PATH, instance_id)
+}
+
+fn endpoint_for_devnode_in(reg_path: &str, instance_id: &str) -> Result<Option<String>> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let want = format!("{{1}}.{instance_id}");
-    let render = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(MMDEV_RENDER_PATH)
-        .with_context(|| format!(r"open HKLM\{MMDEV_RENDER_PATH}"))?;
-    for key in render.enum_keys().flatten() {
-        let Ok(props) = render.open_subkey(format!(r"{key}\Properties")) else {
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(reg_path)
+        .with_context(|| format!(r"open HKLM\{reg_path}"))?;
+    for key in root.enum_keys().flatten() {
+        let Ok(props) = root.open_subkey(format!(r"{key}\Properties")) else {
             continue;
         };
         let Ok(link) = props.get_value::<String, _>(reg_value_name(&PKEY_ENDPOINT_DEVNODE)) else {

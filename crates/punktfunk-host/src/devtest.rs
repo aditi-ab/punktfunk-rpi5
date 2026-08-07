@@ -495,6 +495,16 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
 /// state without changing anything; `remove` deletes the devnode via pnputil — the escape
 /// hatch only, endpoints are persistent by design. Stamping needs SYSTEM (the MMDevices ACL);
 /// run `ensure` under the service account or PsExec when the property-store route is denied.
+/// Windows: the audio-substrate spike measurements (S1–S3 in
+/// `windows-audio-endpoints-and-vbcable.md`) — `audio-probe ssm|sink|sss-primary|cleanup
+/// [--keep]`. `ssm` is the decision gate: mint a second Steam Streaming Microphone devnode and
+/// prove render→capture end to end; `sink` parks the default on a minted Speakers instance and
+/// loopback-measures it; `sss-primary` re-measures the primary Speakers' known-silent loopback.
+#[cfg(target_os = "windows")]
+pub fn audio_probe(args: &[String]) -> Result<()> {
+    crate::audio::audio_probe::run(args)
+}
+
 #[cfg(target_os = "windows")]
 pub fn pad_endpoint(args: &[String]) -> Result<()> {
     use crate::audio::pad_endpoint as pe;

@@ -622,6 +622,10 @@ fn real_main() -> Result<()> {
         // escape hatch (`remove`). `--index N` selects the pad slot (default 0).
         #[cfg(target_os = "windows")]
         Some("pad-endpoint") => devtest::pad_endpoint(&args),
+        // Windows: audio-substrate spikes (design/windows-audio-endpoints-and-vbcable.md §3) —
+        // mint Steam-driver instances and measure render→capture / loopback end to end.
+        #[cfg(target_os = "windows")]
+        Some("audio-probe") => devtest::audio_probe(&args),
         // Capture→encode→file pipeline spike (dev tool).
         Some("spike") => spike::run(parse_spike(&args[1..])?),
         // Native punktfunk/1 host (QUIC control plane + UDP data plane).

@@ -63,7 +63,7 @@ use wasapi::Direction;
 /// Deliberately total: EVERY failure maps to `None` ("assume it is fine"), because the wiring plan
 /// treats an unknown format as non-narrowing. A box where activation fails therefore plans exactly
 /// as it did before formats existed, instead of mis-demoting a perfectly good endpoint.
-fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
+pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
     let fmt = open_endpoint(ep)
         .ok()?
         .get_iaudioclient()
@@ -337,7 +337,7 @@ pub(crate) fn default_render_id() -> Option<String> {
 /// The current default CAPTURE endpoint id, if any — the recording-side analogue of
 /// [`default_render_id`], read before asserting the recording default so an already-correct
 /// default costs zero IPolicyConfig writes.
-fn default_capture_id() -> Option<String> {
+pub(crate) fn default_capture_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Capture)

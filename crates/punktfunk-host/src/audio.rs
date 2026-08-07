@@ -189,6 +189,11 @@ mod linux;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/pad_endpoint.rs"]
 pub(crate) mod pad_endpoint;
+// `audio-probe` devtest — the S1–S3 spike measurements for the Windows audio-substrate design
+// (mint Steam-driver instances, measure their render→capture / loopback paths).
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/audio_probe.rs"]
+pub(crate) mod audio_probe;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/wasapi_cap.rs"]
 mod wasapi_cap;
