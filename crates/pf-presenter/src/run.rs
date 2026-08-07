@@ -222,6 +222,10 @@ struct StreamState {
     /// Live host↔client clock offset handle (None until Connected): loaded per present so
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Where the audio plane reads the video leg it must land with (ns). Published on every
+    /// presented frame; see the two `e2e` sites. The presenter deliberately knows nothing about
+    /// audio beyond writing this number.
+    video_e2e: Option<Arc<std::sync::atomic::AtomicU64>>,
     hdr: bool,
     /// The presented lane shows a PQ stream RAW — no tone-map pass ran — so the OSD badge
     /// reads `HDR→SDR (raw)` instead of claiming one that never did.
@@ -391,6 +395,7 @@ impl StreamState {
             profile,
             latch_grid,
             clock_offset: None,
+            video_e2e: None,
             hdr: false,
             hdr_untonemapped: false,
             win_e2e_us: Vec::with_capacity(256),
@@ -1295,6 +1300,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .ok();
                     gamepad.attach(c.clone());
                     st.clock_offset = Some(c.clock_offset_shared());
+                    st.video_e2e = Some(c.video_e2e_shared());
                     // gamescope's EIS grants only a relative pointer — absolute sends
                     // would be dropped, so the desktop model is pinned off there. Auto
                     // (an older host that didn't say) stays allowed: Windows hosts and
@@ -1619,6 +1625,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             .max(0) as u64;
                         if e2e > 0 && e2e < 10_000_000_000 {
                             st.win_e2e_us.push(e2e / 1000);
+                            // Hand the audio plane the figure it has to hit. This is the TRUE
+                            // on-glass branch, so it is the best reference we can offer.
+                            if let Some(c) = st.video_e2e.as_ref() {
+                                c.store(e2e, Ordering::Relaxed);
+                            }
                         }
                         st.win_disp_us
                             .push(s.displayed_ns.saturating_sub(s.decoded_ns) / 1000);
@@ -1995,6 +2006,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             .max(0) as u64;
                         if e2e > 0 && e2e < 10_000_000_000 {
                             st.win_e2e_us.push(e2e / 1000);
+                            // Same hand-off as the glass-stamped branch above. This one is anchored
+                            // on the submit instant rather than a true latch, so it UNDERSTATES the
+                            // video leg by up to a refresh period — the audio loop's deadband is
+                            // wider than that, which is what keeps the approximation harmless.
+                            if let Some(c) = st.video_e2e.as_ref() {
+                                c.store(e2e, Ordering::Relaxed);
+                            }
                         }
                         st.win_disp_us
                             .push(displayed_ns.saturating_sub(decoded_ns) / 1000);
@@ -2805,6 +2823,20 @@ fn stats_text(
             text.push_str(&format!(" · dropped {}", s.mic_dropped));
         }
     }
+    // The audio plane's own latency, Detailed-only. `buffer` is how much decoded audio is queued
+    // ahead of the speaker; `a/v` is where that PUTS it relative to the picture (+ = audio behind).
+    //
+    // Both, not just the depth: a deep ring on a jittery link is correct behaviour, and only the
+    // offset distinguishes that from a ring that is simply holding audio late. Before this the
+    // plane published neither — they lived in a `tracing::debug!` line that, on the Steam Deck,
+    // goes to a pipe under Steam's reaper that nobody can read, so the device that reported the
+    // latency was the one device where the numbers could not be seen.
+    if detailed && s.audio_buffer_ms > 0 {
+        text.push_str(&format!("\naudio buffer {} ms", s.audio_buffer_ms));
+        if s.audio_av_offset_ms != 0 {
+            text.push_str(&format!(" · a/v {:+} ms", s.audio_av_offset_ms));
+        }
+    }
     // Decode integrity (M4) — the native lane's answer to "was that stream actually
     // clean?". Appended LAST and only when it has something to say, which keeps it
     // additive for the stdout `stats:` line's parsers (a machine interface: every
@@ -3116,6 +3148,8 @@ mod tests {
                 lost_pct: 0.4,
                 mic_sent: 0,
                 mic_dropped: 0,
+                audio_buffer_ms: 0,
+                audio_av_offset_ms: 0,
                 // The decode-path tag as the session actually spells it since M10 — the
                 // ladder's rung names (`NativeRung::name`), not the deleted libavcodec
                 // ones. A fixture carrying a tag no client emits would let this test go on

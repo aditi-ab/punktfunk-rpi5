@@ -297,6 +297,26 @@ pub struct NativeClient {
     /// the pump's first no-op clock flush). Shared with the pump and, via
     /// [`clock_offset_shared`](Self::clock_offset_shared), with embedder latency-math threads.
     clock_offset: Arc<AtomicI64>,
+    /// The video plane's live end-to-end latency in ns — `displayed + clock_offset − pts`, the
+    /// figure the presenter already computes per frame (with a TRUE on-glass stamp where
+    /// `VK_KHR_present_wait` is available, and the submit instant otherwise). `0` = nothing
+    /// presented yet.
+    ///
+    /// Written by whoever puts frames on the glass; read by the audio plane, which steers its ring
+    /// depth to land audio WITH the picture ([`crate::audio::AvSync`]). It lives here, next to
+    /// `clock_offset`, because those two are exactly the pair a synchroniser needs and neither
+    /// plane owns the other: the presenter must not know about audio, and the audio thread cannot
+    /// see the glass.
+    video_e2e_ns: Arc<AtomicU64>,
+    /// The A/V sync loop's smoothed offset in ms — positive = audio playing LATE relative to the
+    /// picture. Written by the audio thread, read by the stats HUD. The audio plane used to
+    /// publish NOTHING a surface could render (its depth and target existed only as a
+    /// `tracing::debug!` line, which on a Deck goes into a pipe under Steam's reaper that nobody
+    /// can read), so a latency report had no instrument behind it at all.
+    audio_av_offset_ms: Arc<AtomicI64>,
+    /// Decoded audio queued ahead of the speaker (ms) — the playback ring's depth, as last seen by
+    /// the audio callback. Written by the audio thread, read by the stats HUD.
+    audio_buffer_ms: Arc<AtomicU32>,
     /// Decode-stage latency samples from the embedder ([`report_decode_us`](Self::report_decode_us)),
     /// drained per window by the data-plane pump to feed the adaptive-bitrate controller's decode
     /// signal. Shared with the pump; see [`DecodeLatAcc`].
@@ -400,7 +420,13 @@ fn pin_thread_user_interactive() {}
 
 /// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
 /// capture `pts_ns` after the skew offset is applied — the same latency math the stats HUDs use.
-fn now_realtime_ns() -> i128 {
+///
+/// Public because the A/V sync loop ([`crate::audio::AvSync`]) lives in an embedder crate but must
+/// read the clock in EXACTLY this basis: its whole output is a difference between a local instant
+/// and a host `pts_ns`, so a caller reaching for `Instant` or a monotonic clock instead would get a
+/// plausible-looking number that is wrong by the machine's boot time. Exporting the one correct
+/// clock is cheaper than documenting which clocks are incorrect.
+pub fn now_realtime_ns() -> i128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
@@ -545,6 +571,9 @@ impl NativeClient {
         let mic_stats = Arc::new(MicUplinkCounters::default());
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
         let clock_offset = Arc::new(AtomicI64::new(0));
+        let video_e2e_ns = Arc::new(AtomicU64::new(0));
+        let audio_av_offset_ms = Arc::new(AtomicI64::new(0));
+        let audio_buffer_ms = Arc::new(AtomicU32::new(0));
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
         // Seeded by the pump from the Welcome (before ready_tx), then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
@@ -690,6 +719,9 @@ impl NativeClient {
             rfi: Mutex::new(RfiRecovery::default()),
             hot_tids,
             clock_offset,
+            video_e2e_ns,
+            audio_av_offset_ms,
+            audio_buffer_ms,
             decode_lat,
             live_bitrate_kbps: live_bitrate,
             // The controller arms exactly when the pump does — all three terms, not two: Automatic
@@ -958,6 +990,35 @@ impl NativeClient {
     /// an `Arc<NativeClient>`, whose drop disconnects).
     pub fn clock_offset_shared(&self) -> Arc<AtomicI64> {
         self.clock_offset.clone()
+    }
+
+    /// The shared cell carrying the video plane's end-to-end latency (ns, `0` = nothing presented
+    /// yet). The presenter WRITES it once per presented frame; the audio plane READS it to place
+    /// its samples with the picture. See the field docs on `video_e2e_ns`.
+    pub fn video_e2e_shared(&self) -> Arc<AtomicU64> {
+        self.video_e2e_ns.clone()
+    }
+
+    /// The cell carrying the A/V sync loop's smoothed offset in ms (positive = audio late).
+    /// Written by the audio thread; read by the HUD.
+    pub fn audio_av_offset_shared(&self) -> Arc<AtomicI64> {
+        self.audio_av_offset_ms.clone()
+    }
+
+    /// The A/V sync offset the audio plane last measured, in ms. Positive = audio is playing
+    /// behind the picture. `0` before the loop has evidence, or when sync is off.
+    pub fn audio_av_offset_ms(&self) -> i64 {
+        self.audio_av_offset_ms.load(Ordering::Relaxed)
+    }
+
+    /// The cell carrying the playback ring's depth in ms. Written by the audio thread.
+    pub fn audio_buffer_ms_shared(&self) -> Arc<AtomicU32> {
+        self.audio_buffer_ms.clone()
+    }
+
+    /// Decoded audio queued ahead of the speaker, in ms.
+    pub fn audio_buffer_ms(&self) -> u32 {
+        self.audio_buffer_ms.load(Ordering::Relaxed)
     }
 
     /// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
