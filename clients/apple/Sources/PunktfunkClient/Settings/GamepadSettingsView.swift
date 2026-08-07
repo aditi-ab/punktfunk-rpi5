@@ -257,10 +257,12 @@ struct GamepadSettingsView: View {
             .padding(.vertical, 7)
             .background {
                 // One shared capsule that MOVES between pills, rather than one per pill fading
-                // in and out — the highlight travels the way the press did.
+                // in and out — the highlight travels the way the press did. A Liquid Glass
+                // surface (accent-tinted through consoleGlass), so the strip wears the same
+                // material language as the rows it sits above.
                 if selected {
-                    Capsule()
-                        .fill(ink.accent(0.85))
+                    Color.clear
+                        .consoleGlass(Capsule(), tint: ink.accent(0.85))
                         .matchedGeometryEffect(id: "tab", in: tabHighlight)
                 }
             }

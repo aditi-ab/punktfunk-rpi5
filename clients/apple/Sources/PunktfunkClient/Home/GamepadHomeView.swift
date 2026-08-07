@@ -124,10 +124,10 @@ struct GamepadHomeView: View {
             #if os(iOS)
             if let screen = topScreen {
                 screenLayer(screen)
-                    // Resolve the screen's internal layout (safe-area trays, the scrims'
-                    // `.ignoresSafeArea()` full-bleed) BEFORE the insertion animates: without
-                    // this the tray blurs entered at their content bounds and visibly grew to
-                    // the screen edges mid-push.
+                    // Settle the screen's internal layout before the insertion animates, so
+                    // descendants never lerp from a half-resolved first frame. (Not sufficient
+                    // for the tray blurs on its own — safe-area expansion resolves outside a
+                    // geometry group; GamepadTrayScrim pins its own geometry too.)
                     .geometryGroup()
                     .zIndex(1)
                     .id(screen.id)

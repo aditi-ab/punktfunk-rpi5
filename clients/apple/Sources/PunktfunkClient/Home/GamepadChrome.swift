@@ -385,15 +385,23 @@ struct GamepadTrayScrim: View {
                 LinearGradient(
                     stops: [
                         .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.9), location: 0.5),
+                        .init(color: .black.opacity(0.92), location: 0.55),
                         .init(color: .clear, location: 1),
                     ],
                     startPoint: fromEdge, endPoint: toContent)
             }
             // Grow past the tray so the fade-to-clear happens OUTSIDE its bounds — the tray's own
-            // text always sits on the strong part, rows blur out before they reach it.
-            .padding(edge == .top ? .bottom : .top, -32)
+            // text always sits on the strong part, rows blur out before they reach it. The bottom
+            // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
+            // the field verdict on the short reach was rows colliding visibly with the legend.
+            .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
             .ignoresSafeArea()
+            // This view's geometry must NEVER animate: mounted inside a pushed shell layer, the
+            // full-bleed growth above (the negative padding and the safe-area expansion) rode the
+            // push's transaction, so the blur visibly entered at content bounds and grew into
+            // place — and `.geometryGroup()` on the layer does not reach safe-area resolution.
+            // The layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
+            .transaction { $0.animation = nil }
     }
 }
 
