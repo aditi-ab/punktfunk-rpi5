@@ -252,7 +252,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         entranceArmed = true
         // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
         entranceAnchor = cursor
-        DispatchQueue.main.async {
+        // Not just the next runloop turn (a change made inside `onAppear` lands in the
+        // insertion's transaction, where animations are disabled) but a couple of frames: the
+        // GeometryReader's first pass can report no width at all, so the strip has to lay out
+        // for real and the scroll view has to centre itself on the cursor before this starts.
+        // Cards are invisible until then (progress 0 ⇒ opacity 0), so the wait never shows.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             // Linear on purpose: the master timeline is a clock, and each card eases its OWN
             // slice of it (see `CardEntrance`) — a spring here would warp every card's curve.
             withAnimation(
@@ -476,23 +481,22 @@ private struct CardEntrance: ViewModifier, Animatable {
         // it instead of swinging the opposite way.
         let away = reduceMotion ? 0 : 1 - travel
         return content
-            // The card's own updates must NEVER inherit the entrance's clock. `withAnimation`
-            // sets its animation on the whole transaction, so the caller's `.scrollTransition` —
-            // which is geometry-driven and expects to land per frame — got swept into the 1 s
-            // linear timeline while the scroll view settled, and the centred card only reached
-            // its focused look as that timeline ran out, arriving as a jump. Clearing the
-            // inherited animation here leaves the transforms below (pure functions of the
-            // interpolated `progress`) untouched, and explicit `.animation`s inside the card
-            // (the poster's cross-fade) still set their own.
-            .transaction { $0.animation = nil }
             .opacity(reduceMotion ? raw : fade)
+            // EVERY transform here stays inside the card's own footprint, and that is a
+            // correctness requirement, not taste: the caller's `.scrollTransition` reads the
+            // geometry of the view underneath these, so a card shoved 58 pt down and hinged on
+            // its leading edge spent the travel reported as "far from centre" — its phase pinned
+            // at fully-receded — and only collapsed to identity as the card came home. That was
+            // the focused card jumping into its correct state at the end. Hence: rotation about
+            // the CENTRE (the card turns in place rather than swinging sideways) and a rise small
+            // enough to stay within the strip's own slack.
             .scaleEffect(1 - 0.26 * away)
             .rotation3DEffect(
                 .degrees(side * -64 * away),
                 axis: (x: 0, y: 1, z: 0),
-                anchor: side < 0 ? .trailing : .leading,
+                anchor: .center,
                 perspective: 0.65)
-            .offset(y: 58 * away)
+            .offset(y: 16 * away)
     }
 
     /// `1 - (1-t)³`, with a small overshoot past 1 before it settles.
