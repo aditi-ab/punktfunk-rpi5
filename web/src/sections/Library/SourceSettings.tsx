@@ -2,6 +2,7 @@ import { toast } from "@unom/ui/toast";
 import { type FC, useEffect, useState } from "react";
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	Dialog,
 	DialogContent,
@@ -10,7 +11,15 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
 import { m } from "@/paraglide/messages";
 
 /**
@@ -152,7 +161,8 @@ const renderable = (node: JsonSchemaNode): boolean => {
 	if (n.enum) return true;
 	if (n.type === "boolean" || n.type === "string") return true;
 	if (n.type === "number" || n.type === "integer") return true;
-	if (n.type === "array" && flatten(n.items ?? {}).type === "string") return true;
+	if (n.type === "array" && flatten(n.items ?? {}).type === "string")
+		return true;
 	if (n.type === "object" && n.properties) {
 		return Object.values(n.properties).every(renderable);
 	}
@@ -173,7 +183,8 @@ const ConfigForm: FC<{
 	// Fall back to the JSON editor when there is no schema, or any field is a shape the generic
 	// form can't express (a non-enum union, a $ref). Partial rendering would be worse than none:
 	// a field silently missing from the form is a setting the operator cannot change.
-	const canRender = props !== undefined && Object.values(props).every(renderable);
+	const canRender =
+		props !== undefined && Object.values(props).every(renderable);
 
 	if (!canRender) {
 		return (
@@ -181,8 +192,8 @@ const ConfigForm: FC<{
 				<p className="text-xs text-muted-foreground">
 					{m.library_source_settings_json_hint()}
 				</p>
-				<textarea
-					className="h-64 w-full rounded-md border bg-background p-2 font-mono text-xs"
+				<Textarea
+					className="h-64 font-mono text-xs"
 					value={raw}
 					onChange={(e) => onRaw(e.target.value)}
 					spellCheck={false}
@@ -255,18 +266,21 @@ const Field: FC<{
 		return (
 			<div className="space-y-1">
 				<Label htmlFor={id}>{label}</Label>
-				<select
-					id={id}
-					className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+				<Select
 					value={String(value ?? node.default ?? node.enum[0])}
-					onChange={(e) => onChange(e.target.value)}
+					onValueChange={onChange}
 				>
-					{node.enum.map((opt) => (
-						<option key={opt} value={opt}>
-							{opt}
-						</option>
-					))}
-				</select>
+					<SelectTrigger id={id} size="sm">
+						<SelectValue />
+					</SelectTrigger>
+					<SelectContent>
+						{node.enum.map((opt) => (
+							<SelectItem key={opt} value={opt}>
+								{opt}
+							</SelectItem>
+						))}
+					</SelectContent>
+				</Select>
 				{node.description && (
 					<p className="text-xs text-muted-foreground">{node.description}</p>
 				)}
@@ -279,11 +293,10 @@ const Field: FC<{
 		return (
 			<div className="space-y-1">
 				<div className="flex items-center gap-2">
-					<input
+					<Checkbox
 						id={id}
-						type="checkbox"
 						checked={checked}
-						onChange={(e) => onChange(e.target.checked)}
+						onCheckedChange={(next) => onChange(next === true)}
 					/>
 					<Label htmlFor={id}>{label}</Label>
 				</div>
@@ -300,9 +313,9 @@ const Field: FC<{
 		return (
 			<div className="space-y-1">
 				<Label htmlFor={id}>{label}</Label>
-				<textarea
+				<Textarea
 					id={id}
-					className="h-24 w-full rounded-md border bg-background p-2 font-mono text-xs"
+					className="h-24 font-mono text-xs"
 					value={list.join("\n")}
 					onChange={(e) =>
 						onChange(

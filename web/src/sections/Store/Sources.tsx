@@ -17,6 +17,7 @@ import {
 	useSetSource,
 	useStoreSources,
 } from "@/api/store";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -49,6 +50,7 @@ const fmtFetched = (secs: number): string =>
  * what trusting a third-party catalog means before anything is written to the host.
  */
 export const SourcesTab: FC = () => {
+	const { confirm } = useDialogs();
 	const sources = useStoreSources();
 	const refresh = useRefreshCatalog();
 	const save = useSetSource();
@@ -82,7 +84,13 @@ export const SourcesTab: FC = () => {
 	};
 
 	const onRemove = async (source: StoreSource) => {
-		if (!confirm(m.store_source_remove_confirm({ name: source.name }))) return;
+		const ok = await confirm({
+			title: m.store_source_remove_confirm({ name: source.name }),
+			description: m.store_source_remove_body(),
+			confirmLabel: m.store_source_remove(),
+			destructive: true,
+		});
+		if (!ok) return;
 		try {
 			await remove.mutateAsync(source.name);
 		} catch (e) {

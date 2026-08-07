@@ -9,6 +9,7 @@ import {
 	useStatsRecordingDelete,
 	useStatsRecordingsList,
 } from "@/api/gen/stats/stats";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,11 +37,18 @@ export const RecordingsSection: FC<{
 	onSelect: (id: string | null) => void;
 }> = ({ selectedId, onSelect }) => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const recordings = useStatsRecordingsList();
 	const del = useStatsRecordingDelete();
 
-	const onDelete = (id: string) => {
-		if (!confirm(m.stats_delete_confirm())) return;
+	const onDelete = async (id: string) => {
+		const ok = await confirm({
+			title: m.stats_delete_confirm(),
+			description: m.stats_delete_body(),
+			confirmLabel: m.stats_delete(),
+			destructive: true,
+		});
+		if (!ok) return;
 		del.mutate(
 			{ id },
 			{

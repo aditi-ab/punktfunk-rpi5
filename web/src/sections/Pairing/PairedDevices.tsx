@@ -11,6 +11,7 @@ import {
 	useListNativeClients,
 	useUnpairNativeClient,
 } from "@/api/gen/native/native";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -43,6 +44,7 @@ export interface PairedRow {
  */
 export const PairedDevicesSection: FC = () => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const native = useListNativeClients();
 	const moonlight = useListPairedClients();
 	const unpairNative = useUnpairNativeClient();
@@ -65,8 +67,14 @@ export const PairedDevicesSection: FC = () => {
 		),
 	];
 
-	const onUnpair = (protocol: PairedProtocol, fingerprint: string) => {
-		if (!confirm(m.pairing_native_unpair_confirm())) return;
+	const onUnpair = async (protocol: PairedProtocol, fingerprint: string) => {
+		const ok = await confirm({
+			title: m.pairing_native_unpair_confirm(),
+			description: m.pairing_native_unpair_body(),
+			confirmLabel: m.action_unpair(),
+			destructive: true,
+		});
+		if (!ok) return;
 		if (protocol === "native") {
 			unpairNative.mutate(
 				{ fingerprint },

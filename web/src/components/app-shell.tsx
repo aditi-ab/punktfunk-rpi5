@@ -12,11 +12,12 @@ import {
 	Settings,
 	Workflow,
 } from "lucide-react";
-import { motion, stagger } from "motion/react";
+import { motion } from "motion/react";
 import { type ReactNode, useState } from "react";
 import { useHostEvents } from "@/api/events";
 import { pluginIcon, uiPlugins, usePlugins } from "@/api/plugins";
 import { BrandMark } from "@/components/brand-mark";
+import { Stagger, staggerProps } from "@/components/stagger";
 import { Wordmark } from "@/components/wordmark";
 import { changeLocale, type Locale, locales, useLocale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -72,10 +73,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 				<motion.nav
 					animate="enter"
 					initial="from"
-					transition={{
-						delayChildren: stagger(0.1),
-					}}
-					variants={{ enter: {}, from: {} }}
+					{...staggerProps()}
 					className="flex flex-col gap-1"
 				>
 					{NAV.map(({ to, icon: Icon, label }) => (
@@ -148,13 +146,7 @@ function PluginNavSection() {
 		// stagger nor the variants and plugin entries simply appeared. They arrive asynchronously
 		// (and a fresh install adds one to a nav that is already on screen), which is exactly when
 		// the animation earns its keep.
-		<motion.div
-			animate="enter"
-			initial="from"
-			transition={{ delayChildren: stagger(0.1) }}
-			variants={{ enter: {}, from: {} }}
-			className="mt-6 flex flex-col gap-1"
-		>
+		<Stagger root className="mt-6 flex flex-col gap-1">
 			<motion.p
 				variants={{ from: { opacity: 0 }, enter: { opacity: 1 } }}
 				className="px-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground/70"
@@ -193,7 +185,7 @@ function PluginNavSection() {
 					</motion.div>
 				);
 			})}
-		</motion.div>
+		</Stagger>
 	);
 }
 

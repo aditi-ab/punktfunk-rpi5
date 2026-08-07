@@ -6,6 +6,7 @@ import { ApiError } from "@/api/fetcher";
 import { useGetHooks } from "@/api/gen/hooks/hooks";
 import type { HookEntry } from "@/api/gen/model/hookEntry";
 import { hookAction, hookFilterSummary, useSaveHooks } from "@/api/hooks";
+import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,6 +37,7 @@ import { HookForm } from "./HookForm";
  */
 export const SectionAutomation: FC = () => {
 	useLocale();
+	const { confirm } = useDialogs();
 	const query = useGetHooks();
 	const save = useSaveHooks();
 
@@ -70,8 +72,13 @@ export const SectionAutomation: FC = () => {
 		setEditing(null);
 	};
 
-	const remove = (index: number) => {
-		if (!confirm(m.automation_delete_confirm())) return;
+	const remove = async (index: number) => {
+		const ok = await confirm({
+			title: m.automation_delete_confirm(),
+			confirmLabel: m.automation_delete(),
+			destructive: true,
+		});
+		if (!ok) return;
 		setHooks((prev) => (prev ?? []).filter((_, i) => i !== index));
 	};
 

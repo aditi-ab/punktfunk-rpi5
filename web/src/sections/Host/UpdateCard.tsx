@@ -1,5 +1,4 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { type FC, type ReactNode, useState } from "react";
 import { ApiError } from "@/api/fetcher";
@@ -11,6 +10,7 @@ import {
 } from "@/api/gen/update/update";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
 	Dialog,

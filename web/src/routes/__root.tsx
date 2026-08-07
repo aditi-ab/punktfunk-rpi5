@@ -13,6 +13,7 @@ import { Toaster } from "@unom/ui/toast";
 import { MotionConfig } from "motion/react";
 import { useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
+import { DialogsProvider } from "@/components/dialogs";
 import { adoptStoredLocale, useLocale } from "@/lib/i18n";
 import appCss from "@/styles.css?url";
 
@@ -68,13 +69,18 @@ function RootComponent() {
 				    animated at full strength even for someone whose OS asks for less. "user" honours
 				    the OS setting. */}
 				<MotionConfig reducedMotion="user">
-					{isLogin ? (
-						<Outlet />
-					) : (
-						<AppShell>
+					{/* The console's own confirm/prompt, in place of the browser's grey boxes. Mounted
+					    at the root because the navigation guard on the Displays page asks for one
+					    while LEAVING that page — see components/dialogs.tsx. */}
+					<DialogsProvider>
+						{isLogin ? (
 							<Outlet />
-						</AppShell>
-					)}
+						) : (
+							<AppShell>
+								<Outlet />
+							</AppShell>
+						)}
+					</DialogsProvider>
 				</MotionConfig>
 				{/* Sonner toaster (lazy client-side) — success feedback for auto-saved settings. */}
 				<Toaster />
