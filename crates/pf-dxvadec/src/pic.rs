@@ -133,6 +133,60 @@ pub struct DecodePlanDxva {
     /// surface exists for the decode itself plus any remaining DPB residency,
     /// and may already have been released by this very AU's `removed`.
     pub setup_is_reference: bool,
+    /// Surfaces this access unit's own end-of-picture bookkeeping retires while the
+    /// submission still NAMES them. Release them once the decode op is issued —
+    /// never inside the conversion, and never dropped.
+    ///
+    /// # Why the conversion cannot release them
+    ///
+    /// [`SlotMap::assign`] takes the LOWEST FREE slot. Release a picture here and the
+    /// setup assignment two lines later hands its surface straight back, so the
+    /// submission says `CurrPic = N` and `RefFrameList[k] = N` in one breath: the
+    /// picture decodes into a surface it predicts from. That is the AV1 defect of
+    /// 2026-08-07 ([`crate::pic_av1::DecodePlanDxvaAv1::release_after_decode`]) on this
+    /// codec, and on H.264 it is not exotic at all.
+    ///
+    /// [`AuPlan::dpb_refs`] — which `RefFrameList` is built from — is snapshotted in
+    /// `H264Planner::begin_picture`, BEFORE `finish_picture` runs 8.2.5's marking and
+    /// C.4.5.3's bump. So a picture the sliding window unmarks and the bump then evicts
+    /// lands in both `dpb_refs` and `dpb.removed` for the same AU. It needs the two to
+    /// coincide, which needs the evicted picture to be already OUTPUT — and that is
+    /// precisely low-delay H.264: `max_num_reorder_frames = 0`, a picture output the
+    /// moment it decodes.
+    ///
+    /// **Measured 2026-08-07, and it is the ordinary case, not a corner.** Every stream
+    /// a punktfunk host emits does it on 297 of 300 access units — 720p, 1080p and
+    /// 2160p alike, on both this rung and [`pf_vkdecode::pic::DecodePlanVk`]'s. NVENC
+    /// writes `max_num_ref_frames = 3` AND `max_dec_frame_buffering = 3`: the DPB is
+    /// exactly as deep as the reference count, so the window unmarks the oldest
+    /// reference in the very AU whose bump evicts it. The aliased picture is
+    /// `ref_idx 2` of a three-entry `num_ref_idx_l0_active` list — addressable by any
+    /// macroblock, not a spare the hardware could ignore.
+    ///
+    /// `test-25fps.h264` measures ZERO and that is why this survived to here: it is
+    /// level 1.3 with no VUI `bitstream_restriction`, so its DPB is the level-derived 7
+    /// against 2 reference frames, and it REORDERS, which keeps an unmarked picture
+    /// alive past the AU that unmarked it. `data/lowdelay-640x480.h264` is vendored to
+    /// close exactly that gap.
+    ///
+    /// # Why the caller can release them safely
+    ///
+    /// The surfaces must outlive the CONVERSION, not the decode. One AU is planned,
+    /// converted and submitted before the next is planned, so once the decode op is
+    /// issued nothing can be assigned them before the next conversion — the same
+    /// argument the AV1 rung's deferral rests on.
+    ///
+    /// # Deferring the whole `removed` list rather than a filtered part
+    ///
+    /// Some removals are pictures no `RefFrameList` entry names (a non-reference
+    /// picture bumped long after it was unmarked), and those could be released here.
+    /// They are not, for three reasons: `refs` is built from the SLICE LISTS as well as
+    /// the snapshot, so a filter on `dpb_refs` would still miss a concealment
+    /// substitute the lists name; deferring costs nothing, because
+    /// [`SlotMap::new`]'s spare slot means `assign` always has a free slot while every
+    /// removal is still held (the DPB never exceeds `max_dpb_frames`, and the map holds
+    /// `max_dpb_frames + 1`); and one unconditional rule is a thing a reader can check.
+    pub release_after_decode: Vec<PicId>,
     /// The marked DPB, resolved to surfaces — the AU's own references first, then
     /// every other marked picture (module docs). Laid out in exactly this order in
     /// `pic_params.RefFrameList`.
@@ -268,7 +322,10 @@ impl From<SlotError> for PlanToDxvaError {
 /// 2. references resolve against the PRE-removal state (read-only) — this AU's
 ///    own end-of-picture marking can evict a picture its slices legitimately
 ///    reference;
-/// 3. `removed` is applied, then the setup slot is assigned last.
+/// 3. the setup slot is assigned last, and `removed` is NOT applied at all: it
+///    leaves as [`DecodePlanDxva::release_after_decode`] for the caller to apply
+///    once the decode op is issued. Applying it here would give the assignment
+///    back a surface this submission still names — see that field's docs.
 pub fn plan_to_dxva(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -480,24 +537,29 @@ pub fn plan_to_dxva(
 
     let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
 
-    // Mutations LAST, after every fallible step above (fn docs). Removals first —
-    // they were real regardless of this AU's fate — then the setup assignment.
+    // Mutations LAST, after every fallible step above (fn docs).
+    //
+    // The removals are NOT applied here — they are handed back as
+    // `release_after_decode` for the caller to apply once the decode op is issued,
+    // because releasing them now would return their surfaces to the setup
+    // assignment below and alias `CurrPic` with a `RefFrameList` entry. The field's
+    // docs carry the measurement; this is the ordinary case on every stream a
+    // punktfunk host emits.
     //
     // The AU's own picture can itself appear in `removed`: a non-reference
     // picture with no free frame buffer bypasses the DPB and is stored-and-
     // evicted within one plan. Its surface must still exist for the decode
-    // itself, so it is assigned here and released right after.
+    // itself, so it is assigned here and released right after — the one removal
+    // that cannot be deferred, since deferring it would hand the caller the
+    // surface being decoded into.
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            // Tolerated but never silent: reachable only when the caller skipped
-            // feeding an AU's plan through this map.
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
+    let release_after_decode: Vec<PicId> = plan
+        .dpb
+        .removed
+        .iter()
+        .copied()
+        .filter(|id| *id != setup_id)
+        .collect();
     let setup_slot = slots.assign(setup_id)?;
     if setup_evicted {
         slots.release(setup_id);
@@ -523,6 +585,7 @@ pub fn plan_to_dxva(
         setup_slot,
         setup_id,
         setup_is_reference: pic.is_reference,
+        release_after_decode,
         refs,
         mb_count: width_mbs * height_mbs,
     })
@@ -570,6 +633,17 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
+    /// **Our own host's output**, and the only stream in this repository that reaches
+    /// the shape `release_after_decode` exists for: low-delay IPPP, 120 pictures,
+    /// `max_num_reorder_frames = 0`, and a DPB exactly as deep as its reference count.
+    ///
+    /// Vendored beside the goldens the GPU legs decode it against (that file's header
+    /// carries the `punktfunk-host spike` command and the ffmpeg cross-check), because
+    /// three crates need it: this one for the CPU proof, `pf-vkdecode`'s `gpu_parity`
+    /// and `pf-client-core`'s `video_d3d11_native::parity` for the hardware one.
+    const LOWDELAY_640X480: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
+
     /// Test-only AU splitter, the same shape pf-vkdecode's `pic` tests use
     /// (which in turn mirrors pf-bitstream's `#[cfg(test)]`-private helper): a
     /// new AU starts at a non-slice NALU following a slice, or at a slice whose
@@ -602,10 +676,22 @@ mod tests {
     /// Plan the vendored stream and convert every AU, returning the plans paired
     /// with their conversions.
     fn convert_stream() -> Vec<(AuPlan, DecodePlanDxva)> {
+        convert(TEST_25FPS)
+    }
+
+    /// The same over [`LOWDELAY_640X480`].
+    fn convert_low_delay() -> Vec<(AuPlan, DecodePlanDxva)> {
+        convert(LOWDELAY_640X480)
+    }
+
+    /// Plan and convert a whole stream the way a caller does — including applying
+    /// `release_after_decode` once the (notional) decode op is issued, which is what
+    /// keeps the ledger from filling up over 120 access units.
+    fn convert(stream: &[u8]) -> Vec<(AuPlan, DecodePlanDxva)> {
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut out = Vec::new();
-        for (i, au) in split_into_aus(TEST_25FPS).into_iter().enumerate() {
+        for (i, au) in split_into_aus(stream).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -614,6 +700,9 @@ mod tests {
                 *map = SlotMap::new(plan.picture.max_dpb_frames);
             }
             let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
+            for &id in &dxva.release_after_decode {
+                assert!(map.release(id), "AU {i}: deferred id {id} held no slot");
+            }
             out.push((plan, dxva));
         }
         out
@@ -881,66 +970,153 @@ mod tests {
         assert_eq!(converted.len(), 250);
     }
 
-    /// ⚠⚠ **TRIPWIRE, not a proof — and the thing it watches for is UNRESOLVED.**
+    /// The hazard the vendored vector CANNOT see, on a stream that can.
     ///
-    /// This conversion releases the whole of `plan.dpb.removed` and then assigns the
-    /// decode target a slot. [`SlotMap::assign`] takes the LOWEST FREE slot, which is
-    /// the one just released — so if a picture is ever in BOTH `dpb_refs` (which is
-    /// what `RefFrameList` is built from, above) and `dpb.removed`, the submission
-    /// names one surface as `CurrPic` and as a `RefFrameList` entry at once, and the
-    /// frame decodes into a picture it predicts from. That is precisely the defect
-    /// measured on the AV1 leg on 2026-08-07: 245 of 250 delivered frames wrong on an
-    /// Intel Arc, invisible on NVIDIA for 63 frames, and invisible on glass entirely.
+    /// `removed ∩ dpb_refs` is the aliasing precondition: a picture this AU's own
+    /// end-of-picture bookkeeping retires while `RefFrameList` still names it. Release
+    /// it inside the conversion and [`SlotMap::assign`] hands its surface straight back
+    /// to `CurrPic`, so the picture decodes into one it predicts from.
     ///
-    /// For AV1 it was fixed by deferring the release past the decode op. For H.264 it
-    /// was NOT, because the intersection is empty on the vendored vector and changing
-    /// a hardware-proven codec on an unreproduced suspicion is the worse risk. What
-    /// this test does is make the assumption falsifiable instead of tacit.
+    /// On `test-25fps.h264` the intersection is **zero**, and for two independent
+    /// reasons that both happen to be properties of that vector rather than of H.264:
+    /// it is level 1.3 with no VUI `bitstream_restriction`, so `dpb_limit` falls back to
+    /// A.3.1's level ceiling and gives a 7-frame DPB against `max_num_ref_frames = 2`
+    /// (the sliding window unmarks two AUs before the bump can evict); and it REORDERS,
+    /// which keeps an unmarked picture alive for output past the AU that unmarked it.
+    /// That zero is what let the eager release survive two milestones.
     ///
-    /// **Why zero here is weak evidence.** `H264Planner` snapshots `dpb_refs` in
-    /// `begin_picture`, BEFORE `finish_picture` runs 8.2.5 marking and then bumps the
-    /// DPB — and the vendored bump drops a picture the sliding window just unmarked
-    /// only once it has been OUTPUT. This vector reorders (it has B-frames), so an
-    /// unmarked picture is still awaiting output and lingers past the AU that unmarked
-    /// it, which is exactly what keeps the intersection empty. **A punktfunk host emits
-    /// low-delay H.264 with no reordering**, where a picture is output the moment it is
-    /// decoded — the condition that puts eviction and unmarking in the same access
-    /// unit. So the shape is plausibly live in the field and merely unreachable here.
+    /// On `lowdelay-640x480.h264` — OUR host's output, vendored for exactly this — it is
+    /// **117 of 120 access units**, measured the same way at 720p, 1080p and 2160p. The
+    /// difference is the encoder, not the resolution: NVENC writes
+    /// `max_num_ref_frames = 3` AND `max_dec_frame_buffering = 3`, a DPB exactly as deep
+    /// as the reference count, so 8.2.5's window unmarks the oldest reference in the very
+    /// AU whose C.4.5.3 bump evicts it — and `max_num_reorder_frames = 0` means it has
+    /// already been output, which is what makes it evictable at all.
     ///
-    /// HEVC does not need this test and cannot be given one: `H265Planner` snapshots
-    /// `dpb_refs` AFTER `decode_rps` has updated the DPB, so an RPS-dropped picture is
-    /// structurally never in the snapshot `RefPicList` is built from.
+    /// So this is not a tripwire any more: it pins BOTH numbers, and the second one is
+    /// what makes `release_after_decode` a fixed defect rather than a precaution.
     ///
-    /// If this ever fires, the fix is `pic_av1.rs`'s: hand the removals back to the
-    /// caller as `release_after_decode` and let it release them once the decode op is
-    /// issued. Do not "fix" it by relaxing the count.
+    /// HEVC needs no such test: `H265Planner` snapshots `dpb_refs` AFTER `decode_rps`
+    /// has updated the DPB, so an RPS-dropped picture is structurally never in the
+    /// snapshot `RefPicList` is built from — and a low-delay HEVC stream from the same
+    /// host measures 0 of 300, which is the argument confirmed rather than assumed.
     #[test]
-    fn no_au_removes_a_picture_its_own_reference_list_names() {
-        let mut both = 0usize;
-        let mut aus_with_removals = 0usize;
-        for (plan, _) in convert_stream() {
-            if !plan.dpb.removed.is_empty() {
-                aus_with_removals += 1;
-            }
-            for id in &plan.dpb.removed {
-                if plan.dpb_refs.iter().any(|r| r.id == *id) {
-                    both += 1;
+    fn the_low_delay_stream_removes_pictures_its_own_reference_list_names_and_the_vector_never_does(
+    ) {
+        fn intersections(stream: &[u8]) -> (usize, usize, usize) {
+            let mut planner = H264Planner::new();
+            let (mut both, mut with_removals, mut planned) = (0usize, 0usize, 0usize);
+            for au in split_into_aus(stream) {
+                let Ok(plan) = planner.plan_au(au) else {
+                    continue;
+                };
+                planned += 1;
+                if !plan.dpb.removed.is_empty() {
+                    with_removals += 1;
                 }
+                both += plan
+                    .dpb
+                    .removed
+                    .iter()
+                    .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+                    .count();
             }
+            (planned, with_removals, both)
         }
+
+        let (planned, with_removals, both) = intersections(TEST_25FPS);
+        assert_eq!(planned, 250);
         assert!(
-            aus_with_removals > 0,
-            "no access unit of this vector removed anything, so the intersection below \
-             is empty for a reason that has nothing to do with the hazard"
+            with_removals > 0,
+            "no access unit of the vendored vector removed anything, so the zero below \
+             would be empty for a reason that has nothing to do with the hazard"
         );
         assert_eq!(
             both, 0,
-            "{both} picture(s) are in this AU's reference list AND removed by it — the \
-             conversion releases them before assigning the decode target a slot, so \
-             `CurrPic` and a `RefFrameList` entry now name one surface and the frame \
-             predicts from the picture it is writing. This is the AV1 defect of \
-             2026-08-07 on the H.264 leg; fix it the same way (a deferred \
-             `release_after_decode`), never by changing this number"
+            "the vendored vector is supposed to be BLIND to this shape — a non-zero \
+             here means the reordering/DPB-depth reasoning above is wrong, and the \
+             low-delay numbers below need re-deriving before they mean anything"
+        );
+
+        let (planned, with_removals, both) = intersections(LOWDELAY_640X480);
+        assert_eq!(planned, 120);
+        assert_eq!(with_removals, 117);
+        assert_eq!(
+            both, 117,
+            "the low-delay stream must still exercise the aliasing precondition on \
+             nearly every access unit — if this ever drops to zero the deferral below \
+             is no longer being TESTED by anything, whatever else still passes"
+        );
+    }
+
+    /// The fix itself: no submission names its decode surface as a reference.
+    ///
+    /// [`the_setup_surface_is_the_current_picture_entry_and_is_never_also_a_reference_entry`]
+    /// asserts this over the vendored vector, where it held even before
+    /// `release_after_decode` existed. This is the same invariant over the stream that
+    /// BREAKS it — 117 of 120 access units before the deferral, every one of them
+    /// decoding into a surface it predicts from.
+    #[test]
+    fn the_low_delay_stream_never_aliases_its_decode_surface_with_a_reference() {
+        let converted = convert_low_delay();
+        assert_eq!(converted.len(), 120);
+        let mut deferred_total = 0usize;
+        for (i, (_, dxva)) in converted.iter().enumerate() {
+            assert_eq!(dxva.pic_params.CurrPic.index(), dxva.setup_slot);
+            deferred_total += dxva.release_after_decode.len();
+            for r in &dxva.refs {
+                assert_ne!(
+                    r.slot, dxva.setup_slot,
+                    "AU {i}: reference picture {} shares surface {} with the decode \
+                     target — the deferral is not holding",
+                    r.id, r.slot
+                );
+            }
+        }
+        assert_eq!(
+            deferred_total, 117,
+            "every access unit that removes a picture must defer it; a zero here with \
+             the assertions above still passing would mean the stream stopped \
+             exercising the shape"
+        );
+    }
+
+    /// The deferral costs no slot the map does not have.
+    ///
+    /// Holding every removal through the setup assignment is only free because
+    /// [`SlotMap::new`] allocates `max_dpb_frames + 1` and the DPB never exceeds
+    /// `max_dpb_frames` — so a free slot always exists even with the whole `removed`
+    /// list still held. Measured rather than argued: the deepest the ledger ever gets
+    /// on the stream that defers on 117 of 120 access units.
+    #[test]
+    fn deferring_every_removal_still_fits_the_ledger() {
+        let mut planner = H264Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut peak = 0usize;
+        let mut capacity = 0usize;
+        for (i, au) in split_into_aus(LOWDELAY_640X480).into_iter().enumerate() {
+            let Ok(plan) = planner.plan_au(au) else {
+                continue;
+            };
+            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+            if map.capacity() != plan.picture.max_dpb_frames + 1 {
+                *map = SlotMap::new(plan.picture.max_dpb_frames);
+            }
+            let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
+            // The peak is measured BEFORE the deferred releases are applied: that is
+            // the moment the map is fullest, and the moment `assign` had to find a
+            // free slot in.
+            peak = peak.max(map.held().count());
+            capacity = map.capacity();
+            for &id in &dxva.release_after_decode {
+                assert!(map.release(id), "AU {i}: deferred id {id} held no slot");
+            }
+        }
+        assert_eq!(capacity, 4, "max_dec_frame_buffering 3 + the spare slot");
+        assert_eq!(
+            peak, 4,
+            "the deferral is expected to USE the spare slot — a peak of 3 would mean \
+             the removals are being released early after all"
         );
     }
 
@@ -1164,27 +1340,47 @@ mod tests {
         assert_eq!(&bytes[10..14], &40u32.to_le_bytes());
     }
 
+    /// The whole-stream churn check: no two live pictures may share a surface index,
+    /// which for DXVA is the difference between a decode and a corrupted reference.
+    ///
+    /// Run over BOTH streams, because they stress opposite halves of the ledger: the
+    /// vendored vector has a DPB (7) far deeper than its reference count (2) and so
+    /// never has to reuse a surface promptly, while the low-delay stream's DPB is
+    /// exactly its reference count and cycles all four slots every four pictures.
+    ///
+    /// The loop applies `release_after_decode` because the CALLER does; a loop that
+    /// drops it holds a surface per access unit and dies of `SlotError::Full` — which
+    /// is what this test did the moment the deferral landed, and is the cheapest
+    /// possible demonstration that the deferral is real rather than decorative.
     #[test]
     fn a_slot_is_reused_only_after_its_picture_leaves_the_dpb() {
-        // The whole-stream churn check: no two live pictures may share a surface
-        // index, which for DXVA is the difference between a decode and a
-        // corrupted reference.
-        let mut planner = H264Planner::new();
-        let mut slots: Option<SlotMap> = None;
-        let mut live: Vec<(PicId, u8)> = Vec::new();
-        for (i, au) in split_into_aus(TEST_25FPS).into_iter().enumerate() {
-            let Ok(plan) = planner.plan_au(au) else {
-                continue;
-            };
-            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
-            let removed = plan.dpb.removed.clone();
-            let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
-            live.retain(|&(id, _)| !removed.contains(&id));
-            assert!(
-                live.iter().all(|&(_, slot)| slot != dxva.setup_slot),
-                "AU {i} decodes into a surface a live picture still holds"
-            );
-            live.push((dxva.setup_id, dxva.setup_slot));
+        for (label, stream) in [("vendored", TEST_25FPS), ("low-delay", LOWDELAY_640X480)] {
+            let mut planner = H264Planner::new();
+            let mut slots: Option<SlotMap> = None;
+            let mut live: Vec<(PicId, u8)> = Vec::new();
+            for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+                let Ok(plan) = planner.plan_au(au) else {
+                    continue;
+                };
+                let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+                let removed = plan.dpb.removed.clone();
+                let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
+                // The check runs BEFORE the deferred releases: the aliasing this
+                // guards against is a property of the SUBMISSION, and at submission
+                // time every removed picture is still live by construction.
+                assert!(
+                    live.iter().all(|&(_, slot)| slot != dxva.setup_slot),
+                    "{label} AU {i} decodes into a surface a live picture still holds"
+                );
+                for &id in &dxva.release_after_decode {
+                    assert!(
+                        map.release(id),
+                        "{label} AU {i}: deferred id {id} held no slot"
+                    );
+                }
+                live.retain(|&(id, _)| !removed.contains(&id));
+                live.push((dxva.setup_id, dxva.setup_slot));
+            }
         }
     }
 }

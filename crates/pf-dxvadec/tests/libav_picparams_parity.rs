@@ -540,6 +540,19 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
         // libavcodec's `1 + report_id++` produces for a decoder that saw only this stream.
         let dxva = pf_dxvadec::plan_to_dxva(&plan, map, out.len() as u32 + 1)
             .unwrap_or_else(|e| panic!("AU {i} must convert: {e}"));
+        // The conversion's half of the deferral contract
+        // ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]): a loop that converts
+        // AU after AU without applying it holds a surface per AU and runs the ledger
+        // dry. The vendored vector never puts a picture in both `RefFrameList` and
+        // `removed`, so this list is always empty HERE — applied anyway, because a
+        // harness that mirrors the caller only on the streams where it does not matter
+        // is a harness that would not notice the caller being wrong.
+        for &id in &dxva.release_after_decode {
+            assert!(
+                map.release(id),
+                "AU {i}: a deferred release named a picture holding no surface"
+            );
+        }
         let packed = pf_dxvadec::pack(au, &dxva.slice_ranges, &mut mapping)
             .unwrap_or_else(|e| panic!("AU {i} must pack: {e}"));
         let unpadded = pf_dxvadec::packed_size(au, &dxva.slice_ranges).expect("packed size") as u32;

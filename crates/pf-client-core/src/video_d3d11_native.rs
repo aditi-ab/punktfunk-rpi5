@@ -20,6 +20,19 @@
 //! * **H.264 and H.265** — frame-hash parity against libavcodec on an RTX 4090 and an AMD
 //!   iGPU plus a 30-minute soak (M5), re-confirmed on an RTX 3500 Ada and an Intel Arc on
 //!   2026-08-07 (250/250 both codecs, plus 50/50 HEVC Main 10 on both).
+//!
+//!   ⚠⚠ **All of that was against ONE vendored vector per codec, and for H.264 the vector
+//!   was blind to a defect present on 99% of the frames we actually stream.** It reorders
+//!   and carries a 7-frame DPB against 2 reference frames; a punktfunk host emits
+//!   low-delay IPPP whose DPB is exactly as deep as its 3 reference frames, so 8.2.5's
+//!   sliding window unmarks a picture in the very access unit whose C.4.5.3 bump evicts
+//!   it. `plan_to_dxva` released that surface before assigning the decode target one, and
+//!   `SlotMap::assign` handed it straight back — `CurrPic` and a `RefFrameList` entry
+//!   naming one surface, on 117 of 120 access units. Found 2026-08-07 by planning our own
+//!   host's output on the CPU, fixed with the same deferral the AV1 rung got
+//!   ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]), and the stream is now
+//!   vendored so `low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec`
+//!   holds the rung to what it streams rather than only to what it conforms to.
 //! * **AV1** — wired in M7, and frame-hash parity on the SAME two GPUs since 2026-08-07:
 //!   250/250 delivered frames bit-identical to libavcodec on the RTX 3500 Ada and on the
 //!   Intel Arc. It streams 4K60 on both with a clean 5-minute soak, but that is throughput
@@ -188,14 +201,19 @@ struct Submission {
     /// other two codecs do not (see [`NativeD3d11Decoder::frame_av1`]). All three
     /// conversions produce it; dropping it here made the AV1 leak invisible.
     setup_id: u64,
-    /// AV1 only: surfaces this frame's own refresh displaces while the submission
-    /// still NAMES them, released once the decode op has been issued.
+    /// Surfaces this picture's own end-of-picture bookkeeping retires while the
+    /// submission still NAMES them, released once the decode op has been issued
+    /// ([`NativeD3d11Decoder::release_deferred`]).
     ///
-    /// See [`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`] — this is the
-    /// caller's half of that contract, and dropping it decodes 268 of the vendored
-    /// vector's 274 frames into a surface they predict from. Always empty on
-    /// H.264 and H.265, whose conversions release their whole `removed` list
-    /// themselves (neither vendored vector ever produces the shape).
+    /// The caller's half of [`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`]
+    /// and [`pf_dxvadec::DecodePlanDxva::release_after_decode`]. Dropping it decodes
+    /// the picture into a surface it predicts from — 268 of the vendored AV1 vector's
+    /// 274 frames, and 297 of every 300 access units of low-delay H.264, which is what
+    /// every punktfunk host emits.
+    ///
+    /// Empty on H.265 alone, and that is structural rather than lucky: `H265Planner`
+    /// snapshots `dpb_refs` AFTER `decode_rps`, so a picture this AU's RPS dropped is
+    /// never in the set `RefPicList` is built from.
     release_after_decode: Vec<u64>,
     /// Which codec's slice-control record the packer's locations become.
     codec: Codec,
@@ -458,11 +476,21 @@ impl NativeD3d11Decoder {
             // The plan needed a substitute for something lost. Fold it, ask for recovery,
             // and do NOT submit: a concealed picture is not fit to present, and submitting
             // it would put a wrong reference in the DPB for every AU after it.
+            //
+            // The deferred releases still run: they are the planner's verdict on
+            // pictures that left the DPB, and a converted-but-unsubmitted AU took its
+            // slot just the same.
+            self.release_deferred(&submission);
             self.health.note(true, false, 0);
             self.want_recovery = true;
             return Ok(None);
         }
-        let frame = match self.submit(au, &submission) {
+        let submitted = self.submit(au, &submission);
+        // The surfaces the conversion refused to release, freed now that the decode op
+        // has been issued (or has failed, where dropping them would leak just the
+        // same) — see [`Self::release_deferred`].
+        self.release_deferred(&submission);
+        let frame = match submitted {
             Ok(frame) => frame,
             Err(e) => {
                 self.health.note(false, true, 0);
@@ -472,6 +500,32 @@ impl NativeD3d11Decoder {
         };
         self.health.note(false, false, 0);
         Ok(Some(frame))
+    }
+
+    /// Apply a submission's [`Submission::release_after_decode`] — the surfaces its
+    /// conversion held back because the submission still NAMED them.
+    ///
+    /// Safe here and nowhere earlier: the decode op has been issued (or will never be),
+    /// so nothing can be assigned these surfaces before the next access unit is
+    /// converted. Dropping the list instead holds a surface per AU and reaches
+    /// `SlotError::Full` within the ledger's depth — which is why every exit of
+    /// [`Self::decode`] runs it, the concealed and failed ones included.
+    ///
+    /// Empty on H.265, whose planner cannot produce the shape; populated on nearly
+    /// every H.264 and AV1 picture.
+    fn release_deferred(&mut self, sub: &Submission) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        for &id in &sub.release_after_decode {
+            if !session.slots.release(id) {
+                // Never fatal, and never silent: a deferred id that holds no slot
+                // means the conversion and the ledger disagree about the DPB, which
+                // is a bug in one of them rather than a stream this AU can do
+                // anything about.
+                tracing::warn!(id, "a deferred release named a picture holding no surface");
+            }
+        }
     }
 
     /// One AV1 **temporal unit**: decode every frame in it, present at most one.
@@ -627,20 +681,7 @@ impl NativeD3d11Decoder {
         // waits: the decode op has been issued, so nothing can be assigned them
         // until the next frame — and on the `damaged` and failed paths there is no
         // op at all, where dropping the release would leak a surface just the same.
-        if let Some(session) = self.session.as_mut() {
-            for &id in &sub.release_after_decode {
-                if !session.slots.release(id) {
-                    // Never fatal, and never silent: a deferred id that holds no
-                    // slot means the conversion and the ledger disagree about the
-                    // store, which is a bug in one of them rather than a stream
-                    // this frame can do anything about.
-                    tracing::warn!(
-                        id,
-                        "AV1 deferred release named a picture holding no surface"
-                    );
-                }
-            }
-        }
+        self.release_deferred(&sub);
 
         // The slot nothing will ever ask for again (fn docs). Released AFTER the
         // blit above, so the surface is read before anything can be assigned it.
@@ -836,21 +877,20 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
-                    // ⚠ H.264's conversion still releases its whole `removed` list
-                    // inside itself, and that is a MEASUREMENT rather than a proof.
-                    // `pf_dxvadec::pic`'s `no_au_removes_a_picture_its_own_reference_
-                    // list_names` pins `removed ∩ dpb_refs` at zero over the vendored
-                    // vector — but that vector REORDERS, and reordering is what keeps
-                    // an unmarked picture in the DPB past the AU that unmarked it. On
-                    // a low-delay stream, which is what a punktfunk host emits, the
-                    // sliding window can unmark an already-output picture and
-                    // `bump_as_needed` evict it in the same access unit, putting it in
-                    // both `RefFrameList` and `removed` — the AV1 aliasing shape,
-                    // exactly. Left alone deliberately: the AV1 defect is what this
-                    // change fixes and proves, and giving two hardware-proven codecs a
-                    // deferral no vector exercises would be an unmeasured change to
-                    // working code. The tripwire is the test named above.
-                    release_after_decode: Vec::new(),
+                    // ⚠⚠ The suspicion of 2026-08-07 was RIGHT, and the shape is the
+                    // ordinary case rather than a corner: on every stream a punktfunk
+                    // host emits, 297 of 300 access units name one surface as both
+                    // `CurrPic` and a `RefFrameList` entry. `H264Planner` snapshots
+                    // `dpb_refs` before 8.2.5's marking, and low-delay H.264 —
+                    // `max_num_reorder_frames = 0`, so a picture is output the moment
+                    // it decodes — puts the unmarking and the eviction in one AU.
+                    // NVENC seals it by writing `max_num_ref_frames = 3` AND
+                    // `max_dec_frame_buffering = 3`: a DPB exactly as deep as the
+                    // reference count. The vendored vector cannot reach the shape (a
+                    // level-derived DPB of 7 against 2 reference frames, and it
+                    // reorders), which is why it measured zero for two milestones.
+                    // See `pf_dxvadec::DecodePlanDxva::release_after_decode`.
+                    release_after_decode: dxva.release_after_decode,
                     codec: Codec::H264,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
@@ -910,13 +950,15 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
-                    // HEVC is the one of the three where this IS structural rather
-                    // than measured: `H265Planner` snapshots `dpb_refs` AFTER
-                    // `decode_rps` has updated the DPB, so a picture this AU's RPS
-                    // dropped is never in the snapshot `RefPicList` is built from, and
-                    // the aliasing shape cannot arise. (The AV1 planner snapshots
-                    // BEFORE, which is why that codec needed the deferral, and the
-                    // H.264 one snapshots before marking too — see the note above.)
+                    // HEVC is the one of the three that needs no deferral, and it is
+                    // STRUCTURAL rather than measured: `H265Planner` snapshots
+                    // `dpb_refs` AFTER `decode_rps` has updated the DPB, so a picture
+                    // this AU's RPS dropped is never in the snapshot `RefPicList` is
+                    // built from, and nothing later in the AU unmarks anything. Both
+                    // other codecs snapshot BEFORE their marking, and both needed the
+                    // deferral. Now measured as well as argued: a low-delay HEVC
+                    // stream from the same host that aliases 297 of 300 H.264 access
+                    // units aliases 0 of 300 here.
                     release_after_decode: Vec::new(),
                     codec: Codec::H265,
                     facts: PictureFacts {
@@ -1701,6 +1743,23 @@ mod parity {
     /// rungs measured against two copies of a golden set is two measurements, and the
     /// point of this file is that they are one.
     const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
+
+    /// **Our own host's low-delay H.264** and its goldens — the stream the vendored
+    /// vector cannot be. 120 pictures of 640x480 IPPP with `max_num_reorder_frames = 0`
+    /// and a DPB exactly as deep as its 3 reference frames, so 8.2.5's sliding window
+    /// unmarks the oldest reference in the very access unit whose C.4.5.3 bump evicts
+    /// it: `dpb.removed` and `dpb_refs` intersect on 117 of the 120, and the conversion
+    /// used to release those surfaces before assigning the decode target one.
+    ///
+    /// The vendored vector passed 250/250 on four GPUs across two milestones while
+    /// that was true of every stream this program ships. Provenance, the
+    /// `punktfunk-host spike` command and the ffmpeg cross-check are in the golden
+    /// file's header.
+    const LOWDELAY_H264: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
+    const GOLDENS_LOWDELAY: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480.nv12.sha256");
+    const LOWDELAY_FRAME_COUNT: usize = 120;
     const GOLDENS_H265: &str =
         include_str!("../../pf-vkdecode/tests/data/test-25fps-h265.nv12.sha256");
 
@@ -2175,6 +2234,11 @@ mod parity {
             decoder
                 .submit(au, &sub)
                 .unwrap_or_else(|e| panic!("AU {index}: submit failed — {e:#}"));
+            // This harness drives `plan` + `submit` rather than `decode`, so it owes
+            // the deferred releases `decode` would have applied. Not optional
+            // bookkeeping: on a low-delay stream nearly every AU defers, and a loop
+            // that drops them exhausts the ledger within the DPB's depth.
+            decoder.release_deferred(&sub);
             let session = decoder.session.as_ref().expect("submit built a session");
             let pool = session.pool.clone();
             let bytes = readback.read(&decoder.device, &pool, slice, display);
@@ -2542,6 +2606,32 @@ mod parity {
             &golden_hashes(GOLDENS_H264),
             FRAME_COUNT,
             "H.264",
+        );
+    }
+
+    /// The leg that would have caught this rung's H.264 defect, and the only one that
+    /// could: **our own host's output** rather than a conformance vector.
+    ///
+    /// `h264_every_frame_hashes_bit_identical_to_libavcodec` above passed 250/250 on an
+    /// RTX 4090, an AMD iGPU, an RTX 3500 Ada and an Intel Arc while this rung was
+    /// naming one surface as both `CurrPic` and a `RefFrameList` entry on 99% of the
+    /// access units of every stream punktfunk actually streams. The vector cannot reach
+    /// the shape — see [`LOWDELAY_H264`] — so no amount of running it harder would have
+    /// found this. That is the lesson worth keeping: a conformance vector proves
+    /// conformance to ITSELF, and the encoder we ship behind is a different stream.
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h264_aus(LOWDELAY_H264);
+        let order = order_h264(&aus);
+        parity_run(
+            Codec::H264,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY),
+            LOWDELAY_FRAME_COUNT,
+            "H.264 (low-delay host stream)",
         );
     }
 

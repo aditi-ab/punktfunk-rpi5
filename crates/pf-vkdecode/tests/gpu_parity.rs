@@ -116,6 +116,29 @@ const AV1_FRAME0: &[u8] = include_bytes!("data/test-25fps-av1.frame0.nv12");
 const TEST_MAIN10_H265: &[u8] = include_bytes!("data/test-main10.h265");
 const GOLDENS_MAIN10: &str = include_str!("data/test-main10.p010.sha256");
 
+/// **Our own host's H.264**, and the only stream here that is not a conformance
+/// vector — vendored 2026-08-07 because the conformance vector is BLIND to the one
+/// defect this rung had.
+///
+/// `test-25fps.h264` reorders and carries a 7-frame DPB against 2 reference frames,
+/// so a picture the sliding window unmarks is never evicted in the same access unit.
+/// A punktfunk host emits low-delay IPPP with `max_num_reorder_frames = 0` and — this
+/// is the part that matters — NVENC writes `max_num_ref_frames = 3` alongside
+/// `max_dec_frame_buffering = 3`, a DPB exactly as deep as its reference count. 8.2.5's
+/// window then unmarks the oldest reference in the very access unit whose C.4.5.3 bump
+/// evicts it, and the conversion used to release that picture's slot before assigning
+/// the setup one — so `pSetupReferenceSlot` and a reference named the same slot on
+/// **117 of these 120 access units**.
+///
+/// The vector passed 250/250 throughout. This is the stream that could not.
+const LOWDELAY_H264: &[u8] = include_bytes!("data/lowdelay-640x480.h264");
+const GOLDENS_LOWDELAY: &str = include_str!("data/lowdelay-640x480.nv12.sha256");
+
+/// The low-delay stream is 120 display frames at 640x480 (no conformance window —
+/// both dimensions are macroblock-aligned, so the coded and display sizes agree).
+const LOWDELAY_FRAME_COUNT: usize = 120;
+const DISPLAY_LOWDELAY: (u32, u32) = (640, 480);
+
 /// The Main 10 vector is 50 display frames.
 const MAIN10_FRAME_COUNT: usize = 50;
 
@@ -690,6 +713,18 @@ fn assert_bit_identical(hashes: &[String], goldens: &[&str], codec: &str) {
 /// information — and running one body twice is what makes that an equality
 /// rather than two similar-looking assertions that could drift apart.
 fn h264_parity_run(aus: &[&[u8]], label: &str) {
+    h264_parity_run_against(aus, label, GOLDENS_H264, FRAME_COUNT, DISPLAY_H264);
+}
+
+/// [`h264_parity_run`] with its stream's own goldens and geometry, for the legs that
+/// do not decode the vendored vector.
+fn h264_parity_run_against(
+    aus: &[&[u8]],
+    label: &str,
+    goldens: &'static str,
+    frame_count: usize,
+    display: (u32, u32),
+) {
     // One codec at a time on the device, and the `set_var` below happens only
     // under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
@@ -698,10 +733,10 @@ fn h264_parity_run(aus: &[&[u8]], label: &str) {
     // images grow TRANSFER_SRC so vkCmdCopyImageToBuffer is legal.
     std::env::set_var("PF_VKD_TEST_READBACK", "1");
 
-    let goldens = golden_hashes(GOLDENS_H264);
+    let goldens = golden_hashes(goldens);
     assert_eq!(
         goldens.len(),
-        FRAME_COUNT,
+        frame_count,
         "the golden file carries one hash per libavcodec frame"
     );
 
@@ -729,7 +764,7 @@ fn h264_parity_run(aus: &[&[u8]], label: &str) {
                 setup.pd,
                 &setup.device,
                 setup.graphics_qf,
-                DISPLAY_H264,
+                display,
                 EXPECTED_FORMAT,
             )
         };
@@ -767,6 +802,28 @@ fn h264_four_byte_start_codes_decode_bit_identically() {
     h264_parity_run(
         &common::split_h264_aus(&stream),
         "H.264 (4-byte start codes)",
+    );
+}
+
+/// The leg the vendored vector cannot be: **our own host's low-delay H.264**.
+///
+/// The vector above passed 250/250 on every driver in the fleet while this rung
+/// named one DPB slot as both `pSetupReferenceSlot` and a reference on 117 of the
+/// 120 access units below — the shape it simply never produces (see
+/// [`LOWDELAY_H264`]). Both of this rung's DPB modes take it badly and neither
+/// loudly: DISTINCT hands the aliased reference the same array layer the setup
+/// writes; COINCIDE finds no bound image for it, drops it from `pReferenceSlots` and
+/// `trace!`s. So a leg that decodes what we actually ship is not redundant with the
+/// conformance leg, it is the only one that can see this class at all.
+#[test]
+#[ignore = "needs a Vulkan Video H.264 decode device (fleet boxes; see module docs)"]
+fn low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec() {
+    h264_parity_run_against(
+        &common::split_h264_aus(LOWDELAY_H264),
+        "H.264 (low-delay host stream)",
+        GOLDENS_LOWDELAY,
+        LOWDELAY_FRAME_COUNT,
+        DISPLAY_LOWDELAY,
     );
 }
 
@@ -1595,6 +1652,76 @@ fn h264_goldens_and_au_split_agree_with_the_planner() {
         goldens.len(),
         "the planner outputs {outputs} pictures but the goldens carry {} hashes",
         goldens.len()
+    );
+}
+
+/// The low-delay stream's own CPU guard, plus the property that makes it worth
+/// vendoring at all.
+///
+/// The goldens/AU/output agreement is the same three-way check
+/// [`h264_goldens_and_au_split_agree_with_the_planner`] does. What is extra here is
+/// the last assertion: this stream must actually REACH the aliasing precondition —
+/// a picture removed by the same access unit whose `dpb_refs` still names it — on
+/// nearly every access unit. If a re-generation ever produced a stream that did not,
+/// the GPU leg above would still pass 120/120 while proving nothing the vendored
+/// vector does not already prove, and nothing else would say so.
+#[test]
+fn the_low_delay_stream_agrees_with_its_goldens_and_still_exercises_the_aliasing_shape() {
+    use pf_bitstream::h264::H264Planner;
+
+    let goldens = golden_hashes(GOLDENS_LOWDELAY);
+    assert_goldens_are_a_real_set(
+        &goldens,
+        LOWDELAY_FRAME_COUNT,
+        "data/lowdelay-640x480.nv12.sha256",
+    );
+
+    let aus = common::split_h264_aus(LOWDELAY_H264);
+    assert_eq!(aus.len(), LOWDELAY_FRAME_COUNT);
+
+    let mut planner = H264Planner::new();
+    let mut outputs = 0usize;
+    let mut both = 0usize;
+    let mut first_sps = None;
+    for (index, au) in aus.iter().enumerate() {
+        let plan = planner
+            .plan_au(au)
+            .unwrap_or_else(|e| panic!("AU {index}: the low-delay stream must plan, got {e:?}"));
+        outputs += plan.dpb.outputs.len();
+        both += plan
+            .dpb
+            .removed
+            .iter()
+            .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+            .count();
+        first_sps.get_or_insert((
+            plan.sps.max_num_ref_frames,
+            plan.picture.max_dpb_frames,
+            plan.sps.vui_parameters.max_num_reorder_frames,
+        ));
+    }
+    outputs += planner.flush().outputs.len();
+    assert_eq!(
+        outputs,
+        goldens.len(),
+        "the planner outputs {outputs} pictures but the goldens carry {} hashes",
+        goldens.len()
+    );
+
+    // The three SPS facts that make the shape reachable, pinned so a regenerated
+    // stream from a different encoder cannot quietly stop being low-delay.
+    assert_eq!(
+        first_sps,
+        Some((3, 3, 0)),
+        "max_num_ref_frames, DPB depth and max_num_reorder_frames — a DPB exactly as \
+         deep as the reference count, with no reordering, is what puts the unmarking \
+         and the eviction in one access unit"
+    );
+    assert_eq!(
+        both, 117,
+        "the stream must still remove pictures its own reference lists name — that is \
+         the ONLY reason it is vendored, and without it the GPU leg is a duplicate of \
+         the conformance one"
     );
 }
 
