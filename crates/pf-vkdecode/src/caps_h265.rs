@@ -320,6 +320,8 @@ pub(crate) unsafe fn query_h265_caps(
         codec = "H.265",
         ?capability_flags,
         ?decode_flags,
+        decode_flags_raw = decode_flags.as_raw(),
+        max_level_idc,
         max_dpb_slots,
         max_active_reference_pictures,
         ?min_coded_extent,
