@@ -122,6 +122,37 @@ pub struct DecodePlanDxvaAv1 {
     pub bitstream: Av1Bitstream,
     pub setup_slot: u8,
     pub setup_id: PicId,
+    /// Pictures this frame's own `refresh_frame_flags` displaces from the store
+    /// while THIS submission still NAMES them — their surfaces may not be recycled
+    /// until the decode op has been issued, and the caller owes exactly that.
+    ///
+    /// AV1 applies `refresh_frame_flags` AFTER the frame is decoded (7.20), so
+    /// `ref_frame_idx` resolves against the store as it stood BEFORE this frame and
+    /// a frame that reads a slot it then overwrites is the ORDINARY case, not an
+    /// exotic one: **268 of the vendored vector's 274 frames** do it, first at frame
+    /// 6. Releasing such a picture inside this conversion — which is what the H.264
+    /// and H.265 siblings do with their whole `removed` list, and what this one did
+    /// until the parity harness caught it — hands its surface straight back to
+    /// [`Self::setup_slot`], because [`SlotMap::assign`] takes the lowest free slot
+    /// and the lowest free slot is the one just vacated. The submission then says
+    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` in the same
+    /// breath: decode into the surface you are predicting from.
+    ///
+    /// Neither vendored H.264 nor H.265 vector ever produces that shape (measured:
+    /// zero on the 250-AU clips), which is why the eager release survived two
+    /// hardware-proven codecs and opened on the first AV1 frame past the key frame's
+    /// neighbourhood. The Vulkan rung carries the same contract for the same reason
+    /// (`pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`), and this
+    /// rung's constraint is the STRICTER of the two: Vulkan binds only the
+    /// references the frame names, while `RefFrameMapTextureIndex` declares the
+    /// whole store, so every picture the store still names has to survive — not just
+    /// the seven the frame reads.
+    ///
+    /// The ids are always a subset of the plan's `dpb.removed`, so applying them
+    /// completes that plan's bookkeeping and never invents a removal. Empty on the
+    /// overwhelming minority of frames that displace nothing they name; a caller
+    /// that drops them leaks a surface per frame and runs the ledger dry within ten.
+    pub release_after_decode: Vec<PicId>,
 }
 
 /// Why a plan cannot be expressed as DXVA AV1 buffers.
@@ -629,8 +660,22 @@ pub fn plan_to_dxva_av1(
     }
 
     // --- mutations, after every fallible step -----------------------------
+    // ⚠ A picture this submission NAMES may be displaced by this same frame's
+    // refresh. Its surface is still in `ref_frame_map` above, so releasing it here
+    // would hand that very surface to `setup_slot` below and the frame would decode
+    // into a picture it predicts from. Held back for the caller instead — see
+    // `DecodePlanDxvaAv1::release_after_decode` for the measurement and for why
+    // this rung's test is `dpb_refs` (the whole store `RefFrameMapTextureIndex`
+    // declares) rather than the Vulkan rung's narrower `refs`.
+    let release_after_decode: Vec<PicId> = plan
+        .dpb
+        .removed
+        .iter()
+        .copied()
+        .filter(|id| *id != setup_id && plan.dpb_refs.iter().any(|r| r.id == *id))
+        .collect();
     for &id in &plan.dpb.removed {
-        if id == setup_id {
+        if id == setup_id || release_after_decode.contains(&id) {
             continue;
         }
         let _ = slots.release(id);
@@ -758,6 +803,7 @@ pub fn plan_to_dxva_av1(
         bitstream,
         setup_slot,
         setup_id,
+        release_after_decode,
     })
 }
 
@@ -780,6 +826,123 @@ mod tests {
     const AV1_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
+
+    /// Convert one plan the way the RUNG must: the conversion, then the releases it
+    /// defers past the decode op ([`DecodePlanDxvaAv1::release_after_decode`]).
+    ///
+    /// Not a convenience — it is the caller's half of the contract, and the same
+    /// helper the Vulkan rung's tests carry for the same reason. A loop that
+    /// converts without it holds a surface on 268 of this vector's 274 frames and
+    /// runs the nine-slot ledger dry inside ten.
+    fn convert(au: &[u8], plan: &AuPlan, slots: &mut SlotMap) -> DecodePlanDxvaAv1 {
+        let dx = plan_to_dxva_av1(au, plan, slots).expect("the clean vector converts");
+        for &id in &dx.release_after_decode {
+            assert!(
+                slots.release(id),
+                "a deferred release named picture {id}, which holds no surface"
+            );
+        }
+        dx
+    }
+
+    /// The decode target never shares a surface with a picture the submission names.
+    ///
+    /// The defect this pins is the one the Windows parity harness caught and nothing
+    /// on the CPU could see. AV1 applies `refresh_frame_flags` AFTER the frame is
+    /// decoded (7.20), so a frame that reads a slot it then overwrites is ordinary —
+    /// **268 of this vector's 274 frames**, first at frame 6 — and releasing the
+    /// displaced picture inside the conversion handed its surface straight to
+    /// `setup_slot`, because [`SlotMap::assign`] takes the lowest free slot and the
+    /// lowest free slot is the one just vacated. The submission then said
+    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` at once.
+    ///
+    /// Measured on hardware before the fix: Intel Arc decoded 245 of 250 delivered
+    /// frames wrong (47% of luma at the first bad frame, max |delta| 242, chroma
+    /// wrong too — a frame predicted from the wrong picture), and the only late
+    /// frame it got right was the one intra frame, which names no reference and so
+    /// could not alias. NVIDIA tolerated it.
+    ///
+    /// The assertion is against the WHOLE STORE, not just the seven names this frame
+    /// reads: `RefFrameMapTextureIndex` declares every occupied slot, so a driver is
+    /// entitled to consult one the frame never names.
+    #[test]
+    fn the_decode_target_never_aliases_a_surface_the_submission_names() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let (mut frames, mut deferring, mut deferred) = (0u32, 0u32, 0u32);
+        let mut peak = 0usize;
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                // Deliberately NOT `convert` — this test applies the deferred
+                // releases itself, after checking each one.
+                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("the vector converts");
+                frames += 1;
+                peak = peak.max(slots.active());
+
+                // `#[repr(packed)]` — copy the fields out before reading them.
+                let curr = dx.pic_params.curr_pic_texture_index;
+                let store = dx.pic_params.ref_frame_map_texture_index;
+                assert!(
+                    store.iter().all(|surface| *surface != curr),
+                    "frame {frames}: surface {curr} is both CurrPicTextureIndex and a \
+                     RefFrameMapTextureIndex entry — the frame decodes into a picture \
+                     it predicts from"
+                );
+                // Every deferred id is one this plan really removed AND the store
+                // really names — never an invented removal, never a live picture.
+                for &id in &dx.release_after_decode {
+                    assert!(
+                        plan.dpb.removed.contains(&id),
+                        "frame {frames}: deferred picture {id} is not in this plan's \
+                         removed list"
+                    );
+                    assert!(
+                        plan.dpb_refs.iter().any(|r| r.id == id),
+                        "frame {frames}: picture {id} is deferred without being named \
+                         by the store — only a picture the submission points at earns \
+                         the reprieve"
+                    );
+                    assert!(
+                        slots.slot_of(id).is_some(),
+                        "frame {frames}: a deferred picture must still hold its surface"
+                    );
+                }
+                if !dx.release_after_decode.is_empty() {
+                    deferring += 1;
+                    deferred += dx.release_after_decode.len() as u32;
+                }
+                for &id in &dx.release_after_decode {
+                    assert!(slots.release(id));
+                }
+            }
+        }
+
+        assert_eq!(frames, 274);
+        assert_eq!(
+            deferring, 268,
+            "268 of 274 frames of this vector displace a picture their own submission \
+             names; at zero this test compares an empty list against itself and the \
+             deferral could be deleted without a single assertion noticing"
+        );
+        assert_eq!(deferred, 268, "one displaced picture per frame here");
+        // The nine-slot ledger is `NUM_REF_SLOTS + 1`, and holding a displaced
+        // picture one frame longer is exactly what that spare is for — the pool is
+        // allocated `SlotMap::capacity()` surfaces (`pf_dxvadec::pool_size`), so a
+        // peak above it would be a submission naming a surface that does not exist.
+        assert!(
+            peak <= slots.capacity(),
+            "peak {peak} surfaces held exceeds the {} the pool allocates",
+            slots.capacity()
+        );
+        eprintln!(
+            "frames {frames} · deferring {deferring} · peak surfaces held {peak}/{}",
+            slots.capacity()
+        );
+    }
 
     /// The whole vector, converted **and packed** — the closest a CPU gate gets to
     /// the hardware leg, and the test that would have caught the defect this
@@ -815,7 +978,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 // Poison the mapping so a record can only be "right" by pointing
                 // at bytes this pack actually wrote.
@@ -949,8 +1112,7 @@ mod tests {
                         index_by_surface_would_differ += 1;
                     }
                 }
-                let dx =
-                    plan_to_dxva_av1(packet, &plan, &mut slots).expect("the clean vector converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
 
                 // Tile records must describe TILE PAYLOAD ranges inside the access
@@ -1153,7 +1315,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let lf = &plan.header.loop_filter_params;
                 // `#[repr(packed)]` — copy the block out before reading its fields.
@@ -1244,7 +1406,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let raw = &plan.header.cdef_params;
                 // `#[repr(packed)]` — copy the arrays out before indexing them.
@@ -1335,7 +1497,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let t = &plan.header.tile_info;
                 // `#[repr(packed)]` — copy the block out before reading its arrays.
@@ -1398,7 +1560,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let pp = &dx.pic_params;
                 let status = pp.status_report_feedback_number;
@@ -1478,7 +1640,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, plan, &mut slots).expect("converts");
+                let dx = convert(packet, plan, &mut slots);
                 decoded.push((dx.setup_id, dx.setup_slot));
             }
             if decoded.len() > 1 {

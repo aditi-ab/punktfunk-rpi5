@@ -184,6 +184,15 @@ struct Submission {
     /// other two codecs do not (see [`NativeD3d11Decoder::frame_av1`]). All three
     /// conversions produce it; dropping it here made the AV1 leak invisible.
     setup_id: u64,
+    /// AV1 only: surfaces this frame's own refresh displaces while the submission
+    /// still NAMES them, released once the decode op has been issued.
+    ///
+    /// See [`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`] — this is the
+    /// caller's half of that contract, and dropping it decodes 268 of the vendored
+    /// vector's 274 frames into a surface they predict from. Always empty on
+    /// H.264 and H.265, whose conversions release their whole `removed` list
+    /// themselves (neither vendored vector ever produces the shape).
+    release_after_decode: Vec<u64>,
     /// Which codec's slice-control record the packer's locations become.
     codec: Codec,
     /// What the hand-off needs to blit this picture.
@@ -595,6 +604,26 @@ impl NativeD3d11Decoder {
             }
         };
 
+        // The surfaces this frame's own refresh displaced while its submission still
+        // NAMED them (fn docs). Released here for the same reason the block below
+        // waits: the decode op has been issued, so nothing can be assigned them
+        // until the next frame — and on the `damaged` path there is no op at all,
+        // where dropping the release would leak a surface just the same.
+        if let Some(session) = self.session.as_mut() {
+            for &id in &sub.release_after_decode {
+                if !session.slots.release(id) {
+                    // Never fatal, and never silent: a deferred id that holds no
+                    // slot means the conversion and the ledger disagree about the
+                    // store, which is a bug in one of them rather than a stream
+                    // this frame can do anything about.
+                    tracing::warn!(
+                        id,
+                        "AV1 deferred release named a picture holding no surface"
+                    );
+                }
+            }
+        }
+
         // The slot nothing will ever ask for again (fn docs). Released AFTER the
         // blit above, so the surface is read before anything can be assigned it.
         if plan.header.refresh_frame_flags == 0 {
@@ -642,6 +671,7 @@ impl NativeD3d11Decoder {
             slice_ranges: Vec::new(),
             setup_slot: dxva.setup_slot,
             setup_id: dxva.setup_id,
+            release_after_decode: dxva.release_after_decode,
             codec: Codec::Av1,
             facts: PictureFacts {
                 colour: colour_of(plan.picture.colour),
@@ -745,6 +775,12 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
+                    // H.264's conversion releases its whole `removed` list itself:
+                    // neither vendored vector ever has a picture the slices read
+                    // being displaced by the same access unit (measured: zero on
+                    // 250 AUs), and the sliding window evicts only pictures no
+                    // slice names.
+                    release_after_decode: Vec::new(),
                     codec: Codec::H264,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
@@ -804,6 +840,10 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
+                    // As H.264 above: an HEVC picture's RPS is resolved against the
+                    // DPB before any removal, and a picture the RPS names is by
+                    // construction still in it.
+                    release_after_decode: Vec::new(),
                     codec: Codec::H265,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
