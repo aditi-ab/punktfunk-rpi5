@@ -483,6 +483,25 @@ public final class SessionAudio {
         }
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
+
+        // The capture side must be PULLED, and only the render graph pulls anything. An input
+        // node carrying nothing but a tap is not part of that graph, so on the combined engine
+        // nobody drove it: the IO unit came up (the recording indicator lit for a beat, then went
+        // out as the input went idle) and NOT ONE BUFFER ever reached the tap — no error, no
+        // failed start, just a session that quietly sent no microphone at all. Routing the input
+        // through a silent sink puts it in the graph, which is what Apple's own voice-processing
+        // sample does. The split path never needed it: a capture-only engine has the input node
+        // AS its graph, so it is pulled by definition — which is why this only broke when the
+        // combined topology became the default.
+        //
+        // `outputVolume = 0` on the sink: the mic has to reach the graph, never the speaker. At
+        // any audible volume this is a microphone wired straight to the earpiece.
+        let micSink = AVAudioMixerNode()
+        engine.attach(micSink)
+        micSink.outputVolume = 0
+        engine.connect(engine.inputNode, to: micSink, format: nil)
+        engine.connect(micSink, to: engine.mainMixerNode, format: nil)
+
         // BEFORE the tap reads a format. Enabling voice processing swaps the engine's IO unit
         // for the VPIO one and renegotiates its formats, and until the engine is prepared the
         // input node can still report the pre-swap state — 0 Hz / 0 channels included, which
