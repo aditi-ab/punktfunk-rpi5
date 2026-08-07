@@ -18,10 +18,19 @@
 //! (`video::native_evidence`, and the table in `video`'s module docs):
 //!
 //! * **H.264 and H.265** — frame-hash parity against libavcodec on an RTX 4090 and an AMD
-//!   iGPU plus a 30-minute soak (M5).
-//! * **AV1** — wired in M7, has decoded nothing on any hardware. Until M10 `auto` skipped it
-//!   in favour of the libavcodec rung below; with that gone the alternative is the CPU, so it
-//!   runs and the session log says so at `warn`.
+//!   iGPU plus a 30-minute soak (M5), re-confirmed on an RTX 3500 Ada and an Intel Arc on
+//!   2026-08-07 (250/250 both codecs, plus 50/50 HEVC Main 10 on both).
+//! * **AV1** — wired in M7. It streams: 4K60 on an RTX 3500 Ada and on an Intel Arc, with a
+//!   clean 5-minute soak. But it **fails frame-hash parity on both of those GPUs**, measured
+//!   2026-08-07 — 186/250 diverging frames on the NVIDIA part and 245/250 on the Intel one,
+//!   deterministically, against the same libavcodec goldens the Vulkan rung reproduces
+//!   250/250 on the SAME box. So this rung's AV1 leg produces wrong pixels and the session
+//!   log says so at `warn`. `av1_divergence_map` (below) carries the two signatures; the
+//!   tool that would localise it — an AV1 leg for pf-dxvadec's `libav_picparams_parity`,
+//!   which covers only H.264 and HEVC — does not exist yet.
+//!
+//!   Until M10 `auto` skipped AV1 here in favour of the libavcodec rung below; with that
+//!   gone the alternative is the CPU, so it still runs.
 //!
 //! A refusal or an init failure logs and falls through to the standard ladder, so neither the
 //! pin nor the `auto` admission can cost a session its decoder.
@@ -2225,6 +2234,163 @@ mod parity {
              decoded and withheld",
             goldens.len()
         );
+    }
+
+    /// The AV1 leg's post-mortem: one line per DISPLAY frame, its verdict against the
+    /// goldens beside the plan facts that could explain it.
+    ///
+    /// Not a gate — it asserts nothing and always "passes". It exists because
+    /// [`av1_every_delivered_frame_hashes_bit_identical_to_libavcodec`] FAILS on
+    /// every device tried so far, and a count of diverging frames is not a lead. This
+    /// is what turned that count into one, on 2026-08-07:
+    ///
+    /// * **NVIDIA RTX 3500 Ada** — display frames 0..=63 bit-identical, then every one
+    ///   of the remaining 186 diverges. The first bad frame is the one whose
+    ///   `order_hint` first reaches **64**, and its error is 174 luma pixels in a
+    ///   single 16x24 block (max |delta| 8, chroma untouched) which then propagates
+    ///   through prediction. The stream keeps the key frame (`order_hint` 0) in the
+    ///   BWDREF and ALTREF2 slots for its whole length, so 64 is where the distance to
+    ///   it reaches the edge of what `get_relative_dist` can represent at
+    ///   `OrderHintBits = 7`.
+    /// * **Intel Arc** — only display frames 0, 1, 2, 3 and 10 are bit-identical, and
+    ///   the divergence is STRUCTURAL rather than marginal (47% of luma at the first
+    ///   bad frame, max |delta| 242, chroma wrong too): a frame predicted from the
+    ///   wrong picture, not a filter rounding.
+    ///
+    /// Both are deterministic — three runs each, identical first-divergent frame and
+    /// identical hashes — so neither is a race against the decode queue.
+    ///
+    /// Set `PF_AV1_DUMP=<tag>` to also write a few frames' raw NV12 to the temp
+    /// directory. That is how "how badly" was answered: at a frame where ONE vendor
+    /// hashes correctly, that vendor's bytes are libavcodec's bytes and so a valid
+    /// reference for the other's, and `ffmpeg -f rawvideo -pix_fmt nv12` regenerates
+    /// the rest (the golden file's header carries the exact command).
+    #[test]
+    #[ignore = "diagnostic, needs a Windows D3D11 video device (see module docs)"]
+    fn av1_divergence_map() {
+        let units = split_ivf(TEST_25FPS_AV1);
+        let order = order_av1(&units);
+        let goldens = golden_hashes(GOLDENS_AV1);
+
+        // Plan facts per PicId, from a planner run alongside the decoder's own.
+        let mut facts: HashMap<u64, String> = HashMap::new();
+        let mut hidden: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        {
+            let mut planner = pf_dxvadec::Av1Planner::new();
+            for unit in &units {
+                for plan in planner.plan_au(unit).expect("the clean vector plans") {
+                    let Some(id) = plan.dpb.stored else { continue };
+                    let h = &*plan.header;
+                    if !h.show_frame {
+                        hidden.insert(id);
+                    }
+                    let mut refs = String::new();
+                    for r in plan.refs.iter() {
+                        match r {
+                            Some(r) => {
+                                refs.push_str(&format!("{}/{} ", r.slot, r.id));
+                            }
+                            None => refs.push_str("-/- "),
+                        }
+                    }
+                    facts.insert(
+                        id,
+                        format!(
+                            "ft={} show={} oh={:3} pri={} refresh={:#06x} grain={} seg={} \
+                             sr={} warp={} refmvs={} skip={} refsel={} tiles={}x{} \
+                             lf={:?} lfsharp={} lfdelta={}{} refd={:?} moded={:?} \
+                             cdefbits={} lr={:?} refs=[{}]",
+                            h.frame_type as u8,
+                            u8::from(h.show_frame),
+                            h.order_hint,
+                            h.primary_ref_frame,
+                            h.refresh_frame_flags,
+                            u8::from(h.film_grain_params.apply_grain),
+                            u8::from(h.segmentation_params.segmentation_enabled),
+                            u8::from(h.use_superres),
+                            u8::from(h.allow_warped_motion),
+                            u8::from(h.use_ref_frame_mvs),
+                            u8::from(h.skip_mode_present),
+                            u8::from(h.reference_select),
+                            h.tile_info.tile_cols,
+                            h.tile_info.tile_rows,
+                            h.loop_filter_params.loop_filter_level,
+                            h.loop_filter_params.loop_filter_sharpness,
+                            u8::from(h.loop_filter_params.loop_filter_delta_enabled),
+                            u8::from(h.loop_filter_params.loop_filter_delta_update),
+                            h.loop_filter_params.loop_filter_ref_deltas,
+                            h.loop_filter_params.loop_filter_mode_deltas,
+                            h.cdef_params.cdef_bits,
+                            h.loop_restoration_params.frame_restoration_type,
+                            refs.trim_end(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        let luid = pinned_adapter();
+        let mut decoder = NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, luid, false)
+            .expect("the box must host AV1 Profile 0");
+        let mut readback = Readback {
+            ctx: decoder.context.clone(),
+            staging: None,
+        };
+        // Raw NV12 for a few display frames is kept as well as its hash, so a
+        // divergence can be classified by plane and magnitude against a vendor whose
+        // hash at that same frame MATCHES the golden. It has to be captured inside
+        // the loop: surfaces are recycled, so by the end of the run the slot that
+        // held an early picture holds someone else's pixels.
+        let dump_tag = std::env::var("PF_AV1_DUMP").ok();
+        let wanted: Vec<u64> = if dump_tag.is_some() {
+            [3usize, 4, 10, 63, 64]
+                .iter()
+                .filter_map(|&n| order.display.get(n).copied())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut by_id: HashMap<u64, String> = HashMap::new();
+        for (index, unit) in units.iter().enumerate() {
+            decoder.decode_av1(unit).expect("decode");
+            for &id in &order.per_unit[index] {
+                let (slot, f, pool) = {
+                    let session = decoder.session.as_ref().expect("session");
+                    let slot = session.slots.slot_of(id).expect("slot");
+                    let f = session.held[usize::from(slot)].expect("facts");
+                    (slot, f, session.pool.clone())
+                };
+                let bytes =
+                    readback.read(&decoder.device, &pool, u32::from(slot), (f.width, f.height));
+                if wanted.contains(&id) {
+                    let tag = dump_tag.as_deref().unwrap_or("x");
+                    let path = std::env::temp_dir().join(format!("pf-nv12-{tag}-pic{id}.bin"));
+                    std::fs::write(&path, &bytes).expect("write the dump");
+                    eprintln!("dumped pic {id} -> {}", path.display());
+                }
+                by_id.insert(id, sha256_hex(&bytes));
+            }
+        }
+
+        eprintln!("=== MAP BEGIN ===");
+        for (n, (id, golden)) in order.display.iter().zip(goldens.iter()).enumerate() {
+            let got = by_id.get(id).expect("decoded");
+            eprintln!(
+                "disp {n:3} pic {id:3} {} | {}",
+                if got == golden { "OK " } else { "BAD" },
+                facts.get(id).map(String::as_str).unwrap_or("?")
+            );
+        }
+        eprintln!("=== HIDDEN ===");
+        let mut h: Vec<u64> = hidden.into_iter().collect();
+        h.sort_unstable();
+        for id in h {
+            eprintln!(
+                "hidden  pic {id:3}     | {}",
+                facts.get(&id).map(String::as_str).unwrap_or("?")
+            );
+        }
+        eprintln!("=== MAP END ===");
     }
 
     #[test]

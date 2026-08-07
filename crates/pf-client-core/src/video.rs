@@ -24,7 +24,7 @@
 //! **One column of that table is different, and it is the one the filter still guards.**
 //! On Linux, Intel and every unknown vendor id run `native-vaapi → native-vk → sw`
 //! ([`VulkanDecodeDevice::prefer_vulkan_first`] is true for NVIDIA and AMD only), so the
-//! rung directly below the never-run pf-vaadec is native Vulkan Video — H.264 and H.265 on
+//! rung directly below the unproven pf-vaadec is native Vulkan Video — H.264 and H.265 on
 //! three drivers plus a 92-minute soak, AV1 250/250. There, barring the unproven rung moves
 //! the session exactly one rung down, onto proven code, so it is barred: an unproven rung
 //! yields to a rung that is BOTH verified for this codec and usable on THIS device, and to
@@ -48,9 +48,10 @@
 //! | native Vulkan Video | [`crate::video_vk_native`] | H.264 | **yes** — bit-exact vs libavcodec, 250/250 AUs on three drivers + a 92-minute soak (M2 WP-D) |
 //! | native Vulkan Video | | H.265 (Main / Main10 / 4:4:4) | **yes** — same parity run + HDR chain and Deck/VanGogh legs (M3) |
 //! | native Vulkan Video | | AV1 | **yes** — 250/250 bit-identical to libavcodec on an RTX 5070 Ti (M7); ONE vendor, no soak |
-//! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5) |
-//! | native D3D11VA | | AV1 | **not proven, but no longer unexercised** — 4K60 on an RTX 3500 Ada AND an Intel Arc, plus a clean 5-minute Arc soak (2026-08-07), at roughly 10x the speed of the Vulkan leg on the same GPU. It stays out of the admission filter for one specific missing thing: frame-hash parity against libavcodec, which every verified pair here has and pf-dxvadec has no harness for. Its M7 wiring was right all along: what looked like a DXVA reference-mapping bug (`reference picture N holds no DPB slot`, 72 consecutive failures) was the HOST shipping half of every AV1 frame — see `pf_encode`'s `resolve_split_subframe` |
-//! | native VAAPI | [`crate::video_vaapi_native`] | H.264, H.265, AV1 | **NO** — has never decoded a frame anywhere (M6/M7). Still true as of 2026-08-07: the reachable VAAPI box (`.25`, RDNA3) reports `VAProfileAV1Profile0: VAEntrypointVLD` and no Vulkan AV1 decode at all, so it is the right box to prove this rung on — it has no punktfunk checkout and 4 GB of usable RAM, which is why it has not happened |
+//! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5), re-confirmed 250/250 (+ 50/50 Main 10) on an RTX 3500 Ada and an Intel Arc on 2026-08-07 |
+//! | native D3D11VA | | AV1 | **NO — it decodes WRONG PIXELS.** The parity harness that was missing turned out to exist (`video_d3d11_native`'s `parity` module, written by M7 and never run); running it on 2026-08-07 failed on BOTH GPUs of `.221`, deterministically: 186/250 diverging frames on an RTX 3500 Ada and 245/250 on an Intel Arc. Not the environment — H.264, H.265 and HEVC Main 10 pass 250/250/50 through the SAME harness on the same two GPUs, and pf-vkdecode's Vulkan AV1 leg reproduces the SAME goldens 250/250 on the same box. Two unlike signatures: NVIDIA is bit-exact for 63 frames and then loses ONE 16x24 luma block (174 px, max |delta| 8) on the frame whose `order_hint` first reaches 64, which then propagates; Intel is structurally wrong from display frame 4 (47% of luma, max |delta| 242). It still streams — 4K60 on both, a clean 5-minute Arc soak, ~10x the Vulkan leg's speed — which is exactly why the picture looked fine and only the goldens caught it. See `av1_divergence_map` |
+//! | native VAAPI | [`crate::video_vaapi_native`] | AV1 | **not proven** — but it has now DECODED: 250/250 frames of the vendored AV1 vector on `.25` (Radeon 780M, RDNA3, Mesa 26.0.3) on 2026-08-07, NV12 on a tiled AMD modifier, and `probe_this_machines_libva` reports `AV1 Profile 0: VLD decode`. Never frame-hash parity-checked: the rung exports a tiled dmabuf with no CPU-readable image, so parity needs a readback path that does not exist yet |
+//! | native VAAPI | | H.264, H.265 | **NO** — these two legs have still never decoded a frame anywhere (M6/M7) |
 //! | software | `video_software` | H.264, AV1 | **not proven** — openh264 has never run on glass; rav1d HAS now decoded 1080p and 4K60 AV1 there (2026-08-07, .21) and recovers in-session from a mid-stream reference loss, but with no parity check and no soak. Its 4K "abort" was never about 4K: rav1d 1.1.0 kills the process on ANY decode error while it holds a single frame context, so `video_software` opens it with two — see [`crate::video_software`] |
 //!
 //! The software rung's evidence is recorded for the same reason but does not gate
@@ -771,7 +772,8 @@ enum Backend {
     /// libavcodec's VAAPI hwaccel, and since M10 the only VAAPI rung: libva driven
     /// straight from pf-bitstream plans, dlopen'd, exporting the same DRM-PRIME dmabufs.
     /// Reachable by pin (`PUNKTFUNK_DECODER=native-vaapi`) and by `auto` in the vendor
-    /// order. ⚠ This rung has decoded NOTHING on hardware ([`native_evidence`]) — `auto`
+    /// order. ⚠ Its AV1 leg has now decoded 250/250 on RDNA3 but is unverified for want of
+    /// parity, and its H.264/H.265 legs have decoded NOTHING ([`native_evidence`]) — `auto`
     /// runs it where the alternative below it is the CPU, and yields to native Vulkan
     /// Video where that rung is proven for the codec and usable on the device
     /// ([`native_rung_admitted`], which is the Intel/unknown arm). Every session that
@@ -1109,38 +1111,67 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
             true,
             "frame-hash parity on an RTX 4090 and an AMD iGPU + 30-min soak (M5)",
         ),
-        // Decoded on hardware for the first time on 2026-08-07 (4K60, RTX 3500 Ada) once the
-        // host stopped truncating AV1 — so the old "NEVER decoded a frame anywhere" is no
-        // longer true and must not be printed.
+        // 2026-08-07: this pair was PARITY-CHECKED for the first time, and it FAILED.
         //
-        // Re-measured the same day against a host carrying #95, and it now has more than one
-        // session behind it: 4K60 on the RTX 3500 Ada AND on the box's Intel Arc (which
-        // advertises no SAMPLED usage on any decode profile, so zero-copy Vulkan Video cannot
-        // work there and `auto` correctly lands here), plus a 5-minute Arc soak — 297 stats
-        // lines, 60 fps, decode 1.3 ms, e2e 10.9/14.8 ms p50/p95, and exactly ONE warning in
-        // the whole run: this very notice. No refusals, no demotions, no concealed runs, and
-        // the session was still alive at the end. Two vendors and a soak. It is also
-        // roughly 10x faster than Vulkan
-        // Video's AV1 leg on the SAME NVIDIA GPU (1.0-1.4 ms against 11.6-16.7 ms), which is
-        // the strongest argument yet for eventually admitting it.
+        // The harness the previous note said did not exist did exist — `video_d3d11_native`'s
+        // `parity` module, written by M7 against the same libavcodec goldens the Vulkan rung
+        // uses, `#[ignore]`d and never once run on a device. Running it on `.221` failed on
+        // BOTH GPUs and did so deterministically (three runs each, identical first-divergent
+        // frame and identical hashes): 186/250 diverging display frames on an RTX 3500 Ada,
+        // 245/250 on an Intel Arc.
         //
-        // Still NOT `verified`, and the missing piece is named rather than hand-waved:
-        // `verified` gates `native_rung_admitted` — whether `auto` may pick this rung AHEAD
-        // of Vulkan Video — and there is still NO frame-hash parity against libavcodec.
-        // Every other verified pair in this table earned it with one. pf-dxvadec has no
-        // `gpu_parity`-style harness at all (only `libav_picparams_parity`, which compares
-        // picture parameters on the CPU and never decodes), so building that harness is the
-        // work that would promote this, not another session.
+        // It is the DECODE that is wrong, not the measurement. Three things rule the harness
+        // and the box out: H.264 and H.265 pass 250/250 and HEVC Main 10 50/50 through the
+        // SAME harness, the same readback geometry and the same slot map on those same two
+        // GPUs; pf-vkdecode's Vulkan AV1 leg reproduces the SAME golden file 250/250 on the
+        // same box; and the goldens themselves reproduce byte-for-byte from ffmpeg 8.1.1.
+        //
+        // Two signatures, and they are not the same defect wearing two faces:
+        //  * NVIDIA is bit-exact for display frames 0..=63 and then loses ONE 16x24 luma
+        //    block — 174 pixels, max |delta| 8, chroma untouched — on the frame whose
+        //    `order_hint` first reaches 64, after which every remaining frame is downstream
+        //    of it. The stream parks the key frame (`order_hint` 0) in BWDREF and ALTREF2 for
+        //    its whole length, so 64 is where the distance to it reaches the edge of
+        //    `get_relative_dist`'s range at `OrderHintBits = 7`.
+        //  * Intel is structurally wrong from display frame 4 — 47% of luma, max |delta| 242,
+        //    chroma wrong too, i.e. predicted from the wrong picture — and the only later
+        //    frame it gets right is the one whose `primary_ref_frame` is PRIMARY_REF_NONE.
+        //
+        // None of this shows on glass: the rung streams 4K60 on both parts with a clean
+        // 5-minute soak at ~10x the Vulkan leg's speed. That is the point of a golden.
+        //
+        // What would localise it does not exist: pf-dxvadec's `libav_picparams_parity`
+        // covers H.264 and HEVC only, so the AV1 conversion has never been compared against
+        // libavcodec at the picture-parameter level either. `av1_divergence_map` in
+        // `video_d3d11_native` carries the per-frame evidence.
         (NativeRung::D3d11va, CODEC_AV1) => (
             false,
-            "4K60 on an RTX 3500 Ada AND an Intel Arc + a clean 5-min soak (2026-08-07), \
-             and ~10x faster than the Vulkan leg on the same GPU - but has NEVER been \
-             frame-hash parity-checked against libavcodec, which every verified pair \
-             here has (M7)",
+            "streams 4K60 on an RTX 3500 Ada AND an Intel Arc with a clean 5-min soak, but \
+             has NEVER passed frame-hash parity and now measurably FAILS it: 186/250 and \
+             245/250 display frames diverge from libavcodec on those two GPUs (2026-08-07), \
+             while H.264/H.265/Main10 pass through the same harness - this rung decodes AV1 \
+             to wrong pixels (M7)",
+        ),
+        // 2026-08-07: the VAAPI rung decoded its first frames ever — 250/250 of the vendored
+        // AV1 vector on `.25` (Radeon 780M, RDNA3, Mesa 26.0.3), NV12 on a tiled AMD
+        // modifier. So "never decoded a frame anywhere" is no longer true of AV1 and must not
+        // be printed for it; it is still exactly true of the other two legs, which is why
+        // this arm is now split.
+        //
+        // Not `verified`, and for a reason the AV1 row above makes vivid: a rung can decode
+        // 250 frames and still produce wrong pixels. Parity is what tells them apart, and
+        // this rung exports a TILED dmabuf with no CPU-readable image, so it needs a readback
+        // path nothing has written yet.
+        (NativeRung::Vaapi, CODEC_AV1) => (
+            false,
+            "decoded 250/250 frames of the vendored AV1 vector on RDNA3 (Mesa 26.0.3, \
+             2026-08-07) - its first frames on any hardware - but has never been frame-hash \
+             parity-checked: the rung exports a tiled dmabuf with no CPU-readable image (M7)",
         ),
         (NativeRung::Vaapi, _) => (
             false,
-            "NEVER decoded a frame on any hardware - no VAAPI device was reachable (M6/M7)",
+            "NEVER decoded a frame on any hardware - the AV1 leg has now run on RDNA3, these \
+             two have not (M6/M7)",
         ),
         // The 4K AV1 abort recorded here on 2026-08-07 is FIXED, and it was never about 4K.
         // rav1d 1.1.0 aborts the process on ANY decode error while it holds a single frame
@@ -1192,7 +1223,7 @@ pub fn native_vulkan_usable(wire: u8, video_decode: bool, decode_video_caps: u32
 /// Where the rule bites, and where it deliberately does not:
 ///
 /// * **Linux, Intel and every unknown vendor id.** The order is `native-vaapi →
-///   native-vk → sw`, so the rung under the never-run pf-vaadec is native Vulkan Video,
+///   native-vk → sw`, so the rung under the unproven pf-vaadec is native Vulkan Video,
 ///   proven for all three codecs. Barring VAAPI there moves the session ONE rung down onto
 ///   proven code, so it is barred — and it stays reachable below Vulkan (the same ladder
 ///   reaches it again if Vulkan can't be built) and by pin.
@@ -1462,8 +1493,11 @@ pub fn decodable_codecs() -> u8 {
 /// * the presenter's Vulkan device advertises `DECODE_AV1` in its decode queue
 ///   family's codec operations, or
 /// * (Windows) the presenter can import D3D11 textures — the native DXVA rung then decodes
-///   AV1 Profile 0 through the adapter's profile GUID, and `auto` reaches it. ⚠ That leg
-///   has decoded nothing on hardware ([`native_evidence`]); the session says so at `warn`.
+///   AV1 Profile 0 through the adapter's profile GUID, and `auto` reaches it. ⚠⚠ That leg
+///   decodes WRONG PIXELS — measured against libavcodec on two GPUs on 2026-08-07
+///   ([`native_evidence`]); the session says so at `warn`. Advertising AV1 is still answered
+///   from device facts here, deliberately: withdrawing the codec would be a product call
+///   about what a Windows Intel box streams instead, not a fact about the device.
 ///   Before M10 this arm was conditional, because the leg was kept out of `auto` while
 ///   libavcodec's DXVA rung was still below it — with that rung deleted there is no
 ///   condition left to write.
@@ -1568,7 +1602,8 @@ fn report_au_fault_env(native_rung: bool) {
 /// a frame through it for this codec.
 ///
 /// This is the program's honesty surface, and M10 is where it earns its keep: every rung
-/// is now native, two of them have never decoded anything anywhere, and there is no
+/// is now native, one of them still has legs that have never decoded anything anywhere,
+/// another has a leg that decodes wrong pixels, and there is no
 /// libavcodec twin left underneath to catch a session that lands wrong. A field report of
 /// the form "M10 broke my stream" is only actionable if the log distinguishes *the rung
 /// with three drivers and a 92-minute soak behind it* from *the rung nothing has ever
@@ -1646,10 +1681,10 @@ impl Decoder {
     /// Intel/unknown (Intel's driver advertises Vulkan Video, but Vulkan decode on it
     /// strobed/overran the budget — B580 field report).
     ///
-    /// On top of that order sits the evidence filter ([`native_rung_admitted`]): a rung
-    /// that has never decoded a frame does not go FIRST when the rung directly below it is
-    /// proven for this codec and usable on this device. That is the Linux Intel/unknown
-    /// arm and only that arm — everywhere else what is below is the CPU.
+    /// On top of that order sits the evidence filter ([`native_rung_admitted`]): an
+    /// UNPROVEN rung does not go FIRST when the rung directly below it is proven for this
+    /// codec and usable on this device. That is the Linux Intel/unknown arm and only that
+    /// arm — everywhere else what is below is the CPU.
     ///
     /// Whatever it lands on, the session logs `decode rung active` with the rung's name
     /// and its evidence state, and that line is a WARNING when no hardware has ever
@@ -1994,6 +2029,20 @@ impl Decoder {
             // so what is really below the DXVA AV1 leg is the CPU — and its H.264/H.265
             // legs are verified anyway, which is what the first clause of
             // [`native_rung_admitted`] answers.
+            //
+            // ⚠⚠ OPEN, 2026-08-07: for AV1 this now admits a rung MEASURED to decode wrong
+            // pixels (186/250 and 245/250 diverging frames — [`native_evidence`]), and on
+            // Intel it is the arm that actually fires, because that vendor advertises no
+            // SAMPLED usage on any decode profile so zero-copy Vulkan Video cannot run
+            // there. The filter is behaving as written — "unproven yields only to PROVEN
+            // code below", and below here is the CPU — but the premise has changed: this is
+            // no longer a rung with no evidence, it is a rung with BAD evidence, and the
+            // rule was never asked that question. Deliberately NOT changed here: barring it
+            // trades visibly-wrong AV1 for the software rung, which cannot keep up at 4K
+            // (see [`crate::video_software`]) and is itself unproven, so which way that
+            // trade should go is a product call and not this function's to make silently.
+            // Every such session says so at `warn` via [`log_rung`], and the note now names
+            // the parity failure rather than merely the absence of a check.
             && native_rung_admitted(NativeRung::D3d11va, wire, None)
         {
             d3d11_tried = true;
@@ -3282,22 +3331,22 @@ mod tests {
             (
                 NativeRung::D3d11va,
                 CODEC_AV1,
-                "the DXVA AV1 leg never ran (M7)",
+                "the DXVA AV1 leg FAILS parity on two GPUs (M7)",
             ),
             (
                 NativeRung::Vaapi,
                 CODEC_H264,
-                "no VAAPI device was reachable",
+                "no VAAPI device has run this leg",
             ),
             (
                 NativeRung::Vaapi,
                 CODEC_HEVC,
-                "no VAAPI device was reachable",
+                "no VAAPI device has run this leg",
             ),
             (
                 NativeRung::Vaapi,
                 CODEC_AV1,
-                "no VAAPI device was reachable",
+                "VAAPI decoded AV1 on RDNA3 but has no parity check",
             ),
             (
                 NativeRung::Software,
@@ -3375,8 +3424,9 @@ mod tests {
                 e.note.contains("NEVER") || e.note.contains("never"),
                 "{} / {codec:#x}: the note is what the session log prints at warn — it \
                  must name plainly what this pair has NEVER had, whether that is a \
-                 hardware run at all (the VAAPI rows) or the parity check that would \
-                 promote it (D3D11VA/AV1), got {:?}",
+                 hardware run at all (VAAPI H.264/H.265) or the parity check that would \
+                 promote it (VAAPI AV1, which HAS decoded, and D3D11VA AV1, which has \
+                 decoded and then FAILED that check on two GPUs), got {:?}",
                 rung.name(),
                 e.note
             );
