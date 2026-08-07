@@ -616,17 +616,24 @@ public final class GamepadCapture {
         }
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
+        // Into the DualSense report frame. GameController and the pad's own report do not agree
+        // about which slot is which axis — measured, both from the same controller, on 2026-08-07
+        // — so forwarding GC's x/y/z straight through sent yaw where the game reads roll. See
+        // `GamepadWire.appleMotionToWire`. One change of basis, applied to both planes.
+        let g = GamepadWire.appleMotionToWire(
+            (Float(m.rotationRate.x), Float(m.rotationRate.y), Float(m.rotationRate.z)))
+        let a = GamepadWire.appleMotionToWire((ax, ay, az))
         wire?.sendMotion(
             pad: UInt8(slot.pad),
             gyro: (
-                GamepadWire.motionRaw(Float(m.rotationRate.x), scale: gs),
-                GamepadWire.motionRaw(Float(m.rotationRate.y), scale: gs),
-                GamepadWire.motionRaw(Float(m.rotationRate.z), scale: gs)
+                GamepadWire.motionRaw(g.0, scale: gs),
+                GamepadWire.motionRaw(g.1, scale: gs),
+                GamepadWire.motionRaw(g.2, scale: gs)
             ),
             accel: (
-                GamepadWire.motionRaw(ax, scale: as_),
-                GamepadWire.motionRaw(ay, scale: as_),
-                GamepadWire.motionRaw(az, scale: as_)
+                GamepadWire.motionRaw(a.0, scale: as_),
+                GamepadWire.motionRaw(a.1, scale: as_),
+                GamepadWire.motionRaw(a.2, scale: as_)
             ))
     }
 
