@@ -1,5 +1,5 @@
-//! Native D3D11VA (DXVA) H.264/HEVC decode for the Windows clients — M5 of the
-//! native-decode program, and the DXVA counterpart of [`pf_vkdecode`].
+//! Native D3D11VA (DXVA) H.264/HEVC/AV1 decode for the Windows clients — M5 and
+//! M7 of the native-decode program, and the DXVA counterpart of [`pf_vkdecode`].
 //!
 //! This crate is the CPU-testable half: everything between pf-bitstream's per-AU
 //! plan and the bytes an `ID3D11VideoContext::SubmitDecoderBuffers` call
@@ -15,15 +15,20 @@
 //!   compile-time size/offset proofs that stand in for a header).
 //! - [`config`]: decoder-creation decisions — profile GUID per codec/shape,
 //!   `D3D11_VIDEO_DECODER_CONFIG` selection (short-format slice control, whose
-//!   `ConfigBitstreamRaw` value differs between the two codecs), surface
-//!   alignment and pool sizing.
+//!   `ConfigBitstreamRaw` value is H.264's alone), surface alignment and pool
+//!   sizing.
 //! - [`pack`]: the bitstream buffer's contents — start-code normalisation and
 //!   the 128-byte tail padding rule.
-//! - [`pic`] / [`pic_h265`]: one [`pf_bitstream`] `AuPlan` into
-//!   `DXVA_PicParams_*`, `DXVA_Qmatrix_*` and the slice-control records, with the
-//!   reference lists resolved through a DPB slot map.
-//! - [`descriptors`]: which buffers one `SubmitDecoderBuffers` call carries and
-//!   the four `D3D11_VIDEO_DECODER_BUFFER_DESC` fields that are a decision —
+//! - [`mod@pack_av1`]: the same job for AV1, which shares neither rule — no start
+//!   codes to normalise, and a padding that is charged to the buffer rather than
+//!   to the last record.
+//! - [`pic`] / [`pic_h265`] / [`pic_av1`]: one [`pf_bitstream`] `AuPlan` into
+//!   `DXVA_PicParams_*`, `DXVA_Qmatrix_*` and the slice-control (AV1:
+//!   tile-control) records, with the reference lists resolved through a DPB slot
+//!   map.
+//! - [`descriptors`]: which buffers one `SubmitDecoderBuffers` call carries —
+//!   four for H.264, three or four for HEVC, three for AV1 — and the four
+//!   `D3D11_VIDEO_DECODER_BUFFER_DESC` fields that are a decision —
 //!   where two of review 13's three structural defects lived, and the reason
 //!   they are now a CPU test rather than a Windows-only code path.
 //!
@@ -54,10 +59,20 @@ pub mod descriptors;
 pub mod dxva;
 pub mod dxva_av1;
 pub mod pack;
+pub mod pack_av1;
 pub mod pic;
 pub mod pic_av1;
 pub mod pic_h265;
 
+/// The AV1 tile walk, borrowed from the Vulkan crate for exactly the reason
+/// [`SlotMap`] is: it is spec-literal `tile_group_obu()` byte arithmetic (5.11.1)
+/// with no Vulkan in it, both native rungs need the same per-tile payload ranges,
+/// and a second copy would be a second chance to get the `tile_size_minus_1`
+/// widths wrong. [`Av1Bitstream::groups`] is the half only this crate reads —
+/// see [`mod@pack_av1`] for why the two rungs upload different layouts.
+pub use pf_vkdecode::plan_bitstream;
+pub use pf_vkdecode::Av1Bitstream;
+pub use pf_vkdecode::Av1TileError;
 /// The DPB slot ledger — see the crate docs for why it is borrowed rather than
 /// redefined. Re-exported so this crate's callers name it through `pf_dxvadec`.
 pub use pf_vkdecode::SlotError;
@@ -69,6 +84,16 @@ pub use pf_vkdecode::SlotMap;
 // per-decode state worth an owning decoder type here. The Windows layer drives the
 // planner itself — and names every type it touches through this crate, so it needs
 // no pf-bitstream dependency of its own.
+/// The AV1 planner and its plan. ⚠ Its `plan_au` returns a **`Vec`** of plans: an
+/// AV1 access unit is a TEMPORAL UNIT and may carry several frames, of which at
+/// most one displays.
+pub use pf_bitstream::av1::AuPlan as AuPlanAv1;
+pub use pf_bitstream::av1::Av1Planner;
+pub use pf_bitstream::av1::FrameType as FrameTypeAv1;
+pub use pf_bitstream::av1::PicId as PicIdAv1;
+pub use pf_bitstream::av1::PlanError as PlanErrorAv1;
+pub use pf_bitstream::av1::PlanWarning as PlanWarningAv1;
+pub use pf_bitstream::av1::NUM_REF_SLOTS;
 /// The H.264 planner and the plan it produces.
 pub use pf_bitstream::h264::AuPlan;
 pub use pf_bitstream::h264::ColourDescription;
@@ -86,6 +111,7 @@ pub use pf_bitstream::h265::PlanWarning as PlanWarningH265;
 /// Which warnings mean the PICTURE is damaged — pf-vkdecode's one list, reused so
 /// both native rungs conceal on exactly the same predicate.
 pub use pf_vkdecode::is_integrity_warning;
+pub use pf_vkdecode::is_integrity_warning_av1;
 pub use pf_vkdecode::is_integrity_warning_h265;
 
 pub use config::align_surface;
@@ -97,11 +123,14 @@ pub use config::surface_alignment;
 pub use config::Codec;
 pub use config::ConfigFacts;
 pub use config::DxvaProfile;
+pub use config::AV1_VLD_PROFILE0;
+pub use config::AV1_VLD_PROFILE0_10BIT;
 pub use config::DXGI_FORMAT_NV12;
 pub use config::DXGI_FORMAT_P010;
 pub use config::H264_VLD_NOFGT;
 pub use config::HEVC_VLD_MAIN;
 pub use config::HEVC_VLD_MAIN10;
+pub use descriptors::descriptors_av1;
 pub use descriptors::descriptors_h264;
 pub use descriptors::descriptors_h265;
 pub use descriptors::BufferDescriptor;
@@ -118,16 +147,24 @@ pub use dxva::QmatrixHevc;
 pub use dxva::SliceH264Short;
 pub use dxva::SliceHevcShort;
 pub use dxva::BITSTREAM_ALIGN;
+pub use dxva_av1::PicParamsAv1;
+pub use dxva_av1::TileAv1;
 pub use pack::pack;
 pub use pack::packed_size;
 pub use pack::PackError;
 pub use pack::Packed;
 pub use pack::SliceRecord;
+pub use pack_av1::pack_av1;
+pub use pack_av1::packed_size_av1;
+pub use pack_av1::PackedAv1;
 pub use pic::plan_to_dxva;
 pub use pic::slice_control;
 pub use pic::DecodePlanDxva;
 pub use pic::DxvaRef;
 pub use pic::PlanToDxvaError;
+pub use pic_av1::plan_to_dxva_av1;
+pub use pic_av1::DecodePlanDxvaAv1;
+pub use pic_av1::PlanToDxvaAv1Error;
 pub use pic_h265::plan_to_dxva_h265;
 pub use pic_h265::slice_control_h265;
 pub use pic_h265::DecodePlanDxvaH265;

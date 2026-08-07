@@ -21,13 +21,14 @@
 //! can be asserted on any host, on every leg, over every AU of the vendored
 //! vectors.
 //!
-//! # ⚠ The Windows layer still builds its own — rewire it
+//! # ⚠ The Windows layer still builds its own for H.264 and HEVC — rewire them
 //!
-//! `pf-client-core`'s `video_d3d11_native.rs` (`fill_and_submit` + its private
-//! `buffer_desc`) constructs the same four descriptors itself. This module was
-//! written to be the single source of truth for them, and that file should be
-//! rewired to call [`descriptors_h264`] / [`descriptors_h265`] and translate the
-//! result into `D3D11_VIDEO_DECODER_BUFFER_DESC` field for field. Until it is,
+//! `pf-client-core`'s `video_d3d11_native.rs` was rewired for **AV1**
+//! (`fill_and_submit_av1` builds its submission from [`descriptors_av1`] and
+//! cross-checks every `DataSize` against what its writers actually wrote), and
+//! that is what this module was written for. Its H.264 and HEVC arm
+//! (`fill_and_submit_slices` + the private `buffer_desc`) still constructs the
+//! same four descriptors itself and should be rewired the same way. Until it is,
 //! the two must be read together: this module is the SPEC and the tests are its
 //! proof, and a divergence between them is a defect in the Windows file. The
 //! ordering, the values and the presence rule below are exactly what that file
@@ -74,7 +75,11 @@
 //!   descriptors ([`crate::pic::DecodePlanDxva::mb_count`]);
 //! * HEVC — 0 on the same two. HEVC has no macroblocks and the field has no CTB
 //!   spelling;
-//! * picture parameters and quantization matrices — 0 in both codecs.
+//! * **AV1 — 0 on all three**, and neither a tile count nor a superblock count.
+//!   `dxva2_av1.c`'s `commit_bitstream_and_slice_buffer` writes a literal
+//!   `dsc11->NumMBsInBuffer = 0` on the bitstream descriptor and passes a literal
+//!   `0` as `ff_dxva2_commit_buffer`'s `mb_count` for the tile buffer;
+//! * picture parameters and quantization matrices — 0 in every codec.
 //!
 //! That asymmetry is libavcodec's, read out of an **FFmpeg n8.1** tree:
 //! `dxva2_h264.c:307` computes `const unsigned mb_count = h->mb_width *
@@ -102,6 +107,13 @@
 //!   driver ignoring it too — and with the vendored parser leaving an uncoded list
 //!   all-zero, the losing side of that bet is every residual dequantizing to
 //!   nothing.
+//!
+//! * **AV1: never.** `dxva2_av1_end_frame` calls `ff_dxva2_common_end_frame` with
+//!   `NULL, 0` for the matrix pair, and the generic layer's `if (qm_size > 0)`
+//!   then skips the buffer entirely — so an AV1 submission is THREE buffers,
+//!   always. AV1's quantiser matrices are selected by index
+//!   (`qm_y`/`qm_u`/`qm_v` in `DXVA_PicParams_AV1::quantization`) out of tables
+//!   the decoder already has, not transmitted; there is no matrix to send.
 //!
 //! ⚠ The flag test is NECESSARY but not SUFFICIENT. HEVC 7.4.5 says that with
 //! `scaling_list_enabled_flag` set and NO scaling-list data in either parameter
@@ -131,7 +143,10 @@ use crate::dxva::QmatrixH264;
 use crate::dxva::QmatrixHevc;
 use crate::dxva::SliceH264Short;
 use crate::dxva::SliceHevcShort;
+use crate::dxva_av1::PicParamsAv1;
+use crate::dxva_av1::TileAv1;
 use crate::pack::Packed;
+use crate::pack_av1::PackedAv1;
 use crate::pic::DecodePlanDxva;
 use crate::pic_h265::DecodePlanDxvaH265;
 
@@ -243,6 +258,31 @@ pub fn descriptors_h265(plan: &DecodePlanDxvaH265, packed: &Packed) -> Vec<Buffe
         0,
     ));
     out
+}
+
+/// The descriptor set of one AV1 submission, in libavcodec's order.
+///
+/// **THREE buffers, always**, and `NumMBsInBuffer` 0 on every one of them (module
+/// docs). The slice-control buffer carries `DXVA_Tile_AV1` records — sixteen bytes
+/// each, one per TILE — where the other two codecs carry ten-byte slice records.
+///
+/// The bitstream `DataSize` is the packer's PADDED figure, which for AV1 is the
+/// only place the padding is accounted at all: no tile record grows by it
+/// ([`mod@crate::pack_av1`]).
+pub fn descriptors_av1(packed: &PackedAv1) -> Vec<BufferDescriptor> {
+    vec![
+        BufferDescriptor::new(
+            BUFFER_PICTURE_PARAMETERS,
+            size_of::<PicParamsAv1>() as u32,
+            0,
+        ),
+        BufferDescriptor::new(BUFFER_BITSTREAM, packed.data_size, 0),
+        BufferDescriptor::new(
+            BUFFER_SLICE_CONTROL,
+            slice_control_size(size_of::<TileAv1>(), packed.tiles.len()),
+            0,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -417,6 +457,71 @@ mod tests {
             assert_eq!(h264[3].data_size, 10 * slices as u32);
             let h265 = descriptors_h265(&h265_plan(None), &packed(slices, 4096));
             assert_eq!(h265[2].data_size, 10 * slices as u32);
+        }
+    }
+
+    /// `n` tiles packed into `data_size` bytes.
+    fn packed_av1(tiles: usize, data_size: u32) -> PackedAv1 {
+        PackedAv1 {
+            tiles: (0..tiles)
+                .map(|i| TileAv1 {
+                    data_offset: i as u32 * 64,
+                    data_size: 64,
+                    row: 0,
+                    column: i as u16,
+                    ..Default::default()
+                })
+                .collect(),
+            data_size,
+        }
+    }
+
+    #[test]
+    fn an_av1_submission_carries_three_buffers_and_never_a_quantization_matrix() {
+        // `dxva2_av1_end_frame` passes `NULL, 0` for the matrix pair, so the
+        // generic layer's `if (qm_size > 0)` never fires. A fourth buffer here
+        // would be a matrix AV1 does not transmit at all.
+        let descs = descriptors_av1(&packed_av1(1, 384));
+        assert_eq!(
+            descs.iter().map(|d| d.buffer_type).collect::<Vec<_>>(),
+            vec![
+                BUFFER_PICTURE_PARAMETERS,
+                BUFFER_BITSTREAM,
+                BUFFER_SLICE_CONTROL,
+            ]
+        );
+        assert_eq!(descs[0].data_size, 912, "DXVA_PicParams_AV1, measured");
+        assert_eq!(descs[1].data_size, 384);
+        assert_eq!(descs[2].data_size, 16, "one sixteen-byte DXVA_Tile_AV1");
+    }
+
+    #[test]
+    fn the_av1_descriptors_carry_no_macroblock_count_at_all() {
+        // The third spelling of the asymmetry: H.264 writes mb_width*mb_height,
+        // HEVC writes 0, AV1 writes 0 — and specifically NOT a tile count, which
+        // is the symmetric-looking value there is now a plausible field for.
+        for tiles in [1usize, 4, 64] {
+            for desc in descriptors_av1(&packed_av1(tiles, 4096)) {
+                assert_eq!(
+                    desc.num_mbs_in_buffer, 0,
+                    "buffer type {} carries a macroblock count",
+                    desc.buffer_type
+                );
+                assert_eq!(desc.data_offset, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_av1_tile_buffer_is_sixteen_bytes_per_tile_not_ten() {
+        // The slice-control buffer is the one place a codec's record SIZE is
+        // observable from outside, and AV1's record is a different structure from
+        // the other two: `DXVA_Tile_AV1` is 16 bytes (measured against the Windows
+        // SDK's `dxva.h`), where `DXVA_Slice_*_Short` is 10.
+        assert_eq!(size_of::<TileAv1>(), 16);
+        for tiles in [1usize, 2, 8, 64] {
+            let descs = descriptors_av1(&packed_av1(tiles, 4096));
+            assert_eq!(descs[2].data_size, 16 * tiles as u32);
         }
     }
 

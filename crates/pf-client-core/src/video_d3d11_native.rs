@@ -36,7 +36,7 @@
 //!   `CreateVideoProcessorInputView` needs no bind flag at all.
 //! * **`MiscFlags = 0`** — no sharing. The shareable textures are the RGBA ring's, on the
 //!   other side of the video processor.
-//! * **Dimensions aligned to the codec's granule** (16 for H.264, 128 for HEVC —
+//! * **Dimensions aligned to the codec's granule** (16 for H.264, 128 for HEVC and AV1 —
 //!   [`pf_dxvadec::align_surface`]), so the surface is TALLER than the frame. That padding is
 //!   the green bar the hand-off's stream source rect already excludes. The alignment applies
 //!   to the TEXTURE only: `D3D11_VIDEO_DECODER_DESC` gets the CODED size, exactly as
@@ -55,8 +55,19 @@
 //! `cargo check`s. Every decision that could be a pure function therefore lives in
 //! [`pf_dxvadec`] with unit tests: the DXVA buffer layouts, the profile table, the
 //! decoder-config choice, the surface alignment, the pool size, the bitstream packing rules,
-//! and the whole plan → picparams/qmatrix/slice-control conversion. What is left here is
-//! enumeration, allocation and submission — the parts that genuinely need a device.
+//! the buffer DESCRIPTORS, and the whole plan → picparams/qmatrix/slice-control (AV1:
+//! tile-control) conversion. What is left here is enumeration, allocation and submission —
+//! the parts that genuinely need a device.
+//!
+//! # Three codecs, one submission path
+//!
+//! H.264, HEVC and — since M7 — AV1 Profile 0. AV1 is not a fourth flavour of the same
+//! submission: its buffer SET is different (no quantization matrix at all; `DXVA_Tile_AV1`
+//! records where the other two put slice control), its bitstream buffer holds tile data
+//! rather than start-code-prefixed NALUs, and its access unit is a TEMPORAL UNIT that may
+//! decode several frames of which at most one displays. What it shares — and what it must
+//! not fork — is the session, the pool, the slot map, `DecoderBeginFrame`/`EndFrame` and
+//! the hand-off ring, because those are the parts hardware has already found the traps in.
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use pf_dxvadec::{Codec, DxvaProfile};
@@ -103,6 +114,35 @@ pub(crate) const DECODER_PIN: &str = "native-d3d11va";
 enum Planner {
     H264(Box<pf_dxvadec::H264Planner>),
     H265(Box<pf_dxvadec::H265Planner>),
+    Av1(Box<pf_dxvadec::Av1Planner>),
+}
+
+/// What a decoded picture is, for the hand-off — separated from [`Submission`]
+/// because AV1 can need it for a picture whose submission happened several access
+/// units ago.
+///
+/// A `show_existing_frame` carries a frame header with no dimensions, no colour
+/// and no frame type of its own (AV1 5.9.2: the shown frame's state is LOADED),
+/// so the only honest source for those is what the picture was decoded with.
+/// [`Session::held`] remembers exactly this, per surface.
+#[derive(Debug, Clone, Copy)]
+struct PictureFacts {
+    /// The picture's colour signalling and keyframe-ness.
+    colour: ColorDesc,
+    keyframe: bool,
+    /// Display size — the conformance-window crop on H.264/H.265, the render size
+    /// on AV1 — which is what the hand-off blits.
+    width: u32,
+    height: u32,
+}
+
+/// The two AV1 buffers that have no H.264/H.265 counterpart.
+struct Av1Buffers {
+    /// Where this frame's tiles and tile-group regions are in the access unit.
+    bitstream: pf_dxvadec::Av1Bitstream,
+    /// One `DXVA_Tile_AV1` per TILE, rows and columns final, offsets rebased by
+    /// the packer into the driver's own mapping.
+    tiles: Vec<pf_dxvadec::TileAv1>,
 }
 
 /// What one planned AU produced, reduced to the codec-agnostic facts submission needs.
@@ -121,18 +161,31 @@ struct Submission {
     slice_ranges: Vec<std::ops::Range<usize>>,
     /// The surface (array slice) the picture decodes into.
     setup_slot: u8,
+    /// The picture id the slot map was told that surface holds.
+    ///
+    /// Carried so a caller can give the ledger entry BACK — which AV1 needs and the
+    /// other two codecs do not (see [`NativeD3d11Decoder::frame_av1`]). All three
+    /// conversions produce it; dropping it here made the AV1 leak invisible.
+    setup_id: u64,
     /// Which codec's slice-control record the packer's locations become.
     codec: Codec,
-    /// The picture's colour signalling and keyframe-ness, for the hand-off.
-    colour: ColorDesc,
-    keyframe: bool,
-    /// Display size (the conformance-window crop), which is what the hand-off blits.
-    width: u32,
-    height: u32,
+    /// What the hand-off needs to blit this picture.
+    facts: PictureFacts,
     /// The plan carried an integrity warning: a reference the DPB no longer held, a
     /// `frame_num` gap, a NALU walk that stopped early. The picture would be decoded from a
     /// substitute, so it is never submitted — see [`NativeD3d11Decoder::decode`].
     concealed: bool,
+    /// AV1 only: the tile-control and bitstream inputs, which are a different
+    /// buffer SET rather than a different flavour of the same one — no
+    /// quantization matrix, no slice-control records, and `slice_ranges` and
+    /// `mb_count` above unused. `None` on H.264 and H.265, and that is what
+    /// [`NativeD3d11Decoder::fill_and_submit`] dispatches on.
+    av1: Option<Av1Buffers>,
+    /// AV1 only: does this frame DISPLAY? An AV1 temporal unit may decode several
+    /// frames of which at most one is shown; the hidden ones are references for
+    /// what follows and are never blitted. Always `true` on H.264/H.265, where an
+    /// access unit is a picture and every picture displays.
+    show: bool,
 }
 
 /// Everything about the stream that a decode session is BUILT FROM — the session's identity,
@@ -164,6 +217,39 @@ impl StreamShape {
     fn bit_depth(&self) -> u8 {
         8 + self.bit_depth_luma_minus8
     }
+
+    /// The session shape one AV1 plan implies.
+    ///
+    /// ⚠ The coded size is the SEQUENCE header's **maximum** frame size, not this
+    /// frame's. AV1 lets every frame pick its own size up to that maximum, and
+    /// `DXVA_PicParams_AV1` carries both (`max_width`/`max_height` beside
+    /// `width`/`height`) precisely so the decoder object and its pool can be built
+    /// once for the largest of them. libavcodec does the same thing —
+    /// `set_context_with_sequence` calls `ff_set_dimensions(avctx,
+    /// seq->max_frame_width_minus_1 + 1, …)`, and it is `avctx->coded_width` that
+    /// reaches `D3D11_VIDEO_DECODER_DESC`. Sizing the session from the frame
+    /// instead would rebuild the decoder, the pool and the slot map — dropping
+    /// every reference — the first time a stream resized a frame downward, which
+    /// AV1 permits without a key frame.
+    ///
+    /// The DPB depth is a constant of the codec: eight reference slots
+    /// (`NUM_REF_FRAMES`), and [`pf_dxvadec::SlotMap`] adds the current picture, so
+    /// the pool is nine surfaces — libavcodec's `num_surfaces = 1 + 8` for AV1.
+    fn of_av1(plan: &pf_dxvadec::AuPlanAv1) -> StreamShape {
+        let depth = plan.picture.bit_depth.saturating_sub(8);
+        StreamShape {
+            coded_width: u32::from(plan.sequence.max_frame_width_minus_1) + 1,
+            coded_height: u32::from(plan.sequence.max_frame_height_minus_1) + 1,
+            max_dpb_frames: pf_dxvadec::NUM_REF_SLOTS,
+            chroma_format_idc: plan.picture.chroma_format_idc,
+            // AV1 codes ONE bit depth for all three planes (`high_bitdepth` /
+            // `twelve_bit` in the colour config), so the luma and chroma fields
+            // here are the same number by construction and `Session::build`'s
+            // "no DXGI format carries both" refusal can never fire for AV1.
+            bit_depth_luma_minus8: depth,
+            bit_depth_chroma_minus8: depth,
+        }
+    }
 }
 
 /// The live decoder plus everything sized to the stream it was built for. Rebuilt whole on a
@@ -177,6 +263,14 @@ struct Session {
     /// One output view per array slice — `DecoderBeginFrame`'s target.
     views: Vec<ID3D11VideoDecoderOutputView>,
     slots: pf_dxvadec::SlotMap,
+    /// What each surface of the pool currently holds — written on every AV1
+    /// decode, read only by `show_existing_frame` ([`PictureFacts`]). Empty of
+    /// meaning on H.264/H.265, which never re-present an old surface.
+    ///
+    /// Indexed by surface, and stale entries are unreachable rather than cleaned:
+    /// a surface is only ever named through the slot map, so an entry can be read
+    /// only while the map still says that slot holds the picture that wrote it.
+    held: Vec<Option<PictureFacts>>,
     /// The SPS facts this session was built from; anything else is a rebuild.
     shape: StreamShape,
     /// The profile [`StreamShape::chroma_format_idc`] and the luma depth chose — which is
@@ -257,6 +351,7 @@ impl NativeD3d11Decoder {
         let planner = match codec {
             Codec::H264 => Planner::H264(Box::new(pf_dxvadec::H264Planner::new())),
             Codec::H265 => Planner::H265(Box::new(pf_dxvadec::H265Planner::new())),
+            Codec::Av1 => Planner::Av1(Box::new(pf_dxvadec::Av1Planner::new())),
         };
         tracing::info!(
             ?codec,
@@ -315,6 +410,9 @@ impl NativeD3d11Decoder {
     ///   links and open-GOP joins this rung exists to handle.
     /// * `Err` — the decoder could not run. Streak-eligible, counted as `refused`.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
+        if matches!(self.planner, Planner::Av1(_)) {
+            return self.decode_av1(au);
+        }
         let submission = match self.plan(au) {
             Ok(Some(submission)) => submission,
             // A skipped RASL picture: no plan, no error, nothing to show. It costs no
@@ -344,6 +442,254 @@ impl NativeD3d11Decoder {
         };
         self.health.note(false, false, 0);
         Ok(Some(frame))
+    }
+
+    /// One AV1 **temporal unit**: decode every frame in it, present at most one.
+    ///
+    /// This is the whole of what AV1 adds to this rung's contract, and it is the
+    /// SPEC's shape rather than an assumption about punktfunk hosts. A temporal
+    /// unit may carry several frame headers; the vendored 250-packet conformance
+    /// vector decodes **274 frames** and shows 250, so 24 of its units carry a
+    /// hidden picture (an alt-ref that later frames predict from) ahead of the one
+    /// that displays. Those hidden frames must be DECODED — they are references —
+    /// and must never reach the presenter, which would show each of them for a
+    /// frame and stutter every time.
+    ///
+    /// AV1 admits at most one shown frame per temporal unit, so "the last shown
+    /// frame wins" cannot silently drop a picture; a stream that broke that rule
+    /// would present its last one and is not conformant.
+    ///
+    /// # Concealment is per UNIT here, per picture on the other two codecs
+    ///
+    /// A damaged frame is still CONVERTED — that is what assigns its DPB slot, and
+    /// skipping it would desynchronise this rung's slot map from the planner's
+    /// store and turn every later reference to it into a hard `Err`, i.e. a
+    /// demotion streak earned by one lost packet. It is simply not submitted, and
+    /// then nothing from the unit is presented: a shown frame that predicts from a
+    /// concealed reference in the same unit is not fit to display either, and the
+    /// unit is the smallest thing this rung can honestly drop.
+    fn decode_av1(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
+        let plans = match &mut self.planner {
+            Planner::Av1(planner) => match planner.plan_au(au) {
+                Ok(plans) => plans,
+                Err(e) => {
+                    self.health.note(false, true, 0);
+                    tracing::warn!(
+                        error = %format!("{e:?}"),
+                        "native D3D11VA refused the AV1 temporal unit"
+                    );
+                    return Err(anyhow!("plan: {e:?}"));
+                }
+            },
+            _ => bail!("decode_av1 on a non-AV1 planner"),
+        };
+
+        let mut shown = None;
+        let mut concealed = false;
+        for plan in &plans {
+            let damaged = plan
+                .warnings
+                .iter()
+                .any(pf_dxvadec::is_integrity_warning_av1);
+            concealed |= damaged;
+            match self.frame_av1(au, plan, damaged) {
+                Ok(Some(frame)) => shown = Some(frame),
+                Ok(None) => {}
+                Err(e) => {
+                    self.health.note(false, true, 0);
+                    tracing::warn!(error = %format!("{e:#}"), "native D3D11VA AV1 frame failed");
+                    return Err(e);
+                }
+            }
+        }
+        if concealed {
+            // A frame may already have been blitted before a LATER frame of the
+            // same unit turned out to be damaged, and dropping it here is safe
+            // rather than merely tolerable: `D3d11Frame` is plain POD (no handle
+            // ownership, no `Drop`), and the ring's keyed mutex is taken and
+            // released with key 0 by the producer around the blit itself, so a
+            // slot nobody consumed is simply reused when the ring comes round.
+            // The alternative — deferring every blit to the end of the unit —
+            // would be worse: a frame's surface is only safe to read before
+            // anything else in the unit can be assigned its slot.
+            self.health.note(true, false, 0);
+            self.want_recovery = true;
+            return Ok(None);
+        }
+        self.health.note(false, false, 0);
+        Ok(shown)
+    }
+
+    /// One frame of a temporal unit: converted, submitted unless `damaged`, and
+    /// blitted only if it is the frame the unit displays.
+    ///
+    /// # The frame that refreshes nothing
+    ///
+    /// A frame with `refresh_frame_flags == 0` is legal AV1 — shown once, referenced
+    /// never — and it enters the planner's store NOWHERE, so the planner can never
+    /// report it removed. The conversion nevertheless assigned it a ledger slot (it
+    /// has to: that slot is the surface it decodes into). Left alone, that slot is
+    /// held for the session's whole life and NINE such frames exhaust the ledger
+    /// with `SlotError::Full` — a session that dies of correct streams. The Vulkan
+    /// rung closes it in `pf_vkdecode::decoder_av1`; this is the same close, and it
+    /// runs on the concealed path too, because a converted-but-unsubmitted frame
+    /// took a slot just the same.
+    fn frame_av1(
+        &mut self,
+        au: &[u8],
+        plan: &pf_dxvadec::AuPlanAv1,
+        damaged: bool,
+    ) -> Result<Option<D3d11Frame>> {
+        // `show_existing_frame` decodes nothing at all: it re-displays a picture
+        // some earlier hidden frame put in a reference slot.
+        if plan.dpb.stored.is_none() {
+            return self.show_existing_av1(plan);
+        }
+        let sub = self.plan_frame_av1(au, plan)?;
+        let shown = if damaged {
+            // Converted (so the slot map stayed in step with the planner's store),
+            // deliberately not submitted (fn docs).
+            //
+            // ⚠ And the surface's `held` entry is CLEARED rather than left. The slot
+            // map now says this slot holds THIS picture, while the surface still
+            // carries whatever the previous occupant decoded; a later
+            // `show_existing_frame` naming it would find the old picture's facts and
+            // blit the old picture's pixels. `None` makes that path return
+            // `Ok(None)` — nothing shown — which is what the unit's concealment
+            // already asked for.
+            if let Some(session) = self.session.as_mut() {
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = None;
+                }
+            }
+            None
+        } else {
+            self.decode_into(au, &sub)?;
+            if let Some(session) = self.session.as_mut() {
+                // What this surface now holds, for a later `show_existing_frame`.
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = Some(sub.facts);
+                }
+            }
+            if sub.show {
+                Some(self.present(sub.setup_slot, sub.facts)?)
+            } else {
+                None
+            }
+        };
+
+        // The slot nothing will ever ask for again (fn docs). Released AFTER the
+        // blit above, so the surface is read before anything can be assigned it.
+        if plan.header.refresh_frame_flags == 0 {
+            if let Some(session) = self.session.as_mut() {
+                if session.slots.release(sub.setup_id) {
+                    tracing::trace!(
+                        id = sub.setup_id,
+                        slot = sub.setup_slot,
+                        "AV1 frame refreshes no reference slot — returning its surface"
+                    );
+                }
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = None;
+                }
+            }
+        }
+        Ok(shown)
+    }
+
+    /// Convert one AV1 frame, (re)building the session when the sequence moved.
+    ///
+    /// ⚠ `self.status_id` is deliberately NOT advanced here. AV1 submissions carry
+    /// a zero `StatusReportFeedbackNumber` — libavcodec's `dxva2_av1.c` has the
+    /// assignment commented out because setting it breaks decoding on some NVIDIA
+    /// drivers, and Chromium ships the zero for the same reason — so
+    /// [`pf_dxvadec::plan_to_dxva_av1`] takes no id to write.
+    fn plan_frame_av1(&mut self, au: &[u8], plan: &pf_dxvadec::AuPlanAv1) -> Result<Submission> {
+        let session = ensure_session(
+            &mut self.session,
+            &self.device,
+            &self.video_device,
+            self.codec,
+            StreamShape::of_av1(plan),
+        )?;
+        let dxva = pf_dxvadec::plan_to_dxva_av1(au, plan, &mut session.slots)
+            .map_err(|e| anyhow!("plan → DXVA: {e}"))?;
+        Ok(Submission {
+            pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
+            // AV1 transmits no quantization matrix: its matrices are SELECTED by
+            // index (`qm_y`/`qm_u`/`qm_v`) out of tables the decoder already has.
+            // `dxva2_av1_end_frame` passes `NULL, 0` for the pair and the generic
+            // layer then submits no such buffer at all.
+            qmatrix: None,
+            mb_count: 0,
+            slice_ranges: Vec::new(),
+            setup_slot: dxva.setup_slot,
+            setup_id: dxva.setup_id,
+            codec: Codec::Av1,
+            facts: PictureFacts {
+                colour: colour_of(plan.picture.colour),
+                keyframe: plan.picture.is_key,
+                // The RENDER size, which is AV1's display region — the counterpart
+                // of the other two codecs' conformance-window crop, and (with
+                // superres) not the same as the decoded `upscaled_width`.
+                //
+                // ⚠ Treated as a CROP, which is what the native Vulkan rung does
+                // (`decoder_av1`'s `DisplayCrop`) and what the goldens hash ("the
+                // 320x240 render region"). libavcodec instead keeps the frame at
+                // `upscaled_width` x `frame_height` and expresses the render size
+                // as a sample aspect RATIO, so on a stream where the two differ
+                // this rung shows less picture than the FFmpeg rung would. No
+                // punktfunk host emits such a stream and neither vendored vector
+                // is one; the choice is here so both native rungs answer alike,
+                // not because it is settled.
+                //
+                // ⚠ CLAMPED to the decoded picture. AV1's render size is a display
+                // HINT with no upper bound in 5.9.6 — a stream may legally ask to
+                // be shown at more than it coded — and a crop taken from it
+                // unclamped hands `VideoProcessorBlt` a source rectangle larger
+                // than the surface. The same clamp is in the Vulkan rung's
+                // `DisplayCrop` (`pf_vkdecode::decoder_av1`).
+                width: plan.picture.render_width.min(plan.picture.upscaled_width),
+                height: plan.picture.render_height.min(plan.picture.frame_height),
+            },
+            concealed: false,
+            av1: Some(Av1Buffers {
+                bitstream: dxva.bitstream,
+                tiles: dxva.tiles,
+            }),
+            show: plan.picture.show_frame,
+        })
+    }
+
+    /// A `show_existing_frame` access unit: blit a surface the pool already holds.
+    ///
+    /// The picture's geometry and colour come from [`Session::held`] rather than
+    /// from this plan, because a `show_existing_frame` header carries none of its
+    /// own (AV1 5.9.2 LOADS the shown frame's state) — see [`PictureFacts`].
+    ///
+    /// Everything here is `Ok(None)` rather than an error when the slot is empty:
+    /// that case is already reported as `MissingShowExisting`, which is an
+    /// integrity warning, so the caller has concealed the unit and asked for a
+    /// keyframe before this could return.
+    fn show_existing_av1(&mut self, plan: &pf_dxvadec::AuPlanAv1) -> Result<Option<D3d11Frame>> {
+        let target = self.session.as_ref().and_then(|session| {
+            let id = plan.dpb.outputs.first().copied()?;
+            let slot = session.slots.slot_of(id)?;
+            let facts = (*session.held.get(usize::from(slot))?)?;
+            Some((slot, facts))
+        });
+        // Showing a KEY frame this way resets the whole reference store (7.20), so
+        // the plan's removals are real and this rung's slot map has to follow them
+        // — or the map fills up and the next assignment fails.
+        if let Some(session) = self.session.as_mut() {
+            for &id in &plan.dpb.removed {
+                session.slots.release(id);
+            }
+        }
+        match target {
+            Some((slot, facts)) => self.present(slot, facts).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Plan one AU and convert it, (re)building the session when the stream's shape moved.
@@ -381,12 +727,17 @@ impl NativeD3d11Decoder {
                     mb_count: dxva.mb_count,
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
+                    setup_id: dxva.setup_id,
                     codec: Codec::H264,
-                    colour: colour_of(plan.picture.colour),
-                    keyframe: plan.picture.is_idr,
-                    width: plan.picture.display_crop.width,
-                    height: plan.picture.display_crop.height,
+                    facts: PictureFacts {
+                        colour: colour_of(plan.picture.colour),
+                        keyframe: plan.picture.is_idr,
+                        width: plan.picture.display_crop.width,
+                        height: plan.picture.display_crop.height,
+                    },
                     concealed,
+                    av1: None,
+                    show: true,
                 }))
             }
             Planner::H265(planner) => {
@@ -435,24 +786,47 @@ impl NativeD3d11Decoder {
                     mb_count: 0,
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
+                    setup_id: dxva.setup_id,
                     codec: Codec::H265,
-                    colour: colour_of(plan.picture.colour),
-                    keyframe: plan.picture.is_irap,
-                    width: plan.picture.display_crop.width,
-                    height: plan.picture.display_crop.height,
+                    facts: PictureFacts {
+                        colour: colour_of(plan.picture.colour),
+                        keyframe: plan.picture.is_irap,
+                        width: plan.picture.display_crop.width,
+                        height: plan.picture.display_crop.height,
+                    },
                     concealed,
+                    av1: None,
+                    show: true,
                 }))
             }
+            // An AV1 access unit is a temporal UNIT: `plan_au` answers with a
+            // `Vec`, and one `Submission` cannot represent it. The AV1 path is
+            // [`Self::decode_av1`], which walks the unit frame by frame and comes
+            // back here per frame through [`Self::plan_frame_av1`].
+            Planner::Av1(_) => bail!(
+                "an AV1 temporal unit is planned frame by frame (decode_av1), not through plan()"
+            ),
         }
     }
 
-    /// `DecoderBeginFrame` → four buffers → `SubmitDecoderBuffers` → `DecoderEndFrame`, then
-    /// the shared hand-off.
-    ///
-    /// Buffer order matches libavcodec's exactly (picture parameters, quantization matrices,
-    /// bitstream, slice control): a driver is entitled to care, and matching the path every
-    /// Windows player exercises costs nothing.
+    /// Decode one picture and hand it off — the H.264/H.265 shape, where an access
+    /// unit is a picture and every picture displays.
     fn submit(&mut self, au: &[u8], sub: &Submission) -> Result<D3d11Frame> {
+        self.decode_into(au, sub)?;
+        self.present(sub.setup_slot, sub.facts)
+    }
+
+    /// `DecoderBeginFrame` → the codec's buffers → `SubmitDecoderBuffers` →
+    /// `DecoderEndFrame`. Writes the decode surface and NOTHING else.
+    ///
+    /// Split from the hand-off because AV1 decodes frames that are never shown: a
+    /// hidden alt-ref is a reference for what follows, and blitting it would put it
+    /// on the presenter's screen for one frame.
+    ///
+    /// Buffer order matches libavcodec's exactly (picture parameters, quantization
+    /// matrices, bitstream, slice control): a driver is entitled to care, and
+    /// matching the path every Windows player exercises costs nothing.
+    fn decode_into(&mut self, au: &[u8], sub: &Submission) -> Result<()> {
         let session = self
             .session
             .as_ref()
@@ -471,26 +845,163 @@ impl NativeD3d11Decoder {
         // the live decoder. Its own failure is reported only when nothing worse happened.
         let ended = unsafe { self.video_context.DecoderEndFrame(&session.decoder) };
         result?;
-        ended.ok().context("DecoderEndFrame")?;
+        ended.ok().context("DecoderEndFrame")
+    }
 
-        // The hand-off. `pool` is the decode texture array and `setup_slot` its slice — the
-        // very shape libavcodec's `data[0]`/`data[1]` describe, which is why this is the same
+    /// The shared `VideoProcessorBlt` → shareable-RGBA hand-off, for a surface the
+    /// pool already holds.
+    ///
+    /// Takes a surface index and the picture's facts rather than a [`Submission`],
+    /// because AV1's `show_existing_frame` presents a picture whose submission was
+    /// several access units ago.
+    fn present(&mut self, slot: u8, facts: PictureFacts) -> Result<D3d11Frame> {
+        // `pool` is the decode texture array and `slot` its slice — the very shape
+        // libavcodec's `data[0]`/`data[1]` describe, which is why this is the same
         // call the FFmpeg rung makes.
-        let pool = session.pool.clone();
+        let pool = self
+            .session
+            .as_ref()
+            .ok_or_else(|| anyhow!("no decode session to present from"))?
+            .pool
+            .clone();
         self.handoff.present(HandoffSource {
             texture: &pool,
-            array_slice: u32::from(sub.setup_slot),
-            width: sub.width,
-            height: sub.height,
-            color: sub.colour,
-            keyframe: sub.keyframe,
+            array_slice: u32::from(slot),
+            width: facts.width,
+            height: facts.height,
+            color: facts.colour,
+            keyframe: facts.keyframe,
             decoder: DECODER_PIN,
         })
     }
 
-    /// The four decoder buffers, filled and submitted. Split out so the caller can guarantee
+    /// The decoder buffers, filled and submitted. Split out so the caller can guarantee
     /// `DecoderEndFrame` on every path.
     fn fill_and_submit(&self, au: &[u8], sub: &Submission, session: &Session) -> Result<()> {
+        match &sub.av1 {
+            Some(av1) => self.fill_and_submit_av1(au, av1, sub, session),
+            None => self.fill_and_submit_slices(au, sub, session),
+        }
+    }
+
+    /// AV1's buffer set: picture parameters, bitstream, **tile control**.
+    ///
+    /// Three, never four — `dxva2_av1_end_frame` hands `ff_dxva2_common_end_frame`
+    /// a `NULL, 0` quantization matrix and the generic layer's `if (qm_size > 0)`
+    /// then skips the buffer entirely. AV1 transmits no matrix at all: its
+    /// quantiser matrices are selected by index out of tables the decoder has.
+    ///
+    /// The tile records go in the SLICE_CONTROL buffer, which is where the other
+    /// two codecs put their `DXVA_Slice_*_Short` records — a different structure
+    /// (sixteen bytes, one per TILE, carrying that tile's grid position) in the
+    /// same buffer slot.
+    ///
+    /// `NumMBsInBuffer` is 0 on all three descriptors. That is not symmetry with
+    /// HEVC, it is `dxva2_av1.c` read literally: it writes `dsc11->NumMBsInBuffer =
+    /// 0` on the bitstream descriptor and passes a literal `0` as
+    /// `ff_dxva2_commit_buffer`'s `mb_count` for the tiles. There is no tile-count
+    /// spelling of the field, and inventing one would be a fresh divergence on the
+    /// exact call an Intel driver has already rejected a hand-built variant of.
+    fn fill_and_submit_av1(
+        &self,
+        au: &[u8],
+        av1: &Av1Buffers,
+        sub: &Submission,
+        session: &Session,
+    ) -> Result<()> {
+        // Written in libavcodec's own order — picture parameters, bitstream, tile
+        // control — because that is the order it maps, fills and releases the
+        // driver's buffers in, and this file's method is to reproduce that path
+        // rather than to assume the order is free.
+        let pp_size = write_buffer(
+            &self.video_context,
+            &session.decoder,
+            D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
+            |dst| {
+                copy_into(dst, &sub.pic_params)?;
+                Ok(sub.pic_params.len())
+            },
+        )?;
+
+        // The bitstream is packed IN PLACE in the driver's mapping — no staging
+        // copy — and hands back the tile records the control buffer below is built
+        // from, their `DataOffset`s rebased into that mapping. That ordering is why
+        // the two cannot be one step.
+        let mut packed = None;
+        let bs_size = write_buffer(
+            &self.video_context,
+            &session.decoder,
+            D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+            |dst| {
+                let p = pf_dxvadec::pack_av1(au, &av1.bitstream, &av1.tiles, dst)
+                    .map_err(|e| anyhow!("AV1 tile pack: {e}"))?;
+                let size = p.data_size as usize;
+                packed = Some(p);
+                Ok(size)
+            },
+        )?;
+        let packed = packed.expect("the writer above ran or returned an error");
+
+        let tile_bytes = pf_dxvadec::slice_bytes(&packed.tiles);
+        let tc_size = write_buffer(
+            &self.video_context,
+            &session.decoder,
+            D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+            |dst| {
+                copy_into(dst, tile_bytes)?;
+                Ok(tile_bytes.len())
+            },
+        )?;
+
+        // The descriptor SET comes from pf-dxvadec, which has CPU tests for it on
+        // every CI leg — the buffer types, the order, the sizes and the zero
+        // `NumMBsInBuffer`. Two of review 13's three structural defects lived in
+        // descriptors built inside this file, where nothing could see them; this
+        // arm is built from the tested table and only the byte counts are checked
+        // against what the writers above actually wrote.
+        let descs = pf_dxvadec::descriptors_av1(&packed);
+        let written = [
+            (pf_dxvadec::BUFFER_PICTURE_PARAMETERS, pp_size),
+            (pf_dxvadec::BUFFER_BITSTREAM, bs_size),
+            (pf_dxvadec::BUFFER_SLICE_CONTROL, tc_size),
+        ];
+        let mut out: Vec<D3D11_VIDEO_DECODER_BUFFER_DESC> = Vec::with_capacity(descs.len());
+        for desc in &descs {
+            let wrote = written
+                .iter()
+                .find(|(kind, _)| *kind == desc.buffer_type)
+                .map(|(_, size)| *size)
+                .ok_or_else(|| anyhow!("no writer for AV1 buffer type {}", desc.buffer_type))?;
+            if wrote != desc.data_size as usize {
+                bail!(
+                    "AV1 buffer type {} was written with {wrote} bytes, the descriptor \
+                     declares {}",
+                    desc.buffer_type,
+                    desc.data_size
+                );
+            }
+            out.push(buffer_desc(
+                buffer_kind(desc.buffer_type)?,
+                desc.data_size as usize,
+                desc.num_mbs_in_buffer,
+            ));
+        }
+
+        // SAFETY: a COM call on the live video context with the live decoder and a slice of
+        // fully-initialized descriptors that outlives the call. Every buffer named by a
+        // descriptor was released back to the driver by `write_buffer` before this runs,
+        // which is what makes them submittable.
+        unsafe {
+            self.video_context
+                .SubmitDecoderBuffers(&session.decoder, &out)
+        }
+        .ok()
+        .context("SubmitDecoderBuffers (AV1)")
+    }
+
+    /// The H.264/H.265 buffer set: picture parameters, [quantization matrices],
+    /// bitstream, slice control.
+    fn fill_and_submit_slices(&self, au: &[u8], sub: &Submission, session: &Session) -> Result<()> {
         let mut descs: Vec<D3D11_VIDEO_DECODER_BUFFER_DESC> = Vec::with_capacity(4);
 
         let pp_size = write_buffer(
@@ -569,6 +1080,12 @@ impl NativeD3d11Decoder {
                     copy_into(dst, bytes)?;
                     Ok(bytes.len())
                 }
+                // Unreachable: an AV1 submission carries `av1: Some(..)` and
+                // `fill_and_submit` dispatched it to the other arm. Spelled as a
+                // refusal rather than a catch-all so that adding a fourth codec
+                // fails to compile here instead of silently packing its tiles as
+                // H.264 slices.
+                Codec::Av1 => bail!("AV1 does not submit slice-control records"),
             },
         )?;
         descs.push(buffer_desc(
@@ -843,6 +1360,7 @@ impl Session {
             pool,
             views,
             slots,
+            held: vec![None; pool_size as usize],
             shape,
             profile,
         })
@@ -910,13 +1428,32 @@ fn write_buffer(
     Ok(written)
 }
 
+/// pf-dxvadec's `BUFFER_*` code point as the windows-rs constant of the same name.
+///
+/// Deliberately a match on the four constants rather than a numeric cast: the code
+/// points are asserted against windows-rs's own values in
+/// `pf_dxvadec::descriptors`, and going through the named constants here means the
+/// Windows type's representation (newtype or alias) is never assumed.
+fn buffer_kind(code: u32) -> Result<D3D11_VIDEO_DECODER_BUFFER_TYPE> {
+    Ok(match code {
+        pf_dxvadec::BUFFER_PICTURE_PARAMETERS => D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
+        pf_dxvadec::BUFFER_INVERSE_QUANTIZATION_MATRIX => {
+            D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX
+        }
+        pf_dxvadec::BUFFER_SLICE_CONTROL => D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+        pf_dxvadec::BUFFER_BITSTREAM => D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+        other => bail!("unknown DXVA buffer type {other}"),
+    })
+}
+
 /// A submission descriptor for one filled buffer.
 ///
 /// `mb_count` is `NumMBsInBuffer`, and it is NOT uniformly 0. libavcodec's H.264 path
 /// computes `h->mb_width * h->mb_height` and writes it on both the BITSTREAM and the
 /// SLICE_CONTROL descriptor (`commit_bitstream_and_slice_buffer`, for both slice formats,
 /// the second through `ff_dxva2_commit_buffer`'s `mb_count` argument); its HEVC path writes
-/// 0 on the same two. Picture parameters and quantization matrices take 0 in both codecs.
+/// 0 on the same two, and its AV1 path writes 0 on all three. Picture parameters and
+/// quantization matrices take 0 in every codec.
 ///
 /// The value is arguably redundant in VLD mode — the driver has the same two numbers in the
 /// picture parameters — but this module's whole method is to reproduce libavcodec exactly,
@@ -1048,6 +1585,27 @@ mod parity {
         include_str!("../../pf-vkdecode/tests/data/test-main10.p010.sha256");
     const MAIN10_FRAME_COUNT: usize = 50;
 
+    /// The vendored AV1 vector — an **IVF** file, not an elementary stream, and
+    /// the same one `pf-vkdecode`'s AV1 legs decode.
+    const TEST_25FPS_AV1: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
+    );
+
+    /// libavcodec's per-DELIVERED-frame NV12 hashes for the AV1 vector, 320x240 —
+    /// read across the crate boundary like the other two, and with the strongest
+    /// provenance of the three: two independent ffmpeg builds agree byte for byte,
+    /// cros-codecs' own shipped MD5s reproduce, and libavcodec's Vulkan hwaccel
+    /// reproduces it on the target driver.
+    const GOLDENS_AV1: &str =
+        include_str!("../../pf-vkdecode/tests/data/test-25fps-av1.nv12.sha256");
+
+    /// 250 temporal units carrying **274 frames**, of which 250 are shown. The gap
+    /// is the whole reason the AV1 leg is not a third copy of the other two: 24
+    /// units decode a hidden picture as well as the one they display.
+    const AV1_UNIT_COUNT: usize = 250;
+    const AV1_DECODED_COUNT: usize = 274;
+    const AV1_SHOWN_COUNT: usize = 250;
+
     /// The golden file's hash lines (comments and blanks skipped).
     fn golden_hashes(file: &'static str) -> Vec<&'static str> {
         file.lines()
@@ -1136,16 +1694,59 @@ mod parity {
         })
     }
 
+    /// The IVF container's frames, in file order.
+    ///
+    /// The AV1 vector is not an elementary stream: it is 32 bytes of `DKIF` header
+    /// followed by `[u32 size][u64 pts][size bytes]` per temporal unit. Hand-rolled
+    /// for the same reason `nal_headers` is — `pf-client-core` does not depend on
+    /// the vendored parser crate — and kept honest by the unit count the CPU guard
+    /// asserts, which no plausible reader bug survives.
+    fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
+        assert_eq!(
+            &stream[0..4],
+            b"DKIF",
+            "the vendored AV1 vector must be an IVF file"
+        );
+        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
+        let mut out = Vec::new();
+        let mut at = header;
+        while at + 12 <= stream.len() {
+            let size = u32::from_le_bytes(
+                stream[at..at + 4]
+                    .try_into()
+                    .expect("four bytes make a u32"),
+            ) as usize;
+            at += 12;
+            assert!(
+                at + size <= stream.len(),
+                "an IVF frame header claims {size} bytes past the end of the file"
+            );
+            out.push(&stream[at..at + size]);
+            at += size;
+        }
+        out
+    }
+
     /// The decode order and the display order of a vector's pictures, as `PicId`s.
     ///
     /// Both come from a planner run ALONGSIDE the decoder's own, over the same access
     /// units: the planner is deterministic, so the ids it hands this walk are the ids
     /// it hands the rung, and no production code has to grow a test accessor.
     struct Order {
-        /// One id per access unit, in submission order.
+        /// One id per DECODED picture, in submission order — which is one per
+        /// access unit on H.264/H.265 and one per FRAME on AV1, where a unit can
+        /// carry more than one.
         decode: Vec<u64>,
         /// The same ids in the planner's output (bumping) order, flush included.
         display: Vec<u64>,
+        /// The ids each ACCESS UNIT decodes, in submission order.
+        ///
+        /// Only AV1 fills it, and only AV1 needs it: its driver loop hands whole
+        /// temporal units to the production entry point, which plans them
+        /// internally, so this is how the harness knows which pictures came out of
+        /// which unit without a test accessor on the decoder. Empty on the other
+        /// two, where [`Order::decode`] is already one id per unit.
+        per_unit: Vec<Vec<u64>>,
     }
 
     fn order_h264(aus: &[&[u8]]) -> Order {
@@ -1153,6 +1754,7 @@ mod parity {
         let mut order = Order {
             decode: Vec::new(),
             display: Vec::new(),
+            per_unit: Vec::new(),
         };
         for (index, au) in aus.iter().enumerate() {
             let plan = planner
@@ -1181,6 +1783,7 @@ mod parity {
         let mut order = Order {
             decode: Vec::new(),
             display: Vec::new(),
+            per_unit: Vec::new(),
         };
         for (index, au) in aus.iter().enumerate() {
             let plan = planner
@@ -1200,6 +1803,47 @@ mod parity {
             order.display.extend(plan.dpb.outputs.iter().copied());
         }
         order.display.extend(planner.flush().outputs);
+        order
+    }
+
+    /// The AV1 vector's decode and display orders.
+    ///
+    /// Where the H.264/H.265 walks push one decoded picture per access unit, this
+    /// one pushes one per FRAME and an access unit may carry several — which is
+    /// the whole difference. `display` is still the planner's own output list;
+    /// AV1 has no bumping process, so a picture is output by the unit that shows
+    /// it and there is no flush to drain at the end.
+    fn order_av1(units: &[&[u8]]) -> Order {
+        let mut planner = pf_dxvadec::Av1Planner::new();
+        let mut order = Order {
+            decode: Vec::new(),
+            display: Vec::new(),
+            per_unit: Vec::new(),
+        };
+        for (index, unit) in units.iter().enumerate() {
+            let plans = planner
+                .plan_au(unit)
+                .unwrap_or_else(|e| panic!("unit {index}: the clean vector must plan, got {e:?}"));
+            let mut this_unit = Vec::new();
+            for plan in &plans {
+                assert!(
+                    plan.warnings.is_empty(),
+                    "unit {index}: a clean vector must plan without warnings, got {:?}",
+                    plan.warnings
+                );
+                assert_eq!(
+                    (plan.picture.render_width, plan.picture.render_height),
+                    (320, 240),
+                    "unit {index}: the goldens are the 320x240 render region"
+                );
+                if let Some(id) = plan.dpb.stored {
+                    order.decode.push(id);
+                    this_unit.push(id);
+                }
+                order.display.extend(plan.dpb.outputs.iter().copied());
+            }
+            order.per_unit.push(this_unit);
+        }
         order
     }
 
@@ -1395,7 +2039,7 @@ mod parity {
                 !sub.concealed,
                 "AU {index}: a clean vector must need no concealment"
             );
-            let display = (sub.width, sub.height);
+            let display = (sub.facts.width, sub.facts.height);
             let slice = u32::from(sub.setup_slot);
             decoder
                 .submit(au, &sub)
@@ -1430,6 +2074,157 @@ mod parity {
             "{label}: {} frames bit-identical to libavcodec software decode",
             goldens.len()
         );
+    }
+
+    /// The AV1 leg of [`parity_run`], which cannot be shared with it: one temporal
+    /// unit produces a `Vec` of plans, so a unit is not a picture.
+    ///
+    /// # It drives the PRODUCTION entry point
+    ///
+    /// [`NativeD3d11Decoder::decode_av1`] takes the whole unit — the same call the
+    /// stream makes — so this leg exercises the unit loop, [`frame_av1`] with its
+    /// slot-map bookkeeping, the `show` suppression, [`Session::held`] and the
+    /// hand-off blit. An earlier version of this harness called `plan_frame_av1` +
+    /// `decode_into` per frame instead, which decoded the same pixels while
+    /// exercising none of that: the hidden frames were withheld by the HARNESS, and
+    /// its `hidden` counter was a statement about its own `if !sub.show`.
+    ///
+    /// [`frame_av1`]: NativeD3d11Decoder::frame_av1
+    ///
+    /// # What the hidden frames do to the harness
+    ///
+    /// Everything the unit decodes is hashed — 274 surfaces — and the comparison
+    /// walks the planner's 250-entry OUTPUT list. So the 24 hidden pictures are
+    /// decoded, read back, hashed, and then never looked up, which is exactly
+    /// right: a golden set of what libavcodec DELIVERS cannot contain them. It also
+    /// makes the `PicId` indirection load-bearing in a way the other two legs only
+    /// hint at — there, decode order and display order are permutations of one
+    /// list; here they are lists of different LENGTHS, and hashing in decode order
+    /// would not merely be out of order, it would be 24 hashes too long.
+    ///
+    /// Reaching a hidden frame's pixels through the production path means asking
+    /// the decoder where it put them: [`Order::per_unit`] says which ids a unit
+    /// decoded, the session's slot map says which surface holds each, and
+    /// [`Session::held`] says how large it is. Those last two are production state
+    /// — `show_existing_frame` reads exactly the same pair — so a rung that filled
+    /// them wrongly fails here rather than merely disappointing a later stream.
+    ///
+    /// The hidden frames are not unverified, either: every shown frame after one
+    /// predicts from it, so a hidden picture decoded wrong shows up as a wrong hash
+    /// on the frames that reference it.
+    ///
+    /// ⚠ Still unexercised, because the vendored vector has none:
+    /// `show_existing_frame`.
+    fn av1_parity_run(units: &[&[u8]], order: &Order, goldens: &[&str]) {
+        assert_eq!(
+            units.len(),
+            AV1_UNIT_COUNT,
+            "the IVF reader disagrees with the vector's temporal-unit count"
+        );
+        assert_eq!(order.decode.len(), AV1_DECODED_COUNT);
+        assert_eq!(order.per_unit.len(), units.len());
+        assert_eq!(order.display.len(), goldens.len());
+
+        let luid = pinned_adapter();
+        let mut decoder = NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, luid, false)
+            .unwrap_or_else(|e| panic!("AV1: the box must host AV1 Profile 0 — {e:#}"));
+        let mut readback = Readback {
+            ctx: decoder.context.clone(),
+            staging: None,
+        };
+
+        let mut by_id: HashMap<u64, String> = HashMap::new();
+        let mut decoded = 0usize;
+        let mut presented = 0usize;
+        for (index, unit) in units.iter().enumerate() {
+            // The production call, whole unit in: it plans, decodes every frame,
+            // and hands back the ONE picture the unit displays (or nothing).
+            let frame = decoder
+                .decode_av1(unit)
+                .unwrap_or_else(|e| panic!("unit {index}: decode failed — {e:#}"));
+            if frame.is_some() {
+                presented += 1;
+            }
+
+            // Read back everything the unit decoded — the withheld pictures too,
+            // which is the whole reason this cannot hash `frame`.
+            for &id in &order.per_unit[index] {
+                let (slot, facts, pool) = {
+                    let session = decoder
+                        .session
+                        .as_ref()
+                        .expect("the first unit built a session");
+                    let slot = session.slots.slot_of(id).unwrap_or_else(|| {
+                        panic!("unit {index}: picture {id} holds no surface after its own unit")
+                    });
+                    let facts = session.held[usize::from(slot)].unwrap_or_else(|| {
+                        panic!(
+                            "unit {index}: surface {slot} holds picture {id} and no facts — \
+                             `show_existing_frame` would have nothing to blit"
+                        )
+                    });
+                    (slot, facts, session.pool.clone())
+                };
+                let bytes = readback.read(
+                    &decoder.device,
+                    &pool,
+                    u32::from(slot),
+                    (facts.width, facts.height),
+                );
+                by_id.insert(id, sha256_hex(&bytes));
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, AV1_DECODED_COUNT);
+        assert_eq!(
+            presented, AV1_SHOWN_COUNT,
+            "every unit of this vector shows exactly one frame, so the production \
+             path must have handed back {AV1_SHOWN_COUNT} pictures"
+        );
+        let hidden = AV1_DECODED_COUNT - presented;
+        assert_eq!(
+            hidden,
+            AV1_DECODED_COUNT - AV1_SHOWN_COUNT,
+            "the rung must have decoded 24 frames it never handed back — this counts \
+             what `decode_av1` RETURNED against what it decoded, so at zero the \
+             `!sub.show` suppression is not working (or this vector stopped hiding \
+             frames, which `the_av1_vector_hides_frames…` would catch first)"
+        );
+
+        let mut mismatches = 0usize;
+        for (n, (id, golden)) in order.display.iter().zip(goldens.iter()).enumerate() {
+            let got = by_id
+                .get(id)
+                .unwrap_or_else(|| panic!("display frame {n} names PicId {id}, never decoded"));
+            if got != golden {
+                if mismatches < 10 {
+                    eprintln!("AV1: display frame {n} (PicId {id}): {got} != {golden}");
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "AV1: {mismatches}/{} frames diverge from libavcodec (first 10 above; frame \
+             0 is a key frame — if IT mismatches suspect the readback geometry \
+             (pitch/crop/plane offset) or the tile records rather than the reference \
+             handling)",
+            goldens.len()
+        );
+        eprintln!(
+            "AV1: {} delivered frames bit-identical to libavcodec, {hidden} hidden frames \
+             decoded and withheld",
+            goldens.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn av1_every_delivered_frame_hashes_bit_identical_to_libavcodec() {
+        let units = split_ivf(TEST_25FPS_AV1);
+        let order = order_av1(&units);
+        av1_parity_run(&units, &order, &golden_hashes(GOLDENS_AV1));
     }
 
     #[test]
@@ -1558,6 +2353,60 @@ mod parity {
             (plan.picture.coded_width, plan.picture.coded_height),
             (320, 240),
             "the golden frame size is 320x240"
+        );
+    }
+
+    #[test]
+    fn the_ivf_reader_agrees_with_the_planner_and_the_av1_goldens() {
+        let units = split_ivf(TEST_25FPS_AV1);
+        assert_eq!(units.len(), AV1_UNIT_COUNT, "AV1 temporal units");
+        let order = order_av1(&units);
+        assert_eq!(
+            order.decode.len(),
+            AV1_DECODED_COUNT,
+            "the AV1 vector decodes 274 frames"
+        );
+        assert_eq!(
+            order.display.len(),
+            golden_hashes(GOLDENS_AV1).len(),
+            "the AV1 planner's output count must match the golden count"
+        );
+        assert_eq!(order.display.len(), AV1_SHOWN_COUNT);
+    }
+
+    #[test]
+    fn the_av1_vector_hides_frames_and_that_is_what_makes_this_leg_different() {
+        // The claim the AV1 leg's docs rest on, asserted rather than assumed: an
+        // access unit is a TEMPORAL UNIT, 24 of these carry two frames, and the
+        // extra one is never delivered. If a regenerated vector ever stopped doing
+        // that, `av1_parity_run` would still pass while proving nothing the H.264
+        // leg does not already prove — and its `hidden` assertion is what would
+        // catch it on hardware.
+        let units = split_ivf(TEST_25FPS_AV1);
+        let mut planner = pf_dxvadec::Av1Planner::new();
+        let (mut frames, mut multi_frame_units, mut shown) = (0usize, 0usize, 0usize);
+        for unit in &units {
+            let plans = planner.plan_au(unit).expect("the clean vector plans");
+            if plans.len() > 1 {
+                multi_frame_units += 1;
+            }
+            for plan in &plans {
+                frames += 1;
+                if plan.picture.show_frame {
+                    shown += 1;
+                }
+                assert!(
+                    plan.dpb.stored.is_some(),
+                    "this vector uses no show_existing_frame"
+                );
+            }
+        }
+        assert_eq!(frames, AV1_DECODED_COUNT);
+        assert_eq!(shown, AV1_SHOWN_COUNT);
+        assert_eq!(
+            multi_frame_units,
+            AV1_DECODED_COUNT - AV1_SHOWN_COUNT,
+            "24 units must carry a hidden frame as well as the shown one"
         );
     }
 

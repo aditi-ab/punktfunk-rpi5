@@ -878,6 +878,11 @@ fn native_d3d11_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_dxvadec::Codec> 
     match codec_id {
         ffmpeg::codec::Id::H264 => Some(pf_dxvadec::Codec::H264),
         ffmpeg::codec::Id::HEVC => Some(pf_dxvadec::Codec::H265),
+        // AV1 (M7). Not a widening of what this client can decode — the FFmpeg
+        // D3D11VA rung already decodes AV1 Profile 0 through the same profile GUID
+        // — but the native rung has to cover it, or dropping FFmpeg would drop a
+        // codec.
+        ffmpeg::codec::Id::AV1 => Some(pf_dxvadec::Codec::Av1),
         _ => None,
     }
 }
@@ -1090,12 +1095,15 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     if vk.is_some_and(|v| v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_AV1 != 0) {
         return true;
     }
+    // The second answer is per-platform, so it is bound to a name rather than
+    // written as a cfg'd `return`: on Windows clippy calls that `needless_return`
+    // and fails `-D warnings`, which NO ci leg would have caught (nothing runs
+    // clippy on Windows — this surfaced only from a manual check on a box).
     #[cfg(windows)]
-    {
-        return vk.is_some_and(|v| v.d3d11_import);
-    }
+    let d3d11 = vk.is_some_and(|v| v.d3d11_import);
     #[cfg(not(windows))]
-    false
+    let d3d11 = false;
+    d3d11
 }
 
 /// [`decodable_codecs`] plus the PyroWave bit when the presenter's device passed the
@@ -1286,8 +1294,8 @@ impl Decoder {
                 }
                 (None, _) => tracing::warn!(
                     ?codec_id,
-                    "PUNKTFUNK_DECODER=native-d3d11va refused (needs an H.264 or HEVC \
-                     session) — standard ladder"
+                    "PUNKTFUNK_DECODER=native-d3d11va refused (needs an H.264, HEVC or \
+                     AV1 session) — standard ladder"
                 ),
                 (_, None) => tracing::warn!(
                     "PUNKTFUNK_DECODER=native-d3d11va refused (the presenter's device lacks \

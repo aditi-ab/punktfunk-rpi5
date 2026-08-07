@@ -193,6 +193,8 @@ pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;
 pub use decoder::VkH264Decoder;
+pub use decoder_av1::plan_bitstream;
+pub use decoder_av1::Av1Bitstream;
 pub use decoder_av1::Av1TileError;
 pub use decoder_av1::VkAv1Decoder;
 pub use decoder_h265::VkH265Decoder;

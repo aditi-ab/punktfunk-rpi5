@@ -95,6 +95,21 @@ pub struct RefPic {
 pub struct RefState {
     /// The picture's `OrderHint`.
     pub order_hint: u32,
+    /// The picture's own `UpscaledWidth` — the post-superres coded width it was
+    /// decoded at.
+    ///
+    /// AV1 lets every frame pick its own size up to the sequence maximum without a
+    /// key frame, and a decoder predicting from a differently-sized reference
+    /// SCALES the motion (7.11.3.3 derives `xStep` from `RefUpscaledWidth[refIdx]`).
+    /// So the per-reference structures ask for it: DXVA's `DXVA_PicEntry_AV1` has
+    /// `width`/`height` fields, VA-API's `VADecPictureParameterBufferAV1` has
+    /// `ref_frame_width`/`height`. Answering from the CURRENT header makes every
+    /// scaled prediction read as unscaled.
+    pub upscaled_width: u32,
+    /// The picture's own `FrameHeight`, on the same terms as
+    /// [`Self::upscaled_width`]. (There is no superres in the vertical direction,
+    /// so this is simply the reference's coded height.)
+    pub frame_height: u32,
     /// The picture's own frame type — a reference is routinely a different type
     /// from the frame reading it.
     pub frame_type: FrameType,
@@ -149,6 +164,8 @@ impl RefState {
         }
         RefState {
             order_hint: header.order_hint,
+            upscaled_width: header.upscaled_width,
+            frame_height: header.frame_height,
             frame_type: header.frame_type,
             ref_frame_sign_bias,
             saved_order_hints: header.order_hints,

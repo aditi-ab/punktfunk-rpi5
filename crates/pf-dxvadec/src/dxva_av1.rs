@@ -49,12 +49,29 @@
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PicEntryAv1 {
+    /// The REFERENCE's own `UpscaledWidth` — not the current frame's. AV1 lets
+    /// every frame pick its own size, and this pair is what lets the driver scale
+    /// motion out of a differently-sized reference (libavcodec:
+    /// `pp->frame_refs[i].width = ref_frame->width`).
     pub width: u32,
+    /// The reference's own `FrameHeight`, on the same terms as [`Self::width`].
     pub height: u32,
     pub wmmat: [i32; 6],
     pub global_motion_flags: u8,
-    /// The reference's surface index in the decoder's texture array, or
-    /// [`UNUSED_INDEX`] where this reference is not present.
+    /// ⚠⚠ The AV1 reference **SLOT** — `ref_frame_idx[i]`, 0..8 — or
+    /// [`UNUSED_INDEX`] where this reference is not present. **Not a surface
+    /// index.**
+    ///
+    /// This is a subscript INTO [`PicParamsAv1::ref_frame_map_texture_index`],
+    /// which is the array that names surfaces; the driver dereferences one through
+    /// the other. libavcodec writes `pp->frame_refs[i].Index = ref_frame ? ref_idx
+    /// : 0xFF` with `ref_idx = frame_header->ref_frame_idx[i]`, and Chromium's
+    /// `d3d11_av1_accelerator.cc` writes the same thing.
+    ///
+    /// Putting a surface index here is not a refusal: on a stream where reference
+    /// `i` happens to live in the slot whose number equals its surface it decodes
+    /// correctly, and everywhere else it predicts from whichever picture the
+    /// reference store holds at the surface's number.
     pub index: u8,
     pub reserved16: u16,
 }
@@ -571,6 +588,18 @@ impl FormatFlagsAv1 {
 }
 
 /// `DXVA_Tile_AV1` — one tile's location in the bitstream buffer. 16 bytes.
+///
+/// ONE RECORD PER TILE, not per tile GROUP. `row` and `column` are the tile's
+/// position in the frame's tile grid, which only a per-tile record can carry, and
+/// libavcodec's `dxva2_av1.c` sizes its array `frame_header->tile_cols *
+/// frame_header->tile_rows` and fills it `for (tile_num = h->tg_start; tile_num <=
+/// h->tg_end; tile_num++)`. A frame whose four tiles arrive in one tile group is
+/// four of these, not one.
+///
+/// [`Self::data_offset`] and [`Self::data_size`] address that tile's raw payload
+/// inside the bitstream buffer: the bytes AFTER its `tile_size_minus_1` field, and
+/// not one byte more. See [`mod@crate::pack_av1`] for what the buffer holds around
+/// them.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TileAv1 {
@@ -582,6 +611,18 @@ pub struct TileAv1 {
     pub anchor_frame: u8,
     pub reserved8: u8,
 }
+
+// The byte-view permission ([`crate::dxva::as_bytes`] / [`crate::dxva::slice_bytes`]),
+// for the two structures a submission actually copies into a driver mapping. The
+// sealed trait's argument is even simpler here than for the H.264/HEVC buffers:
+// `#[repr(C, packed)]` leaves NO padding at all, so "every byte is initialized" is
+// a property of the layout rather than of how carefully `zeroed()` was written.
+//
+// The nested blocks (`TilesAv1`, `LoopFilterAv1`, …) deliberately do NOT implement
+// it: they are never submitted on their own, only as members of
+// [`PicParamsAv1`].
+impl crate::dxva::DxvaBuffer for PicParamsAv1 {}
+impl crate::dxva::DxvaBuffer for TileAv1 {}
 
 // Every number below was printed by `layout-probe-av1.c`, compiled with MSVC
 // against the Windows SDK's own `dxva.h` (10.0.26100.0) on .173. Not transcribed

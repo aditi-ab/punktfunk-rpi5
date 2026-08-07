@@ -233,9 +233,32 @@ impl std::error::Error for Av1TileError {}
 ///
 /// These ranges ARE what gets uploaded — the module docs' layout — so the packed
 /// offsets fall straight out of the concatenation and there is nothing to rebase.
+///
+/// # Why [`Self::groups`] exists when this rung never reads it
+///
+/// The DXVA rung (`pf_dxvadec::pack_av1`, which depends on this crate — the link
+/// only goes one way, so it cannot be a doc link) uploads a DIFFERENT layout: whole
+/// `tile_data` regions, `tile_size_minus_1` fields and all, because that is
+/// byte-for-byte what libavcodec's `dxva2_av1.c` hands a Windows driver and this
+/// program's method there is to reproduce libavcodec rather than to reason from a
+/// specification. The two layouts differ only in bytes NEITHER API's per-tile
+/// offsets address, so the walk that finds the tiles is the same walk — and the
+/// region each tile group contributes is a byte offset this function already
+/// computes and used to throw away.
+///
+/// Publishing it here rather than duplicating the walk in pf-dxvadec is the same
+/// call [`SlotMap`] records: a second copy of 150 lines of spec-literal byte
+/// arithmetic buys one fewer crate edge and costs a divergence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Av1Bitstream {
-    pub(crate) tiles: Vec<Range<usize>>,
+pub struct Av1Bitstream {
+    /// Every tile's raw payload, in decode order across all of the frame's tile
+    /// groups. Access-unit coordinates.
+    pub tiles: Vec<Range<usize>>,
+    /// One region per tile-group (or frame) OBU, in plan order: the OBU's
+    /// `tile_data` — from the first tile's `tile_size_minus_1` field through the
+    /// end of the OBU payload. Access-unit coordinates, and every range in
+    /// [`Self::tiles`] lies inside exactly one of these.
+    pub groups: Vec<Range<usize>>,
 }
 
 /// Read one LEB128 value at `at`, returning it and its byte length.
@@ -285,7 +308,7 @@ fn leb128(au: &[u8], at: usize) -> Option<(u64, usize)> {
 /// size that OVERSHOOTS the payload is caught too ([`Av1TileError::Truncated`]);
 /// one that undershoots simply shortens the last tile, and nothing in the
 /// bitstream contradicts it.
-pub(crate) fn plan_bitstream(
+pub fn plan_bitstream(
     au: &[u8],
     plan_tiles: &[pf_bitstream::av1::TilePlan],
     header: &FrameHeaderObu,
@@ -300,6 +323,7 @@ pub(crate) fn plan_bitstream(
     }
 
     let mut tiles: Vec<Range<usize>> = Vec::with_capacity(num_tiles as usize);
+    let mut groups: Vec<Range<usize>> = Vec::with_capacity(plan_tiles.len());
 
     for (index, tile_group) in plan_tiles.iter().enumerate() {
         let obu = &tile_group.data;
@@ -383,6 +407,9 @@ pub(crate) fn plan_bitstream(
         if cursor >= payload_end {
             return Err(Av1TileError::Truncated { obu: index });
         }
+        // `tile_data` begins here — libavcodec's `AV1RawTileGroup::tile_data.data`,
+        // which is exactly the pointer its DXVA hwaccel `memcpy`s (struct docs).
+        groups.push(cursor..payload_end);
 
         // --- the tiles ---
         // `tg_start`/`tg_end` index tiles 0..NumTiles-1, so a group claiming more
@@ -444,7 +471,7 @@ pub(crate) fn plan_bitstream(
     if tiles.is_empty() {
         return Err(Av1TileError::NoTiles);
     }
-    Ok(Av1Bitstream { tiles })
+    Ok(Av1Bitstream { tiles, groups })
 }
 
 /// As many tiles as `pTileOffsets` / `pTileSizes` carry.
@@ -1058,8 +1085,15 @@ impl VkAv1Decoder {
                     // AV1's display region is `render_width`/`render_height`, its
                     // answer to a conformance window — the decoded picture is the
                     // (post-superres) `upscaled_width` x `frame_height`.
-                    width: plan.picture.render_width,
-                    height: plan.picture.render_height,
+                    //
+                    // ⚠ CLAMPED, because AV1's render size is a display HINT and
+                    // not a window: 5.9.6 puts no upper bound on
+                    // `render_width_minus_1`, so a stream may legally ask to be
+                    // shown at more than it coded (that is how a decoder is told to
+                    // upscale on output). Used as a crop unclamped it addresses
+                    // rows and columns the decoded image does not have.
+                    width: plan.picture.render_width.min(plan.picture.upscaled_width),
+                    height: plan.picture.render_height.min(plan.picture.frame_height),
                 },
                 colour: plan.picture.colour,
                 // AV1 has no POC. `OrderHint` is the closest thing the stream

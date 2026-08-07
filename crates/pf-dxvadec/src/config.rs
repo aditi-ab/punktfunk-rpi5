@@ -60,12 +60,40 @@ pub const HEVC_VLD_MAIN10: DxvaProfile = DxvaProfile {
     dxgi_format: DXGI_FORMAT_P010,
 };
 
+/// `D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0` — AV1 Profile 0 (4:2:0, 8 **or** 10
+/// bits). The same GUID `video_d3d11.rs` already hands the FFmpeg rung.
+///
+/// AV1 numbers its profiles by CHROMA SAMPLING, not by depth: Profile 0 is 4:2:0
+/// at 8 and 10 bits both, so [`AV1_VLD_PROFILE0_10BIT`] below repeats this GUID
+/// with the other surface format rather than naming a second profile. (Profile 1
+/// is 4:4:4 and Profile 2 is 4:2:2/12-bit; neither has a rung here — see
+/// [`profile_for`].)
+pub const AV1_VLD_PROFILE0: DxvaProfile = DxvaProfile {
+    name: "AV1 Profile 0",
+    guid: 0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a,
+    dxgi_format: DXGI_FORMAT_NV12,
+};
+
+/// AV1 Profile 0 decoding TEN-bit 4:2:0 into P010 — the same profile GUID as
+/// [`AV1_VLD_PROFILE0`], a different surface format.
+///
+/// Two constants rather than one plus a format argument because the format is
+/// what `CheckVideoDecoderFormat` is asked about and what the pool is allocated
+/// with: a profile whose GUID is supported at NV12 and not at P010 is a real
+/// answer a driver can give, and the caller must be able to ask the question.
+pub const AV1_VLD_PROFILE0_10BIT: DxvaProfile = DxvaProfile {
+    name: "AV1 Profile 0 (10-bit)",
+    guid: 0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a,
+    dxgi_format: DXGI_FORMAT_P010,
+};
+
 /// Which codec this decoder was built for. The negotiated codec picks it once, at
 /// construction — the same shape as `video_vk_native`'s `NativeCodec`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
     H265,
+    Av1,
 }
 
 /// The profile a stream of this codec, chroma format and bit depth needs, or
@@ -80,7 +108,10 @@ pub enum Codec {
 ///   input support is not a thing we have ever measured;
 /// * H.264 above 8-bit — `High10` has no mainstream DXVA profile GUID, and no
 ///   punktfunk host emits it;
-/// * HEVC above 10-bit.
+/// * HEVC above 10-bit;
+/// * AV1 above 10-bit (Profile 2's 12-bit) and AV1 monochrome — an AV1 sequence
+///   with `mono_chrome` set reads as `chroma_format_idc` 0 here and is refused
+///   with every other non-4:2:0 shape.
 pub fn profile_for(codec: Codec, chroma_format_idc: u8, bit_depth: u8) -> Option<DxvaProfile> {
     if chroma_format_idc != 1 {
         return None;
@@ -89,6 +120,8 @@ pub fn profile_for(codec: Codec, chroma_format_idc: u8, bit_depth: u8) -> Option
         (Codec::H264, 8) => Some(H264_VLD_NOFGT),
         (Codec::H265, 8) => Some(HEVC_VLD_MAIN),
         (Codec::H265, 10) => Some(HEVC_VLD_MAIN10),
+        (Codec::Av1, 8) => Some(AV1_VLD_PROFILE0),
+        (Codec::Av1, 10) => Some(AV1_VLD_PROFILE0_10BIT),
         _ => None,
     }
 }
@@ -103,18 +136,28 @@ pub fn profile_for(codec: Codec, chroma_format_idc: u8, bit_depth: u8) -> Option
 /// * H.264: `1` = long format (`DXVA_Slice_H264_Long`), `2` = short format
 ///   (`DXVA_Slice_H264_Short`);
 /// * HEVC: `1` = short format (`DXVA_Slice_HEVC_Short`) — the only format the
-///   HEVC spec defines.
+///   HEVC spec defines;
+/// * AV1: `1`, and there is no second value. The AV1 DXVA specification defines
+///   one slice-control record (`DXVA_Tile_AV1`) and no long form, so `1` is not
+///   "the short one" so much as "the only one".
 ///
-/// This backend implements short format only, for both codecs: the long format
+/// This backend implements short format only, for every codec: the long format
 /// additionally carries the derived reference lists and the prediction weight
 /// tables per slice, which is a second derivation of everything the picture
 /// parameters already say, with a second chance to get it wrong. A device that
 /// offers no short-format config is refused and the ladder answers with the
 /// FFmpeg rung, which implements both.
+///
+/// The AV1 value is not a guess: libavcodec's own
+/// `dxva_get_decoder_configuration` (`dxva2.c`, n8.1) scores
+/// `ConfigBitstreamRaw == 1` for EVERY codec and additionally accepts `2` only
+/// `if (avctx->codec_id == AV_CODEC_ID_H264)`. Anything else it `continue`s past,
+/// so a device offering AV1 at some other value is a device libavcodec's D3D11VA
+/// hwaccel refuses too.
 pub const fn short_slice_config(codec: Codec) -> u32 {
     match codec {
         Codec::H264 => 2,
-        Codec::H265 => 1,
+        Codec::H265 | Codec::Av1 => 1,
     }
 }
 
@@ -167,10 +210,16 @@ pub fn pick_config(codec: Codec, configs: &[ConfigFacts]) -> Option<usize> {
 /// this. Getting it wrong is not a validation failure — it is the class of bug
 /// that shows up as smeared bottom rows, which this codebase has already paid for
 /// once on the CSC side.
+///
+/// **AV1 is 128 too**, and that is the same function's answer rather than an
+/// analogy: `ff_dxva2_common_frame_params` tests
+/// `avctx->codec_id == AV_CODEC_ID_HEVC || avctx->codec_id == AV_CODEC_ID_AV1` in
+/// ONE condition. (AV1's own superblock is 64 or 128 samples, so 128 also covers
+/// the largest of them, but the reason it is written here is the measured one.)
 pub const fn surface_alignment(codec: Codec) -> u32 {
     match codec {
         Codec::H264 => 16,
-        Codec::H265 => 128,
+        Codec::H265 | Codec::Av1 => 128,
     }
 }
 
@@ -227,6 +276,21 @@ mod tests {
             profile_for(Codec::H265, 1, 8).map(|p| p.dxgi_format),
             Some(DXGI_FORMAT_NV12)
         );
+        // AV1 Profile 0 covers 8 AND 10 bits under ONE GUID, so the pair differs
+        // only in the surface format — the one thing that must NOT be shared,
+        // since it is what the pool is allocated with.
+        assert_eq!(profile_for(Codec::Av1, 1, 8), Some(AV1_VLD_PROFILE0));
+        assert_eq!(profile_for(Codec::Av1, 1, 10), Some(AV1_VLD_PROFILE0_10BIT));
+        assert_eq!(AV1_VLD_PROFILE0.guid, AV1_VLD_PROFILE0_10BIT.guid);
+        assert_eq!(AV1_VLD_PROFILE0.dxgi_format, DXGI_FORMAT_NV12);
+        assert_eq!(AV1_VLD_PROFILE0_10BIT.dxgi_format, DXGI_FORMAT_P010);
+        // The GUID `video_d3d11.rs` hands the FFmpeg rung for AV1
+        // (`PROFILE_AV1_VLD_PROFILE0`), transcribed here so a typo in one of the
+        // two is a failing test rather than a rung that quietly never engages.
+        assert_eq!(
+            AV1_VLD_PROFILE0.guid,
+            0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a
+        );
     }
 
     #[test]
@@ -239,14 +303,25 @@ mod tests {
         assert_eq!(profile_for(Codec::H264, 1, 10), None);
         // 12-bit HEVC likewise.
         assert_eq!(profile_for(Codec::H265, 1, 12), None);
+        // AV1: Profile 1 (4:4:4) and Profile 2 (4:2:2 / 12-bit) have no rung
+        // here, and neither does monochrome — which the AV1 planner reports as
+        // `chroma_format_idc` 0, i.e. it lands in the same refusal as 4:4:4
+        // rather than being mistaken for 4:2:0.
+        assert_eq!(profile_for(Codec::Av1, 3, 8), None);
+        assert_eq!(profile_for(Codec::Av1, 3, 10), None);
+        assert_eq!(profile_for(Codec::Av1, 1, 12), None);
+        assert_eq!(profile_for(Codec::Av1, 0, 8), None);
     }
 
     #[test]
-    fn short_slice_control_is_2_for_h264_and_1_for_hevc() {
+    fn short_slice_control_is_2_for_h264_and_1_for_hevc_and_av1() {
         // The one number whose two spellings would silently swap the slice
-        // struct a driver reads.
+        // struct a driver reads. `2` is H.264's and H.264's alone — libavcodec's
+        // own config scoring accepts it `if (codec_id == AV_CODEC_ID_H264)` and
+        // takes `1` everywhere else.
         assert_eq!(short_slice_config(Codec::H264), 2);
         assert_eq!(short_slice_config(Codec::H265), 1);
+        assert_eq!(short_slice_config(Codec::Av1), 1);
     }
 
     #[test]
@@ -270,8 +345,9 @@ mod tests {
         ];
         assert_eq!(pick_config(Codec::H264, &configs), Some(2));
         // For HEVC the same array reads the other way round: 1 IS short format
-        // there, and 2 means nothing.
+        // there, and 2 means nothing. AV1 reads it the HEVC way.
         assert_eq!(pick_config(Codec::H265, &configs), Some(0));
+        assert_eq!(pick_config(Codec::Av1, &configs), Some(0));
     }
 
     #[test]
@@ -313,6 +389,24 @@ mod tests {
         assert_eq!(align_surface(3840, Codec::H265), 3840);
         assert_eq!(align_surface(2400, Codec::H265), 2432);
         assert_eq!(align_surface(2432, Codec::H265), 2432);
+        // AV1 shares HEVC's granule (`ff_dxva2_common_frame_params` tests the two
+        // codec ids in one condition), so the 320x240 conformance vector decodes
+        // into a 384x256 surface and the chroma plane starts 256 rows down — the
+        // geometry the parity readback has to use.
+        assert_eq!(align_surface(320, Codec::Av1), 384);
+        assert_eq!(align_surface(240, Codec::Av1), 256);
+        assert_eq!(align_surface(1920, Codec::Av1), 1920);
+        assert_eq!(align_surface(1080, Codec::Av1), 1152);
+    }
+
+    #[test]
+    fn an_av1_pool_is_the_eight_reference_slots_plus_the_current_picture() {
+        // AV1's DPB depth is a CONSTANT of the codec (`NUM_REF_FRAMES` = 8), not
+        // an SPS field, so the pool is always nine surfaces — which is also
+        // libavcodec's `num_surfaces = 1 + 8` for `AV_CODEC_ID_AV1`. A driver
+        // asking for more still wins.
+        assert_eq!(pool_size(9, 0), 9);
+        assert_eq!(pool_size(9, 16), 16);
     }
 
     #[test]

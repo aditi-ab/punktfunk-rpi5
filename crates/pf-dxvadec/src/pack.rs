@@ -76,6 +76,16 @@ pub enum PackError {
     /// A byte offset or length exceeded `u32`, which is what the DXVA records
     /// carry.
     Overflow(usize),
+    /// AV1 ([`mod@crate::pack_av1`]): the frame carried no tile data.
+    NoTiles,
+    /// AV1: a tile payload lies inside none of the tile-group regions the same
+    /// walk produced. Unreachable through [`pf_vkdecode::plan_bitstream`], and
+    /// checked because the alternative to refusing is a tile record addressing
+    /// another tile's bytes.
+    TileOutsideGroup { start: usize, end: usize },
+    /// AV1: the caller's record template and the walk's tile list are different
+    /// lengths, so no record can be matched to a tile with confidence.
+    TileCountMismatch { records: usize, tiles: usize },
 }
 
 impl std::fmt::Display for PackError {
@@ -96,6 +106,15 @@ impl std::fmt::Display for PackError {
                 "the AU needs {needed} bitstream bytes; the driver's buffer holds {capacity}"
             ),
             PackError::Overflow(value) => write!(f, "byte value {value} exceeds u32"),
+            PackError::NoTiles => write!(f, "the frame carried no tile data"),
+            PackError::TileOutsideGroup { start, end } => write!(
+                f,
+                "tile payload {start}..{end} lies inside no tile-group region"
+            ),
+            PackError::TileCountMismatch { records, tiles } => write!(
+                f,
+                "{records} tile records against {tiles} tiles in the bitstream"
+            ),
         }
     }
 }
