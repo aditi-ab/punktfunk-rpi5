@@ -123,7 +123,9 @@ class GamepadPaletteTest {
      */
     @Test
     fun everySettingsRowHasATab() {
-        val rows = buildSettingsRows(Settings(), hasBodyVibrator = true, av1Capable = true) {}
+        val rows = buildSettingsRows(
+            Settings(), hasBodyVibrator = true, hasGyroscope = true, av1Capable = true,
+        ) {}
         assertTrue(rows.isNotEmpty())
         assertEquals(rows.size, rows.map { it.id }.toSet().size)
         // Profiles is built separately (from the catalog), so no settings row claims it.
@@ -137,7 +139,9 @@ class GamepadPaletteTest {
     @Test
     fun backgroundRowStepsTheSharedKey() {
         var s = Settings()
-        fun rows() = buildSettingsRows(s, hasBodyVibrator = false, av1Capable = false) { s = it }
+        fun rows() = buildSettingsRows(
+            s, hasBodyVibrator = false, hasGyroscope = false, av1Capable = false,
+        ) { s = it }
         fun palette() = rows().first { it.id == "palette" }
 
         assertEquals("violet", s.uiPalette)
