@@ -916,8 +916,36 @@ mod tests {
         }
     }
 
+    /// HEVC's freedom from the aliasing that cost AV1 and H.264 a deferral, and the
+    /// PLANNER property that grants it.
+    ///
+    /// Both other codecs release a removed picture's slot and then let
+    /// [`SlotMap::assign`] hand it straight back to the decode target, so `CurrPic`
+    /// and a `RefPicList` entry name one surface. This conversion still releases its
+    /// whole `removed` list inline, and is safe doing so for one reason: `H265Planner`
+    /// snapshots `dpb_refs` AFTER `decode_rps` has updated the DPB, so a picture this
+    /// AU's RPS dropped is never in the set `RefPicList` is built from, and nothing
+    /// later in the AU unmarks anything. `H264Planner` and `Av1Planner` both snapshot
+    /// BEFORE their marking, and both needed the deferral.
+    ///
+    /// The second assertion is that argument made falsifiable. The first is only the
+    /// consequence, and on this vector the consequence would hold even if the argument
+    /// stopped being true — the vendored H.264 vector taught that lesson expensively
+    /// (it measured zero aliasing for two milestones while every stream we ship
+    /// aliased on 99% of its frames). Moving `dpb_snapshot()` above `decode_rps` would
+    /// leave the first assertion passing and break the second on the first AU whose
+    /// RPS drops a picture, which on this vector is most of them.
+    ///
+    /// ⚠ No low-delay HEVC stream is vendored, so unlike H.264 this is not backed by a
+    /// hardware leg on our own encoder's output. It was MEASURED once, 2026-08-07, on
+    /// a 300-picture 1080p low-delay HEVC stream from a punktfunk host: 0 access units
+    /// with a `removed ∩ dpb_refs` intersection, against 297 of 300 for H.264 from the
+    /// same host and the same run. Vendoring that stream is the way to make this a
+    /// standing guarantee rather than a re-derivable argument.
     #[test]
     fn the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference() {
+        let mut aus_with_removals = 0usize;
+        let mut both = 0usize;
         for (plan, dxva) in convert_stream(TEST_25FPS) {
             assert_eq!(dxva.pic_params.CurrPic.index(), dxva.setup_slot);
             assert!(!dxva.pic_params.CurrPic.associated());
@@ -928,7 +956,30 @@ mod tests {
             for r in &dxva.refs {
                 assert_ne!(r.slot, dxva.setup_slot, "a reference aliases the target");
             }
+            if !plan.dpb.removed.is_empty() {
+                aus_with_removals += 1;
+            }
+            both += plan
+                .dpb
+                .removed
+                .iter()
+                .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+                .count();
         }
+        assert!(
+            aus_with_removals > 0,
+            "no AU of this vector removed anything, so the zero below would be empty \
+             for a reason that has nothing to do with the property being asserted"
+        );
+        assert_eq!(
+            both, 0,
+            "{both} picture(s) are in an AU's own reference set AND removed by it. \
+             That is the H.264/AV1 aliasing precondition, and HEVC is supposed to be \
+             structurally incapable of it — so the snapshot in `H265Planner` has moved \
+             ahead of `decode_rps`. Restore the ordering, or give this conversion the \
+             `release_after_decode` deferral the other two carry; do NOT relax this \
+             number"
+        );
     }
 
     #[test]

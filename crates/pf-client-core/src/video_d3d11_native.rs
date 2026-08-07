@@ -519,11 +519,15 @@ impl NativeD3d11Decoder {
         };
         for &id in &sub.release_after_decode {
             if !session.slots.release(id) {
-                // Never fatal, and never silent: a deferred id that holds no slot
-                // means the conversion and the ledger disagree about the DPB, which
-                // is a bug in one of them rather than a stream this AU can do
-                // anything about.
-                tracing::warn!(id, "a deferred release named a picture holding no surface");
+                // Never fatal, and never silent — but `debug!` rather than `warn!`,
+                // because there is a LEGITIMATE way to get here: a renegotiation
+                // replaces the whole `Session` (and with it the slot map) inside
+                // `plan`, while the planner's own drain reports every drained picture
+                // in the same AU's `removed`. Those ids belong to the map that no
+                // longer exists, so every one of them misses and nothing is wrong.
+                // Outside a rebuild it means the conversion and the ledger disagree
+                // about the DPB, which the surrounding rebuild log makes separable.
+                tracing::debug!(id, "a deferred release named a picture holding no surface");
             }
         }
     }

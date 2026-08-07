@@ -139,10 +139,16 @@ pub struct DecodePlanDxvaAv1 {
     /// breath: decode into the surface you are predicting from.
     ///
     /// Neither vendored H.264 nor H.265 vector ever produces that shape (measured:
-    /// zero on the 250-AU clips — ⚠ but see `plan_to_dxva`'s note, because that is a
-    /// measurement of two REORDERING vectors and not a proof about those codecs),
-    /// which is why the eager release survived two hardware-proven codecs and opened
-    /// on the first AV1 frame past the key frame's neighbourhood. The Vulkan rung
+    /// zero on the 250-AU clips), which is why the eager release survived two
+    /// codecs believed hardware-proven and opened on the first AV1 frame past the key
+    /// frame's neighbourhood.
+    ///
+    /// ⚠ That zero turned out to be a fact about the VECTORS. H.264 has the identical
+    /// defect on any low-delay stream — 117 of 120 access units of our own host's
+    /// output, wrong pixels on three GPUs — and now carries the identical deferral
+    /// ([`crate::pic::DecodePlanDxva::release_after_decode`], which records the
+    /// measurement). H.265 is the only one of the three that is genuinely safe, and
+    /// structurally: its planner snapshots `dpb_refs` after `decode_rps`. The Vulkan rung
     /// carries the same contract for the same reason
     /// (`pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`), and this
     /// rung's constraint is the STRICTER of the two: Vulkan binds only the references

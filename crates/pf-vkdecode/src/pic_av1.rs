@@ -834,12 +834,15 @@ mod tests {
     /// AV1 applies `refresh_frame_flags` after decoding (7.20), so `ref_frame_idx`
     /// resolves against the store as it stood BEFORE the frame. Cycling eight slots
     /// in a low-delay stream therefore means almost every frame displaces something
-    /// it is reading: **268 of this vector's 274 frames**, first at frame 6. The
-    /// H.264 and H.265 planners can produce the same shape — `plan_to_vk`'s own
-    /// docs name the sliding window evicting a picture the slices reference — but
-    /// neither vendored vector ever does it (measured: zero on the 250-AU H.264
-    /// clip), which is why the hole survived two hardware-proven codecs and opened
-    /// on the first AV1 frame that was not a key frame's neighbour.
+    /// it is reading: **268 of this vector's 274 frames**, first at frame 6.
+    ///
+    /// The H.264 planner produces the same shape and the vendored vector never does
+    /// it (measured: zero on the 250-AU clip), which is why the hole survived a codec
+    /// believed hardware-proven and opened here first. That zero was a fact about the
+    /// vector: on a low-delay host stream H.264 aliases on 117 of 120 access units,
+    /// and `plan_to_vk` now carries the same deferral
+    /// ([`crate::pic::DecodePlanVk::release_after_decode`]). H.265 does not need one —
+    /// `H265Planner` snapshots `dpb_refs` after `decode_rps`.
     #[test]
     fn a_reference_this_frame_displaces_keeps_its_slot_until_after_the_decode() {
         let mut planner = Av1Planner::new();
