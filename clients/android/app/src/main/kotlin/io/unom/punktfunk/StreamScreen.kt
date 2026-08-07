@@ -137,6 +137,19 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             micHint = null
         }
     }
+    // A captured pad has a gyro this session's virtual controller cannot carry (see
+    // GamepadRouter.onMotionUnreachable). Shown briefly, then gone: the failure is otherwise
+    // completely silent — the gyro simply does nothing, which from the couch is indistinguishable
+    // from a broken sensor — and the fix is a setting, so the notice has to name it.
+    var motionHint by remember { mutableStateOf(false) }
+    LaunchedEffect(motionHint) {
+        if (motionHint) {
+            // Longer than the mic chord's 1.6 s: that one confirms something the user just did,
+            // this one explains something they did not, in a sentence they have to read.
+            delay(6000)
+            motionHint = false
+        }
+    }
     // The one place mute is toggled — Compose state + the native flag, always together.
     val setMicMuted = { muted: Boolean ->
         micMuted = muted
@@ -359,6 +372,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Select + Y toggles the mic — the couch reach for the on-screen mute button, which a
         // gamepad/TV user has no pointer for. Ignored when no capture is running (there is nothing
         // to mute, and claiming otherwise would be the lie the control exists to avoid).
+        // A captured Sony pad whose motion this session cannot carry. Fires once per pad, at the
+        // moment it is claimed, on the main thread.
+        router.onMotionUnreachable = { motionHint = true }
         router.onMicChord = {
             if (micRunning) {
                 val next = !micMuted
@@ -593,6 +609,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             ds?.stop() // rumble-stop on the physical pad + release the USB link + free the wire slot
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.onMicChord = null // same: no mute toggle on buttons released during teardown
+            router.onMotionUnreachable = null // same: no notice raised by a slot closing at teardown
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
             // Mouse/remote-pointer teardown: lift held buttons, drop the grab, restore the cursor.
@@ -853,6 +870,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         }
         // Chord confirmation (gamepad/TV) — the counterpart to the button changing under a finger.
         micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
+        // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
+        // notice landing on top of one of those would cost the user both.
+        if (motionHint) {
+            MotionUnreachableHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+        }
     }
 }
 
@@ -931,6 +953,28 @@ private fun MicMuteControl(muted: Boolean, onToggle: (() -> Unit)?, modifier: Mo
 private fun MicChordHint(text: String, modifier: Modifier = Modifier) {
     Text(
         text,
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
+}
+
+/**
+ * "This pad's gyro can't reach the game" — shown briefly when a captured controller with motion
+ * meets a session whose virtual pad has no motion plane (the X-Box classes have no gyro in their
+ * HID contract, so every sample would be decoded and dropped host-side).
+ *
+ * It names the setting because that is the whole point: without it the player has a gyro that
+ * silently does nothing and no way to tell that from a broken sensor. Not a control — the setting
+ * applies from the next session, so offering to change it here would promise something this stream
+ * cannot deliver. [GamepadRouter.onMotionUnreachable] raises it.
+ */
+@Composable
+private fun MotionUnreachableHint(modifier: Modifier = Modifier) {
+    Text(
+        "Motion won't reach this session — set Controller type to DualSense",
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
             .padding(horizontal = 14.dp, vertical = 8.dp),

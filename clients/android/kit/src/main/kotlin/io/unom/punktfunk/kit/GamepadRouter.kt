@@ -115,6 +115,17 @@ class GamepadRouter(
      */
     var onMicChord: (() -> Unit)? = null
 
+    /**
+     * Invoked (main thread) once per pad when a captured controller WITH a gyro turns out to be in
+     * a session whose virtual pad has no motion plane — its motion is not being sent, because every
+     * sample would be decoded and dropped host-side.
+     *
+     * It exists because the failure is otherwise completely silent: the gyro just does nothing, and
+     * from the couch that is indistinguishable from a broken sensor. The fix is the Controller type
+     * setting, so whatever shows this has to name it. `StreamScreen` wires it to a brief notice.
+     */
+    var onMotionUnreachable: (() -> Unit)? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
     /** The pending exit-chord hold timer, or null when the chord isn't currently armed. */
     private var pendingExit: Runnable? = null
@@ -326,7 +337,18 @@ class GamepadRouter(
      * the real slots' lifecycle: a stable lowest-free index, Arrival-before-input, held-state
      * flush + Remove on [close], and full participation in the emergency exit chord.
      */
-    inner class ExternalPad internal constructor(private val syntheticId: Int, val index: Int) {
+    inner class ExternalPad internal constructor(
+        private val syntheticId: Int,
+        val index: Int,
+        /**
+         * Whether this pad's motion can reach the game at all, asked once at open (see
+         * [NativeBridge.nativePadMotionReaches]). False means the host built this pad a backend
+         * without a motion plane, so [motion] drops the sample here instead of paying to send one
+         * the host will decode and discard — at a controller's full report rate, for the whole
+         * session.
+         */
+        private val motionReaches: Boolean,
+    ) {
         // Live lookup instead of a captured reference: after [close] (or a router release) the
         // slot is gone from the table and every entry point below degrades to a safe no-op.
         private val slot get() = slots[syntheticId]
@@ -357,7 +379,7 @@ class GamepadRouter(
         /** One motion sample on the rich plane (gyro pitch/yaw/roll + accel, raw device i16
          *  units — the host passes them straight into the virtual pad's report). Per report. */
         fun motion(gyro: IntArray, accel: IntArray) {
-            if (slot != null && forwarding) {
+            if (slot != null && forwarding && motionReaches) {
                 NativeBridge.nativeSendPadMotion(
                     handle, index,
                     gyro[0], gyro[1], gyro[2],
@@ -373,15 +395,26 @@ class GamepadRouter(
     /**
      * Open a slot for a capture-link pad, declaring [pref] as its kind; null when all 16 wire
      * indices are taken. Main thread (like the hot-plug callbacks).
+     *
+     * [hasGyro] says whether this link forwards motion on the RICH plane ([ExternalPad.motion]) —
+     * true for the Sony pads, whose IMU is a headline feature, and false for the Steam Controller 2,
+     * whose motion rides inside the opaque passthrough report that [ExternalPad.hidReport] carries
+     * and which nothing here may second-guess. It gates only the notice: a pad that never sends
+     * motion must not produce a warning about motion.
      */
-    fun openExternal(pref: Int): ExternalPad? {
+    fun openExternal(pref: Int, hasGyro: Boolean = false): ExternalPad? {
         val index = lowestFreeIndex() ?: return null
         // Synthetic ids live below any real InputDevice id (those are positive), so they can't
         // collide and InputDevice.getDevice(id) resolves them to null for the feedback path.
         val syntheticId = EXTERNAL_ID_BASE - index
         if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
+        // Asked once, here, off the kind this pad just DECLARED — not off the session's resolved
+        // backend, which under Automatic answers for whichever pad happened to be active at dial
+        // time. Cheap enough to ask unconditionally; the answer holds for the pad's lifetime.
+        val motionReaches = NativeBridge.nativePadMotionReaches(handle, pref)
+        if (forwarding && hasGyro && !motionReaches) onMotionUnreachable?.invoke()
         slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
-        return ExternalPad(syntheticId, index)
+        return ExternalPad(syntheticId, index, motionReaches)
     }
 
     /**

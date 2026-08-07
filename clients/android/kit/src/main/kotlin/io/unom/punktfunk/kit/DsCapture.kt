@@ -289,7 +289,9 @@ class DsCapture(
     @Synchronized
     private fun ensureSlot(m: DsDevice.Model): GamepadRouter.ExternalPad? {
         pad?.let { return it }
-        val p = router.openExternal(m.pref) ?: return null
+        // hasGyro: every pad this link captures is a Sony one with an IMU, and its motion goes out
+        // on the rich plane — so a session that cannot carry it is worth saying out loud.
+        val p = router.openExternal(m.pref, hasGyro = true) ?: return null
         pad = p
         Log.i(TAG, "captured $m → wire pad ${p.index}")
         // The wire index exists from here on, and the host addresses pad audio by it.

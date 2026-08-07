@@ -517,6 +517,23 @@ object NativeBridge {
     external fun nativeSendGamepadRemove(handle: Long, pad: Int)
 
     /**
+     * Whether motion sent for a pad that declared [declaredPref] (the [Gamepad].PREF_* byte passed
+     * to [nativeSendGamepadArrival]) can actually reach the game, or would be decoded and dropped
+     * by a host backend without a motion plane — the X-Box classes have no gyro in their HID
+     * contract.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_motion_reaches`, rather than
+     * reconstructed here from the session's requested/resolved prefs. The rule is subtler than it
+     * looks (the host builds each pad from its OWN declaration and folds what it cannot build, so
+     * neither the declaration nor the session echo answers it alone) and every way of getting it
+     * wrong is silent, so it lives in one place with one set of tests.
+     *
+     * Ask ONCE when a pad opens, not per sample. `true` when the session handle is dead — "don't
+     * suppress" is the safe answer whenever we cannot tell.
+     */
+    external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
+
+    /**
      * One raw HID input report from a client-captured controller (the as-is Steam Controller 2
      * passthrough), forwarded verbatim on the rich-input plane. [buf] is a DIRECT ByteBuffer whose
      * first [len] bytes are the report, id byte first (0x42/0x45/0x47 state, 0x43 battery, …);
