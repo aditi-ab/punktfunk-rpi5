@@ -564,18 +564,32 @@ public final class GamepadCapture {
         let now = DispatchTime.now().uptimeNanoseconds
         guard now &- slot.lastMotionNs >= Self.motionIntervalNs else { return }
         slot.lastMotionNs = now
-        // Total acceleration in g: gravity + user when split, else the raw vector.
+        // Total acceleration in g: gravity + user when split, else the raw vector — then NEGATED
+        // into the wire's convention.
+        //
+        // Apple reports acceleration as the gravity VECTOR: a device lying flat face-up reads
+        // z = −1, because gravity points down. An accelerometer physically measures proper
+        // acceleration, which at rest is the +1 g normal force pushing UP, and that is what a
+        // DualSense's report — the wire's convention — carries. The two are exact negatives, so
+        // every sample we sent was upside down, on both branches (`m.acceleration` follows the
+        // same Apple convention as the gravity/user split).
+        //
+        // Measured on glass 2026-08-07 (G16): a DualSense flat and face-up, streamed from an
+        // iPhone to a Linux host, arrived at hid-playstation as z = −0.99 g where +1.00 was owed.
+        // Magnitude was 1.006 g, so the SCALE was already right — this is purely direction.
+        // `rotationRate` is a true angular rate and needs no flip; the same session confirmed yaw
+        // came through with the correct sign.
         let ax: Float
         let ay: Float
         let az: Float
         if m.hasGravityAndUserAcceleration {
-            ax = Float(m.gravity.x + m.userAcceleration.x)
-            ay = Float(m.gravity.y + m.userAcceleration.y)
-            az = Float(m.gravity.z + m.userAcceleration.z)
+            ax = -Float(m.gravity.x + m.userAcceleration.x)
+            ay = -Float(m.gravity.y + m.userAcceleration.y)
+            az = -Float(m.gravity.z + m.userAcceleration.z)
         } else {
-            ax = Float(m.acceleration.x)
-            ay = Float(m.acceleration.y)
-            az = Float(m.acceleration.z)
+            ax = -Float(m.acceleration.x)
+            ay = -Float(m.acceleration.y)
+            az = -Float(m.acceleration.z)
         }
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
