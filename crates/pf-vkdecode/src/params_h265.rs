@@ -189,7 +189,9 @@ where
 /// no mutation, deliberately not `Clone` (re-convert instead).
 #[derive(Debug)]
 pub struct OwnedStdH265Vps {
-    std: hh::StdVideoH265VideoParameterSet,
+    /// Boxed so [`Self::std`]'s ADDRESS — what `pStdVPSs` points at — survives every
+    /// move of the wrapper ([`crate::OwnedStdSps`]).
+    std: Box<hh::StdVideoH265VideoParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
 }
@@ -212,7 +214,8 @@ impl OwnedStdH265Vps {
 /// rejected, not dropped).
 #[derive(Debug)]
 pub struct OwnedStdH265Sps {
-    std: hh::StdVideoH265SequenceParameterSet,
+    /// Boxed for [`OwnedStdH265Vps`]'s reason: `pStdSPSs` is this field's address.
+    std: Box<hh::StdVideoH265SequenceParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
     _scaling_backing: Option<Box<hh::StdVideoH265ScalingLists>>,
@@ -232,7 +235,8 @@ impl OwnedStdH265Sps {
 /// targets. Same ownership contract as [`crate::OwnedStdSps`].
 #[derive(Debug)]
 pub struct OwnedStdH265Pps {
-    std: hh::StdVideoH265PictureParameterSet,
+    /// Boxed for [`OwnedStdH265Vps`]'s reason: `pStdPPSs` is this field's address.
+    std: Box<hh::StdVideoH265PictureParameterSet>,
     _scaling_backing: Option<Box<hh::StdVideoH265ScalingLists>>,
 }
 
@@ -474,7 +478,7 @@ pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     std.pProfileTierLevel = &*ptl_backing;
 
     Ok(OwnedStdH265Vps {
-        std,
+        std: Box::new(std),
         _ptl_backing: ptl_backing,
         _dpb_backing: dpb_backing,
     })
@@ -507,7 +511,7 @@ pub fn fallback_vps_from_sps(sps: &Sps) -> Result<OwnedStdH265Vps, H265ParamsErr
     std.pProfileTierLevel = &*ptl_backing;
 
     Ok(OwnedStdH265Vps {
-        std,
+        std: Box::new(std),
         _ptl_backing: ptl_backing,
         _dpb_backing: dpb_backing,
     })
@@ -729,7 +733,7 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     // docs / check_envelope).
 
     Ok(OwnedStdH265Sps {
-        std,
+        std: Box::new(std),
         _ptl_backing: ptl_backing,
         _dpb_backing: dpb_backing,
         _scaling_backing: scaling_backing,
@@ -903,7 +907,7 @@ pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
     // pPredictorPaletteEntries stays null (rejected above).
 
     Ok(OwnedStdH265Pps {
-        std,
+        std: Box::new(std),
         _scaling_backing: scaling_backing,
     })
 }

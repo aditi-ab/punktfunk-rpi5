@@ -26,6 +26,18 @@
 //! lifetime, and both the recreate path and `Drop` destroy the object before that
 //! value is released.
 //!
+//! **Both LEVELS of pointer are covered, not just the one the measurement caught.**
+//! Fixing the inner pointers left the OUTER ones — `pStdSPSs`/`pStdPPSs`, and AV1's
+//! `pStdSequenceHeader` — still addressing function locals, and a driver retaining
+//! those instead would reproduce the same bug with the same silent signature. So the
+//! Std structs are boxed inside their wrappers ([`crate::OwnedStdSps`]) and the
+//! contiguous arrays are FIELDS of `StoredParams`: no address the driver is given
+//! is a temporary's. The line is drawn at Std DATA — `VkVideoSessionParametersCreateInfoKHR`
+//! and its `pNext`/`pParametersAddInfo` plumbing stay function-local, because those
+//! are ordinary create-info structures every `vkCreate*` in Vulkan reads during the
+//! call; it is the `pStd*` members whose retention the spec's wording left ambiguous
+//! and this fleet was measured exercising.
+//!
 //! [`ParamsLedger`] is the pure half of that decision table (unit-tested);
 //! [`VideoSession`] is the thin Vulkan half.
 
@@ -366,18 +378,47 @@ struct StoredParams {
     /// blocks they own.
     sps: Vec<OwnedStdSps>,
     pps: Vec<OwnedStdPps>,
+    /// The contiguous Std ARRAYS the create call was handed as `pStdSPSs`/`pStdPPSs`
+    /// — the OUTER pointers, held for the object's life for the reason the wrappers
+    /// are. They were function-local `Vec`s, dropped the moment
+    /// [`VideoSession::create_parameters_object`] returned; nothing but the spec's
+    /// wording said a driver may not keep them, and that wording is what the AV1
+    /// measurement already disproved for the pointers one level in. Built by
+    /// [`Self::assemble`] at their final address, so the pointer the driver is given
+    /// never moves at all.
+    std_sps: Vec<hh::StdVideoH264SequenceParameterSet>,
+    std_pps: Vec<hh::StdVideoH264PictureParameterSet>,
 }
 
 impl StoredParams {
+    /// The wrappers plus the contiguous Std arrays the create call reads its
+    /// `pStdSPSs`/`pStdPPSs` out of, with a NULL object the caller fills in once
+    /// `vkCreateVideoSessionParametersKHR` has succeeded.
+    ///
+    /// Assembling BEFORE the call is the point: the arrays are copies of the
+    /// wrappers' Std structs, and building them here puts them at the address they
+    /// will keep for the object's whole life rather than in a temporary the call
+    /// outlives.
+    fn assemble(sps: Vec<OwnedStdSps>, pps: Vec<OwnedStdPps>) -> Self {
+        // COPIES of each wrapper's Std struct (it is `Copy`); the embedded pointers
+        // they carry still address the wrappers' own boxed blocks, which is why
+        // both halves have to be kept.
+        let std_sps = sps.iter().map(|o| *o.std()).collect();
+        let std_pps = pps.iter().map(|o| *o.std()).collect();
+        Self {
+            object: vk::VideoSessionParametersKHR::null(),
+            sps,
+            pps,
+            std_sps,
+            std_pps,
+        }
+    }
+
     /// The placeholder a half-built session holds. `vkDestroyVideoSessionParametersKHR`
     /// ignores a NULL handle, so a [`VideoSession::create`] that fails before the
     /// object exists still drops cleanly.
     fn none() -> Self {
-        Self {
-            object: vk::VideoSessionParametersKHR::null(),
-            sps: Vec::new(),
-            pps: Vec::new(),
-        }
+        Self::assemble(Vec::new(), Vec::new())
     }
 
     /// Take over sets an `Add` just handed to the live object — they belong to the
@@ -490,17 +531,13 @@ impl VideoSession {
         sps: Vec<OwnedStdSps>,
         pps: Vec<OwnedStdPps>,
     ) -> Result<StoredParams, SessionError> {
-        // The contiguous Std arrays the call wants. These are COPIES of each
-        // wrapper's Std struct (it is `Copy`, and the driver copies them again
-        // before returning); the embedded pointers they carry still address the
-        // wrappers' own boxed blocks, which are what must outlive the OBJECT.
-        let std_sps: Vec<hh::StdVideoH264SequenceParameterSet> =
-            sps.iter().map(|o| *o.std()).collect();
-        let std_pps: Vec<hh::StdVideoH264PictureParameterSet> =
-            pps.iter().map(|o| *o.std()).collect();
+        // Assembled FIRST so the arrays `pStdSPSs`/`pStdPPSs` will point at are
+        // already where they will stay: `stored` is returned by value, and moving a
+        // `Vec` moves its handle, not the block the driver was given.
+        let mut stored = StoredParams::assemble(sps, pps);
         let add = vk::VideoDecodeH264SessionParametersAddInfoKHR::default()
-            .std_sp_ss(&std_sps)
-            .std_pp_ss(&std_pps);
+            .std_sp_ss(&stored.std_sps)
+            .std_pp_ss(&stored.std_pps);
         let mut h264 = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default()
             .max_std_sps_count(MAX_STD_SPS as u32)
             .max_std_pps_count(MAX_STD_PPS as u32)
@@ -509,9 +546,10 @@ impl VideoSession {
             .video_session(self.session)
             .push_next(&mut h264);
         let mut object = vk::VideoSessionParametersKHR::null();
-        // SAFETY: fn contract; `ci` roots locals outliving the call, and the blocks
-        // the driver may retain past it are owned by `sps`/`pps`, which are moved
-        // into the returned value rather than dropped here.
+        // SAFETY: fn contract; `ci` roots locals outliving the call, and everything
+        // the driver may retain past it — the Std arrays AND the blocks their
+        // embedded pointers address — is owned by `stored`, which is returned
+        // rather than dropped here.
         let r = unsafe {
             (self.video_queue.fp().create_video_session_parameters_khr)(
                 self.device.handle(),
@@ -523,7 +561,8 @@ impl VideoSession {
         if r != vk::Result::SUCCESS {
             return Err(SessionError::Vk(r));
         }
-        Ok(StoredParams { object, sps, pps })
+        stored.object = object;
+        Ok(stored)
     }
 
     /// The ledger's verdict for activating (`sps`, `pps`), without mutating
@@ -774,6 +813,107 @@ mod tests {
         // SAFETY: `stored` owns the block — which is exactly the property here.
         let read_back = unsafe { (*lists).ScalingList4x4[0] };
         assert_eq!(read_back, [0; 16], "the fixture's lists, read back live");
+    }
+
+    /// …and it keeps the ADDRESS too, not merely the blocks.
+    ///
+    /// The Add path hands `vkUpdateVideoSessionParametersKHR` a
+    /// `std::slice::from_ref(o.std())` — a one-element array that IS the wrapper's
+    /// own Std struct — and then moves the wrapper into [`StoredParams`]. The test
+    /// above covers a driver retaining `pScalingLists` (an INNER pointer); this
+    /// covers one retaining `pStdSPSs`/`pStdPPSs`, which the same wording in the
+    /// spec permits just as much. Boxing the Std struct inside the wrapper is what
+    /// makes the two addresses equal; un-boxing it would leave every other test in
+    /// this crate green and hand the driver a moved-from stack slot.
+    #[test]
+    fn an_added_set_keeps_the_address_the_update_call_was_given() {
+        let (sps, pps) = authored(0, 0, 26);
+        let owned_sps = sps_to_std(&sps).expect("converts");
+        let owned_pps = pps_to_std(&pps).expect("converts");
+        // Exactly what `ensure_parameters` puts in `pStdSPSs`/`pStdPPSs`.
+        let handed_sps = std::ptr::from_ref(owned_sps.std());
+        let handed_pps = std::ptr::from_ref(owned_pps.std());
+
+        let mut stored = StoredParams::none();
+        stored.adopt(Some(owned_sps), Some(owned_pps));
+        assert_eq!(
+            std::ptr::from_ref(stored.sps[0].std()),
+            handed_sps,
+            "the SPS address handed to Vulkan must be the one the object keeps"
+        );
+        assert_eq!(
+            std::ptr::from_ref(stored.pps[0].std()),
+            handed_pps,
+            "and likewise the PPS"
+        );
+        // SAFETY: `stored` owns both structs — which is exactly the property here.
+        let ids = unsafe {
+            (
+                (*handed_sps).seq_parameter_set_id,
+                (*handed_pps).pic_parameter_set_id,
+            )
+        };
+        assert_eq!(
+            ids,
+            (0, 0),
+            "read back through the pointers the driver holds"
+        );
+    }
+
+    /// The create path's OUTER pointers: `pStdSPSs`/`pStdPPSs` address contiguous
+    /// COPIES of the wrappers' Std structs, and those arrays must outlive the
+    /// create call the same way the wrappers do.
+    ///
+    /// [`StoredParams::assemble`] builds them at their final address — inside the
+    /// value the parameters object is returned in — so the pointer the driver is
+    /// given never moves at all. Before this, they were function-local `Vec`s that
+    /// were dropped the instant `create_parameters_object` returned: a driver
+    /// retaining the array (rather than the embedded pointer this fleet was
+    /// measured retaining) would have been reading freed heap from the first frame.
+    #[test]
+    fn the_std_arrays_the_create_call_is_given_are_the_ones_the_object_keeps() {
+        let sps = SpsBuilder::new()
+            .seq_parameter_set_id(0)
+            .profile_idc(Profile::Main)
+            .level_idc(Level::L4)
+            .frame_mbs_only_flag(true)
+            .direct_8x8_inference_flag(true)
+            .max_num_ref_frames(4)
+            .resolution(64, 64)
+            // So the copied Std struct carries a NON-null embedded pointer and the
+            // "still addresses the wrapper's live block" assertion below can bite.
+            .seq_scaling_matrix_present_flag(true)
+            .build();
+        let pps = PpsBuilder::new(Rc::clone(&sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let owned_sps = sps_to_std(&sps).expect("converts");
+        let owned_pps = pps_to_std(&pps).expect("converts");
+
+        let stored = StoredParams::assemble(vec![owned_sps], vec![owned_pps]);
+        // Exactly what `create_parameters_object` puts in `pStdSPSs`/`pStdPPSs`.
+        let (handed_sps, handed_pps) = (stored.std_sps.as_ptr(), stored.std_pps.as_ptr());
+        // The move `create_parameters_object` ends with: `Ok(stored)`.
+        let stored = std::hint::black_box(stored);
+        assert_eq!((stored.std_sps.len(), stored.std_pps.len()), (1, 1));
+        assert_eq!(
+            (stored.std_sps.as_ptr(), stored.std_pps.as_ptr()),
+            (handed_sps, handed_pps),
+            "the arrays handed to Vulkan must be the ones the object keeps"
+        );
+        // And their COPIES still address the wrappers' own live blocks.
+        let lists = stored.std_sps[0].pScalingLists;
+        assert!(!lists.is_null(), "the fixture attaches scaling lists");
+        assert_eq!(lists, stored.sps[0].std().pScalingLists);
+        // SAFETY: `stored` owns the block the copy points at — the property here.
+        let read_back = unsafe { (*lists).ScalingList4x4[0] };
+        assert_eq!(read_back, [0; 16], "the fixture's lists, read back live");
+        assert_eq!(
+            stored.std_pps[0].pic_parameter_set_id,
+            stored.pps[0].std().pic_parameter_set_id,
+            "the PPS copy is the wrapper's, field for field"
+        );
     }
 
     #[test]

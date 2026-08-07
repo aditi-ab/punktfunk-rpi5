@@ -77,7 +77,14 @@ impl std::error::Error for ParamsError {}
 ///
 /// - The backing is boxed, so the wrapper may be MOVED freely: moving it relocates
 ///   the `Box` handles (pointer values), never the heap blocks the Std struct's
-///   pointers hold the addresses of.
+///   pointers hold the addresses of. ⚠ The Std struct ITSELF is boxed for the same
+///   reason and it is not decoration: `pStdSPSs` — the OUTER pointer the create/add
+///   info carries — is [`Self::std`]'s address, and the session hands it over
+///   BEFORE moving the wrapper into its stored parameters. Inline, that address
+///   would be a moved-from slot; boxed, it is the one the object keeps
+///   (`crate::session`'s `an_added_set_keeps_the_address_the_update_call_was_given`).
+///   A driver retaining the outer pointer rather than an inner one would otherwise
+///   reproduce the AV1 use-after-free exactly, with the same silent signature.
 /// - [`Self::std`] hands the struct out by shared reference. The struct is `Copy`; a
 ///   copy taken out of the wrapper still points INTO the wrapper's backing and must
 ///   not outlive it. ⚠⚠ The obligation is NOT merely "keep the wrapper alive across
@@ -93,7 +100,9 @@ impl std::error::Error for ParamsError {}
 ///   Re-convert from the `Sps` instead — conversion is cheap and pure.
 #[derive(Debug)]
 pub struct OwnedStdSps {
-    std: hh::StdVideoH264SequenceParameterSet,
+    /// Boxed so [`Self::std`]'s ADDRESS — what `pStdSPSs` points at — survives every
+    /// move of the wrapper (type-level contract).
+    std: Box<hh::StdVideoH264SequenceParameterSet>,
     /// `pOffsetForRefFrame`'s target (POC type 1 only, else `None`/null).
     _offset_backing: Option<Box<[i32]>>,
     /// `pScalingLists`' target (`seq_scaling_matrix_present_flag` only, else null).
@@ -112,7 +121,8 @@ impl OwnedStdSps {
 /// Same ownership contract as [`OwnedStdSps`], with the one pointer.
 #[derive(Debug)]
 pub struct OwnedStdPps {
-    std: hh::StdVideoH264PictureParameterSet,
+    /// Boxed for [`OwnedStdSps`]'s reason: `pStdPPSs` is this field's address.
+    std: Box<hh::StdVideoH264PictureParameterSet>,
     _scaling_backing: Option<Box<hh::StdVideoH264ScalingLists>>,
 }
 
@@ -290,7 +300,7 @@ pub fn sps_to_std(sps: &Sps) -> Result<OwnedStdSps, ParamsError> {
     }
 
     Ok(OwnedStdSps {
-        std,
+        std: Box::new(std),
         _offset_backing: offset_backing,
         _scaling_backing: scaling_backing,
     })
@@ -368,7 +378,7 @@ pub fn pps_to_std(pps: &Pps) -> Result<OwnedStdPps, ParamsError> {
     }
 
     Ok(OwnedStdPps {
-        std,
+        std: Box::new(std),
         _scaling_backing: scaling_backing,
     })
 }

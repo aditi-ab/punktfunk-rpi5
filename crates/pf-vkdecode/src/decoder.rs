@@ -496,17 +496,9 @@ impl OpRing {
     ) -> Result<Self, vk::Result> {
         let query_pool = if dev.result_status_queries() {
             let mut chain = decode_profile.chain();
-            let profile = chain.wire();
-            let mut query_ci = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::RESULT_STATUS_ONLY_KHR)
-                .query_count(query_count);
-            // Chained manually: `push_next` would clobber the profile's own
-            // `p_next` (its H264 half) — the encoder's exact precedent.
-            query_ci.p_next = (profile as *const vk::VideoProfileInfoKHR<'_>).cast();
-            // SAFETY: live device; `query_ci` roots the wired chain for the call.
-            // The video profile chained in satisfies the "same profile as the
-            // session" rule for queries used inside a coding scope.
-            Some(unsafe { dev.ash().create_query_pool(&query_ci, None)? })
+            // SAFETY: fn contract. `chain` outlives the call, and the helper's
+            // SIGNATURE — not a comment — is what keeps it immobile across it.
+            Some(unsafe { Self::create_status_query_pool(dev, chain.wire(), query_count)? })
         } else {
             debug!(
                 "decode family lacks queryResultStatusSupport — no per-op status \
@@ -553,6 +545,39 @@ impl OpRing {
             cmd_pool,
             cmds,
         })
+    }
+
+    /// The RESULT_STATUS query pool, created against `profile`.
+    ///
+    /// Split out for the BORROW rather than for tidiness. `VkQueryPoolCreateInfo`
+    /// has no codec-aware builder here — `push_next` would clobber the profile's
+    /// own `p_next` (its codec half), so the chain is written as a raw `*const`, and
+    /// a raw pointer ends the borrow the moment it is taken. Inline, only inspection
+    /// stopped a later edit from moving or dropping the chain between that write and
+    /// `vkCreateQueryPool`; taking `&vk::VideoProfileInfoKHR<'_>` as a PARAMETER
+    /// makes the compiler hold the borrow across the whole call instead
+    /// ([`crate::caps::H264ProfileChain`]'s contract, which used to claim the
+    /// borrow checker covered this site and did not).
+    ///
+    /// # Safety
+    ///
+    /// `dev` wraps live handles ([`DeviceHandles`] contract).
+    unsafe fn create_status_query_pool(
+        dev: &DecodeDevice,
+        profile: &vk::VideoProfileInfoKHR<'_>,
+        query_count: u32,
+    ) -> Result<vk::QueryPool, vk::Result> {
+        let mut query_ci = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::RESULT_STATUS_ONLY_KHR)
+            .query_count(query_count);
+        // Chained manually: `push_next` would clobber the profile's own `p_next`
+        // — the encoder's exact precedent.
+        query_ci.p_next = std::ptr::from_ref(profile).cast();
+        // SAFETY: fn contract; `query_ci` roots the wired chain for the call, and
+        // `profile` is borrowed for the whole of this body so the chain cannot move
+        // out from under that pointer. The video profile chained in satisfies the
+        // "same profile as the session" rule for queries used inside a coding scope.
+        unsafe { dev.ash().create_query_pool(&query_ci, None) }
     }
 }
 

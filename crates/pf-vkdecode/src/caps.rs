@@ -494,7 +494,16 @@ fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsEr
 ///
 /// [`Self::wire`] links `profile.p_next` to this struct's OWN `h264` field; the
 /// value must not move between `wire()` and the last use of the returned reference
-/// (the borrow checker pins it — `wire` borrows `self` for the reference's life).
+/// — **or of any raw pointer taken from it**, which is the half that does not come
+/// for free. `wire` borrows `self` for the reference's life, so wherever the
+/// reference is passed on AS a reference the borrow checker does pin the chain: a
+/// `profiles(std::slice::from_ref(profile))` builder carries the borrow in its own
+/// lifetime parameter, and so does handing `profile` straight to an entry point.
+/// Where a `*const` is taken instead, the borrow ENDS at that line and nothing but
+/// inspection keeps the chain still — [`crate::decoder`]'s query pool must do
+/// exactly that (`push_next` there would clobber the profile's own `p_next`), so it
+/// holds the reference across the call in a helper's SIGNATURE
+/// (`OpRing::create_status_query_pool`) rather than relying on this sentence.
 pub(crate) struct H264ProfileChain {
     h264: vk::VideoDecodeH264ProfileInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,

@@ -69,9 +69,17 @@ impl std::error::Error for ParamsAv1Error {}
 /// where the measurement lives. Boxed backing (rather than inline arrays) is what
 /// makes storing the wrapper enough — moving it does not move the blocks, which
 /// `moving_the_wrapper_leaves_the_driver_s_pointers_put` pins.
+///
+/// ⚠⚠ The Std struct ITSELF is boxed for the same reason, one level out:
+/// `pStdSequenceHeader` is [`Self::std`]'s address, and `ensure_parameters` hands
+/// it to the create call BEFORE moving the wrapper into the stored parameters.
+/// Inline, that address would be a moved-from stack slot the instant the function
+/// returned — the original bug's exact shape, differing only in WHICH pointer a
+/// driver chose to retain (`session_av1`'s
+/// `the_sequence_header_address_the_create_call_is_given_survives_being_stored`).
 #[derive(Debug)]
 pub struct OwnedStdAv1SequenceHeader {
-    std: hh::StdVideoAV1SequenceHeader,
+    std: Box<hh::StdVideoAV1SequenceHeader>,
     _color_backing: Box<hh::StdVideoAV1ColorConfig>,
     /// `pTimingInfo` is null unless the stream carries timing info: a decoder needs
     /// none of it, and a zeroed block behind a non-null pointer would claim a frame
@@ -213,7 +221,7 @@ pub fn sequence_to_std(
         .map_or(std::ptr::null(), |t| &**t as *const _);
 
     Ok(OwnedStdAv1SequenceHeader {
-        std,
+        std: Box::new(std),
         _color_backing: color_backing,
         _timing_backing: timing_backing,
     })

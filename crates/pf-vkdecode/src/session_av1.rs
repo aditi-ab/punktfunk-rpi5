@@ -37,6 +37,14 @@
 //! entirely. That is the whole of the AV1 rung's parity gap (250/250 frames
 //! divergent; 0/250 with the backing held, [`StoredParamsAv1`]).
 //!
+//! ⚠⚠ That fix stabilised the INNER pointers only. `pStdSequenceHeader` — the
+//! address `VkVideoDecodeAV1SessionParametersCreateInfoKHR` itself carries — was
+//! still [`sequence_to_std`]'s stack local, dead the moment `ensure_parameters`
+//! returned, and a driver retaining IT rather than `pColorConfig` would reproduce
+//! the bug exactly. The Std struct is now boxed inside the wrapper, so the address
+//! handed over is the one `StoredParamsAv1` keeps ([`crate::session`]'s module
+//! docs carry the argument and the line it draws).
+//!
 //! `ParamsLedgerAv1` is the pure half of the decision (unit-tested);
 //! [`VideoSessionAv1`] is the thin Vulkan half.
 
@@ -124,7 +132,9 @@ pub struct SessionConfigAv1 {
 struct StoredParamsAv1 {
     object: vk::VideoSessionParametersKHR,
     /// Held for the OBJECT's whole life. Never read by this crate after the
-    /// create call; the DRIVER reads it.
+    /// create call; the DRIVER reads it — potentially through `pStdSequenceHeader`
+    /// itself, which is why the wrapper boxes its Std struct rather than holding it
+    /// inline (module docs).
     _sequence: OwnedStdAv1SequenceHeader,
 }
 
@@ -374,6 +384,44 @@ mod tests {
             film_grain_params_present: film_grain,
             ..Default::default()
         })
+    }
+
+    /// The OUTER pointer — `pStdSequenceHeader` itself — must still address the
+    /// stored wrapper's Std struct after the wrapper has been moved into
+    /// [`StoredParamsAv1`].
+    ///
+    /// [`crate::params_av1`]'s `moving_the_wrapper_leaves_the_driver_s_pointers_put`
+    /// pins the INNER pointers (`pColorConfig`, `pTimingInfo`); this pins the one
+    /// the create info carries. `ensure_parameters` converts into a local, hands
+    /// `owned.std()` to `vkCreateVideoSessionParametersKHR`, and only THEN moves
+    /// the wrapper into the stored value — so a driver retaining
+    /// `pStdSequenceHeader` (rather than the `pColorConfig` this fleet was measured
+    /// retaining) would read a moved-from slot, with the same silent signature as
+    /// the original bug: plausible pictures, wrong content, no error and no
+    /// counter. Boxing the Std struct inside the wrapper is what makes the two
+    /// addresses equal, and this is the assertion that stops it being un-boxed.
+    #[test]
+    fn the_sequence_header_address_the_create_call_is_given_survives_being_stored() {
+        let seq = authored(1919, false);
+        let owned = sequence_to_std(&seq).expect("a plain 8-bit header converts");
+        // Exactly what `ensure_parameters` puts in `pStdSequenceHeader`.
+        let handed = std::ptr::from_ref(owned.std());
+        // `ensure_parameters`' own final move: `self.parameters = Some(…)`.
+        let parameters = Some(StoredParamsAv1 {
+            object: vk::VideoSessionParametersKHR::null(),
+            _sequence: owned,
+        });
+        let Some(stored) = parameters else {
+            unreachable!("just installed")
+        };
+        assert_eq!(
+            std::ptr::from_ref(stored._sequence.std()),
+            handed,
+            "the address handed to Vulkan must be the address the object keeps"
+        );
+        // SAFETY: `stored` owns the header — which is exactly the property here.
+        let width = unsafe { (*handed).max_frame_width_minus_1 };
+        assert_eq!(width, 1919, "the fixture's width, read back through it");
     }
 
     #[test]

@@ -38,7 +38,9 @@
 //! carries the measurement). H.265 embeds MORE such pointers than any other codec
 //! here — the SPS alone carries seven — so [`StoredParamsH265`] holds the object and
 //! its backings in ONE value with one lifetime, and both the recreate path and
-//! `Drop` destroy the object before that value is released.
+//! `Drop` destroy the object before that value is released. The OUTER pointers
+//! (`pStdVPSs`/`pStdSPSs`/`pStdPPSs`) are held the same way and for the same reason
+//! — [`crate::session`]'s module docs carry the argument and the line it draws.
 //!
 //! `ParamsLedgerH265` is the pure half of that decision table (unit-tested);
 //! `VideoSessionH265` is the thin Vulkan half.
@@ -289,19 +291,47 @@ struct StoredParamsH265 {
     vps: Vec<OwnedStdH265Vps>,
     sps: Vec<OwnedStdH265Sps>,
     pps: Vec<OwnedStdH265Pps>,
+    /// The contiguous Std ARRAYS the create call was handed as
+    /// `pStdVPSs`/`pStdSPSs`/`pStdPPSs` — the OUTER pointers, held for the object's
+    /// life for the reason the wrappers are ([`crate::session`]'s `StoredParams`
+    /// carries the argument). Built by [`Self::assemble`] at their final address.
+    std_vps: Vec<hh::StdVideoH265VideoParameterSet>,
+    std_sps: Vec<hh::StdVideoH265SequenceParameterSet>,
+    std_pps: Vec<hh::StdVideoH265PictureParameterSet>,
 }
 
 impl StoredParamsH265 {
+    /// The wrappers plus the contiguous Std arrays the create call reads its
+    /// `pStdVPSs`/`pStdSPSs`/`pStdPPSs` out of, with a NULL object the caller fills
+    /// in once `vkCreateVideoSessionParametersKHR` has succeeded
+    /// ([`crate::session`]'s `StoredParams::assemble` for why it happens here).
+    fn assemble(
+        vps: Vec<OwnedStdH265Vps>,
+        sps: Vec<OwnedStdH265Sps>,
+        pps: Vec<OwnedStdH265Pps>,
+    ) -> Self {
+        // COPIES of each wrapper's Std struct (it is `Copy`); the embedded pointers
+        // they carry still address the wrappers' own boxed blocks, which is why
+        // both halves have to be kept.
+        let std_vps = vps.iter().map(|o| *o.std()).collect();
+        let std_sps = sps.iter().map(|o| *o.std()).collect();
+        let std_pps = pps.iter().map(|o| *o.std()).collect();
+        Self {
+            object: vk::VideoSessionParametersKHR::null(),
+            vps,
+            sps,
+            pps,
+            std_vps,
+            std_sps,
+            std_pps,
+        }
+    }
+
     /// The placeholder a half-built session holds. `vkDestroyVideoSessionParametersKHR`
     /// ignores a NULL handle, so a [`VideoSessionH265::create`] that fails before
     /// the object exists still drops cleanly.
     fn none() -> Self {
-        Self {
-            object: vk::VideoSessionParametersKHR::null(),
-            vps: Vec::new(),
-            sps: Vec::new(),
-            pps: Vec::new(),
-        }
+        Self::assemble(Vec::new(), Vec::new(), Vec::new())
     }
 
     /// Take over sets an `Add` just handed to the live object — they belong to the
@@ -420,20 +450,14 @@ impl VideoSessionH265 {
         sps: Vec<OwnedStdH265Sps>,
         pps: Vec<OwnedStdH265Pps>,
     ) -> Result<StoredParamsH265, SessionError> {
-        // The contiguous Std arrays the call wants. These are COPIES of each
-        // wrapper's Std struct (it is `Copy`, and the driver copies them again
-        // before returning); the embedded pointers they carry still address the
-        // wrappers' own boxed blocks, which are what must outlive the OBJECT.
-        let std_vps: Vec<hh::StdVideoH265VideoParameterSet> =
-            vps.iter().map(|o| *o.std()).collect();
-        let std_sps: Vec<hh::StdVideoH265SequenceParameterSet> =
-            sps.iter().map(|o| *o.std()).collect();
-        let std_pps: Vec<hh::StdVideoH265PictureParameterSet> =
-            pps.iter().map(|o| *o.std()).collect();
+        // Assembled FIRST so the arrays `pStdVPSs`/`pStdSPSs`/`pStdPPSs` will point
+        // at are already where they will stay: `stored` is returned by value, and
+        // moving a `Vec` moves its handle, not the block the driver was given.
+        let mut stored = StoredParamsH265::assemble(vps, sps, pps);
         let add = vk::VideoDecodeH265SessionParametersAddInfoKHR::default()
-            .std_vp_ss(&std_vps)
-            .std_sp_ss(&std_sps)
-            .std_pp_ss(&std_pps);
+            .std_vp_ss(&stored.std_vps)
+            .std_sp_ss(&stored.std_sps)
+            .std_pp_ss(&stored.std_pps);
         let mut h265 = vk::VideoDecodeH265SessionParametersCreateInfoKHR::default()
             .max_std_vps_count(MAX_STD_VPS as u32)
             .max_std_sps_count(MAX_STD_SPS as u32)
@@ -443,9 +467,10 @@ impl VideoSessionH265 {
             .video_session(self.session)
             .push_next(&mut h265);
         let mut object = vk::VideoSessionParametersKHR::null();
-        // SAFETY: fn contract; `ci` roots locals outliving the call, and the blocks
-        // the driver may retain past it are owned by `vps`/`sps`/`pps`, which are
-        // moved into the returned value rather than dropped here.
+        // SAFETY: fn contract; `ci` roots locals outliving the call, and everything
+        // the driver may retain past it — the Std arrays AND the blocks their
+        // embedded pointers address — is owned by `stored`, which is returned
+        // rather than dropped here.
         let r = unsafe {
             (self.video_queue.fp().create_video_session_parameters_khr)(
                 self.device.handle(),
@@ -457,12 +482,8 @@ impl VideoSessionH265 {
         if r != vk::Result::SUCCESS {
             return Err(SessionError::Vk(r));
         }
-        Ok(StoredParamsH265 {
-            object,
-            vps,
-            sps,
-            pps,
-        })
+        stored.object = object;
+        Ok(stored)
     }
 
     /// The ledger's verdict for activating (`vps`, `sps`, `pps`), without mutating
@@ -769,6 +790,112 @@ mod tests {
         // SAFETY: `stored` owns both blocks — which is exactly the property here.
         let dpb = unsafe { (*sps_dpb).max_dec_pic_buffering_minus1[0] };
         assert_eq!(dpb, 5, "the fixture's DPB sizing, read back live");
+    }
+
+    /// …and it keeps the ADDRESS too, not merely the blocks.
+    ///
+    /// The Add path hands `vkUpdateVideoSessionParametersKHR` a
+    /// `std::slice::from_ref(o.std())` — a one-element array that IS the wrapper's
+    /// own Std struct — and then moves the wrapper into [`StoredParamsH265`]. The
+    /// test above covers a driver retaining `pDecPicBufMgr` (an INNER pointer);
+    /// this covers one retaining `pStdVPSs`/`pStdSPSs`/`pStdPPSs`, which the same
+    /// wording in the spec permits just as much.
+    #[test]
+    fn an_added_set_keeps_the_address_the_update_call_was_given() {
+        let mut base = (*authored_sps(0, 0, 64)).clone();
+        base.profile_tier_level.general_profile_idc = 1; // Main
+        let sps = Rc::new(base);
+        let pps = authored_pps(&sps, 0, 0);
+        let owned_vps = VpsSource::for_sps(&sps).to_std().expect("converts");
+        let owned_sps = sps_to_std_h265(&sps).expect("converts");
+        let owned_pps = pps_to_std_h265(&pps).expect("converts");
+        // Exactly what `ensure_parameters` puts in `pStdVPSs`/`pStdSPSs`/`pStdPPSs`.
+        let handed_vps = std::ptr::from_ref(owned_vps.std());
+        let handed_sps = std::ptr::from_ref(owned_sps.std());
+        let handed_pps = std::ptr::from_ref(owned_pps.std());
+
+        let mut stored = StoredParamsH265::none();
+        stored.adopt(Some(owned_vps), Some(owned_sps), Some(owned_pps));
+        assert_eq!(
+            (
+                std::ptr::from_ref(stored.vps[0].std()),
+                std::ptr::from_ref(stored.sps[0].std()),
+                std::ptr::from_ref(stored.pps[0].std()),
+            ),
+            (handed_vps, handed_sps, handed_pps),
+            "the addresses handed to Vulkan must be the ones the object keeps"
+        );
+        // SAFETY: `stored` owns all three — which is exactly the property here.
+        let ids = unsafe {
+            (
+                (*handed_vps).vps_video_parameter_set_id,
+                (*handed_sps).sps_seq_parameter_set_id,
+                (*handed_pps).pps_pic_parameter_set_id,
+            )
+        };
+        assert_eq!(ids, (0, 0, 0), "read back through the driver's pointers");
+    }
+
+    /// The create path's OUTER pointers: `pStdVPSs`/`pStdSPSs`/`pStdPPSs` address
+    /// contiguous COPIES of the wrappers' Std structs, and those arrays must
+    /// outlive the create call the same way the wrappers do.
+    ///
+    /// [`StoredParamsH265::assemble`] builds them at their final address — inside
+    /// the value the parameters object is returned in — so the pointer the driver
+    /// is given never moves. Before this they were function-local `Vec`s, dropped
+    /// the instant `create_parameters_object` returned.
+    #[test]
+    fn the_std_arrays_the_create_call_is_given_are_the_ones_the_object_keeps() {
+        let mut base = (*authored_sps(0, 0, 64)).clone();
+        base.profile_tier_level.general_profile_idc = 1; // Main
+        let sps = Rc::new(base);
+        let pps = authored_pps(&sps, 0, 0);
+        let owned_vps = VpsSource::for_sps(&sps).to_std().expect("converts");
+        let owned_sps = sps_to_std_h265(&sps).expect("converts");
+        let owned_pps = pps_to_std_h265(&pps).expect("converts");
+
+        let stored = StoredParamsH265::assemble(vec![owned_vps], vec![owned_sps], vec![owned_pps]);
+        // Exactly what `create_parameters_object` hands the create call.
+        let handed = (
+            stored.std_vps.as_ptr(),
+            stored.std_sps.as_ptr(),
+            stored.std_pps.as_ptr(),
+        );
+        // The move `create_parameters_object` ends with: `Ok(stored)`.
+        let stored = std::hint::black_box(stored);
+        assert_eq!(
+            (
+                stored.std_vps.len(),
+                stored.std_sps.len(),
+                stored.std_pps.len()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                stored.std_vps.as_ptr(),
+                stored.std_sps.as_ptr(),
+                stored.std_pps.as_ptr(),
+            ),
+            handed,
+            "the arrays handed to Vulkan must be the ones the object keeps"
+        );
+        // And their COPIES still address the wrappers' own live blocks.
+        let (ptl, dpb) = (
+            stored.std_vps[0].pProfileTierLevel,
+            stored.std_sps[0].pDecPicBufMgr,
+        );
+        assert!(!ptl.is_null() && !dpb.is_null(), "both are always attached");
+        assert_eq!(ptl, stored.vps[0].std().pProfileTierLevel);
+        assert_eq!(dpb, stored.sps[0].std().pDecPicBufMgr);
+        // SAFETY: `stored` owns both blocks — which is exactly the property here.
+        let profile_idc = unsafe { (*ptl).general_profile_idc };
+        assert_eq!(profile_idc, 1, "the fixture's Main profile, read back live");
+        assert_eq!(
+            stored.std_pps[0].pps_pic_parameter_set_id,
+            stored.pps[0].std().pps_pic_parameter_set_id,
+            "the PPS copy is the wrapper's, field for field"
+        );
     }
 
     #[test]
