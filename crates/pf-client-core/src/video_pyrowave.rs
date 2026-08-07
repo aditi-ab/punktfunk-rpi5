@@ -1,7 +1,7 @@
 //! PyroWave client decode (design/pyrowave-codec-plan.md §4.5) — the wired-LAN wavelet
 //! codec's decoder, running as plain Vulkan compute on the PRESENTER's own VkDevice (the
-//! whole point: decode + CSC + present on one device, zero interop). Bypasses FFmpeg
-//! entirely: the AU is one self-delimiting pyrowave packet; `push_packet` → ready →
+//! whole point: decode + CSC + present on one device, zero interop): the AU is one
+//! self-delimiting pyrowave packet; `push_packet` → ready →
 //! `decode_gpu_buffer` recorded into OUR command buffer, submitted on the shared graphics
 //! queue under the device's [`QueueLock`], fence-waited (sub-ms — Phase-0 measured
 //! 0.067 ms GPU at 1080p on the RTX 5070 Ti).
@@ -445,7 +445,7 @@ pub struct PyroWaveDecoder {
 }
 
 // SAFETY: used only from the single decode thread; the shared-queue accesses go through
-// QueueLock, matching the FFmpeg-Vulkan backend's threading contract.
+// QueueLock, matching every other Vulkan backend's threading contract.
 unsafe impl Send for PyroWaveDecoder {}
 
 impl PyroWaveDecoder {
@@ -515,7 +515,7 @@ impl PyroWaveDecoder {
                 as *const pw::VkDeviceCreateInfo,
             queue_info: &mut queue_info,
             queue_info_count: 1,
-            // The presenter/Skia/FFmpeg all serialize on this same lock.
+            // The presenter, Skia and every decode lane serialize on this same lock.
             queue_lock_callback: Some(queue_lock_cb),
             queue_unlock_callback: Some(queue_unlock_cb),
             userdata: Arc::as_ptr(&queue_lock) as *mut c_void,

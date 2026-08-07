@@ -12,9 +12,10 @@
 //!   gated on the four import extensions at device creation; boxes without them (NVIDIA
 //!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
 //!   decoder on software.
-//! * Plus the lanes that arrive already on this device: `VkFrame`/`NativeVk` (Vulkan
-//!   Video), `D3d11` (Windows shared textures) and `PyroWave` (three compute-decoded
-//!   planes, through the same planar pass as the software lane).
+//! * Plus the lanes that arrive already on this device: `NativeVk` (Vulkan Video —
+//!   pf-vkdecode on this very VkDevice), `D3d11` (Windows shared textures) and
+//!   `PyroWave` (three compute-decoded planes, through the same planar pass as the
+//!   software lane).
 //!
 //! Pacing: one frame in flight (the submit fence is waited before each record), MAILBOX
 //! when available, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate`
@@ -30,7 +31,7 @@ use crate::overlay::SharedDevice;
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
-use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame, VkVideoFrame};
+use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame};
 
 mod gpu;
 mod overlay_pipe;
@@ -53,8 +54,6 @@ pub enum FrameInput<'a> {
     Cpu(&'a CpuPlanarFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
-    /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
-    VkFrame(VkVideoFrame),
     /// D3D11VA hand-off — a shareable NT-handle texture to import (`d3d11.rs`).
     #[cfg(windows)]
     D3d11(pf_client_core::video::D3d11Frame),
@@ -84,17 +83,13 @@ struct HwCtxWin {
 }
 
 /// A submitted hardware frame parked until the in-flight fence proves the GPU reads
-/// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
-/// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
+/// done: imported dmabuf planes, an imported D3D11 shared texture, or a native
+/// Vulkan-Video frame.
 enum Retired {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     #[cfg(windows)]
     D3d11(crate::d3d11::HwFrame),
-    Vk {
-        frame: VkVideoFrame,
-        views: [vk::ImageView; 2],
-    },
     /// A native (pf-vkdecode) frame: image + views are the DECODER's — nothing to
     /// destroy here; dropping the frame after the fence wait sends its release token,
     /// which is what returns the decode slot (the release-after-fence contract).
@@ -192,20 +187,20 @@ pub struct Presenter {
     /// stream-size change. `None` until the first CPU frame — a hardware session never
     /// allocates them.
     cpu_planes: Option<CpuPlanes>,
-    /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
+    /// The shared Vulkan device handles the decode lane runs on — `None` when the stack
+    /// can't do Vulkan Video at all.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     /// The console-UI composite quad (§6.1's presenter half).
     overlay_pipe: OverlayPipe,
-    /// The submitted hardware frame (dmabuf plane images + guard, or a Vulkan-Video
-    /// frame + our plane views): its GPU reads end with the in-flight fence, so it's
-    /// destroyed right after the next fence wait.
+    /// The submitted hardware frame (dmabuf plane images + guard, an imported D3D11
+    /// texture, or a native Vulkan-Video frame): its GPU reads end with the in-flight
+    /// fence, so it's released right after the next fence wait.
     retired_hw: Option<Retired>,
-    /// External-sync lock over this device's queues, shared with FFmpeg (via
-    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`] → its
-    /// `lock_queue`/`unlock_queue` callbacks) and the Skia overlay: FFmpeg preps on the
-    /// SAME graphics queue from the pump thread, so every `vkQueueSubmit`/
-    /// `vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must hold it —
-    /// the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
+    /// External-sync lock over this device's queues, shared with the DECODE lane (via
+    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`]) and the Skia overlay:
+    /// the decoder submits on the SAME graphics queue from the pump thread, so every
+    /// `vkQueueSubmit`/`vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must
+    /// hold it — the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
     queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
     format: vk::SurfaceFormatKHR,
     /// The surface's HDR10/ST.2084 pairing, when the stack offers one.
@@ -269,15 +264,15 @@ impl Presenter {
         self.hw_win.is_some()
     }
 
-    /// The FFmpeg Vulkan Video decode handle bundle — `None` when this stack can't
-    /// (device < 1.3, missing video extensions/queue/features). The decoder chain
-    /// falls back to VAAPI/software then.
+    /// The Vulkan Video decode handle bundle — `None` when this stack can't
+    /// (device < 1.3, missing video extensions/queue/features). The decoder ladder
+    /// falls through to the platform rung / software then.
     pub fn vulkan_decode(&self) -> Option<pf_client_core::video::VulkanDecodeDevice> {
         self.video_export.clone()
     }
 
     /// Full device idle — TEARDOWN ONLY, and only after the session pump thread has
-    /// been joined (it submits FFmpeg decode work; wait-idle's external-sync rule
+    /// been joined (it submits decode work; wait-idle's external-sync rule
     /// covers every queue on the device). Mid-session code uses the fence quiesce.
     /// The queue lock is held as cheap insurance against a straggling submitter.
     pub fn wait_idle(&self) {

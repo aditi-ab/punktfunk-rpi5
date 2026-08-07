@@ -16,8 +16,6 @@ repository.workspace = true
 # Otherwise a consumer that deliberately builds us without `pyrowave` still drags the vendored
 # C++ in — fatal on Windows ARM64, where Granite has no SIMD path.
 pf-client-core = { path = "../pf-client-core", default-features = false }
-# AVVkFrame access (Vulkan Video frames: live sync state under the frames lock).
-pf-ffvk = { path = "../pf-ffvk" }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 
 # `loaded` dlopens libvulkan at runtime (no link-time dependency — GPU-less boxes still
@@ -53,17 +51,6 @@ windows-sys = { version = "0.61", features = [
 # backend in pf-client-core; ON by default, matching pf-client-core's default.
 default = ["pyrowave"]
 pyrowave = ["pf-client-core/pyrowave"]
-# Forwards M9's `ffmpeg-fallback` (the libavcodec decode rungs) to pf-client-core. OFF
-# here on purpose — deliberately NOT in `default` — so `cargo clippy -p pf-presenter`
-# compiles this crate against the native-only ladder M10 will leave behind. The binary
-# that ships turns it on: `clients/session` has it in ITS default set, because that is
-# the crate that actually builds a `Decoder`.
-#
-# This crate's own `pf-ffvk` dependency and its `DecodedImage::VkFrame` present lane are
-# NOT gated by it: they are the FFmpeg-Vulkan frame contract, and they die together with
-# `crates/pf-ffvk` at M10 (§6), in one move, rather than half-way through a milestone
-# whose gates cannot run a GPU.
-ffmpeg-fallback = ["pf-client-core/ffmpeg-fallback"]
 
 [lints]
 workspace = true

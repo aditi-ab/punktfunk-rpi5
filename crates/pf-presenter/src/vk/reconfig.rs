@@ -42,7 +42,7 @@ impl Presenter {
         // OUR submit, not the presentation engine's semaphore consumption:
         // VUID-vkDestroySemaphore-05149 / VUID-vkDestroySwapchainKHR-01282 on every
         // recreate, and destroy-in-use is exactly the kind of misuse that turns into an
-        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's FFmpeg submits —
+        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's decode submits —
         // both sides hold the shared queue lock — and cheap: a recreate already stalls
         // the stream for a frame, and only happens on resize/HDR-flip/OUT_OF_DATE.
         {

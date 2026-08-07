@@ -23,20 +23,26 @@
 # libopus and the PipeWire client lib are in the freedesktop base; SDL3 is NOT, so it is built
 # from source as a bundled module.
 #
-# HEVC decode: the base runtime's libavcodec is a stripped build (no encumbered codecs). The
-# freedesktop runtime declares `org.freedesktop.Platform.codecs-extra` as a built-in extension
-# point (directory lib/x86_64-linux-gnu/codecs-extra, add-ld-path lib, auto-downloaded with the
-# runtime), whose full libavcodec.so.61 transparently shadows the base one at runtime. So HEVC
-# (software + VAAPI) works with NO app-side codec extension to declare — we just build against
-# the SDK's linkable libavcodec.so.61 and let the runtime swap in the capable build.
+# HEVC decode needs NOTHING from the runtime since M10 (design/client-native-decode.md §6):
+# the client links no FFmpeg at all. It decodes on the user's own GPU drivers — Vulkan Video
+# through the loader in the GL runtime, or VAAPI through libva, which is dlopen'd and never
+# linked — with openh264 + rav1d (both vendored, both BSD-2) as the CPU floor. Nothing here
+# depends on the base runtime's stripped libavcodec, and nothing depends on
+# `org.freedesktop.Platform.codecs-extra` shadowing it either; that whole arrangement (and the
+# encumbered-codec question it existed to answer) is simply not this app's problem any more.
+#
+# ⚠ The one thing that follows: the CPU floor has no HEVC — no permissively-licensed HEVC
+# decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
+# codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
+# to software. That is a refusal by design, not a packaging gap.
 app-id: io.unom.Punktfunk
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 # Build-time SDK extensions:
 #  - rust-stable: cargo/rustc 1.96 + the bundled mold linker (/usr/lib/sdk/rust-stable/bin).
-#  - llvm20: provides libclang (/usr/lib/sdk/llvm20/lib), which bindgen needs — ffmpeg-sys-next
-#    and sdl3-sys generate their FFI bindings via bindgen at build time. The base SDK ships no
+#  - llvm20: provides libclang (/usr/lib/sdk/llvm20/lib), which bindgen needs — sdl3-sys and
+#    pyrowave-sys generate their FFI bindings via bindgen at build time. The base SDK ships no
 #    clang/libclang, so without this the build panics ("Unable to find libclang").
 # Both are added to PATH / LIBCLANG_PATH in build-options below.
 sdk-extensions:
@@ -112,12 +118,11 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
   # The rust build resolves everything via pkg-config: gtk4/libadwaita/pipewire/opus AND a
-  # linkable libavcodec.so.61 from org.gnome.Sdk//50 (the multiarch /usr dir), plus the bundled
-  # SDL3's .pc from /app. (At runtime the codecs-extra extension swaps in the HEVC-capable
-  # libavcodec — see the header.)
+  # the SDK's own .pc files from the multiarch /usr dir (libopus for audiopus_sys, the
+  # PipeWire client lib, GTK4/libadwaita), plus the bundled SDL3's .pc from /app.
   env:
     PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
-    # bindgen (ffmpeg-sys-next / sdl3-sys) loads libclang from the llvm20 extension.
+    # bindgen (sdl3-sys, pyrowave-sys) loads libclang from the llvm20 extension.
     LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
     # mold (shipped in rust-stable) speeds the ~450-crate link on the Deck APU.
     RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -164,23 +169,6 @@ modules:
       - /lib/pkgconfig
 
   # ---------------------------------------------------------------------------------------
-  # Vulkan-Headers — the SESSION binary's pf-ffvk crate runs bindgen over FFmpeg's
-  # libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`. The GNOME SDK is not
-  # guaranteed to ship those dev headers, so install them into /app ourselves (headers only,
-  # no compile) and point pf-ffvk's bindgen at them via PF_FFVK_VULKAN_INCLUDE below. Kept in
-  # cleanup — headers aren't needed at runtime (the Vulkan LOADER comes from the GL runtime).
-  # ---------------------------------------------------------------------------------------
-  - name: vulkan-headers
-    buildsystem: cmake-ninja
-    sources:
-      - type: archive
-        url: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.313.0.tar.gz
-        # `sha256sum vulkan-sdk-1.4.313.0.tar.gz` (verified 2026-07-07). Bump url + sha together.
-        sha256: 20743c99a96c07290f24377360e7a12bdd2c465ba202e0c7ef2ec25d446cf61d
-    cleanup:
-      - '*'
-
-  # ---------------------------------------------------------------------------------------
   # The client. cargo-sources.json is the GENERATED offline crate cache:
   #   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
   # (run from the repo root; the CI step does exactly this). With it present the build is fully
@@ -200,9 +188,6 @@ modules:
         # flatpak-builder pre-downloaded as a pinned source below. No {tag}/{key}
         # placeholders needed: a template without them is used verbatim.
         SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
-        # Point pf-ffvk's bindgen at the Vulkan-Headers installed into /app above (its clang
-        # invocation doesn't inherit the SDK's default include search, so pass it explicitly).
-        PF_FFVK_VULKAN_INCLUDE: /app/include
     build-commands:
       # Drop every reference to the windows-rs GIT dependency before building. That git
       # source is deliberately NOT vendored into cargo-sources.json — see

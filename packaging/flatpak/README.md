@@ -23,8 +23,10 @@ published two ways by CI (`.gitea/workflows/flatpak.yml`), on every push to `mai
 SteamOS `/usr` is read-only and image-based, and the system is **missing `libadwaita` and
 `libSDL3`** — so a bare `punktfunk-client` binary dropped into `~/.local/bin` won't run. Flatpak
 is the Deck's native, update-survivable app path (the user already runs Moonlight and chiaki-ng
-as flatpaks), and the bundle carries libadwaita (from `org.gnome.Platform//50`) + a bundled SDL3,
-with HEVC-capable FFmpeg supplied automatically by the runtime's `codecs-extra` extension.
+as flatpaks), and the bundle carries libadwaita (from `org.gnome.Platform//50`) + a bundled SDL3.
+It carries no FFmpeg: since M10 the client decodes on the user's own GPU drivers (Vulkan Video,
+VAAPI) with openh264 + rav1d as the CPU floor, so the runtime's `codecs-extra` extension — and the
+encumbered-codec question it answered — no longer enter into it.
 
 App id: **`io.unom.Punktfunk`** (matches the Apple bundle id family and the Decky plugin's
 flatpak fallback).
@@ -63,7 +65,7 @@ repo above is the better path for a human on the Deck:
 VER=1.2.3
 URL="https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/$VER/punktfunk-client-$VER.flatpak"
 
-# Flathub must be enabled (it is on the Deck) so the GNOME runtime + codecs-extra extension pull in:
+# Flathub must be enabled (it is on the Deck) so the GNOME runtime pulls in:
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
 curl -fL -o /tmp/punktfunk-client.flatpak "$URL"
@@ -158,15 +160,17 @@ has been built.
 with two build-time SDK extensions: `org.freedesktop.Sdk.Extension.rust-stable` (→ //25.08,
 **rustc 1.96** — the GTK4 dep chain, e.g. pango-sys 0.22, needs ≥ 1.92, which the EOL GNOME-48 /
 24.08 rust-stable at 1.89 could not provide) and `org.freedesktop.Sdk.Extension.llvm20` (libclang,
-needed by bindgen in ffmpeg-sys-next / sdl3-sys). HEVC-capable libavcodec (soname 61, accepted by
-ffmpeg-next 8.x) is supplied **automatically at runtime** by the freedesktop `codecs-extra`
-extension point (auto-downloaded with the runtime; no app-side codec declaration). A bundled
+needed by bindgen in sdl3-sys / pyrowave-sys). **No libavcodec at any layer** — the client links no
+FFmpeg since M10, so neither the SDK's stripped build nor the runtime's `codecs-extra` shadow of it
+is involved; HEVC decodes on the GPU's own driver, and there is deliberately no software HEVC
+rung (see the manifest header). A bundled
 **SDL3 3.4.10** module (pinned to match `sdl3-sys 0.6.6+SDL-3.4.10`), and finish-args for Wayland +
 `--device=all` (GPU/VAAPI render node + evdev + the hidraw char-devices SDL3 needs for DualSense)
 + `--socket=pulseaudio` (PipeWire-pulse: playback + mic) + `--share=network`. Alongside it:
 `io.unom.Punktfunk.desktop`, `io.unom.Punktfunk.metainfo.xml`, `io.unom.Punktfunk.svg` (all
-installed by the manifest). A `vulkan-headers` module supplies what the session binary's ash/Vulkan
-build needs. `cargo-sources.json` (the offline crate cache) is a pure function of
+installed by the manifest). No `vulkan-headers` module: it existed for `pf-ffvk`'s bindgen over
+FFmpeg's `hwcontext_vulkan.h`, and ash generates its own bindings and dlopens the loader.
+`cargo-sources.json` (the offline crate cache) is a pure function of
 `Cargo.lock`; CI regenerates it each build and it is **gitignored** — generate it on any box with
 network + `python3`/`aiohttp`/`tomlkit` (`build-flatpak.sh` does this automatically) and, for a
 build host that lacks those (the Deck), rsync the generated file in alongside the manifest.

@@ -1,33 +1,45 @@
 //! Video decode: reassembled access units → frames for the presenter.
 //!
-//! # The ladder (M9: native first)
+//! # The ladder (M10: native only)
 //!
-//! Since M9 every `auto` rung is a NATIVE rung — pf-vkdecode, pf-dxvadec, pf-vaadec,
-//! openh264/rav1d — for every codec and on both desktop OSes. The three FFmpeg-backed
-//! rungs still exist, but only when this crate is built with the **`ffmpeg-fallback`**
-//! feature, and then only DIRECTLY BELOW their native counterpart, as the fall-through a
-//! native init failure or error streak lands on. Vendor order is unchanged
+//! Every rung is a NATIVE rung — pf-vkdecode, pf-dxvadec, pf-vaadec, openh264/rav1d — for
+//! every codec and on both desktop OSes. **There is no libavcodec in this crate at all**:
+//! M10 deleted the three FFmpeg-backed rungs (`video_vulkan`, `video_vaapi`, the
+//! libavcodec half of `video_d3d11`), the `video_libav` helpers they shared, `pf-ffvk` and
+//! the `ffmpeg-next` dependency itself. Vendor order is unchanged
 //! ([`VulkanDecodeDevice::prefer_vulkan_first`]):
 //!
-//! | build | Linux, NVIDIA/AMD | Linux, Intel/unknown | Windows, NVIDIA/AMD | Windows, Intel/unknown |
-//! |---|---|---|---|---|
-//! | default (no `ffmpeg-fallback`) | native-vk → native-vaapi → sw | native-vaapi → native-vk → sw | native-vk → native-d3d11va → sw | native-d3d11va → native-vk → sw |
-//! | `ffmpeg-fallback` | native-vk → vk → native-vaapi → vaapi → sw | native-vaapi → vaapi → native-vk → vk → sw | native-vk → vk → native-d3d11va → d3d11va → sw | native-d3d11va → d3d11va → native-vk → vk → sw |
+//! | Linux, NVIDIA/AMD | Linux, Intel/unknown | Windows, NVIDIA/AMD | Windows, Intel/unknown |
+//! |---|---|---|---|
+//! | native-vk → native-vaapi → sw | native-vaapi → native-vk → sw | native-vk → native-d3d11va → sw | native-d3d11va → native-vk → sw |
 //!
-//! …with one filter on top, and it is the honest half of the milestone: **a rung that has
-//! never decoded a frame on real hardware does not join `auto` while a proven rung is
-//! still below it** ([`native_rung_admitted`]). So in an `ffmpeg-fallback` build the
-//! rows above are what you get once the unproven rungs are switched in
-//! (`PUNKTFUNK_NATIVE_FIRST=1`); without that switch the unproven rung/codec pairs are
-//! skipped and the ladder is what shipped before M9, plus the pairs that DO have
-//! hardware evidence. In a build without `ffmpeg-fallback` there is nothing proven left
-//! below them, so every native rung is admitted and each session says so in its log.
+//! M9's evidence FILTER survives, narrowed to the one thing it can still protect
+//! ([`native_rung_admitted`]). The filter kept a rung that had never decoded on real
+//! hardware out of `auto` while its proven libavcodec twin was one step below. With the
+//! twins deleted that is usually no longer the situation: below native-d3d11va's AV1 leg,
+//! and below native-vaapi on NVIDIA/AMD, there is nothing proven left to fall onto, so
+//! barring the rung would not move a session one rung DOWN — it would take hardware decode
+//! away from it entirely, which is the worse answer.
+//!
+//! **One column of that table is different, and it is the one the filter still guards.**
+//! On Linux, Intel and every unknown vendor id run `native-vaapi → native-vk → sw`
+//! ([`VulkanDecodeDevice::prefer_vulkan_first`] is true for NVIDIA and AMD only), so the
+//! rung directly below the never-run pf-vaadec is native Vulkan Video — H.264 and H.265 on
+//! three drivers plus a 92-minute soak, AV1 250/250. There, barring the unproven rung moves
+//! the session exactly one rung down, onto proven code, so it is barred: an unproven rung
+//! yields to a rung that is BOTH verified for this codec and usable on THIS device, and to
+//! nothing else. A pin still reaches it — that is how the missing evidence gets generated.
+//!
+//! Where a rung is admitted unproven, every session SAYS so: the "decode rung active" line
+//! carries `hardware_verified` and the evidence note verbatim, and it is a **warning** when
+//! no hardware has ever decoded through the rung/codec pair the session just chose
+//! ([`log_rung`], [`native_evidence`]). That table below is what a field report about M10
+//! has to be read against.
 //!
 //! # Evidence — which rungs have actually decoded on hardware
 //!
-//! Recorded here because it is the fact that decides admission, and the fact a support
-//! engineer needs when a session log names a rung. [`native_evidence`] is the same table
-//! in code; it is what [`native_rung_admitted`] reads and what every session logs at
+//! Recorded here because it is the fact a support engineer needs when a session log names
+//! a rung. [`native_evidence`] is the same table in code; it is what every session logs at
 //! decoder construction (`hardware_verified` / `evidence` on the "decode rung active"
 //! line).
 //!
@@ -44,44 +56,18 @@
 //! The software rung's evidence is recorded for the same reason but does not gate
 //! anything: it is the LAST rung, so there is nothing below it to protect.
 //!
-//! # Running the M9 field bake
-//!
-//! The bake window and the regression criteria are the user's call — nothing here
-//! decides them, and nothing here claims the gate is met. What the code offers is two
-//! ways to put a box on the M9 ladder:
-//!
-//! * **With the safety net** (recommended): ship as built today and set
-//!   `PUNKTFUNK_NATIVE_FIRST=1` in the session's environment. Every native rung joins
-//!   `auto`, the FFmpeg twin stays directly below it, and a rung that misbehaves demotes
-//!   into a proven one instead of onto the CPU.
-//! * **Without it** (the M10 preview): build the client with
-//!   `--no-default-features` + the features you want minus `ffmpeg-fallback` — e.g.
-//!   `cargo build -p punktfunk-client-session --no-default-features --features ui,pyrowave`.
-//!   There is no FFmpeg rung anywhere in that binary.
-//!
-//! When the bake passes, the default flip is deleting `ffmpeg-fallback` from
-//! `clients/session` + `pf-presenter`'s default feature lists; M10 then deletes the
-//! feature and the rungs behind it.
-//!
 //! # The rungs
 //!
 //! * **native Vulkan Video** (`video_vk_native`): pf-vkdecode's H.264/H.265/AV1 decoders
 //!   on the PRESENTER's own VkDevice — the decoded VkImage feeds its CSC pass directly,
-//!   zero copy, no FFmpeg. Admission is [`native_vulkan_gate`].
+//!   zero copy. Admission is [`native_vulkan_gate`].
 //! * **native D3D11VA** (`video_d3d11_native`, Windows): pf-dxvadec plans driven into
-//!   `ID3D11VideoDecoder`, filling the same field-proven hand-off ring the FFmpeg rung
-//!   uses.
+//!   `ID3D11VideoDecoder`, filling the field-proven shareable-texture hand-off ring in
+//!   `crate::video_d3d11`.
 //! * **native VAAPI** (`video_vaapi_native`, Linux): pf-vaadec plans driven into a
-//!   dlopen'd libva, exporting the same DRM-PRIME dmabufs.
-//! * **Vulkan Video** (`ffmpeg-fallback`): FFmpeg's Vulkan decoder on the same shared
-//!   device (its handles arrive via [`VulkanDecodeDevice`]); every vendor with the video
-//!   extensions (measured 4K@144 with 0.1 ms decode).
-//! * **VAAPI** (`ffmpeg-fallback`, Linux): libavcodec hwaccel mapped to a DRM-PRIME
-//!   dmabuf (`av_hwframe_map`, zero copy). NVIDIA has no usable VAAPI
-//!   (nvidia-vaapi-driver is broken for this — Moonlight blacklists it); device creation
-//!   fails there.
-//! * **D3D11VA** (`ffmpeg-fallback`, Windows): the vendor-agnostic DXVA path every
-//!   Windows video player exercises (`crate::video_d3d11`).
+//!   dlopen'd libva, exporting DRM-PRIME dmabufs. NVIDIA has no usable VAAPI at all
+//!   (nvidia-vaapi-driver is broken for this — Moonlight blacklists it), so device
+//!   creation simply fails there and the ladder walks on.
 //! * **Software**: the CPU rung, FFmpeg-free since M8 — openh264 for H.264, rav1d
 //!   (dav1d) for AV1, planes uploaded straight to the presenter's planar CSC pass. It is
 //!   the LAST rung, so it never demotes further; and it has no HEVC decoder at all (none
@@ -89,36 +75,35 @@
 //!   onto a codec this client can decode — see [`last_rung_verdict`] and
 //!   [`NoSoftwareRung`].
 //!
-//! Every FFmpeg rung runs `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder
-//! streams (no B-frames, in-band parameter sets on every IDR), so decode is strictly
-//! one-in/one-out on every rung.
+//! The host encodes zero-reorder streams (no B-frames, in-band parameter sets on every
+//! IDR), so decode is strictly one-in/one-out on every rung.
 //!
 //! Windows has no VAAPI (DRM-PRIME is a Linux concept) and Linux no DXVA; the vendor
 //! order differs for one reason worth keeping in view: Intel's Windows driver DOES
-//! advertise Vulkan Video (Arc drivers since 2023), but FFmpeg-Vulkan on it strobes and
-//! burns the frame budget (B580 field report, 2026-07) where D3D11VA streams clean — so
-//! Intel/unknown take the DXVA pair first and NVIDIA/AMD keep the Vulkan pair first.
-//! Everything dmabuf-shaped is `cfg(target_os = "linux")`-gated inline.
+//! advertise Vulkan Video (Arc drivers since 2023), but Vulkan decode on it strobed and
+//! burned the frame budget (B580 field report, 2026-07 — measured on the FFmpeg-Vulkan
+//! rung of the day) where DXVA streamed clean, so Intel/unknown take DXVA first and
+//! NVIDIA/AMD keep Vulkan first. Everything dmabuf-shaped is
+//! `cfg(target_os = "linux")`-gated inline.
 //!
 //! # Overrides
 //!
-//! `PUNKTFUNK_DECODER=native-vulkan|native-d3d11va|native-vaapi|software` — and, in an
-//! `ffmpeg-fallback` build, `vulkan|vaapi|d3d11va` for the FFmpeg rungs specifically.
-//! A pin is a pin: it skips the vendor order AND the evidence filter, which is how a lab
-//! run reaches a rung `auto` will not pick. `PUNKTFUNK_NATIVE_FIRST=1` switches the
-//! unproven rungs into `auto` without pinning any of them (see the bake section above).
+//! `PUNKTFUNK_DECODER=native-vulkan|native-d3d11va|native-vaapi|software`. A pin skips
+//! the vendor order, which is how a lab run reaches a rung `auto` would not pick on this
+//! device; an init failure still logs and falls through to the standard ladder, so a pin
+//! can never cost a session its decoder.
+//!
+//! The pre-M10 spellings `vulkan`/`vaapi`/`d3d11va` named libavcodec's rungs specifically.
+//! They MIGRATE onto the native rung for the same hardware family, loudly
+//! ([`migrate_decoder_pref`]) — they are not developer-only strings, every desktop
+//! Settings UI offered them, and refusing them would end a session over a dropdown the
+//! user picked long ago.
 
-// bindgen's C-enum repr is target-dependent (u32 on Linux/clang, i32 on MSVC), so the
-// pf-ffvk Vulkan flag/enum casts below are required on one platform and no-ops on the
-// other — the lint would fire on whichever platform the cast is a no-op for.
-#![allow(clippy::unnecessary_cast)]
-
-// `anyhow!` (the FFmpeg `averr`) and `Context` (libav init) belong to the FFmpeg
-// rungs; `bail!`/`Result` are the ladder's own.
-#[cfg(feature = "ffmpeg-fallback")]
-use anyhow::{anyhow, Context as _};
-use anyhow::{bail, Result};
-use ffmpeg_next as ffmpeg;
+// `bail!` has exactly one site left and it is Windows-only (the D3D11VA rung's win32
+// external-memory refusal), so the import is gated with it rather than allowed dead.
+#[cfg(windows)]
+use anyhow::bail;
+use anyhow::Result;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 
@@ -127,11 +112,7 @@ pub use crate::video_color::{csc_rows, ColorDesc};
 /// module itself stays private, like every other backend's.
 pub use crate::video_software::NoSoftwareRung;
 use crate::video_software::SoftwareDecoder;
-#[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
-use crate::video_vaapi::VaapiDecoder;
 use crate::video_vk_native::{NativeCodec, NativeVulkanDecoder};
-#[cfg(feature = "ffmpeg-fallback")]
-use crate::video_vulkan::VulkanDecoder;
 
 /// One decoded frame headed for the presenter, carrying the host capture timestamp so the
 /// UI can measure capture→displayed latency at the moment it presents.
@@ -156,38 +137,24 @@ pub enum DecodedImage {
     ///
     /// It REPLACES the old `Cpu(CpuFrame)` RGBA variant rather than joining it — there is
     /// exactly one CPU rung, and the swscale conversion it used to carry (and its BT.601
-    /// default) is what this milestone deletes. Adding a second CPU variant would have
+    /// default) is what M8 deleted. Adding a second CPU variant would have
     /// bought the [`DecodedImage::NativeDmabuf`] property below for a distinction that
     /// does not exist: no `stats:` tag, no presenter path and no consumer would ever have
     /// been able to reach the old one.
     Cpu(CpuPlanarFrame),
-    #[cfg(target_os = "linux")]
-    Dmabuf(DmabufFrame),
-    /// The NATIVE VAAPI rung's output (`pf-vaadec` + `video_vaapi_native`, M6) —
-    /// physically the same thing as [`DecodedImage::Dmabuf`], and deliberately the
-    /// same payload type, because the import a consumer performs is identical:
-    /// dmabuf fds plus a plane layout. It is a separate VARIANT purely so the two
-    /// rungs can never be confused for one another.
+    /// The NATIVE VAAPI rung's output (`pf-vaadec` + `video_vaapi_native`, M6): dmabuf
+    /// fds plus a plane layout, exported DRM-PRIME from libva.
     ///
-    /// That is not fastidiousness. Both D3D11VA rungs share one variant (they share
-    /// the hand-off ring on purpose), and the consequence had to be fixed in
-    /// `1573a987`: the `stats:` decode-path tag is derived from the variant, so a
-    /// "native" soak could silently have been an FFmpeg soak, and there was no way
-    /// to tell from the log. Here the compiler asks the question instead — every
-    /// `match` on `DecodedImage` must say which rung it means.
+    /// It shared this payload type with a `Dmabuf` variant — libavcodec's VAAPI hwaccel,
+    /// deleted at M10 — and was kept SEPARATE from it deliberately, which is what the
+    /// name still records. That was not fastidiousness: the two D3D11VA rungs shared one
+    /// variant (they shared the hand-off ring on purpose) and the consequence had to be
+    /// fixed in `1573a987` — the `stats:` decode-path tag is derived from the variant, so
+    /// a "native" soak could silently have been an FFmpeg soak with nothing in the log to
+    /// tell. The name is load-bearing for the same reason today: `native-vaapi` is the
+    /// tag downstream tooling reads, and renaming the variant would rename that.
     #[cfg(target_os = "linux")]
     NativeDmabuf(DmabufFrame),
-    /// FFmpeg Vulkan Video output: a VkImage already on the PRESENTER's device.
-    ///
-    /// ⚠ **Unreachable without `ffmpeg-fallback`** — [`crate::video_vulkan`] is its only
-    /// producer and that module is not compiled. The VARIANT and [`VkVideoFrame`] stay
-    /// unconditional anyway, because they are `pf-presenter`'s public import: its
-    /// `vk/present.rs` implements the `AVVkFrame` lock/unlock + `value + 1` write-back
-    /// contract against this exact type, over `pf-ffvk` handles of its own. Deleting the
-    /// type here is deleting that lane, which M10 does in one move (§6 deletes
-    /// `crates/pf-ffvk` too) rather than M9 doing it half-way through a milestone whose
-    /// gates cannot run a GPU.
-    VkFrame(VkVideoFrame),
     /// D3D11VA output copied into a shareable NT-handle texture the presenter imports
     /// (`VK_KHR_external_memory_win32`) — the DXVA path for GPUs without Vulkan Video
     /// (Intel's Windows driver foremost). See `crate::video_d3d11`.
@@ -198,11 +165,10 @@ pub enum DecodedImage {
     /// samples them directly (BT.709 limited, the codec's fixed colour contract).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
-    /// Native Vulkan Video output (pf-vkdecode — auto's H.264/HEVC rung immediately
-    /// above FFmpeg-Vulkan, plus M7's pin-only AV1 leg; pinnable via
-    /// `PUNKTFUNK_DECODER=native-vulkan`): a decoded image + per-plane views already
-    /// on the PRESENTER's device — same zero-copy contract as
-    /// [`DecodedImage::VkFrame`], no FFmpeg involved. The picture format is the
+    /// Native Vulkan Video output (pf-vkdecode — auto's top rung for H.264, HEVC and
+    /// AV1; pinnable via `PUNKTFUNK_DECODER=native-vulkan`): a decoded image +
+    /// per-plane views already on the PRESENTER's device, zero copy — no import, no
+    /// staging, no interop. The picture format is the
     /// stream's, carried on the frame ([`NativeVkFrame::vk_format`] — NV12 for H.264,
     /// HEVC Main and AV1 Main 8-bit, P010 for Main 10, the two-plane 4:4:4 formats for
     /// RExt and AV1 High), never assumed. The presenter waits the frame's timeline
@@ -349,9 +315,9 @@ impl DecodeHealth {
 
 /// A raw `VkFormat` code point, carried across the ash-free boundary.
 ///
-/// A newtype rather than a bare `i32` because the two hardware frame types
-/// ([`VkVideoFrame`], [`NativeVkFrame`]) carry OTHER `i32`s — `poc` foremost — and
-/// the presenter's colour-math lookup takes exactly one number. Handed the wrong
+/// A newtype rather than a bare `i32` because the hardware frame type
+/// ([`NativeVkFrame`]) carries OTHER `i32`s — `poc` foremost — and the presenter's
+/// colour-math lookup takes exactly one number. Handed the wrong
 /// one it compiles, warns once about an unmapped format, and renders every frame of
 /// the session as 8-bit: decoded correctly, displayed wrong, silently. The wrapper
 /// makes that a type error instead.
@@ -364,7 +330,7 @@ pub struct RawVkFormat(pub i32);
 ///
 /// It is public so the PRESENTER can pin its per-format colour-math table against the
 /// real producer. pf-presenter has no pf-vkdecode dependency, so without this its only
-/// available check is the FFmpeg lane's table against itself — which stays green if
+/// available check would be its own table against itself — which stays green if
 /// pf-vkdecode grows a fifth output format (12-bit RExt) that the CSC pass has no
 /// depth mapping for. This crate sees both, so the fact crosses here.
 pub fn native_picture_formats() -> Vec<RawVkFormat> {
@@ -372,61 +338,6 @@ pub fn native_picture_formats() -> Vec<RawVkFormat> {
         .iter()
         .map(|f| RawVkFormat(f.as_raw()))
         .collect()
-}
-
-/// One Vulkan-decoded frame. The image lives on the presenter's own VkDevice (the
-/// decoder was built over its handles), so presenting is: plane views → CSC pass — no
-/// import, no copy. The live synchronization state (layout / timeline value / owning
-/// queue family) is deliberately NOT snapshotted here: FFmpeg updates it per submission,
-/// so the presenter reads it through `vkframe` under the frames-context lock at ITS
-/// submit time (the `AVVulkanFramesContext.lock_frame` contract).
-pub struct VkVideoFrame {
-    /// `AVVkFrame*` — img[0] is the (multiplanar) image; sem/sem_value/layout/
-    /// queue_family are the live sync state. Valid while `guard` lives.
-    pub vkframe: usize,
-    /// `AVHWFramesContext*` (FFmpeg's) — the first argument to the lock functions.
-    /// Valid while `guard` lives.
-    pub frames_ctx: usize,
-    /// `AVVulkanFramesContext.lock_frame` / `.unlock_frame` (filled in by FFmpeg's
-    /// init): the presenter MUST hold the lock while reading the live sync state and
-    /// writing back the incremented semaphore value around its submission.
-    pub lock_frame: usize,
-    pub unlock_frame: usize,
-    /// The frame pool's VkFormat (`AVVulkanFramesContext.format[0]`) — the
-    /// multiplanar format the presenter builds its per-plane views against.
-    pub vk_format: RawVkFormat,
-    /// The frame's timeline semaphore (raw VkSemaphore; creation-constant) and the
-    /// value FFmpeg's decode submission signals on completion — the pump waits this
-    /// pair AFTER shipping the frame to measure true GPU decode time (zero pipeline
-    /// cost: the presenter already waits the same pair on the GPU).
-    pub timeline_sem: u64,
-    pub decode_done_value: u64,
-    pub width: u32,
-    pub height: u32,
-    /// The decode POOL's allocated extent (`AVHWFramesContext.width`/`.height`) — the
-    /// CODED picture size (rounded up to the codec's macroblock alignment, then to the
-    /// driver's Vulkan picture-access granularity), so it is `>=` `width`/`height`. At
-    /// 1080p the pool is 1088 rows tall: 1080 is not a multiple of 16.
-    ///
-    /// The presenter samples this image with NORMALIZED coordinates, so it needs both
-    /// numbers — `width`/`height` is what to display, `coded_*` is what the texture
-    /// actually spans. Sampling `0..1` without the ratio stretches the alignment padding
-    /// into view; because encoders fill those rows by replicating the picture's last
-    /// line, that reads as the bottom row smeared over the final few rows of the image
-    /// (field report 2026-07-31). Same class as the D3D11VA source-rect clamp in
-    /// `crate::video_d3d11`, which shows as a green bar there only because DXVA padding
-    /// is left uninitialized rather than replicated.
-    pub coded_width: u32,
-    pub coded_height: u32,
-    pub color: ColorDesc,
-    /// Intra keyframe (IDR/I): the stream's re-anchor point. The pump resumes display on
-    /// one after suppressing the concealed frames a reference loss leaves in its wake (on
-    /// RADV a lost reference decodes to a gray plate with the new motion painted on top).
-    pub keyframe: bool,
-    /// Keeps the cloned AVFrame (and through it the VkImage + frames context) alive
-    /// until the presenter's fence proves the GPU reads done — same mechanism as the
-    /// VAAPI path's DRM guard.
-    pub guard: DrmFrameGuard,
 }
 
 /// The layout a [`NativeVkFrame`]'s image layer is in when its semaphore signals —
@@ -448,7 +359,7 @@ pub enum NativeVkLayout {
 /// belongs to (a stale generation routes to the decoder's graveyard — retired pools
 /// die on their last token), and `presented` reports whether the presenter SAMPLED
 /// the image — i.e. whether its submission enqueued the frame's `value + 1` timeline
-/// signal (the AVVkFrame write-back the decoder must wait before reusing the image).
+/// signal (the write-back the decoder must wait before reusing the image).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeReleaseToken {
     pub seq: u64,
@@ -460,7 +371,7 @@ pub struct NativeReleaseToken {
 }
 
 /// Sends the frame's [`NativeReleaseToken`] exactly once, on drop — the native path's
-/// analog of the VAAPI/VkFrame `DrmFrameGuard`s. The presenter holds the frame (and so
+/// analog of the VAAPI rung's [`DrmFrameGuard`]. The presenter holds the frame (and so
 /// this guard) until its sampling submission's fence has been waited, which makes
 /// "guard dropped" equal "the GPU is done with the image"; a frame dropped UNPRESENTED
 /// (newest-wins displacement, demotion drain) releases through the very same drop. A
@@ -510,8 +421,8 @@ impl Drop for NativeReleaseGuard {
 pub struct NativeVkFrame {
     /// The decode image (raw `VkImage`); the picture occupies array layer [`Self::layer`].
     pub image: u64,
-    /// The picture's own `VkFormat` (same shape as [`VkVideoFrame::vk_format`]):
-    /// what the image was created with and what [`Self::plane_views`] alias.
+    /// The picture's own `VkFormat`: what the image was created with and what
+    /// [`Self::plane_views`] alias.
     ///
     /// Read it, never infer it from the codec. H.264 in this program is the 8-bit
     /// 4:2:0 envelope, so its frames are always NV12 — but an H.265 session's format
@@ -523,16 +434,15 @@ pub struct NativeVkFrame {
     pub vk_format: RawVkFormat,
     /// Per-plane views (raw `VkImageView`s) in the formats pf-vkdecode resolves for
     /// [`Self::vk_format`] — `R8`/`R8G8` for the 8-bit families, `R10X6`/`R10X6G10X6`
-    /// for the 10-bit ones — the presenter's planar CSC sampling contract, same shape
-    /// as the FFmpeg path's derived plane views.
+    /// for the 10-bit ones — the presenter's planar CSC sampling contract.
     pub plane_views: [u64; 2],
     pub layer: u32,
     /// The layout the layer is in when the semaphore signals; the presenter must
     /// return it there after sampling (see [`NativeVkLayout`]).
     pub layout: NativeVkLayout,
     /// Timeline pair (raw `VkSemaphore` + value): pixels are ready when the semaphore
-    /// reaches the value — the presenter waits it on the GPU (submit wait list, like
-    /// the AVVkFrame path), never on the host.
+    /// reaches the value — the presenter waits it on the GPU (submit wait list), never
+    /// on the host.
     pub semaphore: u64,
     pub semaphore_value: u64,
     /// The decoder session generation the handles belong to (rides the release token).
@@ -543,7 +453,12 @@ pub struct NativeVkFrame {
     pub height: u32,
     /// The image's allocated/coded extent (`>=` display) — the presenter scales its
     /// sampling UVs by display/coded per axis or the alignment padding smears into
-    /// view (the 1088-row lesson; same contract as [`VkVideoFrame::coded_width`]).
+    /// view. That is the 1088-row lesson (field report 2026-07-31): at 1080p the pool
+    /// is 1088 rows tall because 1080 is not a multiple of 16, encoders fill the extra
+    /// rows by replicating the picture's last line, and sampling `0..1` without the
+    /// ratio smears that line over the bottom of the image. Same class as the D3D11VA
+    /// source-rect clamp in `crate::video_d3d11`, which shows as a green bar there only
+    /// because DXVA padding is left uninitialized rather than replicated.
     pub coded_width: u32,
     pub coded_height: u32,
     /// Crop origin within the coded picture. Punktfunk hosts emit origin crops only;
@@ -553,9 +468,8 @@ pub struct NativeVkFrame {
     pub crop_y: u32,
     /// Colour signalling, read from the SPS active for THIS picture (the H.264/H.265
     /// VUI → H.273 code points, with E.2.1's "unspecified" inference where the VUI is
-    /// silent) — per frame, like the FFmpeg rungs' AVFrame CICP, because the host
-    /// switches HDR in-band; "unspecified" resolves to the BT.709-limited SDR
-    /// default (`csc_rows`' documented fallback).
+    /// silent) — per frame, because the host switches HDR in-band; "unspecified"
+    /// resolves to the BT.709-limited SDR default (`csc_rows`' documented fallback).
     pub color: ColorDesc,
     /// IDR — the stream's re-anchor point (the pump's post-loss resume signal). Truly
     /// IDR: on H.265 a CRA/BLA does NOT set this (pf-bitstream keys it off the NALU
@@ -590,43 +504,26 @@ pub struct NativeVkFrame {
     pub guard: NativeReleaseGuard,
 }
 
-/// True if the decoder tagged this frame as a full IDR keyframe — a guaranteed clean re-anchor
-/// after which the picture is loss-free, so the pump can lift a post-loss display freeze here.
-///
-/// Keys off `AV_FRAME_FLAG_KEY` (with `pict_type == I` as a belt for decoders that fill pict_type
-/// but not the flag). NOTE: FFmpeg's H.264/HEVC decode layer sets this flag **only for true IDR
-/// frames**, never for an *intra-refresh recovery point*. H.264 flags key only when a picture's
-/// `recovery_frame_cnt == 0` (a moving band uses `> 0`); HEVC clears the flag on every non-IRAP
-/// frame regardless of the recovery-point SEI. So an intra-refresh host (NVENC/AMF/QSV) heals the
-/// picture over N P-frames with no decoded frame ever flagged key — this function cannot detect
-/// that clean point, and the pump would freeze until the `REANCHOR_FREEZE_MAX` backstop (in
-/// `session.rs`) forces a real IDR. Detecting an intra-refresh re-anchor requires an out-of-band
-/// host wire signal on the AU that completes the wave; that is not yet plumbed.
-///
-/// # Safety
-/// `frame` must point to a valid `AVFrame` alive for the duration of the call.
-///
-/// FFmpeg rungs only (`ffmpeg-fallback`): every native rung reads the NALU type out of
-/// the bitstream through pf-bitstream, which is both earlier and — for intra refresh —
-/// answerable at all.
-#[cfg(feature = "ffmpeg-fallback")]
-pub unsafe fn frame_is_keyframe(frame: *const ffmpeg::ffi::AVFrame) -> bool {
-    // SAFETY: caller guarantees a live AVFrame; plain field reads.
-    unsafe {
-        ((*frame).flags & ffmpeg::ffi::AV_FRAME_FLAG_KEY) != 0
-            || (*frame).pict_type == ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_I
-    }
-}
-
 impl DecodedImage {
-    /// Whether the frame is an intra keyframe — see [`frame_is_keyframe`]. The pump uses
-    /// this as the stream's re-anchor signal after a loss.
+    /// Whether the frame is an intra keyframe (IDR) — the pump's re-anchor signal after
+    /// a loss.
+    ///
+    /// Every rung answers this from the BITSTREAM now (pf-bitstream's NALU/OBU walk),
+    /// which is both earlier than a decoder's own flag and — unlike libavcodec's
+    /// `AV_FRAME_FLAG_KEY`, which this used to be read from — not the whole story:
+    /// libavcodec flags key only for a true IDR, never for an *intra-refresh recovery
+    /// point* (H.264 needs `recovery_frame_cnt == 0`; HEVC clears the flag on every
+    /// non-IRAP frame regardless of the recovery-point SEI). An intra-refresh host
+    /// (NVENC/AMF/QSV) heals the picture over N P-frames and flags nothing, so this
+    /// alone would freeze the pump until `session.rs`'s `REANCHOR_FREEZE_MAX` backstop
+    /// forced a real IDR — the very IDR the wave exists to avoid. That is what
+    /// [`Self::local_recovery`] answers, from the SEI, and it is one of the things the
+    /// native rungs bought.
     pub fn is_keyframe(&self) -> bool {
         match self {
             DecodedImage::Cpu(f) => f.keyframe,
             #[cfg(target_os = "linux")]
-            DecodedImage::Dmabuf(f) | DecodedImage::NativeDmabuf(f) => f.keyframe,
-            DecodedImage::VkFrame(f) => f.keyframe,
+            DecodedImage::NativeDmabuf(f) => f.keyframe,
             #[cfg(windows)]
             DecodedImage::D3d11(f) => f.keyframe,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -638,9 +535,10 @@ impl DecodedImage {
     /// What the decoder's OWN bitstream parser saw about an intra-refresh heal on
     /// this frame's AU — the recovery point SEI, which no platform decoder exposes.
     ///
-    /// Only the rungs with their OWN parser can answer: libavcodec parses the SEI
-    /// internally and surfaces nothing of it (its `AV_FRAME_FLAG_KEY` is IDR-only),
-    /// MediaCodec and VideoToolbox likewise. That is the native Vulkan rung and — since
+    /// Only the rungs with their OWN parser can answer: a platform decoder parses the
+    /// SEI internally and surfaces nothing of it (MediaCodec, VideoToolbox — and
+    /// libavcodec, whose `AV_FRAME_FLAG_KEY` is IDR-only, back when it was a rung here).
+    /// That is the native Vulkan rung and — since
     /// M8 — the CPU rung's H.264 leg, which plans every AU with the same `H264Planner`
     /// and folds the SEI with the same `RecoveryWatch`. Everyone else reports
     /// [`LocalRecovery::NONE`](punktfunk_core::reanchor::LocalRecovery::NONE) and
@@ -677,8 +575,7 @@ impl DecodedImage {
         match self {
             DecodedImage::Cpu(f) => (f.width, f.height),
             #[cfg(target_os = "linux")]
-            DecodedImage::Dmabuf(f) | DecodedImage::NativeDmabuf(f) => (f.width, f.height),
-            DecodedImage::VkFrame(f) => (f.width, f.height),
+            DecodedImage::NativeDmabuf(f) => (f.width, f.height),
             #[cfg(windows)]
             DecodedImage::D3d11(f) => (f.width, f.height),
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -715,7 +612,8 @@ pub struct CpuPlanarFrame {
     /// see `video_software`'s module docs). Drives the CSC matrix/range AND, for a PQ
     /// stream, the presenter's tone-map mode.
     pub color: ColorDesc,
-    /// Intra keyframe (IDR) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
+    /// Intra keyframe (IDR) — the pump's post-loss re-anchor signal. See
+    /// [`DecodedImage::is_keyframe`].
     pub keyframe: bool,
     /// What this frame's AU said about intra-refresh RECOVERY — the same
     /// `pf-vkdecode` [`RecoveryWatch`](pf_vkdecode::RecoveryWatch) fold the native rung
@@ -822,7 +720,8 @@ pub struct DmabufFrame {
     /// Signaling of the source frame — drives the `GdkDmabufTexture` color state (BT.709
     /// narrow for SDR, BT.2020 PQ for an HDR stream).
     pub color: ColorDesc,
-    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
+    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See
+    /// [`DecodedImage::is_keyframe`].
     pub keyframe: bool,
     pub guard: DrmFrameGuard,
 }
@@ -838,96 +737,68 @@ pub struct DmabufPlane {
 /// it releases the surface back to its decoder's pool and closes the fds.
 ///
 /// The consumer treats this as opaque — the presenter dups every dmabuf fd it
-/// imports and simply holds the guard until its fence has been waited — so the only
-/// thing the two variants differ in is WHO owns the surface. libavcodec's rungs hand
-/// over a mapped `AVFrame`; the native VAAPI rung (`video_vaapi_native`, M6) owns a
-/// `VASurface` from its own pool and has no `AVFrame` at all, which is precisely the
-/// seam that had to be widened for it to exist. M10 deletes the FFmpeg variant and
-/// this enum collapses again.
-pub enum DrmFrameGuard {
-    /// A mapped DRM-PRIME `AVFrame` — the FFmpeg VAAPI hwaccel — or the cloned
-    /// `AVFrame` behind an `AVVkFrame` on the FFmpeg Vulkan path.
-    Av(*mut ffmpeg::ffi::AVFrame),
-    /// The native VAAPI rung's own owner: closes the exported PRIME fds and returns
-    /// the surface to the decoder's pool.
-    #[cfg(target_os = "linux")]
-    NativeVa(crate::video_vaapi_native::VaFrameGuard),
-}
-// SAFETY: the `Av` variant owns one `AVFrame` and frees it exactly once in `Drop`. libav's buffer
-// refcounts are atomic and its hwframe pool is internally locked, so releasing the frame — and with
-// it the VAAPI surface, back to the decoder's pool — from a different thread than the one that
-// mapped it is sound. That is the whole point here: the guard is handed to GTK and dropped on the
-// main thread while the pump thread keeps decoding. Moved, never shared; deliberately NOT `Sync`.
-// The `NativeVa` variant is `Send` on its own (owned fds plus an `mpsc::Sender`) and needs no
-// promise from here.
-unsafe impl Send for DrmFrameGuard {}
-
-impl Drop for DrmFrameGuard {
-    fn drop(&mut self) {
-        match self {
-            // SAFETY: this is the one `AVFrame` the guard owns; `av_frame_free` releases it
-            // exactly once (this `Drop` runs once) and nulls the pointer through the `&mut`.
-            DrmFrameGuard::Av(frame) => unsafe { ffmpeg::ffi::av_frame_free(frame) },
-            // The native guard releases through its own `Drop`, which runs as this value's
-            // fields are dropped — right after this match.
-            #[cfg(target_os = "linux")]
-            DrmFrameGuard::NativeVa(_) => {}
-        }
-    }
-}
+/// imports and simply holds the guard until its fence has been waited.
+///
+/// It was an ENUM until M10, because libavcodec's VAAPI hwaccel handed over a mapped
+/// `AVFrame` while the native rung (`video_vaapi_native`, M6) owns a `VASurface` from its
+/// own pool — widening this seam is what let the native rung exist alongside it. With the
+/// FFmpeg rung deleted there is one owner left, so the enum collapses to the newtype it
+/// started as, and the `unsafe impl Send` the `AVFrame` pointer needed goes with it:
+/// [`VaFrameGuard`](crate::video_vaapi_native::VaFrameGuard) is owned fds plus an
+/// `mpsc::Sender`, i.e. `Send` on its own terms.
+#[cfg(target_os = "linux")]
+pub struct DrmFrameGuard(
+    /// Nothing ever READS this — the whole type is its `Drop`, which closes the exported
+    /// PRIME fds and returns the surface to the decoder's pool. `dead_code` is answered
+    /// here rather than by removing the field (that would release the surface at
+    /// construction) or by making the type an alias (that would hand the presenter a
+    /// pf-vaadec-shaped name for something it must treat as opaque).
+    #[allow(dead_code)]
+    pub(crate) crate::video_vaapi_native::VaFrameGuard,
+);
 
 enum Backend {
-    /// FFmpeg's Vulkan Video rung — compiled only with `ffmpeg-fallback`, and then it
-    /// sits DIRECTLY BELOW [`Backend::NativeVulkan`] (M9).
-    #[cfg(feature = "ffmpeg-fallback")]
-    Vulkan(VulkanDecoder),
     /// Native Vulkan Video H.264/HEVC/AV1 (pf-vkdecode) on the presenter's device —
-    /// auto's TOP rung on both desktop OSes since M9, for all three codecs — every leg
+    /// auto's TOP rung on both desktop OSes, for all three codecs — every leg
     /// has hardware parity against libavcodec (see this module's evidence table) — also
     /// pinnable by name (`PUNKTFUNK_DECODER=native-vulkan`); see [`native_vulkan_gate`].
     /// The negotiated codec picks the decoder once, at construction; everything else
-    /// about this backend is codec-agnostic. Errors ride the SAME streak/demotion
-    /// machinery as the FFmpeg-Vulkan rung.
+    /// about this backend is codec-agnostic.
     /// Boxed: the decoder (planner + shipped-frame ledger) dwarfs the other variants,
     /// same as PyroWave below.
     NativeVulkan(Box<NativeVulkanDecoder>),
-    /// libavcodec's VAAPI hwaccel — compiled only with `ffmpeg-fallback`, directly below
-    /// [`Backend::NativeVaapi`] (M9).
-    #[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
-    Vaapi(VaapiDecoder),
-    /// Native VAAPI (`pf-vaadec` + `video_vaapi_native`) — M6's replacement for the
-    /// FFmpeg-backed [`Backend::Vaapi`] rung: libva driven straight from pf-bitstream
-    /// plans, dlopen'd, exporting the same DRM-PRIME dmabufs, no libavcodec.
-    /// Reachable by pin (`PUNKTFUNK_DECODER=native-vaapi`) always, and by `auto` under
-    /// [`native_rung_admitted`]: this rung has decoded NOTHING on hardware, so it joins
-    /// `auto` only where no proven rung is left below it (a build without
-    /// `ffmpeg-fallback`) or where the user asked (`PUNKTFUNK_NATIVE_FIRST=1`). Errors
-    /// ride the SAME streak/demotion machinery as every other hardware rung.
+    /// Native VAAPI (`pf-vaadec` + `video_vaapi_native`) — M6's replacement for
+    /// libavcodec's VAAPI hwaccel, and since M10 the only VAAPI rung: libva driven
+    /// straight from pf-bitstream plans, dlopen'd, exporting the same DRM-PRIME dmabufs.
+    /// Reachable by pin (`PUNKTFUNK_DECODER=native-vaapi`) and by `auto` in the vendor
+    /// order. ⚠ This rung has decoded NOTHING on hardware ([`native_evidence`]) — `auto`
+    /// runs it where the alternative below it is the CPU, and yields to native Vulkan
+    /// Video where that rung is proven for the codec and usable on the device
+    /// ([`native_rung_admitted`], which is the Intel/unknown arm). Every session that
+    /// lands on it says so at `warn`. Errors ride the SAME streak/demotion machinery as
+    /// every other hardware rung.
     /// Boxed: the decoder (two planners, a display and a surface pool) dwarfs the
     /// other variants.
     #[cfg(target_os = "linux")]
     NativeVaapi(Box<crate::video_vaapi_native::NativeVaapiDecoder>),
-    /// libavcodec's D3D11VA hwaccel — compiled only with `ffmpeg-fallback`, directly
-    /// below [`Backend::NativeD3d11va`] (M9).
-    #[cfg(all(windows, feature = "ffmpeg-fallback"))]
-    D3d11va(crate::video_d3d11::D3d11vaDecoder),
-    /// Native D3D11VA (`pf-dxvadec` + `video_d3d11_native`) — M5's replacement for the
-    /// FFmpeg-backed [`Backend::D3d11va`] rung: `ID3D11VideoDecoder` driven from
-    /// pf-bitstream plans, filling the same shareable-RGBA hand-off, no libavcodec.
-    /// Reachable by pin (`PUNKTFUNK_DECODER=native-d3d11va`) always, and by `auto` under
-    /// [`native_rung_admitted`]: its H.264/H.265 legs have hardware parity + a soak (M5)
-    /// and are in `auto`; its AV1 leg has decoded nothing anywhere and is not. Errors
+    /// Native D3D11VA (`pf-dxvadec` + `video_d3d11_native`) — M5's replacement for
+    /// libavcodec's D3D11VA hwaccel, and since M10 the only DXVA rung:
+    /// `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the shareable-RGBA
+    /// hand-off ring in `crate::video_d3d11`.
+    /// Reachable by pin (`PUNKTFUNK_DECODER=native-d3d11va`) and by `auto` in the vendor
+    /// order: its H.264/H.265 legs have hardware parity + a soak (M5); its AV1 leg has
+    /// decoded nothing anywhere and runs with the warning [`log_rung`] emits. Errors
     /// ride the SAME streak/demotion machinery as every other hardware rung.
     /// Boxed: the decoder (two planners plus a session) dwarfs the other variants.
     #[cfg(windows)]
     NativeD3d11va(Box<crate::video_d3d11_native::NativeD3d11Decoder>),
-    /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device,
-    /// no FFmpeg involvement (Linux + Windows — same Vulkan presenter on both). No demotion
+    /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device
+    /// (Linux + Windows — same Vulkan presenter on both). No demotion
     /// rung — there is no other decoder for it.
     /// Boxed: the decoder (pinned create-info hold + plane ring) dwarfs the other variants.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(Box<crate::video_pyrowave::PyroWaveDecoder>),
-    /// The CPU rung (M8: openh264 / rav1d, no libavcodec). Last in every ladder, so it
+    /// The CPU rung (M8: openh264 / rav1d). Last in every ladder, so it
     /// never demotes — and the only rung that can fail to EXIST for a codec, which is a
     /// different answer from failing to decode: see [`last_rung_verdict`].
     Software(SoftwareDecoder),
@@ -969,14 +840,12 @@ impl StreamFormat {
 
 pub struct Decoder {
     backend: Backend,
-    /// The negotiated codec (from the host's Welcome), so a mid-session VAAPI→software demotion
-    /// rebuilds the software decoder for the SAME codec.
-    codec_id: ffmpeg::codec::Id,
-    /// The same codec as the WIRE states it — what the software rung is built for and
-    /// what a refusal names. Derived once from [`Self::codec_id`] rather than carried
-    /// through a widened `Decoder::new` signature, because the ladder above still speaks
-    /// FFmpeg ids and will until M10 deletes its last FFmpeg rung; this field is the one
-    /// place the two vocabularies meet.
+    /// The negotiated codec as the WIRE states it ([`punktfunk_core::quic`]'s `CODEC_*`
+    /// bit, from the host's Welcome) — the ONE codec vocabulary this crate speaks since
+    /// M10 deleted `ffmpeg::codec::Id` along with the rungs that needed it. Every rung
+    /// map ([`native_codec`], [`native_d3d11_codec`], [`native_vaapi_codec`]), the
+    /// evidence table and the software rung's refusal are keyed on it, so a mid-session
+    /// demotion rebuilds for the SAME codec by construction rather than by translation.
     wire_codec: u8,
     /// Consecutive hardware decode errors (Vulkan or VAAPI) — a single transient failure
     /// (e.g. a reference-missing frame after packet loss) shouldn't cost the whole
@@ -994,14 +863,19 @@ pub struct Decoder {
     want_keyframe: bool,
     /// The CURRENT backend has delivered at least one frame. A backend that never did
     /// is one the session never actually had, so its error streak must not cost the
-    /// session the rung BELOW it — see the native→FFmpeg-Vulkan arm in
-    /// [`Decoder::decode_frame`]. Reset on every backend swap.
+    /// session the rung BELOW it. Reset on every backend swap.
+    ///
+    /// ⚠ Read by nothing but [`Decoder::decode_frame`]'s streak accounting since M10:
+    /// the arm that consumed it — "a native Vulkan rung that never delivered demotes to
+    /// FFmpeg-Vulkan rather than past it" — is gone with FFmpeg-Vulkan itself, and the
+    /// property it protected now holds structurally, because the rung directly below
+    /// native Vulkan IS the next candidate the walk tries.
     delivered: bool,
-    /// The presenter's device, kept so that same arm can build the FFmpeg-Vulkan
+    /// The presenter's device, kept so the demotion walk can build a native Vulkan
     /// decoder mid-stream. Cloned once per session; its handles outlive every pump
     /// (see [`VulkanDecodeDevice`]).
     vk: Option<VulkanDecodeDevice>,
-    /// The negotiated picture shape, kept for the same reason `vk` is: since M9 the
+    /// The negotiated picture shape, kept for the same reason `vk` is: the
     /// demotion walk can build a NATIVE rung mid-stream, and every native constructor
     /// takes it as its device probe ([`StreamFormat`]).
     stream: StreamFormat,
@@ -1009,8 +883,8 @@ pub struct Decoder {
     /// and [`RUNG_BIT_NATIVE_PLATFORM`], set the moment a rung is installed.
     ///
     /// It is what makes the demotion walk TERMINATE now that two native rungs can
-    /// demote into each other (the ladder is `native → other native → software` where
-    /// no FFmpeg twin is compiled, and the two orders are opposite per vendor — so
+    /// demote into each other (the ladder is `native → other native → software`, and
+    /// the two orders are opposite per vendor — so
     /// without this a Vulkan⇄platform pair could hand the session back and forth
     /// forever, one error streak at a time, and never reach the CPU rung that would at
     /// least show a picture). A rung already entered is never re-entered.
@@ -1035,8 +909,8 @@ const RUNG_BIT_NATIVE_VULKAN: u8 = 1 << 0;
 const RUNG_BIT_NATIVE_PLATFORM: u8 = 1 << 1;
 
 /// Which [`Decoder::entered_rungs`] bit a backend claims — 0 for the rungs that cannot
-/// be a demotion TARGET twice (the FFmpeg twins are only ever reached downward, and
-/// software is terminal), so they need no bookkeeping.
+/// be a demotion TARGET twice (software is terminal; PyroWave never demotes at all), so
+/// they need no bookkeeping.
 fn rung_bit(backend: &Backend) -> u8 {
     match backend {
         Backend::NativeVulkan(_) => RUNG_BIT_NATIVE_VULKAN,
@@ -1109,13 +983,17 @@ const VIDEO_CODEC_OP_DECODE_AV1: u32 = 0x0000_0004;
 /// family cannot run is undefined behaviour, not an error).
 ///
 /// ⚠ Being here is "pf-vkdecode has a decoder", NOT "the automatic ladder may pick
-/// it". AV1 (M7) is pin-only; [`native_vulkan_gate`] holds that decision, and it
-/// reads this map for the codec/caps pair only.
-fn native_codec(codec_id: ffmpeg::codec::Id) -> Option<(NativeCodec, u32)> {
-    match codec_id {
-        ffmpeg::codec::Id::H264 => Some((NativeCodec::H264, VIDEO_CODEC_OP_DECODE_H264)),
-        ffmpeg::codec::Id::HEVC => Some((NativeCodec::H265, VIDEO_CODEC_OP_DECODE_H265)),
-        ffmpeg::codec::Id::AV1 => Some((NativeCodec::Av1, VIDEO_CODEC_OP_DECODE_AV1)),
+/// it": [`native_vulkan_gate`] holds that decision, and it reads this map for the
+/// codec/caps pair only.
+///
+/// The key is the WIRE bit ([`punktfunk_core::quic`]'s `CODEC_*`), which since M10 is
+/// the only codec vocabulary in this crate — the `ffmpeg::codec::Id` it used to be
+/// died with the last libavcodec rung.
+fn native_codec(wire: u8) -> Option<(NativeCodec, u32)> {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => Some((NativeCodec::H264, VIDEO_CODEC_OP_DECODE_H264)),
+        punktfunk_core::quic::CODEC_HEVC => Some((NativeCodec::H265, VIDEO_CODEC_OP_DECODE_H265)),
+        punktfunk_core::quic::CODEC_AV1 => Some((NativeCodec::Av1, VIDEO_CODEC_OP_DECODE_AV1)),
         _ => None,
     }
 }
@@ -1127,15 +1005,15 @@ fn native_codec(codec_id: ffmpeg::codec::Id) -> Option<(NativeCodec, u32)> {
 /// device it is about to build on — there is no device-level "which codecs" flag to
 /// consult first.
 #[cfg(windows)]
-fn native_d3d11_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_dxvadec::Codec> {
-    match codec_id {
-        ffmpeg::codec::Id::H264 => Some(pf_dxvadec::Codec::H264),
-        ffmpeg::codec::Id::HEVC => Some(pf_dxvadec::Codec::H265),
-        // AV1 (M7). Not a widening of what this client can decode — the FFmpeg
-        // D3D11VA rung already decodes AV1 Profile 0 through the same profile GUID
-        // — but the native rung has to cover it, or dropping FFmpeg would drop a
-        // codec.
-        ffmpeg::codec::Id::AV1 => Some(pf_dxvadec::Codec::Av1),
+fn native_d3d11_codec(wire: u8) -> Option<pf_dxvadec::Codec> {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => Some(pf_dxvadec::Codec::H264),
+        punktfunk_core::quic::CODEC_HEVC => Some(pf_dxvadec::Codec::H265),
+        // AV1 (M7). It was not a widening of what this client can decode — the FFmpeg
+        // D3D11VA rung of the day already decoded AV1 Profile 0 through the same profile
+        // GUID — but the native rung had to cover it, or dropping FFmpeg (M10, this
+        // milestone) would have dropped a codec.
+        punktfunk_core::quic::CODEC_AV1 => Some(pf_dxvadec::Codec::Av1),
         _ => None,
     }
 }
@@ -1146,14 +1024,12 @@ fn native_d3d11_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_dxvadec::Codec> 
 /// [`crate::video_vaapi_native::NativeVaapiDecoder::new`] queries on the device it is
 /// about to build on.
 #[cfg(target_os = "linux")]
-fn native_vaapi_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_vaadec::Codec> {
-    match codec_id {
-        ffmpeg::codec::Id::H264 => Some(pf_vaadec::Codec::H264),
-        ffmpeg::codec::Id::HEVC => Some(pf_vaadec::Codec::H265),
-        // AV1 (M7). Not a widening of what this client can decode — the FFmpeg VAAPI
-        // rung already decodes AV1 Profile 0 through the same libva profile — but the
-        // native rung has to cover it, or dropping FFmpeg would drop a codec.
-        ffmpeg::codec::Id::AV1 => Some(pf_vaadec::Codec::Av1),
+fn native_vaapi_codec(wire: u8) -> Option<pf_vaadec::Codec> {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => Some(pf_vaadec::Codec::H264),
+        punktfunk_core::quic::CODEC_HEVC => Some(pf_vaadec::Codec::H265),
+        // AV1 (M7) — same reasoning as the DXVA map above.
+        punktfunk_core::quic::CODEC_AV1 => Some(pf_vaadec::Codec::Av1),
         _ => None,
     }
 }
@@ -1207,9 +1083,9 @@ pub struct RungEvidence {
 /// The evidence table (this module's docs hold the readable copy), keyed by rung and WIRE
 /// codec.
 ///
-/// Wire bits rather than `ffmpeg::codec::Id` on purpose: this is a fact about punktfunk's
-/// own decode lanes, it is read by code that will outlive the FFmpeg vocabulary, and M10
-/// must not have to re-key it.
+/// Wire bits rather than `ffmpeg::codec::Id` — deliberately, back when there still was such
+/// a vocabulary here: this is a fact about punktfunk's own decode lanes, and keying it on
+/// FFmpeg's ids would have meant re-keying it at M10. It did not have to be re-keyed.
 ///
 /// An unknown codec for a rung answers `verified: false` — the safe direction: a rung
 /// grows a codec leg before anyone runs it on hardware, and the default must be "no
@@ -1250,59 +1126,68 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
     RungEvidence { verified, note }
 }
 
-/// Has the user asked for the rungs that have NO hardware evidence to join `auto`?
+/// Can THIS device run the native Vulkan rung for this wire codec at all?
 ///
-/// `PUNKTFUNK_NATIVE_FIRST=1` (anything but empty or `0`) is the switch, and it is the M9
-/// bake switch: it puts a box on the full native-first ladder while every FFmpeg rung is
-/// still compiled in directly below, so a rung that misbehaves demotes into a proven one
-/// instead of onto the CPU.
-fn native_first_opt_in() -> bool {
-    std::env::var("PUNKTFUNK_NATIVE_FIRST")
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
+/// [`native_vulkan_gate`] without its `choice` half — the same device facts, asked by the
+/// callers that need to know what is BELOW them rather than what they are about to build:
+/// [`native_rung_admitted`]'s callers, and (spelled inline, with `"auto"`) the mid-session
+/// demotion walk. One function so that "the Vulkan rung is available on this box" cannot
+/// come to mean two different things inside one file.
+pub fn native_vulkan_usable(wire: u8, video_decode: bool, decode_video_caps: u32) -> bool {
+    native_vulkan_gate("auto", wire, video_decode, decode_video_caps)
 }
 
-/// May `auto` pick this native rung for this wire codec?
+/// May `auto` pick this native rung for this wire codec, given what sits directly BELOW it
+/// on THIS device?
 ///
-/// The rule, and the honest half of M9:
+/// One sentence: **an unproven rung yields to a proven one, and to nothing else.**
 ///
 /// * a rung/codec pair WITH hardware evidence is admitted, always — that is what the
 ///   evidence was collected for;
-/// * a pair without it is admitted only when nothing proven is left below it (this build
-///   has no `ffmpeg-fallback`, so the alternative is not "a proven rung" but "the CPU"),
-///   or when the user switched it in (`PUNKTFUNK_NATIVE_FIRST=1`).
+/// * a pair without it is admitted unless the rung the ladder would fall onto instead is
+///   itself verified for this codec AND usable on this device.
 ///
-/// The second clause is why the flip can land without claiming a bake that has not
-/// happened: in the build people install, an unproven rung stays out of `auto` and the
-/// ladder under it is the one that shipped before M9. In an `ffmpeg-fallback`-less build
-/// — the M10 preview, and the thing the bake measures — barring it would cost the session
-/// hardware decode outright, which is a worse answer than running it and saying so out
-/// loud. Every session logs which case it is ([`Decoder::new`]).
+/// `below` is that rung, or `None` when nothing usable is left below it (the CPU). It is
+/// the CALLER's to compute, because "what is below me" is the vendor order's answer, not
+/// this function's: it differs per platform and, on Linux, per vendor id.
 ///
-/// ⚠ This governs `auto` ONLY. An explicit `PUNKTFUNK_DECODER=` pin bypasses it, exactly
-/// as it bypasses the vendor order — a pin is how a lab run reaches a rung `auto` will
-/// not pick, and taking that away would leave no way to GENERATE the missing evidence.
-pub fn native_rung_admitted(rung: NativeRung, wire: u8) -> bool {
+/// Where the rule bites, and where it deliberately does not:
+///
+/// * **Linux, Intel and every unknown vendor id.** The order is `native-vaapi →
+///   native-vk → sw`, so the rung under the never-run pf-vaadec is native Vulkan Video,
+///   proven for all three codecs. Barring VAAPI there moves the session ONE rung down onto
+///   proven code, so it is barred — and it stays reachable below Vulkan (the same ladder
+///   reaches it again if Vulkan can't be built) and by pin.
+/// * **Everything else.** Below the unproven rung is the CPU. Trading hardware decode for
+///   software decode to avoid an unproven decoder is the worse answer, so those rungs run,
+///   with the warning [`log_rung`] emits. That includes Windows Intel/unknown, where the
+///   rung below native-d3d11va IS native Vulkan Video on paper: that vendor family is the
+///   one thing in this program with a MEASURED wrong-pixel report against Vulkan decode
+///   (the B580, see [`Decoder::new`]), and "has never run" is not a reason to move a
+///   session onto "known to strobe here". Callers say so where they pass `None`.
+///
+/// ⚠ This governs `auto` ONLY. An explicit `PUNKTFUNK_DECODER=` pin bypasses it exactly as
+/// it bypasses the vendor order — a pin is how a lab run reaches a rung `auto` will not
+/// pick, and taking that away would leave no way to GENERATE the missing evidence. The
+/// mid-session demotion walk bypasses it too: there the rung above has already failed
+/// repeatedly, so unproven hardware is the only hardware left to try.
+pub fn native_rung_admitted(rung: NativeRung, wire: u8, below: Option<NativeRung>) -> bool {
     native_evidence(rung, wire).verified
-        || cfg!(not(feature = "ffmpeg-fallback"))
-        || native_first_opt_in()
+        || !below.is_some_and(|b| native_evidence(b, wire).verified)
 }
 
 /// The native Vulkan Video admission gate (WP-C of the native-decode program, widened by
-/// the 2026-08-05 ladder decision, by M3 WP-2's HEVC wiring, by M7's AV1 wiring and — for
-/// AV1's entry into `auto` — by M9): the pf-vkdecode backend engages when `choice` asks
-/// for it, by name (`PUNKTFUNK_DECODER=native-vulkan` — `choice` is env-first, so that's
-/// what carries it) or as the auto family (`auto`/``/`hardware`), where since M9 native
-/// is auto's TOP rung for every codec it speaks.
+/// the 2026-08-05 ladder decision, by M3 WP-2's HEVC wiring and by M7's AV1 wiring): the
+/// pf-vkdecode backend engages when `choice` asks for it, by name
+/// (`PUNKTFUNK_DECODER=native-vulkan` — `choice` is env-first, so that's what carries it)
+/// or as the auto family (`auto`/``/`hardware`), where native is auto's TOP rung for
+/// every codec it speaks.
 ///
-/// A native INIT failure falls through to whatever is below — FFmpeg-Vulkan where
-/// `ffmpeg-fallback` compiled it, the platform's native rung otherwise — so admission can
-/// never cost a session its decoder at start. A runtime error streak demotes like every
-/// hardware rung's streaks do, with ONE exception: a native backend that never delivered
-/// a single frame demotes to the rung DIRECTLY below it first, because a rung the session
-/// never actually had must not cost it the rung under that (see
-/// [`Decoder::decode_frame`]). The explicit `vulkan` pin still names the FFmpeg-Vulkan
-/// backend specifically; it — and every other explicit backend pin — refuses here.
+/// A native INIT failure falls through to the platform's own native rung, so admission
+/// can never cost a session its decoder at start. A runtime error streak demotes like
+/// every hardware rung's streaks do. Every explicit OTHER-backend pin refuses here; the
+/// pre-M10 `vulkan` spelling reaches this gate already rewritten to `native-vulkan`
+/// ([`migrate_decoder_pref`]), so it admits, which is the point of the migration.
 ///
 /// Beyond the choice: the negotiated wire codec must be one pf-vkdecode speaks —
 /// H.264, H.265 or AV1 ([`native_codec`]) — and the presenter's decode family must
@@ -1310,36 +1195,15 @@ pub fn native_rung_admitted(rung: NativeRung, wire: u8) -> bool {
 /// stack, never the codec: an AV1-only decode family exists on real hardware, and
 /// H.264-only ones are the common case on older silicon.
 ///
-/// The AUTO family additionally passes through [`native_rung_admitted`], the evidence
-/// filter M9 added — which admits all three codecs here, because all three legs of this
-/// rung have hardware parity against libavcodec (the module's evidence table). It is
-/// written as a rule rather than a per-codec `match` anyway: the per-codec decision now
-/// lives in ONE table that the D3D11VA and VAAPI rungs read too, and a fourth codec that
-/// arrives without a hardware run is then kept out of `auto` by default instead of by
-/// somebody remembering to add an arm here.
-///
 /// What the gate deliberately does NOT check is the stream's picture SHAPE — that is
 /// [`NativeVulkanDecoder::new`]'s construction-time probe, which has the negotiated
 /// chroma format and bit depth and can ask the device directly. Keeping it there keeps
 /// this decision pure (and CPU-testable) while still refusing before a decoder exists.
-fn native_vulkan_gate(
-    choice: &str,
-    codec_id: ffmpeg::codec::Id,
-    video_decode: bool,
-    decode_video_caps: u32,
-) -> bool {
-    let Some((_, codec_op)) = native_codec(codec_id) else {
+fn native_vulkan_gate(choice: &str, wire: u8, video_decode: bool, decode_video_caps: u32) -> bool {
+    let Some((_, codec_op)) = native_codec(wire) else {
         return false;
     };
-    let chosen = match choice {
-        // A pin is a pin: it skips the vendor order AND the evidence filter, which is how
-        // a lab run reaches a rung `auto` would not pick.
-        "native-vulkan" => true,
-        "auto" | "" | "hardware" => {
-            native_rung_admitted(NativeRung::Vulkan, wire_codec_of(codec_id))
-        }
-        _ => false,
-    };
+    let chosen = matches!(choice, "native-vulkan" | "auto" | "" | "hardware");
     chosen && video_decode && decode_video_caps & codec_op != 0
 }
 
@@ -1353,18 +1217,6 @@ pub fn wire_codec_name(wire: u8) -> &'static str {
         punktfunk_core::quic::CODEC_AV1 => "AV1",
         punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
         _ => "?",
-    }
-}
-
-/// The `quic` codec bit for an FFmpeg decoder id — the inverse of [`ffmpeg_codec_id`],
-/// for the one place that has an id in hand and needs the WIRE truth (the software rung's
-/// refusal, which must name a codec the host understands). Dies with the ladder's last
-/// FFmpeg id at M10.
-fn wire_codec_of(id: ffmpeg::codec::Id) -> u8 {
-    match id {
-        ffmpeg::codec::Id::H264 => punktfunk_core::quic::CODEC_H264,
-        ffmpeg::codec::Id::AV1 => punktfunk_core::quic::CODEC_AV1,
-        _ => punktfunk_core::quic::CODEC_HEVC,
     }
 }
 
@@ -1444,6 +1296,44 @@ pub fn last_rung_verdict(negotiated: u8, advertised: u8, loss: RungLoss) -> Last
     }
 }
 
+/// The pre-M10 decoder-preference spellings, mapped onto the rung that replaced them.
+///
+/// `vulkan`, `vaapi` and `d3d11va` named **libavcodec's** rungs specifically — the whole
+/// point of the `native-*` names was that they were the OTHER ones — and M10 deleted them.
+/// But those three are not developer-only env values: all three desktop Settings UIs
+/// offered them (`clients/linux`'s "VAAPI", the WinUI shell's "Hardware (Direct3D 11 /
+/// DXVA)", the console UI's list), so they sit in shipped users' settings files right now.
+/// Refusing them would turn an upgrade into a dead session for anyone who ever touched
+/// that dropdown, and the message would tell them to edit something they never edited.
+///
+/// So they MIGRATE rather than refuse, and the mapping is exact in the sense that
+/// matters: the user asked for a hardware FAMILY (Vulkan Video / VAAPI / DXVA) and gets
+/// that family, on the implementation that still exists. The UI labels stay true
+/// word-for-word — native Vulkan Video is still Vulkan Video. What does change is the
+/// failure mode: a libavcodec pin that failed to open was a hard session error, while
+/// every `native-*` pin logs and falls through to the standard ladder. For a value read
+/// out of a settings file that is the right direction; a pin that cannot open must not be
+/// the reason a user's client stops working.
+///
+/// ⚠ It is `pub` and PURE — no log line — for the Settings dialogs, not for the pump.
+/// Their decoder combos look the stored string up in their own preset list, and a value
+/// that matches nothing shows as "Automatic"; save the dialog without touching that row
+/// and the user's Vulkan/VAAPI preference is silently rewritten to `auto`. So they
+/// migrate on the WAY IN too, and a function that logged would then warn once per dialog
+/// open. [`Decoder::new`] does the logging, where "a session started on a migrated
+/// preference" is the fact worth recording.
+///
+/// Nothing rewrites the STORE. The value is migrated on every read, so a user who
+/// downgrades to an older client still finds the preference they set.
+pub fn migrate_decoder_pref(pref: &str) -> String {
+    match pref {
+        "vulkan" => "native-vulkan".to_string(),
+        "vaapi" => "native-vaapi".to_string(),
+        "d3d11va" => "native-d3d11va".to_string(),
+        _ => pref.to_string(),
+    }
+}
+
 /// Is video decode PINNED to the CPU rung — the Settings "Video decoder" value, or the
 /// `PUNKTFUNK_DECODER` override that wins over it?
 ///
@@ -1457,110 +1347,16 @@ pub fn decode_pinned_to_software(pref: &str) -> bool {
         == "software"
 }
 
-/// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
-pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
-    match wire {
-        punktfunk_core::quic::CODEC_H264 => ffmpeg::codec::Id::H264,
-        punktfunk_core::quic::CODEC_AV1 => ffmpeg::codec::Id::AV1,
-        _ => ffmpeg::codec::Id::HEVC,
-    }
-}
-
-/// Select a decoder for `codec_id` that can actually drive `hw_pix_fmt` through
-/// `hw_device_ctx` — the open-time capability check every hardware backend needs.
-///
-/// `avcodec_find_decoder(id)` is NOT that: it returns the registry's FIRST decoder for
-/// the id, and upstream orders the native `av1` decoder LAST on purpose ("hwaccel hooks
-/// only, so prefer external decoders" — allcodecs.c), behind libdav1d/libaom. The ID
-/// lookup therefore hands every AV1 session a pure software decoder that silently
-/// ignores `hw_device_ctx` and never calls `get_format`; each frame then fails the
-/// backend's hw-format guard and the session burns the demotion ladder MID-STREAM
-/// (~1 s per rung — field-logged as 68 Vulkan fails → D3D11VA → 102 fails → software,
-/// ~3 s of black) instead of failing here at open in milliseconds. H.264/HEVC never hit
-/// this only because their native decoders happen to be registered first.
-///
-/// The walk mirrors what `avcodec_find_decoder` would do, restricted to decoders whose
-/// `avcodec_get_hw_config` advertises the wanted surface via
-/// `AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX` — registry order still wins among those,
-/// so H.264/HEVC keep selecting exactly the decoder they always did. The error names
-/// the decoders that WERE found, so a log reader can tell "this build has no AV1
-/// hwaccel at all" from "no AV1 decoder exists, period".
-#[cfg(feature = "ffmpeg-fallback")]
-pub(crate) fn find_hw_decoder(
-    codec_id: ffmpeg::codec::Id,
-    hw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
-) -> Result<*const ffmpeg::ffi::AVCodec> {
-    use ffmpeg::ffi;
-    let want: ffi::AVCodecID = codec_id.into();
-    let mut found: Vec<String> = Vec::new();
-    // SAFETY: `av_codec_iterate` walks libav's static codec registry (`opaque` is its
-    // cursor) and returns static `AVCodec`s; `avcodec_get_hw_config` only reads the
-    // codec's own static hw-config table, NULL-terminated by returning null past the end.
-    unsafe {
-        let mut opaque = std::ptr::null_mut();
-        loop {
-            let codec = ffi::av_codec_iterate(&mut opaque);
-            if codec.is_null() {
-                break;
-            }
-            if (*codec).id != want || ffi::av_codec_is_decoder(codec) == 0 {
-                continue;
-            }
-            for i in 0.. {
-                let cfg = ffi::avcodec_get_hw_config(codec, i);
-                if cfg.is_null() {
-                    break;
-                }
-                if (*cfg).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
-                    && (*cfg).pix_fmt == hw_pix_fmt
-                {
-                    return Ok(codec);
-                }
-            }
-            found.push(
-                std::ffi::CStr::from_ptr((*codec).name)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-    }
-    if found.is_empty() {
-        bail!("no {codec_id:?} decoder in this FFmpeg build");
-    }
-    bail!(
-        "no {codec_id:?} decoder in this FFmpeg build can drive {hw_pix_fmt:?} via \
-         hw_device_ctx (found: {})",
-        found.join(", ")
-    );
-}
-
-/// The name of a registry `AVCodec` (`(*codec).name`), owned — the field every decode
-/// log carries so `decoder="av1"` vs `decoder="libdav1d"` is one glance, not a debugger.
-///
-/// # Safety
-/// `codec` must point to a registered `AVCodec` (their `name` is a static NUL-terminated
-/// string, valid for the process).
-#[cfg(feature = "ffmpeg-fallback")]
-pub(crate) unsafe fn codec_name(codec: *const ffmpeg::ffi::AVCodec) -> String {
-    // SAFETY: caller guarantees a registered AVCodec; `name` is its static C string.
-    unsafe {
-        std::ffi::CStr::from_ptr((*codec).name)
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
 /// The `quic` codec bitfield this client can decode — the union of the codecs the RUNGS
 /// THIS BUILD COMPILED speak. Advertised to the host so it never emits a codec we can't
 /// decode.
 ///
 /// It used to be a libavcodec registry walk (`ffmpeg::decoder::find` per id), and M9 is
-/// where that stopped being an answer to the question asked: with the FFmpeg rungs behind
-/// `ffmpeg-fallback` the registry describes decoders that are not in the ladder, and in a
-/// default build it would describe decoders this crate never opens at all. It is now what
-/// §3.6 of the plan asked for — a statement about our own rungs — and it does not change
-/// between the two feature states, because the FFmpeg rungs never covered a codec the
-/// native ones don't:
+/// where that stopped being an answer to the question asked: the registry described
+/// decoders that were not in the ladder. It is now what §3.6 of the plan asked for — a
+/// statement about our own rungs — and it is the reason M10 could delete every FFmpeg rung
+/// without renegotiating a single field session: the answer did not move, because the
+/// FFmpeg rungs never covered a codec the native ones don't:
 ///
 /// * native Vulkan Video (`video_vk_native`, both desktop OSes) decodes H.264, H.265 and
 ///   AV1, and it is compiled unconditionally;
@@ -1596,34 +1392,29 @@ pub fn decodable_codecs() -> u8 {
 
 /// Can this machine decode AV1 in HARDWARE?
 ///
-/// The question exists because `ffmpeg::decoder::find(AV1)` answers yes on every
-/// build that links libdav1d — a SOFTWARE decoder — so advertising AV1 off that
-/// answer tells the host "send me AV1" on machines that will then try to decode a
-/// 4K stream on the CPU. That is the standing open item M7 closes: the wire's codec
-/// negotiation is a promise about capability, and a promise the client cannot keep
-/// is worse than not making it, because the host has no other codec to fall back to
-/// once the session is running.
+/// The question exists because "a decoder for AV1 exists" was never the same claim: back
+/// when this crate linked libavcodec, `ffmpeg::decoder::find(AV1)` answered yes on every
+/// build that carried libdav1d — a SOFTWARE decoder — and advertising off that answer told
+/// the host "send me AV1" on machines that would then decode a 4K stream on the CPU. The
+/// dependency is gone and the trap is not: this crate still HAS a CPU AV1 rung (rav1d), so
+/// `decodable_codecs` still says AV1, and the wire's codec negotiation is still a promise
+/// about capability made once, with nothing to fall back to once the session runs.
 ///
-/// Answered from device facts only, never from a decoder registry:
+/// Answered from device facts only, never from a decoder existing:
 ///
 /// * the presenter's Vulkan device advertises `DECODE_AV1` in its decode queue
 ///   family's codec operations, or
-/// * (Windows) the presenter can import D3D11 textures AND this build has a D3D11VA rung
-///   that will actually be REACHED for AV1 — see below.
+/// * (Windows) the presenter can import D3D11 textures — the native DXVA rung then decodes
+///   AV1 Profile 0 through the adapter's profile GUID, and `auto` reaches it. ⚠ That leg
+///   has decoded nothing on hardware ([`native_evidence`]); the session says so at `warn`.
+///   Before M10 this arm was conditional, because the leg was kept out of `auto` while
+///   libavcodec's DXVA rung was still below it — with that rung deleted there is no
+///   condition left to write.
 ///
 /// ⚠ Deliberately NOT consulted: VAAPI. Asking libva costs opening a display, which
 /// this function is called too early and too often to do; the Vulkan bit covers the
 /// Mesa devices where VAAPI AV1 exists in practice, and a machine with VAAPI AV1 but
 /// no Vulkan AV1 loses only the ADVERTISEMENT, not a working path.
-///
-/// ⚠ The D3D11 arm is M9-conditional, and that is the point of this function surviving
-/// the milestone. `d3d11_import` used to imply hardware AV1 because the FFmpeg D3D11VA
-/// rung decodes AV1 Profile 0 through the adapter's profile GUID. With `ffmpeg-fallback`
-/// off that rung does not exist, and the rung that replaces it — native D3D11VA AV1 —
-/// has decoded NOTHING on hardware, so `auto` will not pick it
-/// ([`native_rung_admitted`]). Left unchanged, this function would then promise the host
-/// AV1 on an Intel/AMD Windows box whose only remaining AV1 rung is the CPU: the exact
-/// unkeepable promise the AV1 hardware gate exists to prevent, one milestone later.
 pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     if vk.is_some_and(|v| v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_AV1 != 0) {
         return true;
@@ -1633,9 +1424,7 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     // and fails `-D warnings`, which NO ci leg would have caught (nothing runs
     // clippy on Windows — this surfaced only from a manual check on a box).
     #[cfg(windows)]
-    let d3d11 = vk.is_some_and(|v| v.d3d11_import)
-        && (cfg!(feature = "ffmpeg-fallback")
-            || native_rung_admitted(NativeRung::D3d11va, punktfunk_core::quic::CODEC_AV1));
+    let d3d11 = vk.is_some_and(|v| v.d3d11_import);
     #[cfg(not(windows))]
     let d3d11 = false;
     d3d11
@@ -1648,8 +1437,8 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
 /// opt-in.
 pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> u8 {
     let mut bits = decodable_codecs();
-    // AV1 is hardware-gated (M7). Without this the bit rides on libdav1d's mere
-    // presence and the host is told to send AV1 to a machine that would decode it on
+    // AV1 is hardware-gated (M7). Without this the bit rides on the CPU rung's mere
+    // existence and the host is told to send AV1 to a machine that would decode it on
     // the CPU — and once the session is negotiated there is nothing to fall back to.
     if bits & punktfunk_core::quic::CODEC_AV1 != 0 && !av1_hardware_decodable(vk) {
         tracing::info!(
@@ -1685,35 +1474,12 @@ pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str)
     bits
 }
 
-/// libavcodec logs reference-frame recovery to the process stderr very verbosely
-/// (`First slice in a frame missing`, `Could not find ref with POC …`, `Error
-/// constructing the frame RPS`) — normal chatter while the decoder waits for a keyframe
-/// after loss, but a raw flood in the user's terminal (it bypasses our tracing). Default
-/// it to fatal-only; `PUNKTFUNK_FFMPEG_LOG=<quiet|error|warning|info|debug>` restores it
-/// for decode debugging. Process-global; set once per decoder build (idempotent).
-///
-/// Nothing to quiet without `ffmpeg-fallback` — no libavcodec decoder is ever opened —
-/// so it compiles out with the rungs whose chatter it exists to suppress.
-#[cfg(feature = "ffmpeg-fallback")]
-fn quiet_ffmpeg_log() {
-    use ffmpeg::util::log::Level;
-    let level = match std::env::var("PUNKTFUNK_FFMPEG_LOG").ok().as_deref() {
-        Some("quiet") => Level::Quiet,
-        Some("error") => Level::Error,
-        Some("warning") => Level::Warning,
-        Some("info") => Level::Info,
-        Some("debug" | "trace") => Level::Debug,
-        _ => Level::Fatal,
-    };
-    ffmpeg::util::log::set_level(level);
-}
-
 /// Say what `PUNKTFUNK_AU_FAULT` will do to THIS session, once, at decoder
 /// construction — including the two cases where the answer is "nothing".
 ///
-/// The knob only bites on the native rung (its injector sits at that backend's
-/// decode entry), so a lab run that armed it and landed anywhere else — an FFmpeg
-/// rung, a shape the native rung refused, a session that demoted — must be told
+/// The knob only bites on the native VULKAN rung (its injector sits at that backend's
+/// decode entry), so a lab run that armed it and landed anywhere else — a shape that
+/// rung refused, a session that demoted, a PyroWave session — must be told
 /// so. Silence there is indistinguishable from "the fault was injected and
 /// nothing detected it", which is precisely the conclusion a fault run exists to
 /// make trustworthy. Unset is the normal state and says nothing at all.
@@ -1744,18 +1510,17 @@ fn report_au_fault_env(native_rung: bool) {
 /// Name the rung a session just landed on, and say whether any hardware has ever decoded
 /// a frame through it for this codec.
 ///
-/// This is M9's honesty surface, and it exists because the milestone makes native rungs
-/// the default while two of them have never decoded anything anywhere. A field report of
-/// the form "the flip broke my stream" is only actionable if the log distinguishes *the
-/// rung with three drivers and a 92-minute soak behind it* from *the rung nothing has ever
+/// This is the program's honesty surface, and M10 is where it earns its keep: every rung
+/// is now native, two of them have never decoded anything anywhere, and there is no
+/// libavcodec twin left underneath to catch a session that lands wrong. A field report of
+/// the form "M10 broke my stream" is only actionable if the log distinguishes *the rung
+/// with three drivers and a 92-minute soak behind it* from *the rung nothing has ever
 /// run*, and the `stats:` decode-path tag — which is a machine interface and stays
 /// additive-only — names the rung but says nothing about its provenance.
 ///
 /// So: `info` when the pair is hardware-verified, **`warn` when it is not**, with the
 /// evidence string from [`native_evidence`] carried verbatim so the log explains itself
-/// without a reader having to find this file. The FFmpeg rungs report as verified — they
-/// are the pre-M9 shipping path, which is exactly what "has hardware behind it" means
-/// here — and carry a note saying so.
+/// without a reader having to find this file.
 fn log_rung(backend: &Backend, wire: u8) {
     let (rung, evidence) = match backend {
         Backend::NativeVulkan(_) => (
@@ -1776,12 +1541,9 @@ fn log_rung(backend: &Backend, wire: u8) {
             NativeRung::Software.name(),
             Some(native_evidence(NativeRung::Software, wire)),
         ),
-        #[cfg(feature = "ffmpeg-fallback")]
-        Backend::Vulkan(_) => ("vulkan", None),
-        #[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
-        Backend::Vaapi(_) => ("vaapi", None),
-        #[cfg(all(windows, feature = "ffmpeg-fallback"))]
-        Backend::D3d11va(_) => ("d3d11va", None),
+        // PyroWave is not in the evidence table and never will be: it is not a rung of
+        // the H.264/H.265/AV1 ladder at all, it is its own codec with its own decoder and
+        // no rung above or below it.
         #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         Backend::PyroWave(_) => ("pyrowave", None),
     };
@@ -1800,68 +1562,71 @@ fn log_rung(backend: &Backend, wire: u8) {
             hardware_verified = false,
             evidence = e.note,
             "decode rung active — NO hardware has ever decoded a frame through this \
-             rung/codec pair (M9 evidence table, video.rs)"
+             rung/codec pair (evidence table, video.rs)"
         ),
-        None => tracing::info!(
-            rung,
-            codec,
-            hardware_verified = true,
-            evidence = "libavcodec rung (ffmpeg-fallback) — the pre-M9 shipping path",
-            "decode rung active"
-        ),
+        None => tracing::info!(rung, codec, "decode rung active"),
     }
 }
 
 impl Decoder {
-    /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
-    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`d3d11va`/
-    /// `software`; `hardware` — the WinUI shell's stored value — reads as auto).
-    /// `vk` is the presenter's shared Vulkan device when its stack can run FFmpeg's
-    /// Vulkan Video decoder — decode lands as VkImages the presenter samples directly.
+    /// `wire` is the codec the host resolved in the Welcome, as the WIRE states it
+    /// ([`punktfunk_core::quic`]'s `CODEC_*` bit — never assume HEVC). It is the only
+    /// codec vocabulary the ladder speaks since M10 dropped `ffmpeg::codec::Id` with the
+    /// last libavcodec rung.
+    /// `pref` is the Settings "Video decoder" value (`auto`/`native-vulkan`/
+    /// `native-vaapi`/`native-d3d11va`/`software`; `hardware` — the WinUI shell's stored
+    /// value — reads as auto).
+    /// `vk` is the presenter's shared Vulkan device — decode lands as VkImages the
+    /// presenter samples directly.
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
     /// hatch, and the documented knob), then the setting; both default to auto.
     /// Auto's hardware order depends on the device on BOTH desktop OSes
-    /// ([`VulkanDecodeDevice::prefer_vulkan_first`]) and, since M9, every rung it walks
-    /// is a NATIVE rung with its FFmpeg twin — when `ffmpeg-fallback` compiled one —
-    /// directly below it as the fall-through. Linux: native-vk → vk → native-vaapi →
-    /// vaapi → software on NVIDIA and ALL AMD (`prefer_vulkan_first` is vendor-wide —
+    /// ([`VulkanDecodeDevice::prefer_vulkan_first`]). Linux: native-vk → native-vaapi →
+    /// software on NVIDIA and ALL AMD (`prefer_vulkan_first` is vendor-wide —
     /// desktop RADV included, on-glass verdict — not just the Deck's VanGogh); the two
-    /// PAIRS swap on Intel/unknown. Windows (no VAAPI there): native-vk → vk →
-    /// native-d3d11va → d3d11va → software on NVIDIA/AMD, the pairs swapped on
-    /// Intel/unknown (Intel's driver advertises Vulkan Video, but FFmpeg-Vulkan on it
-    /// strobes/overruns the budget — B580 field report). A native rung with NO hardware
-    /// evidence is skipped while a proven rung is still below it — see
-    /// [`native_rung_admitted`], and this module's evidence table for who is who.
+    /// swap on Intel/unknown. Windows (no VAAPI there): native-vk →
+    /// native-d3d11va → software on NVIDIA/AMD, swapped on
+    /// Intel/unknown (Intel's driver advertises Vulkan Video, but Vulkan decode on it
+    /// strobed/overran the budget — B580 field report).
+    ///
+    /// On top of that order sits the evidence filter ([`native_rung_admitted`]): a rung
+    /// that has never decoded a frame does not go FIRST when the rung directly below it is
+    /// proven for this codec and usable on this device. That is the Linux Intel/unknown
+    /// arm and only that arm — everywhere else what is below is the CPU.
     ///
     /// Whatever it lands on, the session logs `decode rung active` with the rung's name
     /// and its evidence state, and that line is a WARNING when no hardware has ever
     /// decoded a frame through the rung/codec pair the session just chose.
     ///
-    /// `stream` is the picture shape the host resolved ([`StreamFormat`]). Only the
-    /// native rung reads it — as its construction-time device probe — because it is
-    /// the one backend whose support for a shape is a per-device fact the ladder must
-    /// learn BEFORE it commits (FFmpeg's rungs open a codec and discover the pool
-    /// format themselves).
+    /// `stream` is the picture shape the host resolved ([`StreamFormat`]). Every native
+    /// rung reads it as its construction-time device probe, so a shape this GPU cannot
+    /// decode refuses BEFORE the rung is chosen — where the fall-through to the next rung
+    /// is a plain construction failure — instead of at the first AU, where the only exit
+    /// is an error-streak demotion past it.
     pub fn new(
-        codec_id: ffmpeg::codec::Id,
+        wire: u8,
         pref: &str,
         vk: Option<&VulkanDecodeDevice>,
         stream: StreamFormat,
     ) -> Result<Decoder> {
-        // libav is initialised (and hushed) only where a libav decoder can actually be
-        // opened — i.e. only when `ffmpeg-fallback` compiled one.
-        #[cfg(feature = "ffmpeg-fallback")]
-        {
-            ffmpeg::init().context("ffmpeg init")?;
-            quiet_ffmpeg_log();
-        }
-        // The WIRE codec: what the evidence table and every admission decision are keyed
-        // on. Derived once here so the ladder below never re-derives it per rung.
-        let wire = wire_codec_of(codec_id);
-        let choice = std::env::var("PUNKTFUNK_DECODER")
+        let stored = std::env::var("PUNKTFUNK_DECODER")
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| pref.to_string());
+        let choice = migrate_decoder_pref(&stored);
+        if choice != stored {
+            // Said once per session, at `warn`, because a developer who set the env var to
+            // bisect libavcodec against native needs to know that distinction is gone —
+            // and a support engineer reading a log needs to know the rung below was not
+            // the one the settings file names. See [`migrate_decoder_pref`].
+            tracing::warn!(
+                stored,
+                using = choice,
+                "the decoder preference named libavcodec's rung, which no longer exists \
+                 (M10 removed FFmpeg from the client) — using the native rung for the \
+                 same hardware path"
+            );
+        }
         #[cfg(windows)]
         let (d3d11_import, adapter_luid, d3d11_hdr10) = (
             vk.is_some_and(|v| v.d3d11_import),
@@ -1872,21 +1637,20 @@ impl Decoder {
             // Whatever rung this session landed on, say what `PUNKTFUNK_AU_FAULT`
             // is going to do about it — see [`report_au_fault_env`]. Here, at the
             // one exit every backend leaves through, rather than in the native
-            // backend's constructor: a lab run whose session never REACHES that
-            // constructor (an FFmpeg rung, a refused shape, a demotion) would
+            // Vulkan backend's constructor: a lab run whose session never REACHES that
+            // constructor (a refused shape, a demotion, another rung entirely) would
             // otherwise sit silently un-faulted and read as a fault run that
             // detected nothing.
             report_au_fault_env(matches!(backend, Backend::NativeVulkan(_)));
             // ...and say WHICH rung it is and whether any hardware has ever decoded a
-            // frame through it. M9 makes native rungs the default, and two of them have
-            // no hardware evidence at all — a session log that does not distinguish
-            // those from the proven ones would make every field report about the flip
+            // frame through it. Every rung is native now and two of them have no
+            // hardware evidence at all — a session log that does not distinguish
+            // those from the proven ones would make every field report about M10
             // unfalsifiable. See [`log_rung`].
             log_rung(&backend, wire);
             Ok(Decoder {
                 entered_rungs: rung_bit(&backend),
                 backend,
-                codec_id,
                 wire_codec: wire,
                 vaapi_fails: 0,
                 first_fail: None,
@@ -1902,26 +1666,21 @@ impl Decoder {
                 d3d11_hdr10,
             })
         };
-        // Native Vulkan Video (pf-vkdecode), pinned by name (`PUNKTFUNK_DECODER=
-        // native-vulkan`). Since the 2026-08-05 ladder decision native is ALSO an
-        // auto rung (below, immediately above FFmpeg-Vulkan); the pin stays as the
-        // support/debug escape hatch that skips the vendor-ordered rungs ahead of
-        // it. Any refusal or init failure logs and DEMOTES to the standard ladder
-        // below exactly as if the native rung errored (choice reads as `auto` from
-        // here on) — a native failure must never be quieter, or land somewhere
-        // other, than the FFmpeg rungs' failures do.
+        // The codec's human name, for every log line below — the ladder used to print
+        // `?codec_id` (an `ffmpeg::codec::Id` Debug), and this is the same fact stated in
+        // the vocabulary that survived M10.
+        let codec_name = wire_codec_name(wire);
+        // The PINS, ahead of everything, because a pin is a pin: it skips the vendor
+        // order, which is how a lab run reaches a rung `auto` would not have picked on
+        // this device. Any refusal or init failure logs and DEMOTES to the standard
+        // ladder below exactly as if the rung had errored (choice reads as `auto` from
+        // here on) — a pinned rung's failure must never be quieter, or land somewhere
+        // other, than the same rung's failure inside `auto`.
         let mut choice = choice;
-        // Native D3D11VA (M5, pf-dxvadec) pinned by name, ahead of everything because a pin
-        // is a pin: it skips the vendor order AND the evidence filter, which is how a lab run
-        // reaches the AV1 leg `auto` will not pick. (`auto` DOES reach this rung's H.264/H.265
-        // legs since M9 — they have hardware parity; the pair arm below is where that
-        // happens.) A refusal or an init failure logs and drops to the standard ladder
-        // (choice reads as `auto` from here on), exactly like the native-vulkan pin below —
-        // a native failure must never be quieter, or land somewhere other, than the FFmpeg
-        // rungs' failures do.
+        // Native D3D11VA (M5, pf-dxvadec).
         #[cfg(windows)]
         if choice == crate::video_d3d11_native::DECODER_PIN {
-            match (native_d3d11_codec(codec_id), vk.filter(|v| v.d3d11_import)) {
+            match (native_d3d11_codec(wire), vk.filter(|v| v.d3d11_import)) {
                 (Some(codec), Some(v)) => {
                     match crate::video_d3d11_native::NativeD3d11Decoder::new(
                         codec,
@@ -1931,7 +1690,7 @@ impl Decoder {
                     ) {
                         Ok(d) => {
                             tracing::info!(
-                                ?codec_id,
+                                codec = codec_name,
                                 decoder = d.name(),
                                 "native D3D11VA hardware decode active \
                                  (pf-dxvadec, shared-texture hand-off)"
@@ -1943,7 +1702,7 @@ impl Decoder {
                     }
                 }
                 (None, _) => tracing::warn!(
-                    ?codec_id,
+                    codec = codec_name,
                     "PUNKTFUNK_DECODER=native-d3d11va refused (needs an H.264, HEVC or \
                      AV1 session) — standard ladder"
                 ),
@@ -1954,21 +1713,18 @@ impl Decoder {
             }
             choice = "auto".to_string();
         }
-        // Native VAAPI (M6, pf-vaadec) pinned by name, ahead of everything because a pin is
-        // a pin — and here that matters most, because this rung has decoded nothing on any
-        // hardware, so `auto` reaches it only under [`native_rung_admitted`] and the pin is
-        // what a lab run uses to GENERATE the evidence that would change that. A refusal or
-        // an init failure logs and drops to the standard ladder (choice reads as `auto` from
-        // here on), so a native failure is never quieter, nor lands somewhere other, than an
-        // FFmpeg rung's failure.
+        // Native VAAPI (M6, pf-vaadec). The pin matters most here: this rung has decoded
+        // nothing on any hardware, and the pin is what a lab run uses to GENERATE the
+        // evidence that would change that — on a box whose vendor order puts Vulkan first
+        // and where `auto` would therefore never reach it.
         #[cfg(target_os = "linux")]
         if choice == crate::video_vaapi_native::DECODER_PIN {
-            match native_vaapi_codec(codec_id) {
+            match native_vaapi_codec(wire) {
                 Some(codec) => {
                     match crate::video_vaapi_native::NativeVaapiDecoder::new(codec, stream) {
                         Ok(d) => {
                             tracing::info!(
-                                ?codec_id,
+                                codec = codec_name,
                                 decoder = d.name(),
                                 "native VAAPI hardware decode active (pf-vaadec, zero-copy dmabuf)"
                             );
@@ -1979,7 +1735,7 @@ impl Decoder {
                     }
                 }
                 None => tracing::warn!(
-                    ?codec_id,
+                    codec = codec_name,
                     "PUNKTFUNK_DECODER=native-vaapi refused (needs an H.264, HEVC or \
                      AV1 session) — standard ladder"
                 ),
@@ -1990,17 +1746,17 @@ impl Decoder {
         if choice == "native-vulkan" {
             if native_vulkan_gate(
                 &choice,
-                codec_id,
+                wire,
                 vk.is_some_and(|v| v.video_decode),
                 vk.map_or(0, |v| v.decode_video_caps),
             ) {
                 native_tried = true;
                 let vk = vk.expect("gate demands video_decode, so vk is Some");
-                let (codec, _) = native_codec(codec_id).expect("the gate admitted this codec");
+                let (codec, _) = native_codec(wire).expect("the gate admitted this codec");
                 match NativeVulkanDecoder::new(vk, codec, stream) {
                     Ok(n) => {
                         tracing::info!(
-                            ?codec_id,
+                            codec = codec_name,
                             "native Vulkan Video hardware decode active \
                              (pf-vkdecode, presenter-shared device)"
                         );
@@ -2011,7 +1767,7 @@ impl Decoder {
                 }
             } else {
                 tracing::warn!(
-                    ?codec_id,
+                    codec = codec_name,
                     video_decode = vk.is_some_and(|v| v.video_decode),
                     "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264, HEVC or AV1 \
                      session and a presenter device whose decode family advertises that \
@@ -2020,68 +1776,45 @@ impl Decoder {
             }
             choice = "auto".to_string();
         }
-        // Linux's VAAPI RUNG PAIR (M9): native VAAPI (pf-vaadec) first, libavcodec's VAAPI
-        // hwaccel directly below it. `auto` reaches this pair from two places — Intel/unknown
-        // take it before Vulkan, everyone else after — and both must apply the same order, so
-        // it lives here once instead of twice.
+        // Linux's VAAPI RUNG: native VAAPI (pf-vaadec). `auto` reaches it from two places
+        // — Intel/unknown take it before Vulkan, everyone else after — so it lives here
+        // once instead of twice.
         //
-        // The native half is admission-gated ([`native_rung_admitted`]): it has decoded
-        // nothing on any hardware, so in an `ffmpeg-fallback` build it is SKIPPED unless the
-        // user switched it in (`PUNKTFUNK_NATIVE_FIRST=1`) — which leaves this arm behaving
-        // exactly as it did before M9 — while in a build without the FFmpeg rung it is the
-        // only VAAPI there is and runs with the warning `done` logs.
+        // ⚠ It has decoded nothing on any hardware ([`native_evidence`]). Until M10 that
+        // kept it out of `auto` while libavcodec's VAAPI hwaccel sat directly below it;
+        // with that rung deleted this is the only VAAPI there is. It runs with the warning
+        // `done` logs — except where the evidence filter sends the Intel/unknown arm to
+        // native Vulkan Video first ([`native_rung_admitted`], at the call site below),
+        // after which this closure is reached from the SECOND arm, genuinely below Vulkan.
         #[cfg(target_os = "linux")]
-        let vaapi_pair = |choice: &str| -> Result<Option<Backend>> {
-            if native_rung_admitted(NativeRung::Vaapi, wire) {
-                if let Some(codec) = native_vaapi_codec(codec_id) {
-                    match crate::video_vaapi_native::NativeVaapiDecoder::new(codec, stream) {
-                        Ok(d) => {
-                            tracing::info!(
-                                ?codec_id,
-                                decoder = d.name(),
-                                "native VAAPI hardware decode active (pf-vaadec, zero-copy dmabuf)"
-                            );
-                            return Ok(Some(Backend::NativeVaapi(Box::new(d))));
-                        }
-                        Err(e) => tracing::info!(reason = %format!("{e:#}"),
-                            "native VAAPI unavailable — continuing down the ladder"),
+        let vaapi_rung = |choice: &str| -> Result<Option<Backend>> {
+            if let Some(codec) = native_vaapi_codec(wire) {
+                match crate::video_vaapi_native::NativeVaapiDecoder::new(codec, stream) {
+                    Ok(d) => {
+                        tracing::info!(
+                            codec = codec_name,
+                            decoder = d.name(),
+                            "native VAAPI hardware decode active (pf-vaadec, zero-copy dmabuf)"
+                        );
+                        return Ok(Some(Backend::NativeVaapi(Box::new(d))));
                     }
+                    Err(e) => tracing::info!(reason = %format!("{e:#}"),
+                        "native VAAPI unavailable — continuing down the ladder"),
                 }
             }
-            #[cfg(feature = "ffmpeg-fallback")]
-            match VaapiDecoder::new(codec_id) {
-                Ok(v) => {
-                    tracing::info!(
-                        ?codec_id,
-                        decoder = v.name(),
-                        "VAAPI hardware decode active (zero-copy dmabuf)"
-                    );
-                    return Ok(Some(Backend::Vaapi(v)));
-                }
-                Err(e) => {
-                    if choice == "vaapi" {
-                        return Err(e.context("PUNKTFUNK_DECODER=vaapi but VAAPI failed"));
-                    }
-                    tracing::info!(reason = %e, "VAAPI unavailable — continuing down the ladder");
-                }
-            }
-            // `vaapi` names libavcodec's rung specifically (`native-vaapi` is the other one),
-            // so without `ffmpeg-fallback` the pin names something that is not in this build.
-            // Saying so beats silently landing the session two rungs lower.
-            #[cfg(not(feature = "ffmpeg-fallback"))]
-            if choice == "vaapi" {
-                bail!(
-                    "PUNKTFUNK_DECODER=vaapi names libavcodec's VAAPI rung, which this build \
-                     does not contain (no `ffmpeg-fallback` feature) — use native-vaapi"
-                );
-            }
+            // ⚠ `choice` is unread here now, and that is the M10 change worth naming: the
+            // pre-M10 `vaapi` pin meant libavcodec's rung SPECIFICALLY, so this closure
+            // ended in a hard error for it. It is migrated to `native-vaapi` before the
+            // ladder ever runs ([`migrate_decoder_pref`]), so by here it is either a
+            // native pin (handled above, ahead of the vendor order) or the auto family.
+            let _ = choice;
             Ok(None)
         };
-        // Linux `auto`: try the VAAPI pair FIRST unless this device is one where Vulkan Video
+        // Linux `auto`: try VAAPI FIRST unless this device is one where Vulkan Video
         // is the established right answer (NVIDIA — no usable VAAPI; VanGogh — VAAPI
         // chroma-fringes). Mesa now exposes decode queues by default (and the session
         // binary opts RADV in for the Deck's sake), which silently moved every desktop
-        // AMD/Intel box onto FFmpeg-Vulkan-on-Mesa — user-reported to judder/error-streak
+        // AMD/Intel box onto Vulkan-on-Mesa — user-reported to judder/error-streak
         // (then demote to software) where explicit VAAPI streams perfectly.
         #[cfg(target_os = "linux")]
         let mut vaapi_tried = false;
@@ -2091,86 +1824,92 @@ impl Decoder {
                 .filter(|v| v.video_decode)
                 .is_some_and(|v| v.prefer_vulkan_first())
         {
-            vaapi_tried = true;
-            if let Some(b) = vaapi_pair(&choice)? {
-                return done(b);
+            // ⚠ The evidence filter, and the ONE arm of the whole ladder where it still
+            // has somewhere to yield to ([`native_rung_admitted`]). This is the
+            // Intel/unknown order, so the rung directly below VAAPI is native Vulkan
+            // Video — proven for all three codecs, where pf-vaadec is proven for none. If
+            // this device can actually run that rung for this codec, VAAPI does not go
+            // first; the ladder falls through to Vulkan below and VAAPI keeps its place
+            // UNDER it (`vaapi_tried` stays false, so the second arm still tries it when
+            // Vulkan can't be built).
+            let below = native_vulkan_usable(
+                wire,
+                vk.is_some_and(|v| v.video_decode),
+                vk.map_or(0, |v| v.decode_video_caps),
+            )
+            .then_some(NativeRung::Vulkan);
+            if native_rung_admitted(NativeRung::Vaapi, wire, below) {
+                vaapi_tried = true;
+                if let Some(b) = vaapi_rung(&choice)? {
+                    return done(b);
+                }
+            } else {
+                tracing::info!(
+                    codec = codec_name,
+                    evidence = native_evidence(NativeRung::Vaapi, wire).note,
+                    "native VAAPI is this device's first hardware rung, but it has decoded \
+                     nothing on any hardware and the rung below it — native Vulkan Video — \
+                     has, for this codec, on this device: taking Vulkan first \
+                     (PUNKTFUNK_DECODER=native-vaapi runs it anyway)"
+                );
             }
         }
         // Windows `auto`: D3D11VA FIRST unless this device is one where Vulkan Video is
         // the established right answer (NVIDIA/AMD). Intel's Windows driver advertises
-        // Vulkan Video (Arc drivers since 2023) so the capability gate alone no longer
-        // keeps Intel off FFmpeg-Vulkan — and that combination is field-broken (B580,
+        // Vulkan Video (Arc drivers since 2023) so the capability gate alone does not
+        // keep Intel off the Vulkan rung — and that combination is field-broken (B580,
         // 2026-07: strobing between clean anchors and corrupt inter frames that never
         // trips the error-streak demotion, 7 ms p50 decodes blowing the 120 Hz budget)
         // where D3D11VA — the DXVA path every Windows video player exercises, and what
         // this backend was built for — streams clean. Vulkan stays reachable below by
         // explicit preference and as auto's fallback when D3D11VA can't be built.
         //
-        // Windows' D3D11VA RUNG PAIR (M9), the DXVA twin of the VAAPI pair above: native
-        // D3D11VA (pf-dxvadec) first, libavcodec's D3D11VA hwaccel directly below it. Its
-        // H.264/H.265 legs HAVE hardware evidence (parity on an RTX 4090 and an AMD iGPU
-        // plus a 30-minute soak, M5), so `auto` picks them in a shipping build; its AV1 leg
-        // has none, so `auto` skips that one and lands on the FFmpeg rung exactly as before
-        // M9. Both halves need the presenter's win32 import path or their frames could never
-        // reach the screen — that check is the pair's, once, for the same reason the order is.
+        // ⚠ The B580 measurement was taken on the FFmpeg-Vulkan rung of the day, not on
+        // pf-vkdecode, and no Intel box has run the native one. The vendor order is kept
+        // as it was for exactly that reason: nothing has been measured that would justify
+        // changing it, and "the old evidence no longer applies" is not evidence.
+        //
+        // Windows' D3D11VA RUNG: native D3D11VA (pf-dxvadec). Its H.264/H.265 legs HAVE
+        // hardware evidence (parity on an RTX 4090 and an AMD iGPU plus a 30-minute soak,
+        // M5); its AV1 leg has none and runs with the warning `done` logs — until M10 that
+        // leg was skipped in `auto` in favour of libavcodec's DXVA rung, which no longer
+        // exists. The rung needs the presenter's win32 import path or its frames could
+        // never reach the screen — that check is first, once.
         #[cfg(windows)]
-        let d3d11_pair = |choice: &str| -> Result<Option<Backend>> {
+        let d3d11_rung = |choice: &str| -> Result<Option<Backend>> {
             let Some(v) = vk.filter(|v| v.d3d11_import) else {
-                if choice == "d3d11va" {
+                // A PIN that cannot possibly work is worth saying out loud — a DXVA frame
+                // reaches the screen through the presenter's win32 import and nothing else,
+                // so without it this rung would decode into a texture no one can display.
+                // (`native-d3d11va` here covers the migrated `d3d11va` too — see
+                // [`migrate_decoder_pref`].)
+                if choice == crate::video_d3d11_native::DECODER_PIN {
                     bail!(
-                        "PUNKTFUNK_DECODER=d3d11va but the presenter's device lacks the win32 \
-                         external-memory import extensions — see the presenter log"
+                        "PUNKTFUNK_DECODER=native-d3d11va but the presenter's device lacks the \
+                         win32 external-memory import extensions — see the presenter log"
                     );
                 }
                 return Ok(None);
             };
-            if native_rung_admitted(NativeRung::D3d11va, wire) {
-                if let Some(codec) = native_d3d11_codec(codec_id) {
-                    match crate::video_d3d11_native::NativeD3d11Decoder::new(
-                        codec,
-                        stream,
-                        v.adapter_luid,
-                        v.d3d11_hdr10,
-                    ) {
-                        Ok(d) => {
-                            tracing::info!(
-                                ?codec_id,
-                                decoder = d.name(),
-                                "native D3D11VA hardware decode active \
-                                 (pf-dxvadec, shared-texture hand-off)"
-                            );
-                            return Ok(Some(Backend::NativeD3d11va(Box::new(d))));
-                        }
-                        Err(e) => tracing::info!(reason = %format!("{e:#}"),
-                            "native D3D11VA unavailable — continuing down the ladder"),
+            if let Some(codec) = native_d3d11_codec(wire) {
+                match crate::video_d3d11_native::NativeD3d11Decoder::new(
+                    codec,
+                    stream,
+                    v.adapter_luid,
+                    v.d3d11_hdr10,
+                ) {
+                    Ok(d) => {
+                        tracing::info!(
+                            codec = codec_name,
+                            decoder = d.name(),
+                            "native D3D11VA hardware decode active \
+                             (pf-dxvadec, shared-texture hand-off)"
+                        );
+                        return Ok(Some(Backend::NativeD3d11va(Box::new(d))));
                     }
+                    Err(e) => tracing::info!(reason = %format!("{e:#}"),
+                        "native D3D11VA unavailable — continuing down the ladder"),
                 }
-            }
-            #[cfg(feature = "ffmpeg-fallback")]
-            match crate::video_d3d11::D3d11vaDecoder::new(codec_id, v.adapter_luid, v.d3d11_hdr10) {
-                Ok(d) => {
-                    tracing::info!(
-                        ?codec_id,
-                        decoder = d.name(),
-                        "D3D11VA hardware decode active (shared-texture hand-off)"
-                    );
-                    return Ok(Some(Backend::D3d11va(d)));
-                }
-                Err(e) => {
-                    if choice == "d3d11va" {
-                        return Err(e.context("PUNKTFUNK_DECODER=d3d11va but it failed"));
-                    }
-                    tracing::info!(reason = %format!("{e:#}"),
-                        "D3D11VA unavailable — continuing down the ladder");
-                }
-            }
-            // Same as the VAAPI pin above: `d3d11va` names libavcodec's rung specifically.
-            #[cfg(not(feature = "ffmpeg-fallback"))]
-            if choice == "d3d11va" {
-                bail!(
-                    "PUNKTFUNK_DECODER=d3d11va names libavcodec's DXVA rung, which this build \
-                     does not contain (no `ffmpeg-fallback` feature) — use native-d3d11va"
-                );
             }
             Ok(None)
         };
@@ -2181,37 +1920,44 @@ impl Decoder {
             && !vk
                 .filter(|v| v.video_decode)
                 .is_some_and(|v| v.prefer_vulkan_first())
+            // The evidence filter applies here too, and it admits — the `None` is the
+            // load-bearing part, so it is stated rather than assumed. On paper the rung
+            // below D3D11VA on this arm is native Vulkan Video; in fact this arm IS the
+            // Intel/unknown vendor family, the one family in this program with a MEASURED
+            // wrong-pixel report against Vulkan decode (the B580 note below). Falling from
+            // "has never run" onto "known to strobe here" is not a fall onto proven code,
+            // so what is really below the DXVA AV1 leg is the CPU — and its H.264/H.265
+            // legs are verified anyway, which is what the first clause of
+            // [`native_rung_admitted`] answers.
+            && native_rung_admitted(NativeRung::D3d11va, wire, None)
         {
             d3d11_tried = true;
-            if let Some(b) = d3d11_pair(&choice)? {
+            if let Some(b) = d3d11_rung(&choice)? {
                 return done(b);
             }
         }
-        // The VULKAN RUNG PAIR: native Vulkan Video (pf-vkdecode) with FFmpeg-Vulkan
-        // directly below it. Unlike the two pairs above it needs no closure — `auto`
-        // reaches it from exactly one place. [`native_vulkan_gate`] carries the whole
-        // admission decision, including the choice: the explicit `vulkan` pin is NOT this
-        // rung — it names the FFmpeg-Vulkan backend specifically and keeps meaning exactly
-        // that. Every codec leg of this rung has hardware parity against libavcodec (M2/M3
-        // for H.264/H.265, M7 for AV1 — this module's evidence table), which is what M9's
-        // flip rests on here; an init failure still logs and falls through to the rung
-        // below, so admission can never cost a session hardware decode it had before.
+        // The VULKAN RUNG: native Vulkan Video (pf-vkdecode). Unlike the two platform
+        // rungs above it needs no closure — `auto` reaches it from exactly one place.
+        // [`native_vulkan_gate`] carries the whole admission decision, including the
+        // choice. Every codec leg has hardware parity against libavcodec (M2/M3 for
+        // H.264/H.265, M7 for AV1 — this module's evidence table); an init failure logs
+        // and falls through to the rung below.
         // (`native_tried` skips the repeat when the pin above already attempted — and
         // failed — the same construction.)
         if !native_tried
             && native_vulkan_gate(
                 &choice,
-                codec_id,
+                wire,
                 vk.is_some_and(|v| v.video_decode),
                 vk.map_or(0, |v| v.decode_video_caps),
             )
         {
             let vk = vk.expect("gate demands video_decode, so vk is Some");
-            let (codec, _) = native_codec(codec_id).expect("the gate admitted this codec");
+            let (codec, _) = native_codec(wire).expect("the gate admitted this codec");
             match NativeVulkanDecoder::new(vk, codec, stream) {
                 Ok(n) => {
                     tracing::info!(
-                        ?codec_id,
+                        codec = codec_name,
                         "native Vulkan Video hardware decode active \
                          (pf-vkdecode auto rung, presenter-shared device)"
                     );
@@ -2221,70 +1967,29 @@ impl Decoder {
                     "native Vulkan decode unavailable — continuing down the ladder"),
             }
         }
-        #[cfg(feature = "ffmpeg-fallback")]
-        if matches!(choice.as_str(), "auto" | "" | "vulkan" | "hardware") {
-            // `video_decode` gates the Vulkan Video attempt: the presenter now exports its
-            // handle bundle even when the device has no decode queue (Windows D3D11 interop
-            // rides the same struct), so presence alone no longer implies a usable decoder.
-            match vk.filter(|v| v.video_decode) {
-                Some(vk) => match VulkanDecoder::new(codec_id, vk) {
-                    Ok(v) => {
-                        tracing::info!(
-                            ?codec_id,
-                            decoder = v.name(),
-                            "Vulkan Video hardware decode active (presenter-shared device)"
-                        );
-                        return done(Backend::Vulkan(v));
-                    }
-                    Err(e) => {
-                        if choice == "vulkan" {
-                            return Err(e.context("PUNKTFUNK_DECODER=vulkan but it failed"));
-                        }
-                        tracing::info!(reason = %format!("{e:#}"),
-                            "Vulkan Video unavailable — falling back");
-                    }
-                },
-                None if choice == "vulkan" => {
-                    bail!(
-                        "PUNKTFUNK_DECODER=vulkan but the presenter's device can't (missing \
-                           video extensions/queue) — see the presenter log"
-                    )
-                }
-                None => {}
-            }
-        }
-        // Same as the two platform pins: `vulkan` names FFmpeg's rung specifically, so in a
-        // build without it the pin names something absent. `native-vulkan` is the other one.
-        #[cfg(not(feature = "ffmpeg-fallback"))]
-        if choice == "vulkan" {
-            bail!(
-                "PUNKTFUNK_DECODER=vulkan names FFmpeg's Vulkan Video rung, which this build \
-                 does not contain (no `ffmpeg-fallback` feature) — use native-vulkan"
-            );
-        }
-        // Deck/NVIDIA note: `auto` reaches the VAAPI pair here when Vulkan Video isn't
+        // Deck/NVIDIA note: `auto` reaches the VAAPI rung here when Vulkan Video isn't
         // available (on desktop Mesa it was already tried above — `vaapi_tried` skips the
         // repeat). A presenter that can't display the dmabufs demotes this decoder to
         // software mid-session via [`Decoder::force_software`]. Windows has no VAAPI — auto
         // falls straight through to software there.
         #[cfg(target_os = "linux")]
-        if choice != "software" && choice != "vulkan" && !vaapi_tried {
-            if let Some(b) = vaapi_pair(&choice)? {
+        if choice != "software" && !vaapi_tried {
+            if let Some(b) = vaapi_rung(&choice)? {
                 return done(b);
             }
         }
-        // Windows: the D3D11VA pair as the fallback rung for NVIDIA/AMD auto (Vulkan Video
-        // missing or failed to open) and for the explicit `d3d11va` preference. (On
-        // Intel/unknown auto it was already tried above — `d3d11_tried` skips the repeat.)
+        // Windows: the D3D11VA rung as the fallback for NVIDIA/AMD auto (Vulkan Video
+        // missing or failed to open). (On Intel/unknown auto it was already tried above —
+        // `d3d11_tried` skips the repeat.)
         #[cfg(windows)]
-        if choice != "software" && choice != "vulkan" && !d3d11_tried {
-            if let Some(b) = d3d11_pair(&choice)? {
+        if choice != "software" && !d3d11_tried {
+            if let Some(b) = d3d11_rung(&choice)? {
                 return done(b);
             }
         }
         if choice == "software" {
             // Say WHY hardware wasn't even attempted — a stored "software" preference
-            // (or the env override) silently skipping vulkan/vaapi has burned real
+            // (or the env override) silently skipping the hardware rungs has burned real
             // debugging time on boxes that could do better.
             tracing::info!(
                 "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
@@ -2295,26 +2000,22 @@ impl Decoder {
         // one whose device offered no hardware rung at all). It stays typed all the way
         // to the pump, which turns it into the reconnect rather than a dead session —
         // see [`last_rung_verdict`].
-        done(Backend::Software(SoftwareDecoder::new(wire_codec_of(
-            codec_id,
-        ))?))
+        done(Backend::Software(SoftwareDecoder::new(wire)?))
     }
 
     /// Wait for a Vulkan-Video frame's GPU decode to complete (timeline semaphore) —
     /// the pump's decode-stat measurement. `false` = not a Vulkan backend, timeout, or
-    /// (native rung) a pair no longer in the shipped ledger / a stale session
+    /// a pair no longer in the shipped ledger / a stale session
     /// generation — every false just declines the sample.
     pub fn wait_hw_decoded(&self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
         match &self.backend {
-            #[cfg(feature = "ffmpeg-fallback")]
-            Backend::Vulkan(v) => v.wait_timeline(timeline_sem, value, timeout_ns),
             Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
             _ => false,
         }
     }
 
     /// This session's decode-integrity counters, or `None` on a backend that has
-    /// no way to answer (every FFmpeg rung and PyroWave — see [`DecodeHealth`]).
+    /// no way to answer (the CPU rung and PyroWave — see [`DecodeHealth`]).
     ///
     /// `None` and `Some(DecodeHealth::default())` are deliberately different
     /// answers, and the stats surface must keep them different: the first is "this
@@ -2351,11 +2052,8 @@ impl Decoder {
         }
     }
 
-    /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
-    /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
     /// Open a PyroWave decoder for a `CODEC_PYROWAVE` session (plan §4.5): pyrowave
-    /// compute on the presenter's device, no FFmpeg. `codec_id` is irrelevant (kept as
-    /// HEVC so an — impossible — demotion path stays well-formed).
+    /// compute on the presenter's device.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pub fn new_pyrowave(
         vk: &VulkanDecodeDevice,
@@ -2378,7 +2076,6 @@ impl Decoder {
                 color,
                 hdr16,
             )?)),
-            codec_id: ffmpeg::codec::Id::HEVC,
             wire_codec: punktfunk_core::quic::CODEC_PYROWAVE,
             vaapi_fails: 0,
             first_fail: None,
@@ -2401,6 +2098,8 @@ impl Decoder {
         })
     }
 
+    /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
+    /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
     pub fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.want_keyframe)
     }
@@ -2482,27 +2181,22 @@ impl Decoder {
         // whether the `Ok` below is allowed to clear the demotion streak.
         let mut concealed = false;
         let result = match &mut self.backend {
-            #[cfg(feature = "ffmpeg-fallback")]
-            Backend::Vulkan(v) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                v.decode(au).map(|f| f.map(DecodedImage::VkFrame))
-            }
             Backend::NativeVulkan(n) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
                 let r = n.decode(au).map(|f| f.map(DecodedImage::NativeVk));
                 // STREAM damage is not a decoder fault, and must not ride the
                 // demotion streak.
                 //
-                // This distinction only exists on the native rung, because it is
-                // the only one that can SEE damage — and that is precisely what
-                // makes it dangerous. An FFmpeg rung conceals a lost reference
-                // silently and keeps its job; if the native rung turned the same
-                // event into an error, three of them over a second would demote
-                // the program's own headline decoder exactly on the lossy links it
-                // was built to diagnose. So concealment comes back as `Ok(None)`
-                // plus this flag: the pump still asks for a re-anchor at the same
-                // moment and through the same throttle it always did, and the
-                // hardware rung survives the loss that caused it.
+                // The distinction exists only because these rungs can SEE damage —
+                // and that is precisely what makes it dangerous. libavcodec's rungs
+                // concealed a lost reference silently and kept their job; if a
+                // native rung turned the same event into an error, three of them
+                // over a second would demote the program's own headline decoder
+                // exactly on the lossy links it was built to diagnose. So
+                // concealment comes back as `Ok(None)` plus this flag: the pump
+                // still asks for a re-anchor at the same moment and through the
+                // same throttle it always did, and the hardware rung survives the
+                // loss that caused it.
                 //
                 // A driver `RESULT_STATUS` verdict of Failed is NOT routed here —
                 // it stays an `Err` below. That one really is a statement about
@@ -2515,33 +2209,22 @@ impl Decoder {
                 }
                 r
             }
-            #[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
-            Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             #[cfg(target_os = "linux")]
             Backend::NativeVaapi(v) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
                 let r = v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf));
-                // Same split as the two native rungs above, for the same reason: this
-                // rung can SEE stream damage, and turning what an FFmpeg rung conceals
-                // silently into an error would demote it on exactly the lossy links it
-                // exists to diagnose.
+                // Same concealment split as the Vulkan rung above, for the same reason.
                 if v.take_recovery_request() {
                     self.want_keyframe = true;
                     concealed = true;
                 }
                 r
             }
-            #[cfg(all(windows, feature = "ffmpeg-fallback"))]
-            Backend::D3d11va(d) => d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
             #[cfg(windows)]
             Backend::NativeD3d11va(d) => {
                 debug_assert!(complete, "partial AUs are pyrowave-only");
                 let r = d.decode(au).map(|f| f.map(DecodedImage::D3d11));
-                // Same split as the native Vulkan rung above, for the same reason: this
-                // rung can SEE stream damage, and turning what an FFmpeg rung conceals
-                // silently into an error would demote it on exactly the lossy links it
-                // exists to diagnose. Concealment comes back as `Ok(None)` plus a
-                // re-anchor request through the pump's one throttle.
+                // Same concealment split as the Vulkan rung above, for the same reason.
                 if d.take_recovery_request() {
                     self.want_keyframe = true;
                     concealed = true;
@@ -2573,80 +2256,43 @@ impl Decoder {
             }
             Err(e) => {
                 let which = match self.backend {
-                    #[cfg(feature = "ffmpeg-fallback")]
-                    Backend::Vulkan(_) => "Vulkan Video",
                     Backend::NativeVulkan(_) => "native Vulkan Video",
-                    #[cfg(all(windows, feature = "ffmpeg-fallback"))]
-                    Backend::D3d11va(_) => "D3D11VA",
                     #[cfg(windows)]
                     Backend::NativeD3d11va(_) => "native D3D11VA",
                     #[cfg(target_os = "linux")]
                     Backend::NativeVaapi(_) => "native VAAPI",
-                    _ => "VAAPI",
+                    // PyroWave returns above and software never reaches here.
+                    _ => "hardware",
                 };
                 self.vaapi_fails += 1;
                 self.want_keyframe = true;
                 let first = *self.first_fail.get_or_insert_with(std::time::Instant::now);
                 if self.vaapi_fails >= VAAPI_DEMOTE_AFTER && first.elapsed() >= HW_DEMOTE_MIN_STREAK
                 {
-                    // A NATIVE rung that never delivered a single frame is not a
-                    // failing decoder — it is a decoder the session never had, and
-                    // the cause is almost always a stream shape THIS DEVICE cannot
-                    // host (`NativeVulkanDecoder::new`'s probe catches the ones the
-                    // negotiation can see; a level above the device's `maxLevelIdc`,
-                    // or an SPS that disagrees with the Welcome, only surface here).
-                    // Demoting past FFmpeg-Vulkan for that would cost the session the
-                    // rung it would have run on before this backend existed — on
-                    // NVIDIA/Linux, where VAAPI is unusable, that means a 4K HEVC
-                    // session on SOFTWARE. So the first streak in this state falls
-                    // through to FFmpeg-Vulkan, exactly where a construction failure
-                    // would have landed. Once a frame HAS been delivered the rung is
-                    // proven and its streaks demote like every other Vulkan rung's.
-                    #[cfg(feature = "ffmpeg-fallback")]
-                    if !self.delivered && matches!(self.backend, Backend::NativeVulkan(_)) {
-                        // `take`: this arm is one-shot by construction (the native
-                        // backend is gone after it), and taking is also what lets the
-                        // rebuild borrow the device while `self.backend` is assigned.
-                        if let Some(v) = self.vk.take().filter(|v| v.video_decode) {
-                            match VulkanDecoder::new(self.codec_id, &v) {
-                                Ok(fallback) => {
-                                    tracing::warn!(error = %e, fails = self.vaapi_fails,
-                                        decoder = fallback.name(),
-                                        "native Vulkan Video never delivered a frame — \
-                                         demoting to FFmpeg Vulkan Video");
-                                    self.install(Backend::Vulkan(fallback));
-                                    return Ok(None);
-                                }
-                                Err(fe) => tracing::info!(reason = %format!("{fe:#}"),
-                                    "FFmpeg Vulkan Video unavailable for demotion — \
-                                     continuing down the ladder"),
-                            }
-                        }
-                    }
-                    // Without `ffmpeg-fallback` the arm above does not exist, and the
-                    // `!delivered` rule is served by the walk that follows instead: the
-                    // rung DIRECTLY below native Vulkan in that build is the platform's
-                    // own native rung, which is the very next candidate. Nothing is
-                    // special-cased for it, because nothing needs to be — the property
-                    // the arm protects ("a rung the session never had must not cost it
-                    // the rung below") holds as long as the next candidate IS the next
-                    // rung, and here it is.
-
-                    // M9's addition to this walk: the platform's NATIVE hardware rung,
-                    // ABOVE its libavcodec twin, exactly as in `Decoder::new`'s ladder.
-                    // Admission is the same evidence rule the ladder uses
-                    // ([`native_rung_admitted`]), so in a shipping `ffmpeg-fallback`
-                    // build an unproven rung is skipped here too and this walk is
-                    // byte-for-byte the pre-M9 one.
+                    // ⚠ A native rung that never delivered a single frame is not a
+                    // failing decoder — it is a decoder the session never had (usually a
+                    // stream shape THIS DEVICE cannot host: `NativeVulkanDecoder::new`'s
+                    // probe catches what the negotiation can see, but a level above the
+                    // device's `maxLevelIdc`, or an SPS that disagrees with the Welcome,
+                    // only surfaces here). Such a rung must not cost the session the rung
+                    // BELOW it as well.
                     //
-                    // `entered_rungs` is what keeps it monotone: the two native rungs
-                    // sit in opposite orders per vendor, so without it a demotion could
-                    // climb back into a rung that already failed.
+                    // Until M10 that needed an explicit arm: native Vulkan fell through
+                    // to FFmpeg-Vulkan first, because demoting past it would have taken a
+                    // 4K HEVC session on NVIDIA/Linux — where VAAPI is unusable — straight
+                    // to the CPU. The arm is gone with FFmpeg-Vulkan, and the property now
+                    // holds structurally: the rung directly below native Vulkan is the
+                    // platform's own native rung, and that is exactly the next candidate
+                    // this walk tries. `self.delivered` is kept for the streak accounting
+                    // and for the record, not for a branch.
+                    //
+                    // The platform's NATIVE hardware rung, first, exactly as in
+                    // `Decoder::new`'s ladder. `entered_rungs` is what keeps the walk
+                    // monotone: the two native rungs sit in opposite orders per vendor, so
+                    // without it a demotion could climb back into a rung that already failed.
                     #[cfg(target_os = "linux")]
-                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0
-                        && native_rung_admitted(NativeRung::Vaapi, self.wire_codec)
-                    {
-                        if let Some(codec) = native_vaapi_codec(self.codec_id) {
+                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0 {
+                        if let Some(codec) = native_vaapi_codec(self.wire_codec) {
                             match crate::video_vaapi_native::NativeVaapiDecoder::new(
                                 codec,
                                 self.stream,
@@ -2666,11 +2312,8 @@ impl Decoder {
                         }
                     }
                     #[cfg(windows)]
-                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0
-                        && self.d3d11_import
-                        && native_rung_admitted(NativeRung::D3d11va, self.wire_codec)
-                    {
-                        if let Some(codec) = native_d3d11_codec(self.codec_id) {
+                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0 && self.d3d11_import {
+                        if let Some(codec) = native_d3d11_codec(self.wire_codec) {
                             match crate::video_d3d11_native::NativeD3d11Decoder::new(
                                 codec,
                                 self.stream,
@@ -2691,81 +2334,26 @@ impl Decoder {
                             }
                         }
                     }
-                    // A failing Vulkan backend (FFmpeg or native — the native rung
-                    // demotes exactly like the FFmpeg one) still has a hardware rung
-                    // below it on Linux — demote to VAAPI first (user-reported:
-                    // FFmpeg-Vulkan-on-Mesa error-streaking where VAAPI streams
-                    // perfectly); only when that can't be built either does the
-                    // session land on software.
-                    // The NATIVE VAAPI rung demotes here too, and to the same place: its
-                    // failure is a statement about pf-vaadec's submission, not about
-                    // VAAPI, so libavcodec's decoder on the very same profile is the
-                    // right next rung — this is the rung DIRECTLY below it in the M9
-                    // ladder, and it is what keeps a session on hardware when the
-                    // native half of the pair is the half that broke.
-                    #[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
-                    if matches!(
-                        self.backend,
-                        Backend::Vulkan(_) | Backend::NativeVulkan(_) | Backend::NativeVaapi(_)
-                    ) {
-                        match VaapiDecoder::new(self.codec_id) {
-                            Ok(v) => {
-                                tracing::warn!(error = %e, fails = self.vaapi_fails,
-                                    from = which, decoder = v.name(),
-                                    "hardware decode failing repeatedly — demoting to VAAPI");
-                                self.install(Backend::Vaapi(v));
-                                return Ok(None);
-                            }
-                            Err(va) => tracing::info!(reason = %va,
-                                "VAAPI unavailable for demotion — software decode"),
-                        }
-                    }
-                    // Windows' hardware rung below Vulkan (FFmpeg or native) is D3D11VA
-                    // (a 4K120 stream is not survivable on software) — same-GPU rebuild
-                    // via the stashed LUID. The NATIVE D3D11VA rung demotes here too:
-                    // its failure is a statement about pf-dxvadec's submission, not about
-                    // DXVA, so the FFmpeg decoder on the very same profile is the right
-                    // next rung — the rung DIRECTLY below it in the M9 ladder, and what
-                    // keeps a session on hardware when the native half of the pair broke.
-                    #[cfg(all(windows, feature = "ffmpeg-fallback"))]
-                    if matches!(
-                        self.backend,
-                        Backend::Vulkan(_) | Backend::NativeVulkan(_) | Backend::NativeD3d11va(_)
-                    ) && self.d3d11_import
-                    {
-                        match crate::video_d3d11::D3d11vaDecoder::new(
-                            self.codec_id,
-                            self.adapter_luid,
-                            self.d3d11_hdr10,
-                        ) {
-                            Ok(d) => {
-                                tracing::warn!(error = %e, fails = self.vaapi_fails,
-                                    from = which, decoder = d.name(),
-                                    "hardware decode failing repeatedly — demoting to D3D11VA");
-                                self.install(Backend::D3d11va(d));
-                                return Ok(None);
-                            }
-                            Err(dx) => tracing::info!(reason = %dx,
-                                "D3D11VA unavailable for demotion — software decode"),
-                        }
-                    }
                     // The last hardware candidate, and the one that only exists because
                     // M9 stacked two native rungs: a failing native PLATFORM rung on an
                     // Intel/unknown box has native Vulkan BELOW it (that vendor order
-                    // puts the platform pair first), and in a build with no FFmpeg twin
-                    // there is nothing between them. Without this the rung with the
-                    // weakest evidence in the whole program — native VAAPI, which has
-                    // decoded nothing anywhere — would take a 4K session straight to the
-                    // CPU rung the moment it error-streaked. Only fires FROM a native
-                    // platform rung, so no path this walk had before M9 changes.
+                    // puts the platform rung first), and there is nothing between them.
+                    // Without this the rung with the weakest evidence in the whole
+                    // program — native VAAPI, which has decoded nothing anywhere — would
+                    // take a 4K session straight to the CPU rung the moment it
+                    // error-streaked. Only fires FROM a native platform rung.
                     if self.entered_rungs & RUNG_BIT_NATIVE_VULKAN == 0
                         && self.is_native_platform_rung()
                     {
                         if let Some(v) = self.vk.clone().filter(|v| v.video_decode) {
-                            if native_vulkan_gate("auto", self.codec_id, true, v.decode_video_caps)
-                            {
+                            if native_vulkan_gate(
+                                "auto",
+                                self.wire_codec,
+                                true,
+                                v.decode_video_caps,
+                            ) {
                                 let (codec, _) =
-                                    native_codec(self.codec_id).expect("the gate admitted it");
+                                    native_codec(self.wire_codec).expect("the gate admitted it");
                                 match NativeVulkanDecoder::new(&v, codec, self.stream) {
                                     Ok(n) => {
                                         tracing::warn!(error = %e, fails = self.vaapi_fails,
@@ -2801,32 +2389,24 @@ impl Decoder {
     }
 }
 
-// -EAGAIN. FFmpeg uses POSIX errno values on both our targets (MinGW's EAGAIN is 11 too).
-#[cfg(feature = "ffmpeg-fallback")]
-pub(crate) const AVERROR_EAGAIN: i32 = -11;
-
-#[cfg(feature = "ffmpeg-fallback")]
-pub(crate) fn averr(what: &str, code: i32) -> anyhow::Error {
-    anyhow!("{what}: {}", ffmpeg::Error::from(code))
-}
-
 /// Guard-less mutex serializing every `vkQueueSubmit`/`vkQueuePresentKHR`/
-/// `vkQueueWaitIdle` on the device the presenter shares with FFmpeg.
+/// `vkQueueWaitIdle` on the device the presenter shares with the decode lane.
 ///
-/// Why it exists: the presenter created the device with ONE graphics-family queue and
-/// told FFmpeg's `AVVulkanDeviceContext` to use that same family (`nb_graphics_queues
-/// = 1` ⇒ queue index 0) for its transfer/compute prep work — so the presenter thread
-/// and the session pump thread were submitting to the SAME `VkQueue` with no shared
-/// lock. `vkQueueSubmit` requires external synchronization on the queue; the race
-/// surfaced as intermittent `VK_ERROR_DEVICE_LOST` at exactly the moments FFmpeg puts
-/// work on the graphics queue (decoder open / frames-context rebuild — i.e. stream
-/// start and every adaptive-bitrate encoder rebuild; live-diagnosed 2026-07-09).
+/// Why it exists: the presenter creates the device with ONE graphics-family queue, and
+/// the session pump thread submits decode/CSC prep work to that SAME `VkQueue` from a
+/// different thread. `vkQueueSubmit` requires external synchronization on the queue; the
+/// race surfaced as intermittent `VK_ERROR_DEVICE_LOST` at exactly the moments the decode
+/// lane put work on the graphics queue — decoder open and frames-context rebuild, i.e.
+/// stream start and every adaptive-bitrate encoder rebuild (live-diagnosed 2026-07-09,
+/// on the FFmpeg-Vulkan rung, whose `AVVulkanDeviceContext` was configured with
+/// `nb_graphics_queues = 1` ⇒ queue index 0).
 ///
-/// FFmpeg's hook for this is the `lock_queue`/`unlock_queue` callback pair on
-/// `AVVulkanDeviceContext` — a raw lock/unlock shape with no RAII scope, hence this
-/// guard-less primitive (`std::sync::Mutex`'s guard can't cross the C callbacks).
-/// Contention is a handful of µs-scale critical sections per frame; a plain
-/// Mutex+Condvar is more than enough.
+/// It is guard-less because FFmpeg's hook for this was a raw `lock_queue`/`unlock_queue`
+/// callback PAIR with no RAII scope (`std::sync::Mutex`'s guard can't cross a C callback).
+/// That consumer is gone; the shape stays because the presenter, the Skia overlay and the
+/// native decode lane all still share the queue, and [`QueueLock::guard`] gives Rust
+/// callers the RAII form. Contention is a handful of µs-scale critical sections per
+/// frame; a plain Mutex+Condvar is more than enough.
 pub struct QueueLock {
     locked: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
@@ -2883,17 +2463,19 @@ impl Drop for QueueLockGuard<'_> {
     }
 }
 
-/// The presenter's Vulkan device handles, exported so FFmpeg's Vulkan Video decoder
-/// runs on the SAME device the presenter samples from — the whole point: the decoded
-/// VkImage is composited directly, no interop, no copy (plan: Vulkan Video phase).
+/// The presenter's Vulkan device handles, exported so the DECODE lane runs on the SAME
+/// device the presenter samples from — the whole point: the decoded VkImage is composited
+/// directly, no interop, no copy (plan: Vulkan Video phase).
 ///
-/// Plain integers/strings on purpose: pf-client-core has no ash dependency; pf-ffvk
-/// casts these into vulkan.h handle types when filling `AVVulkanDeviceContext`. All
-/// handles stay valid for the presenter's lifetime, which outlives every session pump
-/// (the run loop tears the pump down before the presenter).
+/// Plain integers/strings on purpose: pf-client-core has no ash dependency, so the
+/// consumers (`video_vk_native` → pf-vkdecode, `video_pyrowave` → pyrowave-sys) cast
+/// these back into handle types themselves. All handles stay valid for the presenter's
+/// lifetime, which outlives every session pump (the run loop tears the pump down before
+/// the presenter).
 #[derive(Clone)]
 pub struct VulkanDecodeDevice {
-    /// `PFN_vkGetInstanceProcAddr` from the loader — FFmpeg resolves everything else.
+    /// `PFN_vkGetInstanceProcAddr` from the loader — the decode lanes resolve everything
+    /// else through it.
     pub get_instance_proc_addr: usize,
     pub instance: usize,
     pub physical_device: usize,
@@ -2904,16 +2486,16 @@ pub struct VulkanDecodeDevice {
     /// The driver's device-name string (e.g. "AMD RADV VANGOGH") — the VanGogh/Deck
     /// detection for [`Self::prefer_vulkan_first`].
     pub device_name: String,
-    /// The presenter's graphics+present family (FFmpeg's "required" tx/comp family too).
+    /// The presenter's graphics+present family.
     pub graphics_qf: u32,
-    /// Raw `VkQueueFlags` of that family (the qf[] entry wants the real capabilities).
-    pub graphics_queue_flags: u32,
-    /// The video-decode family (may equal `graphics_qf` on some hardware).
+    /// The video-decode family (may equal `graphics_qf` on some hardware — which is a
+    /// case the native rung must detect; see `video_vk_native::submit_queues_collide`).
     pub decode_qf: u32,
     /// Raw `VkVideoCodecOperationFlagsKHR` the decode family advertises.
     pub decode_video_caps: u32,
-    /// Everything enabled at instance/device creation — FFmpeg keys code paths off the
-    /// extension STRINGS, so the lists must match reality exactly.
+    /// Everything enabled at instance/device creation. The pyrowave decoder replays these
+    /// lists verbatim into its pinned create-info reconstruction, so they must match
+    /// reality exactly.
     pub instance_extensions: Vec<std::ffi::CString>,
     pub device_extensions: Vec<std::ffi::CString>,
     /// Features enabled at device creation (reported via `device_features`).
@@ -2921,8 +2503,8 @@ pub struct VulkanDecodeDevice {
     pub f_timeline_semaphore: bool,
     pub f_synchronization2: bool,
     /// Vulkan Video decode is actually usable on this device (decode queue + extensions +
-    /// features). The bundle now exists even without it — Windows D3D11 interop rides the
-    /// same struct — so consumers gate the FFmpeg-Vulkan decoder on THIS, not on `Some`.
+    /// features). The bundle exists even without it — Windows D3D11 interop rides the
+    /// same struct — so consumers gate the Vulkan decode rung on THIS, not on `Some`.
     pub video_decode: bool,
     /// The presenter has REAL on-glass present timing (`VK_KHR_present_wait` — its
     /// `PresentTimer` runs). Gates the `CLIENT_CAP_PHASE_LOCK` advertisement: without a
@@ -2958,8 +2540,8 @@ pub struct VulkanDecodeDevice {
     /// GPUs. `None` when not reported (or off Windows, where it's unused).
     pub adapter_luid: Option<[u8; 8]>,
     /// The device's shared queue lock (see [`QueueLock`]). The presenter holds it around
-    /// its own submits/presents; the decoder wires it into FFmpeg's
-    /// `lock_queue`/`unlock_queue` callbacks so both sides serialize on the same queues.
+    /// its own submits/presents and every decode lane takes it around its own, so both
+    /// sides serialize on the same queues.
     pub queue_lock: std::sync::Arc<QueueLock>,
 }
 
@@ -2978,42 +2560,16 @@ impl VulkanDecodeDevice {
     ///
     /// Intel and unknown vendors take the battle-tested path first: VAAPI on Linux (ANV's
     /// Vulkan Video is the least-proven Mesa path), D3D11VA on Windows — Intel's Windows
-    /// driver advertises Vulkan Video (Arc drivers since 2023), but FFmpeg-Vulkan on it is
-    /// field-broken (B580, 2026-07: strobing + ~7 ms decodes) where DXVA streams clean.
+    /// driver advertises Vulkan Video (Arc drivers since 2023), but Vulkan decode on it
+    /// was field-broken (B580, 2026-07: strobing + ~7 ms decodes) where DXVA streamed
+    /// clean. ⚠ That measurement was taken on the FFmpeg-Vulkan rung, which M10 deleted;
+    /// no Intel box has run pf-vkdecode. The order stands until something is measured,
+    /// because "the old evidence no longer applies" is not evidence.
     pub fn prefer_vulkan_first(&self) -> bool {
         const VENDOR_NVIDIA: u32 = 0x10DE;
         const VENDOR_AMD: u32 = 0x1002;
         self.vendor_id == VENDOR_NVIDIA || self.vendor_id == VENDOR_AMD
     }
-}
-
-/// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).
-///
-/// [`drm_fourcc_for`] is its only caller and dies with the FFmpeg VAAPI rung, so this
-/// dies with it: the NATIVE VAAPI rung derives a surface's fourcc inside pf-vaadec, from
-/// the libva format it actually configured, and pf-vaadec's own tests pin those values.
-#[cfg(feature = "ffmpeg-fallback")]
-const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
-/// The combined DRM FourCC for a decoder software pixel format. The host streams 8-bit
-/// 4:2:0 (NV12); P010 is here for the eventual 10-bit/HDR path.
-// Only the (Linux-gated) FFmpeg VAAPI rung calls this outside tests — the NATIVE VAAPI
-// rung derives its fourcc from pf-vaadec's own format map — so it rides `ffmpeg-fallback`
-// with that rung, and so does the test that locks its three magic numbers.
-#[cfg(feature = "ffmpeg-fallback")]
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32> {
-    use ffmpeg_next::ffi::AVPixelFormat::*;
-    Some(match sw {
-        AV_PIX_FMT_NV12 => fourcc(b'N', b'V', b'1', b'2'),
-        AV_PIX_FMT_P010LE => fourcc(b'P', b'0', b'1', b'0'),
-        // Full-chroma 4:4:4 semi-planar (HEVC RExt decode on drivers that export it as
-        // two planes) — the presenter imports the full-size chroma plane like any other.
-        AV_PIX_FMT_NV24 => fourcc(b'N', b'V', b'2', b'4'),
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
@@ -3146,18 +2702,66 @@ mod tests {
         assert!(!decode_pinned_to_software(""));
     }
 
-    /// The wire↔FFmpeg codec map must round-trip for every codec the software rung can
-    /// be built for. A mistake here builds an openh264 decoder for an AV1 session — which
-    /// then fails per AU rather than at construction, i.e. exactly the mid-stream burn
-    /// this ladder is written to avoid.
+    /// A settings file written before M10 must still stream.
+    ///
+    /// This is the upgrade path, not a nicety: all three desktop Settings UIs offered
+    /// `vulkan` / `vaapi` / `d3d11va` as decoder choices, so those strings are sitting in
+    /// shipped users' stores right now. They named **libavcodec's** rungs, which M10
+    /// deleted — and the pre-M10 code answered an unavailable named rung with a hard
+    /// error. Left as-is, an upgrade would have ended every one of those sessions with a
+    /// message about a decoder the user never chose by that name.
+    ///
+    /// So each maps onto the rung that replaced it, and the mapping is checked as a pair:
+    /// the LEGACY name must move, and the `native-*` names must NOT (they were always the
+    /// exact pins, and a migration that rewrote them would be a second bug).
     #[test]
-    fn the_wire_codec_of_an_ffmpeg_id_round_trips() {
-        for wire in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
-            assert_eq!(wire_codec_of(ffmpeg_codec_id(wire)), wire);
+    fn a_pre_m10_decoder_preference_migrates_onto_its_native_rung() {
+        for (stored, want) in [
+            ("vulkan", "native-vulkan"),
+            ("vaapi", "native-vaapi"),
+            ("d3d11va", "native-d3d11va"),
+        ] {
+            assert_eq!(migrate_decoder_pref(stored), want, "stored {stored:?}");
         }
-        // PyroWave has no FFmpeg id (`ffmpeg_codec_id` folds it onto HEVC), so the
-        // inverse cannot round-trip it — the PyroWave decoder sets `wire_codec` itself.
-        assert_eq!(wire_codec_of(ffmpeg_codec_id(CODEC_PYROWAVE)), CODEC_HEVC);
+        // Everything else is passed through verbatim — including `auto`/``/`hardware`
+        // (the auto family `native_vulkan_gate` matches on), `software`, the three exact
+        // pins, and a value this build has never heard of, which must reach the ladder
+        // unchanged so it falls through to the CPU rung rather than becoming a silent
+        // hardware pin.
+        for pass in [
+            "auto",
+            "",
+            "hardware",
+            "software",
+            "native-vulkan",
+            "native-vaapi",
+            "native-d3d11va",
+            "something-else",
+        ] {
+            assert_eq!(migrate_decoder_pref(pass), pass, "passthrough {pass:?}");
+        }
+        // The migrated names are exactly the pin constants the ladder compares against —
+        // a typo here would read as "some unknown decoder" and land the session on auto.
+        assert_eq!(migrate_decoder_pref("vulkan"), "native-vulkan");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            migrate_decoder_pref("vaapi"),
+            crate::video_vaapi_native::DECODER_PIN
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            migrate_decoder_pref("d3d11va"),
+            crate::video_d3d11_native::DECODER_PIN
+        );
+        // …and the migrated Vulkan name is one `native_vulkan_gate` admits, on a device
+        // that can run the codec. (`decode_pinned_to_software` above pins the other
+        // direction: none of these is the software pin.)
+        assert!(native_vulkan_gate(
+            &migrate_decoder_pref("vulkan"),
+            CODEC_H264,
+            true,
+            VIDEO_CODEC_OP_DECODE_H264
+        ));
     }
 
     /// `CpuPlanarFrame` is what the presenter uploads with no stride: prove the copy
@@ -3208,7 +2812,6 @@ mod tests {
             vendor_id,
             device_name: device_name.into(),
             graphics_qf: 0,
-            graphics_queue_flags: 0,
             decode_qf: 0,
             decode_video_caps: 0,
             instance_extensions: Vec::new(),
@@ -3384,17 +2987,16 @@ mod tests {
     }
 
     /// The native-Vulkan admission gate (WP-C, widened by the 2026-08-05 ladder
-    /// decision, by M3 WP-2's HEVC wiring, by M7's AV1 wiring and — for AV1's entry into
-    /// `auto` — by M9): the pin AND the auto family admit on a capable H.264, HEVC **or
-    /// AV1** session, every explicit other-backend pin refuses (`vulkan` names the
-    /// FFmpeg-Vulkan backend specifically and must keep meaning exactly that), and the
+    /// decision, by M3 WP-2's HEVC wiring and by M7's AV1 wiring): the pin AND the auto
+    /// family admit on a capable H.264, HEVC **or AV1** session, every explicit
+    /// other-backend pin refuses (a `native-vaapi` pin must not land on Vulkan just
+    /// because the device could), and the
     /// codec/device legs still refuse for every choice. The codec's OWN caps bit is the
     /// device leg: admitting HEVC on an H.264-only decode family would create a video
     /// session for an operation the family cannot run, which is undefined behaviour
     /// rather than an error.
     #[test]
     fn native_vulkan_gate_admits_pin_and_auto_family_per_codec_on_a_capable_family() {
-        use ffmpeg::codec::Id;
         // Pin the raw spec values, not the implementation constants — a typo'd bit
         // would refuse every real driver's caps and native would silently never
         // engage (the program's own nb_queries=0 lesson: silent non-engagement is
@@ -3418,92 +3020,100 @@ mod tests {
             // The pin and the whole auto family admit both codecs pf-vkdecode
             // speaks, on a family that advertises the matching op…
             assert!(
-                native_vulkan_gate(choice, Id::H264, true, H264_OP),
+                native_vulkan_gate(choice, CODEC_H264, true, H264_OP),
                 "{choice:?}"
             );
             assert!(
-                native_vulkan_gate(choice, Id::HEVC, true, H265_OP),
+                native_vulkan_gate(choice, CODEC_HEVC, true, H265_OP),
                 "{choice:?}"
             );
             // …including the ordinary case of a family that runs both.
             assert!(
-                native_vulkan_gate(choice, Id::H264, true, H264_OP | H265_OP),
+                native_vulkan_gate(choice, CODEC_H264, true, H264_OP | H265_OP),
                 "{choice:?}"
             );
             assert!(
-                native_vulkan_gate(choice, Id::HEVC, true, H264_OP | H265_OP),
+                native_vulkan_gate(choice, CODEC_HEVC, true, H264_OP | H265_OP),
                 "{choice:?}"
             );
             // Each codec needs ITS OWN bit: an H.264-only family (the common case on
             // older silicon) must not take an HEVC session, and vice versa.
             assert!(
-                !native_vulkan_gate(choice, Id::HEVC, true, H264_OP),
+                !native_vulkan_gate(choice, CODEC_HEVC, true, H264_OP),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::H264, true, H265_OP),
+                !native_vulkan_gate(choice, CODEC_H264, true, H265_OP),
                 "{choice:?}"
             );
             // AV1 joined the auto family at M9, on the evidence rule and not on a
             // date: `native_evidence(Vulkan, CODEC_AV1)` is verified (250/250
-            // bit-identical to libavcodec on an RTX 5070 Ti, M7), so
-            // `native_rung_admitted` says yes for the auto family exactly as it does
-            // for the other two codecs. Before M9 this pair asserted `choice ==
-            // "native-vulkan"`; the flip is what changed, and it changed HERE.
+            // bit-identical to libavcodec on an RTX 5070 Ti, M7). Before M9 this pair
+            // asserted `choice == "native-vulkan"`; the flip is what changed, and it
+            // changed HERE.
             assert!(
-                native_vulkan_gate(choice, Id::AV1, true, AV1_OP),
+                native_vulkan_gate(choice, CODEC_AV1, true, AV1_OP),
                 "{choice:?}"
             );
             assert!(
-                native_vulkan_gate(choice, Id::AV1, true, H264_OP | H265_OP | AV1_OP),
+                native_vulkan_gate(choice, CODEC_AV1, true, H264_OP | H265_OP | AV1_OP),
                 "{choice:?}"
             );
             // …and the pin is still not a licence to skip the device leg: an AV1
             // session on a family that does not advertise the AV1 op would create a
             // video session for an operation the family cannot run.
             assert!(
-                !native_vulkan_gate(choice, Id::AV1, true, H264_OP | H265_OP),
+                !native_vulkan_gate(choice, CODEC_AV1, true, H264_OP | H265_OP),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::AV1, false, AV1_OP),
+                !native_vulkan_gate(choice, CODEC_AV1, false, AV1_OP),
                 "{choice:?}"
             );
             // No Vulkan-Video-capable presenter device.
             assert!(
-                !native_vulkan_gate(choice, Id::H264, false, H264_OP),
+                !native_vulkan_gate(choice, CODEC_H264, false, H264_OP),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::HEVC, false, H265_OP),
+                !native_vulkan_gate(choice, CODEC_HEVC, false, H265_OP),
                 "{choice:?}"
             );
             // A decode family advertising NO codec op, or only a foreign one,
             // refuses even with the extension stack present — the caps BIT is the
             // codec gate, not `video_decode`.
-            assert!(!native_vulkan_gate(choice, Id::H264, true, 0), "{choice:?}");
-            assert!(!native_vulkan_gate(choice, Id::HEVC, true, 0), "{choice:?}");
             assert!(
-                !native_vulkan_gate(choice, Id::H264, true, AV1_OP),
+                !native_vulkan_gate(choice, CODEC_H264, true, 0),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::HEVC, true, AV1_OP),
+                !native_vulkan_gate(choice, CODEC_HEVC, true, 0),
+                "{choice:?}"
+            );
+            assert!(
+                !native_vulkan_gate(choice, CODEC_H264, true, AV1_OP),
+                "{choice:?}"
+            );
+            assert!(
+                !native_vulkan_gate(choice, CODEC_HEVC, true, AV1_OP),
                 "{choice:?}"
             );
         }
         // Never for an explicit OTHER-backend pin, capable device or not.
-        for choice in ["vulkan", "vaapi", "d3d11va", "software"] {
+        // NOTE: the pre-M10 `vulkan`/`vaapi`/`d3d11va` spellings never reach this gate —
+        // `migrate_decoder_pref` rewrites them first — so what is asserted here is the
+        // gate's own rule: a pin naming ANOTHER backend is not a licence to run this one.
+        for choice in ["native-vaapi", "native-d3d11va", "software"] {
             assert!(
-                !native_vulkan_gate(choice, Id::H264, true, H264_OP),
+                !native_vulkan_gate(choice, CODEC_H264, true, H264_OP),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::HEVC, true, H265_OP),
+                !native_vulkan_gate(choice, CODEC_HEVC, true, H265_OP),
                 "{choice:?}"
             );
             assert!(
-                !native_vulkan_gate(choice, Id::AV1, true, AV1_OP),
+                !native_vulkan_gate(choice, CODEC_AV1, true, AV1_OP),
                 "{choice:?}"
             );
         }
@@ -3511,29 +3121,31 @@ mod tests {
         // exact agreement, so a codec admitted with no decoder behind it would be a
         // panic rather than a demotion.
         assert_eq!(
-            native_codec(Id::H264).map(|(c, _)| c),
+            native_codec(CODEC_H264).map(|(c, _)| c),
             Some(NativeCodec::H264)
         );
         assert_eq!(
-            native_codec(Id::HEVC).map(|(c, _)| c),
+            native_codec(CODEC_HEVC).map(|(c, _)| c),
             Some(NativeCodec::H265)
         );
         // AV1 has a decoder AND the caps bit here — being in this map is what the
         // pin construction path reads. Whether `auto` may pick it is the gate's
         // decision above, and deliberately not this one's.
         assert_eq!(
-            native_codec(Id::AV1),
+            native_codec(CODEC_AV1),
             Some((NativeCodec::Av1, VIDEO_CODEC_OP_DECODE_AV1))
         );
-        assert!(native_codec(Id::VP9).is_none());
+        assert!(native_codec(CODEC_PYROWAVE).is_none());
+        assert!(native_codec(0).is_none());
     }
 
     /// The evidence table, asserted as the FACT it is — which rung/codec pairs have
     /// actually decoded on hardware and which have not.
     ///
-    /// This test is the reason the table can be trusted a milestone from now. M9 turns
-    /// native rungs on by default, and the argument for doing that honestly rests
-    /// entirely on the claim "these five pairs are proven and these six are not". A
+    /// This test is the reason the table can be trusted a milestone from now. M9 turned
+    /// native rungs on by default and M10 deleted every libavcodec rung beneath them; the
+    /// argument for doing that honestly rests entirely on the claim "these five pairs are
+    /// proven and these six are not", and on the session log saying so. A
     /// table nobody checks drifts into a table that says everything is fine — which is
     /// the exact failure this whole program exists to end, one layer up.
     #[test]
@@ -3588,12 +3200,13 @@ mod tests {
         ] {
             assert!(
                 !native_evidence(rung, codec).verified,
-                "{why} — claiming otherwise is the dishonesty M9 must not ship"
+                "{why} — claiming otherwise is the dishonesty this program must not ship"
             );
         }
         // A codec leg nobody wrote an arm for reads as UNVERIFIED, never as its
-        // neighbour's evidence: the next codec this program grows must be kept out of
-        // `auto` by the default, not by somebody remembering to add a row.
+        // neighbour's evidence: the next codec this program grows must land in the
+        // session log's WARNING branch by default, not by somebody remembering to add a
+        // row.
         assert!(!native_evidence(NativeRung::Vulkan, CODEC_PYROWAVE).verified);
         assert!(!native_evidence(NativeRung::Software, CODEC_HEVC).verified);
         assert!(!native_evidence(NativeRung::D3d11va, 0).verified);
@@ -3614,60 +3227,175 @@ mod tests {
         }
     }
 
-    /// M9's admission rule, in both builds — the honest half of the default flip.
+    /// M10's admission rule, stated as the pair of facts it is: an unproven rung runs
+    /// wherever the only thing below it is the CPU, and wherever it runs it is NAMED —
+    /// because naming it is the only protection left there.
     ///
-    /// The gate runs this test twice, once per feature state, and the two branches are
-    /// the whole design: in the build people install, an unproven rung is NOT in `auto`
-    /// and the ladder beneath it is the pre-M9 one; in a build with no FFmpeg twin, the
-    /// alternative to an unproven rung is the CPU, so it runs — and `log_rung` says so
-    /// at `warn`.
+    /// The four pairs below are the unproven ones. `log_rung` turns exactly these into a
+    /// `warn` line carrying their note, and that line is what a field report about M10 gets
+    /// read against. Which of them `auto` may pick FIRST is
+    /// [`native_rung_admitted`]'s decision, asserted in the test after this one.
     #[test]
-    fn auto_admits_an_unproven_rung_only_when_nothing_proven_is_left_below_it() {
-        // Hardware-verified pairs are in, in every build. That is what the evidence was
-        // collected for.
-        assert!(native_rung_admitted(NativeRung::Vulkan, CODEC_H264));
-        assert!(native_rung_admitted(NativeRung::Vulkan, CODEC_HEVC));
-        assert!(native_rung_admitted(NativeRung::Vulkan, CODEC_AV1));
-        assert!(native_rung_admitted(NativeRung::D3d11va, CODEC_H264));
-        assert!(native_rung_admitted(NativeRung::D3d11va, CODEC_HEVC));
-
+    fn every_rung_runs_and_the_unproven_ones_are_named() {
         let unproven = [
             (NativeRung::Vaapi, CODEC_H264),
             (NativeRung::Vaapi, CODEC_HEVC),
             (NativeRung::Vaapi, CODEC_AV1),
             (NativeRung::D3d11va, CODEC_AV1),
         ];
-        // `native_first_opt_in` reads the process environment, which a test must not
-        // write (the whole binary shares it, and these run in parallel). Reading it is
-        // fine, and it keeps the assertion exact rather than conditional-on-nothing.
-        if cfg!(feature = "ffmpeg-fallback") && !native_first_opt_in() {
-            for (rung, codec) in unproven {
+        for (rung, codec) in unproven {
+            let e = native_evidence(rung, codec);
+            assert!(
+                !e.verified,
+                "{} / {codec:#x} is claimed proven — if a hardware run really happened, \
+                 move it into the verified half of the table on purpose",
+                rung.name()
+            );
+            assert!(
+                e.note.contains("NEVER") || e.note.contains("never"),
+                "{} / {codec:#x}: the note is what the session log prints at warn — it \
+                 must say plainly that nothing has run it, got {:?}",
+                rung.name(),
+                e.note
+            );
+        }
+        // ...and the pairs that ARE proven stay proven. Nothing about M10 changes what
+        // hardware has run; deleting the filter must not quietly relabel the evidence.
+        for (rung, codec) in [
+            (NativeRung::Vulkan, CODEC_H264),
+            (NativeRung::Vulkan, CODEC_HEVC),
+            (NativeRung::Vulkan, CODEC_AV1),
+            (NativeRung::D3d11va, CODEC_H264),
+            (NativeRung::D3d11va, CODEC_HEVC),
+        ] {
+            assert!(native_evidence(rung, codec).verified, "{}", rung.name());
+        }
+    }
+
+    /// The evidence FILTER: which rung `auto` may pick first, given what is under it.
+    ///
+    /// This is the rule that keeps M10 from shipping a default no hardware has ever run.
+    /// The case it exists for is a Linux Intel (or unknown-vendor) desktop: the vendor
+    /// order puts native VAAPI first, pf-vaadec has decoded nothing anywhere, and directly
+    /// below it sits native Vulkan Video with three drivers, a 92-minute soak and 250/250
+    /// AV1 behind it. A rung that produces WRONG PIXELS leaves only through the error-streak
+    /// demotion, and the field has already shown that streak failing to trip (the B580's
+    /// strobing between clean anchors and corrupt inter frames) — so "it will demote if it
+    /// misbehaves" is not a guarantee, and the choice has to be made BEFORE the session
+    /// runs. Hence: yield to proven code when there is proven code to yield to, and only
+    /// then.
+    #[test]
+    fn an_unproven_rung_yields_to_a_proven_one_and_to_nothing_else() {
+        // The Linux Intel/unknown arm: VAAPI first, native Vulkan Video under it. Every
+        // codec pf-vaadec speaks is unproven on it, and every one of them is proven on the
+        // rung below — so `auto` takes none of them.
+        for codec in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+            assert!(
+                !native_rung_admitted(NativeRung::Vaapi, codec, Some(NativeRung::Vulkan)),
+                "codec {codec:#x}: a never-run VAAPI rung must not go first when the \
+                 device can run the proven Vulkan rung for it"
+            );
+            // …and the same rung IS admitted when there is nothing proven below it: on
+            // NVIDIA/AMD it is reached after Vulkan, and on a box whose Vulkan device
+            // cannot run this codec at all the fall would be to the CPU. Taking hardware
+            // decode away to protect a session from an unproven decoder is the worse answer.
+            assert!(
+                native_rung_admitted(NativeRung::Vaapi, codec, None),
+                "codec {codec:#x}: with only the CPU below, the unproven rung runs"
+            );
+            // It yields to PROVEN code, not to any code: the CPU rung has never run on
+            // glass either, so it is not something to fall onto in preference.
+            assert!(native_rung_admitted(
+                NativeRung::Vaapi,
+                codec,
+                Some(NativeRung::Software)
+            ));
+        }
+        // A rung with hardware behind it is admitted whatever is below it — that is what
+        // the evidence was collected for, and the filter must never demote a proven rung.
+        for (rung, codec) in [
+            (NativeRung::Vulkan, CODEC_H264),
+            (NativeRung::Vulkan, CODEC_HEVC),
+            (NativeRung::Vulkan, CODEC_AV1),
+            (NativeRung::D3d11va, CODEC_H264),
+            (NativeRung::D3d11va, CODEC_HEVC),
+        ] {
+            for below in [
+                None,
+                Some(NativeRung::Vulkan),
+                Some(NativeRung::Vaapi),
+                Some(NativeRung::Software),
+            ] {
                 assert!(
-                    !native_rung_admitted(rung, codec),
-                    "{} must stay out of auto while its FFmpeg twin is compiled in",
-                    rung.name()
-                );
-            }
-        } else {
-            for (rung, codec) in unproven {
-                assert!(
-                    native_rung_admitted(rung, codec),
-                    "{} is the only rung left above the CPU here — barring it would cost \
-                     the session hardware decode outright",
+                    native_rung_admitted(rung, codec, below),
+                    "{} / {codec:#x} is proven and must run",
                     rung.name()
                 );
             }
         }
+        // Windows, Intel/unknown auto: the DXVA AV1 leg has never run, and the ladder
+        // passes `None` there on purpose — that vendor family is the one with a measured
+        // wrong-pixel report against Vulkan decode, so what is really below it is the CPU.
+        // This asserts the ARGUMENT the call site passes, which is where the judgement
+        // lives; `Some(Vulkan)` would bar it, and that is deliberately not what it passes.
+        assert!(native_rung_admitted(NativeRung::D3d11va, CODEC_AV1, None));
+        assert!(!native_rung_admitted(
+            NativeRung::D3d11va,
+            CODEC_AV1,
+            Some(NativeRung::Vulkan)
+        ));
+        // The CPU rung is last everywhere, so nothing is ever below it and it always runs
+        // — including for a codec it has no decoder for, which is `last_rung_verdict`'s
+        // problem and not the filter's.
+        for codec in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+            assert!(native_rung_admitted(NativeRung::Software, codec, None));
+        }
+    }
+
+    /// The device half of the filter: "native Vulkan Video is below me" is a claim about
+    /// THIS GPU, not about the ladder's shape.
+    ///
+    /// Without it the Linux Intel arm would bar VAAPI on a box whose Vulkan device cannot
+    /// decode the session's codec — no decode family, or a family without that codec's
+    /// operation — and hand the session to the CPU to protect it from a rung it needed.
+    #[test]
+    fn the_rung_below_must_be_one_this_device_can_actually_run() {
+        const H264_OP: u32 = VIDEO_CODEC_OP_DECODE_H264;
+        const AV1_OP: u32 = VIDEO_CODEC_OP_DECODE_AV1;
+        // The ordinary Mesa/Intel case: a decode family that advertises this codec.
+        assert!(native_vulkan_usable(CODEC_H264, true, H264_OP));
+        // No Vulkan Video at all, and a family that runs some OTHER codec: neither is a
+        // rung to fall onto.
+        assert!(!native_vulkan_usable(CODEC_H264, false, H264_OP));
+        assert!(!native_vulkan_usable(CODEC_H264, true, AV1_OP));
+        assert!(!native_vulkan_usable(CODEC_H264, true, 0));
+        // A codec no native rung speaks (PyroWave rides its own path) is not a Vulkan rung.
+        assert!(!native_vulkan_usable(CODEC_PYROWAVE, true, u32::MAX));
+        // Composed, this is the whole Linux Intel decision, both ways round: an H.264
+        // session on an H.264-capable device takes Vulkan; an AV1 session on that same
+        // device has no proven rung below VAAPI, so VAAPI runs (and warns).
+        let below =
+            |wire, caps| native_vulkan_usable(wire, true, caps).then_some(NativeRung::Vulkan);
+        assert!(!native_rung_admitted(
+            NativeRung::Vaapi,
+            CODEC_H264,
+            below(CODEC_H264, H264_OP)
+        ));
+        assert!(native_rung_admitted(
+            NativeRung::Vaapi,
+            CODEC_AV1,
+            below(CODEC_AV1, H264_OP)
+        ));
     }
 
     /// What this client advertises it can decode is a statement about OUR rungs, and it
-    /// does not move when the FFmpeg rungs are compiled out.
+    /// did not move when the FFmpeg rungs were deleted.
     ///
     /// That invariance is the point: the wire's codec negotiation is a promise, M10
-    /// deletes the FFmpeg rungs, and a client whose Hello changed on that deletion would
-    /// renegotiate every session in the field for a refactor. It used to be a
-    /// libavcodec registry walk, which would have answered differently in the two builds
-    /// — and, worse, would have answered about decoders the ladder never reaches.
+    /// deleted the FFmpeg rungs, and a client whose Hello changed on that deletion would
+    /// have renegotiated every session in the field for a refactor. It used to be a
+    /// libavcodec registry walk, which would have answered differently — and, worse,
+    /// would have answered about decoders the ladder never reaches.
     #[test]
     fn advertised_codecs_describe_our_rungs_and_not_libavcodecs_registry() {
         let bits = decodable_codecs();
@@ -3693,27 +3421,6 @@ mod tests {
             bits & !software_decodable_codecs(),
             CODEC_HEVC,
             "HEVC is the ONE advertised codec with no CPU rung (last_rung_verdict owns it)"
-        );
-    }
-
-    /// Lock the DRM FourCC magic numbers against typos — these are the exact values
-    /// `<drm_fourcc.h>` defines, and a wrong one is what painted the Steam Deck green.
-    #[cfg(feature = "ffmpeg-fallback")]
-    #[test]
-    fn drm_fourcc_constants() {
-        assert_eq!(fourcc(b'N', b'V', b'1', b'2'), 0x3231_564e);
-        assert_eq!(fourcc(b'P', b'0', b'1', b'0'), 0x3031_3050);
-        assert_eq!(
-            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12),
-            Some(0x3231_564e)
-        );
-        assert_eq!(
-            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV24),
-            Some(0x3432_564e)
-        );
-        assert_eq!(
-            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA),
-            None
         );
     }
 }

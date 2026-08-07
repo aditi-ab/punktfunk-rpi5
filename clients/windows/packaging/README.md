@@ -9,8 +9,9 @@ touches the client (canary) and on `vX.Y.Z` release tags (stable) — see
 
 **Two architectures, one x64 runner.** Both `x64` and `arm64` packages are produced off the single
 x64 Windows runner — `x86_64-pc-windows-msvc` builds natively, `aarch64-pc-windows-msvc` is
-cross-compiled (the x64 MSVC toolset ships the ARM64 cross compiler; the matrix points `FFMPEG_DIR`
-at the runner's ARM64 FFmpeg tree, `C:\Users\Public\ffmpeg-arm64`). Artifacts are arch-suffixed
+cross-compiled (the x64 MSVC toolset ships the ARM64 cross compiler; since M10 nothing in the
+package links FFmpeg, so neither arch needs a per-arch `FFMPEG_DIR` tree staged on the runner —
+one less thing the ARM64 leg can be missing). Artifacts are arch-suffixed
 (`..._x64.msix` / `..._arm64.msix`, each with its matching `.cer`); `pack-msix.ps1 -Arch x64|arm64`
 stamps the manifest `ProcessorArchitecture` and names the output. See
 [`windows.yml`](../../../.gitea/workflows/windows.yml) for the cross-build rationale.
@@ -25,9 +26,16 @@ stamps the manifest `ProcessorArchitecture` and names the output. See
 | `punktfunk-session.exe` | the release build — the Vulkan session client the shell spawns for every stream (sibling resolution, `src/spawn.rs`). Skia links statically; `vulkan-1.dll` is a GPU-driver component, never bundled. ARM64 builds it `--no-default-features` (no Skia console UI) until rust-skia ships aarch64-pc-windows-msvc prebuilts |
 | `Microsoft.WindowsAppRuntime.Bootstrap.dll`, `resources.pri` | staged by the client's `build.rs` via `windows-reactor-setup::as_framework_dependent()` |
 | `SDL3.dll` | auto-staged by the `sdl3` crate |
-| `avcodec/avformat/avutil/swscale/swresample/...-*.dll` | `FFMPEG_DIR\bin` |
+| `licenses\*` | the project's MIT/Apache texts + the generated `THIRD-PARTY-NOTICES.txt` (MSIX has no installer EULA page, so attribution ships as files) |
 | `Assets\*.png` | checked-in tile/store logos (rasterized from `packaging/flatpak/io.unom.Punktfunk.svg`) |
 | `AppxManifest.xml` | the template here, with `{VERSION}`/`{PUBLISHER}` substituted |
+
+**No FFmpeg DLLs.** The client decodes natively since M10 (`pf-vkdecode` / `pf-dxvadec` /
+OpenH264+rav1d — punktfunk-planning `design/client-native-decode.md` §6), so nothing here
+link-imports `libav*` and the wildcard `avcodec/avformat/avutil/swscale/swresample-*.dll` copy is
+gone, along with the FFmpeg LGPL notice that accompanied it — shipping that notice now would claim
+a dependency the package doesn't have. The **host** installer is unchanged:
+`packaging/windows/pack-host-installer.ps1` still ships those DLLs for its AMF/QSV encode path.
 
 ### Why an "unpackaged" WinUI app packages cleanly
 
@@ -87,8 +95,7 @@ cargo build --release -p punktfunk-client-windows --target x86_64-pc-windows-msv
 pwsh -File clients/windows/packaging/pack-msix.ps1 `
   -Version 0.2.0.0 -TargetDir C:\t\x86_64-pc-windows-msvc\release -OutDir C:\t\msix
 
-# arm64 (cross-compiled; point FFMPEG_DIR at the ARM64 tree)
-$env:FFMPEG_DIR = 'C:\Users\Public\ffmpeg-arm64'
+# arm64 (cross-compiled; no extra environment — the client links no FFmpeg)
 cargo build --release -p punktfunk-client-windows --target aarch64-pc-windows-msvc
 pwsh -File clients/windows/packaging/pack-msix.ps1 `
   -Version 0.2.0.0 -Arch arm64 -TargetDir C:\t\aarch64-pc-windows-msvc\release -OutDir C:\t\msix

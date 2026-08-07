@@ -1,4 +1,4 @@
-//! Low-level GPU helpers: memory allocation, image barriers, AVVkFrame sync, geometry.
+//! Low-level GPU helpers: memory allocation, decode-image barriers, geometry.
 
 use super::Presenter;
 use anyhow::{Context as _, Result};
@@ -7,7 +7,7 @@ use ash::vk;
 impl Presenter {
     /// Wait the in-flight fence: OUR command buffers are done (staging, video image,
     /// old-swapchain images). Deliberately NOT `vkDeviceWaitIdle` — the pump thread
-    /// submits FFmpeg's Vulkan decode work concurrently, and wait-idle's external-sync
+    /// submits Vulkan decode work concurrently, and wait-idle's external-sync
     /// rule over every device queue would race it (observed as a resize crash).
     pub(super) fn quiesce_own(&mut self) -> Result<()> {
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
@@ -79,70 +79,23 @@ pub(super) fn subresource_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
-/// Acquire a Vulkan-Video frame's image from the decode queue family (EXCLUSIVE
-/// sharing) and transition it for sampling. `src_qf == dst_qf` (or IGNORED/CONCURRENT)
-/// degrades to a plain layout transition. The matching decode-side acquire happens in
-/// FFmpeg, keyed off the queue_family we write back after submission.
-///
-/// `srcStage` is FRAGMENT_SHADER — NOT TOP_OF_PIPE — deliberately: the submit waits the
-/// frame's decode-complete timeline semaphore with `wait_dst_stage_mask =
-/// FRAGMENT_SHADER`, and a semaphore wait only orders operations whose first sync scope
-/// INTERSECTS that mask (the dependency-chain rule). With TOP_OF_PIPE the barrier's
-/// layout transition (VIDEO_DECODE_DST/DPB → SHADER_READ_ONLY) formed no chain with the
-/// wait and could execute while the decode queue was still writing the image. On RADV
-/// that transition physically touches the image (metadata/decompression), so the race
-/// showed as green/yellow block corruption exactly at freshly-decoded (damaged) regions
-/// — the Steam Deck cursor-trail artifact. NVIDIA treats the transition as a no-op,
-/// which is why the same code looked clean there.
-pub(super) fn vkframe_acquire_barrier(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    src_qf: u32,
-    dst_qf: u32,
-) {
-    let (src, dst) = if src_qf == dst_qf || src_qf == vk::QUEUE_FAMILY_IGNORED {
-        (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
-    } else {
-        (src_qf, dst_qf)
-    };
-    let b = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(old_layout)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(src)
-        .dst_queue_family_index(dst)
-        .image(image)
-        .subresource_range(subresource_range());
-    // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns and
-    // has begun, referencing handles it also owns; nothing is submitted until the recording is
-    // ended.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
-    }
-}
-
 /// Layout round-trip for one LAYER of a native (pf-vkdecode) decode image: decode
 /// layout → SHADER_READ_ONLY before the CSC pass, and back after it. Layer-scoped —
 /// the pool is an image array and the other layers are live DPB state that must not
 /// be touched. No queue-family transfer: the pool is created CONCURRENT across the
 /// graphics+decode families.
 ///
-/// Both scopes are FRAGMENT_SHADER for the same dependency-chain reason as
-/// [`vkframe_acquire_barrier`]: the submit waits the frame's decode-complete timeline
-/// with `wait_dst_stage_mask = FRAGMENT_SHADER`, and only a barrier whose first sync
-/// scope intersects that mask chains with the wait — with TOP_OF_PIPE the transition
-/// could execute while the decode queue still writes (the RADV green-block class).
+/// Both scopes are FRAGMENT_SHADER, and that is load-bearing, not tidiness: the submit
+/// waits the frame's decode-complete timeline with `wait_dst_stage_mask =
+/// FRAGMENT_SHADER`, and a semaphore wait only orders operations whose first sync scope
+/// INTERSECTS that mask (the dependency-chain rule). With TOP_OF_PIPE the transition
+/// formed no chain with the wait and could execute while the decode queue was still
+/// writing the image. On RADV that transition physically touches the image
+/// (metadata/decompression), so the race showed as green/yellow block corruption exactly
+/// at freshly-decoded (damaged) regions — the Steam Deck cursor-trail artifact. NVIDIA
+/// treats the transition as a no-op, which is why the same code looked clean there.
+/// (Diagnosed on the FFmpeg-Vulkan rung's own acquire barrier, which is where the
+/// TOP_OF_PIPE was; that rung is gone, the rule is not.)
 pub(super) fn native_layer_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,

@@ -20,9 +20,11 @@ pub struct SharedDevice {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    /// External-sync lock for `queue` — FFmpeg's decode prep submits to the same queue
-    /// from the pump thread, so every overlay flush/submit must hold it (the presenter
-    /// and FFmpeg's `lock_queue` callbacks serialize on this same lock).
+    /// External-sync lock for `queue` — the decode lane submits to the same queue
+    /// from the pump thread, so every overlay flush/submit must hold it. The presenter,
+    /// this overlay and the native decode lane all serialize on this one lock; take it
+    /// with [`pf_client_core::video::QueueLock::guard`], whose RAII form is what every
+    /// Rust caller wants.
     pub queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
 }
 

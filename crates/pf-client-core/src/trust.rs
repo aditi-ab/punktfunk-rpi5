@@ -937,11 +937,18 @@ pub struct Settings {
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
     pub codec: String,
-    /// Video decoder preference: `"auto"` (vendor-ordered hardware ladder — on H.264
-    /// and HEVC the native pf-vkdecode rung sits immediately above FFmpeg-Vulkan;
-    /// then VAAPI/D3D11VA, then software — see `video::Decoder::new` for the
-    /// per-vendor order), `"vulkan"`, `"vaapi"`, `"d3d11va"`, `"native-vulkan"`,
-    /// `"software"`.
+    /// Video decoder preference: `"auto"` (vendor-ordered native ladder — pf-vkdecode over
+    /// Vulkan Video, then the platform's own rung, then software; see `video::Decoder::new`
+    /// for the per-vendor order), `"native-vulkan"`, `"native-vaapi"`, `"native-d3d11va"`,
+    /// or `"software"`.
+    ///
+    /// ⚠ A STORED value is not a validated one — this is a plain `String` read out of a
+    /// user's settings file, and the pre-M10 spellings `"vulkan"`/`"vaapi"`/`"d3d11va"`
+    /// (which every desktop Settings UI offered) named libavcodec's rungs, deleted at
+    /// M10. `video::migrate_decoder_pref` maps each onto the native rung for the same
+    /// hardware family, at `warn`, so an upgrade does not end a session over a dropdown
+    /// the user picked long ago. Nothing rewrites the STORE — the value is migrated on
+    /// every read, so downgrading to an older client still works.
     /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
     pub decoder: String,
     /// Decode/present GPU (multi-GPU boxes): the adapter's marketing name, as the WinUI

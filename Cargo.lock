@@ -3022,7 +3022,6 @@ dependencies = [
  "anyhow",
  "ash",
  "async-channel",
- "ffmpeg-next",
  "libc",
  "libloading",
  "mdns-sd",
@@ -3030,7 +3029,6 @@ dependencies = [
  "opus",
  "pf-bitstream",
  "pf-dxvadec",
- "pf-ffvk",
  "pf-update-check",
  "pf-vaadec",
  "pf-vkdecode",
@@ -3125,15 +3123,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pf-ffvk"
-version = "0.24.0"
-dependencies = [
- "ash",
- "bindgen",
- "pkg-config",
-]
-
-[[package]]
 name = "pf-frame"
 version = "0.24.0"
 dependencies = [
@@ -3207,7 +3196,6 @@ dependencies = [
  "ash",
  "async-channel",
  "pf-client-core",
- "pf-ffvk",
  "punktfunk-core",
  "sdl3",
  "tracing",
@@ -3588,7 +3576,6 @@ name = "punktfunk-client-windows"
 version = "0.24.0"
 dependencies = [
  "async-channel",
- "ffmpeg-next",
  "mdns-sd",
  "pf-client-core",
  "punktfunk-core",

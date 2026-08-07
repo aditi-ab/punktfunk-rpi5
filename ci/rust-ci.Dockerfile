@@ -22,8 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl-dev libegl-dev libgbm-dev \
     # punktfunk-client-linux (GTK4/libadwaita shell, SDL3 gamepads)
     libgtk-4-dev libadwaita-1-dev libsdl3-dev \
-    # pf-ffvk (bindgen over libavutil/hwcontext_vulkan.h needs <vulkan/vulkan.h>)
-    libvulkan-dev \
+    # No libvulkan-dev: nothing in the workspace compiles or links against Vulkan (pyrowave-sys
+    # bindgens its own vendored headers, and both host and client reach Vulkan through ash, which
+    # dlopens the loader), so neither the build nor deb.yml's dpkg-shlibdeps ever asks for it.
     && rm -rf /var/lib/apt/lists/*
 
 # bun — builds the punktfunk-web console in deb.yml (which runs the web build in THIS image).

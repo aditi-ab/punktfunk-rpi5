@@ -61,7 +61,7 @@ Every client reports the same measurements, but each family lays them out a litt
 differently. Linux · Windows · Steam Deck:
 
 ```
-1920×1080@120 · 120 fps · 24.3 Mb/s · target 30 Mb/s (auto) · vulkan · HDR
+1920×1080@120 · 120 fps · 24.3 Mb/s · target 30 Mb/s (auto) · native-vulkan · HDR
 e2e 14.2/19.8 ms (p50/p95) · host 3.1 · net 6.7 · decode 2.1 · display 2.3 ms (pace 0.6 + latch 1.7)
 host: queue 0.6 · encode 1.8 · xfer 0.2 · pace 0.5 ms
 present: mailbox
@@ -101,9 +101,14 @@ lost 3 (2.4%)
   report one. Then the decode path, an [HDR](/docs/hdr) tag (`HDR`, or `HDR→SDR` when a PQ
   stream is tone-mapped onto an SDR screen), and — when you asked for
   [full chroma](/docs/client-settings) — the resolved chroma: `4:4:4` when the host
-  granted it, `4:4:4→4:2:0` when it couldn't. Android puts its decoder and the negotiated
-  codec, bit depth, colour and chroma on rows of their own underneath; the Apple clients
-  don't report a codec at all.
+  granted it, `4:4:4→4:2:0` when it couldn't. The decode path is exactly one of
+  `native-vulkan`, `native-d3d11va` (Windows), `native-vaapi` (Linux) and `software`, or
+  `pyrowave` on a [PyroWave](/docs/pyrowave) session — the same names
+  [`PUNKTFUNK_DECODER`](/docs/configuration#client-side-native-clients) takes and the same
+  ones the client's machine-readable `stats:` line carries, so what you pin is what you
+  read back, and a script that parses the line stays honest. Android puts its decoder and
+  the negotiated codec, bit depth, colour and chroma on rows of their own underneath; the
+  Apple clients don't report a codec at all.
   If the session resolved to a [settings profile](/docs/profiles-and-links), its name closes this
   line. On **Android** a `⚠ panel NN Hz` warning joins it whenever the device's panel is refreshing
   *below* the stream's rate — the tell for a phone or TV governor that ignored the requested mode,

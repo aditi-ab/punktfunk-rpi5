@@ -1,6 +1,6 @@
 [package]
 name = "pf-client-core"
-description = "Shared client plumbing (Linux + Windows) — session pump, FFmpeg decode, PipeWire/WASAPI audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shells and the Vulkan session binary build on one implementation"
+description = "Shared client plumbing (Linux + Windows) — session pump, native video decode, PipeWire/WASAPI audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shells and the Vulkan session binary build on one implementation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,6 @@ repository.workspace = true
 # (same public surface — see lib.rs).
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
-# FFmpeg's Vulkan hwcontext surface (Vulkan Video decode on the presenter's device) —
-# used by `video_vulkan.rs` and NOTHING else here, so it rides the M9 `ffmpeg-fallback`
-# feature: with the FFmpeg rungs off, this dependency is not in the graph at all.
-# (pf-presenter has its OWN pf-ffvk for the AVVkFrame sync contract; that one dies with
-# the FFmpeg lane at M10, §6.)
-pf-ffvk = { path = "../pf-ffvk", optional = true }
 # Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
 # WP-2, AV1 by M7): auto's TOP rung on both desktop OSes since M9 — for every codec it
 # speaks, AV1 included — also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
@@ -89,24 +83,10 @@ rav1d = { version = "1", default-features = false, features = ["bitdepth_8"] }
 # otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
 libc = "0.2"
 
-# Opus for the audio planes.
-#
-# `ffmpeg-next` (same pin as the host) is the DECODE side, and since M9 it is no longer
-# the decode side of anything the ladder reaches by default: the three FFmpeg-backed
-# rungs live behind `ffmpeg-fallback` (below). It stays a hard dependency for exactly
-# three residues, all of them M10's §6 line item ("pf-client-core: drop ffmpeg-next")
-# and all of them type-level rather than decode-level:
-#   * `ffmpeg::codec::Id` — the codec vocabulary `Decoder::new` still speaks (the wire
-#     `quic::CODEC_*` bits are the other half; `wire_codec_of` is where they meet);
-#   * `DrmFrameGuard::Av` + `VkVideoFrame` + `DecodedImage::VkFrame` — the FFmpeg-Vulkan
-#     frame TYPE, which is `pf-presenter`'s public import (`vk/present.rs`'s AVVkFrame
-#     lock/unlock contract). Deleting it here is deleting the presenter's FFmpeg lane,
-#     which M10 does in one move together with `crates/pf-ffvk`;
-#   * `AVPixelFormat` in `drm_fourcc_for`'s signature (its constants are locked by a
-#     test that runs on every leg).
-# Nothing in that list opens a decoder, and with `ffmpeg-fallback` off nothing in this
-# crate calls libavcodec at all.
-ffmpeg-next = "8"
+# Opus for the audio planes. The VIDEO side has no FFmpeg at all since M10: every decode
+# rung is native (pf-vkdecode / pf-dxvadec / pf-vaadec / openh264+rav1d) and the codec
+# vocabulary is `punktfunk_core::quic`'s own `CODEC_*` wire bits. The HOST still encodes
+# with libavcodec (`pf-encode`); nothing in this crate does.
 opus = "0.3"
 
 mdns-sd = "0.20"
@@ -164,9 +144,9 @@ pf-dxvadec = { path = "../pf-dxvadec" }
 # property stores entirely (the same version the host pins).
 winreg = "0.56"
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
-# D3D11VA decode (video_d3d11.rs): device/adapter selection, DXVA probes, and the shared
-# NT-handle hand-off ring. Same pinned rev as clients/windows so the workspace builds ONE
-# windows-rs.
+# D3D11 decode-device plumbing (video_d3d11.rs): device/adapter selection, DXVA probes, and
+# the shared NT-handle hand-off ring `video_d3d11_native` fills. Same pinned rev as
+# clients/windows so the workspace builds ONE windows-rs.
 windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
     # Features are header-named since windows-rs generates from the SDK headers directly
     # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
@@ -186,9 +166,10 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# The native D3D11VA rung's frame-hash parity test compares decoded surfaces against
-# libavcodec's goldens — the same SHA-256 list, and the same crate, pf-vkdecode's Vulkan
-# parity legs use (already in the workspace lock).
+# The native D3D11VA rung's frame-hash parity test compares decoded surfaces against the
+# libavcodec goldens M5 captured — the same SHA-256 list, and the same crate, pf-vkdecode's
+# Vulkan parity legs use (already in the workspace lock). The goldens are checked-in
+# hashes; nothing links FFmpeg to read them.
 sha2 = "0.10"
 
 [features]
@@ -197,23 +178,6 @@ sha2 = "0.10"
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
 default = ["pyrowave"]
 pyrowave = ["dep:pyrowave-sys", "dep:ash"]
-# M9 — the three FFmpeg-backed decode rungs (`video_vulkan`, `video_vaapi`, the
-# libavcodec half of `video_d3d11`, plus the `video_libav` ownership helpers they share).
-#
-# **OFF here on purpose, and that is NOT the shipping default.** The crate default is the
-# M10 world — natives only — so that `cargo clippy -p pf-client-core` compiles, lints and
-# tests the ladder M10 will leave behind, and M10 itself becomes `rm` plus attribute
-# deletion instead of a redesign. The binaries that actually decode
-# (`clients/session`, and `pf-presenter` which owns the run loop) turn it back ON in their
-# own default feature sets, so what a user installs is unchanged until they say otherwise.
-#
-# With it ON the FFmpeg rungs sit exactly where they sit today: directly BELOW their
-# native counterparts, as the fall-through a native init failure or error streak lands on.
-# With it OFF the ladder is native → other native → software and nothing else.
-#
-# See `video.rs`'s module docs for the rung/evidence table and for the two ways to run the
-# M9 field bake.
-ffmpeg-fallback = ["dep:pf-ffvk"]
 
 [lints]
 workspace = true

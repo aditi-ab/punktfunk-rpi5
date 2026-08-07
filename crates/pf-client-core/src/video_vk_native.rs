@@ -1,20 +1,19 @@
 //! Native Vulkan Video decode backend (WP-C of the native-decode program, widened to
 //! HEVC by M3 WP-2 and to AV1 by M7): pf-vkdecode's
 //! [`VkH264Decoder`]/[`VkH265Decoder`]/[`VkAv1Decoder`] running on the PRESENTER's own
-//! VkDevice — the same zero-copy shape as the FFmpeg-Vulkan backend, with no FFmpeg in
-//! the path. Auto's TOP rung on both desktop OSes since M9, for ALL THREE codecs — each
+//! VkDevice — the same zero-copy shape the FFmpeg-Vulkan backend had, with no FFmpeg in
+//! the path. Auto's TOP rung on both desktop OSes, for ALL THREE codecs — each
 //! leg has bit-exact parity against libavcodec (H.264/H.265 on three drivers plus a
 //! 92-minute soak, M2/M3; AV1 250/250 on an RTX 5070 Ti, M7 — `video`'s evidence table
 //! holds the record) — also pinnable via `PUNKTFUNK_DECODER=native-vulkan`;
 //! `video::native_vulkan_gate` is the admission either way, and a failure falls through
-//! to the rung below (FFmpeg-Vulkan where `ffmpeg-fallback` compiled it, the platform's
-//! native rung otherwise).
+//! to the rung below (the platform's own native rung).
 //!
 //! **Codec dispatch:** the negotiated codec picks the decoder ONCE, at construction
 //! ([`Codec`]) — H.264, H.265 or AV1, the three codecs pf-vkdecode speaks. The
 //! negotiated picture SHAPE (chroma format + bit depth) is checked there too, against
 //! the device: an H.265 or AV1 session this GPU has no decode format for is refused at
-//! construction, where the ladder answers with FFmpeg-Vulkan, rather than at the
+//! construction, where the ladder simply walks on to the next rung, rather than at the
 //! first AU, where the only exit is an error streak PAST that rung
 //! ([`NativeVulkanDecoder::new`]). Nothing below the codec enum is per-codec: the
 //! shipped-frame ledger, the release tokens, the
@@ -81,8 +80,8 @@
 //! `VK_ERROR_DEVICE_LOST` class). When the families differ, the decode queue has exactly
 //! one submitter (this backend, on the pump thread) and locking would serialize decode
 //! against present for nothing — [`submit_queues_collide`] is the whole decision. (The
-//! FFmpeg path locks on every family only because `lock_queue` is one callback pair for
-//! the whole device; the collision it exists to prevent is the shared-queue one.)
+//! FFmpeg path locked on every family only because `lock_queue` was one callback pair for
+//! the whole device; the collision the lock exists to prevent is the shared-queue one.)
 //!
 //! **Release lifecycle** (decode → present → retire → release): each delivered frame
 //! ships as a [`NativeVkFrame`] whose [`NativeReleaseGuard`] sends a token (seq +
@@ -97,10 +96,10 @@
 //!
 //! **Status queries:** every decode op carries a `RESULT_STATUS_ONLY` query —
 //! [`Codec::poll_status`], read non-blockingly here at each decode entry. A
-//! `Failed` verdict is driver-reported decode corruption, the class FFmpeg's
+//! `Failed` verdict is driver-reported decode corruption, the class libavcodec's
 //! `vulkan_decode.c` (`nb_queries = 0`) architecturally cannot see — the Xbox Ally X
 //! field case. It surfaces as an `Err` from the CURRENT `decode_frame` call so the
-//! existing streak/reanchor machinery fires exactly as it does for FFmpeg errors.
+//! existing streak/reanchor machinery fires exactly as it did for libavcodec errors.
 //!
 //! **The recovery policy** (M4) — what a damaged stream ASKS for, and why it cannot
 //! storm. There are two kinds of damage and they are answered differently:
@@ -114,11 +113,11 @@
 //!   RFI, dropped-climb, no-output streak, overdue backstop, decoder recovery). It is
 //!   deliberately NOT an `Err`: an error ticks the demotion streak, and three of them
 //!   in a second would demote the native rung on exactly the lossy links it exists to
-//!   diagnose — an FFmpeg rung conceals the same event silently and keeps its job.
+//!   diagnose — libavcodec concealed the same event silently and kept its job.
 //! - **A driver `Failed` verdict** (and its query-less twin, a decode status that
 //!   could not be established at all — [`StatusVerdicts`]). That is a statement about
-//!   the DECODER, not the stream, so it stays an `Err`: same volume as an FFmpeg
-//!   reference-miss error, streak-eligible, and a driver making it repeatedly is
+//!   the DECODER, not the stream, so it stays an `Err`: the same volume libavcodec's
+//!   reference-miss errors had, streak-eligible, and a driver making it repeatedly is
 //!   precisely what demotion is for.
 //! - **A REFUSED AU** — the decoder answering `Err` outright (a plan error, a
 //!   Vulkan/session failure). Also an error, also streak-eligible, and counted
@@ -167,7 +166,7 @@
 //! wire mark (Windows AMF and QSV — only Linux libav-NVENC sets it): the wave emits
 //! no IDR and libavcodec flags none, so without this such a session freezes for the
 //! full 500 ms backstop and then forces the very IDR the wave exists to avoid.
-//! Additional, never a replacement: the wire path is untouched and the FFmpeg rungs
+//! Additional, never a replacement: the wire path is untouched and the other rungs
 //! keep exactly the behaviour they had.
 //!
 //! **Teardown:** dropping this backend (demotion, session end) waits — bounded — for
@@ -242,13 +241,13 @@ impl pf_vkdecode::QueueLock for NativeQueueLock {
 
 /// The codecs pf-vkdecode has a decoder for — the native rung's whole vocabulary,
 /// named ash-free so `video.rs` can pick one from the negotiated wire codec without
-/// this module knowing about FFmpeg's codec ids (and `video::native_vulkan_gate`
+/// this module knowing about the wire's codec bits (and `video::native_vulkan_gate`
 /// stays the single admission decision).
 ///
 /// Being IN this enum is not the same as being in `auto`: this list says pf-vkdecode has
-/// a decoder, `video::native_vulkan_gate` (through `video::native_rung_admitted` and the
-/// evidence table) says whether the automatic ladder may pick it. All three legs are in
-/// `auto` since M9, and that is the gate's decision to change, not this list's.
+/// a decoder, `video::native_vulkan_gate` says whether the automatic ladder may pick it
+/// (and the device's own codec-operation caps bit is half of that answer). All three legs
+/// are in `auto`, and that is the gate's decision to change, not this list's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCodec {
     H264,
@@ -910,19 +909,18 @@ impl NativeVulkanDecoder {
     /// formats) and a device that advertises H.265 or AV1 decode need not advertise a
     /// format for every shape of it: 4:4:4 is absent everywhere but NVIDIA. Discovered
     /// lazily, that is a mid-stream ERROR STREAK, and the streak machinery demotes a
-    /// Vulkan rung to VAAPI/D3D11VA — PAST FFmpeg-Vulkan, which on NVIDIA/Linux (no
-    /// usable VAAPI) means a 4K HEVC session lands on SOFTWARE. Refused here it is an
-    /// ordinary construction failure, and `video::Decoder::new` falls through to
-    /// FFmpeg-Vulkan — the rung that session ran on before this backend existed.
+    /// Vulkan rung to VAAPI/D3D11VA — which on NVIDIA/Linux (no usable VAAPI) means a
+    /// 4K HEVC session lands on SOFTWARE. Refused here it is an ordinary construction
+    /// failure, and `video::Decoder::new` simply walks on to the next rung.
     ///
     /// Three legs the probe cannot see, because they are stream facts no negotiation
     /// carries: a level above the device's `maxLevelIdc`, an SPS (or AV1 sequence
     /// header) that disagrees with the Welcome, and — AV1 only — a sequence that
     /// enables FILM GRAIN, which is part of the decode profile and which the probe
     /// therefore has to assume ([`AV1_PROBE_FILM_GRAIN`]). All three still surface at
-    /// the first decode — and are caught by the "never delivered a frame" arm in
-    /// [`crate::video::Decoder::decode_frame`], which routes exactly that state to
-    /// FFmpeg-Vulkan instead of past it.
+    /// the first decode, where the demotion walk's next candidate is the rung DIRECTLY
+    /// below this one — the property the pre-M10 "never delivered a frame" arm existed
+    /// to guarantee, now structural (see [`crate::video::Decoder::decode_frame`]).
     ///
     /// H.264 is deliberately NOT probed: its envelope is fixed at 8-bit 4:2:0, so the
     /// only fact a probe could add is a profile idc guess — on the one path in this
@@ -955,8 +953,8 @@ impl NativeVulkanDecoder {
         // and identical for both arms (it is the HANDLES' contract, not the codec's):
         // the handles are the presenter's live instance/device, which outlives every
         // session pump (the run loop tears the pump — and with it this decoder — down
-        // first: the exact liveness contract the FFmpeg and PyroWave backends already
-        // rely on over the same bundle). `video_decode` (checked above) is set only
+        // first: the exact liveness contract the PyroWave backend also relies on over
+        // the same bundle). `video_decode` (checked above) is set only
         // when the presenter enabled the Vulkan Video decode extension stack +
         // synchronization2/timelineSemaphore at device creation — including the
         // per-codec `VK_KHR_video_decode_h264`/`_h265`/`_av1` extensions, one for
@@ -1006,9 +1004,9 @@ impl NativeVulkanDecoder {
                 // Exactly the H.265 shape check, one codec over — AV1's decode
                 // profile is a (seq_profile, sampling, depth, film grain) tuple and
                 // a device that advertises the AV1 decode OPERATION need not offer
-                // every profile of it. Refused here, the ladder answers with
-                // FFmpeg-Vulkan; discovered at the first AU, the only exit is an
-                // error streak PAST that rung.
+                // every profile of it. Refused here, the ladder walks to the next
+                // rung; discovered at the first AU, the only exit is an error streak
+                // PAST that rung.
                 let wanted = picture_format("AV1", stream)?;
                 // SAFETY: the handle contract stated directly above.
                 let d = unsafe { VkAv1Decoder::new(&handles, lock) }
@@ -1044,7 +1042,7 @@ impl NativeVulkanDecoder {
                 "native decode: this device's decode queue family does not support \
                  RESULT_STATUS queries — driver-reported corruption is not \
                  observable on this session (decode status degrades to timeline \
-                 completion, FFmpeg parity)"
+                 completion — the only signal libavcodec's rungs ever had)"
             );
         }
         // `PUNKTFUNK_AU_FAULT=<mode>[:<period>]` — the deliberate-corruption knob
@@ -1117,7 +1115,7 @@ impl NativeVulkanDecoder {
     ///
     /// `Ok(Some)` = a display-ready picture. `Ok(None)` = no picture this AU, which
     /// covers three unrelated things and the caller treats all three the same
-    /// (its no-output/re-anchor machinery, exactly as for FFmpeg): the decoder
+    /// (its no-output/re-anchor machinery): the decoder
     /// buffered without output, an H.265 RASL picture was skipped after an open-GOP
     /// join, or the AU's plan needed CONCEALMENT and its output was released
     /// unshown. `Err` = the DECODER is in trouble — a Vulkan/session error, an AV1
@@ -1213,9 +1211,8 @@ impl NativeVulkanDecoder {
                 // `take_ready` and ships it with an empty warning ledger. That
                 // would put a picture from a REFUSED unit on screen, clear the
                 // demotion streak with it, and set `video.rs`'s `delivered` —
-                // permanently disabling the never-delivered fall-through to
-                // FFmpeg-Vulkan, which is the backstop for exactly the stream
-                // shapes that refuse every AU.
+                // reporting a rung as working on exactly the stream shapes that
+                // refuse every AU.
                 //
                 // On H.264/H.265 this also catches the pictures `recover_dpb`
                 // FLUSHES out of the DPB on the AU after a failure (that AU then
@@ -1271,7 +1268,7 @@ impl NativeVulkanDecoder {
         if concealed || verdicts.total() > 0 {
             // Concealment planned into THIS AU, or a bad status verdict on a
             // PRIOR frame (driver-reported corruption — the Ally X class,
-            // invisible to FFmpeg's query-less decoder — or a status that could
+            // invisible to libavcodec's query-less decoder — or a status that could
             // not be established at all): this call's output is released unshown
             // either way, because the picture is not fit to present.
             for frame in fresh {
@@ -1281,8 +1278,8 @@ impl NativeVulkanDecoder {
             }
             if verdicts.total() > 0 {
                 // A verdict about the DECODER rather than the stream: an error,
-                // streak-eligible, same volume as an FFmpeg reference-miss error
-                // (never quieter).
+                // streak-eligible, at the volume libavcodec's reference-miss errors
+                // had (never quieter).
                 return Err(self.status_error(verdicts));
             }
             warnings.warn_concealment(integrity.len());
@@ -1808,9 +1805,9 @@ mod tests {
 
     /// The construction-time shape refusal, device-independent half. A negotiated
     /// shape pf-vkdecode has no picture format for must be refused where
-    /// `Decoder::new` still has FFmpeg-Vulkan to fall through to — NOT discovered at
-    /// the first AU, where the only exit is an error streak that demotes PAST that
-    /// rung to VAAPI/D3D11VA (and on NVIDIA/Linux, straight to software).
+    /// `Decoder::new` can still walk to the next rung — NOT discovered at the first AU,
+    /// where the only exit is an error streak that demotes PAST that rung (and on
+    /// NVIDIA/Linux, where VAAPI is unusable, straight to software).
     #[test]
     fn a_stream_shape_with_no_native_picture_format_is_refused_at_construction() {
         use crate::video::StreamFormat;
@@ -1853,8 +1850,7 @@ mod tests {
     /// exactly the same set (monochrome, 4:2:2, the planner's 4:4:0 sentinel, any
     /// depth but 8/10). Two gates that disagreed would mean either a shape refused
     /// here that the device could have decoded, or — worse — a shape admitted here
-    /// and then refused mid-stream, where the exit is an error streak past
-    /// FFmpeg-Vulkan.
+    /// and then refused mid-stream, where the exit is an error streak past this rung.
     ///
     /// The label is checked too, because it is the only thing a support engineer
     /// reading the refusal has to tell an AV1 session's refusal from an HEVC one.

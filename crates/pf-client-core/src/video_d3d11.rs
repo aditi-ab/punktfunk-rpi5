@@ -1,18 +1,26 @@
-//! D3D11VA hardware decode (Windows) for the Vulkan presenter — the vendor-agnostic DXVA
-//! path, and auto's FIRST choice on Intel/unknown vendors. Intel's Windows driver DOES
-//! advertise Vulkan Video (Arc drivers since 2023 — don't trust the capability gate to
-//! keep Intel off it), but FFmpeg-Vulkan on it is field-broken (B580, 2026-07: strobing +
-//! ~7 ms decodes) where this path streams clean; on NVIDIA/AMD it is the fallback rung
-//! below Vulkan Video, in `auto` and via mid-session demotion.
+//! The D3D11 side of the DXVA rung (Windows): the decode DEVICE and the shareable
+//! hand-off ring the decoded surfaces are converted into. Auto's first choice on
+//! Intel/unknown vendors — Intel's Windows driver DOES advertise Vulkan Video (Arc drivers
+//! since 2023 — don't trust the capability gate to keep Intel off it), but Vulkan decode
+//! on it was field-broken (B580, 2026-07: strobing + ~7 ms decodes) where this path
+//! streams clean; on NVIDIA/AMD it is the fallback rung below Vulkan Video, in `auto` and
+//! via mid-session demotion.
+//!
+//! **What decodes into these surfaces is [`crate::video_d3d11_native`]** (M5: pf-dxvadec
+//! plans driven into `ID3D11VideoDecoder`). This module held libavcodec's D3D11VA hwaccel
+//! as well until M10 excised FFmpeg from the client; what is left is the half both rungs
+//! always shared, and it is the field-proven half.
 //!
 //! Ported from the retired in-process WinUI presenter's decoder (`clients/windows/src/video.rs`)
 //! with one structural change: that presenter sampled D3D11 textures directly, while ours draws
 //! with Vulkan. Bridging rules, all learned the hard way there:
 //!
-//! * The **decode pool stays libavcodec-derived** (`get_format` sets no frames context): a
-//!   hand-built pool validated on NVIDIA was rejected by Intel at the first
-//!   `SubmitDecoderBuffers` — and Intel is the GPU this backend exists for. That also means the
-//!   decode surfaces carry no share flags, so they can't be imported into Vulkan directly.
+//! * The decode POOL is not built here. libavcodec's rung let libavcodec derive it
+//!   (`get_format` set no frames context) after a hand-built pool validated on NVIDIA was
+//!   rejected by Intel at the first `SubmitDecoderBuffers` — and Intel is the GPU this
+//!   backend exists for; the native rung declares its own pool in `video_d3d11_native`,
+//!   against pf-dxvadec's pinned bind flags. Either way the decode surfaces carry no share
+//!   flags, so they can't be imported into Vulkan directly — hence the ring below.
 //! * Each decoded slice goes through the fixed-function **`ID3D11VideoProcessor`**
 //!   (`VideoProcessorBlt`, NV12/P010 → BGRA8 — the conversion every Windows video player
 //!   exercises on every vendor) into a small ring of **shareable RGBA textures** created with
@@ -36,30 +44,13 @@
 //! The decode device is created on the **presenter's adapter** (matched by the Vulkan device's
 //! LUID) so the shared textures never cross GPUs on a multi-adapter box.
 //!
-//! **Shared with the native rung.** M5 added a second D3D11VA decoder
-//! ([`crate::video_d3d11_native`], `PUNKTFUNK_DECODER=native-d3d11va`) that drives
-//! `ID3D11VideoDecoder` from pf-bitstream plans instead of libavcodec. It fills the SAME
-//! hand-off — device creation ([`create_device`]) and the video-processor ring
-//! ([`HandoffRing`]) are `pub(crate)` for exactly that, and are the only things the two rungs
-//! share. This half is the field-proven one; what changes between the rungs is only what
-//! writes the decode surface.
+//! Device creation ([`create_device`]) and the video-processor ring ([`HandoffRing`]) are
+//! `pub(crate)` because `video_d3d11_native` is their only consumer.
 
 use crate::video::ColorDesc;
-#[cfg(feature = "ffmpeg-fallback")]
-use crate::video_libav::AvBuffer;
 use anyhow::{anyhow, Context as _, Result};
-// Every `bail!` in this file is in the libavcodec half (the DXVA profile probe and the
-// decoder itself); the shared hand-off half raises its errors through `.context()`.
-#[cfg(feature = "ffmpeg-fallback")]
-use anyhow::bail;
-#[cfg(feature = "ffmpeg-fallback")]
-use ffmpeg_next as ffmpeg;
-#[cfg(feature = "ffmpeg-fallback")]
-use std::ffi::c_void;
 use std::ptr;
 use windows::core::Interface;
-#[cfg(feature = "ffmpeg-fallback")]
-use windows::core::GUID;
 use windows::Win32::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
@@ -83,11 +74,6 @@ use windows::Win32::dxgi::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
     DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
-// The decode-surface formats are named only by the libavcodec rung's adapter probe here —
-// the native rung declares its own pool formats in `video_d3d11_native` — so they ride
-// `ffmpeg-fallback` with it.
-#[cfg(feature = "ffmpeg-fallback")]
-use windows::Win32::dxgi::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::windef::RECT;
 use windows::Win32::winnt::HANDLE;
 
@@ -101,30 +87,6 @@ const RING_SLOTS: usize = 6;
 /// submit's GPU lifetime; multiple seconds means the render thread died — surface an error
 /// (which demotes to software) instead of wedging the decode loop.
 const ACQUIRE_TIMEOUT_MS: u32 = 2000;
-
-/// Probe pool size — mirrors what libavcodec sizes for a worst-case DPB (legacy value).
-#[cfg(feature = "ffmpeg-fallback")]
-const DECODE_POOL_SIZE: i32 = 12;
-
-/// `D3D11_BIND_DECODER` — the decode pool's ONLY bind flag (see `get_format_d3d11`).
-///
-/// The NATIVE rung has its own copy of this fact ([`crate::video_d3d11_native`] builds its
-/// pool with `D3D11_BIND_DECODER` and nothing else, and pf-dxvadec's tests pin it), so this
-/// one belongs to the libavcodec probe alone and rides `ffmpeg-fallback` with it.
-#[cfg(feature = "ffmpeg-fallback")]
-const BIND_DECODER: u32 = 0x200;
-
-// DXVA decode-profile GUIDs (`dxva.h`), defined locally so no extra windows-rs feature or
-// metadata surface is pulled in for four constants. The native rung reads its profile GUIDs
-// from `pf_dxvadec` (unit-tested there), so these belong to the FFmpeg rung's adapter probe.
-#[cfg(feature = "ffmpeg-fallback")]
-const PROFILE_H264_VLD_NOFGT: GUID = GUID::from_u128(0x1b81be68_a0c7_11d3_b984_00c04f2e73c5);
-#[cfg(feature = "ffmpeg-fallback")]
-const PROFILE_HEVC_VLD_MAIN: GUID = GUID::from_u128(0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0);
-#[cfg(feature = "ffmpeg-fallback")]
-const PROFILE_HEVC_VLD_MAIN10: GUID = GUID::from_u128(0x107af0e0_ef1a_4d19_aba8_67a163073d13);
-#[cfg(feature = "ffmpeg-fallback")]
-const PROFILE_AV1_VLD_PROFILE0: GUID = GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a);
 
 /// One decoded frame, parked in a ring slot the presenter imports by NT handle. Plain POD —
 /// the ring (and its handles) belong to the decoder and outlive every in-flight frame; the
@@ -142,7 +104,7 @@ pub struct D3d11Frame {
     /// pass-through flavor) — the presenter's Vulkan import must match it exactly.
     pub rgb10: bool,
     /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See
-    /// `crate::video::VkVideoFrame`.
+    /// [`crate::video::DecodedImage::is_keyframe`].
     pub keyframe: bool,
     /// The ring slot's NT shared handle (`IDXGIResource1::CreateSharedHandle`), stable for the
     /// ring's lifetime. Raw `isize` so the frame crosses the pump→presenter channel.
@@ -151,196 +113,16 @@ pub struct D3d11Frame {
     /// presenter-side import cache could never alias a stale handle. Informational today
     /// (the presenter imports per frame).
     pub generation: u32,
-    /// Which D3D11VA rung wrote the surface this ring slot was converted from:
-    /// [`crate::video_d3d11_native`] (`true`) or this module's libavcodec one (`false`).
-    ///
-    /// Both rungs deliver `DecodedImage::D3d11`, because they deliberately share this
-    /// hand-off ring — so without this flag the `stats:` line's decode-path tag reads
-    /// `d3d11va` for both and nothing downstream can tell them apart. The native Vulkan
-    /// rung never had that problem: it has its own `DecodedImage` variant, hence its own
-    /// `native-vulkan` tag.
-    ///
-    /// That gap is not cosmetic. A native pin that fails to initialise falls through to
-    /// the FFmpeg rung by design, and the line it then emits is byte-identical to the one
-    /// the native rung would have emitted — so a soak or a vendor-matrix bake could
-    /// attribute an entire session to a rung that never ran. This program has already
-    /// shipped one measurement that could not tell "clean" from "unmeasured"; this is the
-    /// same shape and it is closed here rather than in the analysis of a soak log.
-    pub native: bool,
 }
 
-// --- FFmpeg hwcontext_d3d11va ABI (repr(C) mirrors, same as the legacy decoder) --------------
-//
-// Everything from here to `create_device` below is the libavcodec HALF of this module — the
-// `ffmpeg-fallback` rung (M9). It is gated item by item rather than moved to its own file
-// because the two halves share this module's docs, its constants and its hand-off ring, and
-// because nothing in this tree COMPILES `cfg(windows)` code: a file move here could not be
-// checked by any gate, an attribute can at least be read against the item it sits on.
-
-/// `hwcontext_d3d11va.h` — `AVHWDeviceContext::hwctx` for D3D11VA. FFmpeg installs the
-/// `ID3D11Multithread` default lock + multithread protection during init, which is what lets
-/// the presenter-side device share textures with the decode thread safely.
-#[cfg(feature = "ffmpeg-fallback")]
-#[repr(C)]
-struct AVD3D11VADeviceContext {
-    device: *mut c_void,         // ID3D11Device*
-    device_context: *mut c_void, // ID3D11DeviceContext*
-    video_device: *mut c_void,   // ID3D11VideoDevice*
-    video_context: *mut c_void,  // ID3D11VideoContext*
-    lock: *mut c_void,           // void (*)(void*)
-    unlock: *mut c_void,         // void (*)(void*)
-    lock_ctx: *mut c_void,
-}
-
-/// `hwcontext_d3d11va.h` — `AVHWFramesContext::hwctx`. A user-built frames context gets NO
-/// default bind flags (BindFlags 0 → `CreateTexture2D` E_INVALIDARG); only the probe below
-/// builds one, and it sets `BIND_DECODER` exactly like libavcodec's own path.
-#[cfg(feature = "ffmpeg-fallback")]
-#[repr(C)]
-struct AVD3D11VAFramesContext {
-    texture: *mut c_void, // ID3D11Texture2D* (null → FFmpeg allocates the pool)
-    bind_flags: u32,      // UINT BindFlags
-    misc_flags: u32,      // UINT MiscFlags
-    texture_infos: *mut c_void, // AVD3D11FrameDescriptor* (FFmpeg-managed)
-}
-
-// Hand-written mirrors of libav's `AVD3D11VADeviceContext` / `AVD3D11VAFramesContext`
-// (hwcontext_d3d11va.h) — `ffmpeg-sys-next` binds neither, and we WRITE `device` / `bind_flags`
-// through them, so a wrong offset is silent corruption of libav's context rather than a compile
-// error. ⚠ These two structs are duplicated in the other crate that talks to the same libav
-// contexts (pf-encode's `ffmpeg_win.rs` and pf-client-core's `video_d3d11.rs`); they must agree
-// with libav AND with each other, and these assertions are what makes a drift in either a build
-// failure instead of a runtime mystery.
-#[cfg(feature = "ffmpeg-fallback")]
-const _: () = {
-    use std::mem::{offset_of, size_of};
-    type P = *mut c_void;
-    assert!(size_of::<AVD3D11VADeviceContext>() == 7 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, device) == 0);
-    assert!(offset_of!(AVD3D11VADeviceContext, device_context) == size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, video_device) == 2 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, video_context) == 3 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, lock) == 4 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, unlock) == 5 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VADeviceContext, lock_ctx) == 6 * size_of::<P>());
-    // ptr, u32, u32, ptr — the two 32-bit flags pack into one pointer-sized slot with no padding.
-    assert!(size_of::<AVD3D11VAFramesContext>() == 3 * size_of::<P>());
-    assert!(offset_of!(AVD3D11VAFramesContext, texture) == 0);
-    assert!(offset_of!(AVD3D11VAFramesContext, bind_flags) == size_of::<P>());
-    assert!(offset_of!(AVD3D11VAFramesContext, misc_flags) == size_of::<P>() + 4);
-    assert!(offset_of!(AVD3D11VAFramesContext, texture_infos) == 2 * size_of::<P>());
-};
-
-#[cfg(feature = "ffmpeg-fallback")]
-fn averr(what: &str, code: i32) -> anyhow::Error {
-    anyhow!("{what}: {}", ffmpeg::Error::from(code))
-}
-
-/// libavcodec's `get_format` callback: pick the D3D11 hw surface format and nothing else.
-/// Deliberately does NOT build a frames context — with `hw_device_ctx` set and `hw_frames_ctx`
-/// left null, libavcodec derives the decode pool itself (`ff_decode_get_hw_frames_ctx`),
-/// applying every vendor quirk: DXVA surface alignment (128 for HEVC/AV1), DPB-based pool
-/// sizing, and the decoder-only `D3D11_BIND_DECODER` flags. A hand-built context validated on
-/// NVIDIA was rejected by Intel at the first `SubmitDecoderBuffers` (E_INVALIDARG) — the
-/// vendor-proof path is the one the ffmpeg CLI/mpv ship.
-#[cfg(feature = "ffmpeg-fallback")]
-unsafe extern "C" fn get_format_d3d11(
-    avctx: *mut ffmpeg::ffi::AVCodecContext,
-    mut list: *const ffmpeg::ffi::AVPixelFormat,
-) -> ffmpeg::ffi::AVPixelFormat {
-    use ffmpeg::ffi::*;
-    // SAFETY: libav calls this `get_format` callback with a context and a list it owns; the list
-    // is terminated by `AV_PIX_FMT_NONE`, so the walk stays inside it, and `avctx`'s fields are
-    // read/set only while libav holds it live for the call.
-    unsafe {
-        if (*avctx).hw_device_ctx.is_null() {
-            return AVPixelFormat::AV_PIX_FMT_NONE;
-        }
-        while *list != AVPixelFormat::AV_PIX_FMT_NONE {
-            if *list == AVPixelFormat::AV_PIX_FMT_D3D11 {
-                return AVPixelFormat::AV_PIX_FMT_D3D11;
-            }
-            list = list.add(1);
-        }
-        AVPixelFormat::AV_PIX_FMT_NONE
-    }
-}
-
-/// Does the adapter expose a DXVA decode profile for `codec_id`? Checked before building the
-/// FFmpeg hwdevice because hwaccel selection (`get_format`) only runs on the FIRST access
-/// unit — an unsupported profile would otherwise burn the opening IDR and recover through the
-/// mid-stream demotion path instead of committing to software up front.
-#[cfg(feature = "ffmpeg-fallback")]
-fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) -> Result<()> {
-    let video: ID3D11VideoDevice = device
-        .cast()
-        .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
-    // SAFETY: COM calls on the live `ID3D11VideoDevice` obtained by the checked `cast` above; the
-    // count bounds the loop and each profile is returned by value.
-    let profiles: Vec<GUID> = unsafe {
-        let n = video.GetVideoDecoderProfileCount();
-        (0..n)
-            .filter_map(|i| video.GetVideoDecoderProfile(i).ok())
-            .collect()
-    };
-    let (wanted, format, name): (GUID, DXGI_FORMAT, &str) = match codec_id {
-        ffmpeg::codec::Id::H264 => (PROFILE_H264_VLD_NOFGT, DXGI_FORMAT_NV12, "H.264 VLD NoFGT"),
-        ffmpeg::codec::Id::HEVC => (PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_NV12, "HEVC Main"),
-        ffmpeg::codec::Id::AV1 => (PROFILE_AV1_VLD_PROFILE0, DXGI_FORMAT_NV12, "AV1 Profile 0"),
-        other => bail!("no DXVA profile known for {other:?}"),
-    };
-    let ok = profiles.contains(&wanted)
-        // SAFETY: same live video device; the two arguments are a borrowed local GUID and a plain
-        // format enum.
-        && unsafe { video.CheckVideoDecoderFormat(&wanted, format) }
-            .map(|b| b.as_bool())
-            .unwrap_or(false);
-    if !ok {
-        bail!("adapter exposes no {name} decode profile");
-    }
-    // 10-bit (a mid-session HDR upgrade needs Main10): informational — if it's missing, the
-    // decode error → software demotion + keyframe re-request path covers the switch.
-    if codec_id == ffmpeg::codec::Id::HEVC {
-        let main10 = profiles.contains(&PROFILE_HEVC_VLD_MAIN10)
-            // SAFETY: as above — borrowed static GUID plus a plain format enum.
-            && unsafe { video.CheckVideoDecoderFormat(&PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010) }
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
-        tracing::info!(main10, "HEVC Main10 (10-bit/HDR) decode profile");
-    }
-    Ok(())
-}
-
-/// Predict whether D3D11VA decode will work by doing EXACTLY what the decoder's `get_format`
-/// leads to — allocate an `AVHWFramesContext` (decoder-only pool) and initialize it, which
-/// creates the real NV12 decode surface array. On a GPU/driver that can't create the pool this
-/// fails here, up front, so the session commits to software from the first frame (a clean,
-/// gap-free stream) instead of dying mid-stream on the opening IDR.
-#[cfg(feature = "ffmpeg-fallback")]
-unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> bool {
-    use ffmpeg::ffi::*;
-    // SAFETY: `hw_device` is a valid `AVBufferRef` by this fn's contract; the frames context is
-    // allocated, configured and released within this scope, and every libav return is checked
-    // before use.
-    unsafe {
-        // Scope-bound: this probe owns the frames ctx for the length of the check and the drop
-        // below releases it on BOTH exits, instead of the early return relying on the null case and
-        // the success path unref'ing by hand.
-        let Some(frames_ref) = AvBuffer::from_raw(av_hwframe_ctx_alloc(hw_device)) else {
-            return false;
-        };
-        let frames = (*frames_ref.as_ptr()).data as *mut AVHWFramesContext;
-        (*frames).format = AVPixelFormat::AV_PIX_FMT_D3D11;
-        (*frames).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
-        (*frames).width = 1920;
-        (*frames).height = 1152; // 128-aligned 1080p surface (the HEVC DXVA alignment)
-        (*frames).initial_pool_size = DECODE_POOL_SIZE;
-        let fhw = (*frames).hwctx as *mut AVD3D11VAFramesContext;
-        (*fhw).bind_flags = BIND_DECODER;
-        let r = av_hwframe_ctx_init(frames_ref.as_ptr());
-        r >= 0
-    }
-}
+// ⚠ This struct carried a `native: bool` until M10, because TWO rungs filled the ring —
+// libavcodec's D3D11VA hwaccel and `video_d3d11_native` — and both delivered
+// `DecodedImage::D3d11`, so the `stats:` decode-path tag read `d3d11va` for either and no
+// soak log could tell them apart (fixed in `1573a987`). With the libavcodec rung deleted
+// there is one filler, the tag is unconditionally `native-d3d11va`, and a permanently-true
+// flag would be a claim nothing can falsify. If a second rung ever shares this ring again,
+// the flag has to come back WITH it — the lesson is that the tag must name the rung that
+// actually wrote the pixels, not the family it belongs to.
 
 /// Create the decode device on the presenter's adapter. `luid` is the Vulkan device's
 /// `VkPhysicalDeviceIDProperties::deviceLUID` (little-endian LowPart‖HighPart) — matching it
@@ -410,10 +192,10 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
     .context("D3D11CreateDevice")?;
     let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
     let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
-    // The decode (FFmpeg video context) and our copy (immediate context) run on the decode
-    // thread, but FFmpeg's own workers touch the device too — same protection the legacy
-    // shared device enabled (FFmpeg would install it during hwdevice init anyway; explicit
-    // keeps the invariant obvious).
+    // The decode video context and our copy (immediate context) run on the decode thread,
+    // and D3D11's own driver threads touch the device too — the same protection the legacy
+    // shared device enabled, and the same one libavcodec's hwdevice init used to install
+    // for us. Explicit keeps the invariant obvious now that nothing else sets it.
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         // Returns the PREVIOUS protection state — nothing to act on.
         // SAFETY: a COM call on the live `ID3D11Multithread` from a checked `cast`; it takes a
@@ -595,11 +377,10 @@ impl SharedRing {
 /// booleans: a caller that swaps `width` and `height`, or `array_slice` and a dimension,
 /// compiles clean and renders a wrong picture. Named fields make each of those a build error.
 pub(crate) struct HandoffSource<'a> {
-    /// The decode pool's texture ARRAY — for the FFmpeg rung, libav's `data[0]`; for the
-    /// native rung, the pool this decoder created.
+    /// The decode pool's texture ARRAY — the pool `video_d3d11_native` created.
     pub texture: &'a ID3D11Texture2D,
-    /// The picture's slice within that array — libav's `data[1]`, or the native rung's DPB
-    /// slot (which IS the DXVA surface index).
+    /// The picture's slice within that array — the decoder's DPB slot, which IS the DXVA
+    /// surface index.
     pub array_slice: u32,
     /// The FRAME size. The surface is taller (DXVA alignment), which is exactly what the
     /// stream source rect excludes — see the blit below.
@@ -618,11 +399,12 @@ pub(crate) struct HandoffSource<'a> {
 /// D3D11 objects they live on. Everything from "here is a decoded NV12/P010 surface" to "here
 /// is a [`D3d11Frame`] the presenter can import".
 ///
-/// Extracted from [`D3d11vaDecoder`] verbatim so the M5 native rung
-/// ([`crate::video_d3d11_native`]) fills the identical ring rather than growing a second copy
-/// of it: this is the half with the field history (the NVIDIA NV12-import TDR, the Intel green
-/// bar, the keyed-mutex protocol), and two copies of it would be two chances to lose that
-/// history. Nothing about the hand-off changed in the extraction; only its owner did.
+/// Extracted verbatim from `D3d11vaDecoder`, the libavcodec D3D11VA rung that owned this ring
+/// until M10 deleted it, so the M5 native rung ([`crate::video_d3d11_native`]) filled the
+/// identical ring rather than growing a second copy of it: this is the half with the field
+/// history (the NVIDIA NV12-import TDR, the Intel green bar, the keyed-mutex protocol), and two
+/// copies of it would have been two chances to lose that history. Nothing about the hand-off
+/// changed in the extraction; only its owner did, and today that owner is the sole one.
 pub(crate) struct HandoffRing {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -847,222 +629,8 @@ impl HandoffRing {
                 keyframe,
                 handle,
                 generation,
-                // Identity by the pin constant itself, not by a second field the two rungs
-                // could set inconsistently: the native rung passes `DECODER_PIN` here and
-                // nothing else does.
-                native: decoder == crate::video_d3d11_native::DECODER_PIN,
             })
         }
-    }
-}
-
-#[cfg(feature = "ffmpeg-fallback")]
-pub(crate) struct D3d11vaDecoder {
-    ctx: *mut ffmpeg::ffi::AVCodecContext,
-    /// The D3D11VA hwdevice, owned. Nothing reads this field after construction — the codec context
-    /// took its own ref via `av_buffer_ref` — it exists so the device outlives the decoder and is
-    /// unref'd exactly once when it drops. Declared after `ctx` so it still releases AFTER the
-    /// `Drop` below frees packet/frame/context, which is the order the hand-written unref had.
-    /// `dead_code` is answered here rather than by removing the field (that would free the device
-    /// early) or by an underscore name (that would hide what it is).
-    #[allow(dead_code)]
-    hw_device: AvBuffer,
-    packet: *mut ffmpeg::ffi::AVPacket,
-    frame: *mut ffmpeg::ffi::AVFrame,
-    /// The video processor + shareable ring the decoded surfaces are converted into. Declared
-    /// here — after `ctx` — so it still releases AFTER the `Drop` below frees
-    /// packet/frame/context: no decode can be in flight past `avcodec_free_context`.
-    handoff: HandoffRing,
-    /// The selected decoder's registry name (`(*codec).name`) — `"av1"` vs `"libdav1d"`
-    /// is the difference between hardware decode and a silent CPU fallback, so every
-    /// log a field report leans on carries it.
-    name: String,
-}
-
-#[cfg(feature = "ffmpeg-fallback")]
-// SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
-// interfaces it holds are reference-counted with interlocked counts, so moving the whole struct to
-// another thread and releasing it there is sound. D3D11's immediate context is not thread-SAFE but
-// it is thread-AGNOSTIC: it requires serialised use, which `&mut self` on every method gives, not
-// use from one fixed thread. The presenter never touches these objects — it reaches the shared
-// textures through their NT handles on its own device. Moved, never shared; deliberately NOT `Sync`.
-unsafe impl Send for D3d11vaDecoder {}
-
-#[cfg(feature = "ffmpeg-fallback")]
-impl D3d11vaDecoder {
-    pub(crate) fn new(
-        codec_id: ffmpeg::codec::Id,
-        luid: Option<[u8; 8]>,
-        hdr10_out: bool,
-    ) -> Result<D3d11vaDecoder> {
-        use ffmpeg::ffi;
-        let (device, context) = create_device(luid)?;
-        // The adapter must expose the codec's DXVA profile — checked here, not at the first AU.
-        decode_profile_supported(&device, codec_id)?;
-        // The hand-off converter's interfaces, up front (their absence must route to software
-        // decode NOW, not burn the opening IDR).
-        let handoff = HandoffRing::new(device.clone(), context.clone(), hdr10_out)?;
-        // SAFETY: a self-contained builder: every libav allocation is made here and null-checked,
-        // the D3D11VA hwctx fields are filled from the live device/context borrowed above, and
-        // what survives is moved into the decoder, which frees each exactly once in `Drop`.
-        unsafe {
-            let hw_device =
-                ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
-            if hw_device.is_null() {
-                bail!("av_hwdevice_ctx_alloc(D3D11VA) failed");
-            }
-            let devctx = (*hw_device).data as *mut ffi::AVHWDeviceContext;
-            let d3dctx = (*devctx).hwctx as *mut AVD3D11VADeviceContext;
-            // Hand FFmpeg an owned ref to the device + immediate context (it Releases them when
-            // the hwdevice ctx is freed). `into_raw()` transfers a +1 ref without releasing.
-            (*d3dctx).device = device.clone().into_raw();
-            (*d3dctx).device_context = context.clone().into_raw();
-            // lock left null → FFmpeg installs the ID3D11Multithread default lock in init.
-            let r = ffi::av_hwdevice_ctx_init(hw_device);
-            if r < 0 {
-                let mut hw = hw_device;
-                ffi::av_buffer_unref(&mut hw);
-                bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
-            }
-            // Owned from here: every `bail!` below drops it, so none of them unref by hand.
-            let hw_device = AvBuffer::from_raw(hw_device)
-                .context("av_hwdevice_ctx_alloc(D3D11VA) gave no device")?;
-            // Up-front viability probe (see `d3d11va_decode_supported`).
-            if !d3d11va_decode_supported(hw_device.as_ptr()) {
-                bail!("GPU can't create the D3D11VA decode surface pool");
-            }
-            // NOT `avcodec_find_decoder`: the ID lookup returns the registry's FIRST
-            // decoder, and for AV1 that is libdav1d (upstream orders the hwaccel-only
-            // native decoder last) — a software decoder that silently ignores
-            // `hw_device_ctx` and fails every frame's D3D11-format guard mid-stream,
-            // even when the DXVA profile + pool probes above all passed. Select by
-            // capability instead: the first decoder that can drive AV_PIX_FMT_D3D11
-            // via hw_device_ctx, or fail here at open.
-            let codec =
-                crate::video::find_hw_decoder(codec_id, ffi::AVPixelFormat::AV_PIX_FMT_D3D11)?;
-            let name = crate::video::codec_name(codec);
-            let ctx = ffi::avcodec_alloc_context3(codec);
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.as_ptr());
-            (*ctx).get_format = Some(get_format_d3d11);
-            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-            (*ctx).thread_count = 1; // hwaccel: threads only add latency
-                                     // On top of the DPB-based pool libavcodec sizes: margin for the frames briefly held
-                                     // between decode and the ring copy (the copy runs immediately, so this is small).
-            (*ctx).extra_hw_frames = 4;
-            let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
-            if r < 0 {
-                let mut ctx = ctx;
-                ffi::avcodec_free_context(&mut ctx);
-                bail!("avcodec_open2 (D3D11VA): {}", ffmpeg::Error::from(r));
-            }
-            Ok(D3d11vaDecoder {
-                ctx,
-                hw_device,
-                packet: ffi::av_packet_alloc(),
-                frame: ffi::av_frame_alloc(),
-                handoff,
-                name,
-            })
-        }
-    }
-
-    /// The selected decoder's registry name (e.g. `"av1"`) — see the field doc.
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
-        use ffmpeg::ffi;
-        // SAFETY: `packet`/`frame`/`ctx` are this decoder's own allocations, live for its whole
-        // lifetime; `au` outlives the synchronous copy out of it, and every libav return is
-        // checked before use.
-        unsafe {
-            let r = ffi::av_new_packet(self.packet, au.len() as i32);
-            if r < 0 {
-                return Err(averr("av_new_packet", r));
-            }
-            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
-            let r = ffi::avcodec_send_packet(self.ctx, self.packet);
-            ffi::av_packet_unref(self.packet);
-            if r < 0 {
-                return Err(averr("send_packet", r));
-            }
-            let mut out = None;
-            loop {
-                let r = ffi::avcodec_receive_frame(self.ctx, self.frame);
-                if r == ffmpeg::ffi::AVERROR(ffmpeg::ffi::EAGAIN) {
-                    break;
-                }
-                if r < 0 {
-                    return Err(averr("receive_frame", r));
-                }
-                let lifted = self.lift();
-                // The decode surface goes back to the pool NOW — the ring copy (queued ahead
-                // of any later decoder write on the same immediate context) already owns the
-                // pixels. No cross-thread AVFrame guard exists in this backend at all.
-                ffi::av_frame_unref(self.frame);
-                out = Some(lifted?); // newest wins (one-in/one-out streams make this moot)
-            }
-            Ok(out)
-        }
-    }
-
-    /// Hand the decoded surface over to the shared [`HandoffRing`], which does the
-    /// `VideoProcessorBlt` into the next shareable ring slot and describes the result.
-    /// This method's whole job is turning libav's `AVFrame` into the four facts that ring
-    /// needs — the D3D11 texture, its array slice, the frame size and the colour
-    /// signalling — because everything after that is decoder-agnostic and the native rung
-    /// ([`crate::video_d3d11_native`]) fills the identical ring.
-    fn lift(&mut self) -> Result<D3d11Frame> {
-        use ffmpeg::ffi;
-        // SAFETY: `self.frame` is this decoder's own `AVFrame`, live until the caller unrefs
-        // it; the format check below is what proves it carries a D3D11 texture before
-        // anything reads the surface out of it, and `from_raw_borrowed` neither takes nor
-        // releases a reference — the `clone()` is what gives the local its own.
-        unsafe {
-            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
-                bail!("decoder returned a software frame (no D3D11 surface)");
-            }
-            let width = (*self.frame).width as u32;
-            let height = (*self.frame).height as u32;
-            let color = ColorDesc::from_raw(self.frame);
-            let keyframe = crate::video::frame_is_keyframe(self.frame);
-            // `data[0]` is the pool's texture ARRAY and `data[1]` the slice within it —
-            // libav's D3D11 frame descriptor, unchanged since the legacy presenter.
-            let raw = (*self.frame).data[0] as *mut c_void;
-            let src: ID3D11Texture2D = ID3D11Texture2D::from_raw_borrowed(&raw)
-                .ok_or_else(|| anyhow!("null D3D11 texture on decoded frame"))?
-                .clone();
-            let index = (*self.frame).data[1] as usize as u32;
-            self.handoff.present(HandoffSource {
-                texture: &src,
-                array_slice: index,
-                width,
-                height,
-                color,
-                keyframe,
-                decoder: &self.name,
-            })
-        }
-    }
-}
-
-#[cfg(feature = "ffmpeg-fallback")]
-impl Drop for D3d11vaDecoder {
-    fn drop(&mut self) {
-        use ffmpeg::ffi;
-        // SAFETY: each pointer is this decoder's own allocation and nothing else holds it; `Drop`
-        // runs exactly once and each free nulls its pointer through the `&mut`, so none can be
-        // released twice.
-        unsafe {
-            ffi::av_packet_free(&mut self.packet);
-            ffi::av_frame_free(&mut self.frame);
-            ffi::avcodec_free_context(&mut self.ctx);
-            // `hw_device` is an `AvBuffer` and unrefs itself when the field drops, right after this.
-        }
-        // `ring` drops after the codec: no decode can be in flight past avcodec_free_context,
-        // and the slots' CloseHandle only closes OUR handle — a presenter-side import that is
-        // still parked keeps its own reference to the payload.
     }
 }
 
@@ -1070,12 +638,13 @@ impl Drop for D3d11vaDecoder {
 /// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
 /// stream source rect excludes.
 ///
-/// Once PER DECODER, not once per process. Two rungs share this hand-off now — the FFmpeg
-/// D3D11VA one and the native one — and a single process-wide latch would mean a session that
-/// pinned the native rung and then demoted logged the native layout and nothing else, leaving
-/// the rung that actually painted the session's frames undocumented in exactly the report
-/// that needs it. The set is keyed by the rung's name, which is a `&'static str` per rung, so
-/// it holds at most one short entry per rung for the life of the process.
+/// Keyed by DECODER rather than latched once per process. Two rungs shared this hand-off
+/// until M10 (libavcodec's D3D11VA and the native one), and a single process-wide latch
+/// meant a session that pinned the native rung and then demoted logged the native layout
+/// and nothing else, leaving the rung that actually painted the session's frames
+/// undocumented in exactly the report that needs it. One rung fills the ring today, so the
+/// set holds one short entry — kept keyed because the property is about which decoder
+/// wrote the surface, and that is the question a new-GPU forensics report asks.
 fn log_layout_once(
     width: u32,
     height: u32,

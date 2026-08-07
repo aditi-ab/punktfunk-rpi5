@@ -12,17 +12,16 @@
 //!
 //! # Admission
 //!
-//! `PUNKTFUNK_DECODER=native-d3d11va` reaches every leg of this rung, in every build. `auto`
-//! is per-CODEC and per-evidence since M9 (`video::native_rung_admitted`, and the evidence
-//! table in `video`'s module docs):
+//! `PUNKTFUNK_DECODER=native-d3d11va` reaches every leg of this rung, and since M10 deleted
+//! libavcodec's D3D11VA hwaccel `auto` does too — this is the only DXVA rung there is. The
+//! evidence behind the two legs is NOT the same, and the session log distinguishes them
+//! (`video::native_evidence`, and the table in `video`'s module docs):
 //!
-//! * **H.264 and H.265 are in `auto`** — frame-hash parity against libavcodec on an RTX 4090
-//!   and an AMD iGPU plus a 30-minute soak (M5). They sit directly above the libavcodec
-//!   D3D11VA rung wherever the ladder reaches DXVA.
-//! * **AV1 is not** — it was wired in M7 and has decoded nothing on any hardware, so `auto`
-//!   skips it and an AV1 session lands on the FFmpeg rung exactly as it did before. It joins
-//!   when the evidence exists, or in a build with no `ffmpeg-fallback` rung below it (there
-//!   the alternative is the CPU, and the session log says so at `warn`).
+//! * **H.264 and H.265** — frame-hash parity against libavcodec on an RTX 4090 and an AMD
+//!   iGPU plus a 30-minute soak (M5).
+//! * **AV1** — wired in M7, has decoded nothing on any hardware. Until M10 `auto` skipped it
+//!   in favour of the libavcodec rung below; with that gone the alternative is the CPU, so it
+//!   runs and the session log says so at `warn`.
 //!
 //! A refusal or an init failure logs and falls through to the standard ladder, so neither the
 //! pin nor the `auto` admission can cost a session its decoder.
@@ -31,7 +30,7 @@
 //!
 //! [`crate::video_d3d11`]'s module docs record it plainly: a **hand-built decode pool
 //! validated on NVIDIA was rejected by Intel at the first `SubmitDecoderBuffers`**, which is
-//! why the FFmpeg rung leaves the pool to libavcodec. A native decoder has no such luxury —
+//! why the libavcodec rung left the pool to libavcodec. A native decoder has no such luxury —
 //! it must own its pool — so this is the highest-risk code in the milestone, and the answer
 //! is not to invent a pool but to reproduce libavcodec's exactly. What that path does, from
 //! `ff_dxva2_common_frame_params` and `d3d11va_frames_init`:
@@ -647,7 +646,7 @@ impl NativeD3d11Decoder {
                 // 320x240 render region"). libavcodec instead keeps the frame at
                 // `upscaled_width` x `frame_height` and expresses the render size
                 // as a sample aspect RATIO, so on a stream where the two differ
-                // this rung shows less picture than the FFmpeg rung would. No
+                // this rung shows less picture than libavcodec would. No
                 // punktfunk host emits such a stream and neither vendored vector
                 // is one; the choice is here so both native rungs answer alike,
                 // not because it is settled.
@@ -866,7 +865,7 @@ impl NativeD3d11Decoder {
     fn present(&mut self, slot: u8, facts: PictureFacts) -> Result<D3d11Frame> {
         // `pool` is the decode texture array and `slot` its slice — the very shape
         // libavcodec's `data[0]`/`data[1]` describe, which is why this is the same
-        // call the FFmpeg rung makes.
+        // call its D3D11VA rung made.
         let pool = self
             .session
             .as_ref()
@@ -1133,9 +1132,9 @@ fn colour_of(colour: pf_dxvadec::ColourDescription) -> ColorDesc {
 
 /// Does the adapter expose this decode profile, for this surface format?
 ///
-/// Checked at construction rather than at the first AU, for the same reason the FFmpeg rung
-/// checks it there: an unsupported profile discovered mid-stream costs the opening IDR and
-/// exits only through a demotion streak.
+/// Checked at construction rather than at the first AU, for the same reason libavcodec's
+/// D3D11VA rung checked it there: an unsupported profile discovered mid-stream costs the
+/// opening IDR and exits only through a demotion streak.
 fn profile_supported(video: &ID3D11VideoDevice, profile: DxvaProfile) -> Result<()> {
     let wanted = GUID::from_u128(profile.guid);
     // SAFETY: COM calls on the live video device; the count bounds the loop and each profile
@@ -1211,7 +1210,7 @@ impl Session {
     ) -> Result<Session> {
         // A single `DXGI_FORMAT` carries one sample width for both planes, so a stream whose
         // chroma is coded deeper than its luma has no surface this backend can allocate.
-        // Refused rather than approximated: the ladder answers with the FFmpeg rung.
+        // Refused rather than approximated: the ladder walks on to the next rung.
         if shape.bit_depth_chroma_minus8 != shape.bit_depth_luma_minus8 {
             bail!(
                 "luma is {}-bit and chroma is {}-bit; no DXGI decode format carries both",
@@ -1286,8 +1285,8 @@ impl Session {
             .collect();
         let index = pf_dxvadec::pick_config(codec, &facts).ok_or_else(|| {
             anyhow!(
-                "{} offers no short-format ({}) decoder config among {} — the FFmpeg rung \
-                 implements the long format, this one does not",
+                "{} offers no short-format ({}) decoder config among {} — this rung \
+                 implements the short slice format only, and this adapter offers none",
                 profile.name,
                 pf_dxvadec::short_slice_config(codec),
                 facts.len()

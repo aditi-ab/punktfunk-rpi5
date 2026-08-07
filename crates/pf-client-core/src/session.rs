@@ -83,8 +83,8 @@ pub struct SessionParams {
     /// Library id for the host to launch this session (`"steam:570"`, from the library
     /// page); `None` = plain desktop session.
     pub launch: Option<String>,
-    /// The presenter's shared Vulkan device, when its stack can run FFmpeg's Vulkan
-    /// Video decoder (decode lands as VkImages the presenter samples directly).
+    /// The presenter's shared Vulkan device, when its stack can run Vulkan Video decode
+    /// (decode lands as VkImages the presenter samples directly).
     pub vulkan: Option<crate::video::VulkanDecodeDevice>,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
@@ -196,10 +196,12 @@ pub struct Stats {
     /// `chroma_444` false, the host declined — the OSD says so instead of leaving the
     /// switch's effect unobservable.
     pub asked_444: bool,
-    /// The decode lane can answer integrity questions AT ALL (M4). True only on the
-    /// native rung; every FFmpeg rung leaves it false, because libavcodec's Vulkan
-    /// decoder creates no status queries (`nb_queries = 0`), never sets
-    /// `AV_FRAME_FLAG_CORRUPT`, and reports trouble only as log lines.
+    /// The decode lane can answer integrity questions AT ALL (M4). True on the native
+    /// hardware rungs and false on the CPU rung and PyroWave. It exists because the
+    /// libavcodec rungs it was written against could NOT answer — their Vulkan decoder
+    /// created no status queries (`nb_queries = 0`), never set `AV_FRAME_FLAG_CORRUPT`,
+    /// and reported trouble only as log lines, which is why the Xbox Ally X corruption
+    /// was undetectable rather than merely undetected.
     ///
     /// Everything below is meaningless without it, and a surface that renders the
     /// four counters as zeros on a lane that cannot see damage is repeating the
@@ -211,8 +213,8 @@ pub struct Stats {
     /// and a re-anchor request.
     pub decode_damaged: u32,
     /// Frames the DRIVER reported corrupt this window through their per-op
-    /// `RESULT_STATUS` query — the Xbox Ally X class, and the count no FFmpeg rung
-    /// can produce. Always 0 where `decode_status_queries` is false: there is no
+    /// `RESULT_STATUS` query — the Xbox Ally X class, and the count no libavcodec rung
+    /// could ever produce. Always 0 where `decode_status_queries` is false: there is no
     /// verdict to read, not nothing to report. (`video::DecodeHealth::note`
     /// enforces that, so the two fields can never contradict each other here.)
     pub decode_failed: u32,
@@ -496,8 +498,9 @@ fn pump(
         params.bitrate_kbps,
         params.video_caps,
         params.audio_channels,
-        // FFmpeg's codecs plus CODEC_PYROWAVE when the presenter device passed the probe,
-        // minus whatever a previous attempt proved undecodable end to end.
+        // The codecs OUR rungs speak (`video::decodable_codecs`), plus CODEC_PYROWAVE when
+        // the presenter device passed the probe, minus whatever a previous attempt proved
+        // undecodable end to end.
         advertised_codecs,
         preferred, // the user's soft codec preference (0 = auto; see the pyrowave opt-in above)
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
@@ -519,8 +522,8 @@ fn pump(
         } else {
             0
         }),
-        // Slice-progressive delivery: off — this presenter feeds FFmpeg whole AUs; a partial
-        // avcodec feed path can flip it later.
+        // Slice-progressive delivery: off — every rung here is fed whole AUs; a partial-feed
+        // path can flip it later.
         false,
         params.launch.clone(),
         // The host's approval-list / trust-store label for this client. Without it every no-PIN
@@ -559,44 +562,29 @@ fn pump(
     });
 
     // Build the decoder for the codec the host resolved (never assume HEVC), honoring the
-    // Settings backend preference (auto/vaapi/software).
-    let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
-    // The picture shape the host RESOLVED (not what we asked for) — the native
-    // Vulkan rung probes its device against it at construction, so a 4:4:4 or
-    // Main 10 session that this GPU has no decode format for refuses BEFORE it is
-    // chosen instead of error-streaking past FFmpeg-Vulkan mid-stream.
+    // Settings backend preference (auto/native-*/software).
+    //
+    // The WIRE codec bit IS the vocabulary now: M10 deleted the last libavcodec rung and
+    // with it `ffmpeg::codec::Id`, which this used to translate into here. That
+    // translation was also a small lie in the log — its fallthrough mapped every unknown
+    // wire bit, PyroWave included, to HEVC, so a wavelet session printed `codec_id=HEVC`.
+    //
+    // The picture shape the host RESOLVED (not what we asked for) goes with it — every
+    // native rung probes its device against it at construction, so a 4:4:4 or Main 10
+    // session that this GPU has no decode format for refuses BEFORE the rung is chosen
+    // instead of error-streaking past it mid-stream.
     let stream_format = crate::video::StreamFormat {
         chroma_format_idc: connector.chroma_format,
         bit_depth: connector.bit_depth,
     };
-    // The WIRE codec is the negotiated truth; the FFmpeg id is meaningful only where
-    // FFmpeg decodes it. `ffmpeg_codec_id`'s fallthrough maps every unknown wire bit —
-    // PyroWave included — to HEVC, so logging it unconditionally claimed
-    // `codec_id=HEVC` for wavelet sessions that never touch FFmpeg at all.
-    let codec = match connector.codec {
-        punktfunk_core::quic::CODEC_H264 => "H264",
-        punktfunk_core::quic::CODEC_HEVC => "HEVC",
-        punktfunk_core::quic::CODEC_AV1 => "AV1",
-        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
-        _ => "unknown",
-    };
-    if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
-        tracing::info!(
-            codec,
-            welcome_codec = connector.codec,
-            "negotiated video codec"
-        );
-    } else {
-        tracing::info!(
-            codec,
-            ?codec_id,
-            welcome_codec = connector.codec,
-            "negotiated video codec"
-        );
-    }
-    // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
-    // reachable only through the explicit preference above (resolve_codec never
-    // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
+    tracing::info!(
+        codec = crate::video::wire_codec_name(connector.codec),
+        welcome_codec = connector.codec,
+        "negotiated video codec"
+    );
+    // A negotiated PyroWave session decodes on the presenter's device — reachable only
+    // through the explicit preference above (resolve_codec never auto-picks the bit), so
+    // failing loudly here is failing an opted-in experiment.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
@@ -625,7 +613,7 @@ fn pump(
         }
     } else {
         Decoder::new(
-            codec_id,
+            connector.codec,
             &params.decoder,
             params.vulkan.as_ref(),
             stream_format,
@@ -633,7 +621,7 @@ fn pump(
     };
     #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
     let built = Decoder::new(
-        codec_id,
+        connector.codec,
         &params.decoder,
         params.vulkan.as_ref(),
         stream_format,
@@ -952,7 +940,7 @@ fn pump(
                     Ok(Some(image)) => {
                         // The decoder's OWN re-anchor observation FIRST (M4): a recovery point SEI
                         // is the only clean point an intra-refresh session has when the host does not
-                        // mark the wire — its wave emits no IDR and libavcodec flags none, and only
+                        // mark the wire — its wave emits no IDR to flag, and only
                         // one of the three encoder backends that run a wave sets
                         // USER_FLAG_RECOVERY_POINT — so without this such a session freezes for the
                         // full REANCHOR_FREEZE_MAX and then forces the very IDR the wave exists to
@@ -986,36 +974,23 @@ fn pump(
                         }
                         // Then the shared freeze gate: it reads the AU's re-anchor wire flags
                         // (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT), takes
-                        // `image.is_keyframe()` as the ffmpeg keyframe belt, applies the two-mark
+                        // `image.is_keyframe()` as the decoder's own IDR belt, applies the two-mark
                         // rule + the mark-patience backstop, clears the no-output streak, and returns
                         // whether to present this frame or withhold it as a post-loss concealment.
                         let present =
                             gate.on_decoded(frame.flags, image.is_keyframe(), Instant::now())
                                 == GateVerdict::Present;
                         total_frames += 1;
+                        // ⚠ The `stats:` decode-path tag is a machine interface —
+                        // additive only. M10 removed the rungs whose tags were `vaapi`,
+                        // `vulkan` and `d3d11va`; every surviving tag keeps its exact
+                        // spelling.
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
                             #[cfg(target_os = "linux")]
-                            DecodedImage::Dmabuf(_) => "vaapi",
-                            // A separate VARIANT rather than a flag on the frame,
-                            // unlike the D3D11VA pair below — so this tag cannot be
-                            // forgotten, only written.
-                            #[cfg(target_os = "linux")]
                             DecodedImage::NativeDmabuf(_) => "native-vaapi",
-                            DecodedImage::VkFrame(_) => "vulkan",
-                            // Both D3D11VA rungs deliver this variant — they share the
-                            // hand-off ring on purpose — so the frame carries which one
-                            // wrote it. Without that, a native session and an FFmpeg
-                            // session emit the same tag and no soak log can tell them
-                            // apart (`D3d11Frame::native`).
                             #[cfg(windows)]
-                            DecodedImage::D3d11(f) => {
-                                if f.native {
-                                    "native-d3d11va"
-                                } else {
-                                    "d3d11va"
-                                }
-                            }
+                            DecodedImage::D3d11(_) => "native-d3d11va",
                             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                             DecodedImage::PyroWave(_) => "pyrowave",
                             DecodedImage::NativeVk(_) => "native-vulkan",
@@ -1024,14 +999,11 @@ fn pump(
                             let (w, h, path) = match &image {
                                 DecodedImage::Cpu(c) => (c.width, c.height, "software"),
                                 #[cfg(target_os = "linux")]
-                                DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
-                                #[cfg(target_os = "linux")]
                                 DecodedImage::NativeDmabuf(d) => {
                                     (d.width, d.height, "native-vaapi-dmabuf")
                                 }
-                                DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                                 #[cfg(windows)]
-                                DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
+                                DecodedImage::D3d11(d) => (d.width, d.height, "native-d3d11va"),
                                 #[cfg(all(
                                     any(target_os = "linux", windows),
                                     feature = "pyrowave"
@@ -1086,14 +1058,12 @@ fn pump(
                         // that is `Send` but deliberately not `Sync`. Correctness beats
                         // the metric: one honest sample per window stands.
                         let hw_fence = match &image {
-                            DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
-                            // The native rung's frame carries the same pair: the
+                            // The native rung's frame carries the timeline pair: the
                             // decode signals `semaphore_value` when the pixels are
                             // ready (the presenter's write-back is the `+ 1`), so
-                            // waiting it measures received→decode-complete exactly
-                            // like the AVVkFrame arm. Fed since the WP-D hardware
-                            // verdict landed (bit-exact parity, both DPB modes) —
-                            // one stats surface across both Vulkan rungs.
+                            // waiting it measures received→decode-complete. Fed since
+                            // the WP-D hardware verdict landed (bit-exact parity, both
+                            // DPB modes).
                             DecodedImage::NativeVk(f) => Some((f.semaphore, f.semaphore_value)),
                             _ => None,
                         };

@@ -352,7 +352,7 @@ mod session_main {
             exclude_codecs: 0,
             // HDR off = don't advertise 10-bit/HDR at all; the host then never upgrades.
             // MULTI_SLICE is decoder truth for THIS embedder: every desktop decode stack
-            // (FFmpeg software, VAAPI, D3D11VA, Vulkan Video) handles AUs carrying several
+            // (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) handles AUs carrying several
             // slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
             // The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges
             // on multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
@@ -494,7 +494,8 @@ mod session_main {
     ///
     /// RADV-only knob: ANV/NVIDIA/other drivers ignore `RADV_PERFTEST`, and a box where video
     /// decode is already the default just no-ops. Append rather than clobber so a user's own
-    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=vaapi` still overrides the decoder choice.
+    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=native-vaapi` still overrides the decoder
+    /// choice (the pre-M10 `vaapi` spelling reaches the same rung — it migrates, loudly).
     #[cfg(target_os = "linux")]
     fn enable_radv_video_decode() {
         const TOKEN: &str = "video_decode";

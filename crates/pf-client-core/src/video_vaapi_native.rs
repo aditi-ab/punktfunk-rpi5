@@ -1,13 +1,13 @@
 //! Native VAAPI decode — M6 of the native-decode program, and the FFmpeg-free
-//! replacement for [`crate::video_vaapi`].
+//! replacement for `video_vaapi`, the libavcodec VAAPI rung M10 deleted.
 //!
 //! `pf-vaadec` turns one pf-bitstream `AuPlan` into the buffers a
 //! `vaRenderPicture` call carries; this module is everything libva-shaped around
 //! that: the display, the config and context, the surface pool, the submission, and
 //! the DRM-PRIME export the presenter imports. Its output is
-//! [`DecodedImage::NativeDmabuf`] — physically identical to what the FFmpeg VAAPI
-//! rung delivers, deliberately a different variant so a log can never confuse the
-//! two rungs (see that variant's docs).
+//! [`DecodedImage::NativeDmabuf`] — physically identical to what the libavcodec VAAPI
+//! rung delivered, and deliberately a different variant so that while both existed no
+//! log could confuse them (see that variant's docs).
 //!
 //! # libva is dlopen'd, never linked
 //!
@@ -71,13 +71,13 @@ use crate::video_color::ColorDesc;
 
 /// `PUNKTFUNK_DECODER=native-vaapi` — the pin that selects this rung.
 ///
-/// The pin reaches this rung in EVERY build. `auto` is the conditional one: this rung
-/// has decoded nothing on any hardware, so `video::native_rung_admitted` lets it into
-/// `auto` only where no proven rung is left below it (a build without the
-/// `ffmpeg-fallback` FFmpeg rungs) or where the user asked
-/// (`PUNKTFUNK_NATIVE_FIRST=1`). The pin staying unconditional is what makes the
-/// missing evidence GENERATABLE — a rule that gated the pin too would be a rule no
-/// hardware run could ever satisfy.
+/// ⚠ This rung has decoded nothing on any hardware (`video::native_evidence`). Since M10
+/// deleted libavcodec's VAAPI hwaccel it is the only VAAPI there is, so `auto` reaches it
+/// in the vendor order and the session log says at `warn` that nothing has run it.
+///
+/// The PIN is what makes the missing evidence generatable: it skips the vendor order, so a
+/// lab run can reach this rung on a box where `auto` puts Vulkan first. A rule that gated
+/// the pin too would be a rule no hardware run could ever satisfy.
 pub(crate) const DECODER_PIN: &str = "native-vaapi";
 
 // ---------------------------------------------------------------------------
@@ -337,12 +337,12 @@ impl Display {
     ///
     /// `PUNKTFUNK_VAAPI_DEVICE` pins a node explicitly. Otherwise nodes are tried in
     /// name order and the first that initialises wins — the rule libavcodec's VAAPI
-    /// device creation uses when given no device string, so a box that gets hardware
-    /// decode from the FFmpeg rung today gets the same GPU here.
+    /// device creation uses when given no device string, so a box that got hardware
+    /// decode from the libavcodec rung this replaced gets the same GPU here.
     ///
     /// ⚠ On a multi-GPU box that is not necessarily the PRESENTER's GPU, and a dmabuf
     /// exported from one GPU and imported into another either fails outright or
-    /// copies. The FFmpeg rung has always had this property; the env pin is the
+    /// copies. The libavcodec rung had the same property; the env pin is the
     /// escape hatch, and the chosen node is logged so a field report can name it.
     fn open(va: Libva) -> Result<Display> {
         if let Some(pin) = std::env::var_os("PUNKTFUNK_VAAPI_DEVICE") {
@@ -956,8 +956,8 @@ impl NativeVaapiDecoder {
     ///   substituted, so the output is released unshown, [`DecodeHealth::damaged`]
     ///   records it and a re-anchor is requested through the pump's one throttle.
     ///   Not an error, because three errors in a second demote the rung on exactly
-    ///   the lossy links it exists to diagnose, where an FFmpeg rung conceals the
-    ///   same event silently and keeps its job;
+    ///   the lossy links it exists to diagnose — libavcodec concealed the same event
+    ///   silently and kept its job;
     /// * an HEVC RASL picture skipped after an open-GOP join. `PlanError::RaslSkipped`
     ///   is the spec's own answer (8.1.3 NOTE) and must NEVER reach the reanchor
     ///   path — mapping it to an error would make every open-GOP join beg the host
@@ -1339,7 +1339,7 @@ impl NativeVaapiDecoder {
         // ⚠ Treated as a CROP, which is what both other native rungs do. libavcodec
         // instead keeps the frame at `upscaled_width` x `frame_height` and expresses
         // the render size as a sample aspect RATIO, so on a stream where the two
-        // differ this rung shows less picture than the FFmpeg rung would. No
+        // differ this rung shows less picture than libavcodec would. No
         // punktfunk host emits such a stream; the choice is here so the three native
         // rungs answer alike, not because it is settled.
         let display_size = (
@@ -1926,7 +1926,7 @@ fn finish(
         planes,
         color,
         keyframe,
-        guard: DrmFrameGuard::NativeVa(VaFrameGuard {
+        guard: DrmFrameGuard(VaFrameGuard {
             _fds: fds,
             tx: tx.clone(),
             release: VaRelease {

@@ -472,7 +472,7 @@ impl StreamState {
 /// Whether a present error is `VK_ERROR_DEVICE_LOST` anywhere in its chain. A lost
 /// device is unrecoverable by spec — every object on it (decoder frames, swapchain,
 /// the Skia context) is dead, and the demote-to-software path would rebuild the
-/// decoder against that same dead device (observed live 2026-07-09: FFmpeg wedges
+/// decoder against that same dead device (observed live 2026-07-09: the decode lane wedges
 /// inside the rebuild, the decode thread never returns, and the client zombies with
 /// the pump flushing a never-draining backlog every 2 s). The only correct response
 /// is to fail the session loudly and let the shell relaunch.
@@ -1801,14 +1801,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                     }
-                    // Both VAAPI rungs — libavcodec's and M6's native one — hand over
-                    // the same thing: dmabuf fds plus a plane layout, with the guard
-                    // opaque either way. One arm, therefore, rather than a second copy
-                    // of the import and its failure-streak demotion. They stay separate
-                    // VARIANTS so that everywhere it MATTERS which rung decoded (the
-                    // stats tag) the compiler asks; here it genuinely does not.
+                    // The VAAPI rung's output: dmabuf fds plus a plane layout, guard
+                    // opaque. (This arm took libavcodec's VAAPI rung too until M10; the
+                    // import and its failure-streak demotion were identical for both.)
                     #[cfg(target_os = "linux")]
-                    DecodedImage::Dmabuf(d) | DecodedImage::NativeDmabuf(d)
+                    DecodedImage::NativeDmabuf(d)
                         if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
                     {
                         st.hdr = d.color.is_pq();
@@ -1845,7 +1842,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                     }
                     #[cfg(target_os = "linux")]
-                    DecodedImage::Dmabuf(_) | DecodedImage::NativeDmabuf(_) => {
+                    DecodedImage::NativeDmabuf(_) => {
                         // No import extensions on this device (or already demoted) — the
                         // pump rebuilds the decoder as software; frames flow again soon.
                         if !st.dmabuf_demoted {
@@ -1905,44 +1902,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         false
                     }
-                    // Vulkan-Video: decoded on the presenter's own device — present is
-                    // views + CSC, no import step to gate on. Same failure-streak
-                    // demotion contract as the dmabuf path.
-                    DecodedImage::VkFrame(v) if !st.dmabuf_demoted => {
-                        st.hdr = v.color.is_pq();
-                        st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::VkFrame(v),
-                            overlay_frame.as_ref(),
-                        ) {
-                            Ok(p) => {
-                                st.hw_fails = 0;
-                                p
-                            }
-                            Err(e) => {
-                                // Lost device ⇒ unrecoverable, never demote ([`device_lost`]).
-                                if device_lost(&e) {
-                                    return Err(e)
-                                        .context("GPU device lost — the session cannot continue");
-                                }
-                                st.hw_fails += 1;
-                                tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
-                                    "vulkan-video present failed");
-                                if st.hw_fails >= 3 {
-                                    st.dmabuf_demoted = true;
-                                    tracing::warn!("demoting the decoder to software");
-                                    st.force_software.store(true, Ordering::Relaxed);
-                                }
-                                false
-                            }
-                        }
-                    }
-                    DecodedImage::VkFrame(_) => false, // demoted — drain until rebuild
-                    // Native (pf-vkdecode) frames: decoded on the presenter's own
-                    // device, same present shape and the same failure-streak demotion
-                    // contract as the VkFrame arm. A drained/demoted frame drops here
-                    // — its guard still returns the decoder's slot.
+                    // Native Vulkan Video (pf-vkdecode): decoded on the presenter's own
+                    // device — present is views + CSC, no import step to gate on. Same
+                    // failure-streak demotion contract as the dmabuf path. A
+                    // drained/demoted frame drops through the arm below — its guard still
+                    // returns the decoder's slot.
                     DecodedImage::NativeVk(v) if !st.dmabuf_demoted => {
                         st.hdr = v.color.is_pq();
                         st.hdr_untonemapped = false;
@@ -2750,8 +2714,8 @@ fn stats_text(
     // half only, and a silent integrity line would read as a clean bill of health on
     // the one configuration that cannot give one. Saying "no driver status" once a
     // second is the whole lesson of `nb_queries = 0` — an unmeasured session must
-    // never look like a measured one. A lane that cannot report integrity at all (any
-    // FFmpeg rung) prints nothing rather than zeros, for the same reason.
+    // never look like a measured one. A lane that cannot report integrity at all (the
+    // CPU rung, PyroWave) prints nothing rather than zeros, for the same reason.
     if detailed && s.decode_integrity {
         let mut parts: Vec<String> = Vec::new();
         if s.decode_damaged > 0 {
@@ -3050,14 +3014,19 @@ mod tests {
                 lost_pct: 0.4,
                 mic_sent: 0,
                 mic_dropped: 0,
-                decoder: "vulkan",
+                // The decode-path tag as the session actually spells it since M10 — the
+                // ladder's rung names (`NativeRung::name`), not the deleted libavcodec
+                // ones. A fixture carrying a tag no client emits would let this test go on
+                // asserting the shape of a string that no longer exists.
+                decoder: "native-vulkan",
                 // Old-host baseline (no reported target, 4:2:0 never asked): the tier
                 // texts stay exactly what they were before the target/chroma elements.
                 target_kbps: 0,
                 auto_rate: false,
                 chroma_444: false,
                 asked_444: false,
-                // An FFmpeg rung: it cannot answer integrity questions at all, so
+                // A lane with NO detectors (the CPU rung / PyroWave — and, before M10,
+                // any libavcodec rung): it cannot answer integrity questions at all, so
                 // every existing tier text below must be unchanged by M4's line.
                 decode_integrity: false,
                 decode_damaged: 0,
@@ -3093,7 +3062,10 @@ mod tests {
         assert!(normal.starts_with("1920×1080@120 · 120 fps · 24.3 Mb/s\n"));
         assert!(normal.contains("e2e 6.4/9.1 ms (p50/p95)"));
         assert!(normal.contains("lost 3 (0.4%)"));
-        assert!(!normal.contains("vulkan"), "decoder tag is Detailed-only");
+        assert!(
+            !normal.contains("native-vulkan"),
+            "decoder tag is Detailed-only"
+        );
         assert!(!normal.contains("decode"), "stage terms are Detailed-only");
 
         let detailed = text(StatsVerbosity::Detailed);
@@ -3178,7 +3150,8 @@ mod tests {
     /// The decode-integrity line (M4) — the whole point of which is that it can tell
     /// three states apart that all look identical as "no complaints today":
     ///
-    /// * a lane that CANNOT see corruption (any FFmpeg rung — `nb_queries = 0`, no
+    /// * a lane that CANNOT see corruption (the CPU rung, PyroWave — and every
+    ///   libavcodec rung this program used to have: `nb_queries = 0`, no
     ///   `AV_FRAME_FLAG_CORRUPT`): silent, never zeros, because printing zeros would
     ///   assert a cleanliness nothing checked;
     /// * a lane that looked and saw nothing: also silent, but it earned it;
@@ -3206,8 +3179,8 @@ mod tests {
             .map(str::to_string)
         };
 
-        // An FFmpeg rung cannot answer at all — nothing is printed. (The fixture is
-        // one, so this also pins that every other tier text is untouched by M4.)
+        // A lane with no detectors cannot answer at all — nothing is printed. (The
+        // fixture is one, so this also pins that every other tier text is untouched by M4.)
         assert_eq!(line(&base), None, "a lane with no detectors says nothing");
 
         // The native rung on a device with full status support, decoding clean:

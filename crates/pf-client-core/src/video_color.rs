@@ -1,17 +1,12 @@
 //! The stream's per-frame colour signalling (`ColorDesc`) + the Y′CbCr→RGB CSC matrix (`csc_rows`).
-#![allow(clippy::unnecessary_cast)]
 
-// Only [`ColorDesc::from_raw`] — the FFmpeg rungs' per-frame CICP read — needs libav here;
-// every native rung fills `ColorDesc` from pf-bitstream instead. So the import rides
-// `ffmpeg-fallback` (M9) and this module is FFmpeg-free in a default build.
-#[cfg(feature = "ffmpeg-fallback")]
-use ffmpeg_next as ffmpeg;
-
-/// The stream's colour signaling, read PER-FRAME from the decoder (HEVC VUI → the
-/// `AVFrame` CICP fields). The Windows host switches an HDR desktop to Main10 BT.2020 PQ
-/// **in-band** (the Welcome still says SDR — clients are expected to follow the VUI, as
-/// the Windows/Apple/Android clients do), so rendering must follow the frames, not the
-/// handshake — else PQ content drawn as BT.709 comes out washed out and desaturated.
+/// The stream's colour signaling, read PER-FRAME out of the bitstream's own VUI /
+/// sequence header (pf-bitstream, on every rung — the libavcodec `AVFrame` CICP read this
+/// used to have went with M10's rungs). The Windows host switches an HDR desktop to
+/// Main10 BT.2020 PQ **in-band** (the Welcome still says SDR — clients are expected to
+/// follow the VUI, as the Windows/Apple/Android clients do), so rendering must follow the
+/// frames, not the handshake — else PQ content drawn as BT.709 comes out washed out and
+/// desaturated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ColorDesc {
     /// H.273 code points as signaled (2 = unspecified → the renderer picks the SDR default).
@@ -22,26 +17,6 @@ pub struct ColorDesc {
 }
 
 impl ColorDesc {
-    /// Read the CICP fields off a raw decoded frame — the FFmpeg rungs' per-frame colour
-    /// source, and theirs alone: every native rung reads the same signalling out of the
-    /// SPS/sequence header through pf-bitstream, which is why this compiles out with
-    /// `ffmpeg-fallback` (M9) and why nothing was lost when it did.
-    ///
-    /// # Safety
-    /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
-    #[cfg(feature = "ffmpeg-fallback")]
-    pub unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
-        // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
-        unsafe {
-            ColorDesc {
-                primaries: (*frame).color_primaries as u32 as u8,
-                transfer: (*frame).color_trc as u32 as u8,
-                matrix: (*frame).colorspace as u32 as u8,
-                full_range: (*frame).color_range == ffmpeg::ffi::AVColorRange::AVCOL_RANGE_JPEG,
-            }
-        }
-    }
-
     /// PQ (SMPTE ST.2084) transfer — the HDR10 signal.
     pub fn is_pq(&self) -> bool {
         self.transfer == 16

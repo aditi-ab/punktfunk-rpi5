@@ -45,12 +45,14 @@ fn render_scale_label(scale: f64) -> String {
     }
 }
 /// Decode backend presets: `(stored value, display label)`.
-// A stored legacy "hardware" (the D3D11VA era) matches no preset, so the combo shows
-// Automatic — which is exactly how the session's decoder chain reads that value.
+// A stored legacy value that matches no preset (the D3D11VA-era "hardware", and since M10
+// the bare "vulkan"/"d3d11va" that named libavcodec's rungs) shows as Automatic — which is
+// how the session's ladder reads "hardware", and near enough for the other two, which
+// `pf_client_core::video::migrate_decoder_pref` maps onto the entries below anyway.
 const DECODERS: &[(&str, &str)] = &[
     ("auto", "Automatic (GPU, fall back to CPU)"),
-    ("vulkan", "Hardware (Vulkan Video)"),
-    ("d3d11va", "Hardware (Direct3D 11 / DXVA)"),
+    ("native-vulkan", "Hardware (Vulkan Video)"),
+    ("native-d3d11va", "Hardware (Direct3D 11 / DXVA)"),
     ("software", "Software (CPU)"),
 ];
 /// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
@@ -862,7 +864,11 @@ pub(crate) fn settings_page(
     );
 
     // --- Video -----------------------------------------------------------------------------
-    let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
+    // Migrated for the LOOKUP only (the store is left alone): a pre-M10 settings file
+    // holds `vulkan`/`d3d11va`, which match no preset — the combo would show Automatic and
+    // a save would silently rewrite the user's hardware preference to `auto`.
+    let stored_decoder = pf_client_core::video::migrate_decoder_pref(&s.decoder);
+    let (dec_names, dec_i) = presets(DECODERS, |v| *v == stored_decoder);
     let decoder_combo = setting_combo(ctx, scope, (rev, set_rev), dec_names, dec_i, |s, i| {
         s.decoder = DECODERS[i].0.to_string();
     });

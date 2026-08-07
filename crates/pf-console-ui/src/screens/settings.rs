@@ -120,20 +120,26 @@ const CODECS: [(&str, &str); 5] = [
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
 // Per-OS hardware rungs, like the shells' pickers: the console ships on Windows too
-// (`punktfunk-session --browse`), where "vaapi" is a dead option that ALSO hid the real
-// hardware path (d3d11va) — `Decoder::new` has no VAAPI branch there.
+// (`punktfunk-session --browse`), where "vaapi" was a dead option that ALSO hid the real
+// hardware path — `Decoder::new` has no VAAPI branch there.
+//
+// The STORED values are the `native-*` rung names since M10 (the libavcodec rungs those
+// bare names meant are deleted). The LABELS are unchanged and still true — native Vulkan
+// Video is Vulkan Video. A store written by an older client keeps working: the bare names
+// migrate on read (`pf_client_core::video`'s `migrate_decoder_pref`), they just will not
+// match a preset here, so the picker shows the first entry until the user re-picks.
 #[cfg(not(windows))]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
-    ("vulkan", "Vulkan Video"),
-    ("vaapi", "VAAPI"),
+    ("native-vulkan", "Vulkan Video"),
+    ("native-vaapi", "VAAPI"),
     ("software", "Software"),
 ];
 #[cfg(windows)]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
-    ("vulkan", "Vulkan Video"),
-    ("d3d11va", "Direct3D 11"),
+    ("native-vulkan", "Vulkan Video"),
+    ("native-d3d11va", "Direct3D 11"),
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
@@ -421,7 +427,17 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Video codec",
             label_for(&CODECS, &s.codec).into(),
         ),
-        RowId::Decoder => (None, "Decoder", label_for(&DECODERS, &s.decoder).into()),
+        // Migrated on the way in: a pre-M10 store holds `vulkan`/`vaapi`/`d3d11va`,
+        // which name no preset here and would otherwise render as "—".
+        RowId::Decoder => (
+            None,
+            "Decoder",
+            label_for(
+                &DECODERS,
+                &pf_client_core::video::migrate_decoder_pref(&s.decoder),
+            )
+            .into(),
+        ),
         RowId::Hdr => (None, "10-bit HDR", on_off(s.hdr_enabled).into()),
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
         RowId::PresentPriority => (
@@ -680,7 +696,13 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::Compositor => step_str(&COMPOSITORS, &mut s.compositor, delta, wrap),
         RowId::Codec => step_str(&CODECS, &mut s.codec, delta, wrap),
-        RowId::Decoder => step_str(&DECODERS, &mut s.decoder, delta, wrap),
+        RowId::Decoder => {
+            // …and on the way in here too, or stepping from a legacy value would start
+            // from "not found" and jump to the first/last entry instead of the neighbour
+            // of what the user actually has.
+            s.decoder = pf_client_core::video::migrate_decoder_pref(&s.decoder);
+            step_str(&DECODERS, &mut s.decoder, delta, wrap)
+        }
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
         RowId::Chroma444 => toggle(&mut s.enable_444, delta, wrap),
         RowId::PresentPriority => {

@@ -41,7 +41,7 @@
 //! AV1 sessions are — freezes forever, one keyframe request per identical AU.
 //!
 //! Threading: openh264's `num_threads` is documented upstream as "will probably just
-//! segfault", so this stays single-threaded — the old FFmpeg rung's slice threading has
+//! segfault", so this stays single-threaded — the old libavcodec rung's slice threading has
 //! no equivalent here. rav1d gets the machine's cores: `max_frame_delay = 1` is the knob
 //! that removes frame delay (dav1d's `get_num_threads` then computes `n_fc = min(1, n_tc)`,
 //! so exactly one frame is ever in flight whatever `n_threads` says), and `n_threads`
@@ -56,7 +56,7 @@ use pf_bitstream::h264::{H264Planner, PlanError};
 use pf_vkdecode::RecoveryWatch;
 
 /// The codecs this rung can decode at all. Deliberately its own enum rather than an
-/// `ffmpeg::codec::Id`: the whole point of M8 is that nothing in here speaks FFmpeg, and
+/// `ffmpeg::codec::Id`: the whole point of M8 was that nothing in here speaks FFmpeg, and
 /// the ladder above still does only because its other rungs are not swapped yet (M10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwCodec {
@@ -398,7 +398,7 @@ struct Av1Software {
 
 /// An owned `Dav1dData`, unref'd exactly once on drop.
 ///
-/// The same shape (and the same lesson) as the FFmpeg rungs' `AvBuffer`: the send loop
+/// The same shape (and the same lesson) as the libavcodec rungs' `AvBuffer`: the send loop
 /// below has several fallible exits between allocating the buffer and dav1d taking its
 /// reference, and hand-unref'ing on each one is how a leak per failed AU gets written.
 /// dav1d zeroes the struct when it takes the reference, so an already-consumed `Dav1dData`
@@ -450,7 +450,7 @@ impl Av1Software {
         // spends the rest of its budget defending. `max_frame_delay = 1` is the knob that
         // says so — dav1d's `get_num_threads` derives `n_fc = min(max_frame_delay, n_tc)`,
         // so one frame stays in flight no matter how many threads exist. Same reasoning
-        // as the old FFmpeg rung's `FF_THREAD_SLICE` + `AV_CODEC_FLAG_LOW_DELAY`, and
+        // as the old libavcodec rung's `FF_THREAD_SLICE` + `AV_CODEC_FLAG_LOW_DELAY`, and
         // `n_threads` is that rung's SLICE half: intra-frame tile/row workers, which add
         // no delay. Capped at 8 — this is the rung reached because the GPU already
         // failed, and it should not also take the machine over.

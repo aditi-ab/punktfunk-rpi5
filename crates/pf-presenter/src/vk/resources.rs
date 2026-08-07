@@ -13,17 +13,6 @@ impl Retired {
             Retired::Dmabuf(f) => f.destroy(device),
             #[cfg(windows)]
             Retired::D3d11(f) => f.destroy(device),
-            Retired::Vk { frame, views } => {
-                // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned
-                // by this type and live for the call, and every builder struct is a local that
-                // outlives it.
-                unsafe {
-                    for v in views {
-                        device.destroy_image_view(v, None);
-                    }
-                }
-                drop(frame); // guard drops here — AVFrame (and the VkImage) released
-            }
             // The image and plane views belong to the DECODER's pools — nothing of ours
             // to destroy. The drop sends the release token (the caller reaches here only
             // after the sampling fence, so the token honestly means "GPU reads done").
