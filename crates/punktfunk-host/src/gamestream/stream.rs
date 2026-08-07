@@ -221,7 +221,7 @@ fn run(
         // steps, before the source (a bare-spawn gamescope nests the game inside it), before the
         // launch — because a reading taken later would reject the very process it is meant to find.
         // Erring early can only ever include more of our own launch, never a copy from before it.
-        let launch_stamp = crate::gamelease::launch_clock();
+        let fresh_stamp = crate::gamelease::launch_clock();
         // Everything the host knows about the title being launched, resolved in ONE library scan:
         // what to run, what to call it, and how to recognize it once it is up.
         let target = resolve_gs_app(app);
@@ -231,14 +231,29 @@ fn run(
         if let Some(t) = target.as_ref() {
             let reprieved =
                 crate::gamelease::readopt(life.fingerprint.as_deref(), t.game.id.as_deref());
-            if reprieved > 0 {
+            if !reprieved.is_empty() {
                 tracing::info!(
-                    reprieved,
+                    reprieved = reprieved.len(),
                     title = %t.game.title,
                     "gamestream: this client came back for its game — keeping it"
                 );
             }
         }
+        // ...and the other half of coming back for it: the host's own record of what it launched, for
+        // whom (`crate::launchreg`). Plane parity with the native path — same registry, same rule.
+        // A relaunch of a title this client's copy of which is still running neither starts a second
+        // copy nor mints a fresh reference instant the running game could never satisfy. A paired
+        // Moonlight client has a fingerprint; an anonymous one (or an operator-typed `apps.json`
+        // entry with no library id) is not recordable and behaves exactly as it always has.
+        let launch_claim = target.as_ref().map(|t| {
+            crate::launchreg::claim(
+                life.fingerprint.as_deref(),
+                t.game.id.as_deref(),
+                fresh_stamp,
+            )
+        });
+        let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
+        let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());
         // Per-app prep steps (RFC §6): the entry's own `prep` plus a custom library title's,
         // run synchronously BEFORE the virtual output opens or anything launches (an HDR
         // toggle / sink switch must land first — and gamescope's nested launch happens inside
@@ -290,17 +305,34 @@ fn run(
         // store-qualified id — resolved against the host's OWN library (the client can only pick an
         // existing title, never inject a command). An apps.json entry instead carries an
         // operator-typed `cmd`. Library id wins when both are set.
+        //
+        // ...and once per LAUNCH, not once per `/launch` request: `adopt_launch` is the record's
+        // verdict that this client's copy of the title is already running (see above), and
+        // `spawned_now` is what actually happened — the record is settled from it below.
+        #[allow(unused_mut)]
+        let mut spawned_now = false;
         #[cfg(windows)]
         if let Some(t) = target.as_ref() {
-            // A library title launches by its store-qualified id (the interactive-session spawner
-            // resolves the store's own recipe); an operator-typed command runs as itself.
-            let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
-                (Some(id), _) => crate::library::launch_gamestream_library(id),
-                (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd),
-                (None, None) => Ok(()),
-            };
-            if let Err(e) = launched {
-                tracing::warn!(title = %t.game.title, error = %e, "gamestream: could not launch app");
+            if adopt_launch {
+                tracing::info!(
+                    title = %t.game.title,
+                    "gamestream: this client's copy of this title is already running — not starting \
+                     a second one"
+                );
+            } else {
+                // A library title launches by its store-qualified id (the interactive-session spawner
+                // resolves the store's own recipe); an operator-typed command runs as itself.
+                let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
+                    (Some(id), _) => crate::library::launch_gamestream_library(id),
+                    (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd),
+                    (None, None) => Ok(()),
+                };
+                match launched {
+                    Ok(()) => spawned_now = true,
+                    Err(e) => {
+                        tracing::warn!(title = %t.game.title, error = %e, "gamestream: could not launch app")
+                    }
+                }
             }
         }
         // Linux keeps the spawned child rather than dropping it: it is the primary liveness signal
@@ -309,11 +341,28 @@ fn run(
         // source open), so launching again would start it twice.
         #[cfg(target_os = "linux")]
         let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
+            // Already ours and still running: don't hand the player a second copy. The nested arm
+            // below reaches the same conclusion through the display registry, whose reuse key includes
+            // the launch command — a kept gamescope with the game inside it is re-attached, not
+            // respawned.
+            Some(cmd) if adopt_launch => {
+                tracing::info!(
+                    command = %cmd,
+                    "gamestream: this client's copy of this title is already running — not starting \
+                     a second one"
+                );
+                None
+            }
             Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
+                // gamescope spawned it as its own nested child when the source opened above.
+                spawned_now = true;
                 None
             }
             Some(cmd) => match crate::library::launch_session_command(compositor, cmd) {
-                Ok(spawned) => Some(spawned),
+                Ok(spawned) => {
+                    spawned_now = true;
+                    Some(spawned)
+                }
                 Err(e) => {
                     tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
                     None
@@ -321,6 +370,16 @@ fn run(
             },
             None => None,
         };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let _ = adopt_launch;
+        // Settle the record against what actually happened (see the native plane).
+        if let Some(c) = launch_claim.as_ref() {
+            if spawned_now {
+                c.launched();
+            } else if c.must_spawn() {
+                c.abandon();
+            }
+        }
 
         // The launched game's lifetime, in both directions (design/session-game-lifetime.md) — the
         // compat plane's half of what the native plane already does:
@@ -371,6 +430,9 @@ fn run(
                     nested,
                     child,
                     launch_stamp,
+                    // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
+                    // tracking the same processes across the handover.
+                    procs: launch_claim.as_ref().and_then(|c| c.procs()),
                 },
                 on_exit,
             );
@@ -383,6 +445,9 @@ fn run(
                     lease,
                     life.quit.clone(),
                     life.fingerprint.clone(),
+                    // The record's hold moves in here — its drop opens the reconnect window the next
+                    // `/launch` of this title is matched against.
+                    launch_claim,
                 ),
             )
         });

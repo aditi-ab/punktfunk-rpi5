@@ -1486,9 +1486,17 @@ async fn serve_session(
     // A client reconnecting inside its game's reconnect window takes the game back: nothing is ended,
     // and this session adopts it. Matched on (this client, this title) so it can only ever reclaim its
     // own game.
+    //
+    // Cancelling the pending termination is all this does — the *game* is re-adopted in the data plane
+    // through `crate::launchreg`, which is what carries the original launch's reference instant across
+    // sessions (a reprieved lease can't: its watcher is cancelled and its exit action closes a
+    // connection that is already gone). Both are needed, and neither subsumes the other: this one
+    // exists only under `GameOnSessionEnd::Always`, the record exists whatever the policy says.
     if let Some(target) = launch_target.as_ref() {
         let fp = punktfunk_core::quic::endpoint::peer_fingerprint(&conn).map(hex::encode);
-        crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
+        // The reprieved leases are deliberately dropped: they are corpses (see `readopt`), and this
+        // plane has nothing to say about them that `readopt` has not already logged per lease.
+        let _reprieved = crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
     }
     // Per-title prep steps (RFC §6) for a launched CUSTOM library title: run synchronously
     // before the data plane starts (so before the display opens and the title spawns); the

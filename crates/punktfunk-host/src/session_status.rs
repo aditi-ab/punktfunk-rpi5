@@ -383,6 +383,7 @@ mod tests {
                 nested: false,
                 child: None,
                 launch_stamp: None,
+                procs: None,
             },
             Box::new(|| {}),
         );

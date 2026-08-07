@@ -1450,7 +1450,26 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // therefore before a bare-spawn gamescope's nested child) exists, because a reading taken after
     // the launch would reject the very process it is meant to find. Erring early is the safe
     // direction: it can only ever include more of our own launch, never a copy from before it.
-    let launch_stamp = crate::gamelease::launch_clock();
+    let fresh_stamp = crate::gamelease::launch_clock();
+    // ...unless this host ALREADY launched this title for this client and that launch is still ours.
+    // A client that re-dials (the presenter's HEVC→H.264 codec fallback, a crash-restart, a network
+    // blip) re-sends `Hello::launch` verbatim — it cannot drop the field, because the per-session
+    // gamescope is re-adopted through a display-registry key that includes the launch command. So the
+    // host is the one that has to notice, on both counts: not starting a second copy of the game, and
+    // adopting against the ORIGINAL launch's instant rather than this session's — a fresh reading is
+    // minutes after the game started, and `procscan` would refuse to adopt it, leaving this session
+    // with no game-exit detection at all. The record only ever holds launches this host performed for
+    // this client, so `procscan`'s "never adopt a process that predates the launch" survives intact.
+    let launch_claim = launch_target.as_ref().map(|t| {
+        crate::launchreg::claim(
+            endpoint::peer_fingerprint(&conn)
+                .map(hex::encode)
+                .as_deref(),
+            t.game.id.as_deref(),
+            fresh_stamp,
+        )
+    });
+    let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
     // Streamed-AU wire mode: the client's cap AND the host escape hatch (`PUNKTFUNK_STREAMED_AU=0`
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
@@ -1632,20 +1651,54 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // twice). Best-effort: a launch failure (no recipe, launcher missing, no interactive user)
     // leaves the user on the streamed desktop/session, never tears the stream down. Launched ONCE
     // here — the mid-stream rebuild paths below must not re-spawn it.
+    //
+    // ...and ONCE PER LAUNCH, not once per session: `adopt_launch` is the registry's verdict that this
+    // client's own copy of this title is already running (see `fresh_stamp` above), in which case the
+    // spawn is skipped entirely and the lease below adopts what is already there.
+    let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());
+    // Whether this session actually started the title. False when the spawn was skipped (adopted),
+    // when it failed, and on a platform with no launch path at all — the record is settled from it
+    // below, so a launch that did not happen can never be inherited by a later session.
+    #[allow(unused_mut)]
+    let mut spawned_now = false;
     #[cfg(target_os = "windows")]
     if let Some(id) = launch.as_deref() {
-        if let Err(e) = crate::library::launch_title(id) {
+        if adopt_launch {
+            tracing::info!(
+                launch_id = id,
+                "this client's copy of this title is already running from an earlier session — not \
+                 starting a second one"
+            );
+        } else if let Err(e) = crate::library::launch_title(id) {
             tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
+        } else {
+            spawned_now = true;
         }
     }
     #[cfg(target_os = "linux")]
     let spawned_launch = match launch.as_deref() {
+        // Already ours and still running. On the nested path this is also what the display registry
+        // concludes on its own — its reuse key includes the launch command, so the kept gamescope
+        // (with the game inside it) is re-attached rather than respawned.
+        Some(cmd) if adopt_launch => {
+            tracing::info!(
+                command = %cmd,
+                "this client's copy of this title is already running from an earlier session — not \
+                 starting a second one"
+            );
+            None
+        }
         Some(cmd) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
             tracing::info!(command = %cmd, "launch nested into the per-session gamescope");
+            // gamescope spawns it as its own nested child, so the launch DID happen here.
+            spawned_now = true;
             None
         }
         Some(cmd) => match crate::library::launch_session_command(compositor, cmd) {
-            Ok(spawned) => Some(spawned),
+            Ok(spawned) => {
+                spawned_now = true;
+                Some(spawned)
+            }
             Err(e) => {
                 tracing::warn!(command = %cmd, error = %e, "could not launch requested title into the session");
                 None
@@ -1654,7 +1707,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         None => None,
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let _ = &launch;
+    let _ = (&launch, adopt_launch);
+    // Settle the record against what actually happened. A spawn that never ran — it failed, or this
+    // platform has no launch path — must leave nothing behind, or a retry would inherit a launch that
+    // never occurred and then decline to start the title at all.
+    if let Some(c) = launch_claim.as_ref() {
+        if spawned_now {
+            c.launched();
+        } else if c.must_spawn() {
+            c.abandon();
+        }
+    }
 
     // The launched game's lifetime, in both directions (design/session-game-lifetime.md):
     //
@@ -1712,6 +1775,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 nested,
                 child,
                 launch_stamp,
+                // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
+                // tracking the same processes across the handover.
+                procs: launch_claim.as_ref().and_then(|c| c.procs()),
             },
             on_exit,
         )
@@ -1726,6 +1792,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             lease,
             quit.clone(),
             endpoint::peer_fingerprint(&conn).map(hex::encode),
+            // The launch record's hold moves in here: its lifetime is exactly this session's, and its
+            // drop is what opens the reconnect window the next `Hello::launch` is matched against.
+            launch_claim,
         )
     });
 
