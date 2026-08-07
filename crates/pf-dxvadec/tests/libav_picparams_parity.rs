@@ -3690,6 +3690,10 @@ fn dump_our_submission_in_the_captures_own_format() {
     let path = std::env::var("PF_DXVA_DUMP").expect("PF_DXVA_DUMP=<path> names the output file");
     let mut text = dump("h264", &our_h264_submissions());
     text.push_str(&dump("hevc", &our_hevc_submissions()));
+    // AV1 too, and it is the codec that needs this most: no libavcodec AV1 capture has
+    // ever been taken (module docs say why), so for that codec this dump is the only
+    // way to read what the driver is being handed at all.
+    text.push_str(&dump("av1", &our_av1_submissions()));
     std::fs::write(&path, text).expect("write the dump");
     println!("wrote {path}");
 }

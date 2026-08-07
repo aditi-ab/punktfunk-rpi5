@@ -564,6 +564,21 @@ impl NativeD3d11Decoder {
     /// rung closes it in `pf_vkdecode::decoder_av1`; this is the same close, and it
     /// runs on the concealed path too, because a converted-but-unsubmitted frame
     /// took a slot just the same.
+    ///
+    /// # The surfaces the conversion refuses to release
+    ///
+    /// The second of the two slot releases below, and the caller's half of
+    /// [`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`]. AV1 applies
+    /// `refresh_frame_flags` AFTER the frame is decoded (7.20), so a frame that reads
+    /// a slot its own refresh overwrites is ordinary — 268 of the vendored vector's
+    /// 274 frames — and `plan_to_dxva_av1` therefore hands those pictures back rather
+    /// than releasing them, because `SlotMap::assign` would return the surface just
+    /// vacated to `setup_slot` and the submission would name one surface as both
+    /// `CurrPicTextureIndex` and a `RefFrameMapTextureIndex` entry. Releasing them
+    /// HERE is safe for the same reason the `refresh_frame_flags == 0` release below
+    /// is: the decode op has been issued, so nothing can be assigned them before the
+    /// next frame. Dropping them instead holds a surface per frame and exhausts the
+    /// nine-slot ledger within ten.
     fn frame_av1(
         &mut self,
         au: &[u8],
@@ -579,9 +594,18 @@ impl NativeD3d11Decoder {
         // ⚠ The decode's `Result` is held rather than `?`-ed, so that the two slot
         // releases below run on the FAILURE path too. `decode_av1` treats an error
         // here as a health note and keeps the session — it does not rebuild the slot
-        // map — so an early return would leak a surface per failed frame and reach
-        // `SlotError::Full` after nine, which is a session that dies of an error it
-        // had already recovered from.
+        // map — so an early return leaked a surface per failed frame and would reach
+        // `SlotError::Full` after nine, a session dying of an error it had already
+        // recovered from.
+        //
+        // ⚠⚠ That closes THIS frame's leak and not the unit's: `decode_av1` returns on
+        // the first failing frame and abandons the rest of the temporal unit's plans,
+        // whose removals are then never released and whose stored ids are never
+        // assigned — the ledger and the planner's store desynchronise. 24 of the
+        // vendored vector's 250 units carry a second frame, so it is not hypothetical.
+        // Left as it is: recovering a partly-decoded unit means deciding what to do
+        // with the frames after the failure, which is the pump's question and not this
+        // function's, and the failure already ends in a keyframe request.
         let shown = self.decode_and_present_av1(au, &sub, damaged);
 
         // The surfaces this frame's own refresh displaced while its submission still
@@ -798,11 +822,20 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
-                    // H.264's conversion releases its whole `removed` list itself:
-                    // neither vendored vector ever has a picture the slices read
-                    // being displaced by the same access unit (measured: zero on
-                    // 250 AUs), and the sliding window evicts only pictures no
-                    // slice names.
+                    // ⚠ H.264's conversion still releases its whole `removed` list
+                    // inside itself, and that is a MEASUREMENT rather than a proof.
+                    // `pf_dxvadec::pic`'s `no_au_removes_a_picture_its_own_reference_
+                    // list_names` pins `removed ∩ dpb_refs` at zero over the vendored
+                    // vector — but that vector REORDERS, and reordering is what keeps
+                    // an unmarked picture in the DPB past the AU that unmarked it. On
+                    // a low-delay stream, which is what a punktfunk host emits, the
+                    // sliding window can unmark an already-output picture and
+                    // `bump_as_needed` evict it in the same access unit, putting it in
+                    // both `RefFrameList` and `removed` — the AV1 aliasing shape,
+                    // exactly. Left alone deliberately: the AV1 defect is what this
+                    // change fixes and proves, and giving two hardware-proven codecs a
+                    // deferral no vector exercises would be an unmeasured change to
+                    // working code. The tripwire is the test named above.
                     release_after_decode: Vec::new(),
                     codec: Codec::H264,
                     facts: PictureFacts {
@@ -863,9 +896,13 @@ impl NativeD3d11Decoder {
                     slice_ranges: dxva.slice_ranges,
                     setup_slot: dxva.setup_slot,
                     setup_id: dxva.setup_id,
-                    // As H.264 above: an HEVC picture's RPS is resolved against the
-                    // DPB before any removal, and a picture the RPS names is by
-                    // construction still in it.
+                    // HEVC is the one of the three where this IS structural rather
+                    // than measured: `H265Planner` snapshots `dpb_refs` AFTER
+                    // `decode_rps` has updated the DPB, so a picture this AU's RPS
+                    // dropped is never in the snapshot `RefPicList` is built from, and
+                    // the aliasing shape cannot arise. (The AV1 planner snapshots
+                    // BEFORE, which is why that codec needed the deferral, and the
+                    // H.264 one snapshots before marking too — see the note above.)
                     release_after_decode: Vec::new(),
                     codec: Codec::H265,
                     facts: PictureFacts {

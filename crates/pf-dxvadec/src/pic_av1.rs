@@ -139,19 +139,23 @@ pub struct DecodePlanDxvaAv1 {
     /// breath: decode into the surface you are predicting from.
     ///
     /// Neither vendored H.264 nor H.265 vector ever produces that shape (measured:
-    /// zero on the 250-AU clips), which is why the eager release survived two
-    /// hardware-proven codecs and opened on the first AV1 frame past the key frame's
-    /// neighbourhood. The Vulkan rung carries the same contract for the same reason
+    /// zero on the 250-AU clips — ⚠ but see `plan_to_dxva`'s note, because that is a
+    /// measurement of two REORDERING vectors and not a proof about those codecs),
+    /// which is why the eager release survived two hardware-proven codecs and opened
+    /// on the first AV1 frame past the key frame's neighbourhood. The Vulkan rung
+    /// carries the same contract for the same reason
     /// (`pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`), and this
-    /// rung's constraint is the STRICTER of the two: Vulkan binds only the
-    /// references the frame names, while `RefFrameMapTextureIndex` declares the
-    /// whole store, so every picture the store still names has to survive — not just
-    /// the seven the frame reads.
+    /// rung's constraint is the STRICTER of the two: Vulkan binds only the references
+    /// the frame names, while `RefFrameMapTextureIndex` declares the whole store, so
+    /// every picture the store still names has to survive — not just the seven the
+    /// frame reads.
     ///
-    /// The ids are always a subset of the plan's `dpb.removed`, so applying them
-    /// completes that plan's bookkeeping and never invents a removal. Empty on the
-    /// overwhelming minority of frames that displace nothing they name; a caller
-    /// that drops them leaks a surface per frame and runs the ledger dry within ten.
+    /// This is exactly `dpb.removed` less the picture being stored, and that is not a
+    /// coincidence to be tidied into a filter: the planner snapshots `dpb_refs` before
+    /// any mutation, so every removal is by construction a picture the store named
+    /// (see the conversion's own comment). Applying the list completes the plan's
+    /// bookkeeping and never invents a removal. A caller that drops it holds a surface
+    /// on nearly every frame and runs the ledger dry within ten.
     pub release_after_decode: Vec<PicId>,
 }
 
@@ -660,26 +664,32 @@ pub fn plan_to_dxva_av1(
     }
 
     // --- mutations, after every fallible step -----------------------------
-    // ⚠ A picture this submission NAMES may be displaced by this same frame's
-    // refresh. Its surface is still in `ref_frame_map` above, so releasing it here
-    // would hand that very surface to `setup_slot` below and the frame would decode
-    // into a picture it predicts from. Held back for the caller instead — see
-    // `DecodePlanDxvaAv1::release_after_decode` for the measurement and for why
-    // this rung's test is `dpb_refs` (the whole store `RefFrameMapTextureIndex`
-    // declares) rather than the Vulkan rung's narrower `refs`.
+    // ⚠ EVERY removed picture is held back, and nothing is released here at all.
+    //
+    // A picture this submission NAMES may be displaced by this same frame's refresh;
+    // its surface is still in `ref_frame_map` above, so releasing it would hand that
+    // very surface to `setup_slot` below and the frame would decode into a picture it
+    // predicts from. What makes the rule "every removal" rather than "the removals
+    // the store names" is a property of the PLANNER: `Av1Planner::plan_frame`
+    // snapshots `dpb_refs` before any mutation, and `refresh_slots` can only report a
+    // picture that was in `self.slots` at that moment, so `dpb.removed` is always a
+    // SUBSET of the store `ref_frame_map` was built from. Filtering on `dpb_refs`
+    // here would be a condition that is never false wearing the clothes of a
+    // decision; the subset relation is asserted in
+    // `the_decode_target_never_aliases_a_surface_the_submission_names` instead, where
+    // a planner change that broke it fails loudly.
+    //
+    // `setup_id` is excluded as a safety property rather than as a live case: a
+    // picture this frame stores cannot also be one its own refresh displaced, because
+    // `refresh_slots` retains out any displaced id still held anywhere. Releasing it
+    // would return the surface being decoded into.
     let release_after_decode: Vec<PicId> = plan
         .dpb
         .removed
         .iter()
         .copied()
-        .filter(|id| *id != setup_id && plan.dpb_refs.iter().any(|r| r.id == *id))
+        .filter(|id| *id != setup_id)
         .collect();
-    for &id in &plan.dpb.removed {
-        if id == setup_id || release_after_decode.contains(&id) {
-            continue;
-        }
-        let _ = slots.release(id);
-    }
     let setup_slot = match slots.slot_of(setup_id) {
         Some(existing) => existing,
         None => slots.assign(setup_id)?,
@@ -906,19 +916,40 @@ mod tests {
                      RefFrameMapTextureIndex entry — the frame decodes into a picture \
                      it predicts from"
                 );
-                // Every deferred id is one this plan really removed AND the store
-                // really names — never an invented removal, never a live picture.
+                // ⚠ THE PROPERTY THE DEFERRAL RESTS ON, asserted about the PLANNER
+                // rather than about the conversion's own output.
+                //
+                // The conversion holds back every removal, which is only safe-and-
+                // sufficient because `Av1Planner` snapshots `dpb_refs` before any
+                // mutation and `refresh_slots` can only report a picture that was in
+                // it — so `dpb.removed` is a subset of the store `ref_frame_map` was
+                // built from. Asserting instead that each DEFERRED id is in
+                // `dpb_refs` would be vacuous: the deferred list is filtered out of
+                // `removed`, so that check compares an expression with itself. This
+                // one can fail, and if a planner change ever makes it fail the
+                // conversion is releasing a surface the submission points at.
+                for &id in &plan.dpb.removed {
+                    assert!(
+                        plan.dpb_refs.iter().any(|r| r.id == id),
+                        "frame {frames}: the planner removed picture {id}, which the \
+                         pre-decode store never held — `ref_frame_map` is built from \
+                         that store, so a removal outside it is a picture this \
+                         conversion could release without aliasing, and the blanket \
+                         deferral above stops being justified"
+                    );
+                }
+                // Every deferred id is one this plan really removed, and it still
+                // holds the surface the caller is being asked to give back.
                 for &id in &dx.release_after_decode {
                     assert!(
                         plan.dpb.removed.contains(&id),
                         "frame {frames}: deferred picture {id} is not in this plan's \
                          removed list"
                     );
-                    assert!(
-                        plan.dpb_refs.iter().any(|r| r.id == id),
-                        "frame {frames}: picture {id} is deferred without being named \
-                         by the store — only a picture the submission points at earns \
-                         the reprieve"
+                    assert_ne!(
+                        id, dx.setup_id,
+                        "frame {frames}: the picture being decoded must never be \
+                         deferred — releasing it returns the surface being written"
                     );
                     assert!(
                         slots.slot_of(id).is_some(),

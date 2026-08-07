@@ -69,8 +69,8 @@ Video, then the platform's own (pf-dxvadec on Windows, pf-vaadec on Linux), then
 rung (openh264/rav1d). The libavcodec rungs that used to sit under each of them are
 deleted, along with `pf-ffvk` and the `ffmpeg-next` dependency.
 
-Two of the native rungs have never decoded a frame on real hardware (native VAAPI at all;
-native D3D11VA's AV1 leg). They run anyway — with the libavcodec twins gone, the only
+One of the native rungs has never decoded a frame on real hardware (native VAAPI's H.264 and
+H.265 legs; its AV1 leg has decoded but has never been parity-checked). It runs anyway — with the libavcodec twins gone, the only
 thing below them is the CPU, so barring them would cost the session hardware decode
 outright rather than move it one rung down. What replaces the safety net is the log: every
 session names the rung it landed on with its evidence state,

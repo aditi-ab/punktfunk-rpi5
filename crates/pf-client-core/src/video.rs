@@ -16,10 +16,11 @@
 //! M9's evidence FILTER survives, narrowed to the one thing it can still protect
 //! ([`native_rung_admitted`]). The filter kept a rung that had never decoded on real
 //! hardware out of `auto` while its proven libavcodec twin was one step below. With the
-//! twins deleted that is usually no longer the situation: below native-d3d11va's AV1 leg,
-//! and below native-vaapi on NVIDIA/AMD, there is nothing proven left to fall onto, so
-//! barring the rung would not move a session one rung DOWN — it would take hardware decode
-//! away from it entirely, which is the worse answer.
+//! twins deleted that is usually no longer the situation: below native-vaapi on NVIDIA/AMD
+//! there is nothing proven left to fall onto, so barring the rung would not move a session
+//! one rung DOWN — it would take hardware decode away from it entirely, which is the worse
+//! answer. (native-d3d11va's AV1 leg was the other standing example until 2026-08-07, when
+//! it earned parity on two vendors and stopped being an unproven rung at all.)
 //!
 //! **One column of that table is different, and it is the one the filter still guards.**
 //! On Linux, Intel and every unknown vendor id run `native-vaapi → native-vk → sw`
@@ -788,8 +789,9 @@ enum Backend {
     /// `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the shareable-RGBA
     /// hand-off ring in `crate::video_d3d11`.
     /// Reachable by pin (`PUNKTFUNK_DECODER=native-d3d11va`) and by `auto` in the vendor
-    /// order: its H.264/H.265 legs have hardware parity + a soak (M5); its AV1 leg has
-    /// decoded nothing anywhere and runs with the warning [`log_rung`] emits. Errors
+    /// order: its H.264/H.265 legs have hardware parity + a soak (M5), and its AV1 leg has
+    /// frame-hash parity on two vendors since 2026-08-07 (M7) — 250/250 after a decode
+    /// target that aliased a reference surface was fixed. Errors
     /// ride the SAME streak/demotion machinery as every other hardware rung.
     /// Boxed: the decoder (two planners plus a session) dwarfs the other variants.
     #[cfg(windows)]
@@ -1221,11 +1223,14 @@ pub fn native_vulkan_usable(wire: u8, video_decode: bool, decode_video_caps: u32
 ///   reaches it again if Vulkan can't be built) and by pin.
 /// * **Everything else.** Below the unproven rung is the CPU. Trading hardware decode for
 ///   software decode to avoid an unproven decoder is the worse answer, so those rungs run,
-///   with the warning [`log_rung`] emits. That includes Windows Intel/unknown, where the
+///   with the warning [`log_rung`] emits. That included Windows Intel/unknown, where the
 ///   rung below native-d3d11va IS native Vulkan Video on paper: that vendor family is the
 ///   one thing in this program with a MEASURED wrong-pixel report against Vulkan decode
 ///   (the B580, see [`Decoder::new`]), and "has never run" is not a reason to move a
-///   session onto "known to strobe here". Callers say so where they pass `None`.
+///   session onto "known to strobe here". Callers say so where they pass `None`. ⚠ Since
+///   2026-08-07 no D3D11VA leg is unproven, so that arm no longer exercises this clause —
+///   the reasoning is kept because the `None` those callers pass is still what decides the
+///   answer if any leg's evidence ever goes bad again.
 ///
 /// ⚠ This governs `auto` ONLY. An explicit `PUNKTFUNK_DECODER=` pin bypasses it exactly as
 /// it bypasses the vendor order — a pin is how a lab run reaches a rung `auto` will not
@@ -1965,8 +1970,9 @@ impl Decoder {
         //
         // Windows' D3D11VA RUNG: native D3D11VA (pf-dxvadec). Its H.264/H.265 legs HAVE
         // hardware evidence (parity on an RTX 4090 and an AMD iGPU plus a 30-minute soak,
-        // M5); its AV1 leg has none and runs with the warning `done` logs — until M10 that
-        // leg was skipped in `auto` in favour of libavcodec's DXVA rung, which no longer
+        // M5), and since 2026-08-07 so does its AV1 leg (250/250 on an RTX 3500 Ada and an
+        // Intel Arc, no soak) — until M10 that leg was skipped in `auto` in favour of
+        // libavcodec's DXVA rung, which no longer
         // exists. The rung needs the presenter's win32 import path or its frames could
         // never reach the screen — that check is first, once.
         #[cfg(windows)]

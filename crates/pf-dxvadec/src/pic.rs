@@ -881,6 +881,69 @@ mod tests {
         assert_eq!(converted.len(), 250);
     }
 
+    /// ⚠⚠ **TRIPWIRE, not a proof — and the thing it watches for is UNRESOLVED.**
+    ///
+    /// This conversion releases the whole of `plan.dpb.removed` and then assigns the
+    /// decode target a slot. [`SlotMap::assign`] takes the LOWEST FREE slot, which is
+    /// the one just released — so if a picture is ever in BOTH `dpb_refs` (which is
+    /// what `RefFrameList` is built from, above) and `dpb.removed`, the submission
+    /// names one surface as `CurrPic` and as a `RefFrameList` entry at once, and the
+    /// frame decodes into a picture it predicts from. That is precisely the defect
+    /// measured on the AV1 leg on 2026-08-07: 245 of 250 delivered frames wrong on an
+    /// Intel Arc, invisible on NVIDIA for 63 frames, and invisible on glass entirely.
+    ///
+    /// For AV1 it was fixed by deferring the release past the decode op. For H.264 it
+    /// was NOT, because the intersection is empty on the vendored vector and changing
+    /// a hardware-proven codec on an unreproduced suspicion is the worse risk. What
+    /// this test does is make the assumption falsifiable instead of tacit.
+    ///
+    /// **Why zero here is weak evidence.** `H264Planner` snapshots `dpb_refs` in
+    /// `begin_picture`, BEFORE `finish_picture` runs 8.2.5 marking and then bumps the
+    /// DPB — and the vendored bump drops a picture the sliding window just unmarked
+    /// only once it has been OUTPUT. This vector reorders (it has B-frames), so an
+    /// unmarked picture is still awaiting output and lingers past the AU that unmarked
+    /// it, which is exactly what keeps the intersection empty. **A punktfunk host emits
+    /// low-delay H.264 with no reordering**, where a picture is output the moment it is
+    /// decoded — the condition that puts eviction and unmarking in the same access
+    /// unit. So the shape is plausibly live in the field and merely unreachable here.
+    ///
+    /// HEVC does not need this test and cannot be given one: `H265Planner` snapshots
+    /// `dpb_refs` AFTER `decode_rps` has updated the DPB, so an RPS-dropped picture is
+    /// structurally never in the snapshot `RefPicList` is built from.
+    ///
+    /// If this ever fires, the fix is `pic_av1.rs`'s: hand the removals back to the
+    /// caller as `release_after_decode` and let it release them once the decode op is
+    /// issued. Do not "fix" it by relaxing the count.
+    #[test]
+    fn no_au_removes_a_picture_its_own_reference_list_names() {
+        let mut both = 0usize;
+        let mut aus_with_removals = 0usize;
+        for (plan, _) in convert_stream() {
+            if !plan.dpb.removed.is_empty() {
+                aus_with_removals += 1;
+            }
+            for id in &plan.dpb.removed {
+                if plan.dpb_refs.iter().any(|r| r.id == *id) {
+                    both += 1;
+                }
+            }
+        }
+        assert!(
+            aus_with_removals > 0,
+            "no access unit of this vector removed anything, so the intersection below \
+             is empty for a reason that has nothing to do with the hazard"
+        );
+        assert_eq!(
+            both, 0,
+            "{both} picture(s) are in this AU's reference list AND removed by it — the \
+             conversion releases them before assigning the decode target a slot, so \
+             `CurrPic` and a `RefFrameList` entry now name one surface and the frame \
+             predicts from the picture it is writing. This is the AV1 defect of \
+             2026-08-07 on the H.264 leg; fix it the same way (a deferred \
+             `release_after_decode`), never by changing this number"
+        );
+    }
+
     #[test]
     fn the_setup_surface_is_the_current_picture_entry_and_is_never_also_a_reference_entry() {
         for (_, dxva) in convert_stream() {
