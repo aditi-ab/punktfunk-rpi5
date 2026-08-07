@@ -2,13 +2,13 @@
 //! HEVC by M3 WP-2 and to AV1 by M7): pf-vkdecode's
 //! [`VkH264Decoder`]/[`VkH265Decoder`]/[`VkAv1Decoder`] running on the PRESENTER's own
 //! VkDevice — the same zero-copy shape as the FFmpeg-Vulkan backend, with no FFmpeg in
-//! the path. Auto's rung immediately ABOVE FFmpeg-Vulkan since the 2026-08-05 ladder
-//! decision (WP-D closed bit-exact — the program is dropping FFmpeg from the client),
-//! also pinnable via `PUNKTFUNK_DECODER=native-vulkan`; `video::native_vulkan_gate` is
-//! the admission either way, and a failure falls through to the FFmpeg-Vulkan rung.
-//! **AV1 is reachable by the PIN only** — that rung has decoded nothing on hardware,
-//! so it is absent from every `auto` arm on the same rule M5's native D3D11VA and M6's
-//! native VAAPI rungs follow (`video::native_vulkan_gate` is where that lives).
+//! the path. Auto's TOP rung on both desktop OSes since M9, for ALL THREE codecs — each
+//! leg has bit-exact parity against libavcodec (H.264/H.265 on three drivers plus a
+//! 92-minute soak, M2/M3; AV1 250/250 on an RTX 5070 Ti, M7 — `video`'s evidence table
+//! holds the record) — also pinnable via `PUNKTFUNK_DECODER=native-vulkan`;
+//! `video::native_vulkan_gate` is the admission either way, and a failure falls through
+//! to the rung below (FFmpeg-Vulkan where `ffmpeg-fallback` compiled it, the platform's
+//! native rung otherwise).
 //!
 //! **Codec dispatch:** the negotiated codec picks the decoder ONCE, at construction
 //! ([`Codec`]) — H.264, H.265 or AV1, the three codecs pf-vkdecode speaks. The
@@ -69,10 +69,9 @@
 //! read here as a CLEAN access unit, and a clean AU clears `video.rs`'s demotion
 //! streak. A rung whose every key frame fails would then never demote — one error
 //! per key frame, zeroed by the skipped frames between them — and the `!delivered`
-//! fall-through to FFmpeg-Vulkan, the documented backstop for a level above
+//! fall-through to the rung below, the documented backstop for a level above
 //! `maxLevelIdc`, a sequence header disagreeing with the Welcome and (AV1 only)
-//! film grain, would be unreachable. All three codecs demote identically here, and
-//! only the H.26x paths have hardware evidence.
+//! film grain, would be unreachable. All three codecs demote identically here.
 //!
 //! **Queue lock:** pf-vkdecode submits on queue 0 of the decode family
 //! ([`DECODE_QUEUE_INDEX`] — the presenter creates exactly one queue per family). When
@@ -246,9 +245,10 @@ impl pf_vkdecode::QueueLock for NativeQueueLock {
 /// this module knowing about FFmpeg's codec ids (and `video::native_vulkan_gate`
 /// stays the single admission decision).
 ///
-/// Being IN this enum is not the same as being in `auto`: `Av1` is pin-only until it
-/// has hardware evidence, and `video::native_vulkan_gate` — not this list — is where
-/// that decision lives.
+/// Being IN this enum is not the same as being in `auto`: this list says pf-vkdecode has
+/// a decoder, `video::native_vulkan_gate` (through `video::native_rung_admitted` and the
+/// evidence table) says whether the automatic ladder may pick it. All three legs are in
+/// `auto` since M9, and that is the gate's decision to change, not this list's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCodec {
     H264,

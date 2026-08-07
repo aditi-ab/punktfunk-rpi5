@@ -72,26 +72,30 @@ pub mod video;
 mod video_color;
 #[cfg(any(target_os = "linux", windows))]
 mod video_software;
-// libav ownership helpers shared by the hardware decoders below (`AvBuffer`).
-#[cfg(any(target_os = "linux", windows))]
+// libav ownership helpers shared by the FFmpeg-backed rungs below (`AvBuffer`) — and by
+// nothing else, so it rides `ffmpeg-fallback` with them (M9).
+#[cfg(all(any(target_os = "linux", windows), feature = "ffmpeg-fallback"))]
 mod video_libav;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ffmpeg-fallback"))]
 mod video_vaapi;
 // Native VAAPI decode (M6 of the native-decode program): pf-vaadec's plans driven
 // straight into libva, dlopen'd at runtime, exporting DRM-PRIME dmabufs the
-// presenter imports — the FFmpeg-free replacement for `video_vaapi`. Pin-only for
-// now (`PUNKTFUNK_DECODER=native-vaapi`).
+// presenter imports — the FFmpeg-free replacement for `video_vaapi`. It has decoded
+// nothing on hardware, so `auto` reaches it only where nothing proven is left below it
+// (an `ffmpeg-fallback`-less build) or where the user asked — see `video`'s evidence
+// table; `PUNKTFUNK_DECODER=native-vaapi` reaches it by pin regardless.
 #[cfg(target_os = "linux")]
 pub mod video_vaapi_native;
 // Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
 // WP-2, AV1 by M7): pf-vkdecode's H.264/H.265/AV1 decoders on the presenter's shared
-// device — auto's rung immediately above FFmpeg-Vulkan (2026-08-05 ladder decision;
-// the program is dropping FFmpeg from the client), also pinnable via
-// `PUNKTFUNK_DECODER=native-vulkan`. The AV1 leg is PIN ONLY until it has hardware
-// evidence, so an `auto` AV1 session still lands on the FFmpeg rungs.
+// device — auto's TOP rung on both desktop OSes since M9, for all three codecs (each
+// leg has hardware parity against libavcodec; see `video`'s evidence table), also
+// pinnable via `PUNKTFUNK_DECODER=native-vulkan`.
 #[cfg(any(target_os = "linux", windows))]
 mod video_vk_native;
-#[cfg(any(target_os = "linux", windows))]
+// FFmpeg's Vulkan Video rung — the fall-through directly BELOW `video_vk_native`, and
+// only when `ffmpeg-fallback` is compiled in (M9).
+#[cfg(all(any(target_os = "linux", windows), feature = "ffmpeg-fallback"))]
 mod video_vulkan;
 // The OS-clipboard bridge for the shared clipboard (design/clipboard-and-file-transfer.md §5).
 // Built everywhere the session client is; the platform seam inside is Windows-real,
@@ -103,11 +107,18 @@ pub mod clipboard;
 // Linux's: the decoder is plain Vulkan compute on the presenter's device (no fds, no
 // dmabuf, no D3D11 interop), so the old "Windows present-path decision" that gated it
 // resolved itself — the present path is now literally the same code.
+// D3D11VA. Two halves with two lifetimes, which is why this module is NOT gated as a
+// whole: the hand-off ring, the decode-device creation and `display_hdr_volume` are
+// shared, field-proven, FFmpeg-free code that `video_d3d11_native` (and
+// `clients/session`) build on; the libavcodec DECODER inside it rides
+// `ffmpeg-fallback` and is gated item by item in the file (M9).
 #[cfg(windows)]
 pub mod video_d3d11;
 // Native D3D11VA (M5): `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the SAME
-// hand-off ring `video_d3d11` owns. Pin-only (`PUNKTFUNK_DECODER=native-d3d11va`) until it has
-// hardware evidence.
+// hand-off ring `video_d3d11` owns. In `auto` since M9 for the codecs that have hardware
+// evidence (H.264/H.265); its AV1 leg has decoded nothing on hardware and stays out of
+// `auto` — see `video`'s evidence table — while `PUNKTFUNK_DECODER=native-d3d11va` reaches
+// every leg by pin.
 #[cfg(windows)]
 pub mod video_d3d11_native;
 #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]

@@ -1,6 +1,10 @@
 //! The stream's per-frame colour signalling (`ColorDesc`) + the Y′CbCr→RGB CSC matrix (`csc_rows`).
 #![allow(clippy::unnecessary_cast)]
 
+// Only [`ColorDesc::from_raw`] — the FFmpeg rungs' per-frame CICP read — needs libav here;
+// every native rung fills `ColorDesc` from pf-bitstream instead. So the import rides
+// `ffmpeg-fallback` (M9) and this module is FFmpeg-free in a default build.
+#[cfg(feature = "ffmpeg-fallback")]
 use ffmpeg_next as ffmpeg;
 
 /// The stream's colour signaling, read PER-FRAME from the decoder (HEVC VUI → the
@@ -18,12 +22,14 @@ pub struct ColorDesc {
 }
 
 impl ColorDesc {
-    /// Read the CICP fields off a raw decoded frame. Public: the Windows client's raw-FFI
-    /// D3D11VA/software decoders build their per-frame `ColorDesc` with it too (same
-    /// `ffmpeg-next` major, so the `AVFrame` type unifies across the workspace).
+    /// Read the CICP fields off a raw decoded frame — the FFmpeg rungs' per-frame colour
+    /// source, and theirs alone: every native rung reads the same signalling out of the
+    /// SPS/sequence header through pf-bitstream, which is why this compiles out with
+    /// `ffmpeg-fallback` (M9) and why nothing was lost when it did.
     ///
     /// # Safety
     /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
+    #[cfg(feature = "ffmpeg-fallback")]
     pub unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
         // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
         unsafe {

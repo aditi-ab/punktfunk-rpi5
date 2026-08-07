@@ -49,10 +49,10 @@ path + per-stage latency equation); any tier but Off also emits the stdout mirro
 `--no-default-features` is the ~5 MB power-user build — same streaming, stats on stdout
 only, no Skia anywhere in the dependency tree.
 
-Decode follows the Settings preference (auto is vendor-ordered: hardware Vulkan Video →
-VAAPI → software on Linux, hardware Vulkan Video → D3D11VA → software on Windows, with
-VAAPI/D3D11VA first on Intel; on H.264 and HEVC the native pf-vkdecode Vulkan decoder
-is tried immediately before FFmpeg-Vulkan): the Vulkan decoders run on the presenter's own
+Decode follows the Settings preference (auto is vendor-ordered: Vulkan Video → VAAPI →
+software on Linux, Vulkan Video → D3D11VA → software on Windows, with VAAPI/D3D11VA first
+on Intel — and since M9 each of those is a NATIVE rung with its libavcodec twin directly
+below it; see "Decode rungs" below): the Vulkan decoders run on the presenter's own
 device where the stack supports it (every vendor, zero copy); VAAPI dmabufs import
 per-plane elsewhere (D3D11VA textures on Windows); software is the universal fallback.
 10-bit Main10 and HDR10 are advertised (`VIDEO_CAP_10BIT|HDR`): P010 decodes through the
@@ -62,9 +62,31 @@ tone-map in-shader to SDR when it doesn't (`PUNKTFUNK_TONEMAP_PEAK` tunes the ro
 default ≈1000 nits). The host still gates the upgrade behind its `PUNKTFUNK_10BIT`
 policy.
 
+## Decode rungs (M9: native first)
+
+`auto` walks native rungs first — pf-vkdecode over Vulkan Video, then the platform's own
+(pf-dxvadec on Windows, pf-vaadec on Linux), then the CPU rung (openh264/rav1d). The
+libavcodec rungs are still compiled in by default and sit DIRECTLY BELOW their native
+counterpart as the fall-through; `--no-default-features --features ui,pyrowave` builds
+without them entirely.
+
+Two of the native rungs have never decoded a frame on real hardware (native VAAPI at all;
+native D3D11VA's AV1 leg), so `auto` skips those while a libavcodec rung is still below
+them. `PUNKTFUNK_NATIVE_FIRST=1` switches them in — that is the M9 field-bake switch, and
+it keeps the FFmpeg twin underneath as the safety net. Every session logs the rung it
+landed on with its evidence state:
+
+    decode rung active  rung=native-vulkan codec=HEVC hardware_verified=true evidence=...
+
+…and that line is a WARNING when nothing has ever decoded a frame through the rung/codec
+pair the session chose. `pf-client-core`'s `video.rs` module docs carry the full table.
+
 Debug/bisect knobs: `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|native-d3d11va|vulkan|vaapi|d3d11va|software`
-(the three `native-*` values pin this program's own decoders; `native-vaapi` also takes
-`PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderDNNN` to choose the GPU), `PUNKTFUNK_PRESENT_MODE=
+(the three `native-*` values pin this program's own decoders and bypass the evidence rule
+above, which is how a lab run reaches a rung `auto` will not pick; the three bare values
+name the libavcodec rungs specifically and refuse in a build without them; `native-vaapi`
+also takes `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderDNNN` to choose the GPU),
+`PUNKTFUNK_NATIVE_FIRST=1` (above), `PUNKTFUNK_PRESENT_MODE=
 mailbox|fifo|immediate|fifo_relaxed` (default MAILBOX, FIFO where the surface offers no
 MAILBOX — AMD on Windows), `PUNKTFUNK_VK_DEVICE=<index>` (multi-GPU), and
 `PUNKTFUNK_HW_FAULT=import` (fault every VAAPI dmabuf import — proves the three-strike

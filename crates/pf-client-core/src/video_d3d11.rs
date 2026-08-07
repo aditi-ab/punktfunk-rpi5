@@ -45,12 +45,21 @@
 //! writes the decode surface.
 
 use crate::video::ColorDesc;
+#[cfg(feature = "ffmpeg-fallback")]
 use crate::video_libav::AvBuffer;
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
+// Every `bail!` in this file is in the libavcodec half (the DXVA profile probe and the
+// decoder itself); the shared hand-off half raises its errors through `.context()`.
+#[cfg(feature = "ffmpeg-fallback")]
+use anyhow::bail;
+#[cfg(feature = "ffmpeg-fallback")]
 use ffmpeg_next as ffmpeg;
+#[cfg(feature = "ffmpeg-fallback")]
 use std::ffi::c_void;
 use std::ptr;
-use windows::core::{Interface, GUID};
+use windows::core::Interface;
+#[cfg(feature = "ffmpeg-fallback")]
+use windows::core::GUID;
 use windows::Win32::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
@@ -71,10 +80,14 @@ use windows::Win32::dxgi::{
     DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC, DXGI_SHARED_RESOURCE_READ,
-    DXGI_SHARED_RESOURCE_WRITE,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
+// The decode-surface formats are named only by the libavcodec rung's adapter probe here —
+// the native rung declares its own pool formats in `video_d3d11_native` — so they ride
+// `ffmpeg-fallback` with it.
+#[cfg(feature = "ffmpeg-fallback")]
+use windows::Win32::dxgi::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::windef::RECT;
 use windows::Win32::winnt::HANDLE;
 
@@ -90,16 +103,27 @@ const RING_SLOTS: usize = 6;
 const ACQUIRE_TIMEOUT_MS: u32 = 2000;
 
 /// Probe pool size — mirrors what libavcodec sizes for a worst-case DPB (legacy value).
+#[cfg(feature = "ffmpeg-fallback")]
 const DECODE_POOL_SIZE: i32 = 12;
 
 /// `D3D11_BIND_DECODER` — the decode pool's ONLY bind flag (see `get_format_d3d11`).
+///
+/// The NATIVE rung has its own copy of this fact ([`crate::video_d3d11_native`] builds its
+/// pool with `D3D11_BIND_DECODER` and nothing else, and pf-dxvadec's tests pin it), so this
+/// one belongs to the libavcodec probe alone and rides `ffmpeg-fallback` with it.
+#[cfg(feature = "ffmpeg-fallback")]
 const BIND_DECODER: u32 = 0x200;
 
 // DXVA decode-profile GUIDs (`dxva.h`), defined locally so no extra windows-rs feature or
-// metadata surface is pulled in for four constants.
+// metadata surface is pulled in for four constants. The native rung reads its profile GUIDs
+// from `pf_dxvadec` (unit-tested there), so these belong to the FFmpeg rung's adapter probe.
+#[cfg(feature = "ffmpeg-fallback")]
 const PROFILE_H264_VLD_NOFGT: GUID = GUID::from_u128(0x1b81be68_a0c7_11d3_b984_00c04f2e73c5);
+#[cfg(feature = "ffmpeg-fallback")]
 const PROFILE_HEVC_VLD_MAIN: GUID = GUID::from_u128(0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0);
+#[cfg(feature = "ffmpeg-fallback")]
 const PROFILE_HEVC_VLD_MAIN10: GUID = GUID::from_u128(0x107af0e0_ef1a_4d19_aba8_67a163073d13);
+#[cfg(feature = "ffmpeg-fallback")]
 const PROFILE_AV1_VLD_PROFILE0: GUID = GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a);
 
 /// One decoded frame, parked in a ring slot the presenter imports by NT handle. Plain POD —
@@ -146,10 +170,17 @@ pub struct D3d11Frame {
 }
 
 // --- FFmpeg hwcontext_d3d11va ABI (repr(C) mirrors, same as the legacy decoder) --------------
+//
+// Everything from here to `create_device` below is the libavcodec HALF of this module — the
+// `ffmpeg-fallback` rung (M9). It is gated item by item rather than moved to its own file
+// because the two halves share this module's docs, its constants and its hand-off ring, and
+// because nothing in this tree COMPILES `cfg(windows)` code: a file move here could not be
+// checked by any gate, an attribute can at least be read against the item it sits on.
 
 /// `hwcontext_d3d11va.h` — `AVHWDeviceContext::hwctx` for D3D11VA. FFmpeg installs the
 /// `ID3D11Multithread` default lock + multithread protection during init, which is what lets
 /// the presenter-side device share textures with the decode thread safely.
+#[cfg(feature = "ffmpeg-fallback")]
 #[repr(C)]
 struct AVD3D11VADeviceContext {
     device: *mut c_void,         // ID3D11Device*
@@ -164,6 +195,7 @@ struct AVD3D11VADeviceContext {
 /// `hwcontext_d3d11va.h` — `AVHWFramesContext::hwctx`. A user-built frames context gets NO
 /// default bind flags (BindFlags 0 → `CreateTexture2D` E_INVALIDARG); only the probe below
 /// builds one, and it sets `BIND_DECODER` exactly like libavcodec's own path.
+#[cfg(feature = "ffmpeg-fallback")]
 #[repr(C)]
 struct AVD3D11VAFramesContext {
     texture: *mut c_void, // ID3D11Texture2D* (null → FFmpeg allocates the pool)
@@ -179,6 +211,7 @@ struct AVD3D11VAFramesContext {
 // contexts (pf-encode's `ffmpeg_win.rs` and pf-client-core's `video_d3d11.rs`); they must agree
 // with libav AND with each other, and these assertions are what makes a drift in either a build
 // failure instead of a runtime mystery.
+#[cfg(feature = "ffmpeg-fallback")]
 const _: () = {
     use std::mem::{offset_of, size_of};
     type P = *mut c_void;
@@ -198,6 +231,7 @@ const _: () = {
     assert!(offset_of!(AVD3D11VAFramesContext, texture_infos) == 2 * size_of::<P>());
 };
 
+#[cfg(feature = "ffmpeg-fallback")]
 fn averr(what: &str, code: i32) -> anyhow::Error {
     anyhow!("{what}: {}", ffmpeg::Error::from(code))
 }
@@ -209,6 +243,7 @@ fn averr(what: &str, code: i32) -> anyhow::Error {
 /// sizing, and the decoder-only `D3D11_BIND_DECODER` flags. A hand-built context validated on
 /// NVIDIA was rejected by Intel at the first `SubmitDecoderBuffers` (E_INVALIDARG) — the
 /// vendor-proof path is the one the ffmpeg CLI/mpv ship.
+#[cfg(feature = "ffmpeg-fallback")]
 unsafe extern "C" fn get_format_d3d11(
     avctx: *mut ffmpeg::ffi::AVCodecContext,
     mut list: *const ffmpeg::ffi::AVPixelFormat,
@@ -235,6 +270,7 @@ unsafe extern "C" fn get_format_d3d11(
 /// FFmpeg hwdevice because hwaccel selection (`get_format`) only runs on the FIRST access
 /// unit — an unsupported profile would otherwise burn the opening IDR and recover through the
 /// mid-stream demotion path instead of committing to software up front.
+#[cfg(feature = "ffmpeg-fallback")]
 fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) -> Result<()> {
     let video: ID3D11VideoDevice = device
         .cast()
@@ -280,6 +316,7 @@ fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) 
 /// creates the real NV12 decode surface array. On a GPU/driver that can't create the pool this
 /// fails here, up front, so the session commits to software from the first frame (a clean,
 /// gap-free stream) instead of dying mid-stream on the opening IDR.
+#[cfg(feature = "ffmpeg-fallback")]
 unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> bool {
     use ffmpeg::ffi::*;
     // SAFETY: `hw_device` is a valid `AVBufferRef` by this fn's contract; the frames context is
@@ -819,6 +856,7 @@ impl HandoffRing {
     }
 }
 
+#[cfg(feature = "ffmpeg-fallback")]
 pub(crate) struct D3d11vaDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
     /// The D3D11VA hwdevice, owned. Nothing reads this field after construction — the codec context
@@ -841,6 +879,7 @@ pub(crate) struct D3d11vaDecoder {
     name: String,
 }
 
+#[cfg(feature = "ffmpeg-fallback")]
 // SAFETY: the libav pointers are this decoder's own allocations (freed once in `Drop`) and the COM
 // interfaces it holds are reference-counted with interlocked counts, so moving the whole struct to
 // another thread and releasing it there is sound. D3D11's immediate context is not thread-SAFE but
@@ -849,6 +888,7 @@ pub(crate) struct D3d11vaDecoder {
 // textures through their NT handles on its own device. Moved, never shared; deliberately NOT `Sync`.
 unsafe impl Send for D3d11vaDecoder {}
 
+#[cfg(feature = "ffmpeg-fallback")]
 impl D3d11vaDecoder {
     pub(crate) fn new(
         codec_id: ffmpeg::codec::Id,
@@ -1007,6 +1047,7 @@ impl D3d11vaDecoder {
     }
 }
 
+#[cfg(feature = "ffmpeg-fallback")]
 impl Drop for D3d11vaDecoder {
     fn drop(&mut self) {
         use ffmpeg::ffi;

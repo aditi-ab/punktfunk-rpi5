@@ -12,11 +12,20 @@
 //!
 //! # Admission
 //!
-//! Explicit pin only — `PUNKTFUNK_DECODER=native-d3d11va`. It is NOT in the automatic ladder
-//! and must not be until it has hardware evidence: M2's native Vulkan rung was admitted to
-//! `auto` only after WP-D closed bit-exact against libavcodec on three drivers plus a
-//! 92-minute soak, and this rung has decoded nothing yet. A refusal or an init failure logs
-//! and falls through to the standard ladder, so the pin can never cost a session its decoder.
+//! `PUNKTFUNK_DECODER=native-d3d11va` reaches every leg of this rung, in every build. `auto`
+//! is per-CODEC and per-evidence since M9 (`video::native_rung_admitted`, and the evidence
+//! table in `video`'s module docs):
+//!
+//! * **H.264 and H.265 are in `auto`** — frame-hash parity against libavcodec on an RTX 4090
+//!   and an AMD iGPU plus a 30-minute soak (M5). They sit directly above the libavcodec
+//!   D3D11VA rung wherever the ladder reaches DXVA.
+//! * **AV1 is not** — it was wired in M7 and has decoded nothing on any hardware, so `auto`
+//!   skips it and an AV1 session lands on the FFmpeg rung exactly as it did before. It joins
+//!   when the evidence exists, or in a build with no `ffmpeg-fallback` rung below it (there
+//!   the alternative is the CPU, and the session log says so at `warn`).
+//!
+//! A refusal or an init failure logs and falls through to the standard ladder, so neither the
+//! pin nor the `auto` admission can cost a session its decoder.
 //!
 //! # The decode pool — the part that has already failed once
 //!

@@ -71,9 +71,13 @@ use crate::video_color::ColorDesc;
 
 /// `PUNKTFUNK_DECODER=native-vaapi` — the pin that selects this rung.
 ///
-/// Pin-only, like M5's native D3D11VA rung was at the same stage and for the same
-/// reason: the native Vulkan rung joined `auto` only after bit-exact parity on
-/// several drivers and a long soak, and this one has decoded nothing yet.
+/// The pin reaches this rung in EVERY build. `auto` is the conditional one: this rung
+/// has decoded nothing on any hardware, so `video::native_rung_admitted` lets it into
+/// `auto` only where no proven rung is left below it (a build without the
+/// `ffmpeg-fallback` FFmpeg rungs) or where the user asked
+/// (`PUNKTFUNK_NATIVE_FIRST=1`). The pin staying unconditional is what makes the
+/// missing evidence GENERATABLE — a rule that gated the pin too would be a rule no
+/// hardware run could ever satisfy.
 pub(crate) const DECODER_PIN: &str = "native-vaapi";
 
 // ---------------------------------------------------------------------------
