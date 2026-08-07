@@ -99,8 +99,37 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+        // The pitch instrument for the LIVE minted mic pair (field report: voice through the
+        // minted microphone played back "way lower"): a 440 Hz tone into the minted mic's
+        // render side, frequency-measured off its capture side. ~440 Hz = the pair is honest;
+        // ~220 Hz = a link runs at half the declared rate (the octave-down voice).
+        Some("micpitch") => {
+            super::minted::ensure_blocking();
+            let ids = super::minted::minted_ids();
+            let (Some(render), Some(capture)) = (ids.mic_render, ids.mic_capture) else {
+                bail!("no minted microphone pair on this box — run `audio-probe mint` first");
+            };
+            println!("audio-probe micpitch: render={render}");
+            println!("audio-probe micpitch: capture={capture}");
+            let (peak, hz) = tone_while(&Some(render), 6, 440.0, || record_peak(&capture, 4))??;
+            println!("audio-probe micpitch: peak={peak:.4}, 440 Hz read back as {hz:.0} Hz");
+            if peak < SIGNAL_FLOOR {
+                println!("  VERDICT: no signal crossed the pair — is the mic pump holding it?");
+            } else if (hz - 440.0).abs() < 40.0 {
+                println!("  VERDICT: pitch-true — the minted pair is innocent; the shift lives elsewhere.");
+            } else if (hz - 220.0).abs() < 30.0 {
+                println!(
+                    "  VERDICT: OCTAVE DOWN — the driver forwards the stereo render stream \
+                     into the mono capture raw; the render side must run MONO."
+                );
+            } else {
+                println!("  VERDICT: off-pitch by an unusual ratio — measure again / check rates.");
+            }
+            Ok(())
+        }
         _ => bail!(
-            "usage: punktfunk-host audio-probe <ssm|sink|sss-primary|mint|plan|cleanup> [--keep]"
+            "usage: punktfunk-host audio-probe \
+             <ssm|sink|sss-primary|mint|plan|micpitch|cleanup> [--keep]"
         ),
     }
 }
@@ -140,10 +169,12 @@ fn probe_ssm(keep: bool) -> Result<()> {
 
     // E2E: tone into the instance's render side, recorded from its capture side. Concurrent —
     // the driver only moves audio while both ends are open.
-    let peak = tone_while(&Some(render_ep.clone()), 5, 440.0, || {
+    let (peak, hz) = tone_while(&Some(render_ep.clone()), 5, 440.0, || {
         record_peak(&capture_ep, 3)
     })??;
-    println!("audio-probe ssm: capture peak over 3s = {peak:.4}");
+    println!(
+        "audio-probe ssm: capture peak over 3s = {peak:.4}, tone 440 Hz read back as {hz:.0} Hz"
+    );
     if peak > SIGNAL_FLOOR {
         println!(
             "  VERDICT: PASS (S3) — the minted Steam Streaming Microphone instance carries \
@@ -186,8 +217,10 @@ fn probe_sink(keep: bool) -> Result<()> {
     // tone rendered through the DEFAULT device (as any app would), the loopback reading the
     // minted endpoint. This is `wasapi_cap`'s Assert shape minus the game.
     audio_control::set_default_endpoint(&ep).context("park the default playback on the sink")?;
-    let peak = tone_while(&None, 5, 440.0, || loopback_peak(&ep, 3))??;
-    println!("audio-probe sink: loopback peak over 3s = {peak:.4}");
+    let (peak, hz) = tone_while(&None, 5, 440.0, || loopback_peak(&ep, 3))??;
+    println!(
+        "audio-probe sink: loopback peak over 3s = {peak:.4}, tone 440 Hz read back as {hz:.0} Hz"
+    );
     if peak > SIGNAL_FLOOR {
         println!(
             "  VERDICT: PASS (S2) — default-routed audio reaches the minted Speakers instance \
@@ -255,10 +288,10 @@ fn probe_sss_primary(secs: u32) -> Result<()> {
     );
     report_mix_format("primary", &id);
 
-    let peak = tone_while(&Some(id.clone()), secs + 1, 440.0, || {
+    let (peak, hz) = tone_while(&Some(id.clone()), secs + 1, 440.0, || {
         loopback_peak(&id, secs)
     })??;
-    println!("audio-probe sss-primary: loopback peak over {secs}s = {peak:.4}");
+    println!("audio-probe sss-primary: loopback peak over {secs}s = {peak:.4}, tone 440 Hz read back as {hz:.0} Hz");
     if peak > SIGNAL_FLOOR {
         println!(
             "  VERDICT: the primary SSS loopback CARRIES audio here (steam.exe running: \
@@ -561,13 +594,16 @@ fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -
     Ok(())
 }
 
-/// Peak |sample| read from an endpoint for `seconds`. `loopback` taps a RENDER endpoint's mix
-/// (the desktop-audio capture shape); otherwise a normal record from a CAPTURE endpoint (the
-/// virtual-mic consumer shape).
-fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<f32> {
+/// Peak |sample| AND estimated dominant frequency (zero crossings — a pitch-shift detector:
+/// a 440 Hz tone reading back as ~220 Hz means some link runs at half the declared rate, which
+/// peaks alone can never see) read from an endpoint for `seconds`. `loopback` taps a RENDER
+/// endpoint's mix (the desktop-audio capture shape); otherwise a normal record from a CAPTURE
+/// endpoint (the virtual-mic consumer shape). MONO request — frequency counting needs a single
+/// channel, and autoconvert downmix changes no frequencies.
+fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32, f32)> {
     let device = pe::open_wasapi_device(endpoint_id)?;
     let mut client = device.get_iaudioclient().context("IAudioClient")?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
+    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 1, None);
     let (period, _) = client.get_device_period().context("device period")?;
     client
         .initialize_client(
@@ -592,6 +628,11 @@ fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<f32> 
     let mut bytes: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut peak = 0f32;
     let mut frames = 0u64;
+    let mut crossings = 0u64;
+    let mut prev_positive: Option<bool> = None;
+    // Frequency = crossings over the SIGNAL span only (audio starts mid-window; counting the
+    // leading silence into the denominator reads every tone low).
+    let (mut first_signal, mut last_signal): (Option<u64>, Option<u64>) = (None, None);
     while Instant::now() < deadline {
         let _ = h_event.wait_for_event(100);
         loop {
@@ -609,25 +650,41 @@ fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<f32> 
         if whole > 0 {
             let raw: Vec<u8> = bytes.drain(..whole).collect();
             for c in raw.chunks_exact(4) {
-                peak = peak.max(f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs());
+                let s = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                peak = peak.max(s.abs());
+                if s.abs() > 0.01 {
+                    first_signal.get_or_insert(frames);
+                    last_signal = Some(frames);
+                    let pos = s > 0.0;
+                    if prev_positive.is_some_and(|p| p != pos) {
+                        crossings += 1;
+                    }
+                    prev_positive = Some(pos);
+                }
                 frames += 1;
             }
         }
     }
     let _ = client.stop_stream();
+    let est_hz = match (first_signal, last_signal) {
+        (Some(a), Some(b)) if b > a + SAMPLE_RATE as u64 / 10 => {
+            crossings as f32 / 2.0 / ((b - a) as f32 / SAMPLE_RATE as f32)
+        }
+        _ => 0.0,
+    };
     println!(
-        "audio-probe: {} read {} samples from {endpoint_id}",
+        "audio-probe: {} read {} samples from {endpoint_id} (est {est_hz:.0} Hz)",
         if loopback { "loopback" } else { "record" },
         frames
     );
-    Ok(peak)
+    Ok((peak, est_hz))
 }
 
-fn loopback_peak(endpoint_id: &str, seconds: u32) -> Result<f32> {
+fn loopback_peak(endpoint_id: &str, seconds: u32) -> Result<(f32, f32)> {
     measure_peak(endpoint_id, seconds, true)
 }
 
-fn record_peak(endpoint_id: &str, seconds: u32) -> Result<f32> {
+fn record_peak(endpoint_id: &str, seconds: u32) -> Result<(f32, f32)> {
     measure_peak(endpoint_id, seconds, false)
 }
 
