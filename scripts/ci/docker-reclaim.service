@@ -1,0 +1,20 @@
+# Hourly reclaim of Docker resources act_runner LEAKS (per-job volumes, stale networks, old build
+# cache). Sibling of docker-prune.service, which handles what CI legitimately produces and then
+# abandons; the split matters because this one must stay conservative enough to run while jobs are
+# live (dangling-only volumes, age-gated networks) — see docker-reclaim.sh for the full why.
+#
+# Install: see the header of docker-reclaim.sh (note the installed unit name is
+# ci-docker-reclaim.service — existing fleet hosts already run it under that name).
+
+[Unit]
+Description=Reclaim disk leaked by Gitea act_runner (per-job volumes, networks, stale build cache)
+Documentation=https://git.unom.io/unom/punktfunk
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ci-docker-reclaim.sh
+# Never let maintenance starve a running build.
+Nice=10
+IOSchedulingClass=idle

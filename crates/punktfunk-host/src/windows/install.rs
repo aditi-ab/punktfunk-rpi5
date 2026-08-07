@@ -159,13 +159,15 @@ fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     let verdict = (|| -> Result<()> {
         rc.ok().context("GetNamedSecurityInfoW(owner + DACL)")?;
         let privileged = privileged_sids()?;
-        // SAFETY: `owner` points into the descriptor returned above and is valid for this scope.
         let is_privileged = |sid: PSID| -> bool {
+            // SAFETY: every `sid` handed in points into the descriptor returned above (or at an
+            // ACE inside it) and is valid for this scope; IsValidSid is itself the probe.
             if sid.is_invalid() || !unsafe { IsValidSid(sid) }.as_bool() {
                 return false;
             }
             privileged
                 .iter()
+                // SAFETY: `sid` passed IsValidSid above; `p` is an owned, length-exact SID copy.
                 .any(|p| unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok())
         };
 
@@ -237,6 +239,7 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
             .with_context(|| format!("ConvertStringSidToSidW({s})"))?;
         // SAFETY: psid is a valid SID; copy it out so the caller owns plain bytes.
         let len = unsafe { GetLengthSid(psid) } as usize;
+        // SAFETY: GetLengthSid just measured exactly `len` readable bytes at `psid`.
         let bytes = unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec();
         // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
         unsafe {

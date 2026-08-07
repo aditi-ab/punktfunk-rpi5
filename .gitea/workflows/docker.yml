@@ -148,7 +148,12 @@ jobs:
             -t "$CI_REGISTRY_PUSH/${{ matrix.image }}:latest" \
             ci
 
+      # Gated like Build/Push: only the docker CLI needs this login (Reconcile and Tag-for-release
+      # authenticate via curl -u), so a cache-hit job with nothing to push must not be able to fail
+      # on a login it never uses — proven on run 16013, where a host with a misconfigured daemon
+      # failed exactly here on a hit=true leg.
       - name: Log in to the LAN registry
+        if: steps.exists.outputs.hit == 'false'
         run: |
           echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY_PUSH" -u ci --password-stdin
         env:
@@ -236,7 +241,9 @@ jobs:
             -t "$CI_REGISTRY_PUSH/$IMAGE:latest" \
             .
 
+      # Same gate as the builders job above: the login only serves Push.
       - name: Log in to the LAN registry
+        if: steps.exists.outputs.hit == 'false'
         run: |
           echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY_PUSH" -u ci --password-stdin
         env:
