@@ -549,6 +549,20 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
+    /// A punktfunk HOST's own output: 120 pictures of 640x480, `max_num_ref_frames = 3`
+    /// alongside `max_dec_frame_buffering = 3` and `max_num_reorder_frames = 0`.
+    ///
+    /// Vendored beside `pf-vkdecode`'s per-frame goldens, and the only stream in the
+    /// tree that produces the shape this module's exemption is about. The conformance
+    /// vector above cannot: its level gives it a 7-frame DPB against 2 reference
+    /// frames, so 8.2.5's sliding window unmarks a picture two access units before
+    /// C.4.5.3's bump can evict it, and it reorders, which keeps an unmarked picture
+    /// alive past the unit that unmarked it. Both are properties of that vector rather
+    /// than of H.264, and between them they hid a defect that fired on 297 of 300
+    /// access units of every stream we ship, on two other backends, for two milestones.
+    const LOWDELAY_640X480: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
+
     /// Minimal H.264 access-unit splitter. The production wire delivers whole access
     /// units, so pf-bitstream keeps its splitter test-only; this is the same rule —
     /// a new AU begins at a non-VCL NALU following slices, or at a slice declaring
@@ -693,83 +707,311 @@ mod tests {
         );
     }
 
-    /// The decode target must never be a surface this same access unit READS.
+    /// What one walk of a stream through [`plan_to_va`] measured.
     ///
-    /// This is the question a slot ledger cannot answer, and it is why the caller
-    /// binds the setup surface instead of the conversion reading one out of a
-    /// slot-indexed table.
+    /// Every field is a count of ACCESS UNITS, so the four are directly comparable and
+    /// each is bounded by [`Self::converted`].
+    #[derive(Debug, Default)]
+    struct AliasWalk {
+        /// Access units planned and converted.
+        converted: usize,
+        /// The setup picture was assigned a slot this access unit's OWN removals had
+        /// just freed. `SlotMap::assign` takes the lowest free slot, so this is the
+        /// ordinary case rather than an edge one — and it is why a decode target read
+        /// out of a slot-indexed table would be the surface of the picture just
+        /// displayed.
+        inherited_a_just_freed_slot: usize,
+        /// This access unit's own `removed` list names a picture its `dpb_refs`
+        /// snapshot also names: 8.2.5's sliding window unmarked a reference in the very
+        /// unit whose C.4.5.3 bump evicted it. The aliasing PRECONDITION, and the shape
+        /// the vendored conformance vector never produces.
+        removed_and_referenced: usize,
+        /// The setup picture took the slot of a picture this same access unit READS.
+        /// This is the D3D11VA/Vulkan defect verbatim — `CurrPic` and a reference entry
+        /// resolving through one slot — and on those two backends the surface followed
+        /// the slot, so the submission aliased. Here the surface does not follow the
+        /// slot, which is what [`Self::aliased`] measures.
+        setup_took_a_read_pictures_slot: usize,
+        /// The submission names the decode target as one of its own references, in
+        /// `reference_frames` or in any slice's `RefPicList0`/`1`. Must be zero.
+        aliased: usize,
+    }
+
+    /// Drive `stream` through the planner and [`plan_to_va`], modelling the caller the
+    /// way the Linux rung is written, and count the four shapes above.
     ///
-    /// `SlotMap::assign` takes the LOWEST free slot, and a slot freed by this
-    /// access unit's own removals is free by the time the setup picture is
-    /// assigned. Measured on the vendored vector, that is not an edge case: the
-    /// setup picture inherits a just-freed slot on **225 of 250** access units.
-    /// A surface bound BY SLOT would therefore decode, on nine frames in ten,
-    /// into the surface still holding the picture that was just displayed — which
-    /// under zero-copy the consumer may still be sampling. Hence the pool model
-    /// this crate's callers use, and hence `setup_surface`.
-    ///
-    /// The second half of the test is the reassurance that comes with it: given
-    /// the caller's contract (a surface bound to no live picture), the decode
-    /// target is never a surface the same access unit READS. That is checked
-    /// against both readable sets, which are not the same snapshot — `dpb_refs` is
-    /// taken after this AU's marking process, the per-slice lists before it.
-    #[test]
-    fn the_setup_picture_routinely_inherits_a_just_freed_slot() {
+    /// The model is one line and it is the whole contract: the decode target is a
+    /// surface that **is not in the table the conversion is handed**, and it enters
+    /// that table only after the conversion returns. `video_vaapi_native`'s
+    /// `the_low_delay_stream_never_hands_the_decoder_a_surface_it_is_predicting_from`
+    /// is the same walk driven through the REAL `Session` pool, which is what says the
+    /// rung honours the contract; this one says what the contract buys.
+    fn walk_for_aliasing(stream: &[u8]) -> AliasWalk {
         use pf_bitstream::h264::H264Planner;
 
-        let aus = split_aus(TEST_25FPS_H264);
         let mut planner = H264Planner::new();
-        let mut surfaces: Vec<u32> = Vec::new();
         let mut slots: Option<SlotMap> = None;
-        let mut collisions = 0usize;
-        let mut first: Option<usize> = None;
-        let mut inherited = 0usize;
+        // Slot to surface — precisely `Session::surface_table()` on the Linux rung.
+        let mut table: Vec<u32> = Vec::new();
+        let mut out = AliasWalk::default();
 
-        for (index, au) in aus.iter().enumerate() {
-            let plan = planner.plan_au(au).expect("the clean vector plans");
+        for (index, au) in split_aus(stream).into_iter().enumerate() {
+            let plan = planner
+                .plan_au(au)
+                .unwrap_or_else(|e| panic!("AU {index}: this stream must plan, got {e:?}"));
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
-            surfaces.resize(map.capacity(), VA_INVALID_SURFACE);
-            // Which slots this AU's own removals will free — read BEFORE the
-            // conversion applies them, because afterwards the ledger has forgotten.
+            assert_eq!(
+                map.capacity(),
+                plan.picture.max_dpb_frames + 1,
+                "AU {index}: neither stream renegotiates its DPB depth mid-walk"
+            );
+            table.resize(map.capacity(), VA_INVALID_SURFACE);
+
+            if plan
+                .dpb
+                .removed
+                .iter()
+                .any(|id| plan.dpb_refs.iter().any(|r| r.id == *id))
+            {
+                out.removed_and_referenced += 1;
+            }
+            // Which slots this AU's removals will free, read BEFORE the conversion
+            // applies them — afterwards the ledger has forgotten.
             let freed: Vec<u8> = plan
                 .dpb
                 .removed
                 .iter()
                 .filter_map(|id| map.slot_of(*id))
                 .collect();
+
+            // Ids start well away from slot indices and are never reused, so a stale or
+            // aliased reference shows up as a value rather than as a plausible-looking
+            // off-by-one and cannot hide behind a surface that happens to be right
+            // again. The assertion is the model's own precondition: a target the table
+            // already names would beg the question this walk exists to answer.
             let setup_surface = SURFACE_BASE + index as u32;
-            let out = plan_to_va(&plan, au, map, &surfaces, setup_surface)
-                .expect("the clean vector converts");
-            surfaces[usize::from(out.setup_slot)] = setup_surface;
-            if freed.contains(&out.setup_slot) {
-                inherited += 1;
+            assert!(
+                !table.contains(&setup_surface),
+                "AU {index}: the model handed out a surface the table already names"
+            );
+            let displaced = table.clone();
+            let converted = plan_to_va(&plan, au, map, &table, setup_surface)
+                .unwrap_or_else(|e| panic!("AU {index}: conversion failed: {e}"));
+            table[usize::from(converted.setup_slot)] = setup_surface;
+
+            // Both readable sets, and they are not the same snapshot: `dpb_refs` is
+            // taken after this AU's marking process, the per-slice lists before it.
+            let named: Vec<u32> = converted
+                .pic_params
+                .reference_frames
+                .iter()
+                .chain(
+                    converted
+                        .slices
+                        .iter()
+                        .flat_map(|s| s.ref_pic_list0.iter().chain(s.ref_pic_list1.iter())),
+                )
+                .filter(|e| e.flags & VA_PICTURE_H264_INVALID == 0)
+                .map(|e| e.picture_id)
+                .collect();
+
+            if freed.contains(&converted.setup_slot) {
+                out.inherited_a_just_freed_slot += 1;
             }
-            let curr = out.pic_params.curr_pic.picture_id;
-            let names =
-                |e: &VaPictureH264| e.flags & VA_PICTURE_H264_INVALID == 0 && e.picture_id == curr;
-            let read_by_this_au = out.pic_params.reference_frames.iter().any(names)
-                || out.slices.iter().any(|s| {
-                    s.ref_pic_list0.iter().any(names) || s.ref_pic_list1.iter().any(names)
-                });
-            if read_by_this_au {
-                collisions += 1;
-                first.get_or_insert(index);
+            let evicted_surface = displaced[usize::from(converted.setup_slot)];
+            if evicted_surface != VA_INVALID_SURFACE && named.contains(&evicted_surface) {
+                out.setup_took_a_read_pictures_slot += 1;
             }
+            assert_eq!(
+                converted.pic_params.curr_pic.picture_id, setup_surface,
+                "AU {index}: the current picture must be the surface the caller bound"
+            );
+            if named.contains(&setup_surface) {
+                out.aliased += 1;
+            }
+            out.converted += 1;
         }
-        // The measurement this design rests on. A floor rather than the exact
-        // count, so a planner change that shifts it by a frame does not fail —
-        // but one that made slot reuse RARE would, and would mean the doc above
-        // has stopped being true.
+        out
+    }
+
+    /// The setup picture routinely inherits a slot its own access unit just freed —
+    /// which is why the decode target is a PARAMETER and not `surfaces[setup_slot]`.
+    ///
+    /// `SlotMap::assign` takes the LOWEST free slot, and a slot freed by this access
+    /// unit's own removals is free by the time the setup picture is assigned. Measured
+    /// on the vendored vector that is not an edge case: **225 of 250** access units. A
+    /// surface bound BY SLOT would therefore decode, on nine frames in ten, into the
+    /// surface still holding the picture that was just displayed — which under
+    /// zero-copy the consumer may still be sampling. Hence the pool model this crate's
+    /// callers use, and hence `setup_surface`.
+    ///
+    /// ⚠ This test used to carry a second half asserting the decode target was never
+    /// also a reference. It was VACUOUS: the walk hands every picture its own
+    /// never-reused surface id, so distinct ids cannot collide and the assertion could
+    /// not fail whatever the conversion did. The real question needs a surface pool
+    /// that RECYCLES, and it is answered by the two tests below and by
+    /// `video_vaapi_native`'s walk through the real one.
+    #[test]
+    fn the_setup_picture_routinely_inherits_a_just_freed_slot() {
+        let walk = walk_for_aliasing(TEST_25FPS_H264);
+        assert_eq!(walk.converted, 250);
+        // A floor rather than the exact count, so a planner change that shifts it by a
+        // frame does not fail — but one that made slot reuse RARE would, and would mean
+        // the documentation citing this number has stopped being true.
         assert!(
-            inherited > 200,
-            "the setup picture inherited a just-freed slot on only {inherited} of 250 access \
+            walk.inherited_a_just_freed_slot > 200,
+            "the setup picture inherited a just-freed slot on only {} of 250 access \
              units — the reason `setup_surface` is a parameter no longer holds, and the \
-             documentation that cites it needs re-measuring"
+             documentation that cites it needs re-measuring",
+            walk.inherited_a_just_freed_slot
+        );
+    }
+
+    /// The aliasing PRECONDITION, on both streams — the number that says the exemption
+    /// below is being tested by something rather than merely passing.
+    ///
+    /// Two conditions have to coincide inside ONE access unit for a conversion that
+    /// releases eagerly to hand the decode target a picture it is predicting from: the
+    /// access unit must remove a picture, and that picture must still be in the
+    /// `dpb_refs` snapshot the reference lists are built from. Low-delay H.264 is
+    /// exactly what makes them coincide, and NVENC seals it by writing
+    /// `max_num_ref_frames = 3` ALONGSIDE `max_dec_frame_buffering = 3` — a DPB exactly
+    /// as deep as its reference count — while `max_num_reorder_frames = 0` means the
+    /// evicted picture has already been output and is therefore evictable at all.
+    ///
+    /// The vendored conformance vector produces the shape ZERO times, which is why it
+    /// proved nothing on two other backends for two milestones. If that zero ever moves
+    /// the reasoning above is wrong and the 117 needs re-deriving before it means
+    /// anything.
+    #[test]
+    fn the_low_delay_stream_reassigns_slots_whose_pictures_it_still_reads() {
+        let vector = walk_for_aliasing(TEST_25FPS_H264);
+        assert_eq!(vector.converted, 250);
+        assert!(
+            vector.inherited_a_just_freed_slot > 0,
+            "no access unit of the vendored vector reused a freed slot, so the zeroes \
+             below would be empty for a reason that has nothing to do with the hazard"
         );
         assert_eq!(
-            collisions, 0,
-            "the decode target collided with a picture this access unit reads, on \
-             {collisions} of 250 (first at AU {first:?})"
+            vector.removed_and_referenced, 0,
+            "the vendored vector is supposed to be BLIND to this shape"
+        );
+        assert_eq!(
+            vector.setup_took_a_read_pictures_slot, 0,
+            "and therefore never to hand the setup picture a slot it still reads"
+        );
+
+        let lowdelay = walk_for_aliasing(LOWDELAY_640X480);
+        assert_eq!(lowdelay.converted, 120);
+        assert_eq!(
+            lowdelay.removed_and_referenced, 117,
+            "the low-delay stream must still exercise the aliasing precondition on \
+             nearly every access unit — if this drops to zero the exemption below is no \
+             longer being TESTED by anything, whatever else still passes"
+        );
+        assert_eq!(
+            lowdelay.setup_took_a_read_pictures_slot, 117,
+            "and the slot really is handed straight back to the decode target: this is \
+             the D3D11VA/Vulkan defect, present here, and harmless only because the \
+             SURFACE does not follow the slot"
+        );
+    }
+
+    /// The exemption itself: no submission names its decode target as one of its own
+    /// references, on either stream.
+    ///
+    /// This conversion still releases its whole `removed` list inline, exactly as the
+    /// two backends that had to grow a `release_after_decode` deferral once did. It is
+    /// safe doing so for one reason, and it is a property of the INTERFACE rather than
+    /// of any stream: `plan_to_va` never invents a surface. Every reference it can name
+    /// is read out of the `surfaces` table it was handed, so a decode target that is
+    /// not in that table cannot be named, whatever the ledger does with slots. A slot
+    /// is not a surface here; on DXVA it was.
+    ///
+    /// ⚠ That makes this a statement about the CALLER's contract, so it is only half
+    /// the proof. The other half — that the Linux rung really does pick its decode
+    /// target from outside the table — cannot be made here, because the pool lives in
+    /// `pf-client-core`. It is
+    /// `video_vaapi_native`'s
+    /// `the_low_delay_stream_never_hands_the_decoder_a_surface_it_is_predicting_from`,
+    /// which drives this same stream through the real `Session`.
+    #[test]
+    fn no_submission_names_its_decode_target_as_one_of_its_own_references() {
+        for (name, walk) in [
+            ("the vendored vector", walk_for_aliasing(TEST_25FPS_H264)),
+            ("the low-delay stream", walk_for_aliasing(LOWDELAY_640X480)),
+        ] {
+            assert_eq!(
+                walk.aliased, 0,
+                "{name}: {} of {} access units decode into a surface they predict from",
+                walk.aliased, walk.converted
+            );
+        }
+    }
+
+    /// A decode target the caller took from INSIDE the slot table is named as its own
+    /// reference — the counterfactual that gives the test above its teeth.
+    ///
+    /// Without this, `aliased == 0` would be consistent with a conversion that could
+    /// never alias for reasons of its own, and a reader could not tell which. This
+    /// picks the target the way the two broken backends effectively did — the surface
+    /// sitting in the slot the setup picture is about to take — and shows the same walk
+    /// then aliases on 117 of 120 access units of the low-delay stream. So the walk can
+    /// see the defect; it does not see it because the contract holds.
+    #[test]
+    fn taking_the_decode_target_from_the_slot_table_aliases_on_the_low_delay_stream() {
+        use pf_bitstream::h264::H264Planner;
+
+        let mut planner = H264Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut table: Vec<u32> = Vec::new();
+        let (mut converted, mut aliased) = (0usize, 0usize);
+
+        for (index, au) in split_aus(LOWDELAY_640X480).into_iter().enumerate() {
+            let plan = planner.plan_au(au).expect("the low-delay stream plans");
+            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+            table.resize(map.capacity(), VA_INVALID_SURFACE);
+            // The bug, modelled: convert first to learn the slot, then re-run the same
+            // access unit against the real ledger with the target read OUT of the
+            // table. Two passes only because the slot is not known until the conversion
+            // returns; the submission compared below is the second one.
+            //
+            // The probe's own `setup_surface` is arbitrary and deliberately so — the
+            // slot is chosen by `SlotMap::assign` from the ledger alone and no
+            // conversion consults the target to pick it, which is why one pass can
+            // stand in for the other.
+            let mut probe = map.clone();
+            let peek = plan_to_va(&plan, au, &mut probe, &table, SURFACE_BASE)
+                .expect("the low-delay stream converts");
+            let target = table[usize::from(peek.setup_slot)];
+            let target = if target == VA_INVALID_SURFACE {
+                SURFACE_BASE + index as u32
+            } else {
+                target
+            };
+            let out = plan_to_va(&plan, au, map, &table, target).expect("the same conversion");
+            table[usize::from(out.setup_slot)] = target;
+
+            let names = |e: &VaPictureH264| {
+                e.flags & VA_PICTURE_H264_INVALID == 0 && e.picture_id == target
+            };
+            if out.pic_params.reference_frames.iter().any(names)
+                || out
+                    .slices
+                    .iter()
+                    .any(|s| s.ref_pic_list0.iter().any(names) || s.ref_pic_list1.iter().any(names))
+            {
+                aliased += 1;
+            }
+            converted += 1;
+        }
+
+        assert_eq!(converted, 120);
+        assert_eq!(
+            aliased, 117,
+            "binding the decode target BY SLOT is supposed to reproduce the defect on \
+             this stream; if it no longer does, the exemption test above is passing for \
+             a reason nobody has checked"
         );
     }
 
