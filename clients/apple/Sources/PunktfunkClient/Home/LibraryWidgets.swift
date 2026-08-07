@@ -17,16 +17,29 @@ struct StoreBadge: View {
     /// A launcher entry (design D4) gets the brand fill, so "opens Steam" is legible at poster size
     /// without reading the title.
     var isLauncher: Bool = false
+    /// Fill the chip with a flat wash instead of a frosted material.
+    ///
+    /// The coverflow MUST pass true. Its cards ride a `.scrollTransition` that composites them
+    /// with `opacity < 1` and a 3D rotation, and a material cannot sample a backdrop through an
+    /// offscreen composite — so the frost stayed blank on every card and only appeared on the one
+    /// card sitting at exactly full opacity in the centre, reading as a flash on focus. A flat
+    /// wash has no backdrop to sample: it is simply always there. (Deliberately black, not
+    /// palette ink: the chip sits on cover art, whose colours the palette has no business
+    /// fighting.)
+    var solid: Bool = false
+
+    private var fill: AnyShapeStyle {
+        if isLauncher { return AnyShapeStyle(Color.brand) }
+        return solid ? AnyShapeStyle(Color.black.opacity(0.58)) : AnyShapeStyle(.ultraThinMaterial)
+    }
 
     var body: some View {
         Text(label)
             .font(.geist(11, .semibold, relativeTo: .caption2))
-            .foregroundStyle(isLauncher ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+            .foregroundStyle(isLauncher || solid ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(
-                isLauncher ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.ultraThinMaterial),
-                in: Capsule())
+            .background(fill, in: Capsule())
             .padding(6)
     }
 }

@@ -83,6 +83,16 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// confirm and end-stop events (moves trigger on `cursor`).
     @State private var activateTick = 0
     @State private var boundaryTick = 0
+    /// The strip's entrance (see `CardEntrance`): false for exactly one frame after mount, then
+    /// the cards rise in. Never reset — a strip that re-played its entrance every time a screen
+    /// popped off the top of it would be noise, and the shell's push/pop carries that motion
+    /// already. So it plays when a screen is entered: the launcher when the gamepad UI comes up,
+    /// the coverflow each time the library opens (its layer mounts fresh).
+    @State private var appeared = false
+    /// Which card the entrance fans out from — the cursor as it stood at mount, so a restored
+    /// selection assembles around where the eye already is instead of sweeping in from the left.
+    @State private var entranceAnchor = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Read-back from a touch drag is honoured only once the gamepad has been quiet this long
     /// (longer than a move animation, so overlapping held-stick moves never let it through).
@@ -94,7 +104,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
                     HStack(spacing: spacing) {
-                        ForEach(items) { item in
+                        // Enumerated for the entrance stagger only — identity stays `item.id`,
+                        // which is what `.scrollTargetLayout()` and `scrollPosition` key on.
+                        ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
                             #if os(tvOS)
                             // A focusable Button per card: the focus engine does the navigating
                             // (remote swipes and pad dpad alike), select activates. The bare style
@@ -103,6 +115,7 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                             Button { activate(item) } label: {
                                 card(item)
                                     .frame(width: itemWidth)
+                                    .modifier(entrance(idx))
                             }
                             .buttonStyle(ConsoleBareButtonStyle())
                             .focused($focusedID, equals: item.id)
@@ -110,6 +123,7 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                             #else
                             card(item)
                                 .frame(width: itemWidth)
+                                .modifier(entrance(idx))
                                 .contentShape(Rectangle())
                                 .onTapGesture { tap(item) }
                             #endif
@@ -165,6 +179,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             reconcile()
             wire()
             if isActive { input.start() }
+            // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
+            entranceAnchor = cursor
+            appeared = true
         }
         .onDisappear {
             input.stop()
@@ -201,6 +218,19 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             reconcile()
             wire()
         }
+    }
+
+    // MARK: - Entrance
+
+    /// The card's share of the strip's entrance: it rises into place out of a fade, the anchored
+    /// card landing first and its neighbours following outward.
+    private func entrance(_ idx: Int) -> CardEntrance {
+        CardEntrance(
+            shown: appeared,
+            // Capped so a several-hundred-title library never queues a card behind a visibly long
+            // wait — everything past the cap lands together, well off-screen anyway.
+            delay: min(0.3, Double(abs(idx - entranceAnchor)) * 0.05),
+            reduceMotion: reduceMotion)
     }
 
     // MARK: - Input wiring
@@ -344,6 +374,34 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         let recoil: CGFloat = forward ? -16 : 16
         withAnimation(.spring(response: 0.16, dampingFraction: 0.42)) { bumpOffset = recoil }
         withAnimation(.spring(response: 0.34, dampingFraction: 0.7).delay(0.1)) { bumpOffset = 0 }
+    }
+}
+
+/// How a card arrives when its strip does: it rises a little, growing out of a fade, on a spring
+/// soft enough to overshoot by a hair — so the launcher's hosts and the library's covers assemble
+/// themselves around the cursor instead of simply being there. Each card carries its own delay
+/// (see `entrance(_:)`), which is what makes the strip read as one gesture rather than a
+/// simultaneous flash.
+///
+/// Transforms only — nothing here touches layout, so the scroll view's snapping, the caller's
+/// `.scrollTransition` (whose scale/rotation simply multiply with these) and the tvOS focus
+/// engine are all untouched. Reduce Motion drops the travel entirely for a plain, unstaggered
+/// cross-fade.
+private struct CardEntrance: ViewModifier {
+    let shown: Bool
+    let delay: Double
+    let reduceMotion: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .scaleEffect(shown || reduceMotion ? 1 : 0.88)
+            .offset(y: shown || reduceMotion ? 0 : 34)
+            .animation(
+                reduceMotion
+                    ? .easeOut(duration: 0.25)
+                    : .spring(response: 0.52, dampingFraction: 0.78).delay(delay),
+                value: shown)
     }
 }
 #endif

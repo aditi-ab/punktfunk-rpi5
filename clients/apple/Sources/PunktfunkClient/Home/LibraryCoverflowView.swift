@@ -107,7 +107,9 @@ struct LibraryCoverflowView: View {
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(alignment: .topLeading) {
-                StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
+                // `solid`: a frosted chip can't sample a backdrop through this card's own
+                // composited transform, so it would only show up on the centred card.
+                StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher, solid: true)
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
