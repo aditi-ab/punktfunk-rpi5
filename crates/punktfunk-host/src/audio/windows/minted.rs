@@ -279,34 +279,27 @@ const STAMP_ATTEMPTS: usize = 3;
 /// checking immediately reports success on passes that later get reverted).
 const STAMP_SETTLE: Duration = Duration::from_millis(1200);
 
-/// `WAVEFORMATEXTENSIBLE`: 1 ch / 48 kHz / 16-bit PCM, mask 0x4 (FRONT_CENTER), PCM subtype —
-/// the mic render's device format. The driver's capture side is mono 48 kHz by its own
-/// default; the render must MATCH it (measured: a stereo render crosses the driver raw and
-/// plays back an octave low).
-const WFX_PCM16_1CH_48K: [u8; 40] = [
+/// `WAVEFORMATEXTENSIBLE`: 2 ch / 48 kHz / 32-bit float, mask 0x3 (FL FR), IEEE-float subtype
+/// — the ONE format both sides of the minted microphone declare.
+///
+/// Measured ground truth (micpitch, 2026-08-07): the driver forwards the render stream RAW
+/// into the capture side, and its render pin is STEREO-ONLY (a mono-stamped render turned the
+/// endpoint unopenable — `AUDCLNT_E_UNSUPPORTED_FORMAT` on every open, the pad program's
+/// incoherent-stamp signature). The driver-default capture side declares MONO, so the raw
+/// stereo stream read as mono played voice an octave low. Declaring the CAPTURE side stereo —
+/// matching what actually crosses — is the honest fix; the render's stereo float default is
+/// stamped explicitly too, pinning the pair coherent (and healing any endpoint a previous
+/// build left mono-stamped).
+const WFX_F32_2CH_48K: [u8; 40] = [
     0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
-    0x01, 0x00, // nChannels = 1
+    0x02, 0x00, // nChannels = 2
     0x80, 0xbb, 0x00, 0x00, // nSamplesPerSec = 48000
-    0x00, 0x77, 0x01, 0x00, // nAvgBytesPerSec = 96000
-    0x02, 0x00, // nBlockAlign = 2
-    0x10, 0x00, // wBitsPerSample = 16
-    0x16, 0x00, // cbSize = 22
-    0x10, 0x00, // wValidBitsPerSample = 16
-    0x04, 0x00, 0x00, 0x00, // dwChannelMask = SPEAKER_FRONT_CENTER
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
-    0x71, // KSDATAFORMAT_SUBTYPE_PCM
-];
-/// The float leg of ↑ (mix/host formats).
-const WFX_F32_1CH_48K: [u8; 40] = [
-    0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
-    0x01, 0x00, // nChannels = 1
-    0x80, 0xbb, 0x00, 0x00, // nSamplesPerSec = 48000
-    0x00, 0xee, 0x02, 0x00, // nAvgBytesPerSec = 192000
-    0x04, 0x00, // nBlockAlign = 4
+    0x00, 0xdc, 0x05, 0x00, // nAvgBytesPerSec = 384000
+    0x08, 0x00, // nBlockAlign = 8
     0x20, 0x00, // wBitsPerSample = 32
     0x16, 0x00, // cbSize = 22
     0x20, 0x00, // wValidBitsPerSample = 32
-    0x04, 0x00, 0x00, 0x00, // dwChannelMask = SPEAKER_FRONT_CENTER
+    0x03, 0x00, 0x00, 0x00, // dwChannelMask = FL | FR
     0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
     0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 ];
@@ -327,27 +320,31 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
             value: pe::StampValue::Str("Punktfunk"),
         },
     ];
-    if role == Role::Mic && !capture {
+    // Both sides of the mic pair declare the SAME stereo float format (see WFX_F32_2CH_48K:
+    // the crossing is raw and the render pin is stereo-only, so stereo-everywhere is the one
+    // coherent choice). `capture` is accepted for symmetry — both directions get the set.
+    let _ = capture;
+    if role == Role::Mic {
         stamps.extend([
             pe::Stamp {
                 label: "device-format",
                 key: pe::PKEY_DEVICE_FORMAT,
-                value: pe::StampValue::Format(&WFX_PCM16_1CH_48K),
+                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
             },
             pe::Stamp {
                 label: "mix-format-2",
                 key: pe::PKEY_MIX_FORMAT_2,
-                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
             },
             pe::Stamp {
                 label: "mix-format-3",
                 key: pe::PKEY_MIX_FORMAT_3,
-                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
             },
             pe::Stamp {
                 label: "host-format",
                 key: pe::PKEY_HOST_FORMAT,
-                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
             },
         ]);
     }
