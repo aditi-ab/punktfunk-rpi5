@@ -252,11 +252,11 @@ mod split_subframe_tests {
     }
 }
 
-// Split arbitration is wired into the Linux direct-SDK backend only for now, and
-// `nvenc_core` compiles on Windows too — so every item below is linux-gated or it trips
-// the item-level dead_code trap this file already carries a scar from (see
-// `subframe_env_forced`). Ungating is part of the Windows wiring, not a cleanup.
-#[cfg(target_os = "linux")]
+// Split arbitration now runs on BOTH direct-SDK backends, so these are gated to the union of
+// the two rather than to Linux. Kept gated at all because `nvenc_core` is also reachable from
+// builds where neither backend is compiled, and an ungated item there is the item-level
+// dead_code trap this file already carries three scars from (see `subframe_env_forced`).
+#[cfg(any(target_os = "linux", windows))]
 /// What the split arbiter wants the backend to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArbAction {
@@ -266,7 +266,7 @@ pub(super) enum ArbAction {
     Settled(u32),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArbState {
     MeasuringIncumbent,
@@ -275,7 +275,7 @@ enum ArbState {
     Done,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 /// Picks the faster of two NVENC split modes **on the live session**, by measuring both.
 ///
 /// This exists because the alternative — predicting the right mode at open — cannot work: the
@@ -311,19 +311,19 @@ pub(super) struct SplitArbiter {
 }
 
 /// Frames discarded after a switch before the challenger is judged (measured — see the struct doc).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const SETTLE_FRAMES: u32 = 16;
 /// Frames measured per arm. Long enough to median out content variation, short enough that the
 /// whole arbitration is over in well under a second at 60 fps.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const SAMPLE_FRAMES: usize = 24;
 /// The challenger must beat the incumbent by this much to win. Switching is not free (a
 /// reconfigure, and for HEVC it costs sub-frame readback), so a coin-flip difference should leave
 /// the session where it already is.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const WIN_MARGIN_PCT: u64 = 10;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl SplitArbiter {
     /// `handicap_us` is what the challenger costs OUTSIDE the encode it is measured on — pass `0`
     /// when it gives up nothing. See [`Self::challenger_handicap_us`].
@@ -405,7 +405,7 @@ impl SplitArbiter {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn median(v: &mut [u64]) -> u64 {
     v.sort_unstable();
     v[v.len() / 2]
@@ -455,7 +455,7 @@ pub(super) fn store_ceiling(key: CeilingKey, bps: u64) {
     ceilings().lock().unwrap().insert(key, bps);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 /// A config's identity for the split-arbitration verdict cache — [`CeilingKey`] **minus
 /// `split_mode`**, because the split mode is the thing being decided. Including it would key each
 /// verdict under the arm that produced it and the cache could never answer "which arm should this
@@ -471,14 +471,14 @@ pub(super) struct SplitKey {
     pub chroma_444: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn split_verdicts() -> &'static std::sync::Mutex<std::collections::HashMap<SplitKey, u32>> {
     static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<SplitKey, u32>>> =
         std::sync::OnceLock::new();
     V.get_or_init(Default::default)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 /// The split mode a previous arbitration found fastest for `key` this process lifetime.
 ///
 /// Process-lifetime and advisory, exactly like [`cached_ceiling`]: a session that reads a verdict
@@ -489,17 +489,19 @@ pub(super) fn cached_split_verdict(key: &SplitKey) -> Option<u32> {
     split_verdicts().lock().unwrap().get(key).copied()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 /// Record an arbitration result for `key`.
 pub(super) fn store_split_verdict(key: SplitKey, mode: u32) {
     split_verdicts().lock().unwrap().insert(key, mode);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 /// Drop every cached verdict. Test-only: the cache is process-global, so an on-hardware test that
 /// runs an arbitration would otherwise leak its verdict into every later test that opens the same
 /// config with `PUNKTFUNK_SPLIT_ENCODE` unset — which is exactly the shape the D5 legs use.
-#[cfg(test)]
+// Linux-only: its sole caller is `nvenc_cuda`'s arbitration on-hw test. Ungated it is dead
+// code on Windows — the same item-level trap, now four times over.
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn clear_split_verdicts() {
     split_verdicts().lock().unwrap().clear();
 }
@@ -1184,7 +1186,7 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod arbiter_tests {
     use super::{ArbAction, SplitArbiter, SETTLE_FRAMES};
 
