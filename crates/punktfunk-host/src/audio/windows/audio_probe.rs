@@ -132,9 +132,55 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        // The driver-capability map for the minted mic pair: exclusive+shared
+        // IsFormatSupported across {1,2}ch × {16,32}bit × {44.1,48,96}kHz on BOTH pins —
+        // interrogates the DRIVER, bypassing every endpoint-store stamping question. What the
+        // pins truly accept decides whether the mic leg has any coherent configuration (and
+        // whether an exclusive-mode mono open is an escape hatch).
+        Some("micpins") => {
+            super::minted::ensure_blocking();
+            let Some(m) = super::minted::provisioned() else {
+                bail!("nothing minted on this box — run `audio-probe mint` first");
+            };
+            let (Some(render), Some(capture)) = (m.mic_render.clone(), m.mic_capture.clone())
+            else {
+                bail!("no minted microphone pair on this box");
+            };
+            for (label, id) in [("render", &render), ("capture", &capture)] {
+                println!("audio-probe micpins: {label} = {id}");
+                let device = pe::open_wasapi_device(id)?;
+                let client = device.get_iaudioclient().context("IAudioClient")?;
+                for ch in [1usize, 2] {
+                    for bits in [16usize, 32] {
+                        for rate in [44_100usize, 48_000, 96_000] {
+                            let stype = if bits == 16 {
+                                SampleType::Int
+                            } else {
+                                SampleType::Float
+                            };
+                            let fmt = WaveFormat::new(bits, bits, &stype, rate, ch, None);
+                            let mut verdicts = Vec::new();
+                            for (mode_label, mode) in [
+                                ("excl", wasapi::ShareMode::Exclusive),
+                                ("shared", wasapi::ShareMode::Shared),
+                            ] {
+                                let v = match client.is_supported(&fmt, &mode) {
+                                    Ok(None) => "OK",
+                                    Ok(Some(_)) => "alt",
+                                    Err(_) => "no",
+                                };
+                                verdicts.push(format!("{mode_label}={v}"));
+                            }
+                            println!("  {ch}ch {bits:2}bit {rate:5}Hz  {}", verdicts.join(" "));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => bail!(
             "usage: punktfunk-host audio-probe \
-             <ssm|sink|sss-primary|mint|plan|micpitch|cleanup> [--keep]"
+             <ssm|sink|sss-primary|mint|plan|micpitch|micpins|cleanup> [--keep]"
         ),
     }
 }
