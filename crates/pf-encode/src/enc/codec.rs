@@ -654,6 +654,11 @@ pub(crate) fn max_forced_split_mode(engines: u32) -> u32 {
 /// For callers that can only express "split this many ways" and have no vocabulary for our other
 /// modes — the libav path, whose `split_encode_mode` AVOption is libavcodec's own enum, not the
 /// NVENC one (our `DISABLE` is `15`, which would be meaningless there).
+// Linux-only: its sole caller is the libav NVENC path (`enc/linux/mod.rs`). `codec.rs` compiles
+// everywhere, so without this it is dead code on Windows — the same item-level `dead_code`
+// trap this crate has now hit three times (see `subframe_env_forced`, and the arbiter items in
+// `nvenc_core`). Caught by the `.133` check, never by reasoning about it.
+#[cfg(target_os = "linux")]
 pub(crate) fn forced_split_width(mode: u32) -> Option<u32> {
     match mode {
         m if m == SPLIT_TWO_FORCED => Some(2),
