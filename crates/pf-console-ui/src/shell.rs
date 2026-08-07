@@ -13,6 +13,7 @@ use crate::anim::Progress;
 use crate::glyphs::GlyphStyle;
 use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
 use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
@@ -106,6 +107,10 @@ pub(crate) struct Shell {
     glyphs: GlyphStyle,
     chip: Option<String>,
     pads: Vec<PadInfo>,
+    /// The settled top screen's hint-bar hit boxes, republished every frame by
+    /// [`Shell::render`]. The legend is the console's only on-screen statement of what the
+    /// face buttons do; for a pointer, which has none, it IS the button bar.
+    hint_rects: Vec<(crate::glyphs::HintKey, Rect)>,
     t0: Instant,
     last_frame: Option<Instant>,
 }
@@ -152,6 +157,7 @@ impl Shell {
             glyphs: GlyphStyle::Keyboard,
             chip: None,
             pads: Vec::new(),
+            hint_rects: Vec::new(),
             t0: Instant::now(),
             last_frame: None,
         })
@@ -416,10 +422,81 @@ impl Shell {
         pulse
     }
 
+    /// Mouse and touch, in device pixels. `true` = consumed.
+    ///
+    /// The precedence mirrors [`Self::handle_menu`] exactly, and for the same reasons: a
+    /// modal card owns input while it is up, and a screen in motion takes none at all. The
+    /// one addition is the hint bar, which sits above the screens because a pointer has no
+    /// face buttons and the legend is where those actions live.
+    pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
+        self.sync();
+        // The right button is the pointer's B, everywhere — including on the modal cards,
+        // where Back is the only thing that answers at all.
+        //
+        // With ONE exception: B at the root quits the launcher, and a right-click is far
+        // easier to fire by accident than a thumb on B. Quitting stays an explicit act —
+        // the legend's "Quit" is clickable, and that is the pointer's way out.
+        if p.kind == PointerKind::Back {
+            if self.stack.len() > 1 || self.connecting.is_some() || self.wake.is_some() {
+                self.handle_menu(MenuEvent::Back);
+            }
+            return true;
+        }
+        // A modal swallows the rest: clicking "past" a connect takeover onto the library
+        // behind it would start a second session, which is the same hole the menu path
+        // closes by returning early here.
+        if self.connecting.is_some() || self.wake.is_some() {
+            return true;
+        }
+        if !matches!(self.motion, Motion::None) {
+            return true;
+        }
+        if p.press() {
+            if let Some((key, _)) = self.hint_rects.iter().find(|(_, r)| p.hits(*r)) {
+                // Only the face-button hints are actions. Shoulders and Adjust describe a
+                // DIRECTION, and the thing they steer — the tab strip, a row's value — is
+                // already under the pointer's finger; inventing a side for a click here
+                // would just be a worse way to press what it can already press.
+                let ev = match key {
+                    crate::glyphs::HintKey::Confirm => Some(MenuEvent::Confirm),
+                    crate::glyphs::HintKey::Back => Some(MenuEvent::Back),
+                    crate::glyphs::HintKey::Secondary => Some(MenuEvent::Secondary),
+                    crate::glyphs::HintKey::Tertiary => Some(MenuEvent::Tertiary),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    self.handle_menu(ev);
+                }
+                return true;
+            }
+        }
+
+        let mut fx = Outbox::default();
+        let consumed = {
+            let mut ctx = Ctx {
+                hosts: &self.hosts,
+                library: &self.library,
+                settings: &mut self.settings,
+                pads: &self.pads,
+                deck: self.deck,
+                device_name: &self.device_name,
+                t: self.t0.elapsed().as_secs_f64(),
+            };
+            self.stack
+                .last_mut()
+                .expect("non-empty stack")
+                .pointer(p, &mut ctx, &mut fx)
+        };
+        self.apply(fx);
+        consumed
+    }
+
     /// The keyboard fallback — the console is fully drivable with no pad. Arrows and
     /// Enter/Esc map onto menu events; Y/X mirror the pad's Secondary/Tertiary
     /// (suppressed while editing, where letters are text).
-    pub(crate) fn key(&mut self, sc: sdl3::keyboard::Scancode, repeat: bool) -> bool {
+    ///
+    /// `shift` only matters for Tab, whose two directions are one key.
+    pub(crate) fn key(&mut self, sc: sdl3::keyboard::Scancode, shift: bool, repeat: bool) -> bool {
         use sdl3::keyboard::Scancode as S;
         if self.editing() {
             if let Some(top) = self.stack.last_mut() {
@@ -439,6 +516,12 @@ impl Shell {
             S::Escape | S::Backspace if !repeat => MenuEvent::Back,
             S::PageUp if !repeat => MenuEvent::JumpBack,
             S::PageDown if !repeat => MenuEvent::JumpForward,
+            // Tab is what a keyboard reaches for to change section, and the settings tabs
+            // were otherwise on PgUp/PgDn alone — a binding the legend only ever spells out
+            // when NO pad is attached, so with a controller plugged in there was nothing to
+            // discover. Shift+Tab goes back, as everywhere else.
+            S::Tab if !repeat && shift => MenuEvent::JumpBack,
+            S::Tab if !repeat => MenuEvent::JumpForward,
             S::Y if !repeat && !editing => MenuEvent::Secondary,
             S::X if !repeat && !editing => MenuEvent::Tertiary,
             _ => return false,
@@ -483,6 +566,9 @@ impl Shell {
         if let Some(text) = fx.toast {
             self.show_toast(text);
         }
+        if let Some(text) = fx.copy {
+            self.actions.push_back(OverlayAction::CopyText(text));
+        }
         if let Some(intent) = fx.connect {
             self.start_connect(intent);
         }
@@ -494,6 +580,14 @@ impl Shell {
     fn apply_nav(&mut self, nav: Nav) {
         match nav {
             Nav::Push(screen) => {
+                self.stack.push(*screen);
+                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+            }
+            Nav::Replace(screen) => {
+                // Swap under the SAME push choreography: the outgoing screen is dropped
+                // rather than parked, so Back from the incoming one lands where the
+                // replaced screen was reached from.
+                self.stack.pop();
                 self.stack.push(*screen);
                 self.motion = Motion::Push(Progress::new(TRANSITION_S));
             }

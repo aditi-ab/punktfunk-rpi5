@@ -9,6 +9,7 @@ use crate::anim::Spring;
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, SPRING_C, SPRING_K};
 use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, fg, Fonts, PanelStroke, ONLINE_GREEN, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
@@ -29,6 +30,10 @@ pub(crate) struct HomeScreen {
     bump: Spring,
     /// Last-seen tile keys — hosts churn under discovery; focus follows the KEY.
     keys: Vec<String>,
+    /// Each tile's rect as last drawn, device px, `Rect::new_empty()` for the ones the
+    /// carousel culled. Scaled to match: side tiles draw at 0.88, and a press near their
+    /// edge would otherwise pick a neighbour.
+    geom: Vec<Rect>,
 }
 
 impl HomeScreen {
@@ -38,6 +43,7 @@ impl HomeScreen {
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             keys: Vec::new(),
+            geom: Vec::new(),
         }
     }
 
@@ -136,7 +142,52 @@ impl HomeScreen {
                 fx.pop(); // popping the root = quit (the shell's rule)
                 None
             }
+            // Up on a saved tile opens that host's own menu — Wake / Copy link / Edit /
+            // Forget. The carousel is horizontal, so up is the one free direction, and it
+            // is the gesture the Android console already uses for the same menu.
+            MenuEvent::Move(MenuDir::Up) => match self.focused(ctx.hosts) {
+                Some(h) if super::host_options::HostOptionsScreen::available(h) => {
+                    fx.push(Screen::HostOptions(
+                        super::host_options::HostOptionsScreen::new(h),
+                    ));
+                    Some(MenuPulse::Confirm)
+                }
+                _ => Some(MenuPulse::Boundary),
+            },
             MenuEvent::Move(_) => None,
+        }
+    }
+
+    /// Mouse/touch on the carousel. Pressing the CENTRE tile activates it; pressing any
+    /// other one only brings it to the centre.
+    ///
+    /// The asymmetry is the point: the carousel answers a press by sliding, so a rule that
+    /// also activated would connect to whichever host you merely aimed at — and on this
+    /// screen activating means starting a session. Bringing it front first is both the
+    /// safer read and the one a coverflow trains you to expect.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        self.reconcile(ctx.hosts);
+        let len = ctx.hosts.len() + 1;
+        match p.kind {
+            PointerKind::Scroll { up } => {
+                self.step(if up { -1 } else { 1 }, len, false);
+                true
+            }
+            // `i < len` because the geometry is a frame old: discovery can shorten the
+            // carousel between the render that recorded it and this press, and a cursor
+            // parked past the end would read as the trailing Add Host tile.
+            PointerKind::Press => match p.pick(&self.geom).filter(|i| *i < len) {
+                Some(i) if i == self.cursor as usize => {
+                    self.menu(MenuEvent::Confirm, ctx, fx);
+                    true
+                }
+                Some(i) => {
+                    self.cursor = i as i32;
+                    true
+                }
+                None => false,
+            },
+            _ => false,
         }
     }
 
@@ -169,6 +220,12 @@ impl HomeScreen {
         if self.focused(ctx.hosts).is_some_and(|h| h.paired && h.saved) {
             hints.push(Hint::new(HintKey::Secondary, "Library"));
         }
+        if self
+            .focused(ctx.hosts)
+            .is_some_and(super::host_options::HostOptionsScreen::available)
+        {
+            hints.push(Hint::new(HintKey::Up, "Options"));
+        }
         hints.push(Hint::new(HintKey::Tertiary, "Settings"));
         hints.push(Hint::new(HintKey::Back, "Quit"));
         hints
@@ -200,6 +257,8 @@ impl HomeScreen {
         let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
 
         let len = ctx.hosts.len() + 1;
+        self.geom.clear();
+        self.geom.resize(len, Rect::new_empty());
         for i in 0..len {
             let d = i as f64 - self.anim.pos;
             if d.abs() > 2.6 {
@@ -214,6 +273,12 @@ impl HomeScreen {
                 (cy - tile_h / 2.0) as f32,
                 tile_w as f32,
                 tile_h as f32,
+            );
+            self.geom[i] = Rect::from_xywh(
+                (cx - tile_w * scale / 2.0) as f32,
+                (cy - tile_h * scale / 2.0) as f32,
+                (tile_w * scale) as f32,
+                (tile_h * scale) as f32,
             );
             canvas.save();
             canvas.translate((cx as f32, cy as f32));

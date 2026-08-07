@@ -22,6 +22,8 @@ pub mod library;
 #[cfg(any(target_os = "linux", windows))]
 pub mod model;
 #[cfg(any(target_os = "linux", windows))]
+mod pointer;
+#[cfg(any(target_os = "linux", windows))]
 mod screens;
 #[cfg(any(target_os = "linux", windows))]
 mod shell;

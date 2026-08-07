@@ -42,6 +42,8 @@ pub(crate) enum HintKey {
     Shoulders,
     /// ◀ ▶ — left/right adjusts the focused value.
     Adjust,
+    /// ▲ — up opens the focused item's own menu.
+    Up,
     Key(&'static str),
 }
 
@@ -62,7 +64,17 @@ impl Hint {
 const LABEL_SIZE: f64 = 14.0;
 const BADGE_D: f64 = 22.0; // face-button badge diameter
 
-/// The hint bar pill, anchored at its BOTTOM-LEFT corner. Returns the pill's size.
+/// What a drawn hint bar left behind.
+pub(crate) struct HintBar {
+    /// The pill's `(width, height)`.
+    pub size: (f64, f64),
+    /// One hit box per hint, in the order they were given. The legend is also the console's
+    /// only on-screen list of what the face buttons do, so for a pointer — which has no
+    /// face buttons — it doubles as the button bar itself.
+    pub rects: Vec<(HintKey, Rect)>,
+}
+
+/// The hint bar pill, anchored at its BOTTOM-LEFT corner.
 pub(crate) fn hint_bar(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -71,9 +83,12 @@ pub(crate) fn hint_bar(
     x: f64,
     bottom: f64,
     k: f64,
-) -> (f64, f64) {
+) -> HintBar {
     if hints.is_empty() {
-        return (0.0, 0.0);
+        return HintBar {
+            size: (0.0, 0.0),
+            rects: Vec::new(),
+        };
     }
     let pad = 13.0 * k;
     let gap_hint = 18.0 * k;
@@ -111,7 +126,19 @@ pub(crate) fn hint_bar(
 
     let cy = bottom - h / 2.0;
     let mut pen = x + pad;
+    let mut rects = Vec::with_capacity(hints.len());
     for (hint, (gw, lw)) in hints.iter().zip(&widths) {
+        // Glyph + label + half the gap to the next hint, full pill height: a comfortable
+        // target without stealing the neighbour's.
+        rects.push((
+            hint.key,
+            Rect::from_xywh(
+                (pen - gap_glyph / 2.0) as f32,
+                (bottom - h) as f32,
+                (gw + gap_glyph + lw + gap_hint / 2.0) as f32,
+                h as f32,
+            ),
+        ));
         draw_glyph(canvas, fonts, hint.key, style, pen, cy, k);
         pen += gw + gap_glyph;
         // Baseline centered on the badge (cap height ≈ 0.72 em for Geist).
@@ -126,13 +153,17 @@ pub(crate) fn hint_bar(
         );
         pen += lw + gap_hint;
     }
-    (w, h)
+    HintBar {
+        size: (w, h),
+        rects,
+    }
 }
 
 fn glyph_width(fonts: &Fonts, key: HintKey, style: GlyphStyle, k: f64) -> f64 {
     match resolved(key, style) {
         Resolved::Badge(_) | Resolved::Adjust => BADGE_D * k,
         Resolved::Shoulders => 2.0 * shoulder_w(fonts, k) + 3.0 * k,
+        Resolved::Up => BADGE_D * k,
         Resolved::Key(text) => keycap_w(fonts, text, k),
     }
 }
@@ -151,6 +182,9 @@ enum Resolved {
     Badge(Face),
     Shoulders,
     Adjust,
+    /// The d-pad's up — drawn the same in every style, because it is a direction rather
+    /// than a button whose label changes with the pad.
+    Up,
     Key(&'static str),
 }
 
@@ -169,8 +203,11 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Resolved {
             HintKey::Back => Resolved::Key("Esc"),
             HintKey::Secondary => Resolved::Key("Y"),
             HintKey::Tertiary => Resolved::Key("X"),
-            HintKey::Shoulders => Resolved::Key("PgUp/PgDn"),
+            // Tab is the key a keyboard reaches for to change section; PgUp/PgDn still
+            // work, but naming both here makes the legend wider than the hint is worth.
+            HintKey::Shoulders => Resolved::Key("Tab"),
             HintKey::Adjust => Resolved::Adjust,
+            HintKey::Up => Resolved::Up,
             HintKey::Key(t) => Resolved::Key(t),
         };
     }
@@ -181,6 +218,7 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Resolved {
         HintKey::Secondary => Resolved::Badge(Face::Y),
         HintKey::Shoulders => Resolved::Shoulders,
         HintKey::Adjust => Resolved::Adjust,
+        HintKey::Up => Resolved::Up,
         HintKey::Key(t) => Resolved::Key(t),
     }
 }
@@ -250,6 +288,18 @@ fn draw_glyph(
                 );
                 pen += w + 3.0 * k;
             }
+        }
+        Resolved::Up => {
+            // ▲ — one solid triangle in a badge-sized slot.
+            let r = BADGE_D * k / 2.0;
+            let (cx, cyf) = ((x + r) as f32, cy as f32);
+            let (tw, th) = ((5.5 * k) as f32, (4.5 * k) as f32);
+            let mut up = Path::new();
+            up.move_to((cx, cyf - th));
+            up.line_to((cx - tw, cyf + th));
+            up.line_to((cx + tw, cyf + th));
+            up.close();
+            canvas.draw_path(&up, &Paint::new(fg(0.85), None));
         }
         Resolved::Adjust => {
             // ◀ ▶ — two small solid triangles.
