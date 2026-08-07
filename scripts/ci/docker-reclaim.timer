@@ -1,0 +1,16 @@
+# Hourly is the right cadence for LEAKS: they only accrue when jobs die abnormally, and the
+# per-tick docker-prune.timer (every 2 min) already carries the burst guard for genuine
+# disk-pressure emergencies. Install: see the header of docker-reclaim.sh.
+
+[Unit]
+Description=Hourly reclaim of act_runner-leaked Docker disk
+
+[Timer]
+OnCalendar=hourly
+# Catch up after a reboot rather than waiting for the next slot.
+Persistent=true
+# Spread it off the hour so it does not collide with scheduled CI.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
