@@ -532,6 +532,12 @@ fn av1_settings() -> Dav1dSettings {
     //
     // The frame of latency this would normally cost is bought back in `decode`, which
     // drains the in-flight frame in the same call instead of pipelining it — see there.
+    //
+    // Reported upstream as memorysafety/rav1d#1497, with the one-line fix
+    // (`is_some_and` for the `unwrap`) and a reproducer that needs no capture: any AV1
+    // stream with one temporal unit removed from the middle. If a release ever carries
+    // that fix, THIS floor is still the right default — it is what makes a decoder error
+    // an error — but the `bail!` in `Av1Software::new` could then relax.
     settings.max_frame_delay = AV1_MIN_FRAME_CONTEXTS;
     // `n_threads` drives the INTRA-frame tile/row workers, which add no delay, and now also
     // floors `n_fc`. Capped at 8 — this is the rung reached because the GPU already failed,
