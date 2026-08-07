@@ -77,64 +77,21 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
     ((bitrate_bps / (8 * fps.max(1) as u64)) as usize).max(64 * 1024)
 }
 
-/// Raise this process's WDDM GPU scheduling priority so the wavelet encode isn't starved by a
-/// GPU-bound game. PyroWave encodes on the GPU's compute/shader cores — the exact resource a game
-/// saturates — so under load `pyrowave_encoder_encode_gpu_synchronous` spikes from ~2 ms to
-/// 15-18 ms (measured, RTX 4090 at 95 % game load) and the stream fps collapses; NVENC is immune
-/// because it runs on the separate encoder ASIC. HIGH sits above a game's NORMAL/ABOVE_NORMAL so
-/// the WDDM scheduler services the encode's short compute bursts ahead of the game's rendering.
-/// (REALTIME is deliberately avoided: it needs a privilege and would preempt the desktop
-/// compositor too.) Best-effort + once-per-process: if the class isn't grantable we log and run at
-/// normal priority — no session-fatal path.
-fn raise_process_gpu_priority() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        use windows::Wdk::Graphics::Direct3D::{
-            D3DKMTSetProcessSchedulingPriorityClass, D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
-            D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH, D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME,
-        };
-        // `PUNKTFUNK_GPU_PRIORITY` = off | above-normal | high (default) | realtime. REALTIME can
-        // force finer WDDM preemption than HIGH but needs a privilege and preempts the compositor,
-        // so it stays opt-in; `off` skips the call entirely.
-        let (class, label) = match std::env::var("PUNKTFUNK_GPU_PRIORITY")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("off") => {
-                tracing::info!("PyroWave: PUNKTFUNK_GPU_PRIORITY=off — leaving GPU scheduling priority at default");
-                return;
-            }
-            Some("above-normal") | Some("above_normal") => {
-                (D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL, "ABOVE_NORMAL")
-            }
-            Some("realtime") => (D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME, "REALTIME"),
-            _ => (D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH, "HIGH"),
-        };
-        // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle; the D3DKMT call
-        // only sets this process's GPU scheduling class — it creates/frees nothing.
-        let status = unsafe {
-            D3DKMTSetProcessSchedulingPriorityClass(GetCurrentProcess(), class)
-        };
-        if status.is_ok() {
-            tracing::info!(
-                priority = label,
-                "PyroWave: raised process GPU scheduling priority (WDDM) so the wavelet encode is \
-                 serviced ahead of game rendering on the shared shader cores"
-            );
-        } else {
-            tracing::warn!(
-                ?status,
-                priority = label,
-                "PyroWave: could not raise GPU scheduling priority (not grantable) — the encode \
-                 may be starved under heavy game GPU load"
-            );
-        }
-    });
-}
+// GPU scheduling priority is deliberately NOT set here. `pf-frame`'s `dxgi::auto_priority_gate`
+// owns that policy for the whole process and runs once from `create_device` — the call the Windows
+// capture path always makes before any PyroWave texture exists.
+//
+// This module used to raise it itself, to HIGH, once per process. That was a SECOND owner of a
+// process-wide setting and it raced the real one: pf-frame's default `auto` mode starts at HIGH and
+// then UPGRADES to REALTIME once it has established that is safe (HAGS off, or HAGS on with VRAM
+// headroom, with a monitor that drops back when VRAM tightens — REALTIME + NVIDIA + HAGS +
+// near-full VRAM is a documented NVENC hang). Opening a PyroWave session after that upgrade stamped
+// HIGH back over REALTIME and the monitor, silently losing the ceiling-raise on exactly the
+// GPU-saturated workload PyroWave cares about most.
+//
+// The old `PUNKTFUNK_GPU_PRIORITY` knob went with it; `PUNKTFUNK_GPU_PRIORITY_CLASS`
+// (`off|normal|high|realtime|auto`, default `auto`) is the one that survives and it is strictly
+// more capable — the removed knob could not express the auto gate at all.
 
 pub struct PyroWaveEncoder {
     // pyrowave owns the whole Vulkan device (create_device_by_compat) — no ash on this side.
@@ -188,9 +145,6 @@ impl PyroWaveEncoder {
         chroma: crate::ChromaFormat,
         bit_depth: u8,
     ) -> Result<Self> {
-        // Prioritize the host's GPU work over a running game so the compute-shader encode gets
-        // scheduled promptly instead of queuing behind a full frame of the game's rendering.
-        raise_process_gpu_priority();
         let chroma444 = chroma.is_444();
         // A negotiated 10-bit session rides 16-bit UNORM planes carrying the P010-style
         // studio codes the capturer's HDR CSC writes (design/pyrowave-444-hdr.md §2.2) —

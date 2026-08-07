@@ -206,6 +206,20 @@ struct ContentView: View {
             model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
         }
         #if os(iOS) || os(tvOS)
+        // Coming back to the app re-arms the LAN browse. The home's `onAppear`/`onDisappear` do
+        // NOT fire across background/foreground, and a browse the system suspended while we were
+        // away does not resume on its own — so the host grid came back empty and stayed empty
+        // until the app was relaunched. No-op unless the browse is already running (mid-session
+        // the home has deliberately torn it down).
+        //
+        // Mobile only: macOS never suspends the process, and its `scenePhase` flips on every
+        // window focus change — re-arming there would rebuild the browser each time you alt-tab.
+        // A Mac browse that genuinely breaks is caught by `HostDiscovery`'s own sweep instead.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { discovery.refreshIfRunning() }
+        }
+        #endif
+        #if os(iOS) || os(tvOS)
         // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
         // ignored so neither branch fires for a Control-Center pull.
         //
@@ -335,6 +349,16 @@ struct ContentView: View {
             active: fullscreenForSession && model.connection != nil,
             isFullscreen: $isFullscreen))
         #endif
+        // A game launched from the library just exited, so the session ended on purpose: put the
+        // player back in that host's library rather than on host selection. Set on the outer Group
+        // (like the sheets below) so it survives the streaming → home transition the disconnect
+        // drives, and consumed here — the model hands the host over once and we clear it, so a
+        // later manual dismiss of the library can't be undone by a stale value.
+        .onChange(of: model.returnToLibrary) { _, host in
+            guard let host else { return }
+            model.returnToLibrary = nil
+            libraryTarget = host
+        }
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
@@ -512,6 +536,9 @@ struct ContentView: View {
                 waker: waker,
                 gamepadUI: gamepadUIActive,
                 onCancelConnect: { model.disconnect() })
+                // The takeover mounts OUTSIDE the gamepad screens (it covers the whole home), so
+                // it publishes the palette's ink itself rather than inheriting it.
+                .gamepadPaletteInk()
         }
     }
 

@@ -18,6 +18,11 @@ parse_deps = false
 # undefined and the C harness fails to compile: the Apple batched recv (transport/udp.rs
 # `recvmsg_x` + `MsghdrX`) and the Android bionic mmsg bindings (`android_mmsg` module).
 exclude = ["MsghdrX", "recvmsg_x", "mmsghdr", "sendmmsg", "recvmmsg"]
+# Reached by no exported SIGNATURE, so cbindgen's sweep misses it — but a C embedder needs the
+# vocabulary: `punktfunk_connection_end_reason` writes one of these as a bare byte (deliberately,
+# so the JNI/Swift sides can marshal a `u8` rather than an enum), which without this would leave
+# the header documenting names it never defines.
+include = ["PunktfunkEndReason"]
 
 [export.rename]
 "InputEvent" = "PunktfunkInputEvent"

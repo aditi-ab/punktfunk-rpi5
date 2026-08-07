@@ -301,8 +301,9 @@ pub struct AudioGapTracker {
 
 /// Most packets a single gap will ask concealment for (50 ms at the protocol's 5 ms frames).
 /// Crate-internal: callers only ever see `missing_before`'s already-capped count (and cbindgen
-/// must not export it — it's not part of the C ABI).
-const MAX_CONCEAL_PACKETS: u32 = 10;
+/// must not export it — it's not part of the C ABI). `pub(crate)` for the in-core PCM decoder
+/// (`abi.rs`), which sizes its no-realloc output buffer from it.
+pub(crate) const MAX_CONCEAL_PACKETS: u32 = 10;
 
 impl AudioGapTracker {
     pub fn new() -> Self {

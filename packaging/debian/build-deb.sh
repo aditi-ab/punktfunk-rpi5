@@ -289,6 +289,11 @@ set -e
 if [ "$1" = "configure" ]; then
     # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
     getent group punktfunk-update >/dev/null 2>&1 || addgroup --system punktfunk-update 2>/dev/null || true
+    # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input':
+    # writing 'attach' materialises an arbitrary emulated USB device — a root-only kernel
+    # primitive that must not ride on the group users are told to join for gamepads
+    # (security-review 2026-08-05 M-4).
+    getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true
@@ -296,6 +301,8 @@ if [ "$1" = "configure" ]; then
     sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
     echo "punktfunk-host installed. Add yourself to the 'input' group for virtual gamepads:"
     echo "    sudo usermod -aG input \"\$USER\"   # then re-login"
+    echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \"\$USER\""
+    echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust." 
     echo "Config:  mkdir -p ~/.config/punktfunk && cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env"
     echo "Enable:  systemctl --user enable --now punktfunk-host"
     # Debian ships no active firewall and Ubuntu's ufw is inactive by default; hint whichever is present.
@@ -306,6 +313,29 @@ if [ "$1" = "configure" ]; then
         echo "Firewall (firewalld detected): sudo firewall-cmd --reload &&"
         echo "    sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload"
         echo "    (use punktfunk-gamestream for the Moonlight-compat host)"
+    fi
+    # An ALREADY-OPEN firewall does not pick up a port we later added to a profile. ufw expands an
+    # app profile into concrete rules at `ufw allow` time and keeps those, so editing
+    # /etc/ufw/applications.d on upgrade changes nothing; firewalld re-reads its XML, but only on a
+    # reload. 47993 (the separate origin plugin UIs are served from) arrived exactly this way, and
+    # an unrefreshed rule turns every plugin interface in the console into an empty panel.
+    # `ufw status verbose` prints expanded ports, so it can tell "allowed" from "allowed, stale".
+    if command -v ufw >/dev/null 2>&1 &&
+       ufw status verbose 2>/dev/null | grep -q 'punktfunk-web' &&
+       ! ufw status verbose 2>/dev/null | grep -q '47993'; then
+        echo ""
+        echo "punktfunk: your ufw rule for 'punktfunk-web' predates TCP 47993 (plugin UIs, served"
+        echo "  from their own origin). Plugin interfaces will not load in the console until:"
+        echo "    sudo ufw app update punktfunk-web && sudo ufw reload"
+    fi
+    # --info-service answers from the definition the daemon loaded, i.e. the stale one.
+    if command -v firewall-cmd >/dev/null 2>&1 &&
+       firewall-cmd --state >/dev/null 2>&1 &&
+       firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
+       ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
+        echo ""
+        echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
+        echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
     fi
     # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so
     # the warning lives in one place. Exit 1 = found; never fail the install on it.

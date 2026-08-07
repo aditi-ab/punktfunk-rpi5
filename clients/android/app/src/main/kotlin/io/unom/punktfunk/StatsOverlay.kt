@@ -26,13 +26,25 @@ import kotlin.math.roundToInt
  * presentsWindow, presenterActive, feedP50Ms, codecP50Ms, skippedOverflowWindow]`. Every read
  * is length-guarded, so an older native lib simply omits the lines it can't feed.
  *
+ * The shown `display` and `end-to-end` numbers EXCLUDE the OS present floor (see [osFloorMs]) at
+ * every tier, and the detailed tier names what was excluded on its own line. The principle is the
+ * Apple client's: metrics report what Punktfunk controls, so the compositor's own latch and scanout
+ * — which no client can pace under — is reported rather than charged. It also stops the HUD reading
+ * worse than it is: the usual Android streaming overlays stop measuring at decode-complete, so a
+ * headline that carried the compositor's wait was compared against numbers that never contained it.
+ *
+ * The RAW figures are not lost — the native 1 Hz `pf.present` logcat line keeps `paceMs`, `latchMs`
+ * and `e2eMs` unshaved, so a HUD-off A/B and any cross-session comparison still work off the
+ * untouched numbers.
+ *
  * [verbosity] selects how many lines render (each tier a superset of the last — see
  * [StatsVerbosity]):
  * - [StatsVerbosity.COMPACT] — one line, `fps · end-to-end ms · Mb/s` (+ a loss flag).
  * - [StatsVerbosity.NORMAL] — the res/fps/Mb·s line, the end-to-end p50/p95 headline, and the
  *   reliability counters (18–21) when nonzero.
- * - [StatsVerbosity.DETAILED] — also the decoder label, the video-feed descriptor (10–13), and the
- *   stage equation (14/15, split into `host + network` when the Phase-2 terms at 16/17 are nonzero).
+ * - [StatsVerbosity.DETAILED] — also the decoder label, the video-feed descriptor (10–13), the
+ *   stage equation (14/15, split into `host + network` when the Phase-2 terms at 16/17 are nonzero),
+ *   and the excluded-floor line when one was measured.
  * [StatsVerbosity.OFF] renders nothing. Older native layouts simply omit the lines they lack (the
  * counter line falls back to the cumulative `lostTotal` at index 9 on a pre-window lib).
  */
@@ -95,9 +107,15 @@ internal fun StatsOverlay(
             // equation gains its `display` term; otherwise (older lib / no callbacks) the endpoint
             // honestly stays capture→decoded — the equation always tiles the headline interval.
             val dispValid = s.size >= 26 && s[22] != 0.0
+            // The OS present floor this window (see [osFloorMs]) is excluded from every shown
+            // display / end-to-end number, at every tier — it is pipeline depth no client can pace
+            // under, so charging it to Punktfunk made our HUD read worse than clients that simply
+            // never measure it. 0.0 when unmeasured, which leaves the numbers exactly as raw as
+            // they were.
+            val floorMs = osFloorMs(s)
             val tag = if (skew) "" else " (same-host clock)"
             val (p50, p95, endpoint) = if (dispValid) {
-                Triple(s[24], s[25], "capture→displayed")
+                Triple(shave(s[24], floorMs), shave(s[25], floorMs), "capture→displayed")
             } else {
                 Triple(s[2], s[3], "capture→decoded")
             }
@@ -120,6 +138,11 @@ internal fun StatsOverlay(
                 // dropping/serializing, an fps deficit is upstream.
                 val split = s.size >= 30 && s[29] != 0.0 && (s[26] > 0 || s[27] > 0)
                 val displayTerm = when {
+                    // Floor excluded: what remains of the `display` term is the half Punktfunk
+                    // owns (the presenter's pace wait), and the excluded line below carries the
+                    // latch — printing the split too would report the same milliseconds twice.
+                    dispValid && floorMs > 0 ->
+                        " + display ${"%.1f".format(shave(s[23], floorMs))}"
                     dispValid && split ->
                         " + display ${"%.1f".format(s[23])} " +
                             "(pace ${"%.1f".format(s[26])} + latch ${"%.1f".format(s[27])})"
@@ -143,16 +166,14 @@ internal fun StatsOverlay(
                     "= $hostTerms + $decodeTerm$displayTerm$presents",
                     Color.White,
                 )
-                // Metric fairness: the Apple client's HUD shaves ~2 refresh periods of OS
-                // pipeline floor off its shown display/end-to-end; Android shows raw. This twin
-                // applies the same shave so iPhone↔Android HUD numbers compare directly.
-                if (dispValid && hz > 0) {
-                    val shave = 2000.0 / hz
+                // What the numbers above leave out, named — the Apple client's
+                // `os present +N excluded` line, same wording so the two HUDs read alike.
+                // (This replaces the old "≈ Apple-HUD equiv" twin: both clients now shave, and
+                // Android's shave is measured rather than assumed at 2 refresh periods.)
+                if (floorMs > 0) {
                     statLine(
-                        "≈ Apple-HUD equiv: end-to-end " +
-                            "${"%.1f".format((s[24] - shave).coerceAtLeast(0.0))} · display " +
-                            "${"%.1f".format((s[23] - shave).coerceAtLeast(0.0))} (−2 refresh)",
-                        Color(0xFFA8D8B8),
+                        "os present +${"%.1f".format(floorMs)} excluded (display pipeline minimum)",
+                        Color(0xFF9AA6B8),
                     )
                 }
             }
@@ -168,14 +189,46 @@ private fun statLine(text: String, color: Color) {
 }
 
 /**
+ * The OS present floor to exclude from the shown `display` / `end-to-end` numbers, ms — the
+ * measured `latch` p50 at index 27, i.e. release→`OnFrameRendered`: SurfaceFlinger's own latch and
+ * scanout. That is compositor pipeline depth no client can pace under, so it is reported as
+ * excluded rather than charged to Punktfunk — the Apple client's policy since its presentation
+ * rebuild, where the same floor is measured from the display link's vend lead.
+ *
+ * Measured, not assumed: the previous Android treatment used a fixed `2000/hz` twin, but the latch
+ * varies with panel rate, tunnelled playback and the vendor's low-latency mode (~21 ms p50 observed
+ * where the ~2-interval model predicts less), and this term self-adapts to all three. It is also
+ * available on every render path — the presenter's and both legacy release-immediately ones — since
+ * the release stamp it starts from is parked on every render, so it does not depend on
+ * `presenterActive` (29).
+ *
+ * `0.0` means unmeasured — no display stage this window (an older native lib, API < 33, or a
+ * platform that refused the callback), or no latch sample paired — and every caller then leaves its
+ * number raw, which is the honest fallback: we exclude only what we actually measured.
+ */
+private fun osFloorMs(s: DoubleArray): Double {
+    val dispValid = s.size >= 26 && s[22] != 0.0
+    if (!dispValid || s.size < 28) return 0.0
+    return s[27].coerceAtLeast(0.0)
+}
+
+/**
+ * Subtract the excluded [floorMs] from a shown latency [ms], clamped at zero — the percentiles are
+ * drawn from different sample sets (a p50 latch against a p50/p95 end-to-end), so the difference can
+ * legitimately go slightly negative on a well-paced window without anything being wrong.
+ */
+private fun shave(ms: Double, floorMs: Double): Double = (ms - floorMs).coerceAtLeast(0.0)
+
+/**
  * The single [StatsVerbosity.COMPACT] line: `238 fps · 1.3 ms · 921 Mb/s`. The end-to-end p50 term
  * is dropped when no in-range latency sample landed (`latValid` false), and a loss flag
  * `· ⚠ lost {n}` is appended when the window (or, on an old lib, the session) dropped frames — the
  * one reliability signal worth surfacing even at the tersest tier.
  */
 private fun compactLine(s: DoubleArray, latValid: Boolean): String {
-    // Prefer the capture→displayed end-to-end (s[24]) when a render timestamp landed this window.
-    val e2eP50 = if (s.size >= 26 && s[22] != 0.0) s[24] else s[2]
+    // Prefer the capture→displayed end-to-end (s[24]) when a render timestamp landed this window,
+    // less the excluded OS present floor — the same number the richer tiers headline.
+    val e2eP50 = if (s.size >= 26 && s[22] != 0.0) shave(s[24], osFloorMs(s)) else s[2]
     val parts = buildList {
         add("${s[0].roundToInt()} fps")
         if (latValid) add("${"%.1f".format(e2eP50)} ms")

@@ -15,6 +15,7 @@
     "start": "bun run .output/server/index.mjs",
     "api:gen": "orval --config orval.config.ts",
     "lint": "tsc --noEmit",
+    "test": "bun test server/",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
     "screenshots": "node tools/screenshots.mjs",

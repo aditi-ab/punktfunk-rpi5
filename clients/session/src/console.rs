@@ -343,6 +343,7 @@ impl Service {
                     probe_inflight: Arc::new(AtomicBool::new(false)),
                     last_probe: Instant::now() - Duration::from_secs(60),
                     wake_cancel: None,
+                    rescan: None,
                 }
                 .run(stop_w)
             })
@@ -373,11 +374,14 @@ struct ServiceState {
     last_probe: Instant,
     /// Cancels the active wake thread (it owns the model's wake status).
     wake_cancel: Option<Arc<AtomicBool>>,
+    /// Forces the mDNS browse to re-query. Installed by `run`; `None` before it starts.
+    rescan: Option<discovery::Rescan>,
 }
 
 impl ServiceState {
     fn run(mut self, stop: Arc<AtomicBool>) {
-        let discovery_rx = discovery::browse();
+        let (discovery_rx, rescan) = discovery::browse();
+        self.rescan = Some(rescan);
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
@@ -512,6 +516,14 @@ impl ServiceState {
             }
             ConsoleCmd::Probe => {
                 self.last_probe = Instant::now() - Duration::from_secs(60);
+                // "Refresh presence" means the mDNS half too, not just the QUIC sweep: the browse
+                // runs for the process's lifetime and `mdns-sd` backs its re-query interval off to
+                // as much as an hour, so a host that appeared since startup may never be asked
+                // for again. (No console screen emits Probe yet — every face button on the home
+                // screen is spoken for — but the plumbing is correct for when one does.)
+                if let Some(r) = &self.rescan {
+                    r.request();
+                }
             }
             ConsoleCmd::SetPin {
                 key,
@@ -791,6 +803,7 @@ fn spawn_fetch(
                                 id: g.id.clone(),
                                 title: g.title.clone(),
                                 store: g.store.clone(),
+                                launcher: g.is_launcher(),
                             })
                             .collect(),
                     );
@@ -831,6 +844,7 @@ fn load_fake(shared: &LibraryShared, path: &str) {
                 id: g.id.clone(),
                 title: g.title.clone(),
                 store: g.store.clone(),
+                launcher: g.is_launcher(),
             })
             .collect(),
     );

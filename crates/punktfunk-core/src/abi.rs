@@ -654,10 +654,88 @@ pub struct PunktfunkConnection {
 #[derive(Default)]
 struct AudioPcmState {
     decoder: Option<opus::MSDecoder>,
-    /// Interleaved f32 PCM, wire channel order. Pre-sized to the largest legal Opus frame
-    /// (120 ms @ 48 kHz = 5760 samples/ch) × 8 channels so decode never reallocates (which would
+    /// Interleaved f32 PCM, wire channel order. Pre-sized in `decode_packet` for the largest
+    /// legal Opus frame plus a full concealment run, so decode never reallocates (which would
     /// dangle the pointer handed to the embedder).
     pcm: Vec<f32>,
+    /// Loss detector — the same seq-gap accounting the other clients run in their own decode
+    /// loops (`pf-client-core`'s session pump, Android's native pump), here for the one decoder
+    /// that lives in core. Without it a lost 5 ms packet reaches the embedder's playout ring as
+    /// a hard time-domain gap: a click per loss, sustained crackle on lossy Wi-Fi.
+    gaps: crate::audio::AudioGapTracker,
+    /// Per-channel sample count of the last real decode — sizes each synthesized concealment
+    /// frame. 0 until the first decode, which skips concealment (nothing to size it from),
+    /// exactly like the other clients.
+    frame_samples: usize,
+}
+
+#[cfg(feature = "quic")]
+impl AudioPcmState {
+    /// Decode one arriving audio packet into `self.pcm`, synthesizing libopus packet-loss
+    /// concealment for any packets the sequence says went missing immediately before it — the
+    /// concealed frames land first, the real frame after, one contiguous interleaved buffer.
+    ///
+    /// Returns the interleaved sample count now valid at the front of `pcm`; `Ok(0)` means
+    /// nothing to hand out this call (a DTX silence marker with no loss before it). An empty
+    /// `data` is the DTX marker: it still advances the loss accounting (so the silent slot is
+    /// never itself "concealed" later) and flushes any concealment owed, but is never decoded —
+    /// `decode_float` would treat it as a loss and synthesize the buffer's full capacity.
+    fn decode_packet(
+        &mut self,
+        data: &[u8],
+        seq: u32,
+        channels: u8,
+    ) -> Result<usize, PunktfunkStatus> {
+        let ch = channels as usize;
+        if self.decoder.is_none() {
+            let layout = crate::audio::layout_for(channels, false);
+            match opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping) {
+                Ok(d) => {
+                    // Largest legal Opus frame is 120 ms = 5760 samples/ch, and a gap can owe up
+                    // to MAX_CONCEAL_PACKETS concealed frames of the same size in front of it.
+                    self.pcm =
+                        vec![0f32; (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 5760 * ch];
+                    self.decoder = Some(d);
+                }
+                Err(_) => return Err(PunktfunkStatus::Unsupported),
+            }
+        }
+        let dec = self.decoder.as_mut().unwrap();
+
+        // Conceal lost packets (a seq gap) before decoding the one that arrived: empty input
+        // synthesizes `frame_samples` of interpolation per missing packet — an inaudible fade
+        // instead of the click a hard gap makes in the ring. Mirrors the Linux/Windows session
+        // pump and the Android native pump; capped by the tracker at 50 ms.
+        let missing = self.gaps.missing_before(seq);
+        let mut filled = 0usize;
+        if self.frame_samples > 0 {
+            for _ in 0..missing {
+                let plc = self.frame_samples * ch;
+                match dec.decode_float(&[], &mut self.pcm[filled..filled + plc], false) {
+                    Ok(samples) => filled += samples * ch,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if data.is_empty() {
+            // DTX silence marker (a legal wire form) — never decoded (see above); the sink
+            // underruns to silence on its own. Concealment owed for losses before it still
+            // goes out.
+            return Ok(filled);
+        }
+        match dec.decode_float(data, &mut self.pcm[filled..], false) {
+            Ok(samples) => {
+                self.frame_samples = samples;
+                Ok(filled + samples * ch)
+            }
+            // An undecodable packet: hand out whatever concealment the gap before it earned
+            // rather than dropping it with the packet. Its own 5 ms slot plays as a ring gap,
+            // as on every other client (the tracker has already anchored at this seq).
+            Err(_) if filled > 0 => Ok(filled),
+            Err(_) => Err(PunktfunkStatus::BadPacket),
+        }
+    }
 }
 
 /// `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
@@ -2273,6 +2351,45 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
+/// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
+/// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
+///
+/// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
+/// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
+/// while the connection is torn down, and a client that never calls it behaves exactly as it did
+/// before this existed.
+///
+/// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
+/// their game from a host falling off the network, so every client wrote one message for all of
+/// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
+/// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
+/// for `HOST_ERROR` and `LOST`.
+///
+/// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_end_reason(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = c.inner.end_reason() as u8 };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
 /// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
 /// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
@@ -2300,6 +2417,13 @@ pub struct PunktfunkAudioPcm {
 /// connection memory until the next PCM call on this handle. Use EITHER this or
 /// [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
 /// not both (they share the underlying queue).
+///
+/// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
+/// recovery has had its chance) are synthesized via libopus packet-loss concealment and returned
+/// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
+/// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
+/// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
+/// pre-healed, exactly as they do on the clients that decode outside core.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
@@ -2330,36 +2454,16 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
             Err(e) => return e.status(),
         };
         let mut state = c.audio_pcm.lock().unwrap();
-        if state.decoder.is_none() {
-            let layout = crate::audio::layout_for(channels, false);
-            match opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping) {
-                Ok(d) => {
-                    // Largest legal Opus frame is 120 ms = 5760 samples/ch.
-                    state.pcm = vec![0f32; 5760 * channels as usize];
-                    state.decoder = Some(d);
-                }
-                Err(_) => return PunktfunkStatus::Unsupported,
-            }
-        }
-        let AudioPcmState { decoder, pcm } = &mut *state;
-        let dec = decoder.as_mut().unwrap();
-        // A header-only datagram (DTX silence — a legal wire form) must be SKIPPED, not
-        // decoded: `decode_float` treats an empty payload as a loss and synthesizes a full
-        // 120 ms of concealment for a ~5 ms slot, growing the playout ring without bound.
-        // Mirrors the host mic pump's guard; the sink underruns to silence on its own.
-        if pkt.data.is_empty() {
-            return PunktfunkStatus::NoFrame;
-        }
-        // `decode_float` divides the output buffer length by the channel count to get the
-        // per-channel capacity; an empty payload requests packet-loss concealment.
-        match dec.decode_float(&pkt.data, pcm, false) {
-            Ok(frame_count) => {
+        match state.decode_packet(&pkt.data, pkt.seq, channels) {
+            // Nothing to hand out this call: a DTX silence marker with no loss owed before it.
+            Ok(0) => PunktfunkStatus::NoFrame,
+            Ok(samples) => {
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
                 // matching `#[repr(C)]` type, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPcm {
-                        samples: pcm.as_ptr(),
-                        frame_count: frame_count as u32,
+                        samples: state.pcm.as_ptr(),
+                        frame_count: (samples / channels.max(1) as usize) as u32,
                         channels,
                         seq: pkt.seq,
                         pts_ns: pkt.pts_ns,
@@ -2367,7 +2471,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
                 }
                 PunktfunkStatus::Ok
             }
-            Err(_) => PunktfunkStatus::BadPacket,
+            Err(status) => status,
         }
     })
 }
@@ -4615,6 +4719,55 @@ mod tests {
                 data: vec![0x80],
             })
             .is_none()
+        );
+    }
+
+    /// The in-core PCM decoder heals seq gaps with concealment, exactly like the decode loops
+    /// the other clients run themselves: a lost packet's worth of PLC lands in front of the
+    /// arriving frame, DTX markers advance the accounting without being decoded, and a gap is
+    /// capped at the tracker's 50 ms.
+    #[test]
+    fn audio_pcm_decode_conceals_seq_gaps() {
+        const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
+        let l = crate::audio::LAYOUT_STEREO;
+        let mut enc = opus::MSEncoder::new(
+            48_000,
+            l.streams,
+            l.coupled,
+            l.mapping,
+            opus::Application::LowDelay,
+        )
+        .expect("MSEncoder");
+        enc.set_vbr(false).unwrap();
+        let mut packet = |tone: f32| {
+            let mut frame = vec![0f32; FRAME * 2];
+            for (i, s) in frame.iter_mut().enumerate() {
+                *s = 0.25 * (i as f32 * tone).sin();
+            }
+            let mut out = vec![0u8; 1500];
+            let n = enc.encode_float(&frame, &mut out).unwrap();
+            out.truncate(n);
+            out
+        };
+
+        let mut state = AudioPcmState::default();
+        // In-order packets decode to exactly one frame each.
+        assert_eq!(state.decode_packet(&packet(0.05), 0, 2), Ok(FRAME * 2));
+        assert_eq!(state.decode_packet(&packet(0.05), 1, 2), Ok(FRAME * 2));
+        // Seq 2 lost: one concealed frame precedes the real one, contiguously.
+        assert_eq!(state.decode_packet(&packet(0.06), 3, 2), Ok(2 * FRAME * 2));
+        // A duplicate conceals nothing.
+        assert_eq!(state.decode_packet(&packet(0.06), 3, 2), Ok(FRAME * 2));
+        // DTX marker, nothing lost before it: nothing to emit (the ABI maps 0 to NoFrame)...
+        assert_eq!(state.decode_packet(&[], 4, 2), Ok(0));
+        // ...but a DTX marker AFTER a loss still flushes the concealment owed (seq 5 lost).
+        assert_eq!(state.decode_packet(&[], 6, 2), Ok(FRAME * 2));
+        // And the DTX slot itself was accounted, not treated as a loss.
+        assert_eq!(state.decode_packet(&packet(0.07), 7, 2), Ok(FRAME * 2));
+        // A huge gap is capped at MAX_CONCEAL_PACKETS of concealment.
+        assert_eq!(
+            state.decode_packet(&packet(0.07), 1000, 2),
+            Ok((crate::audio::MAX_CONCEAL_PACKETS as usize + 1) * FRAME * 2)
         );
     }
 }

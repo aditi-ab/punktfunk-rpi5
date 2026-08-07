@@ -800,7 +800,16 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     // The scripting runner's scoped credential: minted + persisted (plugin-token) alongside the
     // admin token so a plugin's zero-config `connect()` picks it up — it authorizes the plugin
     // surface but not hook registration or pairing administration (mgmt::auth::plugin_may_access).
-    opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
+    //
+    // Only when a runner is actually installed. It used to be minted unconditionally on every
+    // `serve`, so a host with no plugins — the common case — still persisted a second
+    // admin-adjacent credential to disk and kept a second authentication lane live for a
+    // subsystem it does not run (2026-08-05 review L-21). Installing the runner later mints it on
+    // the next start, and an existing plugin-token file is picked up unchanged, so nothing about
+    // the plugin flow changes for a host that has one.
+    if crate::plugins::runtime_status().installed {
+        opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
+    }
     // Default the mgmt listener to ALL interfaces (not just loopback) so a paired native client can
     // fetch the game library over mTLS with no operator step — the whole point of "browse works by
     // default". This only LAN-exposes the read-only cert allowlist; the bearer-token admin surface

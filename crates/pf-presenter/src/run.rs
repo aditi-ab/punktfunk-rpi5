@@ -1070,15 +1070,24 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
                 chan.pump(c, &mouse, desktop_active, fit_scale);
-                // §8 mid-stream render flip: tell the host who renders the pointer whenever
-                // the local model changes. Desktop-active = we draw it (host excludes +
-                // forwards); anything else — the capture model OR a released pointer — the
-                // host composites it into the video (full fidelity, the pre-channel look).
+                // §8 mid-stream render flip: tell the host who renders the pointer whenever the
+                // local model changes. The host may composite one ONLY while we hold a grabbed,
+                // hidden pointer — the capture model, engaged — because that is the one state
+                // with no local cursor on screen. Note this is deliberately NOT `desktop_active`:
+                // a RELEASED pointer leaves the ordinary window cursor visible over the video,
+                // and a host-composited pointer then sits UNDER it as a second cursor that never
+                // moves (released forwards no motion), which reads on glass as a frozen
+                // duplicate. Released therefore counts as "we draw it" — the host stops
+                // compositing and keeps forwarding shape/state, so re-engaging is seamless.
                 // One edge-detected reconciler covers the chord, the M3 auto-flip, and
                 // engage/release alike.
-                if chan.negotiated() && st.sent_client_draws != Some(desktop_active) {
-                    st.sent_client_draws = Some(desktop_active);
-                    let _ = c.set_cursor_render(desktop_active);
+                let client_draws = match st.capture.as_ref() {
+                    Some(cap) => !cap.captured() || cap.desktop(),
+                    None => true,
+                };
+                if chan.negotiated() && st.sent_client_draws != Some(client_draws) {
+                    st.sent_client_draws = Some(client_draws);
+                    let _ = c.set_cursor_render(client_draws);
                 }
             }
             // M3 — host-driven mode flip: `relative_hint` set = a host app grabbed/hid the

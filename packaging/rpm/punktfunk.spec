@@ -83,9 +83,19 @@ BuildRequires:  pkgconfig(opus)
 # FFmpeg dev headers with NVENC — from RPM Fusion (ffmpeg-devel), NOT ffmpeg-free.
 # Version-agnostic: ffmpeg-sys-next auto-detects the installed FFmpeg, so this builds
 # against FFmpeg 7.x (libavcodec 61, e.g. Fedora 43 / Bazzite) or 8.x (libavcodec 62).
+# ALL SEVEN modules, not just the three we call directly: `ffmpeg-next` is pulled with default
+# features, so its `-sys` build script pkg-config-probes codec/device/filter/format/util/
+# resampling/scaling and panics on the first one missing. RPM Fusion's ffmpeg-devel ships the lot
+# in one package, which hid the gap — on a box where these resolve to Fedora's split
+# libav*-free-devel packages instead, dnf installed only the three named here and the build died
+# in ffmpeg-sys-next's build.rs on `libavfilter`.
 BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavdevice)
+BuildRequires:  pkgconfig(libavfilter)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswresample)
+BuildRequires:  pkgconfig(libswscale)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
@@ -193,9 +203,10 @@ The plugin/script runner for a punktfunk streaming host: it discovers loose scri
 ~/.config/punktfunk/scripts and installed punktfunk-plugin-* packages under ~/.config/punktfunk/
 plugins, and supervises each as an Effect fiber (capped-jittered restart; SIGTERM shuts the whole
 tree down structurally so plugin finalizers run). A plugin auto-wires to the host's mgmt token +
-identity cert on the same box — no env editing. Bundles its own bun runtime. OPT-IN: the systemd
---user unit ships disabled (the runner is inert until you add scripts/plugins). Enable with
-`systemctl --user enable --now punktfunk-scripting`.
+identity cert on the same box — no env editing. Bundles its own bun runtime. ON BY DEFAULT: the
+systemd --user unit is enabled for every user (systemctl --global). The game-library scanners ship
+as plugins, so a host without the runner has an empty library. Opt out per user with
+`systemctl --user mask punktfunk-scripting`.
 %endif
 
 %prep
@@ -560,6 +571,10 @@ update-desktop-database %{_datadir}/applications >/dev/null 2>&1 || :
 %post
 # The (empty) opt-in group for web-console-triggered updates — nobody is auto-added.
 getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
+# Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input': writing
+# 'attach' materialises an arbitrary emulated USB device — a root-only kernel primitive that must
+# not ride on the group users are told to join for gamepads (security-review 2026-08-05 M-4).
+getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc 2>/dev/null || :
@@ -567,6 +582,8 @@ udevadm trigger --subsystem-match=misc 2>/dev/null || :
 # it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
+echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \$USER"
+echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust."
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
 # Fedora/RHEL run firewalld by default — point the way to the installed service definitions.
@@ -574,6 +591,18 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     echo "Firewall (firewalld): sudo firewall-cmd --reload &&"
     echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
     echo "    (use punktfunk-native for the native-only host)"
+fi
+# A RUNNING firewalld keeps serving the service definition it loaded at its last (re)start, so a
+# port added to the XML by this upgrade — 47993, the separate origin plugin UIs are served from —
+# is not open until a reload, and the console shows every plugin interface as an empty panel with
+# nothing to explain it. `--info-service` asks the daemon, i.e. reads that stale copy.
+if command -v firewall-cmd >/dev/null 2>&1 &&
+   firewall-cmd --state >/dev/null 2>&1 &&
+   firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
+   ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
+    echo ""
+    echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
+    echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
 fi
 # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so the
 # warning stays in one place. Exit 1 = something found; never fail the install on it.
@@ -590,16 +619,31 @@ fi
 echo "punktfunk-web installed. Enable the console for your user:"
 echo "    systemctl --user enable --now punktfunk-web"
 echo "A login password is generated on first start — read it with:"
-echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
+# From the 0600 file, NOT the journal: the journal is persistent and group-readable (adm /
+# systemd-journal on Debian-family, and this hint was copied around), so telling people to fish a
+# password out of it published the secret to every member of those groups (review 2026-08-05 L-18).
+echo "    cut -d= -f2- \${XDG_CONFIG_HOME:-\$HOME/.config}/punktfunk/web-password"
 echo "Then open https://<host-ip>:47992"
 %endif
 
 %if %{with scripting}
 %post scripting
-echo "punktfunk-scripting installed. It runs your automation — add scripts to"
+# `--global`, not `--user`: a scriptlet has no user session to act on, and this is the only
+# mechanism that makes a `--user` unit on-by-default for everyone (it symlinks into
+# /etc/systemd/user/…wants/). The game-library scanners are plugins now, so the runner is a default
+# component rather than an add-on (design D9); it stays opt-OUT via
+# `systemctl --user mask punktfunk-scripting`, since a plain `--user disable` cannot remove a global
+# symlink. $1 == 1 is a first INSTALL — on an upgrade ($1 > 1) this must not undo an operator's mask.
+if [ "$1" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || :
+fi
+echo "punktfunk-scripting installed and enabled for all users."
+echo "It runs your automation — game-library sources, scripts in"
 echo "    ~/.config/punktfunk/scripts/  (loose .ts/.js files)"
-echo "or install plugins into ~/.config/punktfunk/plugins/ (bun add punktfunk-plugin-<name>),"
-echo "then enable the runner: systemctl --user enable --now punktfunk-scripting"
+echo "and plugins under ~/.config/punktfunk/plugins/."
+echo "It starts with your next login; start it now with:"
+echo "    systemctl --user start punktfunk-scripting"
+echo "Don't want it? systemctl --user mask punktfunk-scripting"
 %endif
 
 %changelog

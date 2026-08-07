@@ -12,6 +12,7 @@ import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 
 struct GamepadAddHostView: View {
+    @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
     let onAdd: (StoredHost) -> Void
 
@@ -47,12 +48,12 @@ struct GamepadAddHostView: View {
             VStack(spacing: 4) {
                 Text("Add Host")
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                 if !compact {
                     Text("Hosts on this network appear automatically — add one by address "
                         + "for everything else.")
                         .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .foregroundStyle(ink.fg(0.55))
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72)
                 }
@@ -73,6 +74,9 @@ struct GamepadAddHostView: View {
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
         .background { GamepadFormBackground() }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
         // A port can't exceed 5 digits — cap while typing so the row can't grow absurd.
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
@@ -143,7 +147,7 @@ struct GamepadAddHostView: View {
         Button { dismiss() } label: {
             Image(systemName: "xmark")
                 .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
                 .glassBackground(Circle(), interactive: true)
                 .contentShape(Circle())
@@ -180,22 +184,22 @@ struct GamepadAddHostView: View {
             if row.isAction {
                 Label("Add Host", systemImage: "plus.circle.fill")
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(canAdd ? Color.brand : .white.opacity(0.35))
+                    .foregroundStyle(canAdd ? ink.accent : ink.fg(0.35))
                     .frame(maxWidth: .infinity)
             } else {
                 Text(row.label)
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                 Spacer(minLength: 12)
                 Text(row.value.isEmpty ? row.placeholder : row.value)
                     .font(.geistFixed(m.valueFont, .medium))
-                    .foregroundStyle(row.value.isEmpty ? .white.opacity(0.35) : .white)
+                    .foregroundStyle(row.value.isEmpty ? ink.fg(0.35) : ink.fg)
                     .lineLimit(1)
                     .truncationMode(.head) // keep the end of a long address visible while typing
                 if editing == row.id {
                     // The live-edit caret: this row is what the keyboard tray is typing into.
                     Rectangle()
-                        .fill(Color.brand)
+                        .fill(ink.accent)
                         .frame(width: 2, height: m.labelFont + 2)
                 }
             }
@@ -206,12 +210,12 @@ struct GamepadAddHostView: View {
         // takes the brand wash, and the edited row keeps its brand caret border.
         .consoleGlass(
             RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
-            tint: (focused || editing == row.id) ? Color.brand.opacity(0.30) : nil,
+            tint: (focused || editing == row.id) ? ink.accent(0.30) : nil,
             interactive: focused)
         .overlay {
             RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
                 .strokeBorder(
-                    editing == row.id ? Color.brand.opacity(0.7) : .white.opacity(focused ? 0.28 : 0.06),
+                    editing == row.id ? ink.accent(0.7) : ink.fg(focused ? 0.28 : 0.06),
                     lineWidth: 1)
         }
         .scaleEffect(focused ? 1.0 : 0.98)

@@ -10,5 +10,8 @@
 		"noEmit": true,
 		"types": ["bun"]
 	},
-	"include": ["src", "test"]
+	// `examples` is type-checked but never built: tsconfig.build.json narrows to `src`, and
+	// package.json ships only `dist` + README. A worked example that doesn't compile is worse than
+	// no example, and these are what the first-party scanner repos are cut from.
+	"include": ["src", "test", "examples"]
 }

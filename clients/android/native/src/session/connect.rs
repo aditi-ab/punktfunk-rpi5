@@ -404,6 +404,31 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     })
 }
 
+/// `NativeBridge.nativeEndReason(handle): Int` — WHY the session ended, as a
+/// `punktfunk_core::client::PunktfunkEndReason` byte (Kotlin mirrors it in `SessionEndReason`).
+///
+/// Companion to `nativeSessionEnded`, which only says THAT it ended. Kotlin's watchdog needs both:
+/// the flag to leave a dead stream, and this to decide what — if anything — to tell the user. A
+/// player quitting their game and a host dropping off the network both end the session, and until
+/// this existed the watchdog worded them identically ("the host may be asleep"), which is wrong for
+/// every deliberate ending. `0` (NONE) on a `0` handle or before the session ends. Cheap (one
+/// atomic load); safe on the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jint {
+    jni_guard(0, || {
+        if handle == 0 {
+            return 0;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        h.client.end_reason() as jint
+    })
+}
+
 /// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns

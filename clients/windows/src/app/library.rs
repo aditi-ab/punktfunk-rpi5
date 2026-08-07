@@ -39,6 +39,10 @@ pub(crate) struct Game {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) store: String,
+    /// This entry opens the launcher itself (Steam Big Picture, Heroic) rather than a title —
+    /// design D4. Reduced from the wire's `role` by `GameEntry::is_launcher`, so "anything that
+    /// isn't `launcher` is a game" is decided in one place for every client.
+    pub(crate) launcher: bool,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -135,6 +139,7 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
                         id: g.id.clone(),
                         title: g.title.clone(),
                         store: g.store.clone(),
+                        launcher: g.is_launcher(),
                     })
                     .collect(),
             );
@@ -215,6 +220,17 @@ fn initials(title: &str) -> String {
         .collect()
 }
 
+/// A small group label above a tile grid ("Launchers" / "Games"). Only drawn when the page shows
+/// both groups — a single unlabelled grid is what every launcher-less library looked like before.
+fn group_heading(text: &str) -> Element {
+    text_block(text)
+        .font_size(12.0)
+        .semibold()
+        .foreground(ThemeRef::SecondaryText)
+        .margin(edges(2.0, 8.0, 2.0, 2.0))
+        .into()
+}
+
 /// One poster tile: the artwork (or a monogram placeholder while it loads) with the store
 /// badge overlaid top-left, the title below, tap-to-launch across the whole tile.
 fn poster_tile(
@@ -228,13 +244,20 @@ fn poster_tile(
             .stretch(Stretch::UniformToFill)
             .height(poster_h)
             .into(),
+        // A launcher rarely has poster art, and an art-less launcher drawn like an art-less game
+        // reads as "a game whose cover failed to load". So it names its launcher instead of
+        // showing a title monogram, and the frame below picks up the accent stroke.
         None => border(
-            text_block(initials(&game.title))
-                .font_size(28.0)
-                .semibold()
-                .foreground(ThemeRef::SecondaryText)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center),
+            text_block(if game.launcher {
+                store_label(&game.store).to_string()
+            } else {
+                initials(&game.title)
+            })
+            .font_size(if game.launcher { 18.0 } else { 28.0 })
+            .semibold()
+            .foreground(ThemeRef::SecondaryText)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center),
         )
         .background(ThemeRef::SubtleFill)
         .height(poster_h)
@@ -242,14 +265,27 @@ fn poster_tile(
     };
     let framed = border(grid(vec![
         poster,
-        pill(store_label(&game.store), Pill::Neutral)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .vertical_alignment(VerticalAlignment::Top)
-            .margin(uniform(6.0))
-            .into(),
+        // `Pill::Info` rather than a solid accent fill — `style.rs` is explicit that
+        // white-on-bright is unreadable here.
+        pill(
+            store_label(&game.store),
+            if game.launcher {
+                Pill::Info
+            } else {
+                Pill::Neutral
+            },
+        )
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .vertical_alignment(VerticalAlignment::Top)
+        .margin(uniform(6.0))
+        .into(),
     ]))
     .corner_radius(8.0)
-    .border_brush(ThemeRef::CardStroke)
+    .border_brush(if game.launcher {
+        ThemeRef::Accent
+    } else {
+        ThemeRef::CardStroke
+    })
     .border_thickness(uniform(1.0));
 
     border(
@@ -332,22 +368,43 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             .into(),
         ),
         LibraryPhase::Ready(games) => {
-            let tiles: Vec<Element> = games
-                .iter()
-                .map(|g| {
-                    let (ctx2, ss, st) = (ctx.clone(), ss.clone(), st.clone());
-                    let (target, id) = (target.clone(), g.id.clone());
-                    poster_tile(
-                        g,
-                        props.state.art.get(&g.id).map(String::as_str),
-                        poster_h,
-                        Box::new(move || {
-                            initiate_launch(&ctx2, target.clone(), id.clone(), &ss, &st)
-                        }),
-                    )
-                })
-                .collect();
-            body.push(tile_grid(tiles, cols, POSTER_GAP));
+            let tile = |g: &Game| -> Element {
+                let (ctx2, ss, st) = (ctx.clone(), ss.clone(), st.clone());
+                let (target, id) = (target.clone(), g.id.clone());
+                poster_tile(
+                    g,
+                    props.state.art.get(&g.id).map(String::as_str),
+                    poster_h,
+                    Box::new(move || initiate_launch(&ctx2, target.clone(), id.clone(), &ss, &st)),
+                )
+            };
+            // Design D4: launcher entries get their own shelf above the titles, never
+            // interleaved. `partition` is stable, so the host's title order survives in each
+            // group. Headings appear only when both groups exist, so a library without launcher
+            // entries renders exactly as it did before.
+            let (launchers, titles): (Vec<&Game>, Vec<&Game>) =
+                games.iter().partition(|g| g.launcher);
+            let both = !launchers.is_empty() && !titles.is_empty();
+            if !launchers.is_empty() {
+                if both {
+                    body.push(group_heading("Launchers"));
+                }
+                body.push(tile_grid(
+                    launchers.iter().map(|g| tile(g)).collect(),
+                    cols,
+                    POSTER_GAP,
+                ));
+            }
+            if !titles.is_empty() {
+                if both {
+                    body.push(group_heading("Games"));
+                }
+                body.push(tile_grid(
+                    titles.iter().map(|g| tile(g)).collect(),
+                    cols,
+                    POSTER_GAP,
+                ));
+            }
         }
     }
 

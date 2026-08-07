@@ -37,9 +37,51 @@ data class Artwork(val portrait: String?, val header: String?, val hero: String?
     val posterCandidates: List<String> get() = listOfNotNull(portrait, header, hero)
 }
 
-/** One title in the unified library. [id] is store-qualified (`steam:<appid>` / `custom:<id>`). */
-data class GameEntry(val id: String, val store: String, val title: String, val art: Artwork) {
+/**
+ * One title in the unified library. [id] is store-qualified (`steam:<appid>` / `custom:<id>`).
+ *
+ * [role] is `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that
+ * opens the launcher itself (Steam Big Picture, Heroic) rather than a title. Kept a plain nullable
+ * String on purpose: the host owns the vocabulary, and an unknown future value must degrade to a
+ * game rather than break the decode (design D4).
+ */
+data class GameEntry(
+    val id: String,
+    val store: String,
+    val title: String,
+    val art: Artwork,
+    val role: String? = null,
+) {
     val isCustom: Boolean get() = store == "custom"
+
+    /** Whether this entry opens a launcher rather than a game. */
+    val isLauncher: Boolean get() = role == "launcher"
+
+    /**
+     * Display name for the store badge — the same table the other clients use
+     * (`pf-console-ui::library::store_label`). Before this the UI said "Steam" for every non-custom
+     * entry, which a Lutris or GOG title made a lie.
+     */
+    val storeLabel: String get() = when (store) {
+        "steam" -> "Steam"
+        "custom" -> "Custom"
+        "heroic" -> "Heroic"
+        "lutris" -> "Lutris"
+        "epic" -> "Epic"
+        "gog" -> "GOG"
+        "xbox" -> "Xbox"
+        else -> "Game"
+    }
+}
+
+/**
+ * Design D4: launcher entries lead the shelf, keeping the host's title order within each group.
+ * Applied once where the library is fetched, so no screen has to remember the rule — and a library
+ * without launcher entries comes back untouched.
+ */
+fun List<GameEntry>.launchersFirst(): List<GameEntry> {
+    val launchers = filter { it.isLauncher }
+    return if (launchers.isEmpty()) this else launchers + filterNot { it.isLauncher }
 }
 
 /** Fetch outcome — three states so the UI can guide setup (the common case is "not paired yet"). */
@@ -108,10 +150,11 @@ object LibraryClient {
                         header = resolveArt(str(art, "header"), base),
                         hero = resolveArt(str(art, "hero"), base),
                     ),
+                    role = str(o, "role"),
                 ),
             )
         }
-        return out
+        return out.launchersFirst()
     }
 
     /** A present, non-null, non-blank JSON string field, else null. */
@@ -127,8 +170,14 @@ object LibraryClient {
  * An OkHttpClient that presents the paired client cert and pins the host's self-signed cert by
  * SHA-256(DER) — reused for BOTH the library fetch and the cover-art loads (so a paired client
  * reaches the host's own art proxy). The pinning trust manager trusts the host by fingerprint and
- * defers to normal public trust for any other origin (an external CDN URL); the hostname verifier
- * accepts the pinned host (whose self-signed cert has no matching SAN) and defers otherwise.
+ * defers to normal public trust for any other origin (an external CDN URL).
+ *
+ * The two checks are only sound TOGETHER, and the composition is the point: the trust manager
+ * cannot fail closed on its own (it has no hostname, so it must let a CDN chain through), so the
+ * hostname verifier is what makes the pinned host pin-only. Loosen either and a publicly-trusted
+ * certificate for any name is accepted for the host — which is exactly what 2026-08-05 review M-2
+ * found. The host's own cert is self-signed with no matching SAN, so it can never satisfy the
+ * default verifier; the pin is its only credential, on purpose.
  */
 fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String): OkHttpClient {
     val clientCert = CertificateFactory.getInstance("X.509")
@@ -162,7 +211,26 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String)
 
     val defaultVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
     val verifier = HostnameVerifier { hostname, session ->
-        hostname == host || defaultVerifier.verify(hostname, session)
+        if (hostname == host) {
+            // The PINNED host fails closed: only the pinned leaf is acceptable for this name.
+            //
+            // This used to be a bare `hostname == host`, which composed with the trust manager's
+            // system-CA fall-through into "any publicly-trusted certificate, for any name, is
+            // accepted for the pinned host" — the pin was decorative (2026-08-05 review M-2). A
+            // MITM with any free CA-issued cert intercepted the connection, received the client's
+            // mTLS IDENTITY certificate, and served attacker-chosen library JSON and art URLs.
+            // The Rust (`pf-client-core`) and Apple (`ClientTLS`) paths already fail closed here;
+            // only Android did not.
+            try {
+                sha256Hex((session.peerCertificates.firstOrNull() as? X509Certificate)?.encoded ?: return@HostnameVerifier false) == pinned
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            // Any other origin (an external CDN art URL) is ordinary public trust: the system
+            // trust manager validated the chain, and this checks the name against it.
+            defaultVerifier.verify(hostname, session)
+        }
     }
 
     return OkHttpClient.Builder()

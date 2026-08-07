@@ -7,6 +7,7 @@ use super::*;
 // The ceremony-only wire messages: imported directly (native.rs no longer references them, so they
 // were dropped from its `use` and won't come through `use super::*`). `PairRequest` still arrives
 // via the glob (serve_session decodes it).
+use crate::native_pairing::sanitize_device_name;
 use punktfunk_core::quic::{PairChallenge, PairProof, PairResult};
 
 /// Pairing needs a human in the loop (reading the PIN off the host, typing it into the
@@ -29,10 +30,19 @@ pub(super) async fn pair_ceremony(
     use punktfunk_core::quic::pake;
     let client_fp = endpoint::peer_fingerprint(conn)
         .ok_or_else(|| anyhow!("pairing requires the client to present a certificate"))?;
+    let client_fp_hex = fingerprint_hex(&client_fp);
+    // Scrub the wire-supplied name ONCE, here, and log only the scrubbed value from now on.
+    //
+    // This name arrives from an UNPAIRED device — the earliest, least authenticated input the host
+    // takes — and these were the three log sites that bypassed the documented single scrubber, so
+    // ANSI/C0 escapes and bidi overrides reached the operator's terminal and the journal
+    // (2026-08-05 review L-2). `sanitize_device_name` is "the one place that scrubs it" by its own
+    // module doc; the storage path already went through it, only the logging did not.
+    let name = sanitize_device_name(&req.name, &client_fp_hex);
 
     tracing::info!(
-        name = %req.name,
-        client = %fingerprint_hex(&client_fp),
+        name = %name,
+        client = %client_fp_hex,
         "PAIRING REQUEST — verifying against the armed PIN"
     );
 
@@ -74,9 +84,9 @@ pub(super) async fn pair_ceremony(
         if let Err(e) = np.add(&req.name, &fingerprint_hex(&client_fp)) {
             tracing::error!(error = %format!("{e:#}"), "could not persist paired clients");
         }
-        tracing::info!(name = %req.name, "pairing complete — client trusted");
+        tracing::info!(name = %name, "pairing complete — client trusted");
     } else {
-        tracing::warn!(name = %req.name, "pairing rejected (wrong PIN) — fingerprint not stored");
+        tracing::warn!(name = %name, "pairing rejected (wrong PIN) — fingerprint not stored");
     }
     io::write_msg(&mut send, &PairResult { ok }.encode()).await?;
     let _ = send.finish();

@@ -31,6 +31,12 @@ import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
+import androidx.compose.runtime.CompositionLocalProvider
+import io.unom.punktfunk.GamepadInk
+import io.unom.punktfunk.GamepadPalette
+import io.unom.punktfunk.GamepadSettingsScreen
+import io.unom.punktfunk.LocalGamepadInk
+import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsCategory
@@ -355,9 +361,11 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
         // dispValid, displayP50, e2eDispP50, e2eDispP95].
         // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
         // video-feed line; the display stage is valid (dispValid 1) so the headline is the
-        // directly-measured capture→displayed pair (1.8/2.6) and the Phase-2 stage terms
-        // (host 0.6 + network 0.3 + decode 0.4 + display 0.5) tile it, rendering the full split
-        // equation; the decoder label shows the ranked low-latency decoder. Light per-window loss
+        // directly-measured capture→displayed pair, less the excluded OS present floor (the 0.3
+        // latch p50) — 1.5/2.3 shown from 1.8/2.6 raw — and the Phase-2 stage terms
+        // (host 0.6 + network 0.3 + decode 0.4 + display 0.2) tile the shaved headline, with the
+        // `os present +0.3 excluded` line naming what came off; the decoder label shows the ranked
+        // low-latency decoder. Light per-window loss
         // (lost 2 · skipped 1 · FEC 5 of 238) so the reliability line (NORMAL/DETAILED) and the
         // compact loss flag both render.
         StatsOverlay(
@@ -404,3 +412,25 @@ internal fun WakeTimedOutScene() =
 @Composable
 internal fun ConnectConsoleScene() =
     ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
+
+/**
+ * The real console settings screen — the section tab strip, the glass rows, the focused row's
+ * unfolded detail, and the living (calmed) backdrop behind them. The touch [SettingsScene] can't
+ * stand in for it: this is a different screen with different navigation, and the strip is the part
+ * a layout regression would eat first.
+ */
+@Composable
+internal fun ConsoleSettingsScene(paletteId: String = "violet") {
+    // The scene calls the screen directly, so it has to publish the palette locals `App` would
+    // normally provide — without them a light palette would render with the default DARK ink and
+    // the shot would silently prove nothing.
+    val palette = GamepadPalette.named(paletteId)
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+    ) {
+        GamepadSettingsScreen(
+            initial = SHOT_SETTINGS.copy(uiPalette = paletteId), onChange = {}, onBack = {},
+        )
+    }
+}

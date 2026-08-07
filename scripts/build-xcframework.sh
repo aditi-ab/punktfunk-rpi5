@@ -53,6 +53,15 @@ if [[ -z "${DEVELOPER_DIR:-}" ]]; then
     esac # a non-beta xcode-select default is fine as-is
 fi
 
+# Hermetic Opus: never let audiopus_sys link a Homebrew libopus via pkg-config. A brew lib
+# is built for the RUNNING macOS (its objects carry that minos, tripping the version guard
+# below) and only exists for the host arch — the other slice silently falls back to the
+# vendored build, so the two slices ship different libopus builds. Force the vendored CMake
+# build everywhere; the policy floor keeps modern CMake (≥4) accepting libopus's old
+# `cmake_minimum_required`.
+export OPUS_NO_PKG_CONFIG=1
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
 # Deployment targets must match Package.swift's platforms, or every consumer link emits
 # "object file was built for newer macOS version" warnings.
 for t in "${TARGETS_MAC[@]}"; do

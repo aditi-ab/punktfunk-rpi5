@@ -9,6 +9,25 @@
 //
 // iOS/tvOS gate Bonjour browsing on Info.plist `NSBonjourServices` listing `_punktfunk._udp`
 // (Config/Info.plist) — without it the system blocks the browse and nothing is returned.
+//
+// SELF-HEALING is what the bookkeeping below is for. Neither Network.framework primitive
+// recovers on its own, and all three failure modes read as "the host isn't there":
+//
+//   - `browseResultsChangedHandler` fires only when the result SET changes. A service that is
+//     found but whose resolve fails is never re-offered — from the browser's point of view
+//     nothing changed — so one unlucky resolve hid that host for the life of the process.
+//   - `NWConnection` has no timeout. A resolve that cannot complete (v6-only advert against our
+//     IPv4 pin, Wi-Fi still associating, host mid-reboot) parks in `.preparing`/`.waiting`
+//     forever instead of failing, so the retry path above was never even reached.
+//   - `NWBrowser` parks in `.waiting` when the browse is blocked. On iOS that is where the LOCAL
+//     NETWORK PRIVACY gate lands the first launch after install: the browse starts, the system
+//     puts up its "find and connect to devices on your local network" prompt, and the browser
+//     waits. Granting permission does NOT revive that browser — only a new one sees the grant.
+//
+// Every one of those presented as "restarting the app fixes it", which is what field reports
+// described. A 1 Hz `sweep` therefore times out stuck resolves, retries failed ones on a backoff
+// and re-arms a browser that stopped working; `refresh()` forces the same recovery immediately,
+// behind the UI's pull-to-refresh and Refresh button.
 
 #if canImport(Network)
 import Foundation
@@ -48,12 +67,50 @@ public struct DiscoveredHost: Identifiable, Sendable, Equatable {
 public final class HostDiscovery: ObservableObject {
     /// Currently-visible hosts, deduped by `id`, sorted by name. Main-actor.
     @Published public private(set) var hosts: [DiscoveredHost] = []
+    /// True for a moment after a rescan is kicked off, so a Refresh control can show that it did
+    /// something on the surfaces with no pull-to-refresh spinner of their own (macOS, tvOS).
+    @Published public private(set) var isScanning = false
 
     private var browser: NWBrowser?
-    /// Keyed by the service endpoint's description (a stable, Sendable handle we can capture
-    /// into the resolve callbacks without smuggling non-Sendable Network types across hops).
-    private var resolved: [String: DiscoveredHost] = [:]
+    /// Every service the browser currently reports, keyed by the endpoint's description (a stable,
+    /// Sendable handle we can capture into the resolve callbacks without smuggling non-Sendable
+    /// Network types across hops). Held — not just diffed — so a retry can re-resolve a service
+    /// the browser will never report again (see the file header).
+    private var services: [String: NWBrowser.Result] = [:]
+    /// The transport address a completed resolve produced, per service key. The rest of a
+    /// `DiscoveredHost` comes from the advert's TXT, which is re-read on every browse report.
+    private var addresses: [String: (host: String, port: UInt16)] = [:]
     private var connections: [String: NWConnection] = [:]
+    /// Deadline for each in-flight resolve — `NWConnection` has none of its own.
+    private var deadlines: [String: Date] = [:]
+    /// Consecutive failed resolves per service, and when the next attempt is allowed.
+    private var failures: [String: Int] = [:]
+    private var retryAt: [String: Date] = [:]
+    /// Services whose address should be re-resolved even though we already have one — set by
+    /// `refresh()`. The old address keeps showing until the new one lands, so a rescan never
+    /// blinks the list empty; without this a manual Refresh silently skipped every host it had
+    /// already resolved, which is exactly the host whose address may have moved.
+    private var staleAddresses: Set<String> = []
+    /// Consecutive non-ready browser states, and when to tear it down and re-arm. nil = healthy.
+    private var browserFailures = 0
+    private var browserRearmAt: Date?
+    /// Bumped on every re-arm so callbacks from a superseded browser — and from the resolves it
+    /// started — are ignored instead of clobbering the current generation's bookkeeping.
+    private var generation = 0
+    /// The 1 Hz maintenance tick. Nothing else re-drives a stuck resolve or a sick browser.
+    private var sweep: Task<Void, Never>?
+    private var scanningUntil: Date?
+
+    /// A LAN resolve answers in milliseconds; this only has to outlast a slow Wi-Fi wake.
+    private static let resolveTimeout: TimeInterval = 6
+    /// How long `isScanning` holds — and `rescan()` waits — after a manual refresh.
+    private static let scanSettle: TimeInterval = 1.5
+    /// 1s, 2s, 4s, 8s … capped at 30s, for the resolve retry and the browser re-arm alike. Long
+    /// enough that a genuinely-down network doesn't spin the main queue, short enough that a host
+    /// coming back is picked up while the user is still looking at the screen.
+    private static func backoff(_ failures: Int) -> TimeInterval {
+        min(pow(2, Double(max(0, failures - 1))), 30)
+    }
 
     public init() {}
 
@@ -63,34 +120,73 @@ public final class HostDiscovery: ObservableObject {
         guard !debugPinned else { return } // a seeded advert set outranks the live LAN
         #endif
         guard browser == nil else { return }
-        let browser = NWBrowser(
-            for: .bonjourWithTXTRecord(type: "_punktfunk._udp", domain: nil),
-            using: NWParameters())
-        browser.browseResultsChangedHandler = { results, _ in
-            MainActor.assumeIsolated { [weak self] in self?.reconcile(results) }
-        }
-        browser.stateUpdateHandler = { state in
-            // A failed browser never recovers on its own; tear down and re-arm so transient
-            // network changes (Wi-Fi flip, VPN) don't leave discovery silently dead.
-            MainActor.assumeIsolated { [weak self] in
-                if case .failed = state { self?.restart() }
-            }
-        }
-        self.browser = browser
-        browser.start(queue: .main)
+        armBrowser()
+        startSweep()
     }
 
     /// Stop browsing and drop all discovered state.
     public func stop() {
+        sweep?.cancel()
+        sweep = nil
+        generation &+= 1
         browser?.cancel()
         browser = nil
         for conn in connections.values { conn.cancel() }
         connections.removeAll()
-        resolved.removeAll()
+        deadlines.removeAll()
+        services.removeAll()
+        addresses.removeAll()
+        failures.removeAll()
+        retryAt.removeAll()
+        staleAddresses.removeAll()
+        browserFailures = 0
+        browserRearmAt = nil
+        scanningUntil = nil
+        if isScanning { isScanning = false }
         if !hosts.isEmpty { hosts = [] }
     }
 
+    /// Force a rescan now: re-arm the browser and retry every service whose resolve had failed,
+    /// clearing the backoffs so nothing is left waiting. This is the manual escape hatch for the
+    /// failure modes in the file header — and the only thing that clears the iOS local-network
+    /// permission gate without an app restart, since only a NEW browser sees a permission the
+    /// user granted after the old one started.
+    ///
+    /// Also starts discovery if it wasn't running, so a Refresh button does the obvious thing.
+    public func refresh() {
+        #if DEBUG
+        guard !debugPinned else { return } // as in `start()` — the harness's set is the truth
+        #endif
+        isScanning = true
+        scanningUntil = Date().addingTimeInterval(Self.scanSettle)
+        failures.removeAll()
+        retryAt.removeAll()
+        staleAddresses = Set(services.keys)
+        browserFailures = 0
+        armBrowser()
+        startSweep()
+        pump()
+    }
+
+    /// `refresh()` for a `.refreshable` gesture: holds briefly so the control's spinner reflects a
+    /// browse that had time to answer instead of blinking out instantly.
+    public func rescan() async {
+        refresh()
+        try? await Task.sleep(nanoseconds: UInt64(Self.scanSettle * 1_000_000_000))
+    }
+
+    /// `refresh()`, but only when discovery is already running — the app-foreground hook. iOS
+    /// suspends a backgrounded process's browse and `onAppear`/`onDisappear` don't fire across
+    /// background/foreground, so a browse that died while suspended stayed dead on return; this
+    /// re-arms it without starting a browse on a screen that deliberately isn't browsing
+    /// (mid-session, where the home tore discovery down).
+    public func refreshIfRunning() {
+        guard browser != nil else { return }
+        refresh()
+    }
+
     deinit {
+        sweep?.cancel()
         browser?.cancel()
         for conn in connections.values { conn.cancel() }
     }
@@ -124,48 +220,103 @@ public final class HostDiscovery: ObservableObject {
     }
     #endif
 
-    private func restart() {
-        stop()
-        start()
+    // MARK: - Browser
+
+    /// Build and start a fresh browser, retiring the previous one and every resolve it started.
+    /// Those resolves' callbacks are gated on `generation`, so they must not be left holding map
+    /// entries — `pump()` restarts them against the new generation.
+    private func armBrowser() {
+        generation &+= 1
+        browser?.cancel()
+        for conn in connections.values { conn.cancel() }
+        connections.removeAll()
+        deadlines.removeAll()
+        browserRearmAt = nil
+
+        let generation = self.generation
+        let browser = NWBrowser(
+            for: .bonjourWithTXTRecord(type: "_punktfunk._udp", domain: nil),
+            using: NWParameters())
+        browser.browseResultsChangedHandler = { results, _ in
+            MainActor.assumeIsolated { [weak self] in
+                guard let self, generation == self.generation else { return }
+                self.reconcile(results)
+            }
+        }
+        browser.stateUpdateHandler = { state in
+            MainActor.assumeIsolated { [weak self] in
+                guard let self, generation == self.generation else { return }
+                self.browserStateChanged(state)
+            }
+        }
+        self.browser = browser
+        browser.start(queue: .main)
     }
 
-    /// Diff the browser's current result set against what we're tracking: drop departed
-    /// services, resolve newly-seen ones.
-    private func reconcile(_ results: Set<NWBrowser.Result>) {
-        let live = Set(results.map { Self.key($0) })
-        for key in resolved.keys where !live.contains(key) { resolved[key] = nil }
-        for key in connections.keys where !live.contains(key) {
-            connections[key]?.cancel()
-            connections[key] = nil
+    /// A browser that stops working never recovers on its own, and it has two ways to stop:
+    /// `.failed` (dead) and `.waiting` (blocked — a network change, or the iOS local-network
+    /// permission gate described in the file header). Schedule a re-arm for both, on a backoff:
+    /// re-arming synchronously on `.failed` alone both missed the permission case entirely and
+    /// could spin the main queue on a browser that fails instantly every time.
+    private func browserStateChanged(_ state: NWBrowser.State) {
+        switch state {
+        case .ready:
+            browserFailures = 0
+            browserRearmAt = nil
+        case .failed, .waiting:
+            guard browserRearmAt == nil else { return } // one re-arm already scheduled
+            browserFailures += 1
+            browserRearmAt = Date().addingTimeInterval(Self.backoff(browserFailures))
+        default:
+            break // .setup / .cancelled — nothing to heal
         }
+    }
+
+    /// Diff the browser's current result set against what we're tracking: drop departed services,
+    /// record the rest — re-reading the advert every time, so a host that re-keys, moves or flips
+    /// its pairing policy republishes under the same name and the card follows it — then resolve
+    /// whatever still needs an address.
+    private func reconcile(_ results: Set<NWBrowser.Result>) {
+        var live: Set<String> = []
         for result in results {
             let key = Self.key(result)
-            if resolved[key] == nil, connections[key] == nil { resolve(result) }
+            live.insert(key)
+            services[key] = result
         }
+        for key in Array(services.keys) where !live.contains(key) { forget(key) }
         publish()
+        pump()
+    }
+
+    private func forget(_ key: String) {
+        connections[key]?.cancel()
+        connections[key] = nil
+        deadlines[key] = nil
+        services[key] = nil
+        addresses[key] = nil
+        failures[key] = nil
+        retryAt[key] = nil
+        staleAddresses.remove(key)
+    }
+
+    // MARK: - Resolve
+
+    /// Start the resolves that are due: every live service with no address yet, nothing in flight,
+    /// and past its retry time.
+    private func pump() {
+        let now = Date()
+        for (key, result) in services {
+            guard addresses[key] == nil || staleAddresses.contains(key) else { continue }
+            guard connections[key] == nil else { continue }
+            if let at = retryAt[key], at > now { continue }
+            resolve(key, result)
+        }
     }
 
     /// Resolve one service to IP:port via a short UDP connection (it reaches `.ready` once the
-    /// path is established — no data is sent), reading the TXT up front so the callback only
-    /// captures Sendable values + the endpoint key.
-    private func resolve(_ result: NWBrowser.Result) {
-        let key = Self.key(result)
-        let name = Self.instanceName(result.endpoint)
-        var fp: String?
-        var pair: String?
-        var id: String?
-        var macs: [String] = []
-        var osChain = ""
-        if case let .bonjour(txt) = result.metadata {
-            fp = Self.entry(txt, "fp")
-            pair = Self.entry(txt, "pair")
-            id = Self.entry(txt, "id")
-            macs = (Self.entry(txt, "mac") ?? "")
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            osChain = sanitizeOsChain(Self.entry(txt, "os") ?? "")
-        }
+    /// path is established — no data is sent). The TXT is NOT read here: it comes from the browse
+    /// result at publish time, so a re-advertised host doesn't need a fresh resolve to be re-read.
+    private func resolve(_ key: String, _ result: NWBrowser.Result) {
         // Resolve over IPv4 only: Network.framework prefers IPv6 (RFC 6724), and the host's OS
         // mDNS responder often answers AAAA for its hostname even though the punktfunk host stack
         // (control QUIC + data UDP) binds IPv4 sockets exclusively — a v6-resolved address would
@@ -177,42 +328,123 @@ public final class HostDiscovery: ObservableObject {
         }
         let conn = NWConnection(to: result.endpoint, using: params)
         connections[key] = conn
+        deadlines[key] = Date().addingTimeInterval(Self.resolveTimeout)
+        let generation = self.generation
         conn.stateUpdateHandler = { state in
             MainActor.assumeIsolated { [weak self] in
-                guard let self, let conn = self.connections[key] else { return }
+                // Look the connection back up rather than capturing it — capturing it here would
+                // retain the connection through its own handler.
+                guard let self, generation == self.generation,
+                      let conn = self.connections[key] else { return }
                 switch state {
                 case .ready:
-                    if case let .hostPort(host, port)? = conn.currentPath?.remoteEndpoint,
-                       let address = Self.hostString(host) {
-                        self.resolved[key] = DiscoveredHost(
-                            id: (id?.isEmpty == false) ? id! : name,
-                            name: name, host: address, port: port.rawValue,
-                            fingerprintHex: fp, requiresPairing: pair == "required",
-                            allowsTofu: pair == "optional", macAddresses: macs,
-                            osChain: osChain)
-                        self.publish()
-                    }
-                    conn.cancel()
+                    let endpoint = conn.currentPath?.remoteEndpoint
                     self.connections[key] = nil
+                    self.deadlines[key] = nil
+                    conn.cancel()
+                    if case let .hostPort(host, port)? = endpoint,
+                       let address = Self.hostString(host) {
+                        self.addresses[key] = (address, port.rawValue)
+                        self.failures[key] = nil
+                        self.retryAt[key] = nil
+                        self.staleAddresses.remove(key)
+                        self.publish()
+                    } else {
+                        // Ready but no usable remote — a failed attempt, not a finished one.
+                        self.resolveFailed(key)
+                    }
                 case .failed, .cancelled:
                     self.connections[key] = nil
+                    self.deadlines[key] = nil
+                    self.resolveFailed(key)
                 default:
-                    break
+                    break // .preparing / .waiting — the sweep's deadline is what ends these
                 }
             }
         }
         conn.start(queue: .main)
     }
 
-    /// Publish the resolved set, deduped by `id` (a host on several interfaces / re-advertising
-    /// collapses to one row), sorted by name.
+    private func resolveFailed(_ key: String) {
+        let count = (failures[key] ?? 0) + 1
+        failures[key] = count
+        retryAt[key] = Date().addingTimeInterval(Self.backoff(count))
+    }
+
+    // MARK: - Sweep
+
+    private func startSweep() {
+        sweep?.cancel()
+        sweep = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.tick()
+            }
+        }
+    }
+
+    private func tick() {
+        let now = Date()
+        // Time out the resolves that parked. Without this they never end, and `pump()` skips a
+        // service that has a connection in flight — so that host stayed invisible indefinitely.
+        for key in deadlines.filter({ $0.value <= now }).keys {
+            connections[key]?.cancel()
+            connections[key] = nil
+            deadlines[key] = nil
+            resolveFailed(key)
+        }
+        if let at = browserRearmAt, at <= now { armBrowser() }
+        pump()
+        if let until = scanningUntil, until <= now {
+            scanningUntil = nil
+            isScanning = false
+        }
+    }
+
+    // MARK: - Publish
+
+    /// Publish the live adverts that have an address, deduped by `id` (a host on several
+    /// interfaces / re-advertising collapses to one row), sorted by name.
     private func publish() {
         var byID: [String: DiscoveredHost] = [:]
-        for host in resolved.values { byID[host.id] = host }
+        for key in services.keys.sorted() {
+            guard let result = services[key], let address = addresses[key] else { continue }
+            let host = Self.host(from: result, address: address.host, port: address.port)
+            byID[host.id] = host
+        }
         let next = byID.values.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
         if next != hosts { hosts = next }
+    }
+
+    /// Join a browse result's advert (instance name + TXT) to a resolved address.
+    private static func host(
+        from result: NWBrowser.Result, address: String, port: UInt16
+    ) -> DiscoveredHost {
+        let name = instanceName(result.endpoint)
+        var fp: String?
+        var pair: String?
+        var id: String?
+        var macs: [String] = []
+        var osChain = ""
+        if case let .bonjour(txt) = result.metadata {
+            fp = entry(txt, "fp")
+            pair = entry(txt, "pair")
+            id = entry(txt, "id")
+            macs = (entry(txt, "mac") ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            osChain = sanitizeOsChain(entry(txt, "os") ?? "")
+        }
+        return DiscoveredHost(
+            id: (id?.isEmpty == false) ? id! : name,
+            name: name, host: address, port: port,
+            fingerprintHex: fp, requiresPairing: pair == "required",
+            allowsTofu: pair == "optional", macAddresses: macs,
+            osChain: osChain)
     }
 
     private static func key(_ result: NWBrowser.Result) -> String {
@@ -221,7 +453,7 @@ public final class HostDiscovery: ObservableObject {
 
     private static func instanceName(_ endpoint: NWEndpoint) -> String {
         if case let .service(name, _, _, _) = endpoint { return name }
-        return "punktfunk host"
+        return "Punktfunk host"
     }
 
     private static func entry(_ txt: NWTXTRecord, _ field: String) -> String? {

@@ -1,8 +1,47 @@
 //! Library-tagged management endpoints: installed-store + custom game entries and box art.
 //! Split out of the `mgmt` facade (plan §W5).
 
+use super::auth::AuthLane;
 use super::shared::*;
 use axum::http::header;
+use axum::Extension;
+
+/// Refuse a write whose payload carries an operator-privileged field to a lane that may not set one
+/// (2026-08-05 review H-1), and refuse any local art path the proxy would not serve back (H-2).
+///
+/// Both checks belong here rather than in the route gate: `PUT /library/provider/{p}` is a route a
+/// provider plugin must be able to call — reconciling its own entry set is the whole point of a
+/// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
+/// authority alone. Route reachability and field authority are separate questions.
+///
+/// `Some(response)` is the refusal to return; `None` means the payload may proceed. Deliberately
+/// not `Result<(), Response>`: the "error" here IS the response the handler sends, so there is no
+/// error value to propagate, and a 128-byte `Response` in an `Err` variant is what
+/// `clippy::result_large_err` objects to.
+fn check_entry_fields(
+    lane: AuthLane,
+    art: &crate::library::Artwork,
+    launch: Option<&crate::library::LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+) -> Option<Response> {
+    if !lane.may_set_privileged_fields() {
+        if let Some(field) = crate::library::privileged_field(launch, prep) {
+            return Some(api_error(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "`{field}` is executed as the host user and may only be set with the \
+                     operator's admin token — a plugin may publish entries with any host-resolved \
+                     launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
+                     heroic, playnite) \
+                     instead"
+                ),
+            ));
+        }
+    }
+    crate::library::validate_art_paths(art)
+        .err()
+        .map(|e| api_error(StatusCode::BAD_REQUEST, &e))
+}
 
 #[derive(Deserialize)]
 pub(crate) struct LibraryQuery {
@@ -34,6 +73,7 @@ pub(crate) struct LibraryQuery {
     )
 )]
 pub(crate) async fn get_library(
+    Extension(lane): Extension<AuthLane>,
     Query(q): Query<LibraryQuery>,
 ) -> Json<Vec<crate::library::GameEntry>> {
     let mut games = crate::library::all_games();
@@ -53,6 +93,24 @@ pub(crate) async fn get_library(
     // library size, and the client never sees an unreachable `C:\…`).
     for g in &mut games {
         crate::library::proxy_local_art(&g.id, &mut g.art);
+    }
+    // Redact the operator's command lines for every lane but their own (2026-08-05 review L-1).
+    //
+    // `cert_may_access` allows `GET /library`, so this response goes to every paired STREAMING
+    // client on the LAN — and for a custom entry `launch.value` is the raw shell command or
+    // absolute exe path the operator typed. The adjacent `detect` field is `#[serde(skip)]` for
+    // exactly this reason; `launch` simply never got the same treatment. Clients don't need it:
+    // a client picks a title by ID and the host resolves the recipe itself (`resolve_launch`),
+    // which is the invariant that stops a client injecting a command in the first place. The
+    // `kind` stays, so "this is launchable, and how" still renders.
+    if !lane.may_set_privileged_fields() {
+        for g in &mut games {
+            if let Some(l) = g.launch.as_mut() {
+                if l.kind == "command" {
+                    l.value.clear();
+                }
+            }
+        }
     }
     Json(games)
 }
@@ -141,10 +199,14 @@ pub(crate) async fn set_library_scanner(
     )
 )]
 pub(crate) async fn create_custom_game(
+    Extension(lane): Extension<AuthLane>,
     ApiJson(input): ApiJson<crate::library::CustomInput>,
 ) -> Response {
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+        return denied;
     }
     match crate::library::add_custom(input) {
         Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
@@ -169,11 +231,15 @@ pub(crate) async fn create_custom_game(
     )
 )]
 pub(crate) async fn update_custom_game(
+    Extension(lane): Extension<AuthLane>,
     Path(id): Path<String>,
     ApiJson(input): ApiJson<crate::library::CustomInput>,
 ) -> Response {
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+        return denied;
     }
     use crate::library::MutateOutcome;
     match crate::library::update_custom(&id, input) {
@@ -184,6 +250,11 @@ pub(crate) async fn update_custom_game(
         Ok(MutateOutcome::ProviderOwned(p)) => api_error(
             StatusCode::CONFLICT,
             &format!("entry is owned by provider `{p}` — update it through its reconcile"),
+        ),
+        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected claim outcome",
         ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -216,6 +287,11 @@ pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
                 "entry is owned by provider `{p}` — remove it there, or DELETE the provider set"
             ),
         ),
+        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected claim outcome",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -227,6 +303,13 @@ pub(crate) struct ProviderRemoved {
     removed: usize,
 }
 
+/// Query for `reconcileProviderEntries` — the optional store claim (D2).
+#[derive(Deserialize)]
+pub(crate) struct ReconcileQuery {
+    /// Claim this store for the provider, so its entries take the store's own identity.
+    store: Option<String>,
+}
+
 /// Replace a provider's library entries (declarative reconcile)
 ///
 /// Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the
@@ -234,39 +317,80 @@ pub(crate) struct ProviderRemoved {
 /// surviving title's host id stable across reconciles, drops orphans, and never touches manual
 /// entries or other providers'. An empty array removes everything the provider owns. Emits
 /// `library.changed` with the provider as `source`.
+///
+/// `?store=` additionally **claims** that store for the provider: its entries then surface with
+/// deterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque
+/// `custom:<id>` ones — which is what lets a library plugin reproduce the entries an in-host scanner
+/// used to produce, right down to the GameStream app ids and client-side art caches. One provider
+/// per store; a second claimant gets 409. While a claim is held the matching built-in scanner is
+/// suppressed, so the two never double-list. The claim is released by `DELETE`, not by an empty
+/// reconcile (a store can legitimately have zero installed titles).
 #[utoipa::path(
     put,
     path = "/library/provider/{provider}",
     tag = "library",
     operation_id = "reconcileProviderEntries",
-    params(("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)")),
+    params(
+        ("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)"),
+        ("store" = Option<String>, Query, description = "Claim this store for the provider ([a-z0-9_-], `custom`/`manual` reserved)"),
+    ),
     request_body = Vec<crate::library::ProviderEntryInput>,
     responses(
         (status = OK, description = "The provider's resulting entries (host ids assigned/kept)", body = [crate::library::CustomEntry]),
-        (status = BAD_REQUEST, description = "Invalid provider id or payload", body = ApiError),
+        (status = BAD_REQUEST, description = "Invalid provider id, store id, or payload", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = CONFLICT, description = "That store is already claimed by another provider", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
     )
 )]
 pub(crate) async fn reconcile_provider_entries(
+    Extension(lane): Extension<AuthLane>,
     Path(provider): Path<String>,
+    Query(q): Query<ReconcileQuery>,
     ApiJson(inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
 ) -> Response {
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
+    let store = q.store.filter(|s| !s.is_empty());
+    if let Some(store) = &store {
+        if let Err(e) = crate::library::validate_store_claim(store) {
+            return api_error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     if let Err(e) = crate::library::validate_provider_payload(&inputs) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
-    match crate::library::reconcile_provider(&provider, inputs) {
-        Ok(entries) => {
+    // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
+    // one privileged field anywhere in it is one command execution.
+    for (i, e) in inputs.iter().enumerate() {
+        if let Some(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
+            tracing::warn!(
+                provider,
+                index = i,
+                "library reconcile refused: payload carries a field this lane may not set"
+            );
+            return denied;
+        }
+    }
+    match crate::library::reconcile_provider(&provider, store.as_deref(), inputs) {
+        Ok(crate::library::MutateOutcome::Done(entries)) => {
             tracing::info!(
                 provider,
+                store = store.as_deref().unwrap_or("-"),
                 count = entries.len(),
                 "library provider reconciled"
             );
             Json(entries).into_response()
         }
+        Ok(crate::library::MutateOutcome::StoreClaimed { store, provider }) => api_error(
+            StatusCode::CONFLICT,
+            &format!("store `{store}` is already claimed by provider `{provider}`"),
+        ),
+        Ok(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected reconcile outcome",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -306,11 +430,12 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
 /// Fetch one cover-art image for a library entry
 ///
 /// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
-/// the image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —
-/// it's what the user's Steam client already shows for it), the public Steam CDN's flat URL
-/// convention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host
-/// can't predict, in which case this 404s and the client falls through to its next art candidate).
-/// Only Steam ids are backed today; any other store 404s.
+/// the image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,
+/// and a library plugin's claimed-store entries) serves its local art file. A Steam title falls back
+/// to the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the
+/// user's Steam client already shows for it), the public Steam CDN's flat URL convention second
+/// (newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case
+/// this 404s and the client falls through to its next art candidate).
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -330,7 +455,20 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
-    // Steam: CDN / local-cache proxy (id `steam:<appid>`).
+    // `library.json` FIRST, for ANY id (WP1.2). Stored entries — manual, provider-synced, and (once
+    // store claims land) a scanner plugin's `steam:570` — all serve their local art file from here,
+    // so the proxy never has to know which store an id belongs to. Steam ids aren't stored today, so
+    // this misses and the legacy branch below still answers them.
+    let stored = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || crate::library::library_local_art_bytes(&id, kind))
+            .await
+    };
+    if let Ok(Some((bytes, ctype))) = stored {
+        return ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
+    }
+    // Legacy in-host Steam scanner: local Steam cache, then the flat CDN URL. Retired with the
+    // scanner itself once the steam plugin claims the store (M6).
     if let Some(appid) = id
         .strip_prefix("steam:")
         .and_then(|s| s.parse::<u32>().ok())
@@ -344,17 +482,5 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
             _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
         };
     }
-    // Custom/provider entry (id `custom:<id>`): serve its stored LOCAL art file — e.g. the Playnite
-    // plugin's covers, reconciled as on-host paths rather than inlined bytes.
-    if let Some(cid) = id.strip_prefix("custom:").map(str::to_owned) {
-        return match tokio::task::spawn_blocking(move || {
-            crate::library::custom_local_art_bytes(&cid, kind)
-        })
-        .await
-        {
-            Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
-            _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
-        };
-    }
-    api_error(StatusCode::NOT_FOUND, "no art proxy for this store")
+    api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
 }

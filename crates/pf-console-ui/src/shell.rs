@@ -11,7 +11,7 @@
 
 use crate::anim::Progress;
 use crate::glyphs::GlyphStyle;
-use crate::library::{mesh_sksl, LibraryShared};
+use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
 use anyhow::{anyhow, Result};
@@ -85,7 +85,23 @@ pub(crate) struct Shell {
     wake_optimistic: bool,
     toast: Option<Toast>,
     mesh: RuntimeEffect,
-    /// 0 = aurora, 1 = form — chased, so backdrops crossfade with the transition.
+    /// The `ui_palette` the compiled `mesh` bakes. The settings screen can change the palette
+    /// mid-frame-loop, so [`Self::sync`] recompiles when this falls out of step — the backdrop
+    /// re-colours under the cursor as the row is stepped, which is the whole point of putting
+    /// the picker on a screen the backdrop is behind.
+    mesh_palette: String,
+    /// The palette's ground × 0.4 — the calm lift, precomputed with `mesh`. Chosen so
+    /// `col*0.6 + lift` leaves the ground EXACTLY where it was and pulls the bright pools down
+    /// to it: the form screens lose the launcher's contrast, not its colour.
+    mesh_lift: [f32; 3],
+    /// The backdrop's scrim under this palette: rgb = what the vignette and scrims tend
+    /// toward (black on a dark field, white on a pale one), a = how hard. Kept with the ink.
+    mesh_scrim: [f32; 4],
+    /// The text/accent/glass the palette calls for, published to the whole crate once per
+    /// frame (see [`crate::theme::set_ink`]).
+    ink: crate::theme::Ink,
+    /// 0 = launcher aurora, 1 = the calm form field — chased, so the backdrop settles into
+    /// (or out of) calm alongside the screen transition.
     bg_mix: f64,
     glyphs: GlyphStyle,
     chip: Option<String>,
@@ -103,8 +119,8 @@ impl Shell {
         stack: Vec<Screen>,
     ) -> Result<Shell> {
         anyhow::ensure!(!stack.is_empty(), "the console needs a root screen");
-        let mesh = RuntimeEffect::make_for_shader(mesh_sksl(), None)
-            .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+        let settings = trust::Settings::load();
+        let (mesh, mesh_lift, mesh_scrim, ink) = build_mesh(&settings.ui_palette)?;
         let bg_mix = match stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -116,7 +132,8 @@ impl Shell {
             library,
             bus,
             actions: VecDeque::new(),
-            settings: trust::Settings::load(),
+            mesh_palette: settings.ui_palette.clone(),
+            settings,
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
@@ -128,6 +145,9 @@ impl Shell {
             wake_optimistic: false,
             toast: None,
             mesh,
+            mesh_lift,
+            mesh_scrim,
+            ink,
             bg_mix,
             glyphs: GlyphStyle::Keyboard,
             chip: None,
@@ -226,6 +246,28 @@ impl Shell {
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
 
     fn sync(&mut self) {
+        // The settings screen writes `ui_palette` straight into `self.settings`; recompiling
+        // here is what makes the backdrop re-colour live under the row being stepped. A
+        // rejected compile keeps the palette that IS drawing — the field never goes black
+        // because someone picked a colour.
+        if self.settings.ui_palette != self.mesh_palette {
+            match build_mesh(&self.settings.ui_palette) {
+                Ok((mesh, lift, scrim, ink)) => {
+                    self.mesh = mesh;
+                    self.mesh_lift = lift;
+                    self.mesh_scrim = scrim;
+                    self.ink = ink;
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "console: {} palette rejected: {e}",
+                        self.settings.ui_palette
+                    );
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+            }
+        }
         if self.console.hosts_gen() != self.hosts_gen {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
         }
@@ -470,12 +512,30 @@ impl Shell {
         }
     }
 
-    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64) {
-        let uniforms: [f32; 3] = [w as f32, h as f32, t as f32];
-        // SAFETY: `uniforms` is a local `[f32; 3]` — exactly 12 bytes — and `f32` has no padding or
-        // invalid bit patterns, so reading it as bytes is sound; the slice is copied by
+    /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
+    /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
+    /// former aurora-over-static-form crossfade is now a single uniform.
+    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4),
+        // u_scrim (float4).
+        let uniforms: [f32; 12] = [
+            w as f32,
+            h as f32,
+            t as f32,
+            calm as f32,
+            self.mesh_lift[0],
+            self.mesh_lift[1],
+            self.mesh_lift[2],
+            0.0,
+            self.mesh_scrim[0],
+            self.mesh_scrim[1],
+            self.mesh_scrim[2],
+            self.mesh_scrim[3],
+        ];
+        // SAFETY: `uniforms` is a local `[f32; 12]` — exactly 48 bytes — and `f32` has no padding
+        // or invalid bit patterns, so reading it as bytes is sound; the slice is copied by
         // `Data::new_copy` before `uniforms` goes out of scope.
-        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 12) };
+        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 48) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
                 let mut paint = Paint::default();
@@ -487,6 +547,33 @@ impl Shell {
             }
         }
     }
+}
+
+/// Compile the mesh shader for a palette and resolve everything else that palette decides:
+/// the calm lift, the scrim direction, and the ink the whole UI draws with.
+/// `uniform_size` is checked rather than assumed: the byte buffer [`Shell::draw_aurora`]
+/// hands Skia is hand-packed, and a silent layout change would feed the field garbage
+/// instead of failing.
+type MeshLook = (RuntimeEffect, [f32; 3], [f32; 4], crate::theme::Ink);
+
+fn build_mesh(palette_id: &str) -> Result<MeshLook> {
+    let p = palette(palette_id);
+    let colors = p.mesh_colors();
+    let effect = RuntimeEffect::make_for_shader(mesh_sksl(&colors), None)
+        .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+    anyhow::ensure!(
+        effect.uniform_size() == 48,
+        "mesh uniform block is {} bytes, expected 48 (u_res, u_tc, u_lift, u_scrim)",
+        effect.uniform_size()
+    );
+    let ink = crate::theme::Ink::of(p);
+    let g = p.ground;
+    Ok((
+        effect,
+        [(g.0 * 0.4) as f32, (g.1 * 0.4) as f32, (g.2 * 0.4) as f32],
+        [ink.scrim.r, ink.scrim.g, ink.scrim.b, ink.scrim.a],
+        ink,
+    ))
 }
 
 #[cfg(test)]

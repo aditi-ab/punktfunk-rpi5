@@ -29,7 +29,17 @@ export interface PluginSummary {
 	version?: string;
 	/** Present iff the plugin serves a UI (and thus gets a nav entry). */
 	ui?: PluginUiSummary;
+	/**
+	 * What kind of plugin this is. The console knows one value — `"library"` — and keeps those OUT
+	 * of the nav: a scanner's entry point is the Library section's Game sources surface, and six
+	 * installed scanners would otherwise flood the sidebar (design D5). Absent on an older host, and
+	 * absent by choice for a plugin that wants its own page anyway (rom-manager).
+	 */
+	category?: string;
 }
+
+/** The one category the console treats specially. */
+export const LIBRARY_CATEGORY = "library";
 
 // A curated lucide set for plugin nav icons. Importing lucide's full dynamic icon map would defeat
 // tree-shaking (U-S4), so a plugin picks a name from here; anything unknown falls back to Puzzle.
@@ -97,6 +107,18 @@ export function usePlugins() {
 	});
 }
 
-/** Only the plugins that surface a UI — the ones that get a nav entry. */
+/**
+ * The plugins that get a **nav entry**: those serving a UI, minus the library-category ones.
+ *
+ * A library plugin still serves a UI port (that is how `__config` is reached) and its
+ * `/plugins/$pluginId/$` route still resolves, so an existing deep link keeps working — it simply
+ * isn't advertised in the sidebar.
+ */
 export const uiPlugins = (list: PluginSummary[] | undefined): PluginSummary[] =>
-	(list ?? []).filter((p) => p.ui);
+	(list ?? []).filter((p) => p.ui && p.category !== LIBRARY_CATEGORY);
+
+/** The installed library-category plugins — the Game sources surface's own list. */
+export const libraryPlugins = (
+	list: PluginSummary[] | undefined,
+): PluginSummary[] =>
+	(list ?? []).filter((p) => p.category === LIBRARY_CATEGORY);

@@ -1202,7 +1202,27 @@ fn pump(
                 }
             }
             Err(PunktfunkError::NoFrame) => {}
-            Err(PunktfunkError::Closed) => break Some("Host ended the session".to_string()),
+            // The session ended. `None` here means "normal finish" to every embedder — the browse
+            // console returns to the library with no status strip, the one-shot binary exits 0
+            // quietly — so only an ending that actually went wrong should carry a message.
+            // Previously EVERY close reported "Host ended the session", which put an error-shaped
+            // line in front of the player for quitting their own game.
+            Err(PunktfunkError::Closed) => {
+                use punktfunk_core::client::PunktfunkEndReason as End;
+                break match connector.end_reason() {
+                    // The player quit the game the host launched. Nothing to report; a launcher
+                    // embedder returns to its library, which is where they were headed anyway.
+                    End::GameExited => None,
+                    // We closed it, or the host closed cleanly (an operator "End", or the session
+                    // simply finishing). Both were asked for.
+                    End::Local | End::HostEnded => None,
+                    End::HostError => Some("The host ended the session with an error".to_string()),
+                    End::Lost => Some("Connection lost".to_string()),
+                    // No verdict (an older core, or the close raced the read): keep the wording
+                    // this arm has always used rather than inventing a new one.
+                    End::None => Some("Host ended the session".to_string()),
+                };
+            }
             Err(e) => break Some(format!("session: {e:?}")),
         }
 

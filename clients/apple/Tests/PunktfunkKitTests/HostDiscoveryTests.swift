@@ -50,5 +50,21 @@ final class HostDiscoveryTests: XCTestCase {
         XCTAssertEqual(host.fingerprintHex, String(repeating: "ab", count: 32))
         XCTAssertFalse(host.host.isEmpty, "a resolved address is required to connect")
         XCTAssertGreaterThan(host.port, 0, "a resolved port is required to connect")
+
+        // A rescan tears the browser down and re-arms it (the only way past the iOS local-network
+        // permission gate without relaunching). The host must come BACK — `refresh()` cancels every
+        // in-flight resolve and invalidates the previous generation's callbacks, so a re-arm that
+        // failed to re-drive them would leave the list permanently empty.
+        await discovery.rescan()
+        var reappeared = false
+        let rescanDeadline = Date().addingTimeInterval(10)
+        while Date() < rescanDeadline {
+            if await discovery.hosts.contains(where: { $0.id == uniqueid }) {
+                reappeared = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(reappeared, "a rescan must re-find a host that is still advertising")
     }
 }

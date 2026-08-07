@@ -107,6 +107,14 @@ class ScreenshotTest {
     fun connectingConsole() = shootRoot("connecting-console") { ConnectConsoleScene() }
 
     @Test
+    fun consoleSettings() = shootRoot("console-settings") { ConsoleSettingsScene() }
+
+    /** A PALE palette: the whole UI flips to dark ink on white frost, which only a shot proves. */
+    @Test
+    fun consoleSettingsLight() =
+        shootRoot("console-settings-light") { ConsoleSettingsScene(paletteId = "holo") }
+
+    @Test
     fun trust() = shootScreen("trust") {
         HostsScene()
         TrustDialog()

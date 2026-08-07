@@ -23,6 +23,14 @@ interface FormState {
 	header: string;
 	logo: string;
 	command: string;
+	/** Console-password re-confirmation, required only when `command` is set — see the field's
+	 *  own comment at the render site (2026-08-05 review M-6). Never round-tripped from the
+	 *  server, so it is always empty on open, including when editing an entry that has one. */
+	password: string;
+	/** `true` = this entry opens a launcher rather than a game (design D4). Purely presentational:
+	 *  the console groups launcher entries into their own rail, and clients that don't know the
+	 *  field render them as ordinary tiles. */
+	isLauncher: boolean;
 	// Details — the flattened GameMeta fields; numbers and lists are kept as the raw
 	// text the user typed and only parsed on submit.
 	platform: string;
@@ -43,6 +51,8 @@ const emptyForm: FormState = {
 	header: "",
 	logo: "",
 	command: "",
+	password: "",
+	isLauncher: false,
 	platform: "",
 	description: "",
 	developer: "",
@@ -62,6 +72,10 @@ function formFrom(entry: GameEntry): FormState {
 		header: entry.art.header ?? "",
 		logo: entry.art.logo ?? "",
 		command: entry.launch?.kind === "command" ? entry.launch.value : "",
+		password: "",
+		// Round-tripped like every other field: `update_custom` REPLACES the whole entry, so an
+		// unread field here would silently demote a launcher entry back to a game on any edit.
+		isLauncher: entry.role === "launcher",
 		platform: entry.platform ?? "",
 		description: entry.description ?? "",
 		developer: entry.developer ?? "",
@@ -104,6 +118,11 @@ function toInput(f: FormState): CustomInput {
 			logo: trim(f.logo),
 		},
 		launch: command ? { kind: "command", value: command } : null,
+		// The BFF re-verifies this and strips it before forwarding; the host never sees the field.
+		// Only sent when there is a command to authorize, matching the conditional gate.
+		...(command ? { password: f.password } : {}),
+		// Omitted when it is the default, matching the host's skip-when-`game` serialization.
+		...(f.isLauncher ? { role: "launcher" as const } : {}),
 		platform: trim(f.platform),
 		description: trim(f.description),
 		developer: trim(f.developer),
@@ -208,6 +227,8 @@ export const GameForm: FC<{
 		e.preventDefault();
 		const data = toInput(form);
 		if (!data.title) return;
+		// A command is code the host will run on its own; the password field is required with it.
+		if (form.command.trim() && !form.password) return;
 		onSubmit(data);
 	};
 
@@ -270,6 +291,42 @@ export const GameForm: FC<{
 						onChange={set("command")}
 						help={m.library_field_command_help()}
 					/>
+					{/* A launch command is a shell command the host runs as the host user, so saving
+					    one clears the same bar as a hook or an unreviewed install: the console
+					    password, not just a 7-day session cookie (2026-08-05 review M-6). Shown only
+					    when there is a command to authorize — gating an ordinary title/art edit
+					    would just train the operator to type it without reading. */}
+					{form.command.trim() && (
+						<Field
+							id="password"
+							label={m.library_field_password()}
+							value={form.password}
+							onChange={set("password")}
+							help={m.library_field_password_help()}
+							type="password"
+							required
+						/>
+					)}
+					{/* Design D4: a launcher entry opens the launcher itself rather than a title. It
+					    launches and leases like any other entry — this only moves it into the
+					    console's Launchers rail. Hand-adding one is the supported way to get a
+					    "Heroic" or "Lutris" tile without installing that source's plugin. */}
+					<div className="space-y-2">
+						<div className="flex items-center gap-2">
+							<input
+								id="lib-isLauncher"
+								type="checkbox"
+								checked={form.isLauncher}
+								onChange={(e) =>
+									setForm((f) => ({ ...f, isLauncher: e.target.checked }))
+								}
+							/>
+							<Label htmlFor="lib-isLauncher">{m.library_field_role()}</Label>
+						</div>
+						<p className="text-xs text-muted-foreground">
+							{m.library_field_role_help()}
+						</p>
+					</div>
 					<fieldset className="space-y-4 border-t pt-2">
 						<legend className="sr-only">{m.library_details_legend()}</legend>
 						<p

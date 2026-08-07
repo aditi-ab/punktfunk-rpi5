@@ -817,6 +817,31 @@ async fn serve_session(
             anyhow::bail!("pairing requires the client to present a certificate");
         };
         let client_fp_hex = fingerprint_hex(&client_fp);
+        // The cooldown is charged BEFORE the arming state is consulted, and stamped on EVERY
+        // outcome — including the rejections.
+        //
+        // It used to be charged only after `pin_for_attempt` returned a PIN, which made the two
+        // rejections free: an unpaired LAN peer could ask "is pairing armed right now?" at
+        // unlimited rate at zero cost, learning the moment the operator opens a window and racing
+        // the legitimate device into it (2026-08-05 review M-5). Charging first costs an attacker
+        // one cooldown per probe and makes armed/disarmed indistinguishable from rate-limited.
+        //
+        // The trade is deliberate: a peer spamming knocks can now hold the cooldown against the
+        // operator's real device. That is a visible, self-limiting nuisance — the operator retries
+        // — whereas the oracle was silent and gave away the window.
+        {
+            let mut last = last_pairing.lock().unwrap();
+            if let Some(t) = *last {
+                if t.elapsed() < PAIRING_COOLDOWN {
+                    close_rejected(
+                        &conn,
+                        punktfunk_core::reject::RejectReason::PairingRateLimited,
+                    );
+                    anyhow::bail!("pairing rate-limited — retry shortly");
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
         // Resolve the live arming PIN per attempt (so a lapsed window no longer pairs), honoring any
         // fingerprint binding.
         let pin = match np.pin_for_attempt(&client_fp_hex) {
@@ -839,19 +864,6 @@ async fn serve_session(
                 )
             }
         };
-        {
-            let mut last = last_pairing.lock().unwrap();
-            if let Some(t) = *last {
-                if t.elapsed() < PAIRING_COOLDOWN {
-                    close_rejected(
-                        &conn,
-                        punktfunk_core::reject::RejectReason::PairingRateLimited,
-                    );
-                    anyhow::bail!("pairing rate-limited — retry shortly");
-                }
-            }
-            *last = Some(std::time::Instant::now());
-        }
         return pair_ceremony(&conn, send, recv, req, host_fp, np, &pin)
             .await
             .map(|()| Served::Session);
@@ -1208,7 +1220,22 @@ async fn serve_session(
     // channel's 4 ms recv timeout — every motion sample of a pure-gyro aim (no button
     // traffic) ate up to 4 ms of added latency/jitter. A single channel wakes the thread on
     // whichever arrives.
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<ClientInput>();
+    // BOUNDED, and lossy on overflow — the mic plane on this very datagram loop has been bounded
+    // with `try_send` since security-review S6, and the three input planes had simply never been
+    // given the same treatment (2026-08-05 review M-3).
+    //
+    // The producer is one `read_datagram` loop that can push a message per datagram; the consumer
+    // handles ONE item per iteration and then runs a full gamepad feedback pump + heartbeat. The
+    // producer therefore outruns the consumer by orders of magnitude, and with an unbounded queue
+    // the backlog is host RSS: pen batches amplify ~8× from wire to heap, so a paired client on a
+    // 100 Mbps link grows the host by ~100 MB/s until it dies. Reachable by any paired client, or
+    // any LAN peer under `--open`.
+    //
+    // Dropping is correct here in a way it would not be for a reliable stream: input is a
+    // real-time plane where a sample that cannot be delivered promptly is already stale — the
+    // freshest state wins, and the injector re-syncs from the next event.
+    const INPUT_QUEUE_DEPTH: usize = 1024;
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
     let rich_tx = input_tx.clone();
     // The stream loop's handle into the same pipeline: it parks the seat pointer on the
     // streamed surface (stream.rs `park_pointer`) through exactly the path client input takes.
@@ -1235,6 +1262,20 @@ async fn serve_session(
     let input_conn = conn.clone();
     tokio::spawn(async move {
         let (mut input_count, mut mic_count, mut rich_count) = (0u64, 0u64, 0u64);
+        let mut dropped = 0u64;
+        // `try_send` on a full queue drops rather than blocking this loop — blocking here would
+        // stall the mic plane and the datagram reader itself. A DISCONNECTED channel is the input
+        // thread having gone away, which is the one condition that ends the loop.
+        let mut offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
+            .try_send(item)
+        {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                dropped += 1;
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        };
         while let Ok(d) = input_conn.read_datagram().await {
             if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
                 mic_count += 1;
@@ -1249,7 +1290,7 @@ async fn serve_session(
                 });
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
                 rich_count += 1;
-                if rich_tx.send(ClientInput::Rich(rich)).is_err() {
+                if !offer(&rich_tx, ClientInput::Rich(rich)) {
                     break;
                 }
             } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
@@ -1257,7 +1298,7 @@ async fn serve_session(
                 // design; see punktfunk_core::quic::pen). Routed to the same input thread,
                 // which owns the per-session tracker + virtual tablet.
                 rich_count += 1;
-                if rich_tx.send(ClientInput::Pen(pen)).is_err() {
+                if !offer(&rich_tx, ClientInput::Pen(pen)) {
                     break;
                 }
             } else if let Some(mut ev) = InputEvent::decode(&d) {
@@ -1273,7 +1314,7 @@ async fn serve_session(
                 ) {
                     ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
                 }
-                if input_tx.send(ClientInput::Event(ev)).is_err() {
+                if !offer(&input_tx, ClientInput::Event(ev)) {
                     break;
                 }
             }
@@ -1282,6 +1323,7 @@ async fn serve_session(
             input = input_count,
             mic = mic_count,
             rich = rich_count,
+            dropped,
             "client datagram stream ended"
         );
     });

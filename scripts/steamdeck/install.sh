@@ -185,6 +185,11 @@ ok "plugin runner: ~/.local/bin/punktfunk-scripting"
 # --- 3. config -------------------------------------------------------------
 log "Configuration ($CONFIG)"
 mkdir -p "$CONFIG"
+# Owner-only: this directory holds web.env (console password + session secret), the mgmt token and
+# the host key. A plain `mkdir -p` leaves it 0755 at the Deck's default umask, so the secrets below
+# sat in a world-TRAVERSABLE directory (2026-08-05 review L-19). Matches what the host itself does
+# via `pf_paths::create_private_dir`, and is idempotent on an existing dir.
+chmod 700 "$CONFIG" 2>/dev/null || true
 if [ ! -f "$CONFIG/host.env" ]; then
     cat > "$CONFIG/host.env" <<'EOF'
 # punktfunk Steam Deck host config (sourced by the punktfunk-host user service).
@@ -235,10 +240,16 @@ if [ "$WITH_WEB" = 1 ] && [ ! -f "$CONFIG/web.env" ]; then
     # `|| true` swallows the SIGPIPE `tr` takes when `head` closes the pipe (pipefail would abort).
     WEB_PW="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 12 || true)"
     WEB_SECRET="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)"
-    cat > "$CONFIG/web.env" <<EOF
+    # `umask 077` around the redirect, not `chmod 600` after it: the heredoc CREATES the file at
+    # the ambient umask (0022 on a Deck ⇒ world-readable), so the console password and session
+    # secret existed group/world-readable for the window between the redirect and the chmod
+    # (2026-08-05 review L-19). Setting the mask first means the file is never readable at all.
+    # The chmod stays as the idempotent belt for a pre-existing file.
+    (umask 077; cat > "$CONFIG/web.env" <<EOF
 PUNKTFUNK_UI_PASSWORD=$WEB_PW
 PUNKTFUNK_UI_SECRET=$WEB_SECRET
 EOF
+    )
     chmod 600 "$CONFIG/web.env"
     ok "wrote web.env (generated login password)"
 else

@@ -109,6 +109,7 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
         };
         games.push(GameEntry {
             provider: None,
+            role: GameRole::Game,
             meta: GameMeta::pc(),
             id: format!("heroic:{runner}:{app_name}"),
             store: "heroic".into(),
@@ -128,48 +129,8 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
     Ok(games)
 }
 
-/// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
-/// gamescope. The host owns this mapping; the client only ever sends the id. CAVEAT: Heroic is a
-/// single-instance Electron app — in a fresh per-session gamescope it boots, launches the game (which
-/// renders into that gamescope) and stays hidden via `--no-gui`; but if a Heroic GUI is ALREADY
-/// running on the box, the spawned process forwards the URI and exits, which would tear the session
-/// down. The validated path is the fresh-session case; needs live confirmation on a box with Heroic.
-#[cfg(target_os = "linux")]
-pub(crate) fn heroic_command(value: &str) -> Option<String> {
-    let (runner, app) = value.split_once(':')?;
-    if !matches!(runner, "legendary" | "gog" | "nile") {
-        return None;
-    }
-    // appName charset (Epic alnum, GOG digits, Amazon alnum) — keep the URI a single safe token.
-    if app.is_empty()
-        || !app
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return None;
-    }
-    let prefix = heroic_launch_prefix()?;
-    // No quotes: gamescope spawns the app by `split_whitespace()`, and the URI has no spaces (appName
-    // is validated above) so it stays a single argv token; `&` is fine (exec'd, not shell-parsed).
-    Some(format!(
-        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
-    ))
-}
-
-/// How to invoke Heroic: the native `heroic` binary if on `PATH`, else the Flatpak app if its data
-/// root is present. `None` ⇒ Heroic not found, so no launch command.
-#[cfg(target_os = "linux")]
-fn heroic_launch_prefix() -> Option<String> {
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("heroic").is_file()));
-    if on_path {
-        return Some("heroic".into());
-    }
-    let flatpak = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .is_some_and(|h| h.join(".var/app/com.heroicgameslauncher.hgl").is_dir());
-    flatpak.then(|| "flatpak run com.heroicgameslauncher.hgl".into())
-}
+// The `heroic` launch mapping (`heroic_command` + its launcher-prefix probe) lives in `launch.rs`
+// (WP1.1) — this module enumerates, it does not launch.
 
 #[cfg(test)]
 mod tests {

@@ -234,18 +234,33 @@ The shell exports an
   already in the lockfile, via a generated-and-committed `bun.nix` (`web/bun.nix`, `sdk/bun.nix`).
   There is **no aggregate deps hash to bump** — the previous design put `bun install` in a
   fixed-output derivation whose single `outputHash` silently went stale on every lockfile change and
-  broke the build. `bun.nix` regenerates itself: `bun2nix` is a devDependency of both packages and
-  runs on every `bun install` (web's `postinstall`; the SDK's `prepare`, since sdk/ is the
-  *published* `@punktfunk/host` package and a `postinstall` would then fire on consumers' installs).
-  Regenerate by hand with `cd web && bunx bun2nix -o bun.nix` if a lockfile is ever edited directly.
+  broke the build. `bun2nix` is a devDependency of both packages and regenerates `bun.nix` on every
+  `bun install` (web's `postinstall`; the SDK's `prepare`, since sdk/ is the *published*
+  `@punktfunk/host` package and a `postinstall` would then fire on consumers' installs).
   The `@unom` scope needs no special handling: `web/bun.lock` records those tarballs' full
   `https://git.unom.io/api/packages/unom/npm/…` URLs and the registry is read-public (the same
   anonymous pull CI's rpm/deb builds do).
 
-  > ⚠ **`bun.nix` has no schema stability across bun2nix versions.** The flake input is pinned
-  > (`github:nix-community/bun2nix?ref=2.1.2`) and the npm devDependency is pinned to the *same*
-  > exact version in `web/package.json` + `sdk/package.json`. Move both together, then rerun
-  > `bun install` in `web/` and `sdk/` to regenerate.
+  > ⚠⚠ **That devDependency hook is a convenience, NOT the guarantee — `bun.nix` still drifts.**
+  > It fires only on a local `bun install` that runs lifecycle scripts. It does *not* fire under
+  > `bun install --ignore-scripts`, which is what every bun install in CI uses; and it cannot fire
+  > on a **merge or rebase**, where git carries someone else's `bun.lock` change past a `bun.nix`
+  > generated before it and reports no conflict. That is how `web/bun.nix` shipped on main holding
+  > `brace-expansion@5.0.7` while `web/bun.lock` said `5.0.8` — for **553 commits** (2026-07-27 →
+  > 2026-08-05), with `nix build .#punktfunk-web` broken the whole time, until an unrelated
+  > advisory bump happened to rerun a real `bun install` and closed it by accident.
+  >
+  > The enforcement point is **`scripts/ci/check-bun-nix.sh`** (the `bun-nix` job in `ci.yml`,
+  > unfiltered so it sees the innocuous-looking commits drift arrives through). It regenerates each
+  > `bun.nix` from its committed `bun.lock` and diffs. Fix any report with:
+  >
+  >     scripts/ci/check-bun-nix.sh --fix
+  >
+  > Never regenerate with a bare `bunx bun2nix`: **`bun.nix` has no schema stability across bun2nix
+  > versions**, and an unpinned `bunx` uses whatever is newest. The flake input
+  > (`github:nix-community/bun2nix?ref=2.1.2`) and the npm devDependency in `web/package.json` +
+  > `sdk/package.json` must name the *same exact version* — the script checks that too, and always
+  > generates with the pinned one. Move all three together, then rerun it with `--fix`.
 
   Everything past the deps fetch is offline (the console's codegen + vite build; the runner's
   `bun build --target=bun` bundle). Both launchers exec `pkgs.bun` from the store — unlike the

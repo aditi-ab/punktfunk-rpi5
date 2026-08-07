@@ -97,6 +97,31 @@ pub(crate) struct Entry {
     /// Host platforms this plugin works on (`linux`/`windows`/`macos`). Empty ⇒ all.
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// What kinds of plugin this is (`[a-z][a-z0-9-]{0,31}`, ≤4). The console filters Browse by
+    /// these, and the Game sources surface's "Add a source" rail lists exactly the entries carrying
+    /// `library` (design D5/D6). Additive: an older host ignores the field, a newer one just sees no
+    /// categories on an older index.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Optional per-platform "is this launcher installed here?" probes (design D8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect: Option<DetectProbes>,
+}
+
+/// Existence probes that let the console badge a catalog row "detected on this host" **without the
+/// host re-growing per-store knowledge** — the whole point of extracting the scanners. Store
+/// knowledge lives in the updatable, signed index; the host stays generic and only evaluates.
+///
+/// Deliberately anaemic: a probe is a path or an `HKLM\…` registry key, checked for EXISTENCE only.
+/// No reads, no content matching, no globbing beyond a single `*` segment. The index is
+/// operator-trusted but remotely updatable, so a probe must never be able to exfiltrate anything or
+/// cost more than a stat.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct DetectProbes {
+    #[serde(default)]
+    pub linux: Vec<String>,
+    #[serde(default)]
+    pub windows: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -228,7 +253,38 @@ impl Entry {
         self.platforms
             .retain(|p| matches!(p.as_str(), "linux" | "windows" | "macos"));
         self.platforms.truncate(4);
+        // Categories and probes are cosmetic/advisory: a malformed one is dropped, never fatal to
+        // the entry — a plugin must stay installable even if a future index writes a category this
+        // host build has never heard of.
+        self.categories.retain(|c| valid_category(c));
+        self.categories.truncate(4);
+        if let Some(d) = &mut self.detect {
+            d.linux.retain(|p| valid_probe(p));
+            d.windows.retain(|p| valid_probe(p));
+            d.linux.truncate(MAX_PROBES);
+            d.windows.truncate(MAX_PROBES);
+            if d.linux.is_empty() && d.windows.is_empty() {
+                self.detect = None;
+            }
+        }
         Ok(())
+    }
+
+    /// Does this entry's platform probe match on the running host? `None` = the entry declares no
+    /// probes for this platform, i.e. "unknown", which the console renders differently from "no".
+    pub(crate) fn detected(&self) -> Option<bool> {
+        let probes = self.detect.as_ref()?;
+        let list = if cfg!(windows) {
+            &probes.windows
+        } else if cfg!(target_os = "linux") {
+            &probes.linux
+        } else {
+            return None;
+        };
+        if list.is_empty() {
+            return None;
+        }
+        Some(list.iter().any(|p| probe_matches(p)))
     }
 
     /// Is this entry installable on the running host? Returns the operator-facing reason when not.
@@ -372,6 +428,94 @@ fn is_https(url: &str) -> bool {
     url.starts_with("https://") && url.len() > "https://".len()
 }
 
+/// A plugin category (design D5): same shape the registration API accepts, so a plugin's declared
+/// category and its catalog row can never disagree about spelling.
+fn valid_category(c: &str) -> bool {
+    (1..=32).contains(&c.len())
+        && c.starts_with(|ch: char| ch.is_ascii_lowercase())
+        && c.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// How many probes one platform may declare — a handful of well-chosen paths covers any launcher,
+/// and the cap bounds the stat cost of rendering the catalog.
+const MAX_PROBES: usize = 8;
+
+/// Is this a probe the host will evaluate? An **absolute** filesystem path with at most one `*`
+/// segment, or an `HKLM\…` registry key. Everything else is dropped.
+///
+/// The restrictions are the security model (D8). Absolute: a relative path would resolve against
+/// whatever the host's cwd happens to be. One `*` segment: bounded fan-out, so a probe can't walk a
+/// tree. `HKLM` only: `HKCU` is unreadable as LocalService anyway, and pointing the host at an
+/// arbitrary hive is not something a remote index should be able to ask for.
+fn valid_probe(p: &str) -> bool {
+    if p.is_empty() || p.len() > 260 {
+        return false;
+    }
+    if let Some(key) = p.strip_prefix("HKLM\\") {
+        return !key.is_empty()
+            && !key.contains("..")
+            && key.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'\\' | b' ' | b'-' | b'_' | b'.')
+            });
+    }
+    let b = p.as_bytes();
+    let absolute = p.starts_with('/') || (b.len() >= 3 && b[1] == b':' && b[2] == b'\\');
+    // No traversal, and at most ONE wildcard segment (`~` is not expanded — the host runs as a
+    // service account whose home means nothing to a user's launcher install).
+    absolute && !p.contains("..") && p.matches('*').count() <= 1
+}
+
+/// Evaluate one probe: does the path (or registry key) exist? Existence only — never a read.
+fn probe_matches(p: &str) -> bool {
+    #[cfg(windows)]
+    if let Some(key) = p.strip_prefix("HKLM\\") {
+        use std::os::windows::process::CommandExt;
+        // `reg.exe query` rather than a registry crate: dependency-free, and it is exactly what a
+        // library plugin will use for the same job under LocalService.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        return std::process::Command::new("reg.exe")
+            .args(["query", &format!("HKLM\\{key}")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    if p.starts_with("HKLM\\") {
+        return false; // a Windows probe on a POSIX host is simply not a match
+    }
+    match p.split_once('*') {
+        None => std::path::Path::new(p).exists(),
+        // One wildcard: list the parent of the wildcard segment and match the fixed prefix/suffix
+        // around it. Bounded to a single directory read.
+        Some((before, after)) => {
+            let (dir, prefix) = match before.rfind(['/', '\\']) {
+                Some(i) => (&before[..=i], &before[i + 1..]),
+                None => return false, // a wildcard with no directory to anchor it
+            };
+            let (suffix, rest) = match after.find(['/', '\\']) {
+                Some(i) => (&after[..i], &after[i..]),
+                None => (after, ""),
+            };
+            let Ok(read) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            read.flatten().any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(prefix)
+                    && name.ends_with(suffix)
+                    && name.len() >= prefix.len() + suffix.len()
+                    && (rest.is_empty()
+                        || e.path().join(rest.trim_start_matches(['/', '\\'])).exists())
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +543,73 @@ mod tests {
     fn rejects_unknown_schema_and_bad_json() {
         assert!(Index::parse(br#"{"schema":2,"plugins":[]}"#).is_err());
         assert!(Index::parse(b"not json").is_err());
+    }
+
+    /// WP2.8 is additive on purpose — SCHEMA stays 1. An index written by a newer curator must load
+    /// on an older host (unknown fields ignored) and vice versa (absent fields default), or the
+    /// signed-index rollout would need a flag day.
+    #[test]
+    fn categories_and_probes_are_additive_and_sanitized() {
+        // An entry with NEITHER field — every index in the wild today.
+        let e = &Index::parse(&doc(GOOD)).unwrap().plugins[0];
+        assert!(e.categories.is_empty());
+        assert!(e.detect.is_none());
+        assert_eq!(e.detected(), None, "no probes ⇒ unknown, not `false`");
+
+        // With both, including rows that must be dropped rather than fail the entry.
+        let rich = GOOD.trim_end_matches('}').to_string()
+            + r#","categories":["library","Bad Cat","x","y","z","w"],
+                 "detect":{"linux":["/usr/bin/steam","relative/path","/etc/../etc/passwd"],
+                           "windows":["HKLM\\SOFTWARE\\Valve\\Steam","HKCU\\SOFTWARE\\Valve"]}}"#;
+        let e = &Index::parse(&doc(&rich)).unwrap().plugins[0];
+        assert_eq!(
+            e.categories,
+            ["library", "x", "y", "z"],
+            "malformed dropped, capped at 4"
+        );
+        let d = e.detect.as_ref().expect("probes kept");
+        assert_eq!(d.linux, ["/usr/bin/steam"], "relative + traversal dropped");
+        assert_eq!(
+            d.windows,
+            ["HKLM\\SOFTWARE\\Valve\\Steam"],
+            "HKCU is not evaluable as LocalService — dropped"
+        );
+    }
+
+    #[test]
+    fn probe_shapes_are_bounded() {
+        assert!(valid_probe("/usr/bin/steam"));
+        assert!(
+            valid_probe("/home/*/.steam"),
+            "one wildcard segment is fine"
+        );
+        assert!(valid_probe(r"C:\Program Files (x86)\Steam\steam.exe"));
+        assert!(valid_probe(r"HKLM\SOFTWARE\WOW6432Node\Valve\Steam"));
+        // Rejected: relative, traversal, more than one wildcard, other hives, absurd length.
+        assert!(!valid_probe("steam"));
+        assert!(!valid_probe("/usr/../etc/passwd"));
+        assert!(!valid_probe("/home/*/games/*/steam"));
+        assert!(!valid_probe(r"HKCU\SOFTWARE\Valve"));
+        assert!(!valid_probe(""));
+        assert!(!valid_probe(&"/x".repeat(200)));
+    }
+
+    /// The evaluator does existence checks only, against real paths, and never reads a byte.
+    #[test]
+    fn probes_evaluate_against_the_filesystem() {
+        let dir = std::env::temp_dir().join(format!("pf-probe-{}", std::process::id()));
+        let nested = dir.join("SteamLibrary-42");
+        std::fs::create_dir_all(nested.join("steamapps")).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+
+        assert!(probe_matches(&format!("{d}/SteamLibrary-42")));
+        assert!(!probe_matches(&format!("{d}/nope")));
+        // One wildcard segment, with and without a trailing fixed component.
+        assert!(probe_matches(&format!("{d}/SteamLibrary-*")));
+        assert!(probe_matches(&format!("{d}/SteamLibrary-*/steamapps")));
+        assert!(!probe_matches(&format!("{d}/SteamLibrary-*/nope")));
+        assert!(!probe_matches(&format!("{d}/Other-*")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

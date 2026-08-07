@@ -36,8 +36,15 @@ ports=47984,47989,48010/tcp|47998:48010/udp|5353/udp
 # Run the host with `--mgmt-bind 127.0.0.1:47990` to keep 47990 loopback-only (then don't open it).
 #
 # The optional web console (the separate punktfunk-web package). Open only if you installed it and
-# want to reach it from another device — it binds all interfaces on TCP 47992 (HTTPS, login-gated).
+# want to reach it from another device — it binds all interfaces on TCP 47992 (HTTPS, login-gated),
+# and serves plugin UIs from a SEPARATE ORIGIN on TCP 47993.
+#
+# 47993 is not a second console. A plugin's interface is third-party code, and serving it on the
+# console's own origin let it act as the logged-in operator (security-review 2026-08-05 H-3). Same
+# host, same certificate, different port: a different ORIGIN to the browser, so the same-origin
+# policy is the boundary — but still the same SITE, so the login session still reaches it. It is
+# login-gated exactly like the console, and only needed for plugins that ship a UI.
 [punktfunk-web]
 title=punktfunk web console
-description=The optional punktfunk management web console (HTTPS, login-gated) reachable from the LAN
-ports=47992/tcp
+description=The optional punktfunk management web console (HTTPS, login-gated) reachable from the LAN, plus the separate-origin port its plugin UIs are served on
+ports=47992,47993/tcp

@@ -73,7 +73,7 @@ export const Incompatible: Story = {
 			...BASE,
 			compatible: false,
 			incompatible_reason:
-				"needs punktfunk host ≥ 0.16.0 (this host is 0.15.0)",
+				"needs Punktfunk host ≥ 0.16.0 (this host is 0.15.0)",
 		},
 	},
 };

@@ -5,10 +5,10 @@ use crate::glyphs::{hint_bar, GlyphStyle};
 use crate::library::LibraryShared;
 use crate::model::HostRow;
 use crate::screens::{Bg, Ctx, Screen};
-use crate::theme::{white, Fonts, PanelStroke, W, WHITE};
+use crate::theme::{fg, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::PadInfo;
 use pf_client_core::trust;
-use skia_safe::{Canvas, Color4f, Rect};
+use skia_safe::{Canvas, Rect};
 use std::time::Instant;
 
 use super::{Motion, Shell, BOTTOM_BAND, TOP_BAND};
@@ -31,6 +31,10 @@ impl Shell {
             .replace(now)
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f64().clamp(0.0, 0.05));
         self.sync();
+        // Publish the palette's ink before ANYTHING draws — every widget, glyph and panel in
+        // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
+        // the previous palette's text over the new palette's field.
+        crate::theme::set_ink(self.ink);
         self.pads = pads.to_vec();
         self.glyphs = GlyphStyle::from_pref(pad_pref);
         self.chip = Some(pad.map_or_else(
@@ -67,7 +71,9 @@ impl Shell {
             }
         };
 
-        // Backdrop crossfade follows the top screen.
+        // The backdrop settles into (or out of) calm with the screen transition. It is the
+        // SAME living field either way — a form screen quiets it, it doesn't replace it —
+        // so this is one shader pass with a chased uniform, not two stacked backdrops.
         let bg_target = match self.stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -76,16 +82,7 @@ impl Shell {
         if (self.bg_mix - bg_target).abs() < 0.005 {
             self.bg_mix = bg_target;
         }
-        if self.bg_mix < 1.0 {
-            self.draw_aurora(canvas, w, h, t);
-        } else {
-            canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
-        }
-        if self.bg_mix > 0.0 {
-            canvas.save_layer_alpha_f(None, self.bg_mix as f32);
-            crate::theme::draw_form_background(canvas, w, h);
-            canvas.restore();
-        }
+        self.draw_aurora(canvas, w, h, t, self.bg_mix);
 
         // The screens, through the transition choreography.
         let content = Rect::from_ltrb(
@@ -175,7 +172,7 @@ impl Shell {
                 18.0 * k + 16.0 * k,
                 W::Medium,
                 size,
-                white(0.7),
+                fg(0.7),
             );
         }
 
@@ -231,7 +228,7 @@ impl LayerEnv<'_> {
             &screen.title(&ctx),
             W::Bold,
             30.0 * self.k,
-            WHITE,
+            fg(1.0),
             self.w / 2.0,
             18.0 * self.k,
             self.w * 0.7,

@@ -674,6 +674,9 @@ pub struct HostsPage {
     saved: FactoryVecDeque<HostCard>,
     discovered: FactoryVecDeque<HostCard>,
     widgets: PageWidgets,
+    /// Forces the mDNS browse to re-query (the header's Refresh button). `None` only if the
+    /// browse never started — the button then just re-renders, which is what it did before.
+    rescan: Option<discovery::Rescan>,
 }
 
 struct PageWidgets {
@@ -693,6 +696,10 @@ pub enum HostsMsg {
     },
     /// Reload the disk store and re-render (fresh pairings, renames, the library gate).
     Refresh,
+    /// Re-query mDNS *and* re-render — the header's Refresh button. Distinct from [`Self::Refresh`],
+    /// which only re-reads local state: after a while `mdns-sd` re-queries about once an hour, so a
+    /// host that appeared since (or whose announcement was lost) needs an actual query to show up.
+    Rescan,
     /// A completed reachability sweep: saved-host key → reachable. Merged into the online pips.
     Probed(HashMap<String, bool>),
     /// Mark the card matching `ConnectRequest::card_key` as connecting; `None` restores.
@@ -841,6 +848,13 @@ impl SimpleComponent for HostsPage {
         add_host_btn.set_tooltip_text(Some("Add host"));
         add_host_btn.set_action_name(Some("win.add-host"));
         header.pack_start(&add_host_btn);
+        let rescan_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+        rescan_btn.set_tooltip_text(Some("Scan the network for hosts again"));
+        {
+            let sender = sender.clone();
+            rescan_btn.connect_clicked(move |_| sender.input(HostsMsg::Rescan));
+        }
+        header.pack_start(&rescan_btn);
         let menu = gio::Menu::new();
         menu.append(Some("Preferences"), Some("win.preferences"));
         menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
@@ -867,8 +881,8 @@ impl SimpleComponent for HostsPage {
         }
 
         // Stream mDNS adverts into the model; every add/remove re-evaluates both grids.
+        let (rx, rescan) = discovery::browse();
         {
-            let rx = discovery::browse();
             let sender = sender.clone();
             glib::spawn_future_local(async move {
                 while let Ok(event) = rx.recv().await {
@@ -937,6 +951,7 @@ impl SimpleComponent for HostsPage {
                 disc_heading,
                 searching,
             },
+            rescan: Some(rescan),
         };
         model.rebuild();
 
@@ -954,6 +969,14 @@ impl SimpleComponent for HostsPage {
                 self.rebuild();
             }
             HostsMsg::Refresh => self.rebuild(),
+            HostsMsg::Rescan => {
+                if let Some(rescan) = &self.rescan {
+                    rescan.request();
+                }
+                // Adverts stream in as they answer; re-render now so the local half is current
+                // either way.
+                self.rebuild();
+            }
             HostsMsg::Probed(map) => {
                 self.probed = map;
                 self.rebuild();

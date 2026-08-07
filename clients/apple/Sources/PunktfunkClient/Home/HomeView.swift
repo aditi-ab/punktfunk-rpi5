@@ -53,7 +53,18 @@ struct HomeView: View {
         NavigationStack {
             Group {
                 if store.hosts.isEmpty && discoveredUnsaved.isEmpty {
-                    emptyState
+                    #if os(tvOS)
+                    emptyState // no pull-to-refresh on a remote; the action row carries Refresh
+                    #else
+                    // Inside a ScrollView purely so the pull gesture works on the ONE screen
+                    // where a rescan matters most: the one that found nothing.
+                    ScrollView {
+                        emptyState
+                            .frame(maxWidth: .infinity)
+                            .containerRelativeFrame(.vertical)
+                    }
+                    .refreshable { await discovery.rescan() }
+                    #endif
                 } else {
                     ScrollView {
                         if !store.hosts.isEmpty {
@@ -94,6 +105,7 @@ struct HomeView: View {
                             } label: {
                                 Label("Settings", systemImage: "gearshape")
                             }
+                            refreshButton
                         }
                         .padding(.top, 24)
                         // One FULL-WIDTH focus target for any downward move out of the grid.
@@ -106,6 +118,9 @@ struct HomeView: View {
                         .focusSection()
                         #endif
                     }
+                    #if !os(tvOS)
+                    .refreshable { await discovery.rescan() }
+                    #endif
                 }
             }
             .navigationTitle("Punktfunk")
@@ -151,6 +166,7 @@ struct HomeView: View {
                 if showsArrangeMenu {
                     ToolbarItem(placement: .topBarTrailing) { arrangeMenu }
                 }
+                ToolbarItem(placement: .topBarTrailing) { refreshButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
                 #else
                 if showsArrangeMenu {
@@ -158,6 +174,10 @@ struct HomeView: View {
                         arrangeMenu
                             .help("Sort and group the host list")
                     }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    refreshButton
+                        .help("Scan the network for hosts again")
                 }
                 ToolbarItem(placement: .primaryAction) {
                     addHostButton
@@ -324,10 +344,17 @@ struct HomeView: View {
         ContentUnavailableView {
             Label("No Hosts", systemImage: "rectangle.connected.to.line.below")
         } description: {
-            Text("Add your punktfunk host with the + button.")
+            Text("Add your Punktfunk host with the + button, or scan the network again.")
         } actions: {
             Button("Add Host") { showAddHost = true }
                 .glassProminentButtonStyle()
+                #if os(iOS)
+                .controlSize(.large)
+                #endif
+            // The screen a host SHOULD have appeared on is where a rescan is worth offering
+            // outright rather than hiding behind a pull gesture.
+            Button("Scan Again") { discovery.refresh() }
+                .disabled(discovery.isScanning)
                 #if os(iOS)
                 .controlSize(.large)
                 #endif
@@ -343,6 +370,18 @@ struct HomeView: View {
         } label: {
             Label("Add Host", systemImage: "plus")
         }
+    }
+
+    /// Re-run mDNS discovery from scratch. Discovery heals itself now (`HostDiscovery`'s sweep),
+    /// so this is the fallback the field asked for — and the fastest way past the iOS
+    /// local-network permission gate, which only a NEW browser can clear.
+    private var refreshButton: some View {
+        Button {
+            discovery.refresh()
+        } label: {
+            Label("Refresh", systemImage: "arrow.clockwise")
+        }
+        .disabled(discovery.isScanning)
     }
 
     #if !os(tvOS)

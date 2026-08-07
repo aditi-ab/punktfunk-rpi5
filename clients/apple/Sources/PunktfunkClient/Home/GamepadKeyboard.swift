@@ -14,6 +14,7 @@ import SwiftUI
 #if os(iOS) || os(macOS)
 
 struct GamepadKeyboard: View {
+    @Environment(\.gamepadInk) private var ink
     @Binding var text: String
     /// Restricts typed characters (e.g. digits for a port field); backspace always works.
     var allowed: CharacterSet?
@@ -79,7 +80,7 @@ struct GamepadKeyboard: View {
         }
         .overlay {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                .strokeBorder(ink.fg(0.12), lineWidth: 1)
         }
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .light), trigger: pressTick)
@@ -110,11 +111,11 @@ struct GamepadKeyboard: View {
                     .font(.geist(15, .semibold, relativeTo: .callout))
             }
         }
-        .foregroundStyle(focused ? Color.black : .white)
+        .foregroundStyle(focused ? Color.black : ink.fg)
         .frame(maxWidth: .infinity, minHeight: compact ? 34 : 42)
         .background {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(focused ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.white.opacity(0.08)))
+                .fill(focused ? AnyShapeStyle(ink.accent) : AnyShapeStyle(ink.fg(0.08)))
         }
         .animation(.smooth(duration: 0.12), value: focused)
         .contentShape(Rectangle())

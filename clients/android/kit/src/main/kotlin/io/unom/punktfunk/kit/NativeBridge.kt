@@ -88,6 +88,18 @@ object NativeBridge {
     external fun nativeSessionEnded(handle: Long): Boolean
 
     /**
+     * WHY the session ended, as a [SessionEndReason] ordinal — decode with
+     * [SessionEndReason.fromNative]. `0` (NONE) before it ends, or on a `0` handle.
+     *
+     * The companion to [nativeSessionEnded], which only says THAT it ended. Both are needed: the
+     * flag to leave a dead stream, this to decide what to tell the user. A player quitting their
+     * game and a host falling off the network both end the session, and with no way to separate
+     * them the watchdog said "the host may be asleep" for all of them — wrong for every deliberate
+     * ending. Cheap (one atomic load); UI-safe.
+     */
+    external fun nativeEndReason(handle: Long): Int
+
+    /**
      * Run the SPAKE2 PIN ceremony, presenting [certPem]/[keyPem]. Returns the host's verified
      * fingerprint (64-hex) to persist + pin, or `""` on failure (wrong PIN / MITM / unreachable).
      * Blocking — call off the main thread.

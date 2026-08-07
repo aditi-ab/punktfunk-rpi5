@@ -1,0 +1,167 @@
+# Nix packaging gate. Until this existed, NOTHING in CI ever evaluated flake.nix: the word "nix"
+# appeared in exactly one workflow file, and only in a comment about bun2nix breaking a Windows
+# step. Every Nix regression therefore reached main invisibly and was found by hand on a Nix box —
+# `nix build .#punktfunk-web` was broken for 553 commits before anyone noticed (see the bun-nix job
+# in ci.yml for that story).
+#
+# Two tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
+# run for an hour on every push:
+#
+#   * eval  — `nix flake check --no-build`: instantiates every package, app, check, devShell and
+#             the NixOS module without building them. Catches the failures that actually happen to
+#             this flake — a renamed file, a callPackage argument that no longer exists, a syntax
+#             error, a package attribute dropped from packages.nix.
+#   * bun   — actually BUILDS punktfunk-web + punktfunk-scripting. These are the two derivations
+#             whose inputs churn constantly (every dependency bump moves a lockfile) and they cost
+#             minutes, not hours, because neither compiles Rust. This is the end-to-end proof that
+#             the generated bun.nix really does materialise a working node_modules offline — it
+#             covers what the ci.yml drift gate cannot, e.g. a tarball the registry no longer
+#             serves, or the codegen going quietly message-less (see packages.nix's inlang note).
+#
+# The Rust packages (punktfunk-host, punktfunk-client) and punktfunk-gamescope are NOT built here.
+# They are the expensive ones and their inputs are already gated by the `rust` job in ci.yml; build
+# them by hand on a Nix box, or with the `build-rust` dispatch input below.
+#
+# ⚠ pull_request is deliberately present. flatpak.yml shipped with push-only triggers and manifest
+# breakage reached main invisibly for weeks — do not "simplify" this workflow by dropping it.
+# ⚠ The two path lists are duplicated on purpose: a YAML anchor would be tidier, but Gitea's
+# workflow parser is not a place to bet on anchor support. Keep them in step by hand.
+name: nix
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "packaging/nix/**"
+      - "**/bun.lock"
+      - "**/bun.nix"
+      - "**/package.json"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".gitea/workflows/nix.yml"
+      - "scripts/ci/check-bun-nix.sh"
+  pull_request:
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "packaging/nix/**"
+      - "**/bun.lock"
+      - "**/bun.nix"
+      - "**/package.json"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".gitea/workflows/nix.yml"
+      - "scripts/ci/check-bun-nix.sh"
+  workflow_dispatch:
+    inputs:
+      build-rust:
+        description: "Also build punktfunk-host + punktfunk-client (slow: full Rust workspace)"
+        type: boolean
+        default: false
+
+jobs:
+  flake:
+    runs-on: ubuntu-24.04
+    container:
+      # NOT nixos/nix. That image contains nix and essentially nothing else — in particular no
+      # /bin/sleep, and Gitea's act_runner starts every job container with
+      # `entrypoint=["/bin/sleep","10800"]`. The container therefore never starts:
+      #   failed to create shim task: OCI runtime create failed: unable to start container
+      #   process: exec: "/bin/sleep": stat /bin/sleep: no such file or directory
+      # and — the part that makes this expensive to debug — every step is then reported as
+      # `cancelled` rather than failed, which reads exactly like a superseded run.
+      #
+      # node:22-bookworm instead: a full Debian with coreutils (so the entrypoint exists) and a
+      # real node (so actions/checkout works with no pre-checkout install dance), and audit.yml
+      # already pulls it on this fleet, so it is proven to resolve here. Nix is installed below.
+      image: node:22-bookworm
+    timeout-minutes: 90
+    env:
+      # The flake needs both experimental features. Also baked into the installer's --extra-conf
+      # below; this covers any step that shells out before that config is read.
+      NIX_CONFIG: "experimental-features = nix-command flakes"
+      # Absolute path rather than $GITHUB_PATH: one less runner behaviour to assume.
+      NIX: /nix/var/nix/profiles/default/bin/nix
+      # `--init none` installs Nix with NO daemon running, but the installer still writes a profile
+      # script that exports NIX_REMOTE=daemon. Anything that sources it (any `-l` login shell) then
+      # dies on `cannot connect to socket at '/nix/var/nix/daemon-socket/socket'` — which is exactly
+      # how the installer's own self-test fails during this step, harmlessly, and would be a
+      # confusing first thing to read in the log. The steps below never source that profile, but pin
+      # the empty value so a future step cannot reintroduce it. Empty = talk to the local store
+      # directly, which works because the job runs as root (MEASURED: "Store URL: local, Trusted: 1",
+      # and a real `nix build` of a trivial derivation succeeds).
+      NIX_REMOTE: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Determinate installer needs curl + xz; git so nix can read the flake from the checkout.
+      # (node:22-bookworm is the full image and already has all three — this is belt-and-braces
+      # against a future slim-image swap, and costs one cached apt call.)
+      - name: Installer prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git
+
+      # `--init none` is the container mode: no systemd, no daemon. Running as root, nix then talks
+      # to the store directly. Determinate Nix is also what the Nix box (.21) runs, so CI and the
+      # hand-verification box stay on the same distribution.
+      - name: Install Nix
+        run: |
+          curl -fsSL https://install.determinate.systems/nix -o /tmp/nix-installer.sh
+          sh /tmp/nix-installer.sh install linux --init none --no-confirm \
+            --extra-conf "experimental-features = nix-command flakes"
+          "$NIX" --version
+
+      # Nix reads the flake through libgit2 and refuses a checkout owned by another uid
+      # ("detected dubious ownership"), which is the normal case for a container job.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$PWD"
+
+      # Diagnostics. This fleet ran a runner out of disk on 2026-08-06 (the ci.yml `web` job died
+      # with "no space left on device" mid-`bun install`), and a Nix build is the heaviest thing
+      # here — so record the headroom, or a future failure is a guess.
+      - name: Environment
+        run: df -h / /nix /tmp || true
+
+      # Evaluates + instantiates every flake output without building any of it.
+      - name: nix flake check (eval only)
+        run: |
+          "$NIX" flake check --no-build --show-trace
+
+      # The bun packages, built for real. This is the leg that would have caught the stale
+      # web/bun.nix end to end: the derivation's offline `bun install` runs against a store cache
+      # built strictly from bun.nix, so a lockfile that cache does not cover fails here.
+      # Path-filtered, so it runs only when the packaging or a lockfile actually moves. If it ever
+      # starts going red on runner disk rather than on real defects, demote it to the dispatch
+      # opt-in below rather than leaving an infra-red gate on the board.
+      - name: Build the bun packages
+        run: |
+          "$NIX" build --print-build-logs .#punktfunk-web .#punktfunk-scripting
+
+      # Both launchers exec pkgs.bun from the store; confirm they were produced and are real entry
+      # points rather than dangling wrappers.
+      - name: Smoke the built launchers
+        run: |
+          set -eu
+          web=$("$NIX" path-info .#punktfunk-web)
+          scripting=$("$NIX" path-info .#punktfunk-scripting)
+          test -x "$web/bin/punktfunk-web-server" || { echo "no punktfunk-web-server in $web" >&2; exit 1; }
+          test -x "$scripting/bin/punktfunk-scripting" || { echo "no punktfunk-scripting in $scripting" >&2; exit 1; }
+          # The console must be the bun bundle, not a node one — the same assertion packages.nix
+          # makes at build time, re-checked on the installed output.
+          grep -q 'Bun\.serve' "$web/share/punktfunk-web/.output/server/index.mjs" \
+            || { echo "installed console is not a bun bundle" >&2; exit 1; }
+          echo "bun packages OK: $web  $scripting"
+
+      # Opt-in only: the full Rust workspace through crane, which is the hour-long leg.
+      # `github.event.inputs.*` (string) rather than `inputs.*` — the portable spelling.
+      - name: Build the Rust packages (dispatch opt-in)
+        if: ${{ github.event.inputs.build-rust == 'true' }}
+        run: |
+          "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client

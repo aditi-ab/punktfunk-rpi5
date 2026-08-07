@@ -12,11 +12,44 @@ export const Artwork = Schema.Struct({
 });
 export type Artwork = typeof Artwork.Type;
 
+/**
+ * How the host should launch a title. **The host owns this vocabulary** — it validates the value
+ * per kind and builds the actual URI / command line itself, so a plugin only ever supplies a
+ * validated value, never a command. That is the security invariant behind the whole provider lane:
+ * a client sends an entry id, and the host resolves what to run.
+ *
+ * `kind` is a plain string rather than a union so the kit never has to ship a release to keep up
+ * with a host that grew a new kind. The kinds the host understands today:
+ *
+ * | kind | value | platforms |
+ * |---|---|---|
+ * | `command` | a shell command (operator-trust tier) | both |
+ * | `steam_appid` | digits — an appid, or a 64-bit non-Steam-shortcut game id | both |
+ * | `steam_ui` | `bigpicture` \| `desktop` — opens the Steam client itself | both |
+ * | `launcher_ui` | a store id (`heroic`, `lutris`) — opens that launcher's own UI | linux |
+ * | `lutris_id` | digits — a pga.db game id | linux |
+ * | `heroic` | `<runner>:<appName>`, runner ∈ legendary/gog/nile | linux |
+ * | `epic` | `<namespace>:<catalogItemId>:<appName>` or a bare appName | windows |
+ * | `gog` | `exe \t args \t workdir` | windows |
+ * | `aumid` | `<PFN>!<AppId>` | windows |
+ *
+ * An unknown kind is accepted on the wire and simply yields no launch recipe on that host, so a
+ * plugin targeting a newer host degrades to an unlaunchable tile rather than a failed reconcile.
+ */
 export const LaunchSpec = Schema.Struct({
-	kind: Schema.Literal("command"),
+	kind: Schema.String,
 	value: Schema.String,
 });
 export type LaunchSpec = typeof LaunchSpec.Type;
+
+/**
+ * Whether an entry is an ordinary title or the launcher application itself (Steam Big Picture,
+ * Heroic, Playnite fullscreen). Launcher entries launch, lease and list exactly like games; a
+ * console or client that knows the field groups them into their own rail, and one that doesn't
+ * renders them as plain tiles.
+ */
+export const GameRole = Schema.Literals(["game", "launcher"]);
+export type GameRole = typeof GameRole.Type;
 
 export const PrepStep = Schema.Struct({
 	do: Schema.String,
@@ -43,6 +76,28 @@ export const DetectHint = Schema.Struct({
 	exe: Schema.optionalKey(Schema.NullOr(Schema.String)),
 	/** The executable's file name (`Hades.exe`), when its location isn't fixed. Weakest signal. */
 	process_name: Schema.optionalKey(Schema.NullOr(Schema.String)),
+	/**
+	 * The Steam appid, for a title Steam itself installed. On Linux this is the **sharpest** signal
+	 * there is: Steam wraps every launch — native or Proton — in `reaper SteamLaunch AppId=<appid>`,
+	 * whose lifetime is exactly the game's. Send it if you have it.
+	 */
+	steam_appid: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+	/**
+	 * An environment variable the launcher stamps on the game's process. Load-bearing for launchers
+	 * that run games under Proton/Wine, where the process tree tells you very little (Heroic's
+	 * `HEROIC_APP_NAME` is the verified case). Omit `value` to match on the key's mere presence —
+	 * only safe for a launcher that runs one game at a time.
+	 */
+	env_marker: Schema.optionalKey(
+		Schema.NullOr(
+			Schema.Struct({
+				/** `[A-Za-z0-9_]{1,64}` — the host rejects anything else. */
+				key: Schema.String,
+				/** At most 256 chars. */
+				value: Schema.optionalKey(Schema.NullOr(Schema.String)),
+			}),
+		),
+	),
 });
 export type DetectHint = typeof DetectHint.Type;
 
@@ -76,6 +131,8 @@ export const ProviderEntry = Schema.Struct({
 	launch: Schema.optionalKey(Schema.NullOr(LaunchSpec)),
 	prep: Schema.optionalKey(Schema.Array(PrepStep)),
 	detect: Schema.optionalKey(DetectHint),
+	/** `"game"` (default) or `"launcher"` — see {@link GameRole}. */
+	role: Schema.optionalKey(GameRole),
 	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;

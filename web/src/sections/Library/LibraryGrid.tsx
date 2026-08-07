@@ -82,14 +82,42 @@ export const LibraryGrid: FC<{
 	/** Custom id of the card whose delete is in flight, or null — only that card disables. */
 	deletingId: string | null;
 }> = ({ library, onEdit, onDelete, deletingId }) => {
-	const games = library.data ?? [];
+	const all = library.data ?? [];
+	// Launcher entries (design D4) open the launcher itself — Steam Big Picture, Heroic — rather than
+	// a title. They launch and lease exactly like games; grouping them into their own rail is purely
+	// so a shelf of 400 games doesn't bury the two or three ways to open a launcher.
+	const launchers = all.filter((g) => g.role === "launcher");
+	const games = all.filter((g) => g.role !== "launcher");
+	const card = (game: GameEntry) => (
+		<GameCard
+			key={game.id}
+			game={game}
+			onEdit={() => onEdit(game)}
+			onDelete={() => onDelete(game)}
+			deleting={deletingId === customId(game)}
+		/>
+	);
 	return (
 		<QueryState
 			isLoading={library.isLoading}
 			error={library.error}
 			refetch={library.refetch}
 		>
-			{games.length === 0 ? (
+			{launchers.length > 0 && (
+				<div className="@container mb-card">
+					<p className="pb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+						{m.library_launchers_title()}
+					</p>
+					<motion.div
+						transition={{ delayChildren: stagger(0.1) }}
+						variants={{ enter: {}, from: {} }}
+						className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5"
+					>
+						{launchers.map(card)}
+					</motion.div>
+				</div>
+			)}
+			{all.length === 0 ? (
 				<Card>
 					{/* `flush`, not a bare `p-8`: the default `sm:pt-0` would survive the override
 					    (tailwind-merge only resolves conflicts within a variant) and eat the top
@@ -98,27 +126,25 @@ export const LibraryGrid: FC<{
 						flush
 						className="p-8 text-center text-sm text-muted-foreground"
 					>
-						{m.library_empty()}
+						{/* After extraction a fresh host has NO scanners at all, so "no games" is the
+						    expected first-run state rather than a fault. Point at the fix (design D9)
+						    instead of leaving a bare empty grid. */}
+						<p>{m.library_empty()}</p>
+						<p className="mt-2">{m.library_empty_add_source()}</p>
 					</CardContent>
 				</Card>
 			) : (
-				<div className="@container">
-					<motion.div
-						transition={{ delayChildren: stagger(0.1) }}
-						variants={{ enter: {}, from: {} }}
-						className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5"
-					>
-						{games.map((game) => (
-							<GameCard
-								key={game.id}
-								game={game}
-								onEdit={() => onEdit(game)}
-								onDelete={() => onDelete(game)}
-								deleting={deletingId === customId(game)}
-							/>
-						))}
-					</motion.div>
-				</div>
+				games.length > 0 && (
+					<div className="@container">
+						<motion.div
+							transition={{ delayChildren: stagger(0.1) }}
+							variants={{ enter: {}, from: {} }}
+							className="grid grid-cols-1 gap-card @sm:grid-cols-2 @md:grid-cols-2 @lg:grid-cols-3 @2xl:grid-cols-4 @4xl:grid-cols-5"
+						>
+							{games.map(card)}
+						</motion.div>
+					</div>
+				)
 			)}
 		</QueryState>
 	);

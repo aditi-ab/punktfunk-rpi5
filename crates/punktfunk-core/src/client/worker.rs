@@ -68,6 +68,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     pub(crate) ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// A [`crate::client::PunktfunkEndReason`] as `u8`, classified from the connection's close and
+    /// latched alongside `shutdown` (see [`NativeClient::end_reason`]).
+    pub(crate) end_reason: Arc<AtomicU8>,
     /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
     pub(crate) quit: Arc<AtomicBool>,
     pub(crate) mode_slot: Arc<std::sync::Mutex<Mode>>,

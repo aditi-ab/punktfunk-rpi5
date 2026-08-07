@@ -46,7 +46,10 @@ env:
   REGISTRY: git.unom.io
   OWNER: unom
   PACKAGE: punktfunk-decky        # generic-registry package name
-  PLUGIN: punktfunk               # plugin.json "name" == zip top-level dir
+  # The plugin's ON-DISK dir == the zip's top-level dir. Deliberately NOT plugin.json "name"
+  # (that is the brand-cased label Decky lists, and it locates a plugin by matching it, not by
+  # the folder) — see clients/decky/scripts/package.sh.
+  PLUGIN: punktfunk
 
 jobs:
   build-publish:

@@ -6,7 +6,7 @@
 
 use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
-use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, DIM, FAINT, W, WHITE};
+use crate::theme::{accent, fg, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, Path, RRect, Rect};
 
@@ -84,6 +84,9 @@ pub(crate) struct MenuList {
     bump: Spring,
     scroll: f64,
     focus: Vec<f64>,
+    /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
+    /// [`MenuList::jump_to`].
+    snap: bool,
 }
 
 impl MenuList {
@@ -93,7 +96,16 @@ impl MenuList {
             bump: Spring::rest(0.0),
             scroll: 0.0,
             focus: Vec::new(),
+            snap: true,
         }
+    }
+
+    /// Move the cursor WITHOUT the scroll gliding there. For a tab switch, where the whole
+    /// row set is replaced: chasing would sweep the viewport through rows that no longer
+    /// exist, which reads as a glitch rather than as motion.
+    pub(crate) fn jump_to(&mut self, cursor: usize) {
+        self.cursor = cursor;
+        self.snap = true;
     }
 
     /// Route a menu event. Up/down move focus (Boundary = recoil), left/right become
@@ -136,10 +148,19 @@ impl MenuList {
         dt: f64,
         active: bool,
     ) {
+        if self.snap {
+            // A replaced row set has no shared history with the old one — start every row's
+            // focus ease from scratch so the new cursor is simply THERE.
+            self.focus.clear();
+        }
         self.focus.resize(rows.len(), 0.0);
         for (i, f) in self.focus.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
-            *f = approach(*f, target, dt, 0.06);
+            *f = if self.snap {
+                target
+            } else {
+                approach(*f, target, dt, 0.06)
+            };
         }
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
@@ -160,7 +181,11 @@ impl MenuList {
         // The scroll chases the focused row into the middle band, clamped to content.
         let focused_center = tops.get(self.cursor).map_or(0.0, |t| (t + ROW_H / 2.0) * k);
         let target = (focused_center - view_h / 2.0).clamp(0.0, (content_h - view_h).max(0.0));
-        self.scroll = approach(self.scroll, target, dt, 0.08);
+        self.scroll = if std::mem::take(&mut self.snap) {
+            target
+        } else {
+            approach(self.scroll, target, dt, 0.08)
+        };
 
         let row_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k);
         let x0 = f64::from(rect.left) + (f64::from(rect.width()) - row_w) / 2.0;
@@ -184,7 +209,7 @@ impl MenuList {
                     W::SemiBold,
                     12.0 * k,
                     1.4 * k,
-                    white(0.45),
+                    fg(0.45),
                 );
             }
             // Focus scale eases 0.98 → 1.0 about the row center.
@@ -201,9 +226,9 @@ impl MenuList {
                 PanelStroke::Plain(0.06 + 0.22 * f as f32)
             };
             let tint = if row.caret {
-                Some(brand(0.30))
+                Some(accent(0.30))
             } else if f > 0.01 {
-                Some(brand(0.30 * f as f32))
+                Some(accent(0.30 * f as f32))
             } else {
                 None
             };
@@ -212,7 +237,7 @@ impl MenuList {
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {
                 // Action row: centered label, brand when actionable.
-                let color = if row.enabled { BRAND } else { FAINT };
+                let color = if row.enabled { accent(1.0) } else { fg(0.35) };
                 let tw = fonts.measure(&row.label, W::SemiBold, 16.0 * k) as f64;
                 fonts.draw(
                     canvas,
@@ -231,15 +256,15 @@ impl MenuList {
                     baseline,
                     W::SemiBold,
                     16.0 * k,
-                    if row.enabled { WHITE } else { DIM },
+                    if row.enabled { fg(1.0) } else { fg(0.55) },
                 );
                 let value = row.value.as_deref().unwrap_or_default();
                 let vcolor = if row.value_dim {
-                    FAINT
+                    fg(0.35)
                 } else if f > 0.5 {
-                    WHITE
+                    fg(1.0)
                 } else {
-                    white(0.6 + 0.4 * f as f32)
+                    fg(0.6 + 0.4 * f as f32)
                 };
                 let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
                 let caret_w = if row.caret { 8.0 * k } else { 0.0 };
@@ -257,7 +282,7 @@ impl MenuList {
                             (2.0 * k) as f32,
                             (18.0 * k) as f32,
                         ),
-                        &Paint::new(BRAND, None),
+                        &Paint::new(accent(1.0), None),
                     );
                 }
                 if row.adjustable && f > 0.01 {
@@ -269,6 +294,98 @@ impl MenuList {
             canvas.restore();
         }
         canvas.restore();
+    }
+}
+
+// --- Tab strip ---------------------------------------------------------------------------
+
+/// The strip's design height, including the air under it before the first row.
+pub(crate) const TAB_STRIP_H: f64 = 46.0;
+
+/// The horizontal section switcher above a menu list. Purely presentational — the SCREEN
+/// owns which tab is selected and what the shoulders do; this draws the pills and slides
+/// one highlight between them, so switching sections reads as travel rather than a swap.
+pub(crate) struct TabStrip {
+    /// Chased highlight geometry `(x, width)` in device px. `None` until the first render,
+    /// so a freshly opened screen doesn't animate its highlight in from x = 0.
+    indicator: Option<(f64, f64)>,
+}
+
+impl TabStrip {
+    pub(crate) fn new() -> TabStrip {
+        TabStrip { indicator: None }
+    }
+
+    /// Draw the pills centered in `rect`'s top band. Returns nothing — the caller already
+    /// knows the band is [`TAB_STRIP_H`] tall.
+    #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
+    pub(crate) fn render(
+        &mut self,
+        canvas: &Canvas,
+        rect: Rect,
+        labels: &[&str],
+        selected: usize,
+        fonts: &Fonts,
+        k: f64,
+        dt: f64,
+    ) {
+        if labels.is_empty() {
+            return;
+        }
+        let size = 13.0 * k;
+        let pad_x = 13.0 * k;
+        let gap = 7.0 * k;
+        let pill_h = 30.0 * k;
+        let widths: Vec<f64> = labels
+            .iter()
+            .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * pad_x)
+            .collect();
+        let total: f64 = widths.iter().sum::<f64>() + gap * (labels.len() - 1) as f64;
+        let mut x = f64::from(rect.left) + (f64::from(rect.width()) - total) / 2.0;
+        let top = f64::from(rect.top) + 2.0 * k;
+
+        // Where the highlight wants to be, then the eased position it actually draws at.
+        let sel = selected.min(labels.len() - 1);
+        let target = (
+            x + widths[..sel].iter().sum::<f64>() + gap * sel as f64,
+            widths[sel],
+        );
+        let (ix, iw) = match self.indicator {
+            None => target,
+            Some((cx, cw)) => (
+                approach(cx, target.0, dt, 0.07),
+                approach(cw, target.1, dt, 0.07),
+            ),
+        };
+        self.indicator = Some((ix, iw));
+        crate::theme::panel(
+            canvas,
+            Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
+            (pill_h / 2.0 / k) as f32,
+            Some(accent(0.85)),
+            PanelStroke::Plain(0.22),
+            k as f32,
+        );
+
+        let baseline = top + pill_h / 2.0 + size * 0.36;
+        for (i, label) in labels.iter().enumerate() {
+            // Fade each label toward white by how much the highlight actually covers it, so
+            // the two labels a sliding highlight passes between light up together.
+            let pill_x = x;
+            let overlap = (pill_x + widths[i]).min(ix + iw) - pill_x.max(ix);
+            let covered = (overlap / widths[i]).clamp(0.0, 1.0) as f32;
+            let tw = f64::from(fonts.measure(label, W::SemiBold, size));
+            fonts.draw(
+                canvas,
+                label,
+                pill_x + (widths[i] - tw) / 2.0,
+                baseline,
+                W::SemiBold,
+                size,
+                fg(0.5 + 0.5 * covered),
+            );
+            x += widths[i] + gap;
+        }
     }
 }
 
@@ -290,7 +407,7 @@ fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> Stri
 
 fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     let dir = if left { -1.0 } else { 1.0 };
-    let mut p = Paint::new(white(alpha), None);
+    let mut p = Paint::new(fg(alpha), None);
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width((1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -477,7 +594,7 @@ impl Keyboard {
                 let focused = r == self.row && c == self.col;
                 let kr = Rect::from_xywh(x as f32, y as f32, key_w as f32, key_h as f32);
                 let fill = if focused {
-                    let mut b = BRAND;
+                    let mut b = accent(1.0);
                     if self.key_flash > 0.02 {
                         // A just-typed key flashes brighter, then eases back.
                         let f = self.key_flash as f32;
@@ -490,16 +607,18 @@ impl Keyboard {
                     }
                     b
                 } else {
-                    white(0.08)
+                    fg(0.08)
                 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(kr, (9.0 * k) as f32, (9.0 * k) as f32),
                     &Paint::new(fill, None),
                 );
+                // The focused key is filled with the accent, so its letter needs ink that
+                // reads on THAT, not on the field.
                 let ink = if focused {
-                    skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0)
+                    crate::theme::on_accent()
                 } else {
-                    WHITE
+                    fg(1.0)
                 };
                 let (cx, cy) = (x + key_w / 2.0, y + key_h / 2.0);
                 match key {

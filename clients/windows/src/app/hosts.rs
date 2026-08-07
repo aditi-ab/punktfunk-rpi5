@@ -595,6 +595,22 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         move || sa.call(true)
                     })
                     .into()];
+                // Re-query mDNS. The browse runs for the app's lifetime, and `mdns-sd` backs its
+                // re-query interval off to as much as an hour — so a host that appeared since
+                // startup, or whose announcement was lost to multicast, may need an actual ask.
+                actions.push(
+                    icon_btn("Scan the network for hosts again", Symbol::Refresh)
+                        .on_click({
+                            let (c, st) = (ctx.clone(), set_status.clone());
+                            move || {
+                                if let Some(r) = c.shared.rescan.lock().unwrap().as_ref() {
+                                    r.request();
+                                }
+                                st.call("Scanning the network\u{2026}".to_string());
+                            }
+                        })
+                        .into(),
+                );
                 // The couch UI's front door, beside the other page actions. Absent on ARM64,
                 // where the session binary ships without its Skia console.
                 if CONSOLE_UI_AVAILABLE {

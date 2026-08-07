@@ -428,6 +428,7 @@ fn run(
                     plane: crate::events::Plane::Gamestream,
                     spec: t.detect.clone(),
                     nested,
+                    launcher: t.launcher,
                     child,
                     launch_stamp,
                     // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
@@ -645,6 +646,9 @@ fn open_gs_mirror_source(
 /// run it.
 struct GsApp {
     game: crate::gamelease::GameRef,
+    /// This entry opens a LAUNCHER rather than a game (design D4) — carried through from
+    /// [`crate::library::LaunchTarget`] so the lease can stay untracked for it.
+    launcher: bool,
     detect: crate::library::DetectSpec,
     /// The resolved shell command. `Some` on Linux, which runs it itself; `None` for a Windows
     /// library title, which launches by id through the interactive-session spawner instead.
@@ -666,6 +670,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
             Some(t) => {
                 return Some(GsApp {
                     game: t.game,
+                    launcher: t.launcher,
                     detect: t.detect,
                     command: t.command,
                 })
@@ -684,6 +689,8 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         .map(str::trim)
         .filter(|c| !c.is_empty())?;
     Some(GsApp {
+        // An operator-typed command has no library entry behind it, so it is never a launcher tile.
+        launcher: false,
         game: crate::gamelease::GameRef {
             id: None,
             store: None,

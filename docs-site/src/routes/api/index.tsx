@@ -13,18 +13,18 @@ export const Route = createFileRoute('/api/')({
   component: ApiReference,
   head: () => ({
     meta: [
-      { title: 'punktfunk — Management API reference' },
+      { title: 'Punktfunk — Management API Reference' },
       {
         name: 'description',
         content:
-          'Interactive reference for the punktfunk host management REST API (OpenAPI).',
+          'Interactive reference for the Punktfunk host management REST API (OpenAPI).',
       },
     ],
     links: [{ rel: 'stylesheet', href: scalarCss }],
   }),
 })
 
-// The full punktfunk theme rolled out onto Scalar — the same dark-violet (and
+// The full Punktfunk theme rolled out onto Scalar — the same dark-violet (and
 // light-lavender) product chrome as the docs/management console.
 //
 // IMPORTANT: Scalar toggles `.light-mode` / `.dark-mode` on `document.body`,
@@ -191,7 +191,7 @@ function ApiReference() {
       url: '/openapi.json',
       darkMode: isDark,
       hideDarkModeToggle: true,
-      metaData: { title: 'punktfunk Management API' },
+      metaData: { title: 'Punktfunk Management API' },
       hideDownloadButton: false,
       customCss: SCALAR_CSS,
     }),
@@ -200,13 +200,13 @@ function ApiReference() {
 
   return (
     <div className="flex min-h-screen flex-col">
-      {/* Slim branded bar so the reference stays inside the punktfunk identity
+      {/* Slim branded bar so the reference stays inside the Punktfunk identity
           and links back into the docs. */}
       <header className="flex h-14 shrink-0 items-center justify-between border-b border-fd-border px-4 md:px-6">
         <Link
           to="/docs/$"
           params={{ _splat: '' }}
-          aria-label="punktfunk documentation"
+          aria-label="Punktfunk documentation"
           className="flex items-center gap-2 no-underline"
         >
           <BrandMark className="size-6" />

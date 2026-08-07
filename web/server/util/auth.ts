@@ -174,9 +174,20 @@ export function sessionConfig(): SessionConfig {
 			sameSite: "lax",
 			path: "/",
 			// h3 defaults Secure to true, which browsers DROP over plain http:// (so login
-			// silently fails on a LAN HTTP server). Only mark Secure when actually behind TLS
-			// (set PUNKTFUNK_UI_SECURE=1 / =true then).
-			secure: /^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? ""),
+			// silently fails on a LAN HTTP server). Only mark Secure when actually behind TLS.
+			//
+			// Derived from whether TLS is CONFIGURED, not from `PUNKTFUNK_UI_SECURE` alone
+			// (2026-08-05 review L-20). The entry point already refuses the inverse mistake —
+			// `PUNKTFUNK_UI_SECURE` without TLS exits rather than serving a console whose cookie
+			// the browser will never store — but nothing caught this direction: TLS configured and
+			// the flag forgotten shipped a session cookie without `Secure`, which a browser will
+			// then also send over a plain-http downgrade. The env var still forces it on for a
+			// deploy terminating TLS in front of us (a reverse proxy), where this process sees no
+			// cert of its own.
+			secure:
+				(!!process.env.PUNKTFUNK_UI_TLS_CERT &&
+					!!process.env.PUNKTFUNK_UI_TLS_KEY) ||
+				/^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? ""),
 		},
 	};
 }

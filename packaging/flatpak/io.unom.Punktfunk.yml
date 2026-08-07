@@ -91,28 +91,43 @@ finish-args:
   # --- persistent client identity / pairing store (shared with punktfunk-probe) ---
   - --filesystem=~/.config/punktfunk:create   # client-{cert,key}.pem, known-hosts, settings
   # --- HDR under gamescope (Steam Deck Game Mode) ---
-  # A flatpak's Vulkan loader can't see the host's gamescope WSI layer, so the SDL3 surface never
-  # offers the HDR10 (ST.2084) colorspace and the presenter silently tone-maps PQ->SDR — the
-  # Game-Mode HDR indicator stays dark (verified on a Deck OLED: the sandbox loader found NO
-  # frog/gamescope layer). The layer ships as the runtime extension
-  # `org.freedesktop.Platform.VulkanLayer.gamescope`, which org.gnome.Platform//50 auto-mounts at
-  # /usr/lib/extensions/vulkan/gamescope once installed (a one-time, per-Deck step; keep it in the
-  # Decky plugin's setup / docs):
-  #     flatpak install --user -y flathub org.freedesktop.Platform.VulkanLayer.gamescope//25.08
-  # THREE things are needed, not two (verified live on a Deck OLED — the env vars alone left
-  # hdr10_format=None). (1) VK_ADD_IMPLICIT_LAYER_PATH puts the layer's implicit-layer JSON on the
-  # Vulkan loader's search path (the runtime point mounts the files but not onto the path). (2)
-  # ENABLE_GAMESCOPE_WSI flips the layer's own `enable_environment` gate. (3) The layer, once
-  # loaded, must open a *Wayland* connection to gamescope's private socket ($GAMESCOPE_WAYLAND_DISPLAY
-  # = gamescope-0) to negotiate the HDR10 colorspace via the gamescope_swapchain protocol — but the
-  # Deck runs games as X11 clients (DISPLAY=:1, no WAYLAND_DISPLAY exported), so --socket=wayland
-  # binds nothing and that socket never enters the sandbox. Without it the layer loads, maps, and
-  # silently can't reach the compositor → no HDR10 offered → PQ tone-mapped to SDR, badge dark.
-  # Binding xdg-run/gamescope-0 is the missing half (chiaki-ng does the same). With all three the
-  # surface offers HDR10 and the presenter's existing HDR10 swapchain path engages — no client code
-  # change. Harmless off-Deck: the layer no-ops when there's no gamescope socket to bind.
-  - --env=VK_ADD_IMPLICIT_LAYER_PATH=/usr/lib/extensions/vulkan/gamescope/share/vulkan/implicit_layer.d
+  # A flatpak's Vulkan loader can't see the host's gamescope WSI layer, so without help the SDL3
+  # surface never offers the HDR10 (ST.2084) colorspace and the presenter silently tone-maps
+  # PQ->SDR — the field-reported "HDR->SDR" badge. The layer is now VENDORED (see the
+  # gamescope-wsi-layer module below), so it is always present and there is no longer any
+  # manual `flatpak install ... VulkanLayer.gamescope` step for the user.
+  # FOUR things are needed. An earlier revision of this block claimed three and was WRONG: the
+  # fourth is the gate that makes the other three moot, so the Deck sat at hdr10_format=None with
+  # all of (1)-(3) in place, which is exactly the field report ("HDR->SDR" in the stats overlay).
+  # (1) the layer's implicit-layer JSON must be on the Vulkan loader's search path — now
+  # automatic, the vendored module installs it to /app/share/vulkan/implicit_layer.d which
+  # XDG_DATA_DIRS already covers. (2) ENABLE_GAMESCOPE_WSI
+  # flips the layer's own `enable_environment` gate. (3) --filesystem=xdg-run/gamescope-0 binds
+  # gamescope's private Wayland socket: the layer must reach the compositor over it to negotiate
+  # HDR10, and the Deck runs games as X11 clients (DISPLAY=:1, no WAYLAND_DISPLAY exported) so
+  # --socket=wayland binds nothing (chiaki-ng does the same). (4) GAMESCOPE_WAYLAND_DISPLAY must be
+  # set INSIDE the sandbox. The layer's `isRunningUnderGamescope()` reads that env var and nothing
+  # else; flatpak does not forward host env, so it arrives unset and the layer's CreateInstance
+  # early-returns before it ever creates a GamescopeInstance. The layer still LOADS and still logs
+  # its generic bits ("Forcing on VK_EXT_swapchain_maintenance1", swapchain destroys), which is why
+  # this reads as working — but no gamescope surface is made, so no HDR10 format is ever appended
+  # and (1)-(3) buy nothing. Measured on a Deck OLED (Galileo, SteamOS 3.8.16) 2026-08-05, client
+  # `--browse`, reading `pf_presenter::vk::setup` "swapchain config":
+  #     unset                    -> no "[Gamescope WSI] Surface state" block at all, hdr10_format=None
+  #     set, hdr_enabled=0       -> "server hdr output enabled: false", hdr10_format=None
+  #     set, hdr_enabled=1       -> "hdr formats exposed to client: true",
+  #                                 hdr10_format=Some(A2B10G10R10_UNORM_PACK32, HDR10_ST2084_EXT)
+  # DXVK_HDR is NOT the gate for us and was ruled out by measurement: the layer forces it OFF for
+  # clients it has already decided to deny, it does not turn HDR on.
+  # Hardcoding `gamescope-0` matches the socket bound just below, and is safe off-Deck both ways:
+  # on a normal Wayland desktop --socket=wayland sets WAYLAND_DISPLAY=wayland-0 inside the sandbox
+  # and the layer bails on the mismatch; on X11-only there is no gamescope socket to connect to, so
+  # it prints one "Bypass layer will be unavailable" line and passes through.
+  # The REMAINING gate is not ours: gamescope's `hdr_enabled` convar (Steam's HDR display setting)
+  # drives the GAMESCOPE_HDR_OUTPUT_FEEDBACK X property the layer reads, and with it off no app on
+  # the Deck gets HDR. See docs — that one is a user/Decky-side step, not a packaging one.
   - --env=ENABLE_GAMESCOPE_WSI=1
+  - --env=GAMESCOPE_WAYLAND_DISPLAY=gamescope-0   # the layer's ONLY "am I under gamescope?" signal
   - --filesystem=xdg-run/gamescope-0   # gamescope's private Wayland socket (HDR negotiation)
 
 build-options:
@@ -167,6 +182,117 @@ modules:
       - /include
       - /lib/cmake
       - /lib/pkgconfig
+
+  # ---------------------------------------------------------------------------------------
+  # Vulkan-Headers — build-time `vulkan/vulkan.h` for anything below that compiles against
+  # Vulkan, which the GNOME SDK is not guaranteed to ship dev headers for. Headers only, no
+  # compile, and `cleanup: '*'` so nothing reaches the runtime (the Vulkan LOADER comes from
+  # the GL runtime).
+  #
+  # It was added for the session binary's pf-ffvk crate, which ran bindgen over FFmpeg's
+  # libavutil/hwcontext_vulkan.h. M10 deleted pf-ffvk along with the rest of the client's
+  # FFmpeg (design/client-native-decode.md §6), so that consumer is gone — but the module
+  # stays, because the gamescope WSI layer built two modules below is itself a VULKAN LAYER
+  # and compiles against these headers. Module order is the dependency: this one must build
+  # first. Do not drop it as dead weight; flatpak.yml has no `pull_request:` trigger, so a
+  # manifest break of that kind reaches main invisibly and a tag then ships no Linux flatpak.
+  # The native decoder needs nothing from here — pf-vkdecode reaches Vulkan through `ash`,
+  # which is pure Rust bindings with no bindgen and no C headers.
+  # ---------------------------------------------------------------------------------------
+  - name: vulkan-headers
+    buildsystem: cmake-ninja
+    sources:
+      - type: archive
+        url: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.313.0.tar.gz
+        # `sha256sum vulkan-sdk-1.4.313.0.tar.gz` (verified 2026-07-07). Bump url + sha together.
+        sha256: 20743c99a96c07290f24377360e7a12bdd2c465ba202e0c7ef2ec25d446cf61d
+    cleanup:
+      - '*'
+
+  # ---------------------------------------------------------------------------------------
+  # gamescope WSI layer — VENDORED, so HDR works from a plain `flatpak install` with no
+  # second step. This is the ONLY route to HDR on a Deck: measured on SteamOS 3.8.16
+  # (gamescope 3.16.23.4), the gamescope-0 socket advertises `gamescope_swapchain_factory_v2`
+  # but NOT `wp_color_manager_v1` (checked with HDR both off and on), so Mesa's Wayland WSI
+  # has no colour-management protocol to negotiate HDR10 through and only this layer can add
+  # the ST.2084 surface formats. Without it: zero `[Gamescope WSI]` lines, hdr10_format=None.
+  #
+  # It used to come from the flathub runtime extension
+  # `org.freedesktop.Platform.VulkanLayer.gamescope`, which every user had to install BY HAND
+  # (documented only in a comment here — so in practice nobody did, and the field report was
+  # "HDR->SDR" in the stats overlay). Vendoring instead of `add-extensions` autodownload,
+  # deliberately: that extension is 94 MB of whole-gamescope to deliver one 4 MB .so, its
+  # layer JSON hardcodes a /usr `library_path` that an app-scoped extension (mounted under
+  # /app) would not satisfy, and it would make flathub a hard install-time dependency of an
+  # app we self-host on flatpak.unom.io.
+  #
+  # Pinned to the SAME gamescope rev as packaging/gamescope/PKGBUILD (`_gsrev`) so the
+  # client's layer and the host's punktfunk-gamescope always come from one tree — bump both
+  # together. `enable_gamescope=false` skips subdir('src') and every compositor dependency
+  # (wlroots, SDL2, libliftoff, ...); only protocol/ and layer/ are built.
+  #
+  # `buildsystem: simple` rather than `meson` because two subprojects need their wrap
+  # `patch_directory` applied by hand: glm and stb ship NO meson.build of their own, and the
+  # one meson would normally inject lives in subprojects/packagefiles/. Cloning them as plain
+  # sources without that copy fails at configure with "Subproject exists but has no
+  # meson.build file". `--wrap-mode=nodownload` then proves the build is genuinely offline.
+  #
+  # The layer JSON is generated by meson from prefix+libdir, so it self-writes
+  # `library_path: /app/lib/libVkLayer_FROG_gamescope_wsi_x86_64.so` and lands in
+  # /app/share/vulkan/implicit_layer.d — already on the loader's search path via
+  # XDG_DATA_DIRS, which is why no VK_ADD_IMPLICIT_LAYER_PATH is needed (and why it was
+  # dropped from finish-args: pointing at the old /usr extension path too would risk
+  # double-loading two layers of the same name).
+  #
+  # Verified on a Deck OLED 2026-08-05: builds offline in org.gnome.Sdk//50, and the
+  # resulting .so drives the Deck's system gamescope to
+  # "hdr formats exposed to client: true" + hdr10_format=Some(...).
+  # ---------------------------------------------------------------------------------------
+  - name: gamescope-wsi-layer
+    buildsystem: simple
+    build-commands:
+      # Apply the wraps' patch_directory by hand (see above) — these supply the meson.build
+      # that glm and stb do not ship themselves.
+      - cp -r subprojects/packagefiles/glm/. subprojects/glm/
+      - cp -r subprojects/packagefiles/stb/. subprojects/stb/
+      - meson setup _build --prefix=/app --libdir=lib --wrap-mode=nodownload
+        -Denable_gamescope=false -Denable_gamescope_wsi_layer=true
+        -Denable_tests=false -Denable_openvr_support=false
+      - ninja -C _build
+      - ninja -C _build install
+    sources:
+      - type: git
+        url: https://github.com/ValveSoftware/gamescope.git
+        # KEEP IN SYNC with `_gsrev` in packaging/gamescope/PKGBUILD.
+        commit: 8c676c399c761e4540587f61004c957993d12fea
+      # Wrap pins as of that rev (`subprojects/*.wrap`). These are meson WRAPS, not gamescope
+      # submodules, so nothing else populates them and they need explicit sources.
+      #
+      # vkroots is deliberately NOT listed here. It is a real gamescope SUBMODULE, and
+      # flatpak-builder clones git sources with submodules by default — so it is already
+      # checked out at exactly the rev above (`git ls-tree <rev> subprojects/vkroots`), which
+      # leaves `subprojects/vkroots/.git` as a gitlink FILE. Declaring it again with
+      # `dest: subprojects/vkroots` made the extractor copy the bare mirror onto that path and
+      # die before any build command ran:
+      #   cp: cannot overwrite non-directory '.../subprojects/vkroots/.git' with directory
+      # Re-adding it re-breaks the whole flatpak. If the submodule ever needs to be pinned away
+      # from the gamescope rev, set `disable-submodules: true` on the source above and then
+      # declare ALL THREE subprojects explicitly — not one of them alone.
+      - type: git
+        url: https://github.com/g-truc/glm.git
+        commit: 0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+        dest: subprojects/glm
+      - type: git
+        url: https://github.com/nothings/stb.git
+        commit: 5736b15f7ea0ffb08dd38af21067c314d6a3aae9
+        dest: subprojects/stb
+    cleanup:
+      # Only the .so and its implicit-layer JSON are runtime. vkroots installs its dev files
+      # from the subproject, and the layer-only install still drops gamescope's display .lua
+      # scripts + LUT .cube files, none of which a client uses.
+      - /include
+      - /lib/pkgconfig
+      - /share/gamescope
 
   # ---------------------------------------------------------------------------------------
   # The client. cargo-sources.json is the GENERATED offline crate cache:
