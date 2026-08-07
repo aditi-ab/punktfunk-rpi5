@@ -8,6 +8,7 @@
 //! OSD, capture hint, the auto-fading start banner).
 
 use crate::model::{ConsoleBus, ConsoleShared, HostRow};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::Screen;
 use crate::shell::{ConsoleOptions, Shell};
 use crate::theme::{match_first_family, Fonts};
@@ -16,7 +17,8 @@ use ash::vk as avk;
 use ash::vk::Handle as _;
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use pf_presenter::overlay::{
-    FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase, SharedDevice,
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, SessionPhase,
+    SharedDevice,
 };
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
@@ -294,7 +296,8 @@ impl Overlay for SkiaOverlay {
                 if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD) {
                     return false;
                 }
-                shell.key(*sc, *repeat)
+                let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+                shell.key(*sc, shift, *repeat)
             }
             sdl3::event::Event::TextInput { text, .. } => {
                 shell.text_input(text);
@@ -310,6 +313,48 @@ impl Overlay for SkiaOverlay {
         } else {
             None
         }
+    }
+
+    fn handle_pointer(&mut self, input: PointerInput) -> bool {
+        if !self.console_visible() {
+            return false;
+        }
+        let Some(shell) = &mut self.shell else {
+            return false;
+        };
+        // `Up` of the secondary button is dropped rather than mapped: `Down` already sent
+        // Back, and a second event would pop two screens per right-click.
+        let (x, y, kind) = match input {
+            PointerInput::Move { x, y } => (x, y, PointerKind::Move),
+            PointerInput::Down {
+                x,
+                y,
+                button: PointerButton::Primary,
+            } => (x, y, PointerKind::Press),
+            PointerInput::Down {
+                x,
+                y,
+                button: PointerButton::Secondary,
+            } => (x, y, PointerKind::Back),
+            PointerInput::Up {
+                x,
+                y,
+                button: PointerButton::Primary,
+            } => (x, y, PointerKind::Release),
+            PointerInput::Up { .. } => return true,
+            PointerInput::Wheel { x, y, dy } => {
+                if dy == 0.0 {
+                    return true;
+                }
+                (x, y, PointerKind::Scroll { up: dy > 0.0 })
+            }
+            PointerInput::Cancel => (0.0, 0.0, PointerKind::Cancel),
+        };
+        shell.pointer(Pointer {
+            x: f64::from(x),
+            y: f64::from(y),
+            kind,
+        })
     }
 
     fn take_action(&mut self) -> Option<OverlayAction> {
@@ -331,6 +376,15 @@ impl Overlay for SkiaOverlay {
             SessionPhase::Failed(msg) => shell.session_failed(msg),
             SessionPhase::Ended(reason) => {
                 shell.session_ended(reason);
+                self.streaming_since = None;
+            }
+            // The stream stopped but a new dial is already in flight: toast WHY (the
+            // codec changed under the user) AND raise the connecting takeover, because
+            // nothing else will — the run loop starts the retry's pump directly rather
+            // than through a `Launch`, so the shell would otherwise sit in a state where
+            // a menu press could start a second session over the running one.
+            SessionPhase::Reconnecting(msg) => {
+                shell.session_reconnecting(msg);
                 self.streaming_since = None;
             }
         }

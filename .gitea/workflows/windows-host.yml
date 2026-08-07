@@ -141,8 +141,10 @@ jobs:
           # observed on a clean build on this very runner (2026-07-17). No-op for compliant
           # projects (libvpl-sys pins 3.13+).
           "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # FFMPEG_DIR: the same BtbN lgpl-shared x64 tree the Windows CLIENT links against (provisioned
-          # by scripts/ci/provision-windows-punktfunk-extras.ps1). The host's AMD/Intel AMF/QSV encode backend
+          # FFMPEG_DIR: the BtbN lgpl-shared x64 tree, provisioned by
+          # scripts/ci/provision-windows-punktfunk-extras.ps1. The CLIENT used to link it too; since M10
+          # it links no libav* at all (windows.yml sets no FFMPEG_DIR), so this tree is the HOST's alone
+          # and the provisioning step keeps fetching it for that reason. The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
           # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.
           if (-not $env:FFMPEG_DIR) {

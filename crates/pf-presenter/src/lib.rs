@@ -3,7 +3,9 @@
 //! decoded frames, captures input on the `ui_stream` state-machine contract, and reports
 //! the unified stats window on stdout. No UI toolkit anywhere in the dependency tree.
 //!
-//! Three frame paths: software (`CpuFrame` RGBA staging upload), Vulkan Video (the
+//! Three frame paths: software (`CpuPlanarFrame` — I420 planes staged into three R8
+//! images and converted by the same CICP-driven CSC pass as the hardware lanes; before M8
+//! this lane arrived as swscale RGBA and skipped the pass entirely), Vulkan Video (the
 //! decoder's VkImage on THIS device — plane views + the CICP-driven CSC pass), and on
 //! Linux additionally VAAPI hardware (NV12 dmabuf imported per-plane — `dmabuf.rs`),
 //! all composited by a letterboxed blit. Devices without the import extensions, and any

@@ -71,6 +71,10 @@ mod install;
 #[cfg(target_os = "windows")]
 #[path = "windows/interactive.rs"]
 mod interactive;
+// What this host launched, for whom, and when — so a client that re-dials and re-sends its
+// `Hello::launch` verbatim neither gets a second copy of its game nor loses sight of the one it has
+// (design/session-game-lifetime.md).
+mod launchreg;
 mod library;
 mod log_capture;
 mod mgmt;

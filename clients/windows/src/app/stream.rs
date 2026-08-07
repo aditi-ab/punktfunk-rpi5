@@ -81,8 +81,13 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .map(|c| {
+                    // The `stats:` decode-path tags (see pf-client-core's session
+                    // pump). M10 removed the `vulkan`/`vaapi`/`d3d11va` tags with their
+                    // rungs; a hardware rung is now always a `native-*` one.
                     let kind = match c {
-                        "vulkan" | "vaapi" => Pill::Good,
+                        "native-vulkan" | "native-vaapi" | "native-d3d11va" | "pyrowave" => {
+                            Pill::Good
+                        }
                         "software" => Pill::Info,
                         _ => Pill::Neutral,
                     };

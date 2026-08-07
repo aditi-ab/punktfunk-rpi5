@@ -476,13 +476,22 @@ impl NvencEncoder {
             opts.set("profile", "main10");
         }
 
-        // Split-frame encode across both NVENC engines (GB203 has 2) when the pixel rate exceeds
-        // a single engine's HEVC capacity; e.g. 5120x1440@240 = 1.77 Gpix/s needs it, @120
-        // (0.88 Gpix/s) does not. HEVC/AV1 only (not H.264). AUTO won't engage below ~2112px
-        // height, so we force `2`; below the threshold we leave it AUTO (split costs ~2% BD-rate).
-        // Threshold shared with the direct-SDK selector ([`super::SPLIT_FORCE_PIXEL_RATE`] — set
-        // so 4K120 = 995.3 Mpix/s forces, which `> 1e9` famously missed by 0.47%). Output is
-        // standard HEVC — transparent to the client. Override with PUNKTFUNK_SPLIT_ENCODE.
+        // Split-frame encode across the GPU's NVENC engines. WP4: the policy is no longer
+        // duplicated here — it comes from the SAME [`resolve_split_mode`] the two direct-SDK
+        // backends use, so the pixel-rate threshold, the codec scoping and the (dropped) 10-bit
+        // short circuit cannot drift between the libav path and the rest. This copy had already
+        // diverged: it hard-coded a 2-way split regardless of engine count and carried no depth
+        // rule at all.
+        //
+        // ⚠ Only the FORCED outcomes are actionable here. libavcodec's `split_encode_mode`
+        // AVOption is its own vocabulary, and our `DISABLE` is the NVENC enum's `15` — passing
+        // that through would be meaningless to it (or fail the open). `DISABLE`/`AUTO` therefore
+        // both mean "leave the option unset", which is exactly today's behaviour: unset = the
+        // driver's own auto.
+        //
+        // ⚠ `engines = 0` = "not probed": the libav path has no caps probe of its own, and
+        // [`max_forced_split_mode`] maps unknown to 2-way, preserving what this site always did.
+        // A 3-NVENC part gets the wider split only on the direct-SDK path.
         let pix_rate = width as u64 * height as u64 * fps as u64;
         let split = std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok();
         match split.as_deref() {
@@ -497,14 +506,17 @@ impl NvencEncoder {
                 "PUNKTFUNK_SPLIT_ENCODE ignored — split encoding is not applicable to H.264 \
                  (nvEncodeAPI.h)"
             ),
-            None if matches!(codec, Codec::H265 | Codec::Av1)
-                && pix_rate >= super::SPLIT_FORCE_PIXEL_RATE =>
-            {
-                opts.set("split_encode_mode", "2");
-                tracing::info!(
-                    pix_rate,
-                    "NVENC: forcing 2-way split encode (high pixel rate)"
-                );
+            None if matches!(codec, Codec::H265 | Codec::Av1) => {
+                let resolved = super::resolve_split_mode(codec, bit_depth, pix_rate, 0);
+                if let Some(n) = super::forced_split_width(resolved) {
+                    opts.set("split_encode_mode", &n.to_string());
+                    tracing::info!(
+                        pix_rate,
+                        bit_depth,
+                        split_encode_mode = n,
+                        "NVENC (libav): forcing split encode (shared selector)"
+                    );
+                }
             }
             None => {}
         }

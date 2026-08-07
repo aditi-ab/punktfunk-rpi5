@@ -45,10 +45,12 @@ license=('MIT OR Apache-2.0')
 # !debug: skip the -debug split package (debuginfo bloat, not shipped).
 options=('!lto' '!debug')
 
-# All build deps for both crates (Arch runtime packages ship their own headers, so these cover
-# build + link). aws-lc/ring need clang+cmake; nasm is for asm. vulkan-headers: the client's
-# pf-ffvk crate runs bindgen over FFmpeg's libavutil/hwcontext_vulkan.h (#include <vulkan/vulkan.h>).
-makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git' 'vulkan-headers'
+# All build deps for both packages (Arch runtime packages ship their own headers, so these cover
+# build + link). aws-lc/ring need clang+cmake; nasm is for asm. ffmpeg stays because the HOST's
+# encoder links libav* — the CLIENT dropped it in M10 and decodes natively. No vulkan-headers:
+# nothing in the workspace compiles against the system Vulkan headers any more (pyrowave-sys builds
+# against its own vendored copy, and both binaries reach Vulkan through ash, which dlopens it).
+makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
              'gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
 
 # Opt-in punktfunk-web / punktfunk-scripting: only then is bun (the build tool AND the vendored
@@ -250,15 +252,18 @@ package_punktfunk-host() {
 
 package_punktfunk-client() {
   pkgdesc="Low-latency desktop/game streaming CLIENT — native GTK4/libadwaita Linux app"
-  # The GTK4/libadwaita shell + its Vulkan session streamer: SDL3 gamepads, FFmpeg (VAAPI +
-  # Vulkan Video) decode, PipeWire audio/mic. vulkan-icd-loader: the session binary loads
-  # libvulkan at runtime (ash) for its ash/Skia presenter.
+  # The GTK4/libadwaita shell + its Vulkan session streamer: SDL3 gamepads, native decode
+  # (Vulkan Video, VAAPI, and openh264 + rav1d in software), PipeWire audio/mic.
+  # No ffmpeg since M10: the client links no libav* at all, and its VAAPI rung dlopens libva
+  # rather than linking it, so the driver optdepends below are all it needs.
+  # vulkan-icd-loader: the session binary loads libvulkan at runtime (ash) for both its decoder
+  # and its ash/Skia presenter.
   # NOT pipewire-pulse: the client speaks NATIVE PipeWire (audio.rs drives libpipewire-0.3
   # directly for both playback and the mic uplink) and never opens a Pulse socket, so the
   # compat shim buys it nothing — while `pipewire-pulse` CONFLICTS with `pulseaudio`, which
   # made the package uninstallable for anyone keeping real PulseAudio. Matches the .deb
   # (Recommends) and the RPM (Recommends, "degrade gracefully without it").
-  depends=('gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wireplumber'
+  depends=('gtk4' 'libadwaita' 'sdl3' 'pipewire' 'wireplumber'
            'opus' 'libglvnd' 'vulkan-icd-loader')
   optdepends=('libva-mesa-driver: VAAPI hardware decode on AMD (incl. Steam Deck); software fallback otherwise'
               'intel-media-driver: VAAPI hardware decode on Intel'

@@ -1,0 +1,17 @@
+# Vendored snapshot — see PROVENANCE.md. Deliberately NOT opted into workspace lints
+# or workspace package inheritance: upstream code stays as close to pristine as the
+# trim allows, so re-syncing against the AOSP tree stays a diff, not an archaeology dig.
+[package]
+name = "cros-codecs"
+version = "0.0.5"
+license = "BSD-3-Clause"
+description = "Vendored cros-codecs parser layer (codec module only) for pf-bitstream"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+
+# Upstream's in-tree unit tests (kept — they are the conformance goldens) want these.
+[dev-dependencies]
+env_logger = "0.11"
+serde_json = "1"

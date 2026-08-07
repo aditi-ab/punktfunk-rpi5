@@ -483,19 +483,52 @@ public final class SessionAudio {
         }
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
-        guard installMicTap(on: input, micUID: micUID, micChannel: micChannel) else {
-            // Mic chain unavailable (logged) — keep the session audible on the plain playback
-            // engine rather than playing through an idle voice processor.
+
+        // The capture side must be PULLED, and only the render graph pulls anything. An input
+        // node carrying nothing but a tap is not part of that graph, so on the combined engine
+        // nobody drove it: the IO unit came up (the recording indicator lit for a beat, then went
+        // out as the input went idle) and NOT ONE BUFFER ever reached the tap — no error, no
+        // failed start, just a session that quietly sent no microphone at all. Routing the input
+        // through a silent sink puts it in the graph, which is what Apple's own voice-processing
+        // sample does. The split path never needed it: a capture-only engine has the input node
+        // AS its graph, so it is pulled by definition — which is why this only broke when the
+        // combined topology became the default.
+        //
+        // `outputVolume = 0` on the sink: the mic has to reach the graph, never the speaker. At
+        // any audible volume this is a microphone wired straight to the earpiece.
+        let micSink = AVAudioMixerNode()
+        engine.attach(micSink)
+        micSink.outputVolume = 0
+        engine.connect(engine.inputNode, to: micSink, format: nil)
+        engine.connect(micSink, to: engine.mainMixerNode, format: nil)
+
+        // BEFORE the tap reads a format. Enabling voice processing swaps the engine's IO unit
+        // for the VPIO one and renegotiates its formats, and until the engine is prepared the
+        // input node can still report the pre-swap state — 0 Hz / 0 channels included, which
+        // `installMicTap` (correctly) refuses as "no usable input device". Preparing first means
+        // the chain is built against what the voice processor will actually emit.
+        engine.prepare()
+        guard installMicTap(on: engine.inputNode, micUID: micUID, micChannel: micChannel) else {
+            // Mic chain unavailable on the VOICE-PROCESSED engine (logged). The mic outranks the
+            // echo cancellation, so fall back to the split path — its own engine, no voice
+            // processor, the topology that shipped before AEC existed — rather than dropping the
+            // uplink for the rest of the session. (The sibling failure above, where the voice
+            // processor won't engage at all, already does exactly this; this arm used to give up
+            // on the mic instead, which is how a whole session could go silent uplink-only.)
+            engine.stop()
             startPlayback(speakerUID: speakerUID)
+            startCapture(micUID: micUID, micChannel: micChannel)
             return
         }
-        engine.prepare()
         do {
             try engine.start()
         } catch {
             log.error("combined engine failed to start: \(error.localizedDescription)")
-            input.removeTap(onBus: 0)
-            startPlayback(speakerUID: speakerUID) // no echo cancellation beats no audio
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            // Same rule: a working mic without echo cancellation beats no mic at all.
+            startPlayback(speakerUID: speakerUID)
+            startCapture(micUID: micUID, micChannel: micChannel)
             return
         }
         stateLock.lock()
@@ -533,8 +566,16 @@ public final class SessionAudio {
             }
         }
         #endif
-        guard installMicTap(on: input, micUID: micUID, micChannel: micChannel) else { return }
+        // Prepared before the tap reads a format, for the same reason the combined path does it:
+        // a node that hasn't been through `prepare()` can still report the pre-negotiation
+        // format (0 Hz / 0 channels on a device that is perfectly fine), which reads downstream
+        // as "no microphone".
         engine.prepare()
+        guard installMicTap(on: engine.inputNode, micUID: micUID, micChannel: micChannel) else {
+            log.error("mic uplink unavailable — this session sends no microphone audio")
+            engine.stop()
+            return
+        }
         do {
             try engine.start()
         } catch {

@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
+import io.unom.punktfunk.kit.DeviceGyro
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
@@ -126,6 +127,8 @@ fun GamepadSettingsScreen(
     val context = LocalContext.current
     // Gates the "Rumble on this phone" row — a TV box has no body vibrator to mirror onto.
     val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
+    // Gates "Gyro from this phone" the same way — a TV box has no gyroscope to mirror from.
+    val hasGyroscope = remember { DeviceGyro.available(context) }
     // Gates the AV1 codec row the same way the touch settings do (see `codecOptionsFor`).
     val av1Capable = remember { io.unom.punktfunk.kit.VideoDecoders.pickDecoder("video/av01") != null }
 
@@ -159,7 +162,7 @@ fun GamepadSettingsScreen(
     // path there is this screen's own Controller-optimized UI toggle, which swaps in the standard
     // interface remote-navigably. The strings branch on it.
     val tv = remember { isTvDevice(context) }
-    val allRows = buildSettingsRows(s, hasBodyVibrator, av1Capable, ::update) +
+    val allRows = buildSettingsRows(s, hasBodyVibrator, hasGyroscope, av1Capable, ::update) +
         buildProfileRows(profiles, savedHosts, tv) { pinProfile = it }
     // Which section is showing, and where each one's focus was when it was last left — a detour
     // into another tab shouldn't lose your place.
@@ -445,12 +448,13 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
 }
 
 /** Build the console settings rows from the current [Settings], writing through [update].
- * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs); [av1Capable] gates the
- * AV1 codec entry (see `codecOptionsFor`). Every row declares its [GpTab]; the screen shows one
- * tab at a time. */
+ * [hasBodyVibrator] gates the "Rumble on this phone" row and [hasGyroscope] the "Gyro from this
+ * phone" row (both absent on TVs); [av1Capable] gates the AV1 codec entry (see
+ * `codecOptionsFor`). Every row declares its [GpTab]; the screen shows one tab at a time. */
 internal fun buildSettingsRows(
     s: Settings,
     hasBodyVibrator: Boolean,
+    hasGyroscope: Boolean,
     av1Capable: Boolean,
     update: (Settings) -> Unit,
 ): List<GpRow> {
@@ -595,6 +599,18 @@ internal fun buildSettingsRows(
                     "for clip-on pads without rumble motors.",
                 s.rumbleOnPhone,
             ) { update(s.copy(rumbleOnPhone = it)) }
+        } else {
+            null
+        },
+        // The rumble mirror's sibling, data flowing the other way — needs a gyroscope to
+        // mirror FROM, which a TV box lacks.
+        if (hasGyroscope) {
+            toggle(
+                "phoneGyro", GpTab.CONTROLLER, null, "Gyro from this phone",
+                "When the controller has no gyro of its own, send this phone's motion " +
+                    "sensors as controller 1's — for clip-on pads without one.",
+                s.gyroOnPhone,
+            ) { update(s.copy(gyroOnPhone = it)) }
         } else {
             null
         },

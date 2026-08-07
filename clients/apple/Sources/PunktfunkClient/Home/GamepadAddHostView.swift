@@ -14,7 +14,15 @@ import SwiftUI
 struct GamepadAddHostView: View {
     @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
     let onAdd: (StoredHost) -> Void
+    /// How the in-place shell (iOS) closes this screen; nil (the macOS sheet, the tvOS cover)
+    /// falls back to the environment dismiss. Declared AFTER `onAdd` so the existing trailing-
+    /// closure call sites keep binding to it, not to this.
+    var close: (() -> Void)?
+    /// Whether this screen owns the controller — false while the shell is mid-transition or the
+    /// connect takeover is up (see GamepadSettingsView's twin).
+    var controllerActive = true
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — tighter chrome so the keyboard tray still fits.
@@ -36,8 +44,8 @@ struct GamepadAddHostView: View {
             items: rows,
             focusID: $focusID,
             onActivate: { activate(id: $0.id) },
-            onBack: { dismiss() },
-            isActive: editing == nil
+            onBack: { performClose() },
+            isActive: controllerActive && editing == nil
         ) { row, focused in
             rowView(row, focused: focused)
                 .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
@@ -45,7 +53,8 @@ struct GamepadAddHostView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 4) {
+            VStack(alignment: .leading, spacing: gamepadHeaderSpacing(compact: compact)) {
+                // Leading, like every gamepad heading — and no close chrome (B is the exit).
                 Text("Add Host")
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
@@ -54,14 +63,14 @@ struct GamepadAddHostView: View {
                         + "for everything else.")
                         .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
                         .foregroundStyle(ink.fg(0.55))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72, alignment: .leading)
                 }
             }
+            .padding(.horizontal, 24)
             .padding(.top, gamepadTitleTopPadding(compact: compact))
-            .padding(.bottom, compact ? 4 : 8)
-            .frame(maxWidth: .infinity)
-            .overlay(alignment: .topTrailing) { closeButton.padding(.top, 20).padding(.trailing, 20) }
+            .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -73,7 +82,10 @@ struct GamepadAddHostView: View {
                 .background { GamepadTrayScrim(edge: .bottom) }
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
-        .background { GamepadFormBackground() }
+        // Hosted in the shell, the field is the shell's (see GamepadSettingsView's twin).
+        .background {
+            if !hostedInShell { GamepadFormBackground() }
+        }
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
@@ -81,6 +93,18 @@ struct GamepadAddHostView: View {
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
         }
+        #if !os(tvOS)
+        // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
+        // keyboard's Esc and the macOS sheet's cancel working without chrome.
+        .background {
+            Button("Cancel") { performClose() }
+                .keyboardShortcut(.cancelAction)
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        #endif
         #if os(tvOS)
         // tvOS types with the SYSTEM fullscreen keyboard (TVTextEntry) instead of the custom
         // tray — the remote and the pad both drive it natively. Same `editing` state as the
@@ -141,22 +165,10 @@ struct GamepadAddHostView: View {
         #endif
     }
 
-    /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
-    /// rides the cancel action.
-    private var closeButton: some View {
-        Button { dismiss() } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(ink.fg)
-                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .glassBackground(Circle(), interactive: true)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        #if !os(tvOS)
-        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
-        #endif
-        .accessibilityLabel("Cancel")
+    /// Close this screen through whichever mechanism presents it: the shell's layer pop on iOS,
+    /// the environment dismiss under a macOS sheet / tvOS cover.
+    private func performClose() {
+        if let close { close() } else { dismiss() }
     }
 
     // MARK: - Rows
@@ -237,7 +249,7 @@ struct GamepadAddHostView: View {
                 name: name.trimmingCharacters(in: .whitespaces),
                 address: address.trimmingCharacters(in: .whitespaces),
                 port: UInt16(port) ?? 9777))
-            dismiss()
+            performClose()
         default:
             openKeyboard(id)
         }

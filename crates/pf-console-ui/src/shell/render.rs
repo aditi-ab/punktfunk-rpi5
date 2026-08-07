@@ -112,6 +112,11 @@ impl Shell {
             // A modal card owns B/A while it's up — the screen's legend would lie.
             show_hints: self.connecting.is_none() && self.wake.is_none(),
         };
+        // Only a SETTLED top screen publishes clickable hint boxes. Mid-transition every
+        // layer is slid and scaled inside a `save_layer`, so the rects a `paint` reports
+        // aren't where the pixels are — and the shell drops pointer input during a
+        // transition anyway, exactly as it drops menu events.
+        self.hint_rects.clear();
         match (&mut self.motion, motion_p) {
             (Motion::Push(_), Some(raw)) => {
                 let p = ease_out_cubic(raw);
@@ -141,7 +146,7 @@ impl Shell {
             }
             _ => {
                 let n = self.stack.len();
-                env.paint(&mut self.stack[n - 1], 1.0, 0.0, 1.0);
+                self.hint_rects = env.paint(&mut self.stack[n - 1], 1.0, 0.0, 1.0);
             }
         }
 
@@ -204,8 +209,15 @@ struct LayerEnv<'a> {
 impl LayerEnv<'_> {
     /// One screen composited as a unit: `alpha` fade, `dy` vertical slide, `scale`
     /// about the screen center — its pinned title and hint bar ride inside the layer,
-    /// so chrome travels with content through a transition.
-    fn paint(&mut self, screen: &mut Screen, alpha: f64, dy: f64, scale: f64) {
+    /// so chrome travels with content through a transition. Returns the hint bar's hit
+    /// boxes, which only the caller can know are worth keeping (see `Shell::render`).
+    fn paint(
+        &mut self,
+        screen: &mut Screen,
+        alpha: f64,
+        dy: f64,
+        scale: f64,
+    ) -> Vec<(crate::glyphs::HintKey, Rect)> {
         let canvas = self.canvas;
         canvas.save_layer_alpha_f(None, alpha.clamp(0.0, 1.0) as f32);
         canvas.translate((0.0, dy as f32));
@@ -234,7 +246,7 @@ impl LayerEnv<'_> {
             self.w * 0.7,
         );
         screen.render(canvas, self.content, self.k, self.dt, self.fonts, &mut ctx);
-        if self.show_hints {
+        let rects = if self.show_hints {
             let hints = screen.hints(&ctx);
             hint_bar(
                 canvas,
@@ -244,8 +256,12 @@ impl LayerEnv<'_> {
                 18.0 * self.k,
                 self.h - 18.0 * self.k,
                 self.k,
-            );
-        }
+            )
+            .rects
+        } else {
+            Vec::new()
+        };
         canvas.restore();
+        rects
     }
 }

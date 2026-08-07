@@ -58,8 +58,8 @@ struct AcknowledgementsView: View {
                         .font(.geist(Self.headlineFont, .semibold, relativeTo: .headline))
                     Text(
                         "Punktfunk uses the open-source components below, each under its own license. "
-                            + "On some platforms FFmpeg is additionally bundled under the LGPL v2.1+ "
-                            + "(dynamically linked, replaceable)."
+                            + "Video decoding uses the system's own VideoToolbox framework, so nothing "
+                            + "is bundled for it — and no Punktfunk client bundles FFmpeg on any platform."
                     )
                     .font(.geist(Self.captionFont, relativeTo: .caption))
                     .foregroundStyle(.secondary)

@@ -24,6 +24,7 @@ class GamepadSettingsRowsTest {
     ): List<GpRow> = buildSettingsRows(
         Settings(gamepadForwarding = forwarding),
         hasBodyVibrator = true,
+        hasGyroscope = true,
         av1Capable = true,
     ) { sink += it }
 

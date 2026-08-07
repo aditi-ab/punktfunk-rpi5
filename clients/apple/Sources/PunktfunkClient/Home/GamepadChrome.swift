@@ -23,22 +23,47 @@ func buttonGlyph(
 
 /// Top padding for a gamepad screen's pinned title. macOS gets extra clearance — the launcher
 /// title sits right under the window titlebar and the settings/add-host sheets have no titlebar
-/// at all, so the iOS value hugs the top edge there.
+/// at all. The other values follow the console shell's rhythm (title top = 18 design units,
+/// k-floored to 10 for a landscape phone): the title needs air to the screen edge or the whole
+/// header reads pressed against the bezel, which the tab strip's extra band made obvious.
 func gamepadTitleTopPadding(compact: Bool) -> CGFloat {
     #if os(macOS)
     26
+    #elseif os(tvOS)
+    24
     #else
-    compact ? 4 : 10
+    compact ? 18 : 28
+    #endif
+}
+
+/// Padding under a gamepad screen's pinned header block (title, and the tab strip where there is
+/// one) before the content: the console leaves ~14 units of air under its tab pills, and without
+/// it the first row sits shoulder-to-shoulder with the header.
+func gamepadTitleBottomPadding(compact: Bool) -> CGFloat {
+    #if os(tvOS)
+    16
+    #else
+    compact ? 8 : 12
+    #endif
+}
+
+/// Spacing between a header's stacked elements (title over tab strip / subtitle).
+func gamepadHeaderSpacing(compact: Bool) -> CGFloat {
+    #if os(tvOS)
+    13
+    #else
+    compact ? 6 : 10
     #endif
 }
 
 /// Point size for a gamepad screen's pinned title: TV-large on tvOS (read from the couch), the
-/// in-hand compact-aware sizes elsewhere.
+/// in-hand compact-aware sizes elsewhere. Sized as a proper screen heading — the field verdict
+/// on the smaller first cut was "way too small" once the title moved off-centre.
 func gamepadTitleSize(compact: Bool) -> CGFloat {
     #if os(tvOS)
     44
     #else
-    compact ? 20 : 30
+    compact ? 24 : 34
     #endif
 }
 
@@ -58,8 +83,7 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 18
     static let rowMaxWidth: CGFloat = 920
     static let detailFont: CGFloat = 19
-    static let closeFont: CGFloat = 20
-    static let closeSide: CGFloat = 48
+    static let bandWidth: CGFloat = 380
     #else
     static let headerFont: CGFloat = 12
     static let labelFont: CGFloat = 16
@@ -72,8 +96,8 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 14
     static let rowMaxWidth: CGFloat = 620
     static let detailFont: CGFloat = 13
-    static let closeFont: CGFloat = 14
-    static let closeSide: CGFloat = 34
+    /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
+    static let bandWidth: CGFloat = 240
     #endif
 }
 
@@ -147,8 +171,21 @@ struct GamepadHintBar: View {
 /// header). Honors Reduce Motion by freezing the field at a fixed phase.
 struct GamepadScreenBackground: View {
     @Environment(\.gamepadInk) private var ink
-    /// Quiet the field for a form screen (see the type comment).
-    var calm = false
+    /// How far toward the form screens' quiet the field sits: 0 = the launcher's full aurora,
+    /// 1 = calm, fractional mid-chase. Continuous (not a Bool) so the in-place shell can CHASE
+    /// it during a push/pop — the console does the same with its `bg_mix` — and every
+    /// calm-dependent factor below rides an `.opacity` modifier, which animates reliably where
+    /// re-built gradient stops do not.
+    var calmMix: Double
+
+    /// The Bool spelling every non-shell call site uses (see the type comment for `calm`).
+    init(calm: Bool = false) {
+        calmMix = calm ? 1 : 0
+    }
+
+    init(calmMix: Double) {
+        self.calmMix = calmMix
+    }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
@@ -184,21 +221,22 @@ struct GamepadScreenBackground: View {
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
                 // Calm = col·0.6 + ground·0.4: over the ground, `.opacity` IS the multiply…
-                .opacity(calm ? 0.6 : 1)
-            if calm {
-                // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
-                // ground lands exactly where it was and the bright pools come down to meet it.
-                Self.color(palette.ground)
-                    .opacity(0.4)
-                    .blendMode(.plusLighter)
-            }
+                .opacity(1 - 0.4 * calmMix)
+            // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
+            // ground lands exactly where it was and the bright pools come down to meet it.
+            // Mounted unconditionally — at opacity 0 a plusLighter layer contributes nothing,
+            // and an always-present layer is what lets the mix animate instead of popping.
+            Self.color(palette.ground)
+                .opacity(0.4 * calmMix)
+                .blendMode(.plusLighter)
             // Cinematic vignette: the edges settle toward the scrim so the cards sit in the
             // pooled light. Soft (extends past the frame) so the corners deepen rather than
             // crush. Halved under calm: a launcher's cards sit in the pooled centre, but a form
             // screen's rows run out toward the edges, where crushing them just eats the list.
             EllipticalGradient(
-                colors: [.clear, scrim.opacity((calm ? 0.21 : 0.42) * strength)],
+                colors: [.clear, scrim.opacity(0.42 * strength)],
                 center: .center, startRadiusFraction: 0.25, endRadiusFraction: 1.15)
+                .opacity(1 - 0.5 * calmMix)
             // Legibility grounding for the pinned title (top) and hint pill (bottom). This one
             // works on the field itself (it's the backdrop's bottom layer — nothing behind it to
             // blur), so it stays a gradient, just a light one.
@@ -342,20 +380,39 @@ struct GamepadTrayScrim: View {
             // to keep the pinned title legible, so it has to frost dark under white ink and
             // light under dark ink.
             .environment(\.colorScheme, ink.isLight ? .light : .dark)
-            // Fade the whole blur out toward the content so it dissolves rather than ending on a line.
+            // Sink the material's grey luminance lift toward the palette's shade (black on a
+            // dark field — field ask: the frost read GREY over the aurora). Inside the mask, so
+            // the tint dissolves with the blur.
+            .overlay(ink.shade(0.35))
+            // Fade the whole blur out toward the content so it dissolves rather than ending on a
+            // line. The strong region sits deep (0.65) because the first stretch of the gradient
+            // now runs over the fixed 80 pt outer overhang below.
             .mask {
                 LinearGradient(
                     stops: [
                         .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.9), location: 0.5),
+                        .init(color: .black.opacity(0.92), location: 0.65),
                         .init(color: .clear, location: 1),
                     ],
                     startPoint: fromEdge, endPoint: toContent)
             }
             // Grow past the tray so the fade-to-clear happens OUTSIDE its bounds — the tray's own
-            // text always sits on the strong part, rows blur out before they reach it.
-            .padding(edge == .top ? .bottom : .top, -32)
-            .ignoresSafeArea()
+            // text always sits on the strong part, rows blur out before they reach it. The bottom
+            // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
+            // the field verdict on the short reach was rows colliding visibly with the legend.
+            .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
+            // Full-bleed by LAYOUT, not by `.ignoresSafeArea()`: safe-area expansion resolves a
+            // beat after insertion (outside any geometry group and outside this view's own
+            // transaction), which is exactly the pop the field kept seeing — vertically first,
+            // then, once the vertical runway became padding, on the X axis alone (the landscape
+            // side insets). 80 pt clears every inset on every device; backgrounds never clip,
+            // so the overhang simply draws.
+            .padding(edge == .top ? .top : .bottom, -80)
+            .padding(.horizontal, -80)
+            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
+            // geometry would ride the push's transaction and visibly grow into place. The
+            // layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
+            .transaction { $0.animation = nil }
     }
 }
 

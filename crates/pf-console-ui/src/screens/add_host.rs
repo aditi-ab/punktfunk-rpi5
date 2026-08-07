@@ -5,7 +5,8 @@
 //! hardware keyboards type straight into the focused field through SDL text input.
 
 use crate::glyphs::{Hint, HintKey};
-use crate::model::ConsoleCmd;
+use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
@@ -28,6 +29,10 @@ pub(crate) struct AddHostScreen {
     address: String,
     port: String,
     editing: Option<Field>,
+    /// `Some(host key)` = editing a saved host rather than adding one. The same three
+    /// fields either way — what changes is the verb, and that the write must UPDATE the
+    /// stored host instead of appending a second one beside it.
+    edits: Option<String>,
 }
 
 impl AddHostScreen {
@@ -39,7 +44,69 @@ impl AddHostScreen {
             address: String::new(),
             port: "9777".into(),
             editing: None,
+            edits: None,
         }
+    }
+
+    /// The same screen, prefilled, saving over a host instead of adding one.
+    pub(crate) fn edit(host: &HostRow) -> AddHostScreen {
+        AddHostScreen {
+            name: host.name.clone(),
+            address: host.addr.clone(),
+            port: host.port.to_string(),
+            // A pinned card's key carries its profile past a NUL; the HOST is what's edited.
+            edits: Some(host.key.split('\0').next().unwrap_or(&host.key).to_string()),
+            ..AddHostScreen::new()
+        }
+    }
+
+    pub(crate) fn title(&self) -> String {
+        if self.edits.is_some() {
+            "Edit Host".into()
+        } else {
+            "Add Host".into()
+        }
+    }
+
+    fn commit_label(&self) -> &'static str {
+        if self.edits.is_some() {
+            "Save changes"
+        } else {
+            "Add host"
+        }
+    }
+
+    /// Mouse/touch. A raised keyboard is modal: it takes anything landing on it, and a
+    /// press outside closes it rather than reaching the row underneath — which is what a
+    /// tap outside a keyboard means everywhere else on a touchscreen.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        if self.editing.is_some() && !ctx.deck {
+            if !self.keyboard.covers(p) {
+                if p.press() {
+                    self.editing = None;
+                    return true;
+                }
+                return false;
+            }
+            let (msg, _) = self.keyboard.pointer(p);
+            match msg {
+                KeyMsg::Type(c) => {
+                    self.type_char(c);
+                }
+                KeyMsg::Backspace => {
+                    self.backspace();
+                }
+                KeyMsg::Done => self.editing = None,
+                KeyMsg::None => {}
+            }
+            return true;
+        }
+        let (msg, pulse) = self.list.pointer(p, FIELDS.len() + 1);
+        if matches!(msg, ListMsg::None) && pulse.is_none() {
+            return false;
+        }
+        self.activate(msg, fx);
+        true
     }
 
     pub(crate) fn editing(&self) -> bool {
@@ -157,25 +224,56 @@ impl AddHostScreen {
         let (msg, pulse) = self.list.menu(ev, FIELDS.len() + 1);
         match msg {
             ListMsg::Activate => {
-                if self.list.cursor < FIELDS.len() {
-                    self.editing = Some(FIELDS[self.list.cursor]);
-                } else if self.can_add() {
-                    fx.cmds.push(ConsoleCmd::SaveHost {
-                        name: self.name.trim().to_string(),
-                        addr: self.address.trim().to_string(),
-                        port: self.port.parse().unwrap_or(9777),
-                    });
-                    fx.toast = Some(format!("Added {}", self.address.trim()));
-                    fx.pop();
-                } else {
-                    // Not addable yet — jump to what's missing instead of a dead press.
-                    self.list.cursor = 1; // the address row
-                    self.editing = Some(Field::Address);
-                }
+                self.activate(msg, fx);
                 pulse
             }
             _ => pulse,
         }
+    }
+
+    /// The commit row's behaviour, shared by the pad/keyboard path and the pointer's.
+    fn activate(&mut self, msg: ListMsg, fx: &mut Outbox) {
+        if !matches!(msg, ListMsg::Activate) {
+            return;
+        }
+        if self.list.cursor < FIELDS.len() {
+            self.editing = Some(FIELDS[self.list.cursor]);
+            return;
+        }
+        if !self.can_add() {
+            // Not commitable yet — jump to what's missing instead of a dead press.
+            self.list.cursor = 1; // the address row
+            self.editing = Some(Field::Address);
+            return;
+        }
+        let (name, addr) = (
+            self.name.trim().to_string(),
+            self.address.trim().to_string(),
+        );
+        let port = self.port.parse().unwrap_or(9777);
+        match &self.edits {
+            Some(key) => {
+                // Name it by its nickname if it has one, else by the address — the same
+                // fallback the store applies to an unnamed host.
+                let label = if name.is_empty() {
+                    addr.clone()
+                } else {
+                    name.clone()
+                };
+                fx.cmds.push(ConsoleCmd::UpdateHost {
+                    key: key.clone(),
+                    name,
+                    addr,
+                    port,
+                });
+                fx.toast = Some(format!("Saved {label}"));
+            }
+            None => {
+                fx.toast = Some(format!("Added {addr}"));
+                fx.cmds.push(ConsoleCmd::SaveHost { name, addr, port });
+            }
+        }
+        fx.pop();
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
@@ -270,7 +368,7 @@ impl AddHostScreen {
             ),
             field_row("Address", &self.address, "IP or hostname", Field::Address),
             field_row("Port", &self.port, "9777", Field::Port),
-            RowSpec::action("Add Host", self.can_add()),
+            RowSpec::action(self.commit_label(), self.can_add()),
         ]
     }
 }

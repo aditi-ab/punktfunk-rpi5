@@ -219,7 +219,7 @@ impl Shell {
                 fonts,
                 hints,
                 self.glyphs,
-                cx - probe.0 / 2.0,
+                cx - probe.size.0 / 2.0,
                 h - 34.0 * k,
                 k,
             );

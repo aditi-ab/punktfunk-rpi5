@@ -1,6 +1,6 @@
 [package]
 name = "pf-client-core"
-description = "Shared client plumbing (Linux + Windows) — session pump, FFmpeg decode, PipeWire/WASAPI audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shells and the Vulkan session binary build on one implementation"
+description = "Shared client plumbing (Linux + Windows) — session pump, native video decode, PipeWire/WASAPI audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shells and the Vulkan session binary build on one implementation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,78 @@ repository.workspace = true
 # (same public surface — see lib.rs).
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
-# FFmpeg's Vulkan hwcontext surface (Vulkan Video decode on the presenter's device).
-pf-ffvk = { path = "../pf-ffvk" }
+# Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
+# WP-2, AV1 by M7): auto's TOP rung on both desktop OSes since M9 — for every codec it
+# speaks, AV1 included — also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
+# video_vk_native.rs, running pf-vkdecode's VkH264Decoder/VkH265Decoder/VkAv1Decoder on
+# the presenter's shared device.
+pf-vkdecode = { path = "../pf-vkdecode" }
+# The one bitstream parser (M1): the SOFTWARE rung reads its per-picture colour
+# signalling, IDR flag and recovery-point SEI from the same `AuPlan` every hardware rung
+# already submits from (`video_software.rs`). That is what makes the swscale BT.601
+# default unrepresentable rather than merely fixed — there is no second colour source
+# left to disagree with.
+pf-bitstream = { path = "../pf-bitstream" }
 async-channel = "2"
 
-# Video decode (same FFmpeg pin as the host) and Opus for the audio planes.
-ffmpeg-next = "8"
+# M8's software rung, the ladder's last one — no FFmpeg in either half.
+#
+# H.264: openh264 (BSD-2), already a workspace dependency (the HOST's GPU-less encoder,
+# `pf-encode/src/enc/sw.rs`), so the licence posture and the bundled-source build are
+# both already settled and already compiled by every `--workspace` leg.
+#
+# AV1: rav1d (BSD-2) — dav1d itself, ported to Rust by the ISRG/Prossimo memory-safety
+# project. The plan of record names "dav1d"; the `dav1d` crate reaches it through
+# `dav1d-sys`, which is `system-deps`-only (no vendored build): it needs `dav1d.pc` +
+# headers at build time and `libdav1d.so`/`dav1d.dll` at run time on EVERY client
+# package. That is a new system codec dependency added by the milestone family whose
+# §6 excision checklist exists to delete exactly those. rav1d is the same decoder with
+# none of that: pure Rust, no linker, nothing new in any package.
+#
+# ⚠ Both of these are NEW COMPILE COST on the client packaging legs, which is easy to
+# miss because the workspace already built openh264: every client leg is `-p`-scoped and
+# excludes pf-encode (flatpak's `cargo build -p punktfunk-client-linux -p
+# punktfunk-client-session -p punktfunk-cli`, windows.yml/windows-msix.yml's
+# `-p punktfunk-client-windows …`, deb.yml's client job, packaging/nix's
+# `punktfunk-client`), so all of them compile the bundled OpenH264 tree for the FIRST
+# time here. Only the `--workspace` CI legs and the host packages built it before.
+#
+# `default-features = false` drops two things deliberately:
+#  * `asm` — rav1d's hand-written assembly needs `nasm` at build time, and it is NOT the
+#    same trade openh264 makes next to it: openh264-sys2's `try_compile_nasm` returns
+#    quietly when nasm is missing ("Failed to compile NASM files, not using any
+#    assembly") and the C build still succeeds, whereas rav1d's build.rs PANICS ("NASM
+#    build failed. Make sure you have nasm installed or disable the \"asm\" feature").
+#    So turning `asm` on makes nasm a hard build requirement of every client package,
+#    and `ci/rust-ci.Dockerfile` — the container the client .deb and the workspace CI
+#    build in — does not have it (arch, rpm, nix and the FFmpeg-building noble image
+#    all do; the flatpak GNOME SDK and the Windows runner are not provisioned by
+#    anything in this tree). Making the rung that only ever runs BECAUSE the GPU
+#    already failed a build-breaker for the legs that ship it is the wrong way round.
+#    Turn it back on the day every client leg provisions nasm — and expect a large
+#    speedup when you do; this is dav1d's asm, and the Rust fallbacks are much slower.
+#  * `bitdepth_16` — the CPU rung is 8-bit by contract (`video_software.rs` refuses
+#    anything else rather than mis-scaling it), so building the 10/12-bit half would be
+#    compiling a path the code refuses to take.
+#
+# One packaging risk this DOESN'T carry: rav1d exports dav1d's C ABI as `#[no_mangle]`
+# symbols (`dav1d_open`, `dav1d_send_data`, …), which could in principle interpose on a
+# real libdav1d loaded into the same process. It cannot here — these are Rust `staticlib`
+# symbols in an executable with no `-rdynamic` and no dynamic export table entry, so the
+# loader never offers them to anyone. That changes if pf-client-core ever becomes a
+# `cdylib` or a leg adds `-rdynamic`/`--export-dynamic`; re-check it then.
+openh264 = "0.9"
+rav1d = { version = "1", default-features = false, features = ["bitdepth_8"] }
+# errno names for rav1d's negated-`c_int` returns (`video_software.rs`): `ENOPROTOOPT` —
+# the code a `bitdepth_8`-only build answers a 10-bit stream with — is 92 on Linux and
+# 123 on Windows, and rav1d re-exports only `Dav1dResult`, so the typed enum that would
+# otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
+libc = "0.2"
+
+# Opus for the audio planes. The VIDEO side has no FFmpeg at all since M10: every decode
+# rung is native (pf-vkdecode / pf-dxvadec / pf-vaadec / openh264+rav1d) and the codec
+# vocabulary is `punktfunk_core::quic`'s own `CODEC_*` wire bits. The HOST still encodes
+# with libavcodec (`pf-encode`); nothing in this crate does.
 opus = "0.3"
 
 mdns-sd = "0.20"
@@ -54,17 +120,33 @@ rand = "0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = "0.9"
 sdl3 = { version = "0.18", features = ["hidapi"] }
+# Native VAAPI decode (M6 of the native-decode program): the hand-declared libva buffer
+# layouts, the profile/format/surface decisions, the AuPlan → picparams/IQ/slice
+# conversion and the DRM-PRIME export descriptor that `video_vaapi_native` marshals.
+# Cross-platform on purpose — everything decidable without a device is tested by the
+# ordinary macOS and container gates, exactly as pf-dxvadec does for Windows.
+pf-vaadec = { path = "../pf-vaadec" }
+# libva itself is dlopen'd, never linked (see `video_vaapi_native`'s module docs): the
+# container can then compile and clippy the whole rung without `libva-dev`, and a machine
+# without a VAAPI runtime gets a clean refusal instead of a packaging dependency.
+libloading = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
+# Native D3D11VA decode (M5 of the native-decode program): the hand-declared DXVA buffer
+# layouts and the AuPlan → picparams/qmatrix/slice-control conversion that video_d3d11_native
+# submits. Windows-only because the rung is; the crate itself is cross-platform CPU code so
+# its tests run on every CI leg (which is the point — `cfg(windows)` code cannot be tested by
+# the Linux or macOS gates at all).
+pf-dxvadec = { path = "../pf-dxvadec" }
 # Pad-audio correlation (pad_audio.rs): the HID devnode's ContainerID and a render endpoint's
 # stamped PKEY_Device_ContainerId both live in the registry — read-only, which sidesteps COM
 # property stores entirely (the same version the host pins).
 winreg = "0.56"
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
-# D3D11VA decode (video_d3d11.rs): device/adapter selection, DXVA probes, and the shared
-# NT-handle hand-off ring. Same pinned rev as clients/windows so the workspace builds ONE
-# windows-rs.
+# D3D11 decode-device plumbing (video_d3d11.rs): device/adapter selection, DXVA probes, and
+# the shared NT-handle hand-off ring `video_d3d11_native` fills. Same pinned rev as
+# clients/windows so the workspace builds ONE windows-rs.
 windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
     # Features are header-named since windows-rs generates from the SDK headers directly
     # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
@@ -82,6 +164,13 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     # number — all in winuser now.
     "winuser",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The native D3D11VA rung's frame-hash parity test compares decoded surfaces against the
+# libavcodec goldens M5 captured — the same SHA-256 list, and the same crate, pf-vkdecode's
+# Vulkan parity legs use (already in the workspace lock). The goldens are checked-in
+# hashes; nothing links FFmpeg to read them.
+sha2 = "0.10"
 
 [features]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a

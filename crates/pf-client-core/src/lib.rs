@@ -20,6 +20,8 @@
 // instead of an argument precisely because nothing required one.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(any(target_os = "linux", windows))]
+mod au_dump;
 #[cfg(target_os = "linux")]
 pub mod audio;
 #[cfg(windows)]
@@ -70,13 +72,21 @@ pub mod video;
 mod video_color;
 #[cfg(any(target_os = "linux", windows))]
 mod video_software;
-// libav ownership helpers shared by the hardware decoders below (`AvBuffer`).
-#[cfg(any(target_os = "linux", windows))]
-mod video_libav;
+// Native VAAPI decode (M6 of the native-decode program): pf-vaadec's plans driven
+// straight into libva, dlopen'd at runtime, exporting DRM-PRIME dmabufs the presenter
+// imports. Since M10 it is the ONLY VAAPI rung there is — the libavcodec one it
+// replaced is deleted — so `auto` reaches it wherever the vendor order puts VAAPI
+// first; `PUNKTFUNK_DECODER=native-vaapi` reaches it by pin regardless. See `video`'s
+// evidence table for what hardware has actually run it.
 #[cfg(target_os = "linux")]
-mod video_vaapi;
+pub mod video_vaapi_native;
+// Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
+// WP-2, AV1 by M7): pf-vkdecode's H.264/H.265/AV1 decoders on the presenter's shared
+// device — auto's TOP rung on both desktop OSes since M9, for all three codecs (each
+// leg has hardware parity against libavcodec; see `video`'s evidence table), also
+// pinnable via `PUNKTFUNK_DECODER=native-vulkan`.
 #[cfg(any(target_os = "linux", windows))]
-mod video_vulkan;
+mod video_vk_native;
 // The OS-clipboard bridge for the shared clipboard (design/clipboard-and-file-transfer.md §5).
 // Built everywhere the session client is; the platform seam inside is Windows-real,
 // stub elsewhere.
@@ -87,8 +97,19 @@ pub mod clipboard;
 // Linux's: the decoder is plain Vulkan compute on the presenter's device (no fds, no
 // dmabuf, no D3D11 interop), so the old "Windows present-path decision" that gated it
 // resolved itself — the present path is now literally the same code.
+// D3D11 decode-device plumbing: the shareable-texture hand-off ring, the decode-device
+// creation and `display_hdr_volume`. Field-proven, FFmpeg-free code that
+// `video_d3d11_native` (and `clients/session`) build on; the libavcodec DECODER that used
+// to live alongside it went with M10's excision.
 #[cfg(windows)]
 pub mod video_d3d11;
+// Native D3D11VA (M5): `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the
+// hand-off ring `video_d3d11` owns. Since M10 it is the only DXVA rung there is. In `auto`
+// for the codecs that have hardware evidence (H.264/H.265) and, with nothing proven left
+// below it, for AV1 too — see `video`'s evidence table; `PUNKTFUNK_DECODER=native-d3d11va`
+// reaches every leg by pin.
+#[cfg(windows)]
+pub mod video_d3d11_native;
 #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
 pub mod video_pyrowave;
 

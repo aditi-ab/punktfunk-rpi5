@@ -37,6 +37,12 @@ struct GamepadInk: Equatable, Sendable {
     func accent(_ alpha: Double) -> Color { accent.opacity(alpha) }
     /// A wash under text: `alpha` is the dark-field strength, scaled for a pale one.
     func shade(_ alpha: Double) -> Color { shade.opacity(alpha * shadeScale) }
+    /// The glass base at `alpha` — what a surface's material is washed with so it carries the
+    /// palette's hue (the console fills its panels with exactly this colour).
+    func glass(_ alpha: Double) -> Color { glass.opacity(alpha) }
+    /// A drop shadow: always black — a white shadow is not a shadow — but softened on a pale
+    /// field, where full-strength black under every card reads as a smear rather than depth.
+    func shadow(_ alpha: Double) -> Color { .black.opacity(alpha * (isLight ? 0.4 : 1)) }
 
     static func of(_ p: GamepadPalette) -> GamepadInk {
         let accent = Color(red: p.accent.x, green: p.accent.y, blue: p.accent.z)
@@ -60,6 +66,10 @@ struct GamepadInk: Equatable, Sendable {
 
     /// The shipped dark look — what a preview or a test composition gets.
     static let dark = GamepadInk.of(GamepadPalette.named("violet"))
+
+    /// The online pip — deliberately NOT palette-derived: a status colour must not change
+    /// meaning with the wallpaper (the console's rule; this is its `ONLINE_GREEN` verbatim).
+    static let onlineGreen = Color(red: 0.20, green: 0.84, blue: 0.29)
 }
 
 private struct GamepadInkKey: EnvironmentKey {

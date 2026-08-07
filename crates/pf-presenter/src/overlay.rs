@@ -20,9 +20,11 @@ pub struct SharedDevice {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    /// External-sync lock for `queue` — FFmpeg's decode prep submits to the same queue
-    /// from the pump thread, so every overlay flush/submit must hold it (the presenter
-    /// and FFmpeg's `lock_queue` callbacks serialize on this same lock).
+    /// External-sync lock for `queue` — the decode lane submits to the same queue
+    /// from the pump thread, so every overlay flush/submit must hold it. The presenter,
+    /// this overlay and the native decode lane all serialize on this one lock; take it
+    /// with [`pf_client_core::video::QueueLock::guard`], whose RAII form is what every
+    /// Rust caller wants.
     pub queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
 }
 
@@ -100,6 +102,53 @@ pub enum OverlayAction {
     CancelConnect,
     /// Quit the launcher (B at the root) — ends the process, Gaming Mode returns.
     Quit,
+    /// Put this text on the system clipboard (the host menu's "Copy link"). An action
+    /// rather than a console command because the clipboard belongs to SDL, which lives on
+    /// the run loop's thread and nowhere else.
+    CopyText(String),
+}
+
+/// Which button a [`PointerInput`] press/release carries. A touchscreen contact always
+/// arrives as `Primary` — there is no second finger-button, and the console's back
+/// affordance is on glass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    Primary,
+    /// The right button — the console reads it as Back, the pointer's B.
+    Secondary,
+}
+
+/// Pointer or touch input offered to the overlay, in SWAPCHAIN PIXELS.
+///
+/// Pixels, not window coordinates, because that is the space the overlay renders in: a
+/// screen hit-tests the very rects it drew last frame instead of re-deriving a layout
+/// through the display scale. The run loop owns the conversion — it is the side that
+/// holds the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerInput {
+    Move {
+        x: f32,
+        y: f32,
+    },
+    Down {
+        x: f32,
+        y: f32,
+        button: PointerButton,
+    },
+    Up {
+        x: f32,
+        y: f32,
+        button: PointerButton,
+    },
+    /// One wheel/trackpad scroll step at `x`/`y`; `dy` > 0 scrolls away from the user.
+    Wheel {
+        x: f32,
+        y: f32,
+        dy: f32,
+    },
+    /// The gesture was abandoned (the pointer left the window, the touch was canceled) —
+    /// any armed press is dropped without acting.
+    Cancel,
 }
 
 /// Session lifecycle notifications into the overlay (browse mode drives its scenes off
@@ -113,6 +162,15 @@ pub enum SessionPhase<'a> {
     Failed(&'a str),
     /// The session ran and ended (`Some` = abnormal reason for the status strip).
     Ended(Option<&'a str>),
+    /// The session ended and the client is DIALING AGAIN by itself — today only because
+    /// the negotiated codec ran out of decode rungs (M8's software-HEVC drop) and the
+    /// retry advertises a codec this device can actually finish.
+    ///
+    /// Distinct from [`Self::Ended`] and [`Self::Failed`] because the user's next action
+    /// is different: nothing. "Session ended — HEVC decoding failed" invites a manual
+    /// reconnect that is already in flight, and "Couldn't connect" is simply false — the
+    /// connect worked, the decode did not.
+    Reconnecting(&'a str),
 }
 
 /// The console-UI side. Object-safe; the session binary passes
@@ -129,6 +187,17 @@ pub trait Overlay {
     /// menu channel). Returns a haptic pulse to play on the menu pad, if any.
     fn handle_menu(&mut self, _event: MenuEvent) -> Option<MenuPulse> {
         None
+    }
+
+    /// Mouse/touch input, in swapchain pixels, before capture sees it. `true` = consumed
+    /// (the console is up and something under the pointer took it) — the event must not
+    /// reach capture/forwarding.
+    ///
+    /// Separate from [`Self::handle_event`] because the window→pixel conversion belongs to
+    /// the run loop, which is the side that holds the window: the overlay renders in
+    /// pixels and would otherwise have to re-derive the display scale it never sees.
+    fn handle_pointer(&mut self, _input: PointerInput) -> bool {
+        false
     }
 
     /// Drain one pending action raised by handled input. Called once per loop

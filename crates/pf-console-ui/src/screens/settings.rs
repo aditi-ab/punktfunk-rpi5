@@ -8,8 +8,12 @@
 //! The rows are split across tabs (see [`TABS`]). They used to be one 30-row scroll with
 //! inline headers, which on a Deck meant thumbing past Video and Audio to reach the pad
 //! settings; a tab is one shoulder press, and each tab remembers where its cursor was.
+//! A tab is also one Tab keypress, and one click or tap on its pill — the strip shipped
+//! reachable by shoulder buttons alone, which left it unusable to everyone holding a
+//! mouse or touching the glass.
 
 use crate::glyphs::{Hint, HintKey};
+use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
@@ -166,20 +170,26 @@ const CODECS: [(&str, &str); 5] = [
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
 // Per-OS hardware rungs, like the shells' pickers: the console ships on Windows too
-// (`punktfunk-session --browse`), where "vaapi" is a dead option that ALSO hid the real
-// hardware path (d3d11va) — `Decoder::new` has no VAAPI branch there.
+// (`punktfunk-session --browse`), where "vaapi" was a dead option that ALSO hid the real
+// hardware path — `Decoder::new` has no VAAPI branch there.
+//
+// The STORED values are the `native-*` rung names since M10 (the libavcodec rungs those
+// bare names meant are deleted). The LABELS are unchanged and still true — native Vulkan
+// Video is Vulkan Video. A store written by an older client keeps working: the bare names
+// migrate on read (`pf_client_core::video`'s `migrate_decoder_pref`), they just will not
+// match a preset here, so the picker shows the first entry until the user re-picks.
 #[cfg(not(windows))]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
-    ("vulkan", "Vulkan Video"),
-    ("vaapi", "VAAPI"),
+    ("native-vulkan", "Vulkan Video"),
+    ("native-vaapi", "VAAPI"),
     ("software", "Software"),
 ];
 #[cfg(windows)]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
-    ("vulkan", "Vulkan Video"),
-    ("d3d11va", "Direct3D 11"),
+    ("native-vulkan", "Vulkan Video"),
+    ("native-d3d11va", "Direct3D 11"),
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
@@ -261,17 +271,47 @@ impl SettingsScreen {
         }
     }
 
-    /// L1/R1 — move one tab, wrapping (the strip is a ring, like A's value cycle), keeping
-    /// each tab's own cursor.
+    #[cfg(test)]
+    pub(crate) fn tab_for_test(&self) -> usize {
+        self.tab
+    }
+
+    /// L1/R1 (and Tab/PgUp/PgDn) — move one tab, wrapping (the strip is a ring, like A's
+    /// value cycle), keeping each tab's own cursor.
     fn switch_tab(&mut self, delta: i32) -> Option<MenuPulse> {
-        self.tab_cursors[self.tab] = self.list.cursor;
         let n = TABS.len() as i32;
-        self.tab = (self.tab as i32 + delta).rem_euclid(n) as usize;
+        self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize)
+    }
+
+    /// Show `tab`, parking the cursor the outgoing tab was on. Also the pointer's path in:
+    /// a press on a pill names a tab outright rather than a direction to step in.
+    fn show_tab(&mut self, tab: usize) -> Option<MenuPulse> {
+        if tab >= TABS.len() {
+            return None;
+        }
+        self.tab_cursors[self.tab] = self.list.cursor;
+        self.tab = tab;
         // Clamp the remembered cursor: the Profiles tab's length follows the catalog.
         let len = self.row_ids().len();
         self.list
             .jump_to(self.tab_cursors[self.tab].min(len.saturating_sub(1)));
         Some(MenuPulse::Move)
+    }
+
+    /// Mouse/touch. The strip is checked first — its pills sit above the list and a press
+    /// there is never meant for a row.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        if let Some(tab) = self.strip.pointer(p) {
+            self.show_tab(tab);
+            return true;
+        }
+        let ids = self.row_ids();
+        let (msg, pulse) = self.list.pointer(p, ids.len());
+        if matches!(msg, ListMsg::None) && pulse.is_none() {
+            return false;
+        }
+        self.apply_row(msg, pulse, &ids, ctx, fx);
+        true
     }
 
     pub(crate) fn menu(
@@ -291,6 +331,19 @@ impl SettingsScreen {
         }
         let ids = self.row_ids();
         let (msg, pulse) = self.list.menu(ev, ids.len());
+        self.apply_row(msg, pulse, &ids, ctx, fx)
+    }
+
+    /// What a list message means on the focused row — shared by the pad/keyboard path and
+    /// the pointer's, so a click and an A press can never drift apart.
+    fn apply_row(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        ids: &[RowId],
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
         // The Profiles rows navigate instead of editing the settings file.
         match ids[self.list.cursor] {
             RowId::Profile(i) => {
@@ -505,7 +558,17 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             label_for(&COMPOSITORS, &s.compositor).into(),
         ),
         RowId::Codec => (None, "Video codec", label_for(&CODECS, &s.codec).into()),
-        RowId::Decoder => (None, "Decoder", label_for(&DECODERS, &s.decoder).into()),
+        // Migrated on the way in: a pre-M10 store holds `vulkan`/`vaapi`/`d3d11va`,
+        // which name no preset here and would otherwise render as "—".
+        RowId::Decoder => (
+            None,
+            "Decoder",
+            label_for(
+                &DECODERS,
+                &pf_client_core::video::migrate_decoder_pref(&s.decoder),
+            )
+            .into(),
+        ),
         RowId::Hdr => (None, "10-bit HDR", on_off(s.hdr_enabled).into()),
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
         RowId::PresentPriority => (
@@ -621,7 +684,7 @@ fn detail(id: RowId) -> &'static str {
             "Which compositor drives the virtual output — honored only if available on the host."
         }
         RowId::Codec => "A preference — the host falls back if it can't encode this one.",
-        RowId::Decoder => "Automatic prefers Vulkan Video, then VAAPI, then software.",
+        RowId::Decoder => "Automatic picks the best hardware decoder for this GPU, then software.",
         RowId::Hdr => {
             "HDR10 — engages when the host sends HDR content and this display supports it."
         }
@@ -769,7 +832,13 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::Compositor => step_str(&COMPOSITORS, &mut s.compositor, delta, wrap),
         RowId::Codec => step_str(&CODECS, &mut s.codec, delta, wrap),
-        RowId::Decoder => step_str(&DECODERS, &mut s.decoder, delta, wrap),
+        RowId::Decoder => {
+            // …and on the way in here too, or stepping from a legacy value would start
+            // from "not found" and jump to the first/last entry instead of the neighbour
+            // of what the user actually has.
+            s.decoder = pf_client_core::video::migrate_decoder_pref(&s.decoder);
+            step_str(&DECODERS, &mut s.decoder, delta, wrap)
+        }
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
         RowId::Chroma444 => toggle(&mut s.enable_444, delta, wrap),
         RowId::PresentPriority => {
@@ -908,6 +977,163 @@ mod tests {
 
     fn ctx_parts() -> (Settings, Vec<pf_client_core::gamepad::PadInfo>) {
         (Settings::default(), Vec::new())
+    }
+
+    /// Point the settings store at a throwaway HOME. `apply_row` rebases on the FILE
+    /// before a mutating press and saves after it, so a test driving that path against the
+    /// real `$HOME` would rewrite the developer's own console settings.
+    fn fake_home() {
+        use std::sync::OnceLock;
+        static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let dir = HOME.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("pf-settings-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        std::env::set_var("HOME", dir);
+    }
+
+    /// Render the screen once so its strip and list carry real geometry, then hand back a
+    /// pointer aimed at the centre of `rect`. Hit-testing reads what was DRAWN, so a test
+    /// that skipped the render would be testing nothing.
+    fn rendered(screen: &mut SettingsScreen) -> f64 {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let (w, h) = (1280i32, 800i32);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let k = f64::from(h) / 800.0;
+        screen.render(
+            surface.canvas(),
+            Rect::from_ltrb(0.0, 64.0, w as f32, h as f32 - 86.0),
+            k,
+            1.0 / 60.0,
+            &fonts,
+            &mut ctx,
+        );
+        k
+    }
+
+    fn press(r: Rect) -> Pointer {
+        Pointer {
+            x: f64::from(r.center_x()),
+            y: f64::from(r.center_y()),
+            kind: crate::pointer::PointerKind::Press,
+        }
+    }
+
+    fn with_ctx(f: impl FnOnce(&mut Ctx)) {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        f(&mut ctx);
+    }
+
+    /// The bug this all started from: the tabs answered the shoulder buttons and nothing
+    /// else, so a mouse or a touchscreen could not change section at all.
+    #[test]
+    fn a_press_on_a_pill_selects_that_tab() {
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        rendered(&mut s);
+        assert_eq!(s.tab, 0);
+        for target in [3, 1, TABS.len() - 1, 0] {
+            let pill = s.strip.pill(target).expect("the strip drew every pill");
+            with_ctx(|ctx| {
+                let mut fx = Outbox::default();
+                assert!(s.pointer(press(pill), ctx, &mut fx), "the pill took it");
+            });
+            assert_eq!(s.tab, target, "pressing pill {target} selects it");
+            // Selecting a tab re-lays the strip; re-render so the next pick is current.
+            rendered(&mut s);
+        }
+    }
+
+    /// …and each tab still keeps its own cursor when a POINTER is what switched it.
+    #[test]
+    fn a_pressed_tab_restores_that_tabs_cursor() {
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        rendered(&mut s);
+        s.list.cursor = 2;
+        let second = s.strip.pill(1).unwrap();
+        with_ctx(|ctx| {
+            let mut fx = Outbox::default();
+            s.pointer(press(second), ctx, &mut fx);
+        });
+        assert_eq!(s.list.cursor, 0, "a fresh tab starts at its own top");
+        rendered(&mut s);
+        let first = s.strip.pill(0).unwrap();
+        with_ctx(|ctx| {
+            let mut fx = Outbox::default();
+            s.pointer(press(first), ctx, &mut fx);
+        });
+        assert_eq!(s.list.cursor, 2, "coming back lands where it was left");
+    }
+
+    /// A press on a row focuses AND activates it — one click changes the value, the way a
+    /// row that is its own control should behave.
+    #[test]
+    fn a_press_on_a_row_focuses_and_cycles_it() {
+        fake_home();
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        rendered(&mut s);
+        // Row 0 of the leading tab is Resolution, whose first step is Native → Match
+        // window: one field, one unambiguous effect to assert on.
+        assert_eq!(s.row_ids()[0], RowId::Resolution);
+        let first = s.list.row_rect(0).expect("the list drew its rows");
+        let (mut settings, pads) = ctx_parts();
+        settings.save(); // seat the fake HOME's file — `apply_row` rebases on it
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut fx = Outbox::default();
+        assert!(!ctx.settings.match_window);
+        assert!(s.pointer(press(first), &mut ctx, &mut fx));
+        assert_eq!(s.list.cursor, 0, "the pressed row takes focus");
+        assert!(
+            ctx.settings.match_window,
+            "one press both focuses the row and cycles its value"
+        );
+    }
+
+    /// A press that lands on neither a pill nor a row is refused, so the shell can let it
+    /// fall through rather than swallowing every stray click.
+    #[test]
+    fn a_press_on_empty_space_is_not_consumed() {
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        rendered(&mut s);
+        with_ctx(|ctx| {
+            let mut fx = Outbox::default();
+            let p = Pointer {
+                x: 4.0,
+                y: 780.0,
+                kind: crate::pointer::PointerKind::Press,
+            };
+            assert!(!s.pointer(p, ctx, &mut fx));
+        });
     }
 
     #[test]

@@ -4,8 +4,9 @@ FFmpeg — third-party component notice
 This product bundles unmodified shared libraries from the FFmpeg project
 (avcodec / avutil / avformat / swscale / swresample and their dependencies) as
 separate dynamic-link libraries (DLLs). punktfunk uses them only for hardware
-video encode (AMD AMF / Intel QSV) on the host and hardware/software video
-decode on the client.
+video encode (AMD AMF / Intel QSV) in the streaming host. The punktfunk client
+bundles no FFmpeg libraries at all — it decodes with its own native decoders —
+so this notice concerns the host installer only.
 
 License
 -------

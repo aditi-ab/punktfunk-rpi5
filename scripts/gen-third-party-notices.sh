@@ -20,16 +20,39 @@ else
 fi
 echo "==> wrote $OUT" >&2
 
-# Keep the per-client in-tree copies in sync (the GUI apps bundle these as resources/assets and
-# show them on their Acknowledgements / Open-source-licenses screen). The Linux/Windows Rust clients
-# embed the root file directly via include_str!, so they need no copy.
+# Regenerate the per-client in-tree copies. EVERY client has one now, because every client SHOWS
+# it: the mobile apps bundle theirs as a resource/asset for their Acknowledgements screen, and the
+# two desktop shells `include_str!` theirs onto their Licenses page (the MSIX and the client .deb
+# ship the file as well).
+#
+# These are GENERATED, not copied. They used to be the workspace-wide file, which attributed to
+# every client every crate anything in this repo links: FFmpeg, the NVENC SDK, GTK4, windows-rs.
+# The Apple app links ONE Rust crate (punktfunk-core, through PunktfunkCore.xcframework — see
+# scripts/build-xcframework.sh) and Android links the JNI bridge over it; everything else in those
+# apps is Swift/Kotlin and platform frameworks.
+#
+# M10 — the client's FFmpeg excision — is what turned the same untidiness on the DESKTOP copies
+# into a false statement a user can see: the shells print an `ffmpeg-next 8.1.0 — WTFPL` line and
+# the full FFmpeg licence text three screens under a card saying no FFmpeg is bundled. So they are
+# scoped too, each to the binaries its package actually installs — the shell, the session streamer,
+# the headless CLI, and on Linux the update helper (`pf-update` ships as pf-update-client).
+#
+# The ROOT file stays workspace-wide on purpose: the HOST ships out of it, and the host does still
+# link FFmpeg.
+#
+# Only the offline generator can scope a file (cargo-about renders the whole workspace), so these
+# always go through it — the root file above still prefers cargo-about when installed.
 if [ "$OUT" = "THIRD-PARTY-NOTICES.txt" ]; then
-    for dest in \
-        clients/apple/Sources/PunktfunkKit/Resources/THIRD-PARTY-NOTICES.txt \
-        clients/android/app/src/main/assets/THIRD-PARTY-NOTICES.txt; do
-        if [ -d "$(dirname "$dest")" ]; then
-            cp "$OUT" "$dest"
-            echo "==> synced $dest" >&2
-        fi
-    done
+    # <in-tree path> <workspace members whose closure it must state>
+    while read -r dest packages; do
+        [ -n "$dest" ] || continue
+        [ -d "$(dirname "$dest")" ] || continue
+        python3 scripts/gen-third-party-notices.py --packages "$packages" --out "$dest"
+        echo "==> generated $dest ($packages closure)" >&2
+    done <<'CLIENTS'
+clients/apple/Sources/PunktfunkKit/Resources/THIRD-PARTY-NOTICES.txt punktfunk-core
+clients/android/app/src/main/assets/THIRD-PARTY-NOTICES.txt punktfunk-client-android
+clients/linux/THIRD-PARTY-NOTICES.txt punktfunk-client-linux,punktfunk-client-session,punktfunk-cli,pf-update
+clients/windows/THIRD-PARTY-NOTICES.txt punktfunk-client-windows,punktfunk-client-session,punktfunk-cli
+CLIENTS
 fi
