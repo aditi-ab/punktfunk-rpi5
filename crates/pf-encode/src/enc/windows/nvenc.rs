@@ -2704,6 +2704,162 @@ mod tests {
         }
     }
 
+    /// ON-HARDWARE — **S1 on WINDOWS/D3D11**, the question that gates Windows split arbitration.
+    ///
+    /// Everything the split-encode programme rests on was proven on **Linux/CUDA**: that
+    /// `nvEncReconfigureEncoder` accepts a changed `splitEncodeMode` with `resetEncoder=0`, emits
+    /// **no IDR**, and actually takes effect. The Windows backend drives a different device type
+    /// (`NV_ENC_DEVICE_TYPE_DIRECTX`), so none of that transfers by assumption — and if the driver
+    /// refuses it here, Windows arbitration is simply not buildable and should not be attempted.
+    ///
+    /// Also checks the two things WP1.1 added, on real Windows hardware rather than by inference
+    /// from Linux: that `query_caps` latches `NUM_ENCODER_ENGINES`, and that the driver **honours
+    /// an over-ask** (asking for a 3-way split on a 2-engine card) — the behaviour that makes the
+    /// clamp necessary rather than defensive.
+    ///
+    /// Reports rather than asserts the verdict: both outcomes are legitimate findings. Run:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_split_reconfigure_in_place --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX Windows box"]
+    fn nvenc_split_reconfigure_in_place() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        const BPS: u64 = 40_000_000;
+        let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let two = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+
+        // Isolate the split variable exactly as the Linux spike does.
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+
+        // SAFETY: (test-only) the same straight-line D3D11/DXGI setup as `nvenc_reconfigure_no_idr`.
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut adapter = None;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                if a.GetDesc1().expect("adapter desc").Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32
+                    == 0
+                {
+                    adapter = Some(a);
+                    break;
+                }
+            }
+            let adapter = adapter.expect("no hardware DXGI adapter");
+            let (device, _ctx) = pf_frame::dxgi::make_device(&adapter).expect("make_device");
+            let bytes = probe_pattern(W as usize, H as usize);
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr() as *const _,
+                SysMemPitch: W * 4,
+                SysMemSlicePitch: 0,
+            };
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+                .expect("pattern texture");
+            let tex = tex.expect("null pattern texture");
+
+            let mut enc = NvencD3d11Encoder::open(
+                Codec::H265,
+                PixelFormat::Bgra,
+                W,
+                H,
+                60,
+                BPS,
+                8,
+                ChromaFormat::Yuv420,
+                1,
+            )
+            .expect("NVENC open");
+
+            let submit_and_poll = |enc: &mut NvencD3d11Encoder, range: std::ops::Range<u64>| {
+                let (mut aus, mut keyframes) = (0usize, 0usize);
+                for i in range {
+                    let frame = CapturedFrame {
+                        width: W,
+                        height: H,
+                        pts_ns: i * 16_666_667,
+                        format: PixelFormat::Bgra,
+                        payload: FramePayload::D3d11(D3d11Frame {
+                            texture: tex.clone(),
+                            device: device.clone(),
+                            pyro: None,
+                        }),
+                        cursor: None,
+                    };
+                    enc.submit_indexed(&frame, i as u32).expect("submit");
+                    while let Some(au) = enc.poll().expect("poll") {
+                        aus += 1;
+                        keyframes += au.keyframe as usize;
+                    }
+                }
+                (aus, keyframes)
+            };
+
+            let (aus, kfs) = submit_and_poll(&mut enc, 0..6);
+            assert!(aus > 0 && kfs == 1, "opening IDR then steady P-frames");
+            println!(
+                "S1(win): engines={} (latched by query_caps), opened split_mode={}",
+                enc.encoder_engines, enc.split_mode
+            );
+            assert!(
+                enc.encoder_engines >= 2,
+                "this GPU reports {} NVENC engine(s) — S1 is not interpretable here",
+                enc.encoder_engines
+            );
+            assert_eq!(enc.split_mode, disable, "must open split-disabled");
+
+            // THE SPIKE: change ONLY splitEncodeMode, in place, same bitrate.
+            enc.split_mode = two;
+            let accepted = enc.reconfigure_bitrate(BPS);
+            println!("S1(win): reconfigure DISABLE→TWO_FORCED accepted = {accepted}");
+            if accepted {
+                let (aus, kfs) = submit_and_poll(&mut enc, 6..12);
+                assert!(aus > 0, "no AUs after the accepted reconfigure");
+                println!(
+                    "S1(win) VERDICT: {}",
+                    if kfs == 0 {
+                        "PASS — accepted with NO IDR on D3D11: Windows arbitration is buildable"
+                    } else {
+                        "FAIL — accepted but forced an IDR, which is the same as a rejection"
+                    }
+                );
+                enc.split_mode = disable;
+                let back = enc.reconfigure_bitrate(BPS);
+                println!("S1(win): reverse accepted = {back}");
+            } else {
+                enc.split_mode = disable;
+                println!(
+                    "S1(win) VERDICT: FAIL — the D3D11 path REFUSES an in-place split change. \
+                     Windows arbitration is not buildable; the Linux result does not transfer."
+                );
+            }
+            enc.flush().ok();
+        }
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+    }
+
     /// ON-GLASS (RTX box): the measurement gating the AYUV 4:4:4 work — encodes the probe
     /// pattern through the REAL ARGB-input NVENC session once with `chromaFormatIDC=3`/FREXT
     /// and once as plain 4:2:0, so offline analysis of the two bitstreams answers (1) whether
