@@ -37,7 +37,10 @@ into a "no" on your machine:
   answer. The backend supports it; **your device may still refuse it**. Most codec, 10-bit and
   4:4:4 cells are this kind.
 - **Negotiated** — both ends must advertise it before it happens. The clipboard, pen input, 4:4:4
-  and client-drawn cursors all die quietly if either side says no.
+  and client-drawn cursors all die if either side says no. Mostly quietly — 4:4:4 is the exception,
+  and deliberately so: the host resolves the chroma *before* the Welcome and names the losing gate
+  in its log, and the client's stats overlay prints `4:4:4→4:2:0` rather than letting you assume
+  you got what you asked for.
 - **Default on / opt-in / operator-gated** — HDR and 10-bit are attempted by default; the game
   library is off by default on the desktop clients; the shared clipboard is off on the host until
   an operator turns it on.
@@ -199,14 +202,21 @@ newer on AMD, Arc and newer on Intel).
 1. H.264, HEVC and AV1, intersected with what the driver reports. If the probe cannot run (no
    driver, or a build without NVENC), the host advertises the full set rather than nothing — so an
    advertised codec is not always a *confirmed* codec.
-2. HEVC only, and only when the GPU's 4:4:4 capability bit says yes. 4:4:4 **and** HDR together is
-   refused.
+2. HEVC only, and only when the GPU's 4:4:4 capability bit says yes. **HDR and 4:4:4 together
+   depend on the platform.** On Windows they compose: the IDD-push capturer converts the FP16
+   desktop to packed 10-bit BT.2020 PQ RGB and NVENC encodes HEVC Main 4:4:4 10, so a session gets
+   both. On Linux 4:4:4 rides an 8-bit `YUV444P` route, so a session that negotiates both resolves
+   the bit depth back to 8 — full chroma wins and the stream is SDR. Either way the answer is
+   settled before the Welcome, so the client is never told one thing and sent another.
 3. A hardware limitation of AMD's encode block, not a gap in Punktfunk. VCN never encodes 4:4:4,
    so there is nothing to probe.
 4. Only in a build that includes the native QSV backend — which the shipped installer does. In a
    hand build without it, 10-bit is honestly reported as unavailable rather than guessed.
 5. [PyroWave](/docs/pyrowave) is a wavelet codec, not H.26x. It is never picked automatically: your
-   client has to ask for it by name in its codec setting.
+   client has to ask for it by name in its codec setting. Its 4:4:4 is the one that needs no GPU
+   encode probe — it does its own full-chroma colour conversion, so it resolves on any vendor —
+   with a single ceiling: the vendored rate controller packs its block index into 16 bits, which an
+   ≈8K-class 4:4:4 mode overflows, so those modes are downgraded to 4:2:0 before the Welcome.
 6. Requires the direct-SDK NVENC path (which every shipped Linux package builds). Without it the
    frame takes a slower CPU route to reach 10-bit.
 7. H.264 never uses this backend, and it exists only in a build carrying the Vulkan-encode feature
@@ -224,10 +234,11 @@ newer on AMD, Arc and newer on Intel).
     `PUNKTFUNK_ENCODER=software` deliberately if that is what you want. On Windows, by contrast, an
     unrecognised adapter does resolve to software on its own.
 
-**4:4:4 across the whole project:** only HEVC and PyroWave can carry it, only NVENC and PyroWave can
-produce it, and only the Apple client asks for it. The Linux and Windows desktop clients have a
-4:4:4 setting that currently does nothing — see [Client settings](/docs/client-settings). GameStream
-sessions are always 4:2:0.
+**4:4:4 across the whole project:** only HEVC and PyroWave can carry it, and only NVENC and
+PyroWave can produce it — so on the HEVC side full chroma means an NVIDIA host. Asking for it is a
+client setting, off by default, and the **Linux, Windows and Apple** clients all have a working one;
+**Android does not implement 4:4:4 at all**, and GameStream sessions are always 4:2:0. See
+[Client settings](/docs/client-settings).
 
 ### How the host picks a backend
 
@@ -288,9 +299,9 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 
 | Client | Decode path (in order) | Codecs | 10-bit / HDR | 4:4:4 |
 |---|---|---|---|---|
-| Linux desktop | Vulkan Video → VAAPI → software ¹ | probed ² | ✅ ³ | ❌ ⁴ |
-| Windows desktop | Vulkan Video → D3D11VA → software ¹ | probed ² | ✅ ³ | ❌ ⁴ |
-| Steam Deck (via Decky) | as Linux desktop ⁵ | probed ² | ✅ | ❌ |
+| Linux desktop | Vulkan Video → VAAPI → software ¹ | probed ² | ✅ ³ | ⚠️ ⁴ |
+| Windows desktop | Vulkan Video → D3D11VA → software ¹ | probed ² | ✅ ³ | ⚠️ ⁴ |
+| Steam Deck (via Decky) | as Linux desktop ⁵ | probed ² | ✅ | ⚠️ ⁴ |
 | macOS · iOS · tvOS | VideoToolbox only | H.264, HEVC, AV1 ⁶ | ⚠️ ⁷ | ⚠️ ⁸ |
 | Android · Android TV | MediaCodec only ⁹ | H.264, HEVC, AV1 ¹⁰ | ⚠️ ⁷ | ❌ |
 | Moonlight | your Moonlight app's | negotiated | ⚠️ ¹¹ | ❌ |
@@ -308,8 +319,14 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 3. On by default. It is presented on a real HDR10 surface where your desktop offers one (KDE HDR,
    gamescope), and tone-mapped in-shader otherwise. Software-decoded frames never take the HDR
    surface.
-4. The 4:4:4 setting is stored and shown but is never advertised to the host, so these clients
-   always receive 4:2:0.
+4. Opt-in (Settings ▸ **Full chroma**), off by default, and advertised whenever you ask — unlike
+   Apple, **no client-side probe gates it**, because every rung here can display full chroma: the
+   Vulkan presenter samples the 2-plane 4:4:4 pool formats where the driver decodes RExt in
+   hardware (NVIDIA today), and swscale converts for the software rung otherwise. So the setting
+   always reaches the host; what varies is the *cost*, and that cost is visible rather than silent
+   — the Detailed [stats overlay](/docs/stats) prints the resolved chroma (`4:4:4→4:2:0` when the
+   host declined) and the decode path frames really took. Whether you get it is then the host's
+   answer: HEVC 4:4:4 means an NVIDIA host, or pick PyroWave, which does it on any vendor.
 5. The Decky plugin does not decode anything — it launches the Linux client, so the decode path is
    identical, including the Mesa `RADV_PERFTEST=video_decode` opt-in the session binary sets before
    any Vulkan call (without it RADV exposes no decode queue and the Deck silently falls back to
@@ -320,8 +337,11 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 7. Runtime-probed against the actual display: EDR headroom on iPhone/iPad, HDR eligibility on Mac
    and Apple TV, HDR capabilities on Android. On an SDR panel the client advertises no HDR at all
    so the host sends a correct 8-bit picture instead of PQ your screen would mangle.
-8. The only client that asks for 4:4:4 — opt-in, and gated on a real hardware-decode probe (both
-   8-bit and 10-bit when HDR is also on). In practice it only ever resolves against an NVIDIA host.
+8. Opt-in, and the only client that **probes before asking**: it advertises 4:4:4 only where
+   VideoToolbox really hardware-decodes it (both 8-bit and 10-bit when HDR is also on), because
+   VideoToolbox's software 4:4:4 decode is far too slow for a real-time stream — validated on M3.
+   The desktop clients need no such probe (note 4). For HEVC it only ever resolves against an
+   NVIDIA host.
 9. Chosen by name from a ranked device list that prefers hardware, real SoC vendors and low-latency
    decoders, and blocks the known-bad software ones. There is no software rung.
 10. H.264 and HEVC are assumed universal on Android hardware; AV1 is probed.
@@ -445,8 +465,8 @@ text from an IME), are covered in [Input](/docs/input).
 
 | Client | HDR | 4:4:4 | Surround 5.1 / 7.1 | Microphone | Clipboard | Stats overlay |
 |---|---|---|---|---|---|---|
-| Linux desktop | ✅ ¹ | ❌ ¹³ | ✅ ² | ✅ | ❌ ³ | ✅ |
-| Windows desktop | ✅ ¹ | ❌ ¹³ | ✅ ² | ✅ | ⚠️ ⁴ | ✅ |
+| Linux desktop | ✅ ¹ | ⚠️ ¹³ | ✅ ² | ✅ | ❌ ³ | ✅ |
+| Windows desktop | ✅ ¹ | ⚠️ ¹³ | ✅ ² | ✅ | ⚠️ ⁴ | ✅ |
 | macOS | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ✅ | ✅ ⁷ | ✅ |
 | iPhone · iPad | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ✅ | ❌ ⁸ | ✅ |
 | Apple TV | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ❌ ⁹ | ❌ ⁸ | ✅ |
@@ -475,9 +495,12 @@ text from an IME), are covered in [Input](/docs/input).
     until the host also enables its clipboard, but the client-side consent is pre-granted.
 11. Decided entirely by the host and layered into what Moonlight is offered.
 12. Moonlight has its own overlay; [stats](/docs/stats) here describes Punktfunk's.
-13. The desktop settings still show a **Full chroma (4:4:4)** switch, and it is a per-profile field
-    — but the session binary never advertises the 4:4:4 capability, so the switch has no effect
-    today and the stream stays 4:2:0.
+13. Opt-in — the per-profile **Full chroma (4:4:4)** switch, off by default — and advertised with
+    no client-side probe, because every desktop decode rung can display it (note 4 under
+    [Client decode](#client-decode)). The ⚠️ is the host half: full chroma needs HEVC on an
+    **NVIDIA** host, or the PyroWave codec, which carries it on any vendor. On Windows it composes
+    with HDR; on a Linux host 4:4:4 is 8-bit, so asking for both gives you full chroma in SDR. The
+    stats overlay tells you which you got.
 
 **File transfer through the clipboard does not exist yet** on any client. The wire format and the
 host-side policy for it are in place, but no client offers files, so a copied file never crosses.
@@ -531,7 +554,7 @@ own so that adding a client-side feature never locks a client out of a deployed 
 | Contract | Current | What it governs |
 |---|---|---|
 | `punktfunk/1` wire version | **2** | The `Hello`/`Welcome` handshake and the session planes. Hosts equality-check it, so this is the one that must match. |
-| C ABI version | **13** | The embeddable C surface a client links against. It grows far more often than the wire does. |
+| C ABI version | **14** | The embeddable C surface a client links against. It grows far more often than the wire does. |
 | Virtual-display driver protocol (Windows) | **6** (accepts **3** and up) | Between the Windows host and its display driver, so an older driver keeps working after a host update. |
 | Windows virtual-gamepad channel | **3** | Between the host and its pad driver. |
 

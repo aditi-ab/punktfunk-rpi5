@@ -39,10 +39,12 @@ told HDR, so that is the one place a Punktfunk label can outrun the picture. The
 
 Two details worth knowing:
 
-- **HDR usually beats 4:4:4.** For HEVC and AV1 there is no 10-bit full-chroma capture source, so an
-  HDR session drops to 4:2:0 and says so. If you want [full chroma](/docs/client-settings) with
-  those codecs, turn HDR off for that profile. [PyroWave](/docs/pyrowave) is the exception: its
-  Windows capture path writes full-resolution 10-bit chroma, so it can carry HDR and 4:4:4 together.
+- **HDR and 4:4:4 compose on Windows, not on Linux.** A **Windows** host carries both: the capture
+  path writes full-resolution 10-bit chroma and NVENC encodes HEVC Main 4:4:4 10, so
+  [full chroma](/docs/client-settings) costs you nothing on an HDR desktop.
+  [PyroWave](/docs/pyrowave) does the same there, in 16-bit planes. On **Linux** the 4:4:4 route is
+  8-bit, so a session that negotiates both resolves back down to SDR — full chroma wins. AV1 never
+  carries 4:4:4 anywhere: Range Extensions are HEVC-only.
 - **Vulkan games need the bundled layer.** NVIDIA and AMD Vulkan drivers refuse to advertise any HDR
   colour space for a surface on an indirect (virtual) display, so Vulkan games decide the device
   "does not support HDR" — even though the driver happily presents an HDR swapchain there. The host
@@ -139,8 +141,9 @@ swapchain without a tone-map, which looks washed out. Turn the client's HDR sett
   is SDR. Use HEVC or AV1 for HDR from Linux.
 
 One more rule if you also use full chroma: a **Linux** host encodes 4:4:4 at 8 bits, so a session
-that negotiates both resolves back down to SDR before the stream starts. On Linux 4:4:4 wins; on
-Windows HDR does. Full chroma is off until you turn it on, so this only bites if you did.
+that negotiates both resolves back down to SDR before the stream starts — on Linux, 4:4:4 wins. A
+**Windows** host has no such trade: it carries HDR and full chroma at once. Full chroma is off until
+you turn it on, so this only bites if you did.
 
 ## Check it
 
