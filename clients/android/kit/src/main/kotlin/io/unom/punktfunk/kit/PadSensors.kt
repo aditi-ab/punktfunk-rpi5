@@ -211,25 +211,23 @@ class PadSensors(private val router: GamepadRouter) {
         /**
          * One gyroscope sample (Android: rad/s) → the wire's three signed-16 components, in place.
          *
-         * ⚠ **THE AXIS FRAME IS NOT VERIFIED ON THIS PATH.** The wire is a unit passthrough into a
-         * virtual DualSense report, and that report's frame was MEASURED on 2026-08-07 over raw
-         * HID: slot 0 = Right (pitch), slot 1 = Up (yaw), slot 2 = Backward, toward the player
-         * (roll), right-handed. Android documents its sensor frame for a handheld device as +x
-         * right, +y up, +z out of the face — the same frame once "the face" is read as the one the
-         * player looks at, which is what the platform means by a controller's own sensor. So
-         * straight through is the mapping the documentation implies, and it is what this does.
-         * What nobody has DONE is put a Bluetooth DualSense in front of the platform sensor
-         * framework and compare: those numbers come through a HID driver and InputFlinger's sensor
-         * mapper, either of which could permute or negate without saying so.
+         * The axis frame is straight through, and that is now MEASURED rather than assumed.
          *
-         * The measurement that settles it is the DualSense one repeated on this path — pad flat
-         * and still, then three labelled rotations:
-         *  - at rest, gravity must land as +1 g on ACCEL slot 1 (not 0, not 2);
-         *  - yaw clockwise seen from above ⇒ GYRO slot 1 negative;
-         *  - pitch the far edge down ⇒ slot 0 negative;
-         *  - roll right-side down ⇒ slot 2 negative.
-         * Any disagreement is a remap, and it belongs HERE with its own expectations in
-         * `PadSensorsTest` — not spread across callers, and not guessed at in advance.
+         * The wire is a unit passthrough into a virtual DualSense report, whose frame was measured
+         * over raw HID on 2026-08-07: slot 0 = Right (pitch), slot 1 = Up (yaw), slot 2 = Backward
+         * toward the player (roll), right-handed. Android hands a controller's own sensors over in
+         * that same frame — which was the documented expectation, but the numbers pass through a
+         * HID driver and InputFlinger's sensor mapper, either of which could have permuted or
+         * negated without saying so.
+         *
+         * Verified 2026-08-07 end to end: a DualSense on Bluetooth to an Android phone, streaming
+         * to a Linux host. This path's own first-sample log read `accel 0, 10000, 0` — exactly 1 g
+         * on slot 1 — and at the far end `hid-playstation` published gravity as +0.991 g on ABS_Y
+         * with every rotation driving its correctly-named axis (yaw→RY, pitch→RX, roll→RZ) and the
+         * signs agreeing with gravity's independent witness on 95 of 100 rotating samples.
+         *
+         * So: no remap. If a future device disagrees, the remap belongs HERE with its own
+         * expectations in `PadSensorsTest` — not spread across callers.
          */
         fun gyroToWire(values: FloatArray, out: IntArray) {
             for (i in 0..2) out[i] = Gamepad.motionGyroWire(values.getOrElse(i) { 0f })
@@ -237,9 +235,10 @@ class PadSensors(private val router: GamepadRouter) {
 
         /**
          * One accelerometer sample (Android: m/s², specific force) → the wire's three signed-16
-         * components, in place. Same unverified frame as [gyroToWire] and the same straight-through
+         * components, in place. Same measured frame as [gyroToWire] and the same straight-through
          * mapping; the sign needs no flip, because Android and the DualSense report agree that the
-         * axis pointing up reads +1 g at rest (see [Gamepad.motionAccelWire]).
+         * axis pointing up reads +1 g at rest (see [Gamepad.motionAccelWire]) — which is precisely
+         * what the on-glass run read back, `accel 0, 10000, 0` with the pad lying flat.
          */
         fun accelToWire(values: FloatArray, out: IntArray) {
             for (i in 0..2) out[i] = Gamepad.motionAccelWire(values.getOrElse(i) { 0f })

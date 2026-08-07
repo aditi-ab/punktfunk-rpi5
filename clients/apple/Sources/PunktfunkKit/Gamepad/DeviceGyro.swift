@@ -183,28 +183,33 @@ public final class DeviceGyro {
             x: -Float(m.gravity.x + m.userAcceleration.x),
             y: -Float(m.gravity.y + m.userAcceleration.y),
             z: -Float(m.gravity.z + m.userAcceleration.z))
-        // Then the SAME change of basis the controller path takes. `r` puts the sample in the
-        // controller frame this file's header describes — x right, y up, z out of the screen —
-        // which is exactly GameController's frame, and that is not the DualSense report frame the
-        // wire is defined in. Measured 2026-08-07; see `GamepadWire.appleMotionToWire`.
+        // NO frame conversion here, and that is not an oversight — `GamepadCapture.forwardMotion`
+        // applies `GamepadWire.appleMotionToWire` and this deliberately does not.
         //
-        // Both corrections are here because the header states the intent plainly: units and axis
-        // semantics match `GamepadCapture.forwardMotion` so a sign/scale fix lands in one place for
-        // both sources. Fixing only the controller path would have left this one silently on the
-        // old convention — a mirror that disagrees with the thing it mirrors.
-        let g = GamepadWire.appleMotionToWire((rot.x, rot.y, rot.z))
-        let a = GamepadWire.appleMotionToWire((acc.x, acc.y, acc.z))
+        // The trap is that two different frames are both called "the controller frame". GCMotion
+        // reports a CONTROLLER in (Right, Forward, Up) — measured on a real DualSense — which is
+        // not the wire's frame, hence the conversion over there. `r` above resolves THIS DEVICE
+        // into the frame the header describes: x right, y up, z out of the screen. For the pose
+        // this mirror exists to serve — a phone clipped upright, screen facing the player — "out of
+        // the screen" points AT the player, so that frame is (Right, Up, Backward), which IS the
+        // wire's frame. Straight through is already correct.
+        //
+        // Applying the controller path's conversion here was tried and was WRONG: a phone at rest
+        // would have reported gravity as −1 g on the roll axis instead of +1 g up, i.e. lying on
+        // its edge. Caught by measuring the Android twin, which does the same thing straight
+        // through and reads +1 g on the up axis end to end. If a future capture path needs a
+        // conversion, decide it from that source's OWN measured frame rather than by analogy.
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
         let gyro = (
-            GamepadWire.motionRaw(g.0, scale: gs),
-            GamepadWire.motionRaw(g.1, scale: gs),
-            GamepadWire.motionRaw(g.2, scale: gs)
+            GamepadWire.motionRaw(rot.x, scale: gs),
+            GamepadWire.motionRaw(rot.y, scale: gs),
+            GamepadWire.motionRaw(rot.z, scale: gs)
         )
         let accel = (
-            GamepadWire.motionRaw(a.0, scale: as_),
-            GamepadWire.motionRaw(a.1, scale: as_),
-            GamepadWire.motionRaw(a.2, scale: as_)
+            GamepadWire.motionRaw(acc.x, scale: as_),
+            GamepadWire.motionRaw(acc.y, scale: as_),
+            GamepadWire.motionRaw(acc.z, scale: as_)
         )
         state.lock.lock()
         state.lastAccel = accel
