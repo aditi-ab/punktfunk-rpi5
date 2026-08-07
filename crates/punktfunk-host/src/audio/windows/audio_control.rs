@@ -10,7 +10,10 @@
 //!
 //! * the **mic inject target** is assigned FIRST (VB-Cable "CABLE Input" preferred) — mic passthrough
 //!   is what the cable is bundled for, so it wins the cable even when the cable is the only render
-//!   endpoint on the box (the loopback then reports itself unavailable instead of echoing);
+//!   endpoint on the box (the loopback then reports itself unavailable instead of echoing). One
+//!   exception: the Steam Streaming Microphone is surrendered to the loopback when taking it would
+//!   leave desktop audio on the known-silent last resort or nothing — game audio outranks the mic
+//!   (see [`wiring_plan`], `Wiring::mic_withheld`);
 //! * default **PLAYBACK** → the plan's loopback endpoint, applied ONLY while a desktop-audio capture
 //!   is open (`set_playback` — the mic pump must never park the playback default while the host is
 //!   idle). By default that endpoint is the SILENT sink (Steam Streaming Microphone render side) so
@@ -216,6 +219,7 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
             mic_capture = wiring.mic_capture.as_ref().map(|(n, _)| n.as_str()),
             loopback_render = wiring.loopback_render.as_ref().map(|(n, _)| n.as_str()),
             loopback_last_resort = wiring.loopback_last_resort,
+            mic_withheld = wiring.mic_withheld,
             renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             "audio wiring plan"
         );

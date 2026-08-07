@@ -219,13 +219,24 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
     // set_playback=false: the mic pump runs while the host is idle — only the desktop-audio
     // capture may park the playback default (on the silent sink) for a stream's lifetime.
     let mut wiring = audio_control::wire_now(false);
-    if wiring.mic_render.is_none() {
+    if wiring.mic_render.is_none() && !wiring.mic_withheld {
+        // A WITHHELD mic skips the install attempt: the Streaming Microphone exists — the plan
+        // gave it to the loopback — so reinstalling the pair changes nothing and costs a 5 s
+        // endpoint-settle sleep per reopen.
         tracing::info!("no usable virtual mic device present — attempting auto-install");
         if install_steam_audio_pair() {
             wiring = audio_control::wire_now(false);
         }
     }
     let Some(ep) = wiring.mic_render else {
+        if wiring.mic_withheld {
+            anyhow::bail!(
+                "the Steam Streaming Microphone is carrying desktop audio (game audio outranks \
+                 the mic; taking it would have silenced the stream) — install VB-Audio Virtual \
+                 Cable to give the mic its own device, or set PUNKTFUNK_MIC_DEVICE=<friendly-name \
+                 substring> to force a target."
+            );
+        }
         anyhow::bail!(
             "no virtual-mic render endpoint on this box. Install VB-Audio Virtual Cable (the host \
              installer bundles it) or enable Steam Remote Play's microphone (Steam Streaming \
@@ -285,6 +296,23 @@ pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
     }
     path.truncate(n as usize); // keeps the NUL
     Some(path)
+}
+
+/// Do Steam's streaming-audio driver INFs exist on this box? The auto-install RE-ARM trigger:
+/// INF files appearing later (Steam installed mid-run) are invisible to the endpoint-set
+/// fingerprint — files are not endpoints — so the desktop-audio capture's install latch keys on
+/// this instead of staying once-per-process ([`super::wasapi_cap`]).
+pub(crate) fn steam_infs_present() -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    ["SteamStreamingMicrophone.inf", "SteamStreamingSpeakers.inf"]
+        .iter()
+        .any(|inf| {
+            steam_driver_inf_path(inf).is_some_and(|wide| {
+                // Drop the trailing NUL the FFI callers need; `exists` wants the bare path.
+                let len = wide.len().saturating_sub(1);
+                std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide[..len])).exists()
+            })
+        })
 }
 
 /// Install one Steam Streaming driver INF by filename via `DiInstallDriverW` (loaded from

@@ -19,6 +19,17 @@
 //! default render endpoint — which permanently killed mic passthrough in the exact configuration
 //! the installer ships (VB-CABLE as the only render device).
 //!
+//! **One exception to mic-first — game audio outranks the mic.** The Steam Streaming
+//! Microphone's render side is ALSO the only silent client-only loopback sink, so the mic may
+//! take it only while the loopback still gets a preferred (non-last-resort) pick without it:
+//! another silent sink, or real hardware. When taking it would leave desktop audio on the
+//! known-silent Speakers or on nothing — the cable-less headless box, the recurring field
+//! failure — the loopback gets the endpoint and the mic falls to a lesser candidate or is
+//! honestly unavailable ([`Wiring::mic_withheld`]), with guidance naming the trade. The
+//! cable-only rule above is untouched (a cable can never be a loopback, so the mic still wins
+//! it), and an operator `PUNKTFUNK_MIC_DEVICE` override also still wins — an explicit choice
+//! beats the trade-off.
+//!
 //! **Loopback preference depends on where the audio should be heard.** The default is
 //! *client-only*: prefer a render endpoint that is silent on the host but has a WORKING loopback
 //! (the Steam Streaming *Microphone*'s render side — validated live; the Steam Streaming
@@ -118,6 +129,12 @@ pub(crate) struct Wiring {
     /// the human-readable reason for the capture side to log — a quality risk the operator can act
     /// on (attach a real output, or set the output mode to prefer hardware), not a failure.
     pub loopback_narrowing: Option<String>,
+    /// The mic was DENIED the Steam Streaming Microphone because taking it would have left the
+    /// loopback with only the known-silent last resort or nothing — game audio outranks the
+    /// optional mic. (`mic_render` may still hold a lesser candidate; when it is `None` the
+    /// mic open fails with guidance naming the trade — a cable gives the mic its own device
+    /// without costing the loopback.)
+    pub mic_withheld: bool,
 }
 
 impl Wiring {
@@ -267,6 +284,36 @@ pub(crate) fn plan_with_formats(
         Some(w) => find_render(w),
         None => MIC_CANDIDATES.iter().find_map(|c| find_render(c)),
     };
+    // Game audio outranks the mic: the Steam Streaming Microphone's render side is also the
+    // only silent client-only loopback sink, so the mic may hold it only while the loopback
+    // still gets a PREFERRED (non-last-resort) pick without it — another silent sink or real
+    // hardware, the same two tiers both preference orders draw from. Otherwise the endpoint
+    // goes to the loopback and the mic falls to a lesser candidate or (honestly) to none.
+    // Before this rule, the cable-less headless Steam box streamed SILENCE: the mic held the
+    // Streaming Microphone and the loopback got the known-silent Speakers (the 2026-08 field
+    // case). An operator override is exempt — an explicit PUNKTFUNK_MIC_DEVICE beats the
+    // trade-off.
+    let mut mic_withheld = false;
+    let mic_render = match mic_render {
+        Some((name, id)) if mic_want.is_none() && silent_sink(&name.to_lowercase()) => {
+            let loopback_survives = renders.iter().any(|(n, rid)| {
+                let ln = n.to_lowercase();
+                *rid != id
+                    && (silent_sink(&ln) || (!excluded_from_loopback(&ln) && !virtualish(&ln)))
+            });
+            if loopback_survives {
+                Some((name, id))
+            } else {
+                mic_withheld = true;
+                // Skip the silent-sink candidate; a lesser candidate may still serve the mic.
+                MIC_CANDIDATES
+                    .iter()
+                    .filter(|c| !silent_sink(c))
+                    .find_map(|c| find_render(c))
+            }
+        }
+        other => other,
+    };
 
     // 2. Its capture side (what host apps record).
     let mic_capture = mic_render.as_ref().and_then(|(name, _)| {
@@ -342,6 +389,7 @@ pub(crate) fn plan_with_formats(
         loopback_render,
         loopback_last_resort,
         loopback_narrowing,
+        mic_withheld,
     }
 }
 
@@ -570,8 +618,9 @@ mod tests {
         );
     }
 
-    /// No cable: the Steam Streaming Microphone doubles as the mic target, and the loopback
-    /// must NOT then pick the same endpoint (real hardware wins).
+    /// No cable: the Steam Streaming Microphone doubles as the mic target — allowed, because
+    /// the loopback still gets real hardware — and the loopback must NOT then pick the same
+    /// endpoint.
     #[test]
     fn steam_mic_as_target_never_doubles_as_loopback() {
         let renders = [
@@ -584,18 +633,56 @@ mod tests {
             w.mic_render.unwrap().0,
             "Speakers (Steam Streaming Microphone)"
         );
+        assert!(!w.mic_withheld);
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
-    /// No cable and ONLY the Steam mic: mic wins it, loopback honestly absent (never the same
-    /// device — that would echo).
+    /// No cable and ONLY the Steam mic: GAME AUDIO wins the endpoint — the loopback takes the
+    /// render side (a working silent sink) and the mic is honestly withheld. The old rule gave
+    /// the mic the endpoint and the stream was silent.
     #[test]
-    fn steam_mic_only_no_echo() {
+    fn steam_mic_only_audio_wins() {
         let renders = [ep("Speakers (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
         let w = plan(&renders, &captures, None, false, &[]);
-        assert!(w.mic_render.is_some());
-        assert!(w.loopback_render.is_none());
+        assert!(w.mic_render.is_none());
+        assert!(w.mic_withheld);
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert!(!w.loopback_last_resort);
+    }
+
+    /// Cable absent but a VoiceMeeter strip exists: the withheld mic falls to the lesser
+    /// candidate instead of dying — mic on the strip, loopback on the freed Streaming
+    /// Microphone render side. Both features work without a cable.
+    #[test]
+    fn withheld_mic_falls_to_voicemeeter() {
+        let renders = [
+            ep("Speakers (Steam Streaming Speakers)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+            ep("Voicemeeter Input (VB-Audio Voicemeeter VAIO)"),
+        ];
+        let captures = [
+            ep("Microphone (Steam Streaming Microphone)"),
+            ep("Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)"),
+        ];
+        let w = plan(&renders, &captures, None, false, &[]);
+        assert_eq!(
+            w.mic_render.as_ref().unwrap().0,
+            "Voicemeeter Input (VB-Audio Voicemeeter VAIO)"
+        );
+        assert!(w.mic_withheld);
+        assert_eq!(
+            w.mic_capture.unwrap().0,
+            "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)"
+        );
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert!(!w.loopback_last_resort);
     }
 
     /// Steam Streaming Speakers are never a PREFERRED loopback (their loopback is silent —
@@ -619,22 +706,53 @@ mod tests {
         }
     }
 
-    /// THE 2026-08 field case: no cable, only the Steam pair left after the display isolate
-    /// invalidated the monitor's DP audio endpoint. The mic reserves the Streaming Microphone
-    /// (the only mic candidate), and the plan must then take the Speakers as the last resort —
-    /// the old plan yielded no loopback here and the session never recovered.
+    /// THE 2026-08 field case, re-decided: no cable, only the Steam pair left after the display
+    /// isolate invalidated the monitor's DP audio endpoint. Game audio now OUTRANKS the mic —
+    /// the loopback takes the Streaming Microphone's render side (a WORKING silent sink)
+    /// instead of the mic holding it and stranding the loopback on the known-silent Speakers.
+    /// Audio streams; the mic is honestly withheld. Holds in both preference modes.
     #[test]
-    fn field_case_steam_pair_only_takes_speakers_as_last_resort() {
+    fn field_case_steam_pair_only_audio_outranks_mic() {
         let renders = [
             ep("Altavoces (Steam Streaming Speakers)"),
             ep("Altavoces (Steam Streaming Microphone)"),
         ];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false, &[]);
+        for host_audio in [false, true] {
+            let w = plan(&renders, &captures, None, host_audio, &[]);
+            assert!(w.mic_render.is_none(), "host_audio={host_audio}");
+            assert!(w.mic_withheld, "host_audio={host_audio}");
+            assert_eq!(
+                w.loopback_render.as_ref().unwrap().0,
+                "Altavoces (Steam Streaming Microphone)",
+                "host_audio={host_audio}"
+            );
+            assert!(!w.loopback_last_resort, "host_audio={host_audio}");
+        }
+    }
+
+    /// The operator override is exempt from game-audio-outranks-the-mic: pinning the mic to
+    /// the Streaming Microphone strands the loopback on the last resort, and that is the
+    /// operator's explicit call.
+    #[test]
+    fn env_override_may_strand_the_loopback() {
+        let renders = [
+            ep("Altavoces (Steam Streaming Speakers)"),
+            ep("Altavoces (Steam Streaming Microphone)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let w = plan(
+            &renders,
+            &captures,
+            Some("steam streaming microphone"),
+            false,
+            &[],
+        );
         assert_eq!(
             w.mic_render.unwrap().0,
             "Altavoces (Steam Streaming Microphone)"
         );
+        assert!(!w.mic_withheld);
         assert_eq!(
             w.loopback_render.unwrap().0,
             "Altavoces (Steam Streaming Speakers)"
@@ -948,10 +1066,18 @@ mod tests {
     /// is the advice that actually frees the silent sink).
     #[test]
     fn describe_no_loopback_skips_satisfied_remedies() {
-        // Field shape minus the Speakers (mic holds the Streaming Microphone, nothing else).
+        // Mic PINNED to the Streaming Microphone by operator override — the only way the mic
+        // may strand the loopback now that game audio outranks the candidate order — with
+        // nothing else present.
         let renders = [ep("Altavoces (Steam Streaming Microphone)")];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
-        let w = plan(&renders, &captures, None, false, &[]);
+        let w = plan(
+            &renders,
+            &captures,
+            Some("steam streaming microphone"),
+            false,
+            &[],
+        );
         assert!(w.loopback_unsatisfiable());
         let msg = describe_no_loopback(&renders, &w);
         assert!(msg.contains("reserved for the virtual mic"), "{msg}");
@@ -1001,7 +1127,8 @@ mod tests {
     /// desktop mix would be routed into the controller's voice coils.
     #[test]
     fn a_pad_is_never_the_last_resort() {
-        // Only the pad and the Steam pair exist; the mic reserves the Streaming Microphone, so
+        // Only the pad and the Steam pair exist, the mic PINNED to the Streaming Microphone by
+        // operator override (game audio otherwise outranks the mic and takes the endpoint), so
         // the plan falls all the way through to the last resort.
         let renders = [
             ep("DualSense Wireless Controller"),
@@ -1010,7 +1137,13 @@ mod tests {
         ];
         let captures = [ep("Microphone (Steam Streaming Microphone)")];
         let pads = [renders[0].1.clone()];
-        let w = plan(&renders, &captures, None, false, &pads);
+        let w = plan(
+            &renders,
+            &captures,
+            Some("steam streaming microphone"),
+            false,
+            &pads,
+        );
         assert_eq!(
             w.loopback_render.as_ref().unwrap().0,
             "Speakers (Steam Streaming Speakers)",
