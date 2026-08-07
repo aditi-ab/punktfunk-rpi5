@@ -61,14 +61,6 @@
     },
     {
       "type": "application",
-      "name": "VB-CABLE",
-      "version": "redistributed installer, see packaging/windows/install-vbcable.ps1",
-      "description": "Third-party kernel-mode virtual audio driver redistributed with the Windows host; notice at packaging/windows/licenses/VB-CABLE-NOTICE.txt. Planned to be replaced by an attestation-signed first-party driver.",
-      "licenses": [{ "license": { "name": "Proprietary freeware (VB-Audio Software, redistribution permitted per notice)" } }],
-      "externalReferences": [{ "type": "website", "url": "https://vb-audio.com/Cable/" }]
-    },
-    {
-      "type": "application",
       "name": "punktfunk-gamescope",
       "version": "upstream gamescope pinned by packaging/nix/gamescope.nix (nixpkgs) or built by packaging/gamescope/build-punktfunk-gamescope.sh, plus 3 local patches from packaging/gamescope/patches/",
       "description": "Patched gamescope compositor distributed via sysext/Arch/nix channels alongside the host",

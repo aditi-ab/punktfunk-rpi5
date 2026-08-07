@@ -33,7 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wasapi::{Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
@@ -202,7 +202,7 @@ fn capture_thread(
             }
             Err(e) if ready.is_some() => {
                 // An unsatisfiable PLAN cannot improve within the handshake window — the
-                // once-per-process Steam-pair install already ran inside `capture_once` — so
+                // Steam-pair install latch already ran inside `capture_once` — so
                 // fail the open now with the full diagnosis instead of spending the transient
                 // retry budget on a structural verdict. The native plane owns first-open
                 // retries and backs off on its own.
@@ -366,16 +366,37 @@ fn capture_once(
     let mut plan = audio_control::wire_now_full(assert_plan);
 
     // Client-only audio needs a silent-on-host sink with a working loopback (the Steam Streaming
-    // Microphone's render side). If the plan had to settle for real hardware (or nothing), try —
-    // once per process — to install the Steam pair (present when Steam is), then re-plan.
+    // Microphone's render side). If the plan had to settle for real hardware (or nothing), try to
+    // install the Steam pair (present when Steam is), then re-plan. The latch is once per
+    // INF-STATE, not once per process: an attempt made while Steam was absent re-arms when its
+    // driver INFs later appear (Steam installed mid-run) — files are invisible to the
+    // endpoint-set fingerprint, so nothing else would ever retry.
     if assert_plan && !audio_control::host_audio_requested() {
+        // "Silent on the host" is true for the name-matched Streaming Microphone AND for the
+        // minted "Punktfunk Speakers" (identified by id — its NAME says Speakers, which the
+        // name rule rightly refuses). Without the id check, a session on the minted sink
+        // logged "desktop audio will also play on the host" (false) and re-attempted the
+        // Steam-pair install it doesn't need (observed live, first substrate session).
         let have_silent = |w: &wiring_plan::Wiring| {
-            w.loopback_render
-                .as_ref()
-                .is_some_and(|(n, _)| wiring_plan::silent_sink(&n.to_lowercase()))
+            w.loopback_render.as_ref().is_some_and(|(n, id)| {
+                wiring_plan::silent_sink(&n.to_lowercase())
+                    || super::minted::minted_ids().speakers_render.as_deref() == Some(id.as_str())
+            })
         };
-        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
-        if !have_silent(&plan.wiring) && !INSTALL_TRIED.swap(true, Ordering::SeqCst) {
+        static TRIED_WITH_INFS: Mutex<Option<bool>> = Mutex::new(None);
+        let should_try = !have_silent(&plan.wiring) && {
+            let infs = super::wasapi_mic::steam_infs_present();
+            let mut tried = TRIED_WITH_INFS.lock().unwrap();
+            let go = match *tried {
+                None => true,
+                Some(had_infs) => !had_infs && infs,
+            };
+            if go {
+                *tried = Some(infs);
+            }
+            go
+        };
+        if should_try {
             if super::wasapi_mic::install_steam_audio_pair() {
                 plan = audio_control::wire_now_full(true);
             }

@@ -16,8 +16,8 @@ ElevationRequirement: elevatesSelf
 MinimumOSVersion: 10.0.22621.0
 
 InstallModes:
-  # interactive keeps the FULL wizard — every task checkbox, the web-console password page, and the
-  # VB-CABLE notice text. `winget install unom.PunktfunkHost --interactive`.
+  # interactive keeps the FULL wizard — every task checkbox and the web-console password page.
+  # `winget install unom.PunktfunkHost --interactive`.
   - interactive
   - silent
   - silentWithProgress
@@ -34,7 +34,7 @@ InstallerSwitches:
   # enabling it unattended is the additive form:
   #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=gamestream"
   # and dropping a default-on task is the negated form, e.g. /MERGETASKS=!trayicon
-  # Task names: installdriver, installgamepad, installaudiocable, installhdrlayer,
+  # Task names: installdriver, installgamepad, installhdrlayer,
   #             gamestream, allowpublicfw, startservice, trayicon
   Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
   SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-

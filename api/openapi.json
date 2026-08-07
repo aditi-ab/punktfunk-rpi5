@@ -4045,6 +4045,51 @@
           }
         }
       },
+      "AudioWiring": {
+        "type": "object",
+        "description": "The Windows host's audio wiring verdict — which endpoint carries each role. The names are\nthe endpoints' friendly names as the Sound settings show them (on current hosts the minted\n\"Punktfunk\" instances of Steam's streaming drivers).",
+        "required": [
+          "readiness",
+          "mic_withheld",
+          "last_resort"
+        ],
+        "properties": {
+          "last_resort": {
+            "type": "boolean",
+            "description": "The loopback is the known-degraded last resort — desktop audio may be silent until the\nendpoint set changes."
+          },
+          "loopback": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the desktop-audio loopback source; absent = desktop audio unavailable."
+          },
+          "mic": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the virtual-mic write target; absent = mic passthrough unavailable."
+          },
+          "mic_withheld": {
+            "type": "boolean",
+            "description": "The mic was WITHHELD so game audio could keep the only working sink — mic passthrough\nneeds Steam installed (the host mints its own microphone) or a virtual cable."
+          },
+          "narrowing": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the chosen loopback endpoint NARROWS the desktop mix (rate/channels), when it does."
+          },
+          "readiness": {
+            "type": "string",
+            "description": "`full` | `audio_only` | `mic_only` | `none` — whether desktop audio and mic passthrough\neach have an endpoint at all.",
+            "example": "full"
+          }
+        }
+      },
       "AvailableCompositor": {
         "type": "object",
         "description": "A compositor backend the host can drive a virtual output on, and whether it's usable now.",
@@ -6804,6 +6849,17 @@
             "format": "int32",
             "description": "Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The\nnative server admits concurrent sessions, so this can exceed 1; `session`/`stream` below\ndescribe a single representative session for the detail card.",
             "minimum": 0
+          },
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioWiring",
+                "description": "The audio wiring verdict (Windows hosts; absent on other platforms and before the first\nwiring pass). Present even while idle — the wiring exists for the host's lifetime."
+              }
+            ]
           },
           "audio_streaming": {
             "type": "boolean",

@@ -189,6 +189,16 @@ mod linux;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/pad_endpoint.rs"]
 pub(crate) mod pad_endpoint;
+// `audio-probe` devtest — the S1–S3 spike measurements for the Windows audio-substrate design
+// (mint Steam-driver instances, measure their render→capture / loopback paths).
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/audio_probe.rs"]
+pub(crate) mod audio_probe;
+// The minted "Punktfunk Speakers/Microphone" provider — punktfunk-owned instances of Valve's
+// streaming-audio drivers, the wiring plan's tier-0 (the audio-substrate program).
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/minted.rs"]
+pub(crate) mod minted;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/wasapi_cap.rs"]
 mod wasapi_cap;
@@ -207,3 +217,15 @@ pub(crate) mod capture_policy;
 mod mic_jitter;
 mod mic_pump;
 pub use mic_pump::{MicFrame, MicPump};
+
+/// The most recent audio wiring verdict — the LAST wiring pass's assignment on a Windows host,
+/// `None` elsewhere or before the first pass. A read-only snapshot for the status API; never
+/// triggers a pass.
+#[cfg(target_os = "windows")]
+pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
+    audio_control::last_wiring()
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
+    None
+}

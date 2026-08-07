@@ -91,8 +91,16 @@ const SSS_HWID: &str = "ROOT\\SteamStreamingSpeakers";
 const PAD_INDEX_VALUE: &str = "PunktfunkPadIndex";
 /// The endpoint store for render endpoints (each subkey = one endpoint GUID).
 const MMDEV_RENDER_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
+/// The capture-direction sibling of [`MMDEV_RENDER_PATH`] — where a paired device's microphone
+/// half registers (the `audio-probe` devtest's S3 lookup).
+const MMDEV_CAPTURE_PATH: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
 /// WASAPI endpoint-id prefix for render endpoints (`{0.0.0.00000000}.{guid}`).
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
+/// …and for CAPTURE endpoints, whose ids carry `{0.0.1.…}` (measured: the enumeration returns
+/// this form, and an id built with the render prefix never string-matches it — the minted
+/// mic's capture side resolved to nothing until this was split).
+const CAPTURE_ENDPOINT_ID_PREFIX: &str = "{0.0.1.00000000}.";
 /// How long [`ensure`] waits for the new render endpoint to materialise after driver install.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(10);
 /// How many times [`ensure`] re-stamps before giving up and asking for an AudioEndpointBuilder
@@ -124,13 +132,15 @@ pub struct PadEndpoint {
 // --- the stamp set -------------------------------------------------------------------------
 
 /// One endpoint property to stamp: the property-store key, the value, a short log label.
-struct Stamp {
-    label: &'static str,
-    key: PROPERTYKEY,
-    value: StampValue,
+/// pub(crate): the minted-audio provider stamps its endpoint names through the same machinery
+/// (store-first, registry fallback, served-check) — see [`write_stamps`].
+pub(crate) struct Stamp {
+    pub(crate) label: &'static str,
+    pub(crate) key: PROPERTYKEY,
+    pub(crate) value: StampValue,
 }
 
-enum StampValue {
+pub(crate) enum StampValue {
     Str(&'static str),
     /// The PFDS container (VT_CLSID / serialized-CLSID registry blob).
     Container(GUID),
@@ -146,21 +156,22 @@ const fn pkey(fmtid: u128, pid: u32) -> PROPERTYKEY {
 }
 
 /// `PKEY_Device_DeviceDesc` — the "description" half of the endpoint display name.
-const PKEY_DEVICE_DESC: PROPERTYKEY = pkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
+pub(crate) const PKEY_DEVICE_DESC: PROPERTYKEY = pkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
 /// Endpoint-store "device name" half of the display name.
-const PKEY_ENDPOINT_DEVICE_NAME: PROPERTYKEY = pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 6);
+pub(crate) const PKEY_ENDPOINT_DEVICE_NAME: PROPERTYKEY =
+    pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 6);
 /// Endpoint-store devnode link: `"{1}.<device instance id>"` — how an endpoint is tied back to
 /// the devnode that owns it.
 const PKEY_ENDPOINT_DEVNODE: PROPERTYKEY = pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 2);
 /// `PKEY_Device_ContainerId` — what games match against the pad's HID container.
 const PKEY_CONTAINER_ID: PROPERTYKEY = pkey(0x8c7ed206_3f8a_4827_b3ab_ae9e1faefc6c, 2);
 /// `PKEY_AudioEngine_DeviceFormat` (16-bit PCM leg of the format set).
-const PKEY_DEVICE_FORMAT: PROPERTYKEY = pkey(0xf19f064d_082c_4e27_bc73_6882a1bb8e4c, 0);
+pub(crate) const PKEY_DEVICE_FORMAT: PROPERTYKEY = pkey(0xf19f064d_082c_4e27_bc73_6882a1bb8e4c, 0);
 /// Endpoint format pair (float leg) — pids 2 and 3 of the same fmtid.
-const PKEY_MIX_FORMAT_2: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 2);
-const PKEY_MIX_FORMAT_3: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 3);
+pub(crate) const PKEY_MIX_FORMAT_2: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 2);
+pub(crate) const PKEY_MIX_FORMAT_3: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 3);
 /// Host processing format (float leg).
-const PKEY_HOST_FORMAT: PROPERTYKEY = pkey(0xe4870e26_3cc5_4cd2_ba46_ca0a9a70ed04, 0);
+pub(crate) const PKEY_HOST_FORMAT: PROPERTYKEY = pkey(0xe4870e26_3cc5_4cd2_ba46_ca0a9a70ed04, 0);
 
 /// `WAVEFORMATEXTENSIBLE`: 4 ch / 48 kHz / 16-bit PCM, mask 0x33 (FL FR BL BR), PCM subtype.
 const WFX_PCM16_4CH_48K: [u8; 40] = [
@@ -261,7 +272,7 @@ fn active_stamps(pad_index: u8) -> Vec<Stamp> {
 // --- small encoding helpers ----------------------------------------------------------------
 
 /// NUL-terminated UTF-16.
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -468,7 +479,7 @@ fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
 // --- devnode management (SetupAPI) ----------------------------------------------------------
 
 /// Owns an HDEVINFO and destroys it on drop.
-struct DevInfoSet(HDEVINFO);
+pub(crate) struct DevInfoSet(pub(crate) HDEVINFO);
 impl Drop for DevInfoSet {
     fn drop(&mut self) {
         // SAFETY: the handle came from SetupDiGetClassDevsW/SetupDiCreateDeviceInfoList and is
@@ -479,7 +490,7 @@ impl Drop for DevInfoSet {
     }
 }
 
-fn media_class_devs() -> Result<DevInfoSet> {
+pub(crate) fn media_class_devs() -> Result<DevInfoSet> {
     // SAFETY: the class GUID is a static const; flags 0 (not DIGCF_PRESENT) so a created-but-
     // never-installed phantom from a previous run is still found and reused, not duplicated.
     let set = unsafe {
@@ -494,14 +505,14 @@ fn media_class_devs() -> Result<DevInfoSet> {
     Ok(DevInfoSet(set))
 }
 
-fn devinfo_data() -> SP_DEVINFO_DATA {
+pub(crate) fn devinfo_data() -> SP_DEVINFO_DATA {
     SP_DEVINFO_DATA {
         cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
         ..Default::default()
     }
 }
 
-fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut buf = [0u16; 200];
     // SAFETY: live devinfo set + element; the buffer length travels with the slice.
     unsafe { SetupDiGetDeviceInstanceIdW(set.0, did, Some(&mut buf), None) }.ok()?;
@@ -510,7 +521,7 @@ fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
 }
 
 /// A REG_MULTI_SZ SetupDi registry property (e.g. SPDRP_HARDWAREID) as strings.
-fn devnode_multi_sz_prop(
+pub(crate) fn devnode_multi_sz_prop(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
     prop: windows::Win32::Devices::DeviceAndDriverInstallation::SETUP_DI_REGISTRY_PROPERTY,
@@ -538,7 +549,7 @@ fn devnode_multi_sz_prop(
 
 /// The devnode's installed-driver INF filename (`DEVPKEY_Device_DriverInfPath`, e.g.
 /// `oem32.inf`) — absent on a devnode whose driver never installed.
-fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut ty = DEVPROPTYPE(0);
     let mut buf = vec![0u8; 1024];
     let mut req = 0u32;
@@ -567,9 +578,14 @@ fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     (len > 0).then(|| String::from_utf16_lossy(&units[..len]))
 }
 
-/// The persisted pad slot of a devnode (the `PunktfunkPadIndex` value under its
-/// `Device Parameters` key), or `None` for foreign devnodes.
-fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
+/// Read a REG_DWORD from a devnode's `Device Parameters` key — the durable owner-marker
+/// mechanism every punktfunk-minted devnode family uses (pad slot, minted-audio role, probe
+/// marker). `None`: no key, no value, or wrong type — a foreign devnode.
+pub(crate) fn read_devparam_dword(
+    set: &DevInfoSet,
+    did: &SP_DEVINFO_DATA,
+    value_name: &str,
+) -> Option<u32> {
     // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
     let hkey = unsafe {
         SetupDiOpenDevRegKey(
@@ -582,7 +598,7 @@ fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
         )
     }
     .ok()?;
-    let name = wide(PAD_INDEX_VALUE);
+    let name = wide(value_name);
     let mut data = [0u8; 4];
     let mut len = data.len() as u32;
     let mut ty = REG_VALUE_TYPE(0);
@@ -605,70 +621,14 @@ fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
     (rc.is_ok() && ty == REG_DWORD && len == 4).then(|| u32::from_le_bytes(data))
 }
 
-/// Find the devnode previously created for `pad_index` (see the module doc: the persisted
-/// index value is the durable marker; DeviceDesc only survives until the INF installs).
-fn find_devnode(pad_index: u8) -> Result<Option<String>> {
-    let set = media_class_devs()?;
-    for i in 0.. {
-        let mut did = devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break; // ERROR_NO_MORE_ITEMS
-        }
-        let Some(inst) = instance_id(&set, &did) else {
-            continue;
-        };
-        if !inst.to_ascii_uppercase().starts_with("ROOT\\") {
-            continue;
-        }
-        if devnode_pad_index(&set, &did) == Some(pad_index as u32) {
-            return Ok(Some(inst));
-        }
-    }
-    Ok(None)
-}
-
-/// Create + register a fresh MEDIA-class root devnode carrying the Steam Streaming Speakers
-/// hardware id, and persist the pad slot in its `Device Parameters` key.
-fn create_devnode(pad_index: u8) -> Result<String> {
-    // SAFETY: the class GUID is a static const.
-    let set = unsafe { SetupDiCreateDeviceInfoList(Some(&GUID_DEVCLASS_MEDIA), None) }
-        .context("SetupDiCreateDeviceInfoList(MEDIA)")?;
-    let set = DevInfoSet(set);
-    let mut did = devinfo_data();
-    let desc = wide(DEVNODE_DESC);
-    // SAFETY: name/class/description are live NUL-terminated buffers; DICD_GENERATE_ID makes
-    // PnP mint the ROOT\MEDIA\00NN instance id; `did` receives the element.
-    unsafe {
-        SetupDiCreateDeviceInfoW(
-            set.0,
-            w!("MEDIA"),
-            &GUID_DEVCLASS_MEDIA,
-            PCWSTR(desc.as_ptr()),
-            None,
-            DICD_GENERATE_ID,
-            Some(&mut did),
-        )
-    }
-    .context("SetupDiCreateDeviceInfo")?;
-    let hwid = multi_sz_bytes(&[SSS_HWID]);
-    // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
-    unsafe { SetupDiSetDeviceRegistryPropertyW(set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
-        .context("set SPDRP_HARDWAREID")?;
-    // NOT SetupDiCallClassInstaller(DIF_REGISTERDEVICE): that requires an interactive window
-    // station and fails with error 1459 from a service. Plain registration is all a root
-    // devnode needs before UpdateDriverForPlugAndPlayDevices binds the driver.
-    // SAFETY: live set + element; no compare callback.
-    unsafe { SetupDiRegisterDeviceInfo(set.0, &mut did, 0, None, None, None) }
-        .context("SetupDiRegisterDeviceInfo")?;
-    write_pad_index(&set, &mut did, pad_index)?;
-    let inst = instance_id(&set, &did).context("read the new devnode's instance id")?;
-    tracing::info!(pad = pad_index, devnode = %inst, "created a pad-audio devnode");
-    Ok(inst)
-}
-
-/// Persist `pad_index` in the devnode's `Device Parameters` key (created on a fresh devnode).
-fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -> Result<()> {
+/// Write a REG_DWORD into a devnode's `Device Parameters` key, creating the key on a fresh
+/// devnode — the write side of [`read_devparam_dword`].
+pub(crate) fn write_devparam_dword(
+    set: &DevInfoSet,
+    did: &mut SP_DEVINFO_DATA,
+    value_name: &str,
+    value: u32,
+) -> Result<()> {
     // SAFETY: live set + element; DIREG_DEV opens the devnode's Device Parameters key.
     let opened = unsafe {
         SetupDiOpenDevRegKey(
@@ -695,9 +655,9 @@ fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -
                 PCWSTR::null(),
             )
         }
-        .context("create the devnode's Device Parameters key")?,
+        .with_context(|| format!("create the Device Parameters key for {value_name}"))?,
     };
-    let name = wide(PAD_INDEX_VALUE);
+    let name = wide(value_name);
     // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
     // with the slice.
     let rc = unsafe {
@@ -706,14 +666,102 @@ fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -
             PCWSTR(name.as_ptr()),
             None,
             REG_DWORD,
-            Some(&(pad_index as u32).to_le_bytes()),
+            Some(&value.to_le_bytes()),
         )
     };
     // SAFETY: closing the key opened/created above, exactly once.
     unsafe {
         let _ = RegCloseKey(hkey);
     }
-    rc.ok().context("write PunktfunkPadIndex")
+    rc.ok().with_context(|| format!("write {value_name}"))
+}
+
+/// The persisted pad slot of a devnode (the `PunktfunkPadIndex` value under its
+/// `Device Parameters` key), or `None` for foreign devnodes.
+fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
+    read_devparam_dword(set, did, PAD_INDEX_VALUE)
+}
+
+/// Find the devnode previously created for `pad_index` (see the module doc: the persisted
+/// index value is the durable marker; DeviceDesc only survives until the INF installs).
+fn find_devnode(pad_index: u8) -> Result<Option<String>> {
+    let set = media_class_devs()?;
+    for i in 0.. {
+        let mut did = devinfo_data();
+        // SAFETY: live set; `did` is a live out-param with cbSize set.
+        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
+            break; // ERROR_NO_MORE_ITEMS
+        }
+        let Some(inst) = instance_id(&set, &did) else {
+            continue;
+        };
+        if !inst.to_ascii_uppercase().starts_with("ROOT\\") {
+            continue;
+        }
+        if devnode_pad_index(&set, &did) == Some(pad_index as u32) {
+            return Ok(Some(inst));
+        }
+    }
+    Ok(None)
+}
+
+/// Create + register a fresh MEDIA-class root devnode carrying `hwid`, then let `mark` write
+/// the caller's durable owner marker into its `Device Parameters` key (DeviceDesc only
+/// survives until the INF installs — see the module doc). Shared by the pad provisioner and
+/// the `audio-probe` devtest: the first slice of the shared minting surface the
+/// audio-substrate design (`windows-audio-endpoints-and-vbcable.md` §C1) extracts.
+pub(crate) fn create_media_devnode(
+    desc: &str,
+    hwid: &str,
+    mark: impl FnOnce(&DevInfoSet, &mut SP_DEVINFO_DATA) -> Result<()>,
+) -> Result<String> {
+    // SAFETY: the class GUID is a static const.
+    let set = unsafe { SetupDiCreateDeviceInfoList(Some(&GUID_DEVCLASS_MEDIA), None) }
+        .context("SetupDiCreateDeviceInfoList(MEDIA)")?;
+    let set = DevInfoSet(set);
+    let mut did = devinfo_data();
+    let desc = wide(desc);
+    // SAFETY: name/class/description are live NUL-terminated buffers; DICD_GENERATE_ID makes
+    // PnP mint the ROOT\MEDIA\00NN instance id; `did` receives the element.
+    unsafe {
+        SetupDiCreateDeviceInfoW(
+            set.0,
+            w!("MEDIA"),
+            &GUID_DEVCLASS_MEDIA,
+            PCWSTR(desc.as_ptr()),
+            None,
+            DICD_GENERATE_ID,
+            Some(&mut did),
+        )
+    }
+    .context("SetupDiCreateDeviceInfo")?;
+    let hwid = multi_sz_bytes(&[hwid]);
+    // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
+    unsafe { SetupDiSetDeviceRegistryPropertyW(set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
+        .context("set SPDRP_HARDWAREID")?;
+    // NOT SetupDiCallClassInstaller(DIF_REGISTERDEVICE): that requires an interactive window
+    // station and fails with error 1459 from a service. Plain registration is all a root
+    // devnode needs before UpdateDriverForPlugAndPlayDevices binds the driver.
+    // SAFETY: live set + element; no compare callback.
+    unsafe { SetupDiRegisterDeviceInfo(set.0, &mut did, 0, None, None, None) }
+        .context("SetupDiRegisterDeviceInfo")?;
+    mark(&set, &mut did)?;
+    instance_id(&set, &did).context("read the new devnode's instance id")
+}
+
+/// Create + register a fresh MEDIA-class root devnode carrying the Steam Streaming Speakers
+/// hardware id, and persist the pad slot in its `Device Parameters` key.
+fn create_devnode(pad_index: u8) -> Result<String> {
+    let inst = create_media_devnode(DEVNODE_DESC, SSS_HWID, |set, did| {
+        write_pad_index(set, did, pad_index)
+    })?;
+    tracing::info!(pad = pad_index, devnode = %inst, "created a pad-audio devnode");
+    Ok(inst)
+}
+
+/// Persist `pad_index` in the devnode's `Device Parameters` key (created on a fresh devnode).
+fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -> Result<()> {
+    write_devparam_dword(set, did, PAD_INDEX_VALUE, pad_index as u32)
 }
 
 /// The Steam Streaming Speakers INF to feed `UpdateDriverForPlugAndPlayDevices`: prefer the
@@ -755,12 +803,11 @@ fn resolve_sss_inf() -> Result<String> {
     )
 }
 
-/// Bind the SSS driver to every unbound devnode carrying its hardware id (i.e. the pad
-/// devnodes just created). Idempotent: "nothing needed an update" is success.
-fn install_sss_driver() -> Result<()> {
-    let inf = resolve_sss_inf()?;
-    let inf_w = wide(&inf);
-    let hwid_w = wide(SSS_HWID);
+/// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: "nothing needed an
+/// update" is success. Shared with the `audio-probe` devtest (§C1 minting surface).
+pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
+    let inf_w = wide(inf);
+    let hwid_w = wide(hwid);
     // SAFETY: both strings are NUL-terminated and outlive the call; a null parent HWND and no
     // reboot-required out-param are documented as accepted.
     let r = unsafe {
@@ -774,7 +821,7 @@ fn install_sss_driver() -> Result<()> {
     };
     match r {
         Ok(()) => {
-            tracing::info!(inf = %inf, "bound the Steam Streaming Speakers driver to the pad devnode(s)");
+            tracing::info!(hwid = %hwid, inf = %inf, "bound the driver to the unbound devnode(s)");
             Ok(())
         }
         // ERROR_NO_MORE_ITEMS (0x80070103): every matching devnode already runs this (or a
@@ -786,26 +833,47 @@ fn install_sss_driver() -> Result<()> {
     }
 }
 
+/// Bind the SSS driver to every unbound devnode carrying its hardware id (i.e. the pad
+/// devnodes just created). Idempotent: "nothing needed an update" is success.
+fn install_sss_driver() -> Result<()> {
+    bind_driver(SSS_HWID, &resolve_sss_inf()?)
+}
+
 // --- endpoint discovery + stamping ----------------------------------------------------------
 
 /// The render endpoint owned by `instance_id`, identified through the endpoint store's devnode
 /// link (`"{1}.<instance id>"` under `…\MMDevices\Audio\Render\{ep}\Properties`).
-fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+pub(crate) fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+    endpoint_for_devnode_in(MMDEV_RENDER_PATH, ENDPOINT_ID_PREFIX, instance_id)
+}
+
+/// The CAPTURE endpoint owned by `instance_id` — the microphone half of a paired device like
+/// the Steam Streaming Microphone. Pad devices are render-only; the minted-audio provider and
+/// the `audio-probe` devtest need this direction.
+pub(crate) fn find_capture_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
+    endpoint_for_devnode_in(MMDEV_CAPTURE_PATH, CAPTURE_ENDPOINT_ID_PREFIX, instance_id)
+}
+
+fn endpoint_for_devnode_in(
+    reg_path: &str,
+    id_prefix: &str,
+    instance_id: &str,
+) -> Result<Option<String>> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let want = format!("{{1}}.{instance_id}");
-    let render = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(MMDEV_RENDER_PATH)
-        .with_context(|| format!(r"open HKLM\{MMDEV_RENDER_PATH}"))?;
-    for key in render.enum_keys().flatten() {
-        let Ok(props) = render.open_subkey(format!(r"{key}\Properties")) else {
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(reg_path)
+        .with_context(|| format!(r"open HKLM\{reg_path}"))?;
+    for key in root.enum_keys().flatten() {
+        let Ok(props) = root.open_subkey(format!(r"{key}\Properties")) else {
             continue;
         };
         let Ok(link) = props.get_value::<String, _>(reg_value_name(&PKEY_ENDPOINT_DEVNODE)) else {
             continue;
         };
         if link.eq_ignore_ascii_case(&want) {
-            return Ok(Some(format!("{ENDPOINT_ID_PREFIX}{key}")));
+            return Ok(Some(format!("{id_prefix}{key}")));
         }
     }
     Ok(None)
@@ -926,7 +994,14 @@ fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
 /// restart), raw registry for whatever it rejects. Idempotent — already-served keys are
 /// skipped entirely.
 fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
-    let stamps = active_stamps(pad_index);
+    write_stamps(endpoint_id, &active_stamps(pad_index))
+}
+
+/// The generic stamp writer behind [`stamp_endpoint`], shared with the minted-audio provider
+/// (which stamps "Punktfunk Speakers/Microphone" names — field-measured necessity: without
+/// them even the box's owner could not tell the minted instances from Steam's primaries in
+/// the Sound settings zoo).
+pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
     let dev = open_mmdevice(endpoint_id)?;
     let pending: Vec<&Stamp> = {
         // SAFETY: read-only property store on a COM-initialized thread.
@@ -935,7 +1010,7 @@ fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
         stamps.iter().filter(|s| !stamp_served(&store, s)).collect()
     };
     if pending.is_empty() {
-        tracing::debug!(endpoint = %endpoint_id, pad = pad_index, "pad endpoint already fully stamped");
+        tracing::debug!(endpoint = %endpoint_id, "endpoint already fully stamped");
         return Ok(());
     }
     let mut via_store: Vec<&'static str> = Vec::new();
@@ -976,10 +1051,9 @@ fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
     }
     tracing::info!(
         endpoint = %endpoint_id,
-        pad = pad_index,
         property_store = ?via_store,
         registry = ?via_registry.iter().map(|s| s.label).collect::<Vec<_>>(),
-        "pad endpoint stamped (route per key)"
+        "endpoint stamped (route per key)"
     );
     Ok(())
 }
@@ -1132,6 +1206,11 @@ fn registry_stamp(endpoint_id: &str, stamps: &[&Stamp]) -> Result<()> {
 /// i.e. the audio stack SERVES the identity rather than merely storing it. Any error counts as
 /// "not served" (the only consumer is the needs-AEB-kick decision).
 fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
+    stamps_served(endpoint_id, &active_stamps(pad_index))
+}
+
+/// [`all_served`]'s generic body — shared with the minted-audio provider.
+pub(crate) fn stamps_served(endpoint_id: &str, stamps: &[Stamp]) -> bool {
     let Ok(dev) = open_mmdevice(endpoint_id) else {
         return false;
     };
@@ -1139,9 +1218,7 @@ fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
     let Ok(store) = (unsafe { dev.OpenPropertyStore(STGM_READ) }) else {
         return false;
     };
-    active_stamps(pad_index)
-        .iter()
-        .all(|s| stamp_served(&store, s))
+    stamps.iter().all(|s| stamp_served(&store, s))
 }
 
 // --- public provisioning API ----------------------------------------------------------------

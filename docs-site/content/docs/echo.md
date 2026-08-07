@@ -27,11 +27,12 @@ leaving the stream; see [Input](/docs/input#getting-your-input-back).
 ## "Listen to this device" and app monitoring (Windows hosts)
 
 Windows can play a microphone straight out of the speakers. If **Listen to this device** is
-ticked for the Punktfunk mic (usually *CABLE Output*), your voice plays on the host's output —
-which the stream then captures and sends right back to you.
+ticked for the Punktfunk mic — a *Steam Streaming Microphone*-class device on current hosts,
+*CABLE Output* on older ones — your voice plays on the host's output, which the stream then
+captures and sends right back to you.
 
-Open **Sound settings → More sound settings → Recording**, double-click *CABLE Output*, and on
-the **Listen** tab untick *Listen to this device*.
+Open **Sound settings → More sound settings → Recording**, double-click the Punktfunk mic, and
+on the **Listen** tab untick *Listen to this device*.
 
 The same loop hides in apps: **Discord's** *Mic Test* / input monitoring, **OBS's** *Monitor
 audio* on a mic source, and similar monitoring features in other tools all play your mic into
