@@ -46,6 +46,18 @@
 //! prefix for a driver to mis-skip and no second framing to test (see
 //! `common::split_av1_aus`). Its absence is deliberate.
 //!
+//! # The two legs that decode OUR OWN streams
+//!
+//! [`LOWDELAY_H264`] and [`LOWDELAY_H265`] are not conformance vectors — they are
+//! `punktfunk-host spike` output, vendored because a conformance vector proves
+//! conformance to itself and the encoder we ship behind is a different stream. The
+//! H.264 one is here because it caught a defect the vector is structurally blind to
+//! (117 of its 120 access units named one surface as both the decode target and a
+//! reference); the H.265 one is here because HEVC is EXEMPT from that defect for a
+//! structural reason, and an exemption with no stream behind it is how the H.264
+//! defect survived two milestones. Both are backed by a non-ignored CPU guard that
+//! asserts the stream still has the property it was vendored for.
+//!
 //! # Why the AV1 leg exists at all
 //!
 //! Because until it did, the AV1 rung had no pixel evidence whatsoever. An
@@ -138,6 +150,51 @@ const GOLDENS_LOWDELAY: &str = include_str!("data/lowdelay-640x480.nv12.sha256")
 /// both dimensions are macroblock-aligned, so the coded and display sizes agree).
 const LOWDELAY_FRAME_COUNT: usize = 120;
 const DISPLAY_LOWDELAY: (u32, u32) = (640, 480);
+
+/// **Our own host's HEVC**, the twin of [`LOWDELAY_H264`] — and the one vendored to
+/// keep an exemption honest rather than to catch a defect.
+///
+/// H.264 and AV1 both had to defer their slot releases past the decode op because
+/// their planners snapshot the marked DPB BEFORE the marking that retires a picture.
+/// `H265Planner` snapshots AFTER `decode_rps`, so an RPS-dropped picture is never in
+/// the set `RefPicList`/`pReferenceSlots` is built from, and the HEVC conversions
+/// still release inline. That argument is correct — and it was, until this stream,
+/// backed by `test-25fps.h265` (which REORDERS, so it cannot reach the shape at all)
+/// plus one throwaway measurement.
+///
+/// This stream reaches the shape. `sps_max_dec_pic_buffering_minus1 = 4` against four
+/// pictures marked in steady state, `sps_max_num_reorder_pics = 0`: 115 of its 120
+/// access units retire exactly one picture, and **all 115 of them would alias** if
+/// the snapshot moved above `decode_rps`. Measured `removed ∩ dpb_refs` is 0 of 120,
+/// so the exemption is a measurement on our own encoder's output rather than a
+/// re-derivable argument.
+///
+/// ⚠ On THIS rung that counterfactual is about the planner, not about
+/// [`pf_vkdecode::plan_to_vk_h265`]: Vulkan's `pReferenceSlots` is spec-defined as the
+/// slots the decode operation uses, so the conversion binds `plan.rps` — the three
+/// current sets, which `decode_rps` itself derives — and never reads `dpb_refs` at
+/// all. The DXVA rung is the one that binds the whole marked DPB (`RefPicList` is
+/// spec-defined that way, and an RFI long-term anchor must survive in it), so it is
+/// the rung a moved snapshot would actually alias on;
+/// `pf_dxvadec::pic_h265`'s tests drive that counterfactual through the conversion.
+/// What the leg below adds on this rung is the thing no HEVC leg here had: PIXELS
+/// from our own encoder, under a DPB that evicts and reuses a slot on 115 of 120
+/// access units instead of a vector whose reordering keeps eviction slack.
+///
+/// Provenance, the `punktfunk-host spike` command and the two-build ffmpeg
+/// cross-check are in the golden file's header, as for the H.264 sibling.
+const LOWDELAY_H265: &[u8] = include_bytes!("data/lowdelay-640x480.h265");
+const GOLDENS_LOWDELAY_H265: &str = include_str!("data/lowdelay-640x480-h265.nv12.sha256");
+
+/// The HEVC low-delay stream's own frame count and display region.
+///
+/// Deliberately NOT shared with [`LOWDELAY_FRAME_COUNT`]/[`DISPLAY_LOWDELAY`] even
+/// though the two fixtures agree today: they are separate files from separate
+/// encoder configurations, and one regenerated at another size must fail on its own
+/// leg rather than silently redefine the other's geometry. Same reason
+/// [`DISPLAY_H264`] and [`DISPLAY_H265`] are two constants holding 320x240.
+const LOWDELAY_H265_FRAME_COUNT: usize = 120;
+const DISPLAY_LOWDELAY_H265: (u32, u32) = (640, 480);
 
 /// The Main 10 vector is 50 display frames.
 const MAIN10_FRAME_COUNT: usize = 50;
@@ -932,6 +989,39 @@ fn main10_every_frame_hashes_bit_identical_to_libavcodec() {
     );
 }
 
+/// The HEVC twin of [`low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec`]:
+/// **our own host's HEVC**, in the shape the vendored vector cannot produce.
+///
+/// Its job is the opposite of the H.264 leg's. That one exists because the rung was
+/// broken and only this stream shape could show it. This one exists because until now
+/// no HEVC leg anywhere had decoded a single frame our own encoder produced: both
+/// existing legs run vendored vectors, and the H.264 sibling is the standing proof
+/// that a vector's silence about a stream shape is not evidence.
+///
+/// What it exercises that `h265_every_frame_hashes_bit_identical_to_libavcodec` does
+/// not: a five-picture DPB with four references marked and no reordering, so the
+/// `SlotMap` retires and reissues a slot on 115 of the 120 access units, back to back,
+/// with the decode target taking the slot freed in the same access unit. The vector
+/// reorders, which keeps that eviction slack and never puts the two together.
+///
+/// It is NOT the leg that would catch a moved `dpb_snapshot()` — see [`LOWDELAY_H265`]
+/// for why that lands on the DXVA rung instead, and
+/// [`the_low_delay_h265_stream_agrees_with_its_goldens_and_keeps_the_exemption_falsifiable`]
+/// for the guard that keeps the planner property itself pinned, on CPU, in ordinary CI.
+#[test]
+#[ignore = "needs a Vulkan Video H.265 decode device (fleet boxes; see module docs)"]
+fn low_delay_host_h265_every_frame_hashes_bit_identical_to_libavcodec() {
+    h265_parity_run(
+        &common::split_h265_aus(LOWDELAY_H265),
+        GOLDENS_LOWDELAY_H265,
+        LOWDELAY_H265_FRAME_COUNT,
+        0,
+        EXPECTED_FORMAT,
+        DISPLAY_LOWDELAY_H265,
+        "H.265 (low-delay host stream)",
+    );
+}
+
 /// The HEVC leg of the production prefix form — the one that would have caught
 /// the shipped defect. See [`h264_four_byte_start_codes_decode_bit_identically`].
 #[test]
@@ -1722,6 +1812,160 @@ fn the_low_delay_stream_agrees_with_its_goldens_and_still_exercises_the_aliasing
         "the stream must still remove pictures its own reference lists name — that is \
          the ONLY reason it is vendored, and without it the GPU leg is a duplicate of \
          the conformance one"
+    );
+}
+
+/// The HEVC low-delay stream's CPU guard — the twin of the H.264 one above, with the
+/// extra assertion HEVC needs and H.264 does not.
+///
+/// H.264's guard pins that the stream still ALIASES (117 of 120), because its GPU leg
+/// exists to catch a defect. HEVC's leg exists to keep an exemption from rotting, so
+/// pinning `both == 0` alone would be exactly the vacuous check `fd6241a2` called out:
+/// zero is also what a stream that never removes anything reports, and what a stream
+/// that reorders reports. So this pins three numbers instead:
+///
+/// - **115 access units remove a picture** — the stream reaches the DPB pressure at all;
+/// - **0 of them intersect `dpb_refs`** — the exemption, measured;
+/// - **115 of them WOULD intersect** a snapshot taken before `decode_rps`.
+///
+/// The third is what makes the second worth having. `pre_rps_marked(N)` is exact rather
+/// than approximate: `begin_picture` runs `decode_rps` → `update_dpb_before_decoding` →
+/// `dpb_snapshot`, and the only thing that happens between AU N-1's snapshot and AU N's
+/// `decode_rps` is `finish_picture(N-1)` storing its picture marked short-term. So the
+/// marked set AU N's RPS sees is exactly `dpb_refs(N-1) ∪ {stored(N-1)}`, which is what
+/// `dpb_snapshot()` would have returned from the other side of that call.
+#[test]
+fn the_low_delay_h265_stream_agrees_with_its_goldens_and_keeps_the_exemption_falsifiable() {
+    use pf_bitstream::h265::H265Planner;
+
+    let goldens = golden_hashes(GOLDENS_LOWDELAY_H265);
+    assert_goldens_are_a_real_set(
+        &goldens,
+        LOWDELAY_H265_FRAME_COUNT,
+        "data/lowdelay-640x480-h265.nv12.sha256",
+    );
+
+    let aus = common::split_h265_aus(LOWDELAY_H265);
+    assert_eq!(aus.len(), LOWDELAY_H265_FRAME_COUNT);
+
+    let mut planner = H265Planner::new();
+    let mut outputs = 0usize;
+    let mut iraps = 0usize;
+    let mut with_removals = 0usize;
+    let mut both = 0usize;
+    let mut would_alias = 0usize;
+    let mut first_sps = None;
+    // The marked DPB as AU N's `decode_rps` finds it: AU N-1's snapshot plus the
+    // picture AU N-1 stored. See the doc comment for why this is exact.
+    let mut pre_rps_marked: Vec<u64> = Vec::new();
+    for (index, au) in aus.iter().enumerate() {
+        let plan = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("AU {index}: the low-delay HEVC stream must plan, got {e:?}")
+        });
+        outputs += plan.dpb.outputs.len();
+        iraps += usize::from(plan.picture.is_irap);
+        if !plan.dpb.removed.is_empty() {
+            with_removals += 1;
+        }
+        both += plan
+            .dpb
+            .removed
+            .iter()
+            .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+            .count();
+        would_alias += plan
+            .dpb
+            .removed
+            .iter()
+            .filter(|id| pre_rps_marked.contains(id))
+            .count();
+
+        // The picture shape both HEVC legs hard-code: `probe_stream_support(1, 0)`
+        // and an NV12 pool. Fail here, on CPU, rather than as a confusing
+        // hardware-only refusal.
+        assert_eq!(
+            (
+                plan.picture.chroma_format_idc,
+                plan.picture.bit_depth_luma_minus8
+            ),
+            (1, 0),
+            "AU {index}: the low-delay HEVC stream must stay Main 4:2:0 8-bit"
+        );
+        if index == 0 {
+            assert!(plan.picture.is_idr, "the stream opens with an IDR");
+            assert_eq!(
+                (plan.picture.coded_width, plan.picture.coded_height),
+                DISPLAY_LOWDELAY_H265,
+                "the stream is 640x480"
+            );
+            assert_eq!(
+                (
+                    plan.picture.display_crop.x,
+                    plan.picture.display_crop.y,
+                    plan.picture.display_crop.width,
+                    plan.picture.display_crop.height,
+                ),
+                (0, 0, DISPLAY_LOWDELAY_H265.0, DISPLAY_LOWDELAY_H265.1),
+                "640 and 480 are both multiples of MinCbSizeY, so there is no \
+                 conformance window and the coded size IS what the goldens hashed"
+            );
+        }
+        first_sps.get_or_insert((
+            plan.picture.max_dpb_frames,
+            plan.sps.max_num_reorder_pics[usize::from(plan.sps.max_sub_layers_minus1)],
+        ));
+
+        pre_rps_marked = plan.dpb_refs.iter().map(|r| r.id).collect();
+        if let Some(id) = plan.dpb.stored {
+            assert!(
+                plan.picture.is_reference,
+                "AU {index}: every picture of this stream is a reference — a \
+                 sub-layer non-reference picture would break the pre-RPS \
+                 reconstruction below"
+            );
+            pre_rps_marked.push(id);
+        }
+    }
+    outputs += planner.flush().outputs.len();
+
+    assert_eq!(
+        outputs,
+        goldens.len(),
+        "the planner outputs {outputs} pictures but the goldens carry {} hashes",
+        goldens.len()
+    );
+    assert_eq!(
+        iraps, 1,
+        "the stream holds exactly one IRAP (the opening IDR); a CRA/BLA would make \
+         RASL skips reachable and the expected frame count needs rederiving"
+    );
+    assert_eq!(
+        first_sps,
+        Some((5, 0)),
+        "DPB depth and sps_max_num_reorder_pics — a five-picture DPB against the four \
+         pictures 8.3.2 keeps marked, with no reordering, is what puts an RPS drop and \
+         the eviction it causes in one access unit"
+    );
+
+    assert_eq!(
+        with_removals, 115,
+        "the stream must still retire a picture on nearly every access unit; without \
+         that the two numbers below are both trivially zero"
+    );
+    assert_eq!(
+        both, 0,
+        "{both} picture(s) are in an access unit's own marked DPB AND removed by it. \
+         That is the H.264/AV1 aliasing precondition, and HEVC is supposed to be \
+         structurally incapable of it — `H265Planner`'s snapshot has moved ahead of \
+         `decode_rps`. Restore the ordering, or give the HEVC conversions the \
+         `release_after_decode` deferral the other two carry; do NOT relax this number"
+    );
+    assert_eq!(
+        would_alias, 115,
+        "the fixture must stay CAPABLE of exposing the defect it is here to rule out. \
+         A regenerated stream that reordered, or that carried a DPB deeper than its \
+         reference count, would report 0 here — and the zero above would then prove \
+         nothing at all, exactly as `test-25fps.h264` proved nothing for two milestones"
     );
 }
 

@@ -33,6 +33,15 @@
 //!   ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]), and the stream is now
 //!   vendored so `low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec`
 //!   holds the rung to what it streams rather than only to what it conforms to.
+//!
+//!   HEVC is EXEMPT from that defect, and since 2026-08-07 that is a measurement rather
+//!   than an argument: `H265Planner` snapshots `dpb_refs` after `decode_rps`, so an
+//!   RPS-dropped picture never reaches `RefPicList`, and a vendored low-delay HEVC
+//!   stream from the same host confirms it — 115 of its 120 access units retire a
+//!   picture, 0 alias, and all 115 WOULD alias if the snapshot moved one call earlier.
+//!   `low_delay_host_h265_every_frame_hashes_bit_identical_to_libavcodec` is the pixel
+//!   leg; pf-dxvadec's `pic_h265` tests pin the numbers and drive the counterfactual
+//!   through the conversion.
 //! * **AV1** — wired in M7, and frame-hash parity on the SAME two GPUs since 2026-08-07:
 //!   250/250 delivered frames bit-identical to libavcodec on the RTX 3500 Ada and on the
 //!   Intel Arc. It streams 4K60 on both with a clean 5-minute soak, but that is throughput
@@ -1767,6 +1776,32 @@ mod parity {
     const GOLDENS_H265: &str =
         include_str!("../../pf-vkdecode/tests/data/test-25fps-h265.nv12.sha256");
 
+    /// **Our own host's low-delay HEVC** and its goldens — the H.265 twin of
+    /// [`LOWDELAY_H264`], vendored for the opposite reason.
+    ///
+    /// The H.264 stream is here because this rung was WRONG and only that shape could
+    /// show it. This one is here because HEVC is believed RIGHT — `H265Planner`
+    /// snapshots `dpb_refs` after `decode_rps`, so an RPS-dropped picture is never in
+    /// the marked set `RefPicList` is built from, and `plan_to_dxva_h265` is the one
+    /// conversion of the three that still releases inline. 120 pictures of 640x480
+    /// IPPP, `sps_max_num_reorder_pics = 0`, a five-picture DPB against four marked
+    /// references: 115 of the 120 access units retire a picture, `removed ∩ dpb_refs`
+    /// is 0 of 120, and all 115 would alias under the other snapshot ordering
+    /// (pf-dxvadec's `pic_h265` tests pin every one of those numbers, and drive the
+    /// counterfactual through the conversion itself).
+    ///
+    /// Provenance, the `punktfunk-host spike` command and the ffmpeg cross-check are in
+    /// the golden file's header.
+    const LOWDELAY_H265: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
+    const GOLDENS_LOWDELAY_H265: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480-h265.nv12.sha256");
+
+    /// The HEVC low-delay stream's frame count. A separate constant from
+    /// [`LOWDELAY_FRAME_COUNT`] on purpose: two files, two encoder runs, and one
+    /// regenerated at another length must fail on its own leg.
+    const LOWDELAY_H265_FRAME_COUNT: usize = 120;
+
     /// Both vendored vectors are 250 display frames.
     const FRAME_COUNT: usize = 250;
 
@@ -2652,6 +2687,32 @@ mod parity {
             &golden_hashes(GOLDENS_H265),
             FRAME_COUNT,
             "H.265",
+        );
+    }
+
+    /// The HEVC twin of the low-delay H.264 leg — and the one that keeps HEVC's
+    /// exemption from the release-ordering defect a standing hardware fact.
+    ///
+    /// `h265_every_frame_hashes_bit_identical_to_libavcodec` decodes a vector that
+    /// REORDERS, so it never puts an RPS drop and the eviction it causes in one access
+    /// unit and cannot see this class at all. This stream does, on 115 of its 120
+    /// access units — see [`LOWDELAY_H265`]. If a refactor ever moved `H265Planner`'s
+    /// snapshot ahead of `decode_rps` (where the other two planners take theirs), this
+    /// rung would name one surface as both `CurrPic` and a `RefPicList` entry on all
+    /// 115, and this leg is what would say so in pixels.
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn low_delay_host_h265_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h265_aus(LOWDELAY_H265);
+        let order = order_h265(&aus);
+        parity_run(
+            Codec::H265,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY_H265),
+            LOWDELAY_H265_FRAME_COUNT,
+            "H.265 (low-delay host stream)",
         );
     }
 
