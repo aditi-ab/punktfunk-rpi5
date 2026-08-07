@@ -371,8 +371,8 @@ struct GamepadHomeView: View {
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
             isActive: homeOwnsController
-        ) { tile in
-            hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight))
+        ) { tile, entrance in
+            hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight), entrance: entrance)
         }
         .frame(height: cardHeight + 40)
     }
@@ -381,8 +381,12 @@ struct GamepadHomeView: View {
     /// per-frame `phase` (real distance-from-centered), so the look always matches what's on screen
     /// mid-scroll. `.shadow`/`.overlay` aren't part of `VisualEffect`, so the focus pop is scale +
     /// brightness/saturation + a depth blur on the recessed neighbors.
-    private func hostCard(_ tile: HomeTile, size: CGSize) -> some View {
+    private func hostCard(
+        _ tile: HomeTile, size: CGSize, entrance: CardEntrance
+    ) -> some View {
         GamepadHostTile(tile: tile, size: size)
+            // Beneath the scroll transition, never around it — see CardEntrance.
+            .modifier(entrance)
             .scrollTransition { content, phase in
                 let d = CGFloat(min(abs(phase.value), 1))
                 let scale = 1 - d * 0.12

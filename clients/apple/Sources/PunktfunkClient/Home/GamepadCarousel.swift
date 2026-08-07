@@ -59,7 +59,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// library passes "the first covers have their artwork" (see LibraryCoverflowView); anything
     /// whose cards are ready the moment they mount leaves it alone.
     var contentReady: Bool = true
-    @ViewBuilder let card: (Item) -> Card
+    /// Builds one card. The `CardEntrance` handed along is the card's share of the strip's
+    /// arrival, and the caller MUST apply it (`.modifier(entrance)`) *underneath* its own
+    /// `.scrollTransition` — see `CardEntrance` for why that placement is load-bearing.
+    @ViewBuilder let card: (Item, CardEntrance) -> Card
 
     @State private var input = GamepadMenuInput(manager: .shared)
     @State private var haptics = MenuHaptics(manager: .shared)
@@ -127,18 +130,14 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                             // below keeps the tile's own look — the `.scrollTransition` center pop
                             // is the focus treatment, since focus and center track each other.
                             Button { activate(item) } label: {
-                                // Entrance INSIDE the fixed frame: the scroll target's own
-                                // geometry stays exactly `itemWidth`, whatever the card is doing.
-                                card(item)
-                                    .modifier(entrance(idx))
+                                card(item, entrance(idx))
                                     .frame(width: itemWidth)
                             }
                             .buttonStyle(ConsoleBareButtonStyle())
                             .focused($focusedID, equals: item.id)
                             .id(item.id)
                             #else
-                            card(item)
-                                .modifier(entrance(idx))
+                            card(item, entrance(idx))
                                 .frame(width: itemWidth)
                                 .contentShape(Rectangle())
                                 .onTapGesture { tap(item) }
@@ -436,11 +435,17 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 /// simultaneous flash, and it is the same hinge/perspective language the coverflow's own recede
 /// speaks, so the arrival and the scrolling feel like one object.
 ///
-/// Transforms only — nothing here touches layout, so the scroll view's snapping, the caller's
-/// `.scrollTransition` (whose scale/rotation simply multiply with these) and the tvOS focus
-/// engine are all untouched. Reduce Motion drops every bit of travel for a plain, unstaggered
-/// cross-fade.
-private struct CardEntrance: ViewModifier, Animatable {
+/// ⚠️ APPLY THIS UNDERNEATH THE CARD'S OWN `.scrollTransition`, never around it. A scroll
+/// transition derives its phase from the geometry of the view it wraps, so an entrance layered
+/// on the OUTSIDE moves the very thing the transition is measuring: every card read as far from
+/// centre for the whole travel, its phase pinned at fully-receded, and the centred card only
+/// collapsed into its focused look as the entrance ended — arriving as a jump. Underneath, the
+/// transition measures a card that never moves and simply composes its own scale/rotation on top.
+///
+/// Transforms only — nothing here touches layout, so the scroll view's snapping and the tvOS
+/// focus engine are untouched either. Reduce Motion drops every bit of travel for a plain,
+/// unstaggered cross-fade.
+struct CardEntrance: ViewModifier, Animatable {
     /// How long ONE card takes to travel, and the most any card waits before it starts.
     static let perCard: Double = 0.6
     static let maxDelay: Double = 0.42
@@ -482,21 +487,13 @@ private struct CardEntrance: ViewModifier, Animatable {
         let away = reduceMotion ? 0 : 1 - travel
         return content
             .opacity(reduceMotion ? raw : fade)
-            // EVERY transform here stays inside the card's own footprint, and that is a
-            // correctness requirement, not taste: the caller's `.scrollTransition` reads the
-            // geometry of the view underneath these, so a card shoved 58 pt down and hinged on
-            // its leading edge spent the travel reported as "far from centre" — its phase pinned
-            // at fully-receded — and only collapsed to identity as the card came home. That was
-            // the focused card jumping into its correct state at the end. Hence: rotation about
-            // the CENTRE (the card turns in place rather than swinging sideways) and a rise small
-            // enough to stay within the strip's own slack.
             .scaleEffect(1 - 0.26 * away)
             .rotation3DEffect(
                 .degrees(side * -64 * away),
                 axis: (x: 0, y: 1, z: 0),
                 anchor: .center,
                 perspective: 0.65)
-            .offset(y: 16 * away)
+            .offset(y: 34 * away)
     }
 
     /// `1 - (1-t)³`, with a small overshoot past 1 before it settles.

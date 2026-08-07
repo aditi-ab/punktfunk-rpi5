@@ -110,8 +110,8 @@ struct LibraryCoverflowView: View {
             shoulderJump: 5,
             isActive: controllerActive,
             contentReady: contentReady
-        ) { game in
-            cover(game, width: coverWidth, height: coverHeight)
+        ) { game, entrance in
+            cover(game, width: coverWidth, height: coverHeight, entrance: entrance)
         }
         .frame(height: coverHeight + 44)
     }
@@ -120,7 +120,9 @@ struct LibraryCoverflowView: View {
     /// per-frame `phase` (real distance-from-centered), so the tilt tracks what's actually on screen
     /// mid-scroll. `.shadow` isn't a `VisualEffect`, so it's baked constant into the card; the
     /// scale/rotation/opacity ramp already makes the centered cover prominent.
-    private func cover(_ game: GameEntry, width: CGFloat, height: CGFloat) -> some View {
+    private func cover(
+        _ game: GameEntry, width: CGFloat, height: CGFloat, entrance: CardEntrance
+    ) -> some View {
         PosterImage(
             candidates: game.art.posterCandidates, title: game.title, session: imageSession,
             onLoaded: { artSettled += 1 })
@@ -136,6 +138,8 @@ struct LibraryCoverflowView: View {
                     .strokeBorder(ink.fg(0.12), lineWidth: 1)
             }
             .shadow(color: ink.shadow(0.5), radius: 16, y: 12)
+            // Beneath the scroll transition, never around it — see CardEntrance.
+            .modifier(entrance)
             .scrollTransition { content, phase in
                 let v = phase.value
                 let d = CGFloat(min(abs(v), 1))
