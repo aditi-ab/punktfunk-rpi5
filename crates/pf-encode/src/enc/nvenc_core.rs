@@ -137,6 +137,36 @@ pub(super) fn subframe_env_forced() -> bool {
 /// drop-in alternative — `poll_chunk` cuts at `bitstreamSizeInBytes` on the reasoning that
 /// "slices are contiguous Annex-B", which AV1's OBUs are not.
 ///
+/// # A tile-aware chunk reader was considered and is CLOSED, not deferred
+///
+/// The obvious follow-up is to teach the reader AV1's units — cut on OBU boundaries instead
+/// of byte counts and arm from the driver's reported unit count — so AV1 gets the sub-frame
+/// latency win HEVC gets (ship tile 1 while tile 2 encodes). Measured on `.21` (RTX 5070 Ti,
+/// `av1_nvenc`, 2026-08-07) before writing any of it, and the measurement closes it:
+///
+/// * **4K carries two tiles, and they share ONE Tile Group OBU.** The frame header reads
+///   `width_in_sbs_minus_1[0] = 59` (one tile column, the full 3840) and
+///   `height_in_sbs_minus_1[] = {16, 16}` (two tile rows) — but
+///   `tile_start_and_end_present_flag = 0`, which puts both tiles in a single Tile Group
+///   OBU. There is no OBU boundary between them to cut on. Shipping tile 1 early would mean
+///   the HOST re-authoring AV1 syntax per chunk — synthesising a fresh Tile Group OBU header
+///   with `tile_start_and_end_present_flag = 1` and its own `tg_start`/`tg_end` — which is
+///   bitstream surgery on the encode path, not a reader change.
+/// * **1080p carries one tile** (`tile_cols_log2 = tile_rows_log2 = 0`), so there is nothing
+///   to pipeline at the commonest streaming resolution regardless.
+/// * **The prize is small even at 4K, because split encode already spent it.** The two tile
+///   rows go to two split-encode engines that run CONCURRENTLY, so they finish at nearly the
+///   same moment: the win is bounded by the skew between engines, not by half the frame.
+///   Whole-frame encode measures 3.3–3.6 ms at 4K60 against a 16.7 ms p50 end-to-end, so
+///   even the sequential-tiles fantasy caps out near 1.7 ms and the real figure is a
+///   fraction of that. HEVC's sub-frame win is larger for a structural reason that does not
+///   transfer: forced split and sub-frame are mutually unsupported (below), so HEVC's slices
+///   really are produced one after another.
+///
+/// Reopen only if NVENC starts emitting one OBU per tile, or sets
+/// `tile_start_and_end_present_flag = 1` — at that point the cut points exist and the reader
+/// change becomes the small piece it was assumed to be.
+///
 /// Returns the `(split_mode, subframe)` to ACTUALLY configure. The caller must store BOTH back
 /// (the chunked-poll latch and `CeilingKey` key on them) — a silent in-params drop would leave
 /// `poll_chunk` busy-polling its full budget every AU (`numSlices` stays 0 without
