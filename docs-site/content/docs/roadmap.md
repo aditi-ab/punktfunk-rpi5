@@ -92,7 +92,11 @@ head-tracked remote spatial audio that no streaming stack does today.
   [matrix](/docs/support-matrix#input-cursor-and-hdr).
 - **Hosting on macOS, iOS, tvOS or Android.** Client-only platforms by construction: every host
   entry point fails at compile time. There is no setting that changes this.
-- **4:4:4 on AMD and Intel encoders.** A limitation of those encode blocks, not a gap in Punktfunk.
+- **HEVC 4:4:4 on the AMD encode block.** AMD's VCN never encodes 4:4:4, so there is nothing to
+  implement. Intel is a different story and *is* a gap rather than a wall — the VAAPI backend
+  simply has no 4:4:4 path yet, and it waits on hardware that advertises a HEVC 4:4:4 encode
+  entrypoint to build and validate against. On either vendor, [PyroWave](/docs/pyrowave) already
+  carries full chroma today.
 - **DualSense voice-coil haptics.** Scoped and shelved — it rides the controller's USB audio
   interface and has near-zero game support on Linux. Rumble, adaptive triggers and the lightbar
   already work.

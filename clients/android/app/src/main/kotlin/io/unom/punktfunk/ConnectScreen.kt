@@ -1,11 +1,14 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -168,8 +171,7 @@ fun ConnectScreen(
             lnpPrompt = false
             // The browse started while blocked (its sockets failed or received nothing) — restart it
             // now that the grant makes them work.
-            discovery.stop()
-            discovery.start()
+            discovery.restart()
         } else {
             lnpPrompt = true // rationale + "Open settings" (a permanently-denied request returns instantly)
         }
@@ -191,12 +193,27 @@ fun ConnectScreen(
     // or otherwise notify the app — this observer is what turns the grant into a live discovery.
     DisposableEffect(Unit) {
         val lifecycle = (context as? LifecycleOwner)?.lifecycle
+        // Whether we've actually been away. ON_RESUME also fires on first entry, right after the
+        // effect below starts the browse — restarting it there would be pure churn.
+        var wasPaused = false
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME && !lnpGranted && hasLocalNetworkPermission(context)) {
-                lnpGranted = true
-                lnpPrompt = false
-                discovery.stop()
-                discovery.start()
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> wasPaused = true
+                Lifecycle.Event.ON_RESUME -> {
+                    if (!lnpGranted && hasLocalNetworkPermission(context)) {
+                        lnpGranted = true
+                        lnpPrompt = false
+                        discovery.restart()
+                    } else if (wasPaused) {
+                        // Coming back from the background: the browse may have been sitting idle
+                        // (or had its multicast socket torn out from under it) while we were away,
+                        // and its own re-query interval has kept doubling. Re-arm and ask again,
+                        // so returning to the screen is enough — no app restart.
+                        discovery.restart()
+                    }
+                    wasPaused = false
+                }
+                else -> {}
             }
         }
         lifecycle?.addObserver(obs)
@@ -608,6 +625,32 @@ fun ConnectScreen(
         savedHosts = knownHostStore.all()
     }
 
+    // "Copy link" — the self-emitted form every other client already hands out
+    // (design/client-deep-links.md §4): the host's STABLE id first, with `host=` and `fp=` alongside,
+    // so a link written today still lands on the right box after the host changes address or this
+    // client is reinstalled. A PINNED card copies its own profile with it, because that combination
+    // is the thing being copied; a host card copies no profile at all and so keeps honouring the
+    // host's binding, exactly like a tap on it does.
+    fun copyLink(kh: KnownHost, pin: StreamProfile?) {
+        val url = DeepLinks.forHost(kh, profile = pin?.id).toUrl()
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val copied = clipboard != null && runCatching {
+            clipboard.setPrimaryClip(ClipData.newPlainText("Punktfunk link", url))
+        }.isSuccess
+        // Android 13 draws its own clipboard confirmation, and stacking a second one on top of it is
+        // the platform's own documented anti-pattern. Below it nothing visible happens at all unless
+        // we say so — a silent menu item reads as a broken one.
+        if (copied && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+        val message = if (copied) "Link copied." else "Couldn't copy the link to the clipboard."
+        // The console home renders neither the notice nor the status banner, so there it has to be a
+        // toast; the touch grid has both, and a success dressed as an error banner is a small lie.
+        when {
+            gamepadUi -> Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+            copied -> notice = message
+            else -> status = message
+        }
+    }
+
     // The profile rows a card's overflow menu grows. With no profiles at all it stays empty — a
     // user who never wants this feature sees no new clutter anywhere but the settings scope chips.
     // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
@@ -616,6 +659,7 @@ fun ConnectScreen(
         if (pin == null) {
             add(HostMenuItem("Network speed test") { startSpeedTest(HostCardEntry(kh, null)) })
         }
+        add(HostMenuItem("Copy link") { copyLink(kh, pin) })
         if (profiles.isEmpty()) return@buildList
         if (pin != null) {
             add(HostMenuItem("Unpin card", startsSection = true) { togglePin(kh, pin) })
@@ -897,7 +941,7 @@ fun ConnectScreen(
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                             )
                             Text(
-                                "Android blocks punktfunk from finding or reaching hosts until you allow it.",
+                                "Android blocks Punktfunk from finding or reaching hosts until you allow it.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                                 textAlign = TextAlign.Center,
@@ -1009,20 +1053,28 @@ fun ConnectScreen(
             // rather than looking idle/empty. Suppressed while local network access is denied —
             // a spinner would be a lie there (the browse can't receive anything); the banner above
             // owns that state.
-            if (lnpGranted && !connecting && discovered.isEmpty()) {
+            // Scan again is offered whether or not anything turned up: the case that sends people
+            // here is ONE expected host missing, not an empty list, and a browse that quietly went
+            // deaf (blocked when it started, or backed off to its hour-long re-query) looks
+            // exactly like a network without that host on it.
+            if (lnpGranted && !connecting) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            "Searching the local network…",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        if (discovered.isEmpty()) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Searching the local network…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        TextButton(onClick = { discovery.restart() }) { Text("Scan again") }
                     }
                 }
             }
@@ -1140,6 +1192,7 @@ fun ConnectScreen(
             } else {
                 null
             },
+            onCopyLink = { optionsTarget = null; copyLink(kh, pin) },
             onEdit = { optionsTarget = null; editTarget = kh },
             onForget = {
                 knownHostStore.remove(kh)

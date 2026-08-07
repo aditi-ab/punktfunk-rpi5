@@ -44,10 +44,16 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
-    subframe_env_forced, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling, subframe_env_forced,
+    CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+};
+// Moved to `codec.rs` (WP4) so the libav path, which builds without the `nvenc` feature, can share
+// one split policy instead of keeping the copy that had already drifted.
+use super::nvenc_core::{
+    cached_split_verdict, store_split_verdict, ArbAction, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
+use super::{max_forced_split_mode, resolve_split_mode};
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -592,6 +598,21 @@ pub struct NvencD3d11Encoder {
     /// sub-frame readback (the Linux backend's rule since its Phase 3; Windows joined after the
     /// 2026-07-31 on-glass A/B), so a GPU without it never has sub-frame forced by default.
     subframe_cap: bool,
+    /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
+    /// [`query_caps`](Self::query_caps). `0` = not probed / unreadable. The split-encode ceiling:
+    /// the driver accepts a split wider than the hardware and silently encodes narrower, so this
+    /// is the only honest source for how wide we may go (see `codec::max_forced_split_mode`).
+    encoder_engines: u32,
+    /// Submit stamp for the split arbiter's per-frame cost (sync depth-1 path only).
+    last_submit_at: Option<std::time::Instant>,
+    /// Whole-AU paced-send time (µs) the host last reported. `0` = never reported, which keeps
+    /// the arbiter out of the sub-frame trade it cannot otherwise price.
+    send_spread_us: u32,
+    /// Sub-frame state the session was OPENED able to run, so a return to a non-forced split can
+    /// restore it without ever turning it on for a session that never had it.
+    subframe_opened_with: bool,
+    /// The live split-mode experiment, when one is running.
+    arbiter: Option<SplitArbiter>,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
     /// in-flight encode. The fourth field tags the first frame encoded after a successful
     /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor P-frame the
@@ -753,6 +774,11 @@ impl NvencD3d11Encoder {
             input_ring_depth: None,
             async_supported: false,
             subframe_cap: false,
+            encoder_engines: 0,
+            last_submit_at: None,
+            send_spread_us: 0,
+            subframe_opened_with: false,
+            arbiter: None,
             pending: VecDeque::new(),
             frame_idx: 0,
             force_kf: false,
@@ -928,6 +954,10 @@ impl NvencD3d11Encoder {
         );
         let async_enc = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT);
         let subframe = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK);
+        // How many NVENC engines this GPU has — the split-encode ceiling. Must be probed rather
+        // than inferred from a rejection: the driver ACCEPTS a split wider than the hardware and
+        // silently encodes narrower (measured on `.21`, see `max_forced_split_mode`).
+        let engines = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES);
         let _ = (api().destroy_encoder)(enc);
 
         // Reject an over-range mode with a clear message instead of an opaque InvalidParam.
@@ -962,6 +992,7 @@ impl NvencD3d11Encoder {
         self.custom_vbv = custom_vbv != 0;
         self.async_supported = async_enc != 0;
         self.subframe_cap = subframe != 0;
+        self.encoder_engines = engines.max(0) as u32;
         tracing::info!(
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
@@ -1032,6 +1063,126 @@ impl NvencD3d11Encoder {
             },
         );
         Ok(cfg)
+    }
+
+    /// The config identity this session's split verdict is cached under.
+    fn split_key(&self) -> SplitKey {
+        // Same GPU identity as `ceiling_key`: the selected render adapter's LUID, `0` when
+        // unresolved. Advisory either way.
+        let gpu = pf_gpu::resolve_render_adapter_luid()
+            .map(|l| ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64)
+            .unwrap_or(0);
+        SplitKey {
+            gpu,
+            codec: self.codec,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bit_depth: self.bit_depth,
+            chroma_444: self.chroma_444,
+        }
+    }
+
+    /// Move the LIVE session to `mode` without an IDR. Windows twin of the Linux method; S1 on
+    /// D3D11 proved `nvEncReconfigureEncoder` takes a changed `splitEncodeMode` with
+    /// `resetEncoder=0` and emits no keyframe on this device type too.
+    fn apply_split_mode(&mut self, mode: u32) -> bool {
+        let (prev_mode, prev_sub) = (self.split_mode, self.subframe_on);
+        let (mode, subframe) = resolve_split_subframe(
+            self.codec,
+            mode,
+            self.subframe_opened_with,
+            subframe_env_forced(),
+        );
+        self.split_mode = mode;
+        self.subframe_on = subframe;
+        if self.reconfigure_bitrate(self.bitrate_bps) {
+            true
+        } else {
+            tracing::warn!(
+                from = prev_mode,
+                to = mode,
+                "NVENC split arbitration: driver refused the in-place split change — staying put"
+            );
+            self.split_mode = prev_mode;
+            self.subframe_on = prev_sub;
+            false
+        }
+    }
+
+    /// Feed one frame's encode cost to the split arbiter and act on its verdict.
+    fn feed_split_arbiter(&mut self, encode_us: u64) {
+        let Some(arb) = self.arbiter.as_mut() else {
+            return;
+        };
+        let action = arb.on_frame(encode_us);
+        let done = arb.is_done();
+        match action {
+            Some(ArbAction::SwitchTo(mode)) => {
+                if !self.apply_split_mode(mode) {
+                    self.arbiter = None;
+                    return;
+                }
+            }
+            Some(ArbAction::Settled(mode)) => store_split_verdict(self.split_key(), mode),
+            None => {}
+        }
+        if done {
+            store_split_verdict(self.split_key(), self.split_mode);
+            self.arbiter = None;
+        }
+    }
+
+    /// Decide whether this session may run a live split experiment. Same gates as the Linux
+    /// backend — see its `arm_split_arbiter` for why each one is a correctness condition rather
+    /// than a preference; the only Windows difference is that `async_rt` is a real possibility
+    /// here (opt-in two-thread retrieve), and under it the submit→AU span includes queue depth,
+    /// so the comparison would be noise.
+    fn arm_split_arbiter(&mut self) {
+        if !matches!(
+            std::env::var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE").as_deref(),
+            Ok("1")
+        ) {
+            return;
+        }
+        if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_some()
+            || cached_split_verdict(&self.split_key()).is_some()
+            || self.async_rt.is_some()
+            || self.encoder_engines < 2
+            || self.codec == Codec::H264
+        {
+            return;
+        }
+        let handicap_us = if self.subframe_on && self.codec != Codec::Av1 {
+            if self.send_spread_us == 0 || self.slices < 2 {
+                return;
+            }
+            let slices = self.slices as u64;
+            self.send_spread_us as u64 * (slices - 1) / slices
+        } else {
+            0
+        };
+        let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let widest = max_forced_split_mode(self.encoder_engines);
+        let challenger = if self.split_mode == widest {
+            disable
+        } else {
+            widest
+        };
+        if challenger == self.split_mode {
+            return;
+        }
+        tracing::info!(
+            incumbent = self.split_mode,
+            challenger,
+            handicap_us,
+            "NVENC split arbitration armed (Windows) — measuring both arms live (no IDR)"
+        );
+        self.arbiter = Some(SplitArbiter::with_handicap(
+            self.split_mode,
+            challenger,
+            handicap_us,
+        ));
     }
 
     /// This session config's identity in the process-lifetime bitrate-ceiling cache
@@ -1154,7 +1305,8 @@ impl NvencD3d11Encoder {
             // precedence (env override / the measured Main10 don't-split rule / pixel rate).
             // The init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 = resolve_split_mode(self.bit_depth, pixel_rate);
+            let split_mode: u32 =
+                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines);
             // Negotiated multi-slice (P2f): the direct-NVENC default of 4, clamped by the
             // client's ceiling — a single-slice client keeps today's shape, a
             // VIDEO_CAP_MULTI_SLICE / Moonlight slices-per-frame client gets real slices.
@@ -1400,6 +1552,15 @@ impl NvencD3d11Encoder {
             }
             self.inited = true;
             tracing::info!(
+                // Parity with the Linux session-ready line. `split_mode` is the FINAL mode (post
+                // any rejection fallback) and `engines` the ceiling it was chosen from — the mode
+                // alone is ambiguous between "used every engine" and "left one idle", and the
+                // driver honours an over-wide request without complaint, so neither number means
+                // much without the other. `subframe` because AUTO + sub-frame is a measurably
+                // single-engine combination that reads like a split in a log.
+                split_mode = self.split_mode,
+                engines = self.encoder_engines,
+                subframe = self.subframe_on,
                 "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",
                 self.width,
                 self.height,
@@ -1409,6 +1570,8 @@ impl NvencD3d11Encoder {
                 self.bitrate_bps / 1_000_000,
                 self.codec_guid
             );
+            self.subframe_opened_with = self.subframe_on;
+            self.arm_split_arbiter();
             Ok(())
         }
     }
@@ -1752,6 +1915,9 @@ impl Encoder for NvencD3d11Encoder {
                 anchor,
                 idr_hint,
             ));
+            // Split-arbiter cost stamp; only meaningful on the sync depth-1 path, which is the
+            // only path `arm_split_arbiter` allows an experiment on.
+            self.last_submit_at = Some(std::time::Instant::now());
             // Async: hand the in-flight encode to the retrieve thread (channel capacity = POOL ≥
             // in-flight, so this send never blocks). The pending entry above pairs with its
             // completion FIFO in `absorb_done`.
@@ -1934,6 +2100,13 @@ impl Encoder for NvencD3d11Encoder {
                 .map_err(|e| nvenc_status::call_err("unlock_bitstream", e))?;
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, map);
+            }
+            let encode_us = self
+                .last_submit_at
+                .take()
+                .map(|t| t.elapsed().as_micros() as u64);
+            if let Some(us) = encode_us {
+                self.feed_split_arbiter(us);
             }
             Ok(Some(EncodedFrame {
                 data,
@@ -2192,6 +2365,10 @@ impl Encoder for NvencD3d11Encoder {
                 }
             }
         }
+    }
+
+    fn set_send_spread_us(&mut self, us: u32) {
+        self.send_spread_us = us;
     }
 
     fn applied_bitrate_bps(&self) -> Option<u64> {
@@ -2678,6 +2855,162 @@ mod tests {
 
             println!("nvenc (Windows) reconfigure smoke: 20→60→10 Mbps in place, zero IDRs");
         }
+    }
+
+    /// ON-HARDWARE — **S1 on WINDOWS/D3D11**, the question that gates Windows split arbitration.
+    ///
+    /// Everything the split-encode programme rests on was proven on **Linux/CUDA**: that
+    /// `nvEncReconfigureEncoder` accepts a changed `splitEncodeMode` with `resetEncoder=0`, emits
+    /// **no IDR**, and actually takes effect. The Windows backend drives a different device type
+    /// (`NV_ENC_DEVICE_TYPE_DIRECTX`), so none of that transfers by assumption — and if the driver
+    /// refuses it here, Windows arbitration is simply not buildable and should not be attempted.
+    ///
+    /// Also checks the two things WP1.1 added, on real Windows hardware rather than by inference
+    /// from Linux: that `query_caps` latches `NUM_ENCODER_ENGINES`, and that the driver **honours
+    /// an over-ask** (asking for a 3-way split on a 2-engine card) — the behaviour that makes the
+    /// clamp necessary rather than defensive.
+    ///
+    /// Reports rather than asserts the verdict: both outcomes are legitimate findings. Run:
+    ///   cargo test -p pf-encode --features nvenc -- --ignored --test-threads=1 \
+    ///     nvenc_split_reconfigure_in_place --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX Windows box"]
+    fn nvenc_split_reconfigure_in_place() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        const BPS: u64 = 40_000_000;
+        let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+        let two = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
+
+        // Isolate the split variable exactly as the Linux spike does.
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+
+        // SAFETY: (test-only) the same straight-line D3D11/DXGI setup as `nvenc_reconfigure_no_idr`.
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut adapter = None;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                if a.GetDesc1().expect("adapter desc").Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32
+                    == 0
+                {
+                    adapter = Some(a);
+                    break;
+                }
+            }
+            let adapter = adapter.expect("no hardware DXGI adapter");
+            let (device, _ctx) = pf_frame::dxgi::make_device(&adapter).expect("make_device");
+            let bytes = probe_pattern(W as usize, H as usize);
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr() as *const _,
+                SysMemPitch: W * 4,
+                SysMemSlicePitch: 0,
+            };
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+                .expect("pattern texture");
+            let tex = tex.expect("null pattern texture");
+
+            let mut enc = NvencD3d11Encoder::open(
+                Codec::H265,
+                PixelFormat::Bgra,
+                W,
+                H,
+                60,
+                BPS,
+                8,
+                ChromaFormat::Yuv420,
+                1,
+            )
+            .expect("NVENC open");
+
+            let submit_and_poll = |enc: &mut NvencD3d11Encoder, range: std::ops::Range<u64>| {
+                let (mut aus, mut keyframes) = (0usize, 0usize);
+                for i in range {
+                    let frame = CapturedFrame {
+                        width: W,
+                        height: H,
+                        pts_ns: i * 16_666_667,
+                        format: PixelFormat::Bgra,
+                        payload: FramePayload::D3d11(D3d11Frame {
+                            texture: tex.clone(),
+                            device: device.clone(),
+                            pyro: None,
+                        }),
+                        cursor: None,
+                    };
+                    enc.submit_indexed(&frame, i as u32).expect("submit");
+                    while let Some(au) = enc.poll().expect("poll") {
+                        aus += 1;
+                        keyframes += au.keyframe as usize;
+                    }
+                }
+                (aus, keyframes)
+            };
+
+            let (aus, kfs) = submit_and_poll(&mut enc, 0..6);
+            assert!(aus > 0 && kfs == 1, "opening IDR then steady P-frames");
+            println!(
+                "S1(win): engines={} (latched by query_caps), opened split_mode={}",
+                enc.encoder_engines, enc.split_mode
+            );
+            assert!(
+                enc.encoder_engines >= 2,
+                "this GPU reports {} NVENC engine(s) — S1 is not interpretable here",
+                enc.encoder_engines
+            );
+            assert_eq!(enc.split_mode, disable, "must open split-disabled");
+
+            // THE SPIKE: change ONLY splitEncodeMode, in place, same bitrate.
+            enc.split_mode = two;
+            let accepted = enc.reconfigure_bitrate(BPS);
+            println!("S1(win): reconfigure DISABLE→TWO_FORCED accepted = {accepted}");
+            if accepted {
+                let (aus, kfs) = submit_and_poll(&mut enc, 6..12);
+                assert!(aus > 0, "no AUs after the accepted reconfigure");
+                println!(
+                    "S1(win) VERDICT: {}",
+                    if kfs == 0 {
+                        "PASS — accepted with NO IDR on D3D11: Windows arbitration is buildable"
+                    } else {
+                        "FAIL — accepted but forced an IDR, which is the same as a rejection"
+                    }
+                );
+                enc.split_mode = disable;
+                let back = enc.reconfigure_bitrate(BPS);
+                println!("S1(win): reverse accepted = {back}");
+            } else {
+                enc.split_mode = disable;
+                println!(
+                    "S1(win) VERDICT: FAIL — the D3D11 path REFUSES an in-place split change. \
+                     Windows arbitration is not buildable; the Linux result does not transfer."
+                );
+            }
+            enc.flush().ok();
+        }
+
+        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// ON-GLASS (RTX box): the measurement gating the AYUV 4:4:4 work — encodes the probe

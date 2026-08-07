@@ -11,7 +11,13 @@
 // the thumb it's the last option); A always cycles forward, wrapping, so every option is reachable
 // with one button. Toggles read left = off, right = on — refusing a no-op with the same thud.
 //
-// The trailing Profiles section (design/client-settings-profiles.md §5.2a/§5.4) is the pin manager
+// The rows are split across SECTION TABS (`GpSettingsTab`) — L1/R1 on a pad, a tap elsewhere. They
+// used to be one long scroll with inline group headers, which meant thumbing past Video and Audio
+// to reach the controller settings; a tab is one shoulder press, and each tab remembers where its
+// focus was. The tab names match the desktop console's and the Android client's, so a setting is
+// found under the same word wherever you look for it.
+//
+// The trailing Profiles tab (design/client-settings-profiles.md §5.2a/§5.4) is the pin manager
 // for this controller-first surface: a row per catalog profile opens the pin-to-hosts picker — an
 // in-place swap of the row list (B peels back, the "one layer" rule GamepadAddHostView set) with
 // one toggle row per saved host, writing `StoredHost.pinnedProfileIDs` via HostStore.setPinned.
@@ -27,12 +33,32 @@ import GameController
 import CoreHaptics
 #endif
 
+/// The settings screen's sections. Order IS the strip order and the L1/R1 cycle order; the names
+/// match `pf-console-ui`'s `TABS` and the Android client's `GpTab`.
+enum GpSettingsTab: String, CaseIterable, Hashable {
+    case stream = "Stream"
+    case video = "Video"
+    case audio = "Audio"
+    case controller = "Controller"
+    case interface = "Interface"
+    case profiles = "Profiles"
+}
+
 struct GamepadSettingsView: View {
+    @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
     /// count pins from its live hosts. Threaded in from GamepadHomeView like the home screen
     /// itself (ContentView owns the instance).
     @ObservedObject var store: HostStore
+    /// How the in-place shell (iOS) closes this screen; nil (the macOS sheet, the tvOS cover)
+    /// falls back to the environment dismiss. See `performClose`.
+    var close: (() -> Void)?
+    /// Whether this screen owns the controller. The shell holds it false during a push/pop (the
+    /// console's input drop) and while the connect takeover is up; a system presentation never
+    /// needs the gate and keeps the default.
+    var controllerActive = true
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
@@ -55,6 +81,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    /// The gamepad UI's background colour family — the backdrop BEHIND this screen re-colours as
+    /// the row steps, which is why the picker lives here and not in a sheet.
+    @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
     @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
     @AppStorage(DefaultsKey.presentPriority) private var presentPriority =
         SettingsOptions.presentPriorityDefault
@@ -64,6 +93,7 @@ struct GamepadSettingsView: View {
     #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
+    @AppStorage(DefaultsKey.gyroFromDevice) private var gyroFromDevice = false
     #endif
     @ObservedObject private var gamepads = GamepadManager.shared
     /// The profile catalog (ProfileStore.shared, like every other surface that reads it) — the
@@ -74,12 +104,23 @@ struct GamepadSettingsView: View {
     #if os(iOS)
     /// `.compact` in a landscape phone window — tighter chrome so more rows fit.
     @Environment(\.verticalSizeClass) private var vSizeClass
+    /// `.regular` only on an iPad-class window — see `showsSectionHint`.
+    @Environment(\.horizontalSizeClass) private var hSizeClass
 
     private var compact: Bool { vSizeClass == .compact }
     #else
     private let compact = false // no size classes on macOS; the sheet is sized generously
     #endif
     @State private var focusID: String?
+    /// The section showing. The pin picker ignores it — that layer replaces the whole list.
+    @State private var tab: GpSettingsTab = .stream
+    /// Where each tab's focus was when it was last left, so a detour doesn't lose your place.
+    @State private var tabFocus: [GpSettingsTab: String] = [:]
+    @Namespace private var tabHighlight
+    #if os(tvOS)
+    /// Real focus on the strip — the tvOS route to the sections (see `tabStrip`).
+    @FocusState private var focusedTab: GpSettingsTab?
+    #endif
     /// The pin-to-hosts picker's profile — non-nil swaps the row list for one toggle row per
     /// saved host (§5.2a); B (Menu on tvOS) peels back to the settings rows.
     @State private var pinTarget: StreamProfile?
@@ -93,7 +134,9 @@ struct GamepadSettingsView: View {
             focusID: $focusID,
             onAdjust: { row, delta in adjust(id: row.id, by: delta) },
             onActivate: { activate(id: $0.id) },
-            onBack: { back() }
+            onBack: { back() },
+            onShoulder: { step(tabBy: $0) },
+            isActive: controllerActive
         ) { row, focused in
             rowView(row, focused: focused)
                 .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
@@ -101,20 +144,27 @@ struct GamepadSettingsView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            Text(title)
-                .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-                .foregroundStyle(.white)
-                .padding(.top, gamepadTitleTopPadding(compact: compact))
-                .padding(.bottom, compact ? 4 : 8)
-                .frame(maxWidth: .infinity)
-                .overlay(alignment: .trailing) { closeButton.padding(.trailing, 20) }
-                .background { GamepadTrayScrim(edge: .top) }
+            VStack(alignment: .leading, spacing: gamepadHeaderSpacing(compact: compact)) {
+                // Leading, like a console section heading — centred read as a floating label,
+                // and a gamepad UI needs no close chrome next to it (B is the exit).
+                Text(title)
+                    .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
+                    .foregroundStyle(ink.fg)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
+                // The picker is one layer deeper — its rows aren't sections of anything, so the
+                // strip would be a control that does nothing while it's up.
+                if pinTarget == nil { tabStrip }
+            }
+            .padding(.top, gamepadTitleTopPadding(compact: compact))
+            .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+            .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(focusedDetail)
                     .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
-                    .foregroundStyle(.white.opacity(0.55))
+                    .foregroundStyle(ink.fg(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
                 GamepadHintBar(hints: hints)
@@ -127,32 +177,137 @@ struct GamepadSettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background { GamepadTrayScrim(edge: .bottom) }
         }
-        // No aurora here — the settings read as clean Liquid Glass over a quiet dark base, so the
-        // glass rows are the only material on the screen.
-        .background { GamepadFormBackground() }
+        // The launcher's living field, calmed (GamepadFormBackground) — the glass rows keep real
+        // colour and luminance to lens without the launcher's contrast, and the palette setting
+        // applies here too, so this screen previews the row you're stepping. Hosted in the
+        // shell, the field is the SHELL's (one persistent backdrop, calm-chased) — mounting a
+        // second would double the mesh and snap where the shell crossfades.
+        .background {
+            if !hostedInShell { GamepadFormBackground() }
+        }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
         .onAppear {
             gamepads.refresh()
             gamepads.startDiscovery()
         }
         .onDisappear { gamepads.stopDiscovery() }
+        #if !os(tvOS)
+        // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
+        // keyboard's Esc and the macOS sheet's cancel working without chrome.
+        .background {
+            Button("Close") { performClose() }
+                .keyboardShortcut(.cancelAction)
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        #endif
     }
 
-    /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
-    /// rides the cancel action.
-    private var closeButton: some View {
-        Button { dismiss() } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .glassBackground(Circle(), interactive: true)
-                .contentShape(Circle())
+    /// The section switcher. Horizontally scrollable so a narrow phone in landscape never has to
+    /// squeeze six pills — the selected one is always scrolled into view, whether it was reached
+    /// by shoulder button, tap, or (tvOS) the focus engine.
+    private var tabStrip: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(GpSettingsTab.allCases, id: \.self) { t in
+                        #if os(tvOS)
+                        // Focusable, because L1/R1 is NOT a route here: a Siri Remote has no
+                        // extended gamepad profile, so it never reaches GamepadMenuList's poll.
+                        // As focusable Buttons the pills are simply above the rows, and moving
+                        // focus up onto one switches section — the standard tvOS tab bar.
+                        Button { select(tab: t) } label: { pill(t) }
+                            .buttonStyle(ConsoleBareButtonStyle())
+                            .focused($focusedTab, equals: t)
+                            .id(t)
+                        #else
+                        pill(t)
+                            .contentShape(Capsule())
+                            .onTapGesture { select(tab: t) }
+                            .id(t)
+                        #endif
+                    }
+                }
+                .padding(.horizontal, 24)
+            }
+            .scrollIndicators(.never)
+            .animation(.smooth(duration: 0.22), value: tab)
+            .onChange(of: tab) { _, t in
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(t) }
+            }
+            #if os(tvOS)
+            .onChange(of: focusedTab) { _, t in
+                // Focus IS selection on a tab bar; nil means focus dropped back into the rows.
+                if let t { select(tab: t) }
+            }
+            #endif
         }
-        .buttonStyle(.plain)
-        #if !os(tvOS)
-        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
+    }
+
+    private func pill(_ t: GpSettingsTab) -> some View {
+        let selected = t == tab
+        return Text(t.rawValue)
+            .font(.geist(compact ? 12 : 13, .semibold, relativeTo: .footnote))
+            .foregroundStyle(selected ? ink.fg : ink.fg(0.55))
+            .padding(.horizontal, 13)
+            .padding(.vertical, 7)
+            .background {
+                // One shared capsule that MOVES between pills, rather than one per pill fading
+                // in and out — the highlight travels the way the press did. A Liquid Glass
+                // surface (accent-tinted through consoleGlass), so the strip wears the same
+                // material language as the rows it sits above.
+                if selected {
+                    Color.clear
+                        .consoleGlass(Capsule(), tint: ink.accent(0.85))
+                        .matchedGeometryEffect(id: "tab", in: tabHighlight)
+                }
+            }
+    }
+
+    /// Whether the legend advertises the shoulder shortcut. Held back on an iPhone, whose legend
+    /// is already at its width and would push "Done" off the edge — the strip is visible and
+    /// tappable there anyway. Never on tvOS: a Siri Remote has no shoulders, and its route to the
+    /// sections is the focus engine (see `tabStrip`).
+    private var showsSectionHint: Bool {
+        #if os(tvOS)
+        false
+        #elseif os(iOS)
+        hSizeClass == .regular
+        #else
+        true
         #endif
-        .accessibilityLabel("Close settings")
+    }
+
+    /// L1/R1 — one section along, wrapping (the strip is a ring, like A's value cycle).
+    private func step(tabBy delta: Int) {
+        guard pinTarget == nil else { return }
+        let all = GpSettingsTab.allCases
+        guard let i = all.firstIndex(of: tab) else { return }
+        let n = all.count
+        select(tab: all[((i + delta) % n + n) % n])
+    }
+
+    private func select(tab next: GpSettingsTab) {
+        guard next != tab else { return }
+        tabFocus[tab] = focusID
+        // Restore where this tab was, if that row is still in it (a row can come and go with the
+        // hardware it depends on); otherwise the focus list seeds its first row. Resolved against
+        // `allRows` rather than `rows` so it doesn't depend on `tab`'s write being visible yet.
+        let landing = tabFocus[next].flatMap { id in
+            allRows.contains { $0.tab == next && $0.id == id } ? id : nil
+        }
+        tab = next
+        focusID = landing
+    }
+
+    /// Close this screen through whichever mechanism presents it: the shell's layer pop on iOS,
+    /// the environment dismiss under a macOS sheet / tvOS cover.
+    private func performClose() {
+        if let close { close() } else { dismiss() }
     }
 
     /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
@@ -166,12 +321,19 @@ struct GamepadSettingsView: View {
     /// layer" rule), and a hostless picker has nothing to pin, so only Back remains.
     private var hints: [GamepadHint] {
         guard pinTarget != nil else {
+            // The shoulders change section, so that cell leads — where it fits and where the
+            // shoulders exist at all (see `showsSectionHint`).
+            let sections: [GamepadHint] = showsSectionHint
+                ? [.init(glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
+                         text: "Section")]
+                : []
             // A dimmed row takes neither, so offering them would be the same lie the row itself
             // used to tell — only Done remains, and the detail line says what to turn on first.
             guard rows.first(where: { $0.id == focusID })?.enabled ?? true else {
-                return [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done")]
+                return sections
+                    + [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done")]
             }
-            return [
+            return sections + [
                 .init(glyph: "arrow.left.and.right", text: "Adjust"),
                 .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
                 .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
@@ -193,7 +355,7 @@ struct GamepadSettingsView: View {
             pinTarget = nil
             focusID = "profile-\(profile.id)"
         } else {
-            dismiss()
+            performClose()
         }
     }
 
@@ -201,52 +363,53 @@ struct GamepadSettingsView: View {
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
         let m = GamepadFormMetrics.self
+        // No section header: the tab strip names the section now, and repeating it above the
+        // first row of every tab was just a second label saying the same word.
         return VStack(alignment: .leading, spacing: 6) {
-            if let header = row.header {
-                Text(header)
-                    .font(.geist(m.headerFont, .semibold, relativeTo: .caption))
-                    .tracking(1.4)
-                    .foregroundStyle(.white.opacity(0.45))
-                    .padding(.leading, m.rowHPad)
-                    .padding(.top, 14)
-            }
             HStack(spacing: 14) {
                 Image(systemName: row.icon)
                     .font(.system(size: m.iconFont))
-                    .foregroundStyle(focused ? Color.brand : .white.opacity(0.55))
+                    .foregroundStyle(focused ? ink.accent : ink.fg(0.55))
                     .frame(width: m.iconWidth)
                 Text(row.label)
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                     .lineLimit(1)
                 Spacer(minLength: 12)
                 HStack(spacing: 9) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
-                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
-                    // Keyed by the value so a change slides the new option in instead of
-                    // hard-swapping the string — a QUIET horizontal slip following the user's
-                    // motion (a right-step enters from the right), crossfading over ~14 pt.
-                    // Deliberately not `.push`: that travels the whole container width, loud
-                    // and visibly outside the row. The ZStack is the stable home the
-                    // removed/inserted texts transition within.
-                    let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
-                    ZStack {
-                        Text(row.value)
+                            ink.fg(focused && row.adjustable && row.enabled ? 0.6 : 0))
+                    if let labels = row.optionLabels, let idx = row.selectedIndex {
+                        // A choice row's value is a REAL band — the options ride a rotating
+                        // drum, so fast repeated steps spin it instead of restarting a fade.
+                        GamepadOptionBand(
+                            options: labels, selection: idx, focused: focused, width: bandWidth)
                             .font(.geist(m.valueFont, .medium, relativeTo: .callout))
-                            .foregroundStyle(focused ? .white : .white.opacity(0.6))
-                            .lineLimit(1)
-                            .id(row.value)
-                            .transition(.asymmetric(
-                                insertion: .offset(x: slide).combined(with: .opacity),
-                                removal: .offset(x: -slide).combined(with: .opacity)))
+                            .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
+                    } else {
+                        // The flat rows (profile pin counts, placeholders) keep the quiet slip:
+                        // keyed by the value so a change slides the new string in following the
+                        // user's motion, crossfading over ~14 pt. The ZStack is the stable home
+                        // the removed/inserted texts transition within.
+                        let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
+                        ZStack {
+                            Text(row.value)
+                                .font(.geist(m.valueFont, .medium, relativeTo: .callout))
+                                .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
+                                .lineLimit(1)
+                                .id(row.value)
+                                .transition(.asymmetric(
+                                    insertion: .offset(x: slide).combined(with: .opacity),
+                                    removal: .offset(x: -slide).combined(with: .opacity)))
+                        }
+                        .animation(.smooth(duration: 0.22), value: row.value)
                     }
-                    .animation(.smooth(duration: 0.22), value: row.value)
                     Image(systemName: "chevron.right")
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
-                            .white.opacity(focused && row.adjustable && row.enabled ? 0.6 : 0))
+                            ink.fg(focused && row.adjustable && row.enabled ? 0.6 : 0))
                 }
             }
             // Contents only — the glass and border below stay at full strength, so a dimmed row
@@ -257,11 +420,11 @@ struct GamepadSettingsView: View {
             // Every row is Liquid Glass; the focused one takes a brand wash and reacts to press.
             .consoleGlass(
                 RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
-                tint: focused ? Color.brand.opacity(0.30) : nil,
+                tint: focused ? ink.accent(0.30) : nil,
                 interactive: focused)
             .overlay {
                 RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
-                    .strokeBorder(.white.opacity(focused ? 0.28 : 0.06), lineWidth: 1)
+                    .strokeBorder(ink.fg(focused ? 0.28 : 0.06), lineWidth: 1)
             }
             .scaleEffect(focused ? 1.0 : 0.98)
             .animation(.smooth(duration: 0.18), value: focused)
@@ -272,17 +435,34 @@ struct GamepadSettingsView: View {
         rows.first { $0.id == focusID }?.detail ?? " "
     }
 
+    /// The option band's fixed stage. A portrait phone is the one place the full 240 pt starves
+    /// the row's label (everywhere else the 620 pt row cap leaves room to spare), so it alone
+    /// narrows the stage.
+    private var bandWidth: CGFloat {
+        #if os(iOS)
+        hSizeClass == .compact && vSizeClass == .regular ? 170 : GamepadFormMetrics.bandWidth
+        #else
+        GamepadFormMetrics.bandWidth
+        #endif
+    }
+
     // MARK: - Row model
 
     private struct Row: Identifiable {
         let id: String
-        /// Section header drawn above this row (the first row of each group carries it).
-        var header: String?
+        /// Which section tab this row belongs to. Every row has exactly one, and `rows` shows
+        /// only the current tab's — see `allRows`.
+        var tab: GpSettingsTab = .stream
         let icon: String
         let label: String
         let value: String
         /// One-line explanation shown near the hint bar while this row is focused.
         let detail: String
+        /// A choice row's full option list (labels only — the tags stay inside the closures)
+        /// and where its drum currently rests. nil ⇒ the value renders as plain text (toggles,
+        /// actions, profiles — a two-position switch is not a drum; see GamepadOptionBand).
+        var optionLabels: [String]?
+        var selectedIndex: Int?
         /// Whether left/right means anything here — false hides the value's chevrons (the
         /// Profiles rows navigate, and the placeholder rows do nothing at all).
         var adjustable = true
@@ -313,10 +493,17 @@ struct GamepadSettingsView: View {
         row.activate()
     }
 
+    /// What the focus list actually shows: the current tab's rows — or the pin picker's, which
+    /// replaces the whole list while it's up (same screen, one layer deeper, so the focus list's
+    /// controller wiring and the tvOS focus engine carry over as is).
     private var rows: [Row] {
-        // The pin picker replaces the whole list while it's up — same screen, one layer deeper,
-        // so the focus list's controller wiring (and the tvOS focus engine) carries over as is.
         if let profile = pinTarget { return pinRows(for: profile) }
+        return allRows.filter { $0.tab == tab }
+    }
+
+    /// Every row on the screen, tagged with its section. Built as one list (not per tab) so the
+    /// platform-conditional insertions below can still place a row RELATIVE to another by id.
+    private var allRows: [Row] {
         let resolution = resolutionOptions
         let refresh = SettingsOptions.refreshRates(including: hz)
             .map { (label: "\($0) Hz", tag: $0) }
@@ -324,7 +511,7 @@ struct GamepadSettingsView: View {
         let controllers = SettingsOptions.controllerOptions(gamepads)
         var list: [Row] = [
             choiceRow(
-                id: "resolution", header: "Stream", icon: "aspectratio",
+                id: "resolution", tab: .stream, icon: "aspectratio",
                 label: "Resolution",
                 detail: "The host creates a virtual display at exactly this size — no scaling.",
                 options: resolution, current: "\(width)x\(height)"
@@ -335,53 +522,48 @@ struct GamepadSettingsView: View {
                 height = parts[1]
             },
             choiceRow(
-                id: "refresh", icon: "gauge.with.needle", label: "Refresh rate",
+                id: "refresh", tab: .stream, icon: "gauge.with.needle", label: "Refresh rate",
                 detail: "Rates this display can actually show.",
                 options: refresh, current: hz
             ) { hz = $0 },
             choiceRow(
-                id: "bitrate", icon: "speedometer", label: "Bitrate",
+                id: "bitrate", tab: .stream, icon: "speedometer", label: "Bitrate",
                 detail: "Automatic uses the host's default (20 Mbps). "
                     + "Run a speed test from the touch UI for an informed value.",
                 options: bitrate, current: bitrateKbps
             ) { bitrateKbps = $0 },
             choiceRow(
-                id: "compositor", icon: "macwindow", label: "Compositor",
+                id: "compositor", tab: .stream, icon: "macwindow", label: "Compositor",
                 detail: "Which compositor drives the virtual output — honored only if "
                     + "available on the host.",
                 options: SettingsOptions.compositors, current: compositor
             ) { compositor = $0 },
-            toggleRow(
-                id: "autoWake", icon: "power", label: "Auto-wake on connect",
-                detail: "Send Wake-on-LAN to a sleeping saved host and wait for it before "
-                    + "streaming. Off connects straight through.",
-                value: $autoWakeEnabled),
-
             choiceRow(
-                id: "codec", header: "Video", icon: "film", label: "Video codec",
+                id: "codec", tab: .video, icon: "film", label: "Video codec",
                 detail: "A preference — the host falls back if it can't encode this one "
                     + "(10-bit and 4:4:4 are HEVC-only).",
                 options: SettingsOptions.codecs, current: codec
             ) { codec = $0 },
             toggleRow(
-                id: "hdr", icon: "sun.max", label: "10-bit HDR",
+                id: "hdr", tab: .video, icon: "sun.max", label: "10-bit HDR",
                 detail: "HDR10 — engages when the host sends HDR content and this display "
                     + "supports it.",
                 value: $hdrEnabled),
             toggleRow(
-                id: "chroma", icon: "textformat", label: "Full chroma (4:4:4)",
+                id: "chroma", tab: .video, icon: "textformat", label: "Full chroma (4:4:4)",
                 detail: "Sharper text and UI at more bandwidth — needs host opt-in and "
                     + "hardware decode.",
                 value: $enable444),
             choiceRow(
-                id: "presentPriority", icon: "rectangle.stack", label: "Prioritize",
+                id: "presentPriority", tab: .video, icon: "rectangle.stack", label: "Prioritize",
                 detail: "Lowest latency shows each frame the moment the display can take it; "
                     + "Smoothness buffers a few frames to even out network hiccups. Applies "
                     + "from the next session.",
                 options: SettingsOptions.presentPriorities, current: presentPriority
             ) { presentPriority = $0 },
             choiceRow(
-                id: "smoothBuffer", icon: "square.stack.3d.up", label: "Smoothness buffer",
+                id: "smoothBuffer", tab: .video, icon: "square.stack.3d.up",
+                label: "Smoothness buffer",
                 detail: "How many frames Smoothness holds — each adds about a refresh of "
                     + "display latency and absorbs about a refresh of jitter. Only applies "
                     + "when prioritizing smoothness.",
@@ -389,22 +571,22 @@ struct GamepadSettingsView: View {
             ) { smoothBuffer = $0 },
 
             choiceRow(
-                id: "audio", header: "Audio", icon: "speaker.wave.2", label: "Audio channels",
+                id: "audio", tab: .audio, icon: "speaker.wave.2", label: "Audio channels",
                 detail: "The speaker layout requested from the host.",
                 options: SettingsOptions.audioChannels, current: audioChannels
             ) { audioChannels = $0 },
             toggleRow(
-                id: "mic", icon: "mic", label: "Microphone",
+                id: "mic", tab: .audio, icon: "mic", label: "Microphone",
                 detail: "Send this device's microphone to the host's virtual mic.",
                 value: $micEnabled),
             toggleRow(
-                id: "echoCancel", icon: "waveform", label: "Echo cancellation",
+                id: "echoCancel", tab: .audio, icon: "waveform", label: "Echo cancellation",
                 detail: "Cancel the audio this device plays out of the mic signal — stops "
                     + "speaker setups feeding the game back to the host.",
                 value: $echoCancel),
 
             toggleRow(
-                id: "padForward", header: "Controller", icon: "gamecontroller",
+                id: "padForward", tab: .controller, icon: "gamecontroller",
                 label: "Forward controllers",
                 detail: "Send this device's controllers to the host. Turn it off when your "
                     + "controller already reaches the host another way — USB passthrough such "
@@ -415,26 +597,28 @@ struct GamepadSettingsView: View {
             // `.disabled(!effective.gamepadForwarding)`. This screen could not express it until
             // `Row.enabled` existed, so it alone left them live and steppable.
             choiceRow(
-                id: "pad", icon: "gamecontroller", label: "Use controller",
+                id: "pad", tab: .controller, icon: "gamecontroller", label: "Use controller",
                 detail: "Which pad is forwarded to the host, as player 1.",
                 options: controllers, current: gamepads.preferredID,
                 enabled: gamepadForwarding
             ) { gamepads.preferredID = $0 },
             choiceRow(
-                id: "padType", icon: "dpad", label: "Controller type",
+                id: "padType", tab: .controller, icon: "dpad", label: "Controller type",
                 detail: "The virtual pad the host creates — Automatic matches this controller.",
                 options: SettingsOptions.padTypes, current: gamepadType,
                 enabled: gamepadForwarding
             ) { gamepadType = $0 },
             choiceRow(
-                id: "systemButtons", icon: "house.circle", label: "Guide button",
+                id: "systemButtons", tab: .controller, icon: "house.circle",
+                label: "Guide button",
                 detail: "Where the guide (Xbox/PS) and share presses go while streaming — "
                     + "Automatic sends them to the host whenever this device delivers them.",
                 options: SettingsOptions.systemButtons, current: systemButtons,
                 enabled: gamepadForwarding
             ) { systemButtons = $0 },
             choiceRow(
-                id: "guideGesture", icon: "hand.point.up.left", label: "Hold Select for guide",
+                id: "guideGesture", tab: .controller, icon: "hand.point.up.left",
+                label: "Hold Select for guide",
                 detail: "Hold Select alone to press the host's guide button — keep holding "
                     + "for a Gaming-Mode host's quick-access menu. A tap still goes through.",
                 options: SettingsOptions.guideGestures, current: guideGesture,
@@ -442,33 +626,47 @@ struct GamepadSettingsView: View {
             ) { guideGesture = $0 },
 
             choiceRow(
-                id: "hud", header: "Interface", icon: "chart.bar", label: "Statistics overlay",
+                id: "palette", tab: .interface, icon: "paintpalette", label: "Background",
+                detail: "The colour family this backdrop drifts through — it changes as you "
+                    + "step, so pick by looking. Appearance only.",
+                options: GamepadPalette.all.map { (label: $0.name, tag: $0.id) },
+                current: GamepadPalette.named(paletteID).id
+            ) { paletteID = $0 },
+            toggleRow(
+                id: "autoWake", tab: .interface, icon: "power", label: "Auto-wake on connect",
+                detail: "Send Wake-on-LAN to a sleeping saved host and wait for it before "
+                    + "streaming. Off connects straight through.",
+                value: $autoWakeEnabled),
+            choiceRow(
+                id: "hud", tab: .interface, icon: "chart.bar", label: "Statistics overlay",
                 detail: "How much to show while streaming — Compact is a one-line pill, "
                     + "Detailed adds the latency stage breakdown.",
                 options: SettingsOptions.statsVerbosities, current: statsVerbosityRaw
             ) { statsVerbosityRaw = $0 },
             choiceRow(
-                id: "hudPlacement", icon: "rectangle.inset.topright.filled", label: "Overlay position",
+                id: "hudPlacement", tab: .interface, icon: "rectangle.inset.topright.filled",
+                label: "Overlay position",
                 detail: "Which corner the statistics overlay sits in.",
                 options: SettingsOptions.hudPlacements, current: hudPlacement
             ) { hudPlacement = $0 },
             toggleRow(
-                id: "library", icon: "square.grid.2x2", label: "Game library",
+                id: "library", tab: .interface, icon: "square.grid.2x2", label: "Game library",
                 detail: "Browse and launch the host's games with \(buttonName(\.buttonY, "Y")).",
                 value: $libraryEnabled),
             toggleRow(
-                id: "gamepadUI", icon: "hand.tap", label: "Controller-optimized UI",
+                id: "gamepadUI", tab: .interface, icon: "hand.tap",
+                label: "Controller-optimized UI",
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
         ]
         #if os(macOS)
         // The windowed safe-present toggle slots in after "Smoothness buffer" (staying inside
-        // the Video group) — macOS only, mirroring the touch SettingsView's Presentation row
+        // the Video tab) — macOS only, mirroring the touch SettingsView's Presentation row
         // (the DCP swapID-panic mitigation; see DefaultsKey.windowedSafePresent).
         if let at = list.firstIndex(where: { $0.id == "smoothBuffer" }) {
             list.insert(
                 toggleRow(
-                    id: "windowedSafePresent", icon: "macwindow.badge.plus",
+                    id: "windowedSafePresent", tab: .video, icon: "macwindow.badge.plus",
                     label: "Safe windowed presentation",
                     detail: "Windowed streams present in step with the compositor — avoids a "
                         + "macOS display-driver crash on high-refresh displays, at a small "
@@ -478,19 +676,35 @@ struct GamepadSettingsView: View {
         }
         #endif
         #if os(iOS)
-        // The device-rumble mirror slots in after "Controller type" (staying inside the
-        // Controller group — the next row carries the "Interface" header). iPhone only in
-        // practice: hidden where the device itself can't play haptics (iPad).
+        // The device-rumble mirror slots in after "Controller type", inside the Controller tab.
+        // iPhone only in practice: hidden where the device itself can't play haptics (iPad).
         if CHHapticEngine.capabilitiesForHardware().supportsHaptics,
             let at = list.firstIndex(where: { $0.id == "padType" }) {
             list.insert(
                 toggleRow(
-                    id: "deviceRumble", icon: "iphone.radiowaves.left.and.right",
+                    id: "deviceRumble", tab: .controller,
+                    icon: "iphone.radiowaves.left.and.right",
                     label: "Rumble on this iPhone",
                     detail: "Also play player 1's rumble on the phone's own Taptic Engine — "
                         + "for clip-on pads without rumble motors.",
                     value: $rumbleOnDevice),
                 at: at + 1)
+        }
+        // The phone-gyro mirror sits beside the rumble mirror: same clip-on-pad audience,
+        // opposite data direction. Hidden where the device has no motion hardware; engages
+        // in-session only while player 1's controller reports no rotation rate of its own.
+        if DeviceGyro.isAvailable,
+            let anchor = list.firstIndex(where: { $0.id == "deviceRumble" })
+                ?? list.firstIndex(where: { $0.id == "padType" }) {
+            list.insert(
+                toggleRow(
+                    id: "deviceGyro", tab: .controller,
+                    icon: "gyroscope",
+                    label: "Gyro from this device",
+                    detail: "When the controller has no gyro, send this device's motion "
+                        + "sensors as player 1's — for clip-on pads without one of their own.",
+                    value: $gyroFromDevice),
+                at: anchor + 1)
         }
         #endif
         return list + profileRows
@@ -505,17 +719,17 @@ struct GamepadSettingsView: View {
     private var profileRows: [Row] {
         guard !profiles.profiles.isEmpty else {
             return [Row(
-                id: "noProfiles", header: "Profiles", icon: "slider.horizontal.3",
+                id: "noProfiles", tab: .profiles, icon: "slider.horizontal.3",
                 label: "No profiles yet", value: "",
                 detail: emptyCatalogDetail,
                 adjustable: false,
                 adjust: { _ in false }, activate: {})]
         }
-        return profiles.profiles.enumerated().map { i, profile in
+        return profiles.profiles.map { profile in
             let pins = store.hosts
                 .filter { ($0.pinnedProfileIDs ?? []).contains(profile.id) }.count
             return Row(
-                id: "profile-\(profile.id)", header: i == 0 ? "Profiles" : nil,
+                id: "profile-\(profile.id)", tab: .profiles,
                 icon: "slider.horizontal.3", label: profile.name,
                 value: pins == 0 ? "Not pinned" : "Pinned to \(pins) host\(pins == 1 ? "" : "s")",
                 detail: profileDetail,
@@ -537,7 +751,8 @@ struct GamepadSettingsView: View {
     private func pinRows(for profile: StreamProfile) -> [Row] {
         guard !store.hosts.isEmpty else {
             return [Row(
-                id: "noHosts", icon: "desktopcomputer", label: "No saved hosts yet",
+                id: "noHosts", tab: .profiles, icon: "desktopcomputer",
+                label: "No saved hosts yet",
                 value: "",
                 detail: "Pair with a host first, then pin this profile to it.",
                 adjustable: false,
@@ -547,11 +762,13 @@ struct GamepadSettingsView: View {
             let hostID = host.id
             let pinned = (host.pinnedProfileIDs ?? []).contains(profile.id)
             return Row(
-                id: "pinHost-\(hostID.uuidString)", icon: "desktopcomputer",
+                id: "pinHost-\(hostID.uuidString)", tab: .profiles, icon: "desktopcomputer",
                 label: host.displayName,
                 value: pinned ? "Pinned" : "Off",
                 detail: "A pinned profile appears as its own card on the host — one press "
                     + "connects with it.",
+                optionLabels: ["Off", "Pinned"],
+                selectedIndex: pinned ? 1 : 0,
                 adjust: { delta in
                     let target = delta > 0
                     guard pinned != target else { return false }
@@ -609,15 +826,19 @@ struct GamepadSettingsView: View {
     // MARK: - Row builders
 
     private func choiceRow<T: Equatable>(
-        id: String, header: String? = nil, icon: String, label: String, detail: String,
+        id: String, tab: GpSettingsTab, icon: String, label: String, detail: String,
         options: [(label: String, tag: T)], current: T, enabled: Bool = true,
         write: @escaping (T) -> Void
     ) -> Row {
         let index = options.firstIndex { $0.tag == current }
         return Row(
-            id: id, header: header, icon: icon, label: label,
+            id: id, tab: tab, icon: icon, label: label,
             value: index.map { options[$0].label } ?? "—",
             detail: detail,
+            // The band mounts only once the value is a known option — the "—" of an unknown
+            // current renders flat, and the first step's snap-to-first seats the drum.
+            optionLabels: index != nil ? options.map(\.label) : nil,
+            selectedIndex: index,
             enabled: enabled,
             adjust: { delta in
                 // Unknown current value: snap to the first option on any step.
@@ -638,13 +859,17 @@ struct GamepadSettingsView: View {
     }
 
     private func toggleRow(
-        id: String, header: String? = nil, icon: String, label: String, detail: String,
+        id: String, tab: GpSettingsTab, icon: String, label: String, detail: String,
         value: Binding<Bool>, enabled: Bool = true
     ) -> Row {
         Row(
-            id: id, header: header, icon: icon, label: label,
+            id: id, tab: tab, icon: icon, label: label,
             value: value.wrappedValue ? "On" : "Off",
             detail: detail,
+            // Toggles ride the band too (field ask): Off sits left of On, matching the
+            // directional semantics below, so a right-step slides On in from the right.
+            optionLabels: ["Off", "On"],
+            selectedIndex: value.wrappedValue ? 1 : 0,
             enabled: enabled,
             adjust: { delta in
                 // Directional semantics: left = off, right = on; a no-op reads as a boundary.

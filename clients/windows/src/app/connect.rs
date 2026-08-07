@@ -490,9 +490,13 @@ fn wake_and_connect(
 
     let (ctx, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
     std::thread::spawn(move || {
-        let rx = crate::discovery::browse();
+        let (rx, rescan) = crate::discovery::browse();
         let mut seen: Vec<DiscoveredHost> = Vec::new();
         let mut wait = WakeWait::new();
+        // A waking host starts advertising at a moment we can't predict, and `mdns-sd`'s own
+        // re-query interval has doubled well past a minute by the time a boot finishes — so ask
+        // again periodically instead of waiting to be told (matches the GTK client's wake wait).
+        let mut ticks: u32 = 0;
         loop {
             // Cancel already returned the UI to the host list — stop re-sending and tear down.
             if cancel.load(Ordering::SeqCst) {
@@ -554,6 +558,10 @@ fn wake_and_connect(
                     return;
                 }
                 None => {}
+            }
+            ticks += 1;
+            if ticks.is_multiple_of(5) {
+                rescan.request();
             }
             std::thread::sleep(Duration::from_secs(1));
         }

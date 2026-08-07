@@ -5,7 +5,12 @@
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
+const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredHost {
@@ -54,10 +59,32 @@ pub enum DiscoveryEvent {
     Removed { fullname: String },
 }
 
-/// Browse continuously. The worker exits when the returned receiver is dropped, or when the
-/// daemon dies — checked on a tick, so it stops even on a LAN where no advert ever arrives.
-pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
+/// Forces the running browse to re-query now. Cheap to clone and hand to a UI thread; a request
+/// made after the browse has ended is simply never read.
+///
+/// Why a client needs one at all: `mdns-sd` re-queries on a DOUBLING backoff (1s, 2s, 4s … capped
+/// at one hour), so a browse that has been up a while is effectively passive — it is listening for
+/// announcements rather than asking. A host that starts advertising later, or whose announcement
+/// was dropped (ordinary for multicast over Wi-Fi), can stay invisible for a very long time.
+/// Re-querying resets that clock, which is what a Refresh button should do.
+#[derive(Clone, Debug)]
+pub struct Rescan(Arc<AtomicBool>);
+
+impl Rescan {
+    /// Ask the browse thread to put a fresh query on the wire. Returns immediately; the query
+    /// follows within a tick. Coalesces — several requests in a row cost one query.
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Browse continuously, with a handle that forces an immediate re-query ([`Rescan`]). The worker
+/// exits when the returned receiver is dropped, or when the daemon dies — checked on a tick, so
+/// it stops even on a LAN where no advert ever arrives.
+pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
     let (tx, rx) = async_channel::unbounded();
+    let flag = Arc::new(AtomicBool::new(false));
+    let requested = flag.clone();
     std::thread::Builder::new()
         .name("punktfunk-mdns".into())
         .spawn(move || {
@@ -68,7 +95,7 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                     return;
                 }
             };
-            let receiver = match daemon.browse("_punktfunk._udp.local.") {
+            let mut receiver = match daemon.browse(SERVICE_TYPE) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(error = %e, "mDNS browse failed — discovery disabled");
@@ -87,6 +114,17 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                 // nobody to send to.
                 if tx.is_closed() {
                     break;
+                }
+                // Also at the TOP, and for the same reason: every `continue` below would skip it.
+                if requested.swap(false, Ordering::Relaxed) {
+                    // Browsing the same type again REPLACES the daemon's listener for it: it
+                    // replays the cache into the new channel (so nothing already known is lost),
+                    // puts a fresh PTR query on the wire immediately, and — the point — resets the
+                    // re-query backoff described on `Rescan`.
+                    match daemon.browse(SERVICE_TYPE) {
+                        Ok(r) => receiver = r,
+                        Err(e) => tracing::warn!(error = %e, "mDNS rescan failed"),
+                    }
                 }
                 let event = match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(event) => event,
@@ -147,7 +185,7 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
             let _ = daemon.shutdown();
         })
         .expect("spawn mdns thread");
-    rx
+    (rx, Rescan(flag))
 }
 
 /// The advert map one browse window folded down to. Kept separate from [`discover_for`] so the
@@ -174,7 +212,7 @@ fn fold(adverts: &mut Adverts, event: DiscoveryEvent) {
 /// wants one bounded call rather than a stream). The streaming [`browse`] stays the UI's door:
 /// a live hosts page wants adverts as they land, not a snapshot taken `timeout` after it opened.
 pub fn discover_for(timeout: Duration) -> Vec<DiscoveredHost> {
-    let rx = browse();
+    let (rx, _rescan) = browse();
     let deadline = Instant::now() + timeout;
     let mut adverts = Adverts::new();
     while Instant::now() < deadline {

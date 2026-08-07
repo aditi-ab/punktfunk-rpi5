@@ -21,7 +21,7 @@ agreements and installation notes stay under normal code review.
   `packaging/windows/punktfunk-host.iss`** — if that GUID ever changes, change it here too or
   upgrades silently stop being detected.
 - **`interactive` is in `InstallModes`.** `winget install unom.PunktfunkHost --interactive` runs the
-  full existing wizard: every task checkbox, the web-console password page, the VB-CABLE notice.
+  full existing wizard: every task checkbox and the web-console password page.
   Nothing about the installer changes to support it.
 - **No `/MERGETASKS` in the silent switches.** A silent install deliberately takes the *same* task
   defaults the wizard shows, so the product does not differ by install channel — a per-channel
@@ -41,7 +41,7 @@ Inno's `/MERGETASKS` takes `!` prefixes to deselect a default-checked task. Use 
 winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=!gamestream"
 ```
 
-Task names: `installdriver`, `installgamepad`, `installaudiocable`, `installhdrlayer`,
+Task names: `installdriver`, `installgamepad`, `installhdrlayer`,
 `gamestream`, `allowpublicfw`, `startservice`, `trayicon`.
 
 ## Two installer behaviours that exist for this path

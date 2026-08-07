@@ -5,6 +5,7 @@
 
 pub(crate) mod add_host;
 pub(crate) mod home;
+pub(crate) mod host_options;
 pub(crate) mod library;
 pub(crate) mod pair;
 pub(crate) mod pin_hosts;
@@ -13,6 +14,7 @@ pub(crate) mod settings;
 use crate::glyphs::Hint;
 use crate::library::LibraryShared;
 use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::Pointer;
 use crate::theme::Fonts;
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use pf_client_core::{gamepad::PadInfo, trust};
@@ -21,9 +23,10 @@ use skia_safe::{Canvas, Rect};
 /// What a screen draws over (the shell crossfades between them on push/pop).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Bg {
-    /// The living mesh aurora (home, library).
+    /// The living mesh aurora at full contrast (home, library).
     Aurora,
-    /// The quiet indigo form backdrop (settings, add-host, pair).
+    /// The SAME living mesh, calmed — dimmed pools, lifted corners (settings, add-host,
+    /// pair). Not a second backdrop: the shell chases one `calm` uniform between the two.
     Form,
 }
 
@@ -67,6 +70,10 @@ pub(crate) enum Nav {
     Push(Box<Screen>),
     /// Pop this screen; popping the root quits the console.
     Pop,
+    /// Swap this screen for another, animated as a push. What "Edit\u{2026}" needs: the host
+    /// menu has said its piece, and leaving it on the stack would make Back from the editor
+    /// land on a menu describing the host as it was BEFORE the edit.
+    Replace(Box<Screen>),
 }
 
 /// Everything a screen's input handling may ask of the shell, collected per event and
@@ -77,6 +84,9 @@ pub(crate) struct Outbox {
     pub connect: Option<ConnectIntent>,
     pub cmds: Vec<ConsoleCmd>,
     pub toast: Option<String>,
+    /// Text for the system clipboard. Rides out to the run loop rather than the command
+    /// bus because the clipboard belongs to SDL, which the service thread never touches.
+    pub copy: Option<String>,
 }
 
 impl Outbox {
@@ -87,6 +97,30 @@ impl Outbox {
     pub(crate) fn pop(&mut self) {
         self.nav = Some(Nav::Pop);
     }
+
+    pub(crate) fn replace(&mut self, screen: Screen) {
+        self.nav = Some(Nav::Replace(Box::new(screen)));
+    }
+}
+
+/// This row's `punktfunk://` link, built from the STORE so it carries the fingerprint and
+/// stable id a row doesn't hold — the same builder the desktop shells' "Copy link" uses,
+/// so a link is identical whichever surface hands it to you. `None` if the host has left
+/// the store since the menu was opened.
+pub(crate) fn host_link(row: &HostRow) -> Option<String> {
+    let known = trust::KnownHosts::load();
+    let host = (!row.fp_hex.is_empty())
+        .then(|| known.find_by_fp(&row.fp_hex))
+        .flatten()
+        .or_else(|| known.find_by_addr(&row.addr, row.port))?;
+    Some(
+        pf_client_core::deeplink::DeepLink::for_host(
+            host,
+            None,
+            row.pin.as_ref().map(|p| p.id.as_str()),
+        )
+        .to_url(),
+    )
 }
 
 pub(crate) enum Screen {
@@ -96,6 +130,9 @@ pub(crate) enum Screen {
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
     PinHosts(pin_hosts::PinHostsScreen),
+    /// A saved host's own actions (Wake / Copy link / Edit / Forget) — the console's
+    /// answer to the touch clients' host-card overflow menu.
+    HostOptions(host_options::HostOptionsScreen),
 }
 
 impl Screen {
@@ -112,6 +149,24 @@ impl Screen {
             Screen::AddHost(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
             Screen::PinHosts(s) => s.menu(ev, ctx, fx),
+            Screen::HostOptions(s) => s.menu(ev, ctx, fx),
+        }
+    }
+
+    /// Mouse/touch at a point, in device pixels. `true` = consumed.
+    ///
+    /// A screen answers `true` for anything landing on its own furniture even when the
+    /// press does nothing, so a stray tap can't fall through to a layer underneath; `false`
+    /// only for the empty backdrop.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        match self {
+            Screen::Home(s) => s.pointer(p, ctx, fx),
+            Screen::Library(s) => s.pointer(p, ctx, fx),
+            Screen::Settings(s) => s.pointer(p, ctx, fx),
+            Screen::AddHost(s) => s.pointer(p, ctx, fx),
+            Screen::Pair(s) => s.pointer(p, ctx, fx),
+            Screen::PinHosts(s) => s.pointer(p, ctx, fx),
+            Screen::HostOptions(s) => s.pointer(p, ctx, fx),
         }
     }
 
@@ -156,9 +211,10 @@ impl Screen {
             Screen::Home(_) => "Select a Host".into(),
             Screen::Library(s) => s.host_name().to_string(),
             Screen::Settings(_) => "Settings".into(),
-            Screen::AddHost(_) => "Add Host".into(),
+            Screen::AddHost(s) => s.title(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),
             Screen::PinHosts(s) => format!("Pin \u{201c}{}\u{201d}", s.profile_name()),
+            Screen::HostOptions(s) => s.title(),
         }
     }
 
@@ -170,6 +226,7 @@ impl Screen {
             Screen::AddHost(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
             Screen::PinHosts(s) => s.hints(ctx),
+            Screen::HostOptions(s) => s.hints(ctx),
         }
     }
 
@@ -192,6 +249,7 @@ impl Screen {
             Screen::AddHost(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::PinHosts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::HostOptions(s) => s.render(canvas, rect, k, dt, fonts, ctx),
         }
     }
 }

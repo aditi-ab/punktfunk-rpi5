@@ -31,7 +31,6 @@ param(
     [string]$WebDir = $env:WEB_OUTPUT_DIR,                          # built web .output tree -> bundle the mgmt console
     [string]$ScriptingBundle = $env:SCRIPTING_BUNDLE,              # built runner-cli.js -> bundle the plugin/script runner
     [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console + runner
-    [string]$VbCableDir = $env:VBCABLE_DIR,                         # official base VB-CABLE package -> bundle the virtual mic
     [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
     [switch]$NoSign,                                                # skip signing (local debug)
     # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
@@ -222,33 +221,10 @@ if (-not $NoDriver) {
 }
 
 # --- stage the official base VB-CABLE package (the streaming virtual microphone) --------------
-# VB-CABLE is the virtual audio cable the host writes the client's mic into (its capture endpoint then
-# surfaces as a host microphone). We bundle + silently install the OFFICIAL base VB-CABLE package
-# (VB-Audio donationware, redistributed under VB-Audio's bundling grant - see the VB-CABLE notice added
-# to the licenses payload). The package binary is NOT in the repo (it's a signed third-party blob,
-# shipped intact); supply it via -VbCableDir / $env:VBCABLE_DIR pointing at the extracted official
-# package (must contain VBCABLE_Setup_x64.exe). Absent -> installer built WITHOUT the bundled cable; the
-# host then auto-installs the Steam Streaming pair as a fallback and mic passthrough needs a manual cable.
-if ($VbCableDir -and -not ((Test-Path $VbCableDir) -and (Get-ChildItem -Path $VbCableDir -Filter 'VBCABLE_Setup*.exe' -ErrorAction SilentlyContinue))) {
-    # An explicitly-supplied dir that doesn't hold the package is a broken provisioning, not an
-    # opt-out - fail loudly instead of silently shipping an installer without the virtual mic
-    # (exactly the field regression this bundling fixes). Opt out by leaving VBCABLE_DIR unset.
-    throw "VbCableDir '$VbCableDir' has no VBCABLE_Setup*.exe - re-run scripts/ci/provision-windows-punktfunk-extras.ps1 (or unset VBCABLE_DIR to build without the virtual mic)"
-}
-if ($VbCableDir) {
-    $vbStage = Join-Path $OutDir 'vbcable'
-    if (Test-Path $vbStage) { Remove-Item -Recurse -Force $vbStage }
-    New-Item -ItemType Directory -Force -Path $vbStage | Out-Null
-    Copy-Item (Join-Path $VbCableDir '*') $vbStage -Recurse -Force
-    # The on-target installer script (seeds VB-Audio's cert into TrustedPublisher, runs -i -h) ships
-    # alongside the package so it's extracted to the same {tmp}\vbcable dir.
-    Copy-Item (Join-Path $here 'install-vbcable.ps1') $vbStage -Force
-    $defines += "/DAudioCableStageDir=$vbStage"
-    # Attribution: VB-Audio's bundling grant requires we surface VB-CABLE's origin + donationware status.
-    Copy-Item (Join-Path $here 'licenses\VB-CABLE-NOTICE.txt') -Destination $licStage -Force
-    Write-Host "==> bundling VB-CABLE (virtual mic) from $VbCableDir -> $vbStage"
-}
-else { Write-Host "no -VbCableDir/`$env:VBCABLE_DIR -> installer built WITHOUT the bundled VB-CABLE virtual mic (CI always bundles it; see provision-windows-punktfunk-extras.ps1)" }
+# VB-CABLE is no longer bundled (the audio-substrate program, 2026-08): the host mints its own
+# audio endpoints from Steam's streaming drivers ("Punktfunk Speakers/Microphone"), so audio needs
+# Steam installed on the target box - never running - and no third-party cable. A user-installed
+# VB-CABLE keeps working as a fallback mic target.
 
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
 # A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs

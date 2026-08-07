@@ -2,8 +2,8 @@
 
 use crate::anim::{approach, ease_out_cubic};
 use crate::glyphs::{hint_bar, Hint, HintKey};
-use crate::theme::{white, Fonts, PanelStroke, DIM, W, WHITE};
-use skia_safe::{gradient_shader, Canvas, Color4f, Paint, Point, Rect, TileMode};
+use crate::theme::{fg, Fonts, PanelStroke, W};
+use skia_safe::{gradient_shader, Canvas, Paint, Point, Rect, TileMode};
 
 use super::{Shell, BOTTOM_BAND};
 
@@ -118,7 +118,7 @@ impl Shell {
                 let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
                 canvas.draw_rrect(
                     skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
-                    &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.6), None),
+                    &Paint::new(crate::theme::shade(0.6), None),
                 );
                 crate::theme::panel(
                     canvas,
@@ -135,7 +135,7 @@ impl Shell {
                     by + bh / 2.0 + size * 0.36,
                     W::Medium,
                     size,
-                    white(0.92),
+                    fg(0.92),
                 );
                 canvas.restore();
             }
@@ -166,15 +166,16 @@ impl Shell {
         canvas.save_layer_alpha_f(None, appear as f32);
         // Opaque aurora — the same living backdrop the home wears, so the takeover reads as the
         // console taking over rather than a card popping up.
-        self.draw_aurora(canvas, w, h, t);
-        // A soft pool of shade under the centre seats the white text against a bright aurora.
+        self.draw_aurora(canvas, w, h, t, 0.0);
+        // A soft pool of shade under the centre seats the text against a bright field —
+        // dark on a dark palette, light on a pale one, so it always separates.
         let mut vignette = Paint::default();
         vignette.set_shader(gradient_shader::radial(
             Point::new(cx as f32, (h / 2.0) as f32),
             (w.max(h) * 0.42) as f32,
             gradient_shader::GradientShaderColors::Colors(&[
-                Color4f::new(0.0, 0.0, 0.0, 0.5).to_color(),
-                Color4f::new(0.0, 0.0, 0.0, 0.0).to_color(),
+                crate::theme::shade(0.5).to_color(),
+                crate::theme::shade(0.0).to_color(),
             ]),
             None,
             TileMode::Clamp,
@@ -193,7 +194,7 @@ impl Shell {
             title,
             W::SemiBold,
             23.0 * k,
-            WHITE,
+            fg(1.0),
             cx,
             title_y,
             w * 0.82,
@@ -204,7 +205,7 @@ impl Shell {
                 body,
                 W::Regular,
                 14.0 * k,
-                DIM,
+                fg(0.55),
                 cx,
                 title_y + 32.0 * k,
                 w * 0.66,
@@ -218,7 +219,7 @@ impl Shell {
                 fonts,
                 hints,
                 self.glyphs,
-                cx - probe.0 / 2.0,
+                cx - probe.size.0 / 2.0,
                 h - 34.0 * k,
                 k,
             );

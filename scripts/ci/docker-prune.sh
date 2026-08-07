@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# CI runner disk hygiene — invoked by docker-prune.service (every 30 min). Lives in a real script
+# CI runner disk hygiene — invoked by docker-prune.service (every 2 min). Lives in a real script
 # rather than inline ExecStart= lines because systemd does its OWN $-expansion on ExecStart and
 # empties shell vars / $(...) before /bin/sh sees them (silently breaking the logic under `|| true`).
 #
-# See docker-prune.service for the full why. The headline: the act_runner cache server's blob store
-# lives INSIDE the long-running runner container's writable layer, where `docker prune` can't reach
-# it — left alone it grows to tens of GB and fills the disk on its own.
+# See docker-prune.service for the full why. Sibling: docker-reclaim.sh (hourly) handles what
+# act_runner *leaks* — per-job volumes, stale networks, old build cache. This one handles what
+# CI legitimately *produces* and then abandons: per-SHA app tags and the layers they pin.
 set -u
 export PATH=/usr/bin:/bin:/usr/local/bin:$PATH
 
@@ -23,11 +23,26 @@ MIN_FREE_GB=${MIN_FREE_GB:-60}          # ...or this little is left, whichever t
                                         # 2026-07-29: zero burst clears fired in six hours
                                         # while deb still died of ENOSPC between polls.
 
-# 1) Routine: trim aged images / build cache / stopped containers. sha-<commit> tags aren't
-#    dangling, so -a is required. until=2h, not 6h: on a busy day every image is younger than six
-#    hours, so the filter matched nothing and a run reclaimed 0B while `docker system df` was
-#    reporting 20+ GB reclaimable. Two hours still protects a re-run of the push being worked on.
-docker image prune     -af --filter until=2h || true
+# 1) Routine: retire aged per-SHA app tags, then sweep what untagging released.
+#    ⚠ NEVER `docker image prune -a` on this tick. `until=` filters on image CREATION time, so a
+#    CI *base* image (built days ago) that merely has no container this instant counts as "aged" —
+#    including one a job JUST PULLED whose container does not exist yet. Measured 2026-08-07:
+#    this tick ran 07:36:09–:29 and a rust job's `docker create` failed at 07:36:29 with
+#    "No such image: …punktfunk-rust-ci:latest" — three sampled failures that morning, each
+#    coinciding with a prune run to the second — and every idle base image was re-pulled within
+#    minutes (4–7 GB each), churning the LAN registry for nothing.
+#    The only tag debris this host actually accretes is the per-SHA app tags (web/docs — their
+#    creation time IS the local build time, so a 2h age gate is exact), and a dangling-only prune
+#    cannot touch a tagged image, so neither step can race a starting job.
+now=$(date +%s)
+docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep ':sha-' | while read -r ref; do
+  created=$(docker image inspect -f '{{.Created}}' "$ref" 2>/dev/null) || continue
+  cts=$(date -d "$created" +%s 2>/dev/null) || continue
+  if [ $((now - cts)) -ge 7200 ]; then
+    docker rmi "$ref" >/dev/null 2>&1 || true
+  fi
+done
+docker image prune      -f || true
 docker builder prune   -af --filter until=2h || true
 docker buildx prune    -af --filter until=2h || true
 docker container prune  -f --filter until=2h || true
@@ -44,7 +59,9 @@ docker network prune -f --filter until=2h || true
 #    what matters is absolute headroom for three concurrent target/ dirs, not a ratio — and the
 #    ratio moves whenever the disk is resized (it went 123 G -> 175 G on 2026-07-29) while the
 #    headroom three jobs need does not. In-use images are protected by the daemon, so a burst clear
-#    cannot pull the rug from a live job.
+#    cannot pull the rug from a live job — but the blanket `-a` prune below CAN race an image that
+#    is pulled-but-not-yet-created (the section 1 lesson). That narrow window is accepted HERE
+#    only: when the alternative is every concurrent job dying of ENOSPC, one job re-pulling loses.
 PCT=$(df --output=pcent / | tr -dc '0-9')
 FREE_GB=$(df --output=avail -BG / | tr -dc '0-9')
 # Two flat tests into a flag rather than one multi-line `{ …; } || { …; }` condition: the brace-group

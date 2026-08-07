@@ -70,35 +70,56 @@ extension View {
 
 // MARK: - Console glass (gamepad host tiles + settings rows)
 
-/// Liquid Glass tuned for the gamepad UI's dark "console" surfaces — the host-carousel tiles and
+/// Liquid Glass tuned for the gamepad UI's "console" surfaces — the host-carousel tiles and
 /// the settings rows. Unlike `glassBackground` (floating-overlay only, per HIG), this deliberately
 /// clads content tiles / dense rows: a chosen part of the 10-foot console look. `tint` washes the
-/// glass toward a color (the brand violet on the focused / primary surface); `interactive` makes
-/// it flex on press. The pre-26 fallback is `.ultraThinMaterial` forced dark — these surfaces
-/// always sit on the near-black backdrop, so the material must stay dark even in a light appearance.
+/// glass toward a color (the palette accent on the focused / primary surface); `interactive` makes
+/// it flex on press.
+///
+/// Every tier is WASHED with the palette's `ink.glass` — the same surface colour the console
+/// fills its panels with — so switching the background palette recolours the surfaces, not just
+/// the text on them. The wash alphas are tune-on-device values with one fixed direction: the
+/// pale palettes' white frost needs MORE body than the dark glass (the console's 0.66-vs-0.62
+/// pair), because a thin white wash over a colourful field reads as haze, not as a surface.
 private struct ConsoleGlass<S: Shape>: ViewModifier {
     let shape: S
     var tint: Color?
     var interactive = false
+    /// The console surface follows the background palette: a PALE field needs the material to
+    /// frost light and the glass to read as white, or the dark ink on top of it disappears.
+    /// Defaults to the dark ink, so every non-gamepad caller is unchanged.
+    @Environment(\.gamepadInk) private var ink
+
+    private var scheme: ColorScheme { ink.isLight ? .light : .dark }
+    /// The palette wash over the material tiers (the material itself supplies the blur body).
+    private var materialWash: Color { ink.glass(ink.isLight ? 0.55 : 0.40) }
 
     func body(content: Content) -> some View {
         #if os(tvOS)
         // ALWAYS the material fallback on tvOS: the gamepad settings list is 15+ of these
         // surfaces, and live Liquid Glass per row made the whole screen visibly laggy on the
         // Apple TV's GPU (same class of call GlassProminentButton already makes — glass fights
-        // the 10-foot platform). The tint rides an overlay so the focused row keeps its wash.
+        // the 10-foot platform). The wash and tint ride overlays — two flat fills, no GPU cost.
         content.background {
             shape.fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
+                .environment(\.colorScheme, scheme)
+                .overlay { shape.fill(materialWash) }
                 .overlay {
                     if let tint { shape.fill(tint) }
                 }
         }
         #else
         if #available(iOS 26, macOS 26, *) {
-            content.glassEffect(glass, in: shape)
+            content.glassEffect(glass, in: shape).environment(\.colorScheme, scheme)
         } else {
-            content.background { shape.fill(.ultraThinMaterial).environment(\.colorScheme, .dark) }
+            content.background {
+                shape.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, scheme)
+                    .overlay { shape.fill(materialWash) }
+                    .overlay {
+                        if let tint { shape.fill(tint) }
+                    }
+            }
         }
         #endif
     }
@@ -106,8 +127,13 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     #if !os(tvOS)
     @available(iOS 26, macOS 26, *)
     private var glass: Glass {
-        var g: Glass = .regular
-        if let tint { g = g.tint(tint) }
+        // Liquid Glass has ONE tint channel, so the palette wash and the caller's tint share
+        // it: mixed 60 % toward the caller's (the focused row must still read accented on
+        // every palette) over the palette base. If device QA finds the mixed focus wash too
+        // weak, the escape hatch is `tint ?? wash` — today's focused look, bit for bit.
+        let wash = ink.glass(ink.isLight ? 0.60 : 0.45)
+        var g: Glass = .regular.tint(
+            tint.map { wash.mix(with: $0, by: 0.6) } ?? wash)
         if interactive { g = g.interactive() }
         return g
     }
@@ -115,9 +141,51 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
 }
 
 extension View {
-    /// Liquid Glass for a dark console surface (a host tile / settings row), or `.ultraThinMaterial`
-    /// (forced dark) pre-26. Pass the surface's shape explicitly — glass defaults to a Capsule.
+    /// Liquid Glass for a console surface (a host tile / settings row), or `.ultraThinMaterial`
+    /// pre-26 — both washed with the palette's own glass colour, both frosting to the palette's
+    /// scheme. Pass the surface's shape explicitly — glass defaults to a Capsule.
     func consoleGlass<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
         modifier(ConsoleGlass(shape: shape, tint: tint, interactive: interactive))
+    }
+}
+
+// MARK: - Console floating glass (the gamepad screens' close buttons)
+
+/// `glassBackground` for a floating control INSIDE the gamepad UI (the close ✕): same shape
+/// contract, but washed with the palette's ink and frosted to the palette's scheme — plain
+/// `glassBackground` follows the SYSTEM appearance, which leaves the frost dark under dark ink
+/// when a pale palette is up. The non-gamepad floating surfaces (the HUD, the trust card, the
+/// touch connect modal) keep plain `glassBackground`: they sit over video or the touch UI,
+/// where the palette means nothing.
+private struct ConsoleGlassBackground<S: Shape>: ViewModifier {
+    let shape: S
+    var interactive = false
+    @Environment(\.gamepadInk) private var ink
+
+    private var scheme: ColorScheme { ink.isLight ? .light : .dark }
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, macOS 26, tvOS 26, *) {
+            content
+                .glassEffect(
+                    (interactive ? Glass.regular.interactive() : .regular)
+                        .tint(ink.glass(ink.isLight ? 0.60 : 0.45)),
+                    in: shape)
+                .environment(\.colorScheme, scheme)
+        } else {
+            content.background {
+                shape.fill(.regularMaterial)
+                    .environment(\.colorScheme, scheme)
+                    .overlay { shape.fill(ink.glass(ink.isLight ? 0.55 : 0.40)) }
+            }
+        }
+    }
+}
+
+extension View {
+    /// Palette-washed floating glass for the gamepad screens' own controls. Same fallback story
+    /// as `glassBackground` (`.regularMaterial` pre-26), plus the ink wash and scheme flip.
+    func consoleGlassBackground<S: Shape>(_ shape: S, interactive: Bool = false) -> some View {
+        modifier(ConsoleGlassBackground(shape: shape, interactive: interactive))
     }
 }

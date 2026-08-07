@@ -206,6 +206,20 @@ struct ContentView: View {
             model.setStatsVerbosity(StatsVerbosity(rawValue: raw) ?? .normal)
         }
         #if os(iOS) || os(tvOS)
+        // Coming back to the app re-arms the LAN browse. The home's `onAppear`/`onDisappear` do
+        // NOT fire across background/foreground, and a browse the system suspended while we were
+        // away does not resume on its own — so the host grid came back empty and stayed empty
+        // until the app was relaunched. No-op unless the browse is already running (mid-session
+        // the home has deliberately torn it down).
+        //
+        // Mobile only: macOS never suspends the process, and its `scenePhase` flips on every
+        // window focus change — re-arming there would rebuild the browser each time you alt-tab.
+        // A Mac browse that genuinely breaks is caught by `HostDiscovery`'s own sweep instead.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { discovery.refreshIfRunning() }
+        }
+        #endif
+        #if os(iOS) || os(tvOS)
         // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
         // ignored so neither branch fires for a Control-Center pull.
         //
@@ -335,6 +349,16 @@ struct ContentView: View {
             active: fullscreenForSession && model.connection != nil,
             isFullscreen: $isFullscreen))
         #endif
+        // A game launched from the library just exited, so the session ended on purpose: put the
+        // player back in that host's library rather than on host selection. Set on the outer Group
+        // (like the sheets below) so it survives the streaming → home transition the disconnect
+        // drives, and consumed here — the model hands the host over once and we clear it, so a
+        // later manual dismiss of the library can't be undone by a stale value.
+        .onChange(of: model.returnToLibrary) { _, host in
+            guard let host else { return }
+            model.returnToLibrary = nil
+            libraryTarget = host
+        }
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
@@ -360,7 +384,13 @@ struct ContentView: View {
             .frame(minWidth: 940, minHeight: 620)
         }
         #else
-        .fullScreenCover(item: $libraryTarget) { host in
+        // iOS: the cover is the TOUCH UI's presentation only. In gamepad mode the library is one
+        // of GamepadHomeView's in-place layers (the console shell — no bottom-up cover), so the
+        // proxy hides the target from the cover while that mode owns it; every writer (Y on a
+        // tile, `returnToLibrary`) keeps writing the same `libraryTarget` either way, and a
+        // controller arriving or leaving mid-browse hands the open library to whichever
+        // presentation the new mode owns.
+        .fullScreenCover(item: touchLibraryTarget) { host in
             NavigationStack {
                 LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
             }
@@ -375,6 +405,14 @@ struct ContentView: View {
 
     private var deepLinkNoticePresented: Binding<Bool> {
         Binding(get: { deepLinkNotice != nil }, set: { if !$0 { deepLinkNotice = nil } })
+    }
+
+    /// The iOS library cover's item: `libraryTarget`, hidden while the gamepad shell presents
+    /// the library in place (see the cover's comment).
+    private var touchLibraryTarget: Binding<StoredHost?> {
+        Binding(
+            get: { gamepadUIActive ? nil : libraryTarget },
+            set: { libraryTarget = $0 })
     }
 
     private var approvalChoicePresented: Binding<Bool> {
@@ -512,6 +550,9 @@ struct ContentView: View {
                 waker: waker,
                 gamepadUI: gamepadUIActive,
                 onCancelConnect: { model.disconnect() })
+                // The takeover mounts OUTSIDE the gamepad screens (it covers the whole home), so
+                // it publishes the palette's ink itself rather than inheriting it.
+                .gamepadPaletteInk()
         }
     }
 
@@ -531,7 +572,8 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
+                    launchTitle: launchTitle)
             } else {
                 HomeView(
                     store: store, model: model, discovery: discovery,
@@ -547,7 +589,8 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
+                    launchTitle: launchTitle)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations
                 // — which aren't mounted while the gamepad launcher is up. Give the launcher its
                 // own presenters (exactly one of the two homes is mounted at a time, so these can

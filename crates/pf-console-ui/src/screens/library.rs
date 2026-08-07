@@ -11,8 +11,9 @@ use crate::library::{
     RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
 };
 use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{white, Fonts, DIM, W, WHITE};
+use crate::theme::{accent, fg, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
 use std::collections::HashMap;
@@ -30,6 +31,9 @@ pub(crate) struct LibraryScreen {
     games: Vec<LibraryGame>,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
+    /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
+    /// is a few degrees and well inside a finger's slop), empty for culled cards.
+    geom: Vec<Rect>,
     anim: Spring,
     bump: Spring,
     /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
@@ -49,6 +53,7 @@ impl LibraryScreen {
             phase: LibraryPhase::Loading,
             games: Vec::new(),
             cursor: 0,
+            geom: Vec::new(),
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             art: HashMap::new(),
@@ -152,6 +157,43 @@ impl LibraryScreen {
         }
     }
 
+    /// Mouse/touch on the coverflow. Same rule as the home carousel: the centre card
+    /// launches, any other one only comes to the front.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        match p.kind {
+            PointerKind::Scroll { up } => {
+                self.step(if up { -1 } else { 1 }, false);
+                true
+            }
+            PointerKind::Press => {
+                // The cards OVERLAP, and the ones nearest the cursor are drawn on top —
+                // so among the rects a press falls in, the topmost is the nearest. Picking
+                // the first by index would hand the press to a card buried underneath.
+                let hit = self
+                    .geom
+                    .iter()
+                    .enumerate()
+                    // The geometry is a frame old; a library refresh can shorten the shelf
+                    // between the render that recorded it and this press.
+                    .filter(|(i, r)| *i < self.games.len() && p.hits(**r))
+                    .min_by_key(|(i, _)| (*i as i32 - self.cursor).abs())
+                    .map(|(i, _)| i);
+                match hit {
+                    Some(i) if i == self.cursor as usize => {
+                        self.menu(MenuEvent::Confirm, ctx, fx);
+                        true
+                    }
+                    Some(i) => {
+                        self.cursor = i as i32;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn step(&mut self, delta: i32, clamp: bool) -> Option<MenuPulse> {
         match step_cursor(self.cursor, self.games.len(), delta, clamp) {
             StepResult::Moved(to) => {
@@ -168,10 +210,31 @@ impl LibraryScreen {
         }
     }
 
+    /// How many launcher entries lead the shelf — [`LibraryShared::set_games`] groups them at the
+    /// front, so the launcher group is always the prefix `0..launcher_count()`.
+    fn launcher_count(&self) -> usize {
+        self.games.iter().take_while(|g| g.launcher).count()
+    }
+
+    /// Is the focused entry a launcher? (Drives the confirm hint: you *open* Steam, you *play* a
+    /// game.)
+    fn focused_is_launcher(&self) -> bool {
+        self.games
+            .get(self.cursor as usize)
+            .is_some_and(|g| g.launcher)
+    }
+
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
         match &self.phase {
             LibraryPhase::Ready => vec![
-                Hint::new(HintKey::Confirm, "Play"),
+                Hint::new(
+                    HintKey::Confirm,
+                    if self.focused_is_launcher() {
+                        "Open"
+                    } else {
+                        "Play"
+                    },
+                ),
                 Hint::new(HintKey::Shoulders, "Jump"),
                 Hint::new(HintKey::Back, "Back"),
             ],
@@ -216,7 +279,7 @@ impl LibraryScreen {
                     "Loading library…",
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 16.0 * k,
                     w * 0.8,
@@ -228,7 +291,7 @@ impl LibraryScreen {
                     "No games found",
                     W::Bold,
                     22.0 * k,
-                    WHITE,
+                    fg(1.0),
                     cx,
                     cy_all - 20.0 * k,
                     w * 0.8,
@@ -238,7 +301,7 @@ impl LibraryScreen {
                     "Install Steam titles or add custom entries in the host's web console.",
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 12.0 * k,
                     w * 0.8,
@@ -250,7 +313,7 @@ impl LibraryScreen {
                     &title,
                     W::Bold,
                     22.0 * k,
-                    WHITE,
+                    fg(1.0),
                     cx,
                     cy_all - 32.0 * k,
                     w * 0.8,
@@ -260,7 +323,7 @@ impl LibraryScreen {
                     &body,
                     W::Regular,
                     14.0 * k,
-                    DIM,
+                    fg(0.55),
                     cx,
                     cy_all + 4.0 * k,
                     (600.0 * k).min(w * 0.85),
@@ -277,10 +340,36 @@ impl LibraryScreen {
         let pos = self.anim.pos;
         let bump = self.bump.pos * k;
 
+        // Group heading. The model groups launcher entries at the front (design D4), and a
+        // coverflow is one-dimensional — so instead of a second focus rail (a new up/down nav
+        // model, in three renderers, for two or three tiles) the heading names the group the
+        // cursor is in and changes as it crosses the boundary. Drawn only when the shelf
+        // actually has both groups, so a library without launchers looks exactly as before.
+        let launchers = self.launcher_count();
+        if launchers > 0 && launchers < self.games.len() {
+            let heading = if (self.cursor as usize) < launchers {
+                "LAUNCHERS"
+            } else {
+                "GAMES"
+            };
+            fonts.centered(
+                canvas,
+                heading,
+                W::SemiBold,
+                12.0 * k,
+                fg(0.5),
+                f64::from(rect.left) + w / 2.0,
+                cy - card_h / 2.0 - 22.0 * k,
+                w * 0.5,
+            );
+        }
+
         // Paint order = draw order: farthest from the (integer) cursor first, so the
         // dense side stacks overlap toward the focus.
         let mut order: Vec<usize> = (0..self.games.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse((i as i32 - self.cursor).abs()));
+        self.geom.clear();
+        self.geom.resize(self.games.len(), Rect::new_empty());
 
         for i in order {
             let d = i as f64 - pos;
@@ -297,6 +386,12 @@ impl LibraryScreen {
                 d.signum() * (FOCUS_GAP + (a - 1.0) * SIDE_SPACING) * k
             };
             let ccx = f64::from(rect.left) + w / 2.0 + offset + bump;
+            self.geom[i] = Rect::from_xywh(
+                (ccx - card_w * scale / 2.0) as f32,
+                (cy - card_h * scale / 2.0) as f32,
+                (card_w * scale) as f32,
+                (card_h * scale) as f32,
+            );
             let m = card_matrix(ccx, cy, angle, scale, card_w, card_h, PERSPECTIVE * k);
 
             let game = &self.games[i];
@@ -326,21 +421,31 @@ impl LibraryScreen {
                 }
                 None => {
                     // Solid face, not glass: the side cards OVERLAP.
-                    canvas.draw_rect(
-                        crect,
-                        &Paint::new(Color4f::new(0.118, 0.118, 0.145, 1.0), None),
-                    );
-                    let mono = initials(&game.title);
-                    let font = fonts.font(W::Bold, 38.0 * k);
-                    let tw = font.measure_str(&mono, None).0;
+                    //
+                    // A launcher tile usually has no poster, and an art-less launcher drawn like
+                    // an art-less game reads as "a game whose cover failed to load". So it gets
+                    // the brand-tinted face and names its launcher, instead of a title monogram.
+                    let face = if game.launcher {
+                        Color4f::new(0.153, 0.137, 0.267, 1.0)
+                    } else {
+                        Color4f::new(0.118, 0.118, 0.145, 1.0)
+                    };
+                    canvas.draw_rect(crect, &Paint::new(face, None));
+                    let (glyph, size, ink) = if game.launcher {
+                        (store_label(&game.store).to_string(), 22.0 * k, fg(0.85))
+                    } else {
+                        (initials(&game.title), 38.0 * k, fg(0.45))
+                    };
+                    let font = fonts.font(W::Bold, size);
+                    let tw = font.measure_str(&glyph, None).0;
                     canvas.draw_str(
-                        &mono,
+                        &glyph,
                         Point::new(
                             (card_w as f32 - tw) / 2.0,
                             card_h as f32 / 2.0 + 13.0 * k as f32,
                         ),
                         &font,
-                        &Paint::new(white(0.45), None),
+                        &Paint::new(ink, None),
                     );
                 }
             }
@@ -351,13 +456,20 @@ impl LibraryScreen {
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
                 let (px, py) = (8.0 * k, 8.0 * k);
                 let (bw, bh) = (tw + 16.0 * k, 20.0 * k);
+                // Brand-filled for a launcher, smoked glass for a game — the one cue that
+                // survives being three cards deep in the recede.
+                let pill = if game.launcher {
+                    accent(0.85)
+                } else {
+                    crate::theme::shade(0.55)
+                };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(
                         Rect::from_xywh(px as f32, py as f32, bw as f32, bh as f32),
                         (bh / 2.0) as f32,
                         (bh / 2.0) as f32,
                     ),
-                    &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.55), None),
+                    &Paint::new(pill, None),
                 );
                 fonts.draw(
                     canvas,
@@ -366,7 +478,7 @@ impl LibraryScreen {
                     py + 14.0 * k,
                     W::SemiBold,
                     size,
-                    WHITE,
+                    fg(1.0),
                 );
             }
             // The brightness recede: an opaque-black veil, never whole-card alpha.
@@ -390,17 +502,22 @@ impl LibraryScreen {
                 &g.title,
                 W::Bold,
                 27.0 * k,
-                WHITE,
+                fg(1.0),
                 cx,
                 f64::from(rect.bottom) - 64.0 * k,
                 w * 0.8,
             );
+            let sub = if g.launcher {
+                format!("{} · LAUNCHER", store_label(&g.store).to_uppercase())
+            } else {
+                store_label(&g.store).to_uppercase()
+            };
             fonts.centered(
                 canvas,
-                &store_label(&g.store).to_uppercase(),
+                &sub,
                 W::Regular,
                 12.0 * k,
-                white(0.5),
+                fg(0.5),
                 cx,
                 f64::from(rect.bottom) - 30.0 * k,
                 w * 0.5,

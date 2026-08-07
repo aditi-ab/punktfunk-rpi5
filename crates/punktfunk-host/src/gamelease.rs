@@ -52,6 +52,24 @@ const EXIT_CONFIRM: Duration = Duration::from_secs(3);
 const SHIM_WINDOW: Duration = Duration::from_secs(5);
 /// How long a game gets to close on its own after a polite request, before it is killed outright.
 const TERM_GRACE: Duration = Duration::from_secs(10);
+/// How long [`crate::procscan::running_hint`] may hold off the exit once the game's processes have
+/// all gone.
+///
+/// The hint is a tie-breaker for a scan that momentarily cannot see the game — a launcher re-execing,
+/// an engine relaunching itself into a new pid — and those gaps are over in seconds, an order of
+/// magnitude inside this window. Past it, a game nothing can find is gone whatever the hint says.
+///
+/// **Bounded because the hint's backing state is not guaranteed to be truthful.** Windows reads
+/// Steam's per-app `Running` registry flag, which Steam leaves set whenever it does not cleanly
+/// observe the exit (Steam crashed or was closed first, the game re-parented, a launcher appid stays
+/// set) — and `steam_running_hint` believes the first hive that says so, including a stale one left
+/// in another profile. An UNBOUNDED veto turns that into a session that never ends on its own: the
+/// console shows the game running for as long as the host does, `session_on_game_exit` never fires,
+/// and only a manual "End" gets the stream back (field report 2026-08-06, Windows host 0.24.0).
+///
+/// Ending a moment too early is the cheaper failure: the stream drops while the game lives (the user
+/// reconnects, and `finish` never kills anything). Ending never is the bug above.
+const VETO_LIMIT: Duration = Duration::from_secs(30);
 
 /// A child process the host spawned for a launch, and what may safely be signalled for it.
 #[derive(Clone, Copy, Debug)]
@@ -248,13 +266,34 @@ pub struct LeaseRequest {
     pub spec: DetectSpec,
     /// The game's own compositor-nested-ness: `true` when a bare-spawn gamescope owns it.
     pub nested: bool,
+    /// This entry opens a LAUNCHER rather than a game (design D4), which makes the lease
+    /// [`LeaseKind::Untracked`] no matter what else is known about it.
+    ///
+    /// A launcher has no "the game exited" moment to detect, and trying to infer one is worse than
+    /// not trying. Steam is the clean counterexample: Big Picture is a *mode* of an already-running
+    /// Steam client, not a process — and on a Deck or SteamOS host Steam is always running — so no
+    /// process signal can express "the Big Picture window closed".
+    ///
+    /// Without this flag the lifetime would also be decided by something the user cannot see:
+    /// launching a launcher that is NOT yet running leaves the host holding a live child (tracked,
+    /// so quitting it ends the session), while launching one that IS running has the command
+    /// forward and exit inside [`SHIM_WINDOW`] (untracked, so the session persists). Same tile, two
+    /// behaviours. Untracked is the honest one of the two, so it is the one that always applies.
+    pub launcher: bool,
     /// The child the host spawned for this launch, when it spawned one directly, and whether it
     /// leads its own process group (see [`OwnedChild::group_leader`]).
     pub child: Option<(std::process::Child, bool)>,
     /// Seconds-since-boot from **before** the launch ([`launch_clock`]): the floor for adopting a
     /// process, which is what keeps a copy of the game the player already had open from being
     /// mistaken for this session's. `None` disables the filter (no readable uptime clock).
+    ///
+    /// A *reconnecting* session inherits this from [`crate::launchreg`] rather than minting its own,
+    /// which is the only way its lease can see a game the previous session started.
     pub launch_stamp: Option<f64>,
+    /// Where the watcher publishes the processes it adopts, so the host's launch record can still
+    /// answer "is our launch up?" after this lease and its watcher are gone
+    /// ([`crate::launchreg::LiveProcs`]). `None` for a launch that isn't recorded.
+    pub procs: Option<crate::launchreg::LiveProcs>,
 }
 
 /// The reference instant for adopting this launch's processes, in seconds since boot. Call it
@@ -282,11 +321,19 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         plane,
         spec,
         nested,
+        launcher,
         child,
         launch_stamp,
+        procs,
     } = req;
 
-    let kind = if nested {
+    // A launcher tile is untracked FIRST, before anything else is considered — see
+    // `LeaseRequest::launcher`. Checking it ahead of `child` is the whole point: a launcher the host
+    // just started leaves a live child behind, and tracking that child is exactly the inconsistency
+    // this removes.
+    let kind = if launcher {
+        LeaseKind::Untracked
+    } else if nested {
         LeaseKind::Nested
     } else if child.is_some() {
         LeaseKind::Child
@@ -317,7 +364,14 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         last_seen_ms: AtomicU64::new(0),
     });
 
-    if matches!(kind, LeaseKind::Untracked) {
+    if launcher {
+        tracing::info!(
+            title = %shared.game.title,
+            app = shared.game.id.as_deref().unwrap_or("-"),
+            "this entry opens a launcher, not a game — the session stays up until the client \
+             leaves, and closing the launcher does not end it"
+        );
+    } else if matches!(kind, LeaseKind::Untracked) {
         tracing::info!(
             title = %shared.game.title,
             app = shared.game.id.as_deref().unwrap_or("-"),
@@ -333,7 +387,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         );
     }
 
-    let watcher = spawn_watcher(shared.clone(), child, on_exit);
+    let watcher = spawn_watcher(shared.clone(), child, procs, on_exit);
     if watcher.is_none() {
         // Nothing is polling this lease (no signals to poll, or a platform without a matcher yet), so
         // its state will never advance on its own. Report it as running rather than leaving the
@@ -349,6 +403,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
 fn spawn_watcher(
     shared: Arc<LeaseShared>,
     child: Option<std::process::Child>,
+    procs: Option<crate::launchreg::LiveProcs>,
     on_exit: OnExit,
 ) -> Option<std::thread::JoinHandle<()>> {
     // An untracked lease has nothing to observe (it still exposes state for the status surface).
@@ -369,23 +424,45 @@ fn spawn_watcher(
     // surface, but nothing polls it.
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (child, on_exit);
+        let _ = (child, procs, on_exit);
         return None;
     }
     #[cfg(any(target_os = "linux", windows))]
     {
         std::thread::Builder::new()
             .name("pf1-gamelease".into())
-            .spawn(move || watch(shared, child, on_exit))
+            .spawn(move || watch(shared, child, procs, on_exit))
             .ok()
     }
 }
 
 /// The watch loop: wait for the game to appear, then for it to go away.
 #[cfg(any(target_os = "linux", windows))]
-fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_exit: OnExit) {
+fn watch(
+    shared: Arc<LeaseShared>,
+    mut child: Option<std::process::Child>,
+    procs: Option<crate::launchreg::LiveProcs>,
+    on_exit: OnExit,
+) {
     let scanner = crate::procscan::Scanner::system();
     let cancelled = || shared.cancel.load(Ordering::Relaxed);
+    // Publish what this lease adopted to the host's launch record, so a LATER session can tell "this
+    // host's launch is still up" from "nothing of ours is running" — which is what lets it inherit
+    // this launch instead of starting a second copy (`crate::launchreg`).
+    //
+    // Only ever the CONCRETE processes, and only ever a non-empty set. Never the spec: a later re-scan
+    // by spec would find a copy the player started for themselves since, and adopting that is exactly
+    // what procscan's rule 1 forbids. And never cleared on exit: the last set the watcher saw is what
+    // makes the record answer `Gone` (every recorded pid re-verified dead) rather than "no opinion",
+    // which is how a game the player quit becomes relaunchable at once.
+    let publish = |live: &[crate::procscan::ProcRef]| {
+        if live.is_empty() {
+            return;
+        }
+        if let Some(slot) = procs.as_ref() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = live.to_vec();
+        }
+    };
     let spawned_at = Instant::now();
     let mut kind = shared.kind.clone();
 
@@ -481,6 +558,7 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
         let live = scanner.find(&shared.spec, shared.launch_stamp);
         if !live.is_empty() || child_alive {
             known = live.clone();
+            publish(&live);
             shared.was_running.store(true, Ordering::Relaxed);
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
             shared.set_state(GameState::Running);
@@ -536,31 +614,62 @@ fn watch(shared: Arc<LeaseShared>, mut child: Option<std::process::Child>, on_ex
             }
         };
         if !live.is_empty() || child_alive {
+            publish(&live);
             known = live;
             gone_since = None;
             vetoed = false;
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
-        } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= EXIT_CONFIRM {
-            // Last check before ending a session: does anything outside the process scan still think
-            // the game is up? Only a veto, never a reason to call it running — see
-            // `procscan::running_hint`. The failure mode of honoring it is a stream that stays up.
-            if crate::procscan::running_hint(&shared.spec) == Some(true) {
-                if !vetoed {
-                    vetoed = true;
-                    tracing::info!(
-                        title = %shared.game.title,
-                        "no game processes found, but its launcher still reports it running — not \
-                         ending the session"
-                    );
+        } else {
+            // How long the game's processes have been CONTINUOUSLY absent. Deliberately not reset by
+            // the veto below — letting it run on is exactly what bounds the veto.
+            let gone_for = gone_since.get_or_insert_with(Instant::now).elapsed();
+            if gone_for >= EXIT_CONFIRM {
+                // Last check before ending a session: does anything outside the process scan still
+                // think the game is up? Only a veto, never a reason to call it running — see
+                // `procscan::running_hint`.
+                let hint_running = crate::procscan::running_hint(&shared.spec) == Some(true);
+                if !exit_confirmed(gone_for, hint_running) {
+                    if !vetoed {
+                        vetoed = true;
+                        tracing::info!(
+                            title = %shared.game.title,
+                            veto_limit_s = VETO_LIMIT.as_secs(),
+                            "no game processes found, but its launcher still reports it running — \
+                             holding off on ending the session"
+                        );
+                    }
+                } else {
+                    if hint_running {
+                        // The veto outlived its usefulness: nothing this scan can see has existed
+                        // for VETO_LIMIT, so the launcher's opinion is stale, not early.
+                        tracing::warn!(
+                            title = %shared.game.title,
+                            gone_for_s = gone_for.as_secs(),
+                            "its launcher still reports the game running, but nothing of it has \
+                             been on the box for {}s — treating that as a stale flag and ending \
+                             the session",
+                            VETO_LIMIT.as_secs()
+                        );
+                    }
+                    finish(&shared, &on_exit, "the game exited");
+                    return;
                 }
-                gone_since = None;
-            } else {
-                finish(&shared, &on_exit, "the game exited");
-                return;
             }
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Whether a game nothing can find any more counts as exited: absent for at least [`EXIT_CONFIRM`],
+/// and either unopposed or absent long enough that the opposition ([`crate::procscan::running_hint`]
+/// saying `Some(true)`) has been overruled by [`VETO_LIMIT`].
+///
+/// Split out of the watch loop because it is the one rule in this file whose *bound* is the fix:
+/// the loop itself polls a live process table and cannot be unit-tested, which is how an unbounded
+/// veto shipped. Pure, so the table below is the whole contract.
+#[cfg(any(target_os = "linux", windows))]
+fn exit_confirmed(gone_for: Duration, hint_running: bool) -> bool {
+    gone_for >= EXIT_CONFIRM && (!hint_running || gone_for >= VETO_LIMIT)
 }
 
 /// Record the exit and, unless the host itself ended the game, run the session-ending action.
@@ -790,8 +899,17 @@ fn windows_term_ladder(shared: &LeaseShared) {
 // The grace registry: leases whose session is gone but whose game is on probation
 // ---------------------------------------------------------------------------------------------
 
-/// A lease waiting out its reconnect window. If the client comes back before the deadline the lease
-/// is handed to the new session and nothing is ended; if it doesn't, the game ends.
+/// A lease waiting out its reconnect window. If the client comes back before the deadline the
+/// pending termination is dropped and the game keeps running; if it doesn't, the game ends.
+///
+/// The lease object itself is **not** handed to the new session, and cannot be: by the time an entry
+/// lands here its [`GameLease`] has already been dropped (the guard's `Drop` runs [`on_session_end`]
+/// and then drops the lease), which cancels its watcher — and its `on_exit` action closes a
+/// connection that no longer exists. What the new session re-adopts is the *game*, through
+/// [`crate::launchreg`], which is what carries the original launch's reference instant across
+/// sessions so a fresh lease can see a game started before it. (This doc used to claim the lease was
+/// handed over; nothing ever did that, and a reconnecting session was left with no game-exit
+/// detection at all.)
 pub struct Pending {
     pub shared: Arc<LeaseShared>,
     pub deadline: Instant,
@@ -826,10 +944,16 @@ pub fn arm_grace(shared: Arc<LeaseShared>, fingerprint: Option<String>, grace: D
 }
 
 /// A reconnecting client takes its game back: drops any pending termination for `fingerprint` whose
-/// title matches `app`. Returns the number of leases reprieved.
-pub fn readopt(fingerprint: Option<&str>, app: Option<&str>) -> usize {
+/// title matches `app`.
+///
+/// Returns the reprieved leases, so a caller can name what it saved (and read the launch it came
+/// from) rather than being handed a bare count. They are **corpses by design** — see [`Pending`]:
+/// their watchers are cancelled and their exit actions point at a dead connection. The new session
+/// opens its own lease; what it needs from the old launch (the reference instant to adopt against)
+/// comes from [`crate::launchreg`], not from here.
+pub fn readopt(fingerprint: Option<&str>, app: Option<&str>) -> Vec<Arc<LeaseShared>> {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    let before = reg.len();
+    let mut reprieved = Vec::new();
     reg.retain(|p| {
         let same_client = match (&p.fingerprint, fingerprint) {
             (Some(a), Some(b)) => a == b,
@@ -843,12 +967,13 @@ pub fn readopt(fingerprint: Option<&str>, app: Option<&str>) -> usize {
                 title = %p.shared.game.title,
                 "the client reconnected inside the window — the game keeps running"
             );
+            reprieved.push(p.shared.clone());
             false
         } else {
             true
         }
     });
-    before - reg.len()
+    reprieved
 }
 
 /// Every lease currently on probation, with the time left, for the status surface.
@@ -915,12 +1040,39 @@ fn start_reaper() {
 /// What a session should do with its game when it ends. The policy lives in
 /// [`crate::session_settings`]; this is the one place that turns it into an action, so both planes
 /// behave identically.
-pub fn on_session_end(lease: &GameLease, deliberate: bool, fingerprint: Option<&str>) {
+///
+/// `launch` is this session's hold on the host's launch record ([`crate::launchreg`]), consulted for
+/// one question only: has a newer session already taken this launch over?
+pub fn on_session_end(
+    lease: &GameLease,
+    deliberate: bool,
+    fingerprint: Option<&str>,
+    launch: Option<&crate::launchreg::Claim>,
+) {
     use crate::session_settings::GameOnSessionEnd;
     let settings = crate::session_settings::get();
     let shared = lease.shared();
     if !shared.is_trackable() || shared.state() == GameState::Exited {
         return; // nothing to end (or it already ended on its own)
+    }
+    // A newer session has already claimed this launch: the game this lease tracks is the game that
+    // session is now streaming. Anything this policy would do to "our" game would be done to theirs,
+    // so it does nothing at all.
+    //
+    // **Which order this runs in relative to the new session's handshake does not matter, and that is
+    // the point.** The two are concurrent — the old session's stream loop exits (here) while the new
+    // one is already deciding its launch. If the teardown wins the race, `superseded` is false and the
+    // policy runs exactly as it always has; the new session then finds the record released and adopts
+    // it through the window/liveness arms. If the handshake wins, the new session's claim is already
+    // recorded when this runs, and this returns — which is the case that needed fixing: under
+    // `Always`, the handshake's `readopt` would have run BEFORE this `arm_grace` and so could not
+    // reprieve it, and the reaper would have ended the new session's game when the window closed.
+    if launch.is_some_and(|c| c.superseded()) {
+        tracing::info!(
+            title = %shared.game.title,
+            "this client already came back for this game — leaving it to the session that has it now"
+        );
+        return;
     }
     let end_now = |shared: Arc<LeaseShared>| {
         // A deliberate stop already forces this session's display down immediately (the `quit` flag
@@ -977,16 +1129,28 @@ pub struct SessionGuard {
     quit: Arc<AtomicBool>,
     /// Hex client fingerprint, so a reconnecting client can reclaim its own game and nothing else.
     fingerprint: Option<String>,
+    /// This session's hold on the host's launch record. Held here because its lifetime is exactly the
+    /// session's: its drop is what opens the reconnect window a re-dial is matched against, and it
+    /// must not happen until after the policy above has read it. Rust drops fields **after** the
+    /// `Drop` body, so declaring it here is what orders those two.
+    launch: Option<crate::launchreg::Claim>,
 }
 
 impl SessionGuard {
     /// Bind `lease` to the calling session's lifetime. `quit` is the session's deliberate-stop flag,
-    /// read at drop; `fingerprint` identifies the client allowed to reclaim the game on reconnect.
-    pub fn new(lease: GameLease, quit: Arc<AtomicBool>, fingerprint: Option<String>) -> Self {
+    /// read at drop; `fingerprint` identifies the client allowed to reclaim the game on reconnect;
+    /// `launch` is this session's claim on the host's launch record ([`crate::launchreg::claim`]).
+    pub fn new(
+        lease: GameLease,
+        quit: Arc<AtomicBool>,
+        fingerprint: Option<String>,
+        launch: Option<crate::launchreg::Claim>,
+    ) -> Self {
         Self {
             lease,
             quit,
             fingerprint,
+            launch,
         }
     }
 
@@ -1002,6 +1166,7 @@ impl Drop for SessionGuard {
             &self.lease,
             self.quit.load(Ordering::SeqCst),
             self.fingerprint.as_deref(),
+            self.launch.as_ref(),
         );
     }
 }
@@ -1024,10 +1189,62 @@ mod tests {
             plane: crate::events::Plane::Native,
             spec,
             nested,
+            launcher: false,
             child: None,
             // No start-time floor: these leases are never matched against real processes.
             launch_stamp: None,
+            // Not a recorded launch — nothing here spawns anything (`crate::launchreg`).
+            procs: None,
         }
+    }
+
+    /// Design D4: an entry that opens a LAUNCHER is untracked, whatever else is known about it.
+    ///
+    /// Both cases below are the same tile - "Steam Big Picture" - differing only in whether Steam
+    /// happened to be running already, which the user cannot see:
+    ///
+    ///   * not running: the host's spawned child stays alive, which would otherwise be a `Child`
+    ///     lease, so quitting the launcher would end the session;
+    ///   * already running: the command forwards to the live instance and exits inside
+    ///     `SHIM_WINDOW`, leaving nothing to track, so the session would persist.
+    ///
+    /// Untracked is the honest answer of the two. Big Picture is a *mode* of an already-running
+    /// Steam client rather than a process, and on a Deck or SteamOS host Steam is always running,
+    /// so no process signal can express "the launcher's window closed". Pinning it here keeps the
+    /// tile's behaviour from depending on invisible state.
+    #[test]
+    fn a_launcher_entry_is_untracked_however_it_was_started() {
+        // Already running: nothing held, nothing to detect.
+        let mut r = req("steam:big-picture", DetectSpec::default(), false);
+        r.launcher = true;
+        let lease = open(r, Box::new(|| {}));
+        assert!(matches!(lease.shared().kind, LeaseKind::Untracked));
+        assert!(!lease.shared().is_trackable());
+
+        // Not running: the entry also carries detect signals, which would normally make this a
+        // `Matched` lease. `launcher` outranks them.
+        let mut r = req(
+            "steam:big-picture-2",
+            DetectSpec::exe("/usr/bin/steam"),
+            false,
+        );
+        r.launcher = true;
+        assert!(
+            !r.spec.is_empty(),
+            "the guard is only meaningful with signals"
+        );
+        let lease = open(r, Box::new(|| {}));
+        assert!(matches!(lease.shared().kind, LeaseKind::Untracked));
+        assert!(!lease.shared().is_trackable());
+
+        // The same request WITHOUT the flag is tracked - so the assertions above are the flag's
+        // doing, not an artifact of the fixture.
+        let plain = open(
+            req("steam:570", DetectSpec::exe("/usr/bin/steam"), false),
+            Box::new(|| {}),
+        );
+        assert!(matches!(plain.shared().kind, LeaseKind::Matched));
+        assert!(plain.shared().is_trackable());
     }
 
     /// Is a lease for `id` currently on probation?
@@ -1035,6 +1252,34 @@ mod tests {
         pending_snapshot()
             .iter()
             .any(|(s, _)| s.game.id.as_deref() == Some(id))
+    }
+
+    /// The exit rule, including the thing that was missing: the veto ENDS.
+    ///
+    /// Field 2026-08-06 (Windows 0.24.0): Steam's per-app `Running` flag was left set after the game
+    /// exited, the watcher honoured it on every pass and reset its own confirm window each time, so
+    /// the game read as running for the life of the host and the stream never auto-ended. The last
+    /// case below is that regression.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_launcher_veto_expires_instead_of_pinning_a_session_open() {
+        let brief = EXIT_CONFIRM / 2;
+        let confirmed = EXIT_CONFIRM + Duration::from_secs(1);
+        let long = VETO_LIMIT + Duration::from_secs(1);
+
+        // Too early to call it either way — a process swap is still plausible.
+        assert!(!exit_confirmed(brief, false));
+        assert!(!exit_confirmed(brief, true));
+        // Gone past the confirm window with nothing objecting: exited.
+        assert!(exit_confirmed(confirmed, false));
+        // Same, but the launcher objects — that is what the veto is FOR, so hold off.
+        assert!(!exit_confirmed(confirmed, true));
+        // …and this is the bound. Still objecting, but nothing of the game has existed for
+        // VETO_LIMIT, so the objection is stale and the session ends anyway.
+        assert!(exit_confirmed(long, true));
+        assert!(exit_confirmed(long, false));
+        // (The middle two cases together also pin VETO_LIMIT > EXIT_CONFIRM: a veto that did not
+        // outlast the window it overrides could never hold anything off in the first place.)
     }
 
     #[test]
@@ -1096,14 +1341,16 @@ mod tests {
             Duration::from_secs(3_600),
         );
         // A different client, or a different title, does not reprieve it.
-        assert_eq!(readopt(Some("fp-other"), Some(id)), 0);
-        assert_eq!(readopt(Some("fp-130"), Some("steam:9999")), 0);
+        assert!(readopt(Some("fp-other"), Some(id)).is_empty());
+        assert!(readopt(Some("fp-130"), Some("steam:9999")).is_empty());
         // A missing fingerprint on either side must not reprieve anything either — otherwise any
         // unidentified reconnect could keep any game alive.
-        assert_eq!(readopt(None, Some(id)), 0);
+        assert!(readopt(None, Some(id)).is_empty());
         assert!(is_pending(id), "none of those should have reprieved it");
-        // The right client coming back for the right title does.
-        assert_eq!(readopt(Some("fp-130"), Some(id)), 1);
+        // The right client coming back for the right title does — and names what it saved.
+        let saved = readopt(Some("fp-130"), Some(id));
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].game.id.as_deref(), Some(id));
         assert!(!is_pending(id));
     }
 
@@ -1118,7 +1365,7 @@ mod tests {
             .expect("armed lease is pending");
         assert!(mine.1 > 290 && mine.1 <= 300, "remaining was {}", mine.1);
         // Leave the registry as we found it, so a sibling test's sweep can't see this entry.
-        assert_eq!(readopt(Some("fp-140"), Some(id)), 1);
+        assert_eq!(readopt(Some("fp-140"), Some(id)).len(), 1);
     }
 
     #[test]
@@ -1144,7 +1391,7 @@ mod tests {
         assert!(!lb.shared().is_terminating());
         // An id nobody is waiting on ends nothing.
         assert_eq!(end_pending(Some("steam:99999")), 0);
-        assert_eq!(readopt(Some("fp-151"), Some(b)), 1);
+        assert_eq!(readopt(Some("fp-151"), Some(b)).len(), 1);
     }
 
     /// A launcher that hands off and exits must never be mistaken for the game.
@@ -1178,8 +1425,10 @@ mod tests {
                 // A real signal that no process will ever match — the game never shows up.
                 spec: DetectSpec::steam(999_001),
                 nested: false,
+                launcher: false,
                 child: Some((child, false)),
                 launch_stamp: None,
+                procs: None,
             },
             Box::new(|| {
                 EXITS.fetch_add(1, Ordering::SeqCst);
@@ -1236,8 +1485,10 @@ mod tests {
                 plane: crate::events::Plane::Native,
                 spec: DetectSpec::dir(td.path()),
                 nested: false,
+                launcher: false,
                 child: Some((child, true)),
                 launch_stamp,
+                procs: None,
             },
             Box::new(|| {
                 EXITS.fetch_add(1, Ordering::SeqCst);

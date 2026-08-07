@@ -176,10 +176,7 @@
               pkgs.librsvg
               pkgs.gsettings-desktop-schemas
               pkgs.adwaita-icon-theme
-              pkgs.vulkan-headers
             ];
-            # pf-ffvk bindgen (no /usr/include on NixOS); GPU driver libs at runtime for `cargo run`.
-            PF_FFVK_VULKAN_INCLUDE = "${pkgs.vulkan-headers}/include";
             # CMake ≥ 4 rejects the pre-3.5 minimums some vendored C libs (libopus) still declare.
             CMAKE_POLICY_VERSION_MINIMUM = "3.5";
             LD_LIBRARY_PATH = "/run/opengl-driver/lib:${

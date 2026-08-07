@@ -11,8 +11,9 @@
 
 use crate::anim::Progress;
 use crate::glyphs::GlyphStyle;
-use crate::library::{mesh_sksl, LibraryShared};
+use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
 use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
@@ -72,6 +73,10 @@ pub(crate) struct Shell {
     deck: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
+    /// The last host title a connect was raised for, kept past the connect itself so
+    /// [`Self::session_reconnecting`] can name the host it is re-dialing — that flow
+    /// raises no `Launch` of its own and therefore never passes a title through.
+    last_connect_title: Option<String>,
     wake: Option<WakeStatus>,
     /// True while `wake` is the shell's own optimistic placeholder — raised the instant a
     /// screen queues `ConsoleCmd::Wake` (see [`Self::apply`]), before the service thread has
@@ -81,11 +86,31 @@ pub(crate) struct Shell {
     wake_optimistic: bool,
     toast: Option<Toast>,
     mesh: RuntimeEffect,
-    /// 0 = aurora, 1 = form — chased, so backdrops crossfade with the transition.
+    /// The `ui_palette` the compiled `mesh` bakes. The settings screen can change the palette
+    /// mid-frame-loop, so [`Self::sync`] recompiles when this falls out of step — the backdrop
+    /// re-colours under the cursor as the row is stepped, which is the whole point of putting
+    /// the picker on a screen the backdrop is behind.
+    mesh_palette: String,
+    /// The palette's ground × 0.4 — the calm lift, precomputed with `mesh`. Chosen so
+    /// `col*0.6 + lift` leaves the ground EXACTLY where it was and pulls the bright pools down
+    /// to it: the form screens lose the launcher's contrast, not its colour.
+    mesh_lift: [f32; 3],
+    /// The backdrop's scrim under this palette: rgb = what the vignette and scrims tend
+    /// toward (black on a dark field, white on a pale one), a = how hard. Kept with the ink.
+    mesh_scrim: [f32; 4],
+    /// The text/accent/glass the palette calls for, published to the whole crate once per
+    /// frame (see [`crate::theme::set_ink`]).
+    ink: crate::theme::Ink,
+    /// 0 = launcher aurora, 1 = the calm form field — chased, so the backdrop settles into
+    /// (or out of) calm alongside the screen transition.
     bg_mix: f64,
     glyphs: GlyphStyle,
     chip: Option<String>,
     pads: Vec<PadInfo>,
+    /// The settled top screen's hint-bar hit boxes, republished every frame by
+    /// [`Shell::render`]. The legend is the console's only on-screen statement of what the
+    /// face buttons do; for a pointer, which has none, it IS the button bar.
+    hint_rects: Vec<(crate::glyphs::HintKey, Rect)>,
     t0: Instant,
     last_frame: Option<Instant>,
 }
@@ -99,8 +124,8 @@ impl Shell {
         stack: Vec<Screen>,
     ) -> Result<Shell> {
         anyhow::ensure!(!stack.is_empty(), "the console needs a root screen");
-        let mesh = RuntimeEffect::make_for_shader(mesh_sksl(), None)
-            .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+        let settings = trust::Settings::load();
+        let (mesh, mesh_lift, mesh_scrim, ink) = build_mesh(&settings.ui_palette)?;
         let bg_mix = match stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -112,21 +137,27 @@ impl Shell {
             library,
             bus,
             actions: VecDeque::new(),
-            settings: trust::Settings::load(),
+            mesh_palette: settings.ui_palette.clone(),
+            settings,
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
             deck: opts.deck,
             in_stream: false,
             connecting: None,
+            last_connect_title: None,
             wake: None,
             wake_optimistic: false,
             toast: None,
             mesh,
+            mesh_lift,
+            mesh_scrim,
+            ink,
             bg_mix,
             glyphs: GlyphStyle::Keyboard,
             chip: None,
             pads: Vec::new(),
+            hint_rects: Vec::new(),
             t0: Instant::now(),
             last_frame: None,
         })
@@ -151,6 +182,7 @@ impl Shell {
     pub(crate) fn set_connecting(&mut self, title: Option<String>) {
         match title {
             Some(title) => {
+                self.last_connect_title = Some(title.clone());
                 self.connecting = Some(Connecting {
                     title,
                     canceling: false,
@@ -181,6 +213,38 @@ impl Shell {
         }
     }
 
+    /// The stream stopped and the client is dialing again on its own (M8's codec
+    /// fallback). Says what changed — the picture is about to come back as a different
+    /// codec and silence would read as a glitch — and raises the connecting modal.
+    ///
+    /// The modal is not cosmetic. Nothing raises a `Launch` for this retry (the run loop
+    /// starts the pump itself), so without it the shell would be in a state no other flow
+    /// produces: not streaming, not connecting, and a live pump behind the console. All
+    /// three gates would open at once — menu events flowing, the console drawn
+    /// full-screen over a frozen picture, and no modal interlock — and pressing A would
+    /// launch a SECOND session on top of the running one. This is also what gives B
+    /// somewhere to go: the modal's Back raises `CancelConnect`, which the run loop
+    /// applies to the retry's pump exactly as it does to a first dial.
+    ///
+    /// `appear = 1.0`: the takeover is already the thing on screen (the retry follows a
+    /// live stream), so fading it in would read as a flash rather than a transition.
+    pub(crate) fn session_reconnecting(&mut self, msg: &str) {
+        self.in_stream = false;
+        self.connecting = Some(Connecting {
+            // The host this session was dialed to. `None` only if the shell never raised
+            // the connect itself (a `--connect` run has no console at all, so it never
+            // reaches here) — name the codec change instead of an empty string.
+            title: self
+                .last_connect_title
+                .clone()
+                .unwrap_or_else(|| "the host".to_string()),
+            canceling: false,
+            appear: 1.0,
+            request_access: false,
+        });
+        self.show_toast(msg.to_string());
+    }
+
     fn show_toast(&mut self, text: String) {
         self.toast = Some(Toast { text, at: self.t() });
     }
@@ -188,6 +252,28 @@ impl Shell {
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
 
     fn sync(&mut self) {
+        // The settings screen writes `ui_palette` straight into `self.settings`; recompiling
+        // here is what makes the backdrop re-colour live under the row being stepped. A
+        // rejected compile keeps the palette that IS drawing — the field never goes black
+        // because someone picked a colour.
+        if self.settings.ui_palette != self.mesh_palette {
+            match build_mesh(&self.settings.ui_palette) {
+                Ok((mesh, lift, scrim, ink)) => {
+                    self.mesh = mesh;
+                    self.mesh_lift = lift;
+                    self.mesh_scrim = scrim;
+                    self.ink = ink;
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "console: {} palette rejected: {e}",
+                        self.settings.ui_palette
+                    );
+                    self.mesh_palette = self.settings.ui_palette.clone();
+                }
+            }
+        }
         if self.console.hosts_gen() != self.hosts_gen {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
         }
@@ -336,10 +422,81 @@ impl Shell {
         pulse
     }
 
+    /// Mouse and touch, in device pixels. `true` = consumed.
+    ///
+    /// The precedence mirrors [`Self::handle_menu`] exactly, and for the same reasons: a
+    /// modal card owns input while it is up, and a screen in motion takes none at all. The
+    /// one addition is the hint bar, which sits above the screens because a pointer has no
+    /// face buttons and the legend is where those actions live.
+    pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
+        self.sync();
+        // The right button is the pointer's B, everywhere — including on the modal cards,
+        // where Back is the only thing that answers at all.
+        //
+        // With ONE exception: B at the root quits the launcher, and a right-click is far
+        // easier to fire by accident than a thumb on B. Quitting stays an explicit act —
+        // the legend's "Quit" is clickable, and that is the pointer's way out.
+        if p.kind == PointerKind::Back {
+            if self.stack.len() > 1 || self.connecting.is_some() || self.wake.is_some() {
+                self.handle_menu(MenuEvent::Back);
+            }
+            return true;
+        }
+        // A modal swallows the rest: clicking "past" a connect takeover onto the library
+        // behind it would start a second session, which is the same hole the menu path
+        // closes by returning early here.
+        if self.connecting.is_some() || self.wake.is_some() {
+            return true;
+        }
+        if !matches!(self.motion, Motion::None) {
+            return true;
+        }
+        if p.press() {
+            if let Some((key, _)) = self.hint_rects.iter().find(|(_, r)| p.hits(*r)) {
+                // Only the face-button hints are actions. Shoulders and Adjust describe a
+                // DIRECTION, and the thing they steer — the tab strip, a row's value — is
+                // already under the pointer's finger; inventing a side for a click here
+                // would just be a worse way to press what it can already press.
+                let ev = match key {
+                    crate::glyphs::HintKey::Confirm => Some(MenuEvent::Confirm),
+                    crate::glyphs::HintKey::Back => Some(MenuEvent::Back),
+                    crate::glyphs::HintKey::Secondary => Some(MenuEvent::Secondary),
+                    crate::glyphs::HintKey::Tertiary => Some(MenuEvent::Tertiary),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    self.handle_menu(ev);
+                }
+                return true;
+            }
+        }
+
+        let mut fx = Outbox::default();
+        let consumed = {
+            let mut ctx = Ctx {
+                hosts: &self.hosts,
+                library: &self.library,
+                settings: &mut self.settings,
+                pads: &self.pads,
+                deck: self.deck,
+                device_name: &self.device_name,
+                t: self.t0.elapsed().as_secs_f64(),
+            };
+            self.stack
+                .last_mut()
+                .expect("non-empty stack")
+                .pointer(p, &mut ctx, &mut fx)
+        };
+        self.apply(fx);
+        consumed
+    }
+
     /// The keyboard fallback — the console is fully drivable with no pad. Arrows and
     /// Enter/Esc map onto menu events; Y/X mirror the pad's Secondary/Tertiary
     /// (suppressed while editing, where letters are text).
-    pub(crate) fn key(&mut self, sc: sdl3::keyboard::Scancode, repeat: bool) -> bool {
+    ///
+    /// `shift` only matters for Tab, whose two directions are one key.
+    pub(crate) fn key(&mut self, sc: sdl3::keyboard::Scancode, shift: bool, repeat: bool) -> bool {
         use sdl3::keyboard::Scancode as S;
         if self.editing() {
             if let Some(top) = self.stack.last_mut() {
@@ -359,6 +516,12 @@ impl Shell {
             S::Escape | S::Backspace if !repeat => MenuEvent::Back,
             S::PageUp if !repeat => MenuEvent::JumpBack,
             S::PageDown if !repeat => MenuEvent::JumpForward,
+            // Tab is what a keyboard reaches for to change section, and the settings tabs
+            // were otherwise on PgUp/PgDn alone — a binding the legend only ever spells out
+            // when NO pad is attached, so with a controller plugged in there was nothing to
+            // discover. Shift+Tab goes back, as everywhere else.
+            S::Tab if !repeat && shift => MenuEvent::JumpBack,
+            S::Tab if !repeat => MenuEvent::JumpForward,
             S::Y if !repeat && !editing => MenuEvent::Secondary,
             S::X if !repeat && !editing => MenuEvent::Tertiary,
             _ => return false,
@@ -403,6 +566,9 @@ impl Shell {
         if let Some(text) = fx.toast {
             self.show_toast(text);
         }
+        if let Some(text) = fx.copy {
+            self.actions.push_back(OverlayAction::CopyText(text));
+        }
         if let Some(intent) = fx.connect {
             self.start_connect(intent);
         }
@@ -414,6 +580,14 @@ impl Shell {
     fn apply_nav(&mut self, nav: Nav) {
         match nav {
             Nav::Push(screen) => {
+                self.stack.push(*screen);
+                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+            }
+            Nav::Replace(screen) => {
+                // Swap under the SAME push choreography: the outgoing screen is dropped
+                // rather than parked, so Back from the incoming one lands where the
+                // replaced screen was reached from.
+                self.stack.pop();
                 self.stack.push(*screen);
                 self.motion = Motion::Push(Progress::new(TRANSITION_S));
             }
@@ -432,12 +606,30 @@ impl Shell {
         }
     }
 
-    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64) {
-        let uniforms: [f32; 3] = [w as f32, h as f32, t as f32];
-        // SAFETY: `uniforms` is a local `[f32; 3]` — exactly 12 bytes — and `f32` has no padding or
-        // invalid bit patterns, so reading it as bytes is sound; the slice is copied by
+    /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
+    /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
+    /// former aurora-over-static-form crossfade is now a single uniform.
+    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4),
+        // u_scrim (float4).
+        let uniforms: [f32; 12] = [
+            w as f32,
+            h as f32,
+            t as f32,
+            calm as f32,
+            self.mesh_lift[0],
+            self.mesh_lift[1],
+            self.mesh_lift[2],
+            0.0,
+            self.mesh_scrim[0],
+            self.mesh_scrim[1],
+            self.mesh_scrim[2],
+            self.mesh_scrim[3],
+        ];
+        // SAFETY: `uniforms` is a local `[f32; 12]` — exactly 48 bytes — and `f32` has no padding
+        // or invalid bit patterns, so reading it as bytes is sound; the slice is copied by
         // `Data::new_copy` before `uniforms` goes out of scope.
-        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 12) };
+        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 48) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
                 let mut paint = Paint::default();
@@ -449,6 +641,33 @@ impl Shell {
             }
         }
     }
+}
+
+/// Compile the mesh shader for a palette and resolve everything else that palette decides:
+/// the calm lift, the scrim direction, and the ink the whole UI draws with.
+/// `uniform_size` is checked rather than assumed: the byte buffer [`Shell::draw_aurora`]
+/// hands Skia is hand-packed, and a silent layout change would feed the field garbage
+/// instead of failing.
+type MeshLook = (RuntimeEffect, [f32; 3], [f32; 4], crate::theme::Ink);
+
+fn build_mesh(palette_id: &str) -> Result<MeshLook> {
+    let p = palette(palette_id);
+    let colors = p.mesh_colors();
+    let effect = RuntimeEffect::make_for_shader(mesh_sksl(&colors), None)
+        .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
+    anyhow::ensure!(
+        effect.uniform_size() == 48,
+        "mesh uniform block is {} bytes, expected 48 (u_res, u_tc, u_lift, u_scrim)",
+        effect.uniform_size()
+    );
+    let ink = crate::theme::Ink::of(p);
+    let g = p.ground;
+    Ok((
+        effect,
+        [(g.0 * 0.4) as f32, (g.1 * 0.4) as f32, (g.2 * 0.4) as f32],
+        [ink.scrim.r, ink.scrim.g, ink.scrim.b, ink.scrim.a],
+        ink,
+    ))
 }
 
 #[cfg(test)]

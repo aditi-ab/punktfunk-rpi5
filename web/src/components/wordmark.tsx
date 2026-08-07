@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
 
-// The punktfunk "funk" wordmark — the real brand typo, vectorised from the
+// The Punktfunk "funk" wordmark — the real brand typo, vectorised from the
 // marketing logo. currentColor so it recolours per surface; defaults to the
 // light-violet lens highlight that reads on the dark console chrome. Size via
 // height (e.g. `h-5`); width follows the viewBox.

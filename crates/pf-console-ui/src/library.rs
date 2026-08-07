@@ -203,17 +203,237 @@ pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
     (0.667, 0.667, 0.12, 0.047, 0.061, 5.0),
 ];
 
-/// The mesh gradient as SkSL, palette + motion baked into the source (only time and
-/// resolution are uniforms). A smooth bicubic blend of the 16 colours — a separable
+// --- Background palettes -------------------------------------------------------------------
+
+/// One background colour family for the gamepad UI's living backdrop.
+///
+/// A palette is a short ordered ramp of [`Palette::stops`] — several DISTINCT hues, not one hue
+/// at several brightnesses. The 4×4 mesh samples that ramp diagonally with a per-cell offset
+/// ([`CELL_RAMP`]), so neighbouring cells land on different parts of it and the colours pool and
+/// swirl the way a real gradient poster does; the interior points' existing domain warp then
+/// drifts those pools around. An earlier version rotated ONE field's hue per palette, which is
+/// why every non-default palette read as flat and monotone.
+///
+/// A palette also owns the UI it sits under: [`Palette::accent`] is the focus wash / selected
+/// pill / switch colour, and [`Palette::light`] flips the ink (see [`crate::theme::Ink`]) so a
+/// pale field gets dark text instead of white. The Apple and Android clients carry the same
+/// table under the same ids, so one `ui_palette` value is one look everywhere.
+pub struct Palette {
+    /// The stored `ui_palette` value (see `trust::Settings::ui_palette`).
+    pub id: &'static str,
+    /// What the settings row shows.
+    pub name: &'static str,
+    /// The colour ramp, dark end first. `None` = use [`MESH_COLORS`] verbatim (the brand
+    /// default, kept bit-identical to what every install already sees).
+    pub stops: Option<&'static [(f64, f64, f64)]>,
+    /// The field's ground — what the corners settle onto and what the calm mix lifts toward.
+    pub ground: (f64, f64, f64),
+    /// The UI accent: focus wash, selected tab pill, switch track, caret.
+    pub accent: (f64, f64, f64),
+    /// A pale field: the UI flips to dark ink and the legibility scrims go white.
+    pub light: bool,
+}
+
+/// Where each of the 16 mesh cells samples the ramp. The base is the diagonal
+/// `0.5·(x + y)` — top-left is the ramp's dark end, bottom-right its bright one, like both
+/// reference gradients — and the per-cell nudges break the banding that a pure diagonal would
+/// give, so hues pool instead of striping.
+#[rustfmt::skip]
+const CELL_RAMP: [f64; 16] = [
+     0.10, -0.06,  0.04, -0.12,
+    -0.08,  0.14, -0.10,  0.06,
+     0.06, -0.12,  0.16, -0.04,
+    -0.10,  0.08, -0.06,  0.12,
+];
+
+/// The twelve shipped palettes: the brand default, five more dark fields, then six pale ones.
+/// Cycling order runs dark → light, so stepping the row walks the whole range in one direction.
+/// Adding one here adds it to every console settings screen; the Apple and Android tables must
+/// gain the same entry to keep the `ui_palette` key portable.
+#[rustfmt::skip]
+pub const PALETTES: [Palette; 12] = [
+    // --- dark fields (white ink) ---
+    Palette {
+        id: "violet", name: "Violet", stops: None,
+        ground: (0.075, 0.060, 0.160), accent: (0.525, 0.471, 0.961), light: false,
+    },
+    Palette {
+        // Deep indigo climbing through violet into a hot magenta.
+        id: "nebula", name: "Nebula",
+        stops: Some(&[
+            (0.07, 0.05, 0.20), (0.26, 0.14, 0.54), (0.52, 0.20, 0.72),
+            (0.82, 0.26, 0.62), (0.98, 0.46, 0.68),
+        ]),
+        ground: (0.055, 0.040, 0.135), accent: (0.95, 0.42, 0.72), light: false,
+    },
+    Palette {
+        // Ink-blue water: teal → cerulean → a violet undertow.
+        id: "abyss", name: "Abyss",
+        stops: Some(&[
+            (0.02, 0.10, 0.17), (0.04, 0.28, 0.42), (0.07, 0.46, 0.63),
+            (0.16, 0.38, 0.78), (0.26, 0.22, 0.58),
+        ]),
+        ground: (0.018, 0.070, 0.130), accent: (0.26, 0.76, 0.92), light: false,
+    },
+    Palette {
+        // Banked coals: plum embers → crimson → burnt orange → gold.
+        id: "ember", name: "Ember",
+        stops: Some(&[
+            (0.16, 0.03, 0.10), (0.45, 0.06, 0.12), (0.72, 0.18, 0.06),
+            (0.90, 0.42, 0.08), (0.95, 0.68, 0.18),
+        ]),
+        ground: (0.090, 0.035, 0.040), accent: (0.98, 0.62, 0.26), light: false,
+    },
+    Palette {
+        // Forest floor into moss and a lime break.
+        id: "moss", name: "Moss",
+        stops: Some(&[
+            (0.03, 0.11, 0.09), (0.06, 0.27, 0.20), (0.09, 0.45, 0.31),
+            (0.28, 0.61, 0.28), (0.58, 0.77, 0.31),
+        ]),
+        ground: (0.025, 0.085, 0.070), accent: (0.48, 0.86, 0.46), light: false,
+    },
+    Palette {
+        // Neutral, but never flat: barely-there saturation that still travels from a cool
+        // charcoal to a warm stone, so even the restrained option has somewhere to go.
+        id: "graphite", name: "Graphite",
+        stops: Some(&[
+            (0.06, 0.07, 0.11), (0.15, 0.18, 0.25), (0.30, 0.31, 0.35),
+            (0.45, 0.42, 0.38), (0.60, 0.56, 0.49),
+        ]),
+        ground: (0.055, 0.055, 0.070), accent: (0.78, 0.80, 0.86), light: false,
+    },
+    // --- pale fields (dark ink) ---
+    Palette {
+        // The holographic foil: rose → lilac → periwinkle → aqua, with a white bloom.
+        id: "holo", name: "Holo",
+        stops: Some(&[
+            (0.99, 0.72, 0.90), (0.80, 0.60, 0.98), (0.58, 0.62, 0.99),
+            (0.55, 0.86, 0.98), (0.94, 0.98, 1.00),
+        ]),
+        ground: (0.96, 0.92, 0.99), accent: (0.42, 0.28, 0.86), light: true,
+    },
+    Palette {
+        // The poster sunset: periwinkle → magenta → scarlet → tangerine → gold.
+        id: "sunset", name: "Sunset",
+        stops: Some(&[
+            (0.55, 0.45, 0.92), (0.86, 0.31, 0.66), (0.97, 0.26, 0.34),
+            (0.99, 0.51, 0.18), (1.00, 0.80, 0.22),
+        ]),
+        ground: (0.98, 0.74, 0.34), accent: (0.64, 0.13, 0.44), light: true,
+    },
+    Palette {
+        // Peach into blush and lilac — the softest of the set.
+        id: "bloom", name: "Bloom",
+        stops: Some(&[
+            (1.00, 0.86, 0.72), (0.99, 0.73, 0.79), (0.95, 0.65, 0.89),
+            (0.82, 0.68, 0.96), (0.73, 0.79, 0.99),
+        ]),
+        ground: (0.99, 0.90, 0.89), accent: (0.72, 0.24, 0.55), light: true,
+    },
+    Palette {
+        // First light: pale gold → coral → lilac.
+        id: "dawn", name: "Dawn",
+        stops: Some(&[
+            (1.00, 0.92, 0.70), (1.00, 0.80, 0.62), (0.99, 0.66, 0.62),
+            (0.90, 0.62, 0.78), (0.77, 0.69, 0.95),
+        ]),
+        ground: (1.00, 0.93, 0.82), accent: (0.82, 0.33, 0.28), light: true,
+    },
+    Palette {
+        // Sea glass: mint → aqua → a pale sky.
+        id: "mint", name: "Mint",
+        stops: Some(&[
+            (0.82, 0.98, 0.90), (0.62, 0.94, 0.88), (0.55, 0.88, 0.95),
+            (0.63, 0.82, 0.99), (0.82, 0.87, 1.00),
+        ]),
+        ground: (0.90, 0.98, 0.96), accent: (0.04, 0.42, 0.40), light: true,
+    },
+    Palette {
+        // Near-white, but iridescent rather than flat — rose, sky, mint and cream in turn.
+        id: "opal", name: "Opal",
+        stops: Some(&[
+            (0.98, 0.92, 0.96), (0.87, 0.93, 0.99), (0.91, 0.99, 0.95),
+            (0.99, 0.96, 0.88), (0.94, 0.90, 0.99),
+        ]),
+        ground: (0.97, 0.96, 0.99), accent: (0.36, 0.32, 0.44), light: true,
+    },
+];
+
+/// The palette stored under `id`, falling back to the brand default — an unknown name is a
+/// palette a newer client shipped, not a reason to draw nothing.
+pub fn palette(id: &str) -> &'static Palette {
+    PALETTES.iter().find(|p| p.id == id).unwrap_or(&PALETTES[0])
+}
+
+/// Sample an ordered colour ramp at `t` ∈ [0, 1] (linear between neighbouring stops). Ported
+/// verbatim to Swift and Kotlin — keep the three copies in step or a palette drifts between
+/// clients.
+pub fn ramp(stops: &[(f64, f64, f64)], t: f64) -> (f64, f64, f64) {
+    match stops.len() {
+        0 => (0.0, 0.0, 0.0),
+        1 => stops[0],
+        n => {
+            let x = t.clamp(0.0, 1.0) * (n - 1) as f64;
+            let i = (x.floor() as usize).min(n - 2);
+            let f = x - i as f64;
+            let (a, b) = (stops[i], stops[i + 1]);
+            (
+                a.0 + (b.0 - a.0) * f,
+                a.1 + (b.1 - a.1) * f,
+                a.2 + (b.2 - a.2) * f,
+            )
+        }
+    }
+}
+
+impl Palette {
+    /// The 16 mesh colours for this palette: the ramp sampled per cell (see [`CELL_RAMP`]), or
+    /// [`MESH_COLORS`] verbatim for the brand default.
+    pub fn mesh_colors(&self) -> [(f64, f64, f64); 16] {
+        let Some(stops) = self.stops else {
+            return MESH_COLORS;
+        };
+        core::array::from_fn(|i| {
+            let (x, y) = ((i % 4) as f64 / 3.0, (i / 4) as f64 / 3.0);
+            ramp(stops, 0.5 * (x + y) + CELL_RAMP[i])
+        })
+    }
+
+    /// Four drifting blob colours, for the clients that approximate the mesh with a blob field
+    /// (Android). Spread across the ramp so the field still shows several hues at once.
+    pub fn blob_colors(&self) -> [(f64, f64, f64); 4] {
+        let stops = self.stops.unwrap_or(&VIOLET_BLOBS);
+        core::array::from_fn(|i| ramp(stops, 0.15 + 0.25 * i as f64))
+    }
+}
+
+/// The brand default's blob ramp — the four colours the pre-palette Android/legacy-Apple field
+/// used, kept so `violet` is unchanged there too.
+const VIOLET_BLOBS: [(f64, f64, f64); 5] = [
+    (0.53, 0.47, 0.96),
+    (0.24, 0.20, 0.72),
+    (0.62, 0.30, 0.80),
+    (0.22, 0.38, 0.86),
+    (0.53, 0.47, 0.96),
+];
+
+/// The mesh gradient as SkSL, palette + motion baked into the source (resolution, time and
+/// the calm mix are uniforms). A smooth bicubic blend of the 16 colours — a separable
 /// cubic-Bézier basis in x then y, C∞ and edge-to-edge, the fragment-shader analogue of
 /// SwiftUI's `MeshGradient(smoothsColors: true)`. The four interior points drive a
 /// bounded (weighted-average) domain warp so the bright pools drift; then the whole field
 /// gets the ±8°/~5-min hue sway, an elliptical vignette, and the vertical legibility scrim,
 /// all matching the Swift `composite(at:)`. Runs on the GPU at full rate.
-pub fn mesh_sksl() -> String {
+///
+/// `u_tc.y` is the CALM mix, 0 → 1: at 1 the same living field is flattened toward its own
+/// corner colour (`u_lift`), which is how the form screens (settings, add-host, pair) stay
+/// restful while still drifting — the motion never changes speed, only the contrast, so the
+/// crossfade between a launcher screen and a form screen can't make the field jump.
+pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
     // Colours as `float3(r, g, b)` literals, indices 0..15 (row-major 4×4).
     let c = |i: usize| {
-        let (r, g, b) = MESH_COLORS[i];
+        let (r, g, b) = colors[i];
         format!("float3({r}, {g}, {b})")
     };
     // The four interior-point domain-warp accumulators. Displacement matches Swift `wob()`:
@@ -224,14 +444,23 @@ pub fn mesh_sksl() -> String {
         warp.push_str(&format!(
             "    q = uv - float2({bx}, {by});\n\
                  ww = exp(-dot(q, q) / (2.0 * 0.30 * 0.30));\n\
-                 d = float2({amp} * sin(u_t * {sx} + {ph}), \
-                            {amp} * cos(u_t * {sy} + {ph} * 1.3));\n\
+                 d = float2({amp} * sin(tt * {sx} + {ph}), \
+                            {amp} * cos(tt * {sy} + {ph} * 1.3));\n\
                  wsum += d * ww; wtot += ww;\n",
         ));
     }
     format!(
         "uniform float2 u_res;\n\
-         uniform float u_t;\n\
+         // x = seconds since the shell started, y = the calm mix (0 launcher, 1 form).\n\
+         uniform float2 u_tc;\n\
+         // rgb = the palette's corner colour scaled for the calm lift; a is unused (float4\n\
+         // so the uniform block stays 16-byte aligned under any packing rule).\n\
+         uniform float4 u_lift;\n\
+         // rgb = what the vignette and scrims tend toward (black under a dark palette, white\n\
+         // under a pale one — darkening a pastel field would strand the dark text on it), and\n\
+         // a = how hard. A pale field needs far less: mixing toward white at the dark field's\n\
+         // strength bleaches the chroma straight out of the gradient.\n\
+         uniform float4 u_scrim;\n\
          \n\
          // Cubic-Bézier basis over four control values — the smooth 4-point blend per axis.\n\
          float bz(float t, float a, float b, float c, float d) {{\n\
@@ -250,6 +479,7 @@ pub fn mesh_sksl() -> String {
          }}\n\
          \n\
          half4 main(float2 xy) {{\n\
+         \x20   float tt = u_tc.x; float calm = u_tc.y;\n\
          \x20   float2 uv = xy / u_res;\n\
          \x20   // Interior control points wander → bounded domain warp (pools follow them).\n\
          \x20   float2 wsum = float2(0.0); float wtot = 0.0; float2 q; float ww; float2 d;\n\
@@ -263,19 +493,27 @@ pub fn mesh_sksl() -> String {
          \x20   float3 r3 = bz3(uv.x, {c12}, {c13}, {c14}, {c15});\n\
          \x20   float3 col = bz3(uv.y, r0, r1, r2, r3);\n\
          \n\
-         \x20   col = hue(col, sin(u_t * 0.021) * 0.1396263);\n\
+         \x20   col = hue(col, sin(tt * 0.021) * 0.1396263);\n\
+         \n\
+         \x20   // Calm: flatten the field toward its own corner colour — the pools dim and the\n\
+         \x20   // corners lift, so a form screen keeps real colour under its glass rows while\n\
+         \x20   // losing the launcher's contrast. Motion is untouched (see the doc comment).\n\
+         \x20   col = mix(col, col * 0.60 + u_lift.rgb, calm);\n\
          \n\
          \x20   // Elliptical vignette: clear at r=0.25 → black·0.42 at r=1.15 (aspect-fit ellipse).\n\
+         \x20   // Halved under calm: a launcher's cards sit in the pooled centre, but a form\n\
+         \x20   // screen's rows run out toward the edges, where crushing to black just eats them.\n\
          \x20   float2 e = (xy / u_res - 0.5) * 2.0;\n\
-         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0) * 0.42;\n\
-         \x20   col *= 1.0 - vig;\n\
+         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0)\n\
+         \x20             * mix(0.42, 0.21, calm) * u_scrim.a;\n\
+         \x20   col = mix(col, u_scrim.rgb, vig);\n\
          \n\
          \x20   // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n\
          \x20   float v = xy.y / u_res.y;\n\
          \x20   float s = v < 0.32 ? mix(0.38, 0.06, v / 0.32)\n\
          \x20           : v < 0.68 ? mix(0.06, 0.08, (v - 0.32) / 0.36)\n\
          \x20           : mix(0.08, 0.40, (v - 0.68) / 0.32);\n\
-         \x20   col *= 1.0 - s;\n\
+         \x20   col = mix(col, u_scrim.rgb, s * u_scrim.a);\n\
          \n\
          \x20   return half4(half3(col), 1.0);\n\
          }}\n",
@@ -306,6 +544,11 @@ pub struct LibraryGame {
     pub id: String,
     pub title: String,
     pub store: String,
+    /// This entry opens the launcher itself (Steam Big Picture, Heroic, Lutris) rather than a
+    /// title — design D4. The host's `role` field, already reduced to a boolean by
+    /// [`pf_client_core::library::GameEntry::is_launcher`] so the "anything that isn't
+    /// `launcher` is a game" rule lives in exactly one place.
+    pub launcher: bool,
 }
 
 struct Shared {
@@ -341,7 +584,15 @@ impl LibraryShared {
     }
 
     /// Loaded games → the carousel (empty = the empty scene).
+    ///
+    /// **Launcher entries are moved to the front, keeping the host's title order within each
+    /// group.** Grouping here rather than in the renderer means the carousel's cursor arithmetic,
+    /// the art pump and every future consumer of this model all inherit the invariant for free —
+    /// a launcher tile is never buried in the middle of a 400-title shelf.
     pub fn set_games(&self, games: Vec<LibraryGame>) {
+        let mut games = games;
+        // `sort_by_key` is stable, so this is a partition that preserves the incoming order.
+        games.sort_by_key(|g| !g.launcher);
         let mut s = self.0.lock().unwrap();
         s.phase = if games.is_empty() {
             LibraryPhase::Empty
@@ -406,6 +657,52 @@ mod tests {
         assert_eq!(step_cursor(4, 5, 1, false), StepResult::Boundary);
         assert_eq!(step_cursor(2, 5, 1, false), StepResult::Moved(3));
         assert_eq!(step_cursor(0, 0, 1, false), StepResult::Boundary);
+    }
+
+    /// Design D4: launcher entries lead the shelf, and the host's title order survives within
+    /// each group. The renderer's `launcher_count()` reads the launcher group as the prefix
+    /// `0..n`, so an interleaved list would silently mislabel the group heading.
+    #[test]
+    fn set_games_groups_launchers_first_and_keeps_title_order() {
+        let g = |title: &str, launcher: bool| LibraryGame {
+            id: format!("steam:{title}"),
+            title: title.to_string(),
+            store: "steam".into(),
+            launcher,
+        };
+        let shared = LibraryShared::default();
+        shared.set_games(vec![
+            g("Celeste", false),
+            g("Big Picture", true),
+            g("Portal 2", false),
+            g("Heroic", true),
+        ]);
+        let (phase, games, _) = shared.snapshot();
+        assert!(matches!(phase, LibraryPhase::Ready));
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Big Picture", "Heroic", "Celeste", "Portal 2"]);
+        assert_eq!(games.iter().take_while(|g| g.launcher).count(), 2);
+    }
+
+    /// A library with no launcher entries is untouched — the whole point of the grouping being
+    /// invisible until a plugin actually publishes a launcher tile.
+    #[test]
+    fn set_games_leaves_a_launcher_less_library_alone() {
+        let shared = LibraryShared::default();
+        shared.set_games(
+            ["Celeste", "Portal 2", "Tunic"]
+                .iter()
+                .map(|t| LibraryGame {
+                    id: format!("steam:{t}"),
+                    title: (*t).to_string(),
+                    store: "steam".into(),
+                    launcher: false,
+                })
+                .collect(),
+        );
+        let (_, games, _) = shared.snapshot();
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Celeste", "Portal 2", "Tunic"]);
     }
 
     #[test]
@@ -482,10 +779,139 @@ mod tests {
     /// 16 colours baked in, the five bicubic evals and four interior warp terms present).
     #[test]
     fn mesh_sksl_shape() {
-        let src = mesh_sksl();
+        let src = mesh_sksl(&MESH_COLORS);
         assert!(src.matches("float3(").count() >= 16, "16 colours baked");
         assert_eq!(src.matches("bz3(").count(), 6); // 1 definition + 5 call sites
         assert_eq!(src.matches("wtot +=").count(), 4); // one per interior point
         assert_eq!(src.matches('{').count(), src.matches('}').count());
+    }
+
+    /// The brand default must still be the SHIPPED field, colour for colour. Every install
+    /// already sees it, and a palette table that quietly restyled the default would be a
+    /// regression dressed as a feature.
+    #[test]
+    fn violet_is_the_untouched_shipped_field() {
+        assert_eq!(PALETTES[0].id, "violet");
+        assert!(
+            PALETTES[0].stops.is_none(),
+            "the default is the explicit grid"
+        );
+        assert_eq!(palette("violet").mesh_colors(), MESH_COLORS);
+        // An unknown name is a newer client's palette, not an error.
+        assert_eq!(palette("chartreuse").id, "violet");
+        assert_eq!(palette("").id, "violet");
+    }
+
+    /// Hue angle in degrees, or `None` for something too grey to have one.
+    fn hue(c: (f64, f64, f64)) -> Option<f64> {
+        let (r, g, b) = c;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let d = max - min;
+        if d < 0.04 {
+            return None;
+        }
+        let h = if max == r {
+            60.0 * (((g - b) / d) % 6.0)
+        } else if max == g {
+            60.0 * ((b - r) / d + 2.0)
+        } else {
+            60.0 * ((r - g) / d + 4.0)
+        };
+        Some((h + 360.0) % 360.0)
+    }
+
+    /// A palette must read as SEVERAL hues, not one hue at several brightnesses — that was
+    /// exactly the complaint about the hue-rotation model this replaced. Measured as the
+    /// widest gap between any two of the 16 mesh colours' hue angles.
+    #[test]
+    fn every_palette_is_multi_tone() {
+        for p in &PALETTES {
+            let hues: Vec<f64> = p.mesh_colors().iter().filter_map(|c| hue(*c)).collect();
+            assert!(hues.len() >= 8, "{}: too few coloured cells", p.id);
+            let spread = hues
+                .iter()
+                .flat_map(|a| {
+                    hues.iter().map(move |b| {
+                        let d = (a - b).abs() % 360.0;
+                        d.min(360.0 - d)
+                    })
+                })
+                .fold(0.0f64, f64::max);
+            // Graphite and Opal are deliberately near-neutral; everything else must carry a
+            // real hue journey.
+            let floor = if matches!(p.id, "graphite" | "opal") {
+                20.0
+            } else {
+                45.0
+            };
+            assert!(spread >= floor, "{} spans only {spread:.0}° of hue", p.id);
+        }
+    }
+
+    /// Ids, order and the light/dark split are the cross-client contract — the Apple and
+    /// Android tables must match this exactly.
+    #[test]
+    fn table_matches_the_other_clients() {
+        let ids: Vec<&str> = PALETTES.iter().map(|p| p.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "violet", "nebula", "abyss", "ember", "moss", "graphite", "holo", "sunset",
+                "bloom", "dawn", "mint", "opal",
+            ]
+        );
+        // Dark fields lead, pale ones follow, so stepping the row walks one direction.
+        let first_light = PALETTES
+            .iter()
+            .position(|p| p.light)
+            .expect("some are light");
+        assert!(PALETTES[first_light..].iter().all(|p| p.light));
+        assert_eq!(first_light, 6);
+    }
+
+    /// Every colour a palette produces stays in gamut, and a pale palette really is pale —
+    /// its ink flips, so a mislabelled one would put dark text on a dark field.
+    #[test]
+    fn palettes_are_in_gamut_and_honest_about_lightness() {
+        let luma = |c: (f64, f64, f64)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+        for p in &PALETTES {
+            for c in p.mesh_colors().iter().chain(p.blob_colors().iter()) {
+                for v in [c.0, c.1, c.2] {
+                    assert!((0.0..=1.0).contains(&v), "{} {c:?}", p.id);
+                }
+            }
+            let mean = p.mesh_colors().iter().map(|c| luma(*c)).sum::<f64>() / 16.0;
+            if p.light {
+                assert!(mean > 0.5, "{} is flagged light but means {mean:.2}", p.id);
+                assert!(luma(p.ground) > 0.6, "{}'s ground is dark", p.id);
+            } else {
+                assert!(mean < 0.45, "{} is flagged dark but means {mean:.2}", p.id);
+                assert!(luma(p.ground) < 0.2, "{}'s ground is light", p.id);
+            }
+            // The accent tints glass of the OPPOSITE polarity to the field, so it has to be
+            // legible there: dark accents on white frost, bright ones on dark glass.
+            let a = luma(p.accent);
+            if p.light {
+                assert!(a < 0.45, "{}'s accent is too pale for white glass", p.id);
+            } else {
+                assert!(a > 0.25, "{}'s accent is too dark for dark glass", p.id);
+            }
+        }
+    }
+
+    /// The ramp is the shared sampling rule the Swift and Kotlin ports reproduce.
+    #[test]
+    fn ramp_interpolates_between_stops() {
+        let stops = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0)];
+        assert_eq!(ramp(&stops, 0.0), (0.0, 0.0, 0.0));
+        assert_eq!(ramp(&stops, 1.0), (1.0, 1.0, 1.0));
+        assert_eq!(ramp(&stops, 0.5), (1.0, 0.0, 0.0));
+        let q = ramp(&stops, 0.25);
+        assert!((q.0 - 0.5).abs() < 1e-9 && q.1 == 0.0);
+        // Out of range clamps rather than panicking.
+        assert_eq!(ramp(&stops, -3.0), (0.0, 0.0, 0.0));
+        assert_eq!(ramp(&stops, 9.0), (1.0, 1.0, 1.0));
+        assert_eq!(ramp(&[], 0.5), (0.0, 0.0, 0.0));
     }
 }

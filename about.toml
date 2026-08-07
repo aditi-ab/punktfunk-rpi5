@@ -4,9 +4,21 @@
 #   cargo about generate about.hbs > THIRD-PARTY-NOTICES.txt   # (or use scripts/gen-third-party-notices.sh)
 #
 # `accepted` is the allow-list of SPDX licenses permitted in the dependency tree. CI fails if a crate
-# carries anything not listed here — which is exactly the regression guard we want against a copyleft
-# dependency silently entering the linked set. All entries
+# carries anything not listed here — the regression guard against a copyleft dependency silently
+# entering the linked set. All entries
 # below are permissive / attribution-only; deliberately NO GPL/LGPL/AGPL/MPL-link/SSPL/EPL.
+#
+# ⚠ KNOW THE LIMIT OF THIS GATE. cargo-about walks the CARGO graph, so it sees CRATES. A native
+# library linked through a permissively-licensed `-sys` crate is INVISIBLE to it, licence and all.
+# FFmpeg is precisely that shape: `ffmpeg-sys-next` is WTFPL and passes cleanly, while the LGPL
+# libavcodec/libavutil/swscale it link-imports — and which the Windows host installer bundles as
+# DLLs — never appear in the harvest at all. This gate did not catch FFmpeg entering the tree and
+# would not catch the next such library. Copyleft arriving as C behind a -sys crate is a REVIEW
+# question, not a CI one; the LGPL obligations we do carry are discharged by hand (the notice files
+# and the replaceable-DLL linkage, see packaging/windows/punktfunk-host.iss).
+#
+# Since M10 this is a HOST-only concern: the client links no FFmpeg, so for every client artifact
+# the crate graph and the linked set finally coincide and the gate means what it appears to mean.
 #
 # The dependency-free fallback is scripts/gen-third-party-notices.py (reads the cargo registry cache),
 # which is what produced the committed baseline when cargo-about is unavailable offline.

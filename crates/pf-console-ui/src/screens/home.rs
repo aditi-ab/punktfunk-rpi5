@@ -9,8 +9,9 @@ use crate::anim::Spring;
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, SPRING_C, SPRING_K};
 use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
-use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, DIM, ONLINE_GREEN, W, WHITE};
+use crate::theme::{accent, fg, Fonts, PanelStroke, ONLINE_GREEN, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, MaskFilter, Paint, Path, Point, RRect, Rect};
 
@@ -29,6 +30,10 @@ pub(crate) struct HomeScreen {
     bump: Spring,
     /// Last-seen tile keys — hosts churn under discovery; focus follows the KEY.
     keys: Vec<String>,
+    /// Each tile's rect as last drawn, device px, `Rect::new_empty()` for the ones the
+    /// carousel culled. Scaled to match: side tiles draw at 0.88, and a press near their
+    /// edge would otherwise pick a neighbour.
+    geom: Vec<Rect>,
 }
 
 impl HomeScreen {
@@ -38,6 +43,7 @@ impl HomeScreen {
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             keys: Vec::new(),
+            geom: Vec::new(),
         }
     }
 
@@ -136,7 +142,52 @@ impl HomeScreen {
                 fx.pop(); // popping the root = quit (the shell's rule)
                 None
             }
+            // Up on a saved tile opens that host's own menu — Wake / Copy link / Edit /
+            // Forget. The carousel is horizontal, so up is the one free direction, and it
+            // is the gesture the Android console already uses for the same menu.
+            MenuEvent::Move(MenuDir::Up) => match self.focused(ctx.hosts) {
+                Some(h) if super::host_options::HostOptionsScreen::available(h) => {
+                    fx.push(Screen::HostOptions(
+                        super::host_options::HostOptionsScreen::new(h),
+                    ));
+                    Some(MenuPulse::Confirm)
+                }
+                _ => Some(MenuPulse::Boundary),
+            },
             MenuEvent::Move(_) => None,
+        }
+    }
+
+    /// Mouse/touch on the carousel. Pressing the CENTRE tile activates it; pressing any
+    /// other one only brings it to the centre.
+    ///
+    /// The asymmetry is the point: the carousel answers a press by sliding, so a rule that
+    /// also activated would connect to whichever host you merely aimed at — and on this
+    /// screen activating means starting a session. Bringing it front first is both the
+    /// safer read and the one a coverflow trains you to expect.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        self.reconcile(ctx.hosts);
+        let len = ctx.hosts.len() + 1;
+        match p.kind {
+            PointerKind::Scroll { up } => {
+                self.step(if up { -1 } else { 1 }, len, false);
+                true
+            }
+            // `i < len` because the geometry is a frame old: discovery can shorten the
+            // carousel between the render that recorded it and this press, and a cursor
+            // parked past the end would read as the trailing Add Host tile.
+            PointerKind::Press => match p.pick(&self.geom).filter(|i| *i < len) {
+                Some(i) if i == self.cursor as usize => {
+                    self.menu(MenuEvent::Confirm, ctx, fx);
+                    true
+                }
+                Some(i) => {
+                    self.cursor = i as i32;
+                    true
+                }
+                None => false,
+            },
+            _ => false,
         }
     }
 
@@ -169,6 +220,12 @@ impl HomeScreen {
         if self.focused(ctx.hosts).is_some_and(|h| h.paired && h.saved) {
             hints.push(Hint::new(HintKey::Secondary, "Library"));
         }
+        if self
+            .focused(ctx.hosts)
+            .is_some_and(super::host_options::HostOptionsScreen::available)
+        {
+            hints.push(Hint::new(HintKey::Up, "Options"));
+        }
         hints.push(Hint::new(HintKey::Tertiary, "Settings"));
         hints.push(Hint::new(HintKey::Back, "Quit"));
         hints
@@ -200,6 +257,8 @@ impl HomeScreen {
         let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
 
         let len = ctx.hosts.len() + 1;
+        self.geom.clear();
+        self.geom.resize(len, Rect::new_empty());
         for i in 0..len {
             let d = i as f64 - self.anim.pos;
             if d.abs() > 2.6 {
@@ -214,6 +273,12 @@ impl HomeScreen {
                 (cy - tile_h / 2.0) as f32,
                 tile_w as f32,
                 tile_h as f32,
+            );
+            self.geom[i] = Rect::from_xywh(
+                (cx - tile_w * scale / 2.0) as f32,
+                (cy - tile_h * scale / 2.0) as f32,
+                (tile_w * scale) as f32,
+                (tile_h * scale) as f32,
             );
             canvas.save();
             canvas.translate((cx as f32, cy as f32));
@@ -251,7 +316,7 @@ impl HomeScreen {
                 "Hosts on this network appear automatically — add one by address for everything else.",
                 W::Regular,
                 13.0 * k,
-                DIM,
+                fg(0.55),
                 f64::from(rect.left) + w / 2.0,
                 cy + tile_h / 2.0 + 24.0 * k,
                 w * 0.7,
@@ -265,7 +330,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         canvas,
         rect,
         TILE_CORNER as f32,
-        h.saved.then(|| brand(0.20)),
+        h.saved.then(|| accent(0.20)),
         if h.saved {
             PanelStroke::Gradient
         } else {
@@ -327,7 +392,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
                 sub_base,
                 W::Regular,
                 13.0 * k,
-                white(0.55),
+                fg(0.55),
                 max_w,
             );
             let x = l + addr_w + 8.0 * k;
@@ -352,7 +417,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
                 sub_base,
                 W::Regular,
                 13.0 * k,
-                white(0.55),
+                fg(0.55),
                 max_w,
             );
         }
@@ -364,22 +429,22 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         sub_base - 22.0 * k,
         W::Bold,
         23.0 * k,
-        WHITE,
+        fg(1.0),
         max_w,
     );
 }
 
-/// A profile's `#RRGGBB` accent as a color, defaulting to the brand tint. Parsed
+/// A profile's `#RRGGBB` accent as a color, defaulting to the PALETTE's accent. Parsed
 /// leniently — a malformed accent (hand-edited catalog) falls back rather than erroring.
-fn accent_color(accent: Option<&str>) -> skia_safe::Color4f {
-    let Some(hex) = accent
+fn accent_color(hex: Option<&str>) -> skia_safe::Color4f {
+    let Some(hex) = hex
         .and_then(|a| a.strip_prefix('#'))
         .filter(|h| h.len() == 6)
     else {
-        return BRAND;
+        return accent(1.0);
     };
     let Ok(v) = u32::from_str_radix(hex, 16) else {
-        return BRAND;
+        return accent(1.0);
     };
     skia_safe::Color4f::new(
         ((v >> 16) & 0xff) as f32 / 255.0,
@@ -404,9 +469,9 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     let badge = Rect::from_xywh(l as f32, t as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     canvas.draw_rrect(
         RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32),
-        &Paint::new(brand(0.16), None),
+        &Paint::new(accent(0.16), None),
     );
-    let mut ring = Paint::new(brand(0.5), None);
+    let mut ring = Paint::new(accent(0.5), None);
     ring.set_style(skia_safe::PaintStyle::Stroke);
     ring.set_stroke_width(1.0);
     ring.set_anti_alias(true);
@@ -415,7 +480,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
         &ring,
     );
     let (bcx, bcy) = (l + 26.0 * k, t + 26.0 * k);
-    let mut p = Paint::new(BRAND, None);
+    let mut p = Paint::new(accent(1.0), None);
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width((3.0 * k) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -441,7 +506,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
         sub_base,
         W::Regular,
         13.0 * k,
-        white(0.55),
+        fg(0.55),
         max_w,
     );
     fonts.draw_clipped(
@@ -451,7 +516,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
         sub_base - 22.0 * k,
         W::Bold,
         23.0 * k,
-        WHITE,
+        fg(1.0),
         max_w,
     );
 }
@@ -467,8 +532,8 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
                 Point::new(badge.left, badge.bottom),
             ),
             skia_safe::gradient_shader::GradientShaderColors::Colors(&[
-                BRAND.to_color(),
-                brand(0.68).to_color(),
+                accent(1.0).to_color(),
+                accent(0.68).to_color(),
             ]),
             None,
             skia_safe::TileMode::Clamp,
@@ -477,8 +542,8 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         ));
         canvas.draw_rrect(rr, &p);
     } else {
-        canvas.draw_rrect(rr, &Paint::new(brand(0.16), None));
-        let mut ring = Paint::new(brand(0.5), None);
+        canvas.draw_rrect(rr, &Paint::new(accent(0.16), None));
+        let mut ring = Paint::new(accent(0.5), None);
         ring.set_style(skia_safe::PaintStyle::Stroke);
         ring.set_stroke_width(1.0);
         ring.set_anti_alias(true);
@@ -499,13 +564,13 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         y + 26.0 * k + size * 0.36,
         W::Bold,
         size,
-        if filled { WHITE } else { BRAND },
+        if filled { fg(1.0) } else { accent(1.0) },
     );
 }
 
 /// A small padlock: filled body + stroked shackle (the paired-identity mark).
 fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
-    let ink = white(0.5);
+    let ink = fg(0.5);
     let body_w = 11.0 * k;
     let body_h = 8.0 * k;
     let body_top = y + 5.0 * k;

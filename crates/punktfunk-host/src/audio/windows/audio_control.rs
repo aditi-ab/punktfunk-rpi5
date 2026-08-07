@@ -3,14 +3,20 @@
 //!
 //! A headless host has no real audio output, so BOTH the desktop-audio loopback ([`super::wasapi_cap`])
 //! and the virtual mic ([`super::wasapi_mic`]) must run on VIRTUAL audio cables — and on DIFFERENT
-//! ones, or the loopback re-captures the injected mic (an infinite echo). The installer bundles
+//! ones, or the loopback re-captures the injected mic (an infinite echo). The host mints its own
+//! endpoint pair from Steam's streaming drivers (see [`super::minted`] — the plan's tier-0); the
+//! name-based ladder below covers boxes where minting is unavailable. Historically the installer
+//! bundled
 //! VB-Audio Virtual Cable (the mic target: its "CABLE Input" render endpoint → "CABLE Output" capture)
 //! and the host auto-installs the Steam Streaming pair (a loopback-capable render). This module wires
 //! them up so no manual Sound-settings fiddling is ever needed:
 //!
 //! * the **mic inject target** is assigned FIRST (VB-Cable "CABLE Input" preferred) — mic passthrough
 //!   is what the cable is bundled for, so it wins the cable even when the cable is the only render
-//!   endpoint on the box (the loopback then reports itself unavailable instead of echoing);
+//!   endpoint on the box (the loopback then reports itself unavailable instead of echoing). One
+//!   exception: the Steam Streaming Microphone is surrendered to the loopback when taking it would
+//!   leave desktop audio on the known-silent last resort or nothing — game audio outranks the mic
+//!   (see [`wiring_plan`], `Wiring::mic_withheld`);
 //! * default **PLAYBACK** → the plan's loopback endpoint, applied ONLY while a desktop-audio capture
 //!   is open (`set_playback` — the mic pump must never park the playback default while the host is
 //!   idle). By default that endpoint is the SILENT sink (Steam Streaming Microphone render side) so
@@ -60,7 +66,7 @@ use wasapi::Direction;
 /// Deliberately total: EVERY failure maps to `None` ("assume it is fine"), because the wiring plan
 /// treats an unknown format as non-narrowing. A box where activation fails therefore plans exactly
 /// as it did before formats existed, instead of mis-demoting a perfectly good endpoint.
-fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
+pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
     let fmt = open_endpoint(ep)
         .ok()?
         .get_iaudioclient()
@@ -143,6 +149,17 @@ pub(crate) fn wire_now(set_playback: bool) -> Wiring {
     wire_now_full(set_playback).wiring
 }
 
+/// The most recent wiring verdict, as the LAST wiring pass computed it (the mic pump wires
+/// eagerly at host start and on every reopen, so this is fresh in the steady state). Change
+/// detection for the once-per-change log lives on the same cell.
+static LAST_WIRING: Mutex<Option<Wiring>> = Mutex::new(None);
+
+/// Read-only snapshot of [`LAST_WIRING`] for the status API — never triggers a wiring pass
+/// (a pass does COM work and IPolicyConfig writes; a status poll must do neither).
+pub(crate) fn last_wiring() -> Option<Wiring> {
+    LAST_WIRING.lock().unwrap().clone()
+}
+
 /// Endpoint ids among `renders` that are the host's own pad-audio endpoints — the exclusion
 /// data [`plan`] runs on. Detection lives in [`super::pad_endpoint`] (stamped PFDS container /
 /// devnode marker, registry-only reads); this is just the per-pass collection.
@@ -195,6 +212,14 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
         // cannot carry stereo cannot carry 5.1 either.
         2,
         &pad_ids,
+        // The minted "Punktfunk Speakers/Microphone" ids — tier-0 identity, empty until the
+        // provider latches. The ensure hook makes a box where Steam arrives later mint on a
+        // wiring pass instead of at the next reboot (cheap once latched; cooled-down retries
+        // while not).
+        &{
+            super::minted::ensure_provisioned();
+            super::minted::minted_ids()
+        },
     );
     let done = |wiring: Wiring| WiredPlan {
         wiring,
@@ -203,9 +228,8 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     };
 
     // Log assignment changes exactly once (first plan included).
-    static LAST: Mutex<Option<Wiring>> = Mutex::new(None);
     let changed = {
-        let mut last = LAST.lock().unwrap();
+        let mut last = LAST_WIRING.lock().unwrap();
         let changed = last.as_ref() != Some(&wiring);
         *last = Some(wiring.clone());
         changed
@@ -216,6 +240,8 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
             mic_capture = wiring.mic_capture.as_ref().map(|(n, _)| n.as_str()),
             loopback_render = wiring.loopback_render.as_ref().map(|(n, _)| n.as_str()),
             loopback_last_resort = wiring.loopback_last_resort,
+            mic_withheld = wiring.mic_withheld,
+            readiness = ?wiring_plan::readiness(&wiring),
             renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             "audio wiring plan"
         );
@@ -261,7 +287,16 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     if let Some((mic_name, mic_id)) = &wiring.mic_render {
         if default_render_id().as_deref() == Some(mic_id.as_str()) {
             // Audible preference = the host_audio plan's loopback pick (real hardware first).
-            match plan(&renders, &captures, want.as_deref(), true, &pad_ids).loopback_render {
+            match plan(
+                &renders,
+                &captures,
+                want.as_deref(),
+                true,
+                &pad_ids,
+                &super::minted::minted_ids(),
+            )
+            .loopback_render
+            {
                 Some((name, id)) => match set_default_endpoint(&id) {
                     Ok(()) => tracing::info!(mic = %mic_name, device = %name,
                         "default playback was the virtual-mic target — moved it so desktop \
@@ -333,7 +368,7 @@ pub(crate) fn default_render_id() -> Option<String> {
 /// The current default CAPTURE endpoint id, if any — the recording-side analogue of
 /// [`default_render_id`], read before asserting the recording default so an already-correct
 /// default costs zero IPolicyConfig writes.
-fn default_capture_id() -> Option<String> {
+pub(crate) fn default_capture_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Capture)

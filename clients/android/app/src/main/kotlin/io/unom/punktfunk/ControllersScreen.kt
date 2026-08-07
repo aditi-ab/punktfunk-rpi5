@@ -191,7 +191,7 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
             dsUsb?.let { DsRow(it) }
             if (pads.isEmpty() && !sc2Present) {
                 Text(
-                    "No controller detected. punktfunk can only forward devices Android " +
+                    "No controller detected. Punktfunk can only forward devices Android " +
                         "classifies as a gamepad or joystick — a pad connected through an adapter " +
                         "or hub may show up under \"Other input devices\" below with the adapter's " +
                         "identity, or not at all.",

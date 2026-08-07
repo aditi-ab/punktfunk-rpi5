@@ -2,7 +2,7 @@ import { cn } from "@/lib/utils";
 import { BrandMark } from "./brand-mark";
 import { Wordmark } from "./wordmark";
 
-// Full punktfunk lockup: the lens mark anchored to the top-left corner of the
+// Full Punktfunk lockup: the lens mark anchored to the top-left corner of the
 // "funk" wordmark. Size the lockup with a width on the wrapper (e.g. `w-40`);
 // the mark scales as a fraction of that width.
 export function Logo({ className }: { className?: string }) {

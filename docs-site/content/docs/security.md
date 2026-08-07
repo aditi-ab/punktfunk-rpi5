@@ -167,12 +167,14 @@ We mitigate this deliberately:
 - **Punktfunk's own drivers are user-mode.** The virtual display, both virtual-gamepad drivers
   (DualSense / DualShock 4 / Edge / Deck, and Xbox 360 / XInput) and the virtual pointer are
   **user-mode (UMDF)** drivers, so a driver bug is contained to a restricted service account — never
-  ring-0, never full-system. (This is why Punktfunk dropped ViGEmBus.) **One exception:** the
-  microphone-passthrough option installs VB-CABLE, a third-party **kernel-mode** audio driver from
-  VB-Audio. It's a ticked-by-default checkbox on the installer's task page — clear it if you don't
-  want it, though on a headless host (no real sound device) a virtual cable is also what desktop
-  audio plays into — and because other applications may use it, uninstalling Punktfunk leaves it in
-  place; remove it through its own uninstaller.
+  ring-0, never full-system. (This is why Punktfunk dropped ViGEmBus.) Audio is the one place a
+  kernel-mode driver is unavoidable (Windows has no user-mode way to create an audio device), and
+  Punktfunk deliberately ships none of its own: the "Punktfunk Speakers" and "Punktfunk
+  Microphone" endpoints are instances of **Steam's vendor-signed streaming-audio drivers**,
+  created on your box from your own Steam install. Older Punktfunk versions bundled VB-CABLE
+  (a third-party kernel-mode driver from VB-Audio) for the microphone; if you have one, other
+  applications may use it, so uninstalling Punktfunk leaves it in place — remove it through its
+  own uninstaller.
 - **Sealed internal channels.** The desktop-frame ring and the gamepad input/output channels are
   passed between the host and its drivers as duplicated handles to unnamed objects, so another local
   service can't open them by name to read your screen or forge controller input.

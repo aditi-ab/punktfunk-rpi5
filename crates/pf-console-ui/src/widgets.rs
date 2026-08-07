@@ -6,7 +6,8 @@
 
 use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
-use crate::theme::{brand, white, Fonts, PanelStroke, BRAND, DIM, FAINT, W, WHITE};
+use crate::pointer::{Pointer, PointerKind};
+use crate::theme::{accent, fg, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, Path, RRect, Rect};
 
@@ -84,6 +85,13 @@ pub(crate) struct MenuList {
     bump: Spring,
     scroll: f64,
     focus: Vec<f64>,
+    /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
+    /// [`MenuList::jump_to`].
+    snap: bool,
+    /// Each row's rect as the last frame actually drew it, device px — what a pointer hit-
+    /// tests against. One entry per row, `Rect::new_empty()` for rows scrolled out of view,
+    /// so an index into this is an index into `rows`.
+    geom: Vec<Rect>,
 }
 
 impl MenuList {
@@ -93,7 +101,17 @@ impl MenuList {
             bump: Spring::rest(0.0),
             scroll: 0.0,
             focus: Vec::new(),
+            snap: true,
+            geom: Vec::new(),
         }
+    }
+
+    /// Move the cursor WITHOUT the scroll gliding there. For a tab switch, where the whole
+    /// row set is replaced: chasing would sweep the viewport through rows that no longer
+    /// exist, which reads as a glitch rather than as motion.
+    pub(crate) fn jump_to(&mut self, cursor: usize) {
+        self.cursor = cursor;
+        self.snap = true;
     }
 
     /// Route a menu event. Up/down move focus (Boundary = recoil), left/right become
@@ -105,6 +123,33 @@ impl MenuList {
             MenuEvent::Move(MenuDir::Left) => (ListMsg::Adjust(-1), None),
             MenuEvent::Move(MenuDir::Right) => (ListMsg::Adjust(1), None),
             MenuEvent::Confirm => (ListMsg::Activate, Some(MenuPulse::Confirm)),
+            _ => (ListMsg::None, None),
+        }
+    }
+
+    /// A row's drawn rect, for tests that assert on what a press can actually reach.
+    #[cfg(test)]
+    pub(crate) fn row_rect(&self, i: usize) -> Option<Rect> {
+        self.geom.get(i).copied().filter(|r| !r.is_empty())
+    }
+
+    /// Route a pointer. A press picks the row under it, focuses it AND activates it —
+    /// one click does what the pad needs a move plus an A for, which is what a mouse user
+    /// expects of a row that IS its control ("click Resolution, resolution changes").
+    /// Because activation wraps, every value stays reachable by clicking alone.
+    ///
+    /// A press in the list's empty margin is swallowed, not passed on: it must not fall
+    /// through to whatever the screen draws behind the list.
+    pub(crate) fn pointer(&mut self, p: Pointer, len: usize) -> (ListMsg, Option<MenuPulse>) {
+        match p.kind {
+            PointerKind::Scroll { up } => (ListMsg::None, self.step(if up { -1 } else { 1 }, len)),
+            PointerKind::Press => match p.pick(&self.geom) {
+                Some(i) if i < len => {
+                    self.cursor = i;
+                    (ListMsg::Activate, Some(MenuPulse::Confirm))
+                }
+                _ => (ListMsg::None, None),
+            },
             _ => (ListMsg::None, None),
         }
     }
@@ -136,10 +181,19 @@ impl MenuList {
         dt: f64,
         active: bool,
     ) {
+        if self.snap {
+            // A replaced row set has no shared history with the old one — start every row's
+            // focus ease from scratch so the new cursor is simply THERE.
+            self.focus.clear();
+        }
         self.focus.resize(rows.len(), 0.0);
         for (i, f) in self.focus.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
-            *f = approach(*f, target, dt, 0.06);
+            *f = if self.snap {
+                target
+            } else {
+                approach(*f, target, dt, 0.06)
+            };
         }
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
@@ -160,13 +214,19 @@ impl MenuList {
         // The scroll chases the focused row into the middle band, clamped to content.
         let focused_center = tops.get(self.cursor).map_or(0.0, |t| (t + ROW_H / 2.0) * k);
         let target = (focused_center - view_h / 2.0).clamp(0.0, (content_h - view_h).max(0.0));
-        self.scroll = approach(self.scroll, target, dt, 0.08);
+        self.scroll = if std::mem::take(&mut self.snap) {
+            target
+        } else {
+            approach(self.scroll, target, dt, 0.08)
+        };
 
         let row_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k);
         let x0 = f64::from(rect.left) + (f64::from(rect.width()) - row_w) / 2.0;
 
         canvas.save();
         canvas.clip_rect(rect, None, true);
+        self.geom.clear();
+        self.geom.resize(rows.len(), Rect::new_empty());
         for (i, row) in rows.iter().enumerate() {
             let f = self.focus[i];
             let top = f64::from(rect.top) + tops[i] * k - self.scroll + self.bump.pos * k;
@@ -184,7 +244,7 @@ impl MenuList {
                     W::SemiBold,
                     12.0 * k,
                     1.4 * k,
-                    white(0.45),
+                    fg(0.45),
                 );
             }
             // Focus scale eases 0.98 → 1.0 about the row center.
@@ -195,15 +255,18 @@ impl MenuList {
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
             let r = Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
+            // The untransformed rect: the focus scale is a 2 % breath about the centre, far
+            // inside the slop a finger brings, and clicking must not depend on the ease.
+            self.geom[i] = r;
             let stroke = if row.caret {
                 PanelStroke::Brand(0.7)
             } else {
                 PanelStroke::Plain(0.06 + 0.22 * f as f32)
             };
             let tint = if row.caret {
-                Some(brand(0.30))
+                Some(accent(0.30))
             } else if f > 0.01 {
-                Some(brand(0.30 * f as f32))
+                Some(accent(0.30 * f as f32))
             } else {
                 None
             };
@@ -212,7 +275,7 @@ impl MenuList {
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {
                 // Action row: centered label, brand when actionable.
-                let color = if row.enabled { BRAND } else { FAINT };
+                let color = if row.enabled { accent(1.0) } else { fg(0.35) };
                 let tw = fonts.measure(&row.label, W::SemiBold, 16.0 * k) as f64;
                 fonts.draw(
                     canvas,
@@ -231,15 +294,15 @@ impl MenuList {
                     baseline,
                     W::SemiBold,
                     16.0 * k,
-                    if row.enabled { WHITE } else { DIM },
+                    if row.enabled { fg(1.0) } else { fg(0.55) },
                 );
                 let value = row.value.as_deref().unwrap_or_default();
                 let vcolor = if row.value_dim {
-                    FAINT
+                    fg(0.35)
                 } else if f > 0.5 {
-                    WHITE
+                    fg(1.0)
                 } else {
-                    white(0.6 + 0.4 * f as f32)
+                    fg(0.6 + 0.4 * f as f32)
                 };
                 let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
                 let caret_w = if row.caret { 8.0 * k } else { 0.0 };
@@ -257,7 +320,7 @@ impl MenuList {
                             (2.0 * k) as f32,
                             (18.0 * k) as f32,
                         ),
-                        &Paint::new(BRAND, None),
+                        &Paint::new(accent(1.0), None),
                     );
                 }
                 if row.adjustable && f > 0.01 {
@@ -269,6 +332,127 @@ impl MenuList {
             canvas.restore();
         }
         canvas.restore();
+    }
+}
+
+// --- Tab strip ---------------------------------------------------------------------------
+
+/// The strip's design height, including the air under it before the first row.
+pub(crate) const TAB_STRIP_H: f64 = 46.0;
+
+/// The horizontal section switcher above a menu list. Purely presentational — the SCREEN
+/// owns which tab is selected and what the shoulders do; this draws the pills and slides
+/// one highlight between them, so switching sections reads as travel rather than a swap.
+pub(crate) struct TabStrip {
+    /// Chased highlight geometry `(x, width)` in device px. `None` until the first render,
+    /// so a freshly opened screen doesn't animate its highlight in from x = 0.
+    indicator: Option<(f64, f64)>,
+    /// Each pill's rect as last drawn, device px — the strip is the one part of a settings
+    /// screen a pointer can reach directly, so it hit-tests against what it drew.
+    pills: Vec<Rect>,
+}
+
+impl TabStrip {
+    pub(crate) fn new() -> TabStrip {
+        TabStrip {
+            indicator: None,
+            pills: Vec::new(),
+        }
+    }
+
+    /// A pill's drawn rect, for tests that assert on what a press can actually reach.
+    #[cfg(test)]
+    pub(crate) fn pill(&self, i: usize) -> Option<Rect> {
+        self.pills.get(i).copied()
+    }
+
+    /// The tab a press landed on, if any. Pills are small, so the hit box is the full
+    /// strip height rather than the drawn pill — a tap that lands just above or below the
+    /// text still selects, which on a touchscreen is the difference between working and
+    /// not.
+    pub(crate) fn pointer(&self, p: Pointer) -> Option<usize> {
+        p.press().then(|| p.pick(&self.pills)).flatten()
+    }
+
+    /// Draw the pills centered in `rect`'s top band. Returns nothing — the caller already
+    /// knows the band is [`TAB_STRIP_H`] tall.
+    #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
+    pub(crate) fn render(
+        &mut self,
+        canvas: &Canvas,
+        rect: Rect,
+        labels: &[&str],
+        selected: usize,
+        fonts: &Fonts,
+        k: f64,
+        dt: f64,
+    ) {
+        if labels.is_empty() {
+            return;
+        }
+        let size = 13.0 * k;
+        let pad_x = 13.0 * k;
+        let gap = 7.0 * k;
+        let pill_h = 30.0 * k;
+        let widths: Vec<f64> = labels
+            .iter()
+            .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * pad_x)
+            .collect();
+        let total: f64 = widths.iter().sum::<f64>() + gap * (labels.len() - 1) as f64;
+        let mut x = f64::from(rect.left) + (f64::from(rect.width()) - total) / 2.0;
+        let top = f64::from(rect.top) + 2.0 * k;
+
+        // Where the highlight wants to be, then the eased position it actually draws at.
+        let sel = selected.min(labels.len() - 1);
+        let target = (
+            x + widths[..sel].iter().sum::<f64>() + gap * sel as f64,
+            widths[sel],
+        );
+        let (ix, iw) = match self.indicator {
+            None => target,
+            Some((cx, cw)) => (
+                approach(cx, target.0, dt, 0.07),
+                approach(cw, target.1, dt, 0.07),
+            ),
+        };
+        self.indicator = Some((ix, iw));
+        crate::theme::panel(
+            canvas,
+            Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
+            (pill_h / 2.0 / k) as f32,
+            Some(accent(0.85)),
+            PanelStroke::Plain(0.22),
+            k as f32,
+        );
+
+        let baseline = top + pill_h / 2.0 + size * 0.36;
+        self.pills.clear();
+        for (i, label) in labels.iter().enumerate() {
+            // Fade each label toward white by how much the highlight actually covers it, so
+            // the two labels a sliding highlight passes between light up together.
+            let pill_x = x;
+            // Full-height hit box (see `TabStrip::pointer`), and only ever grown from the
+            // pill's own span so two neighbours can't both claim a press.
+            self.pills.push(Rect::from_xywh(
+                pill_x as f32,
+                rect.top,
+                widths[i] as f32,
+                rect.height().max((pill_h + 4.0 * k) as f32),
+            ));
+            let overlap = (pill_x + widths[i]).min(ix + iw) - pill_x.max(ix);
+            let covered = (overlap / widths[i]).clamp(0.0, 1.0) as f32;
+            let tw = f64::from(fonts.measure(label, W::SemiBold, size));
+            fonts.draw(
+                canvas,
+                label,
+                pill_x + (widths[i] - tw) / 2.0,
+                baseline,
+                W::SemiBold,
+                size,
+                fg(0.5 + 0.5 * covered),
+            );
+            x += widths[i] + gap;
+        }
     }
 }
 
@@ -290,7 +474,7 @@ fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> Stri
 
 fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     let dir = if left { -1.0 } else { 1.0 };
-    let mut p = Paint::new(white(alpha), None);
+    let mut p = Paint::new(fg(alpha), None);
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width((1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
@@ -362,6 +546,9 @@ pub(crate) struct Keyboard {
     /// Tray slide-in (0 hidden → 1 seated), the Swift `.spring(0.32, 0.86)`.
     tray: Spring,
     key_flash: f64,
+    /// Each key's rect and identity as last drawn — the tray slides, so hit-testing has to
+    /// read the drawn geometry rather than recompute a seated layout.
+    keys: Vec<(Rect, Key)>,
 }
 
 impl Keyboard {
@@ -371,7 +558,45 @@ impl Keyboard {
             col: 0,
             tray: Spring::rest(0.0),
             key_flash: 0.0,
+            keys: Vec::new(),
         }
+    }
+
+    /// Route a pointer at the tray. A press types the key under it and moves the key
+    /// cursor there, so a pad can carry on from wherever a finger left off. A press that
+    /// lands on the tray but between keys is swallowed — the tray is modal, and a stray
+    /// tap must not reach the list behind it.
+    pub(crate) fn pointer(&mut self, p: Pointer) -> (KeyMsg, Option<MenuPulse>) {
+        if !p.press() {
+            return (KeyMsg::None, None);
+        }
+        let Some(i) = p.pick(&self.keys.iter().map(|(r, _)| *r).collect::<Vec<_>>()) else {
+            return (KeyMsg::None, None);
+        };
+        let key = self.keys[i].1;
+        // Re-seat the cursor from the key's identity, not the draw index: `key_rows` is the
+        // one layout authority and the two must not be able to drift apart.
+        if let Some((r, c)) = key_rows()
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|k| *k == key).map(|c| (r, c)))
+        {
+            self.row = r;
+            self.col = c;
+        }
+        self.key_flash = 1.0;
+        match key {
+            Key::Char(c) => (KeyMsg::Type(c), None),
+            Key::Space => (KeyMsg::Type(' '), None),
+            Key::Backspace => (KeyMsg::Backspace, None),
+            Key::Done => (KeyMsg::Done, Some(MenuPulse::Confirm)),
+        }
+    }
+
+    /// Does `p` land on the tray at all? The screen asks before routing, so a press
+    /// outside a raised keyboard can dismiss it instead of falling through to the list.
+    pub(crate) fn covers(&self, p: Pointer) -> bool {
+        self.keys.iter().any(|(r, _)| p.hits(*r))
     }
 
     /// Route a menu event; the SCREEN applies `Type`/`Backspace` to its field (charset
@@ -442,7 +667,7 @@ impl Keyboard {
     /// `seat` (0..1). The caller clips nothing — the tray rises from below the screen.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
-        &self,
+        &mut self,
         canvas: &Canvas,
         fonts: &Fonts,
         w: f64,
@@ -451,6 +676,7 @@ impl Keyboard {
         k: f64,
     ) {
         let rows = key_rows();
+        self.keys.clear();
         let tray_w = (560.0 * k).min(w - 32.0 * k);
         let tray_h = Self::tray_height() * k;
         let x0 = (w - tray_w) / 2.0;
@@ -476,8 +702,9 @@ impl Keyboard {
                 let x = x0 + pad + c as f64 * (key_w + gap);
                 let focused = r == self.row && c == self.col;
                 let kr = Rect::from_xywh(x as f32, y as f32, key_w as f32, key_h as f32);
+                self.keys.push((kr, *key));
                 let fill = if focused {
-                    let mut b = BRAND;
+                    let mut b = accent(1.0);
                     if self.key_flash > 0.02 {
                         // A just-typed key flashes brighter, then eases back.
                         let f = self.key_flash as f32;
@@ -490,16 +717,18 @@ impl Keyboard {
                     }
                     b
                 } else {
-                    white(0.08)
+                    fg(0.08)
                 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(kr, (9.0 * k) as f32, (9.0 * k) as f32),
                     &Paint::new(fill, None),
                 );
+                // The focused key is filled with the accent, so its letter needs ink that
+                // reads on THAT, not on the field.
                 let ink = if focused {
-                    skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0)
+                    crate::theme::on_accent()
                 } else {
-                    WHITE
+                    fg(1.0)
                 };
                 let (cx, cy) = (x + key_w / 2.0, y + key_h / 2.0);
                 match key {

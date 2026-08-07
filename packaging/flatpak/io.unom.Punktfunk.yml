@@ -23,20 +23,26 @@
 # libopus and the PipeWire client lib are in the freedesktop base; SDL3 is NOT, so it is built
 # from source as a bundled module.
 #
-# HEVC decode: the base runtime's libavcodec is a stripped build (no encumbered codecs). The
-# freedesktop runtime declares `org.freedesktop.Platform.codecs-extra` as a built-in extension
-# point (directory lib/x86_64-linux-gnu/codecs-extra, add-ld-path lib, auto-downloaded with the
-# runtime), whose full libavcodec.so.61 transparently shadows the base one at runtime. So HEVC
-# (software + VAAPI) works with NO app-side codec extension to declare — we just build against
-# the SDK's linkable libavcodec.so.61 and let the runtime swap in the capable build.
+# HEVC decode needs NOTHING from the runtime since M10 (design/client-native-decode.md §6):
+# the client links no FFmpeg at all. It decodes on the user's own GPU drivers — Vulkan Video
+# through the loader in the GL runtime, or VAAPI through libva, which is dlopen'd and never
+# linked — with openh264 + rav1d (both vendored, both BSD-2) as the CPU floor. Nothing here
+# depends on the base runtime's stripped libavcodec, and nothing depends on
+# `org.freedesktop.Platform.codecs-extra` shadowing it either; that whole arrangement (and the
+# encumbered-codec question it existed to answer) is simply not this app's problem any more.
+#
+# ⚠ The one thing that follows: the CPU floor has no HEVC — no permissively-licensed HEVC
+# decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
+# codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
+# to software. That is a refusal by design, not a packaging gap.
 app-id: io.unom.Punktfunk
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 # Build-time SDK extensions:
 #  - rust-stable: cargo/rustc 1.96 + the bundled mold linker (/usr/lib/sdk/rust-stable/bin).
-#  - llvm20: provides libclang (/usr/lib/sdk/llvm20/lib), which bindgen needs — ffmpeg-sys-next
-#    and sdl3-sys generate their FFI bindings via bindgen at build time. The base SDK ships no
+#  - llvm20: provides libclang (/usr/lib/sdk/llvm20/lib), which bindgen needs — sdl3-sys and
+#    pyrowave-sys generate their FFI bindings via bindgen at build time. The base SDK ships no
 #    clang/libclang, so without this the build panics ("Unable to find libclang").
 # Both are added to PATH / LIBCLANG_PATH in build-options below.
 sdk-extensions:
@@ -127,12 +133,11 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
   # The rust build resolves everything via pkg-config: gtk4/libadwaita/pipewire/opus AND a
-  # linkable libavcodec.so.61 from org.gnome.Sdk//50 (the multiarch /usr dir), plus the bundled
-  # SDL3's .pc from /app. (At runtime the codecs-extra extension swaps in the HEVC-capable
-  # libavcodec — see the header.)
+  # the SDK's own .pc files from the multiarch /usr dir (libopus for audiopus_sys, the
+  # PipeWire client lib, GTK4/libadwaita), plus the bundled SDL3's .pc from /app.
   env:
     PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
-    # bindgen (ffmpeg-sys-next / sdl3-sys) loads libclang from the llvm20 extension.
+    # bindgen (sdl3-sys, pyrowave-sys) loads libclang from the llvm20 extension.
     LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
     # mold (shipped in rust-stable) speeds the ~450-crate link on the Deck APU.
     RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -179,11 +184,20 @@ modules:
       - /lib/pkgconfig
 
   # ---------------------------------------------------------------------------------------
-  # Vulkan-Headers — the SESSION binary's pf-ffvk crate runs bindgen over FFmpeg's
-  # libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`. The GNOME SDK is not
-  # guaranteed to ship those dev headers, so install them into /app ourselves (headers only,
-  # no compile) and point pf-ffvk's bindgen at them via PF_FFVK_VULKAN_INCLUDE below. Kept in
-  # cleanup — headers aren't needed at runtime (the Vulkan LOADER comes from the GL runtime).
+  # Vulkan-Headers — build-time `vulkan/vulkan.h` for anything below that compiles against
+  # Vulkan, which the GNOME SDK is not guaranteed to ship dev headers for. Headers only, no
+  # compile, and `cleanup: '*'` so nothing reaches the runtime (the Vulkan LOADER comes from
+  # the GL runtime).
+  #
+  # It was added for the session binary's pf-ffvk crate, which ran bindgen over FFmpeg's
+  # libavutil/hwcontext_vulkan.h. M10 deleted pf-ffvk along with the rest of the client's
+  # FFmpeg (design/client-native-decode.md §6), so that consumer is gone — but the module
+  # stays, because the gamescope WSI layer built two modules below is itself a VULKAN LAYER
+  # and compiles against these headers. Module order is the dependency: this one must build
+  # first. Do not drop it as dead weight; flatpak.yml has no `pull_request:` trigger, so a
+  # manifest break of that kind reaches main invisibly and a tag then ships no Linux flatpak.
+  # The native decoder needs nothing from here — pf-vkdecode reaches Vulkan through `ash`,
+  # which is pure Rust bindings with no bindgen and no C headers.
   # ---------------------------------------------------------------------------------------
   - name: vulkan-headers
     buildsystem: cmake-ninja
@@ -251,12 +265,19 @@ modules:
         url: https://github.com/ValveSoftware/gamescope.git
         # KEEP IN SYNC with `_gsrev` in packaging/gamescope/PKGBUILD.
         commit: 8c676c399c761e4540587f61004c957993d12fea
-      # Submodule + wrap pins as of that rev. `git ls-tree <rev> subprojects/` for the
-      # submodules; subprojects/*.wrap for the rest.
-      - type: git
-        url: https://github.com/Joshua-Ashton/vkroots.git
-        commit: 5106d8a0df95de66cc58dc1ea37e69c99afc9540
-        dest: subprojects/vkroots
+      # Wrap pins as of that rev (`subprojects/*.wrap`). These are meson WRAPS, not gamescope
+      # submodules, so nothing else populates them and they need explicit sources.
+      #
+      # vkroots is deliberately NOT listed here. It is a real gamescope SUBMODULE, and
+      # flatpak-builder clones git sources with submodules by default — so it is already
+      # checked out at exactly the rev above (`git ls-tree <rev> subprojects/vkroots`), which
+      # leaves `subprojects/vkroots/.git` as a gitlink FILE. Declaring it again with
+      # `dest: subprojects/vkroots` made the extractor copy the bare mirror onto that path and
+      # die before any build command ran:
+      #   cp: cannot overwrite non-directory '.../subprojects/vkroots/.git' with directory
+      # Re-adding it re-breaks the whole flatpak. If the submodule ever needs to be pinned away
+      # from the gamescope rev, set `disable-submodules: true` on the source above and then
+      # declare ALL THREE subprojects explicitly — not one of them alone.
       - type: git
         url: https://github.com/g-truc/glm.git
         commit: 0af55ccecd98d4e5a8d1fad7de25ba429d60e863
@@ -293,9 +314,6 @@ modules:
         # flatpak-builder pre-downloaded as a pinned source below. No {tag}/{key}
         # placeholders needed: a template without them is used verbatim.
         SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
-        # Point pf-ffvk's bindgen at the Vulkan-Headers installed into /app above (its clang
-        # invocation doesn't inherit the SDK's default include search, so pass it explicitly).
-        PF_FFVK_VULKAN_INCLUDE: /app/include
     build-commands:
       # Drop every reference to the windows-rs GIT dependency before building. That git
       # source is deliberately NOT vendored into cargo-sources.json — see

@@ -210,10 +210,11 @@ Three things are left on purpose:
   Remove-Item -Recurse -Force "$env:ProgramData\punktfunk"
   ```
 
-- **VB-CABLE**, unless you cleared its checkbox during setup — it is ticked by default. It is a
-  third-party VB-Audio component other apps may be using, so the Punktfunk uninstaller never touches
-  it. Remove it with its own uninstaller —
-  `VBCABLE_Setup_x64.exe -u -h` — or the **VB-Audio Virtual Cable** entry in Installed apps.
+- **VB-CABLE**, if an older Punktfunk version installed it (releases used to bundle it for the
+  microphone; current hosts use Steam's streaming drivers instead). It is a third-party VB-Audio
+  component other apps may be using, so the Punktfunk uninstaller never touches it. Remove it
+  with its own uninstaller — `VBCABLE_Setup_x64.exe -u -h` — or the **VB-Audio Virtual Cable**
+  entry in Installed apps.
 - **The publisher certificate**, if you imported it by hand to silence the Unknown Publisher prompt.
   Remove it in `certlm.msc` under **Trusted Publishers** and **Trusted Root Certification
   Authorities**. (This is *not* the driver certificate above, which the uninstaller does remove.)

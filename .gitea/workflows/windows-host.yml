@@ -141,19 +141,14 @@ jobs:
           # observed on a clean build on this very runner (2026-07-17). No-op for compliant
           # projects (libvpl-sys pins 3.13+).
           "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # FFMPEG_DIR: the same BtbN lgpl-shared x64 tree the Windows CLIENT links against (provisioned
-          # by scripts/ci/provision-windows-punktfunk-extras.ps1). The host's AMD/Intel AMF/QSV encode backend
+          # FFMPEG_DIR: the BtbN lgpl-shared x64 tree, provisioned by
+          # scripts/ci/provision-windows-punktfunk-extras.ps1. The CLIENT used to link it too; since M10
+          # it links no libav* at all (windows.yml sets no FFMPEG_DIR), so this tree is the HOST's alone
+          # and the provisioning step keeps fetching it for that reason. The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
           # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.
           if (-not $env:FFMPEG_DIR) {
             "FFMPEG_DIR=C:\Users\Public\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-          # VBCABLE_DIR: the pinned official VB-CABLE package (provisioned by
-          # provision-windows-punktfunk-extras.ps1) -> pack-host-installer.ps1 bundles the
-          # streaming virtual microphone. Same daemon-env-or-fallback pattern as FFMPEG_DIR
-          # (the daemon env only refreshes on a runner-task restart).
-          if (-not $env:VBCABLE_DIR) {
-            "VBCABLE_DIR=C:\Users\Public\vbcable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
           $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
@@ -404,7 +399,6 @@ jobs:
             @{ n = 'bun runtime (BUN_EXE)';           p = $env:BUN_EXE;          f = '' }
             @{ n = 'plugin runner (SCRIPTING_BUNDLE)';p = $env:SCRIPTING_BUNDLE; f = '' }
             @{ n = 'FFmpeg DLLs (FFMPEG_DIR\bin)';    p = $env:FFMPEG_DIR;       f = 'bin' }
-            @{ n = 'VB-CABLE (VBCABLE_DIR)';          p = $env:VBCABLE_DIR;      f = 'VBCABLE_Setup_x64.exe' }
           )
           $missing = @()
           foreach ($x in $need) {

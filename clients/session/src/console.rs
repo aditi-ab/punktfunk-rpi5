@@ -266,6 +266,11 @@ pub fn run(target: Option<&str>) -> u8 {
                     ActionOutcome::Start(Box::new(params))
                 }
                 OverlayAction::CancelConnect => ActionOutcome::Handled, // run-loop-side
+                // Also run-loop-side: the clipboard belongs to SDL, which this callback
+                // has no handle on. Unreachable in practice — listed so adding an action
+                // to the enum keeps failing loudly here instead of falling into a
+                // wildcard that silently drops it.
+                OverlayAction::CopyText(_) => ActionOutcome::Handled,
                 OverlayAction::Quit => ActionOutcome::Quit,
             }
         });
@@ -284,6 +289,21 @@ pub fn run(target: Option<&str>) -> u8 {
             crate::session_main::EXIT_PRESENTER_FAILED
         }
     }
+}
+
+/// A console row key → its index in the known-hosts store. The key is the pinned
+/// fingerprint when there is one, else `addr:port` (see the row builder), and a pinned
+/// CARD's key carries the profile id past a NUL — the console strips that before it
+/// sends a command, so nothing here has to.
+fn index_for_key(known: &trust::KnownHosts, key: &str) -> Option<usize> {
+    known
+        .hosts
+        .iter()
+        .position(|h| !h.fp_hex.is_empty() && h.fp_hex == key)
+        .or_else(|| {
+            let (addr, port) = key.rsplit_once(':')?;
+            known.index_by_addr(addr, port.parse().ok()?)
+        })
 }
 
 fn host_display_name(name: &str, addr: &str) -> String {
@@ -343,6 +363,7 @@ impl Service {
                     probe_inflight: Arc::new(AtomicBool::new(false)),
                     last_probe: Instant::now() - Duration::from_secs(60),
                     wake_cancel: None,
+                    rescan: None,
                 }
                 .run(stop_w)
             })
@@ -373,11 +394,14 @@ struct ServiceState {
     last_probe: Instant,
     /// Cancels the active wake thread (it owns the model's wake status).
     wake_cancel: Option<Arc<AtomicBool>>,
+    /// Forces the mDNS browse to re-query. Installed by `run`; `None` before it starts.
+    rescan: Option<discovery::Rescan>,
 }
 
 impl ServiceState {
     fn run(mut self, stop: Arc<AtomicBool>) {
-        let discovery_rx = discovery::browse();
+        let (discovery_rx, rescan) = discovery::browse();
+        self.rescan = Some(rescan);
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
@@ -479,6 +503,48 @@ impl ServiceState {
                 }
                 self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
             }
+            ConsoleCmd::UpdateHost {
+                key,
+                name,
+                addr,
+                port,
+            } => {
+                let mut known = trust::KnownHosts::load();
+                let Some(h) = index_for_key(&known, &key).and_then(|i| known.hosts.get_mut(i))
+                else {
+                    tracing::warn!(%key, "edit for an unknown host — ignoring");
+                    return;
+                };
+                // Edited IN PLACE rather than removed and re-added: the fingerprint, the
+                // learned MAC, the pinned cards and the profile binding all hang off this
+                // entry, and re-adding would silently unpair a host the user only renamed.
+                h.name = if name.trim().is_empty() {
+                    addr.clone()
+                } else {
+                    name
+                };
+                h.addr = addr;
+                h.port = port;
+                if let Err(e) = known.save() {
+                    tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                }
+                self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+            }
+            ConsoleCmd::ForgetHost { key } => {
+                let mut known = trust::KnownHosts::load();
+                let Some(i) = index_for_key(&known, &key) else {
+                    tracing::warn!(%key, "forget for an unknown host — ignoring");
+                    return;
+                };
+                let gone = known.hosts.remove(i);
+                if let Err(e) = known.save() {
+                    tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                }
+                tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten");
+                // It may still be advertising, in which case it comes straight back as a
+                // DISCOVERED row — unsaved and unpaired, which is the honest state.
+                self.last_probe = Instant::now() - Duration::from_secs(60);
+            }
             ConsoleCmd::Wake { key, then_connect } => {
                 if let Some(c) = self.wake_cancel.take() {
                     c.store(true, Ordering::SeqCst);
@@ -512,6 +578,14 @@ impl ServiceState {
             }
             ConsoleCmd::Probe => {
                 self.last_probe = Instant::now() - Duration::from_secs(60);
+                // "Refresh presence" means the mDNS half too, not just the QUIC sweep: the browse
+                // runs for the process's lifetime and `mdns-sd` backs its re-query interval off to
+                // as much as an hour, so a host that appeared since startup may never be asked
+                // for again. (No console screen emits Probe yet — every face button on the home
+                // screen is spoken for — but the plumbing is correct for when one does.)
+                if let Some(r) = &self.rescan {
+                    r.request();
+                }
             }
             ConsoleCmd::SetPin {
                 key,
@@ -522,14 +596,7 @@ impl ServiceState {
                 // end; never touches `profile_id` (the default binding). Idempotent, so
                 // a repeated press inside one refresh window can't double-pin.
                 let mut known = trust::KnownHosts::load();
-                let idx = known
-                    .hosts
-                    .iter()
-                    .position(|h| !h.fp_hex.is_empty() && h.fp_hex == key)
-                    .or_else(|| {
-                        let (addr, port) = key.rsplit_once(':')?;
-                        known.index_by_addr(addr, port.parse().ok()?)
-                    });
+                let idx = index_for_key(&known, &key);
                 let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
                     tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
                     return;
@@ -791,6 +858,7 @@ fn spawn_fetch(
                                 id: g.id.clone(),
                                 title: g.title.clone(),
                                 store: g.store.clone(),
+                                launcher: g.is_launcher(),
                             })
                             .collect(),
                     );
@@ -831,6 +899,7 @@ fn load_fake(shared: &LibraryShared, path: &str) {
                 id: g.id.clone(),
                 title: g.title.clone(),
                 store: g.store.clone(),
+                launcher: g.is_launcher(),
             })
             .collect(),
     );

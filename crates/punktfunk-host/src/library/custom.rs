@@ -371,7 +371,7 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 /// copies of the very primitive the `/hooks` carve-out exists to withhold.
 ///
 /// Returns the field name for the error message, so a plugin author sees exactly what was refused.
-/// The other launch kinds (`steam_appid`, `steam_ui`, `launcher_ui`, `epic`, `gog`, `aumid`,
+/// The other launch kinds (`steam_appid`, `steam_ui`, `launcher_ui`, `epic`, `gog`, `aumid`, `playnite`,
 /// `lutris_id`, `heroic`) are all
 /// host-resolved from a validated id and stay open to every lane — a provider plugin can still
 /// publish its whole catalogue, it just cannot hand the host a shell command to run.
@@ -459,6 +459,21 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     "entries[{i}]: `launch.value` for kind `launcher_ui` names a launcher this host \
                      cannot open (`{}`)",
                     launch.value
+                ));
+            }
+            // The value is interpolated into a `playnite://` URI, so it is charset-checked here as
+            // well as at launch time — same reasoning as the two kinds above.
+            if launch.kind == "playnite" && !valid_playnite_id(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `playnite` must be a Playnite game GUID"
+                ));
+            }
+            // `<Identity>!<AppId>`, both straight off `MicrosoftGame.config`. The host completes it
+            // into an AUMID at launch (it can read the publisher hash; the runner cannot), so the
+            // shape is checked here where the author can still act on the error.
+            if launch.kind == "xbox" && !valid_aumid(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
                 ));
             }
         }
@@ -741,6 +756,47 @@ mod tests {
         // are the same rows, so this is exactly the "plugin stopped claiming" degradation.
         let r3 = reconcile_entries(&mut entries, "steam", None, vec![input("440", "TF2")]);
         assert!(library_id_for(&r3[0]).starts_with("custom:"));
+    }
+
+    /// A plugin's `launchers(cfg)` tile, end to end: `role: "launcher"` survives the reconcile onto
+    /// the stored entry AND onto the `GameEntry` a client renders, keeps the deterministic claimed
+    /// id, and stays out of the wire for ordinary games.
+    ///
+    /// This is the path the lutris and heroic plugins publish through, and nothing exercised it
+    /// before — every earlier test reconciled `GameRole::Game`, which is the serde default, so the
+    /// field could have been dropped anywhere between the payload and the client without a failure.
+    #[test]
+    fn a_launcher_entry_survives_reconcile_onto_the_wire() {
+        let mut launcher = input("launcher", "Lutris");
+        launcher.role = GameRole::Launcher;
+        launcher.launch = Some(LaunchSpec {
+            kind: "launcher_ui".into(),
+            value: "lutris".into(),
+        });
+
+        let mut entries = Vec::new();
+        let out = reconcile_entries(
+            &mut entries,
+            "lutris",
+            Some("lutris"),
+            vec![launcher, input("42", "Some Game")],
+        );
+
+        assert_eq!(library_id_for(&out[0]), "lutris:launcher");
+        assert_eq!(out[0].role, GameRole::Launcher);
+        assert_eq!(out[1].role, GameRole::Game, "the game is untouched");
+
+        // Onto the wire: the client sees `role`, and `is_game` keeps it off ordinary entries.
+        let tile: GameEntry = out[0].clone().into();
+        assert_eq!(tile.role, GameRole::Launcher);
+        let v = serde_json::to_value(&tile).unwrap();
+        assert_eq!(v["role"], "launcher");
+        let game: GameEntry = out[1].clone().into();
+        let vg = serde_json::to_value(&game).unwrap();
+        assert!(
+            vg.get("role").is_none(),
+            "a game's role stays off the wire, so old clients are unaffected"
+        );
     }
 
     /// The metadata contract on the wire and on disk: fields serialize FLAT (no `meta` nesting —

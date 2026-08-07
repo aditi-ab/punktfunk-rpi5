@@ -106,6 +106,16 @@ data class Settings(
      */
     val libraryEnabled: Boolean = true,
     /**
+     * Which colour family the console (gamepad) UI's living backdrop drifts through — the
+     * cross-client `ui_palette` key: `"violet"` (the brand default), `"tide"`, `"forest"`,
+     * `"ember"`, `"rose"`, `"graphite"`. See [GamepadPalette], whose table and maths mirror the
+     * desktop console's and the Apple client's under the same names. Presentation only: nothing
+     * about a stream depends on it, so it is a device preference and never part of a profile.
+     * An unknown value reads as the default rather than failing — a newer client may have shipped
+     * a palette this build doesn't know.
+     */
+    val uiPalette: String = "violet",
+    /**
      * "Low-latency mode" — the master switch over the latency pipeline: the async decode loop
      * (native; burst-feed + present-newest-per-vsync, the Apple client's discipline), decoder ranking
      * + per-SoC vendor keys, pipeline thread boosts + ADPF max-performance, game-tagged AAudio, DSCP
@@ -148,6 +158,16 @@ data class Settings(
      * toggle is hidden on devices without a vibrator (TVs), where this would be a silent no-op.
      */
     val rumbleOnPhone: Boolean = false,
+    /**
+     * Opt-in: use this phone's own gyroscope as controller 1's motion when the forwarded pad has
+     * none of its own — for clip-on gamepads without an IMU, where the phone body moves with the
+     * player's hands. The rumble mirror's sibling, data flowing the other way. Off by default;
+     * read once per session by StreamScreen (it starts a [io.unom.punktfunk.kit.DeviceGyro] only
+     * when set), and the mirror stands down by itself whenever wire pad 0 is fed by a capture
+     * link (USB DualSense / SC2 — pads with a real gyro). The toggle is hidden on devices
+     * without a gyroscope (TVs), where this would be a silent no-op.
+     */
+    val gyroOnPhone: Boolean = false,
 
     /**
      * Capture a Steam Controller 2 (wired / Puck dongle over USB, or an already-paired BLE pad)
@@ -284,11 +304,13 @@ class SettingsStore(context: Context) {
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
+        uiPalette = prefs.getString(K_UI_PALETTE, "violet") ?: "violet",
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
         presentPriority = prefs.getString(K_PRESENT_PRIORITY, "latency") ?: "latency",
         smoothBuffer = prefs.getInt(K_SMOOTH_BUFFER, 0),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
+        gyroOnPhone = prefs.getBoolean(K_GYRO_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
         dsCapture = prefs.getBoolean(K_DS_CAPTURE, true),
         padHaptics = prefs.getBoolean(K_PAD_HAPTICS, true),
@@ -323,11 +345,13 @@ class SettingsStore(context: Context) {
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
+            .putString(K_UI_PALETTE, s.uiPalette)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
             .putString(K_PRESENT_PRIORITY, s.presentPriority)
             .putInt(K_SMOOTH_BUFFER, s.smoothBuffer)
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
+            .putBoolean(K_GYRO_ON_PHONE, s.gyroOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
             .putBoolean(K_DS_CAPTURE, s.dsCapture)
             .putBoolean(K_PAD_HAPTICS, s.padHaptics)
@@ -361,6 +385,7 @@ class SettingsStore(context: Context) {
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
         const val K_LIBRARY = "library_enabled"
+        const val K_UI_PALETTE = "ui_palette"
 
         /**
          * Bumped AGAIN to restart every install at the new default (ON). History: the original
@@ -377,6 +402,7 @@ class SettingsStore(context: Context) {
         const val K_SMOOTH_BUFFER = "smooth_buffer"
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
+        const val K_GYRO_ON_PHONE = "gyro_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
         const val K_DS_CAPTURE = "ds_capture"
         const val K_PAD_HAPTICS = "pad_haptics"
@@ -425,6 +451,96 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
 }
 
 /**
+ * Sentinel [Settings.width]/[Settings.height] meaning "the native mode, narrowed so the picture
+ * clears the display cutout and the rounded corners" — resolved at connect by [safeDisplayMode],
+ * exactly as `0` is resolved by [nativeDisplayMode]. Negative, so it can never collide with a real
+ * size; distinct from the UI's `-1` "Custom…" sentinel.
+ */
+const val SAFE_AREA_MODE = -2
+
+/**
+ * Safe-area stream geometry — the pure part, so it is unit-testable without a Display.
+ *
+ * The phone clips the picture in HARDWARE: the cutout (notch / punch-hole) and the four rounded
+ * corners eat whatever the stream draws under them. [StreamScreen] deliberately draws edge-to-edge
+ * (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS`) and centres the video at its own aspect ratio
+ * (`Modifier.aspectRatio`), so which pixels survive is decided purely by the mode's aspect:
+ *
+ *  * A 16:9 mode on a 20:9 phone pillarboxes, and those black bars land exactly on the unsafe
+ *    regions — which is why the presets have always "just worked".
+ *  * The NATIVE mode has the panel's own aspect, so it fills every pixel, cutout and corners
+ *    included. That is the mode that loses its corners.
+ *
+ * So asking the host for a mode narrower by the unsafe inset is the entire fix: the existing
+ * aspect-fit centres it inside the safe region, and pointer mapping follows for free (MouseInput
+ * derives the picture rect from the live video size, not from the window).
+ */
+object SafeArea {
+    /** The host rejects odd dimensions and anything under 320 px wide (`validate_dimensions`). */
+    const val MIN_WIDTH = 320
+
+    /**
+     * [nativeWidth] reduced by [perSideInsetPx] on each side, even-floored and clamped to the
+     * host's floor. Height is deliberately untouched: under aspect-fit only one axis can bind, and
+     * on a landscape phone that axis is always the horizontal one — insetting height as well would
+     * shrink the picture without uncovering anything.
+     */
+    fun insetWidth(nativeWidth: Int, perSideInsetPx: Int): Int {
+        val inset = perSideInsetPx.coerceAtLeast(0)
+        return (nativeWidth - inset * 2).coerceAtLeast(MIN_WIDTH) / 2 * 2
+    }
+}
+
+/**
+ * The per-side inset, in pixels, that the **landscape** stream must clear on this display.
+ *
+ * Two contributions, and the larger wins:
+ *  * **The cutout.** [DisplayCutout] is rotation-aware, so in landscape the housing shows up on
+ *    `left`/`right`. The settings screen may be portrait though, where the very same housing is
+ *    reported on `top`/`bottom` and the horizontal insets read zero — which would compute "no inset
+ *    needed" for exactly the devices that need one. The stream is always landscape, so a vertical
+ *    inset now becomes a horizontal one then: fall back to it.
+ *  * **The rounded corners.** These are NOT part of the cutout insets. For a FULL-HEIGHT picture the
+ *    horizontal clearance a corner of radius `r` needs is exactly `r`: at the topmost row the
+ *    display boundary sits at `x = r`, so anything left of that is clipped. Not conservative — it is
+ *    the precise requirement for a picture that spans the full height.
+ *
+ * `0` when the display has neither, which makes the safe mode identical to the native one.
+ */
+private fun displaySideInsetPx(context: Context): Int {
+    val display = probeDisplay(context) ?: return 0
+    var inset = 0
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        display.cutout?.let { cut ->
+            val horizontal = maxOf(cut.safeInsetLeft, cut.safeInsetRight)
+            val vertical = maxOf(cut.safeInsetTop, cut.safeInsetBottom)
+            inset = maxOf(inset, if (horizontal > 0) horizontal else vertical)
+        }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        for (position in intArrayOf(
+            android.view.RoundedCorner.POSITION_TOP_LEFT,
+            android.view.RoundedCorner.POSITION_TOP_RIGHT,
+            android.view.RoundedCorner.POSITION_BOTTOM_LEFT,
+            android.view.RoundedCorner.POSITION_BOTTOM_RIGHT,
+        )) {
+            display.getRoundedCorner(position)?.let { inset = maxOf(inset, it.radius) }
+        }
+    }
+    return inset
+}
+
+/**
+ * The native mode narrowed to clear the cutout and the rounded corners — the [SAFE_AREA_MODE]
+ * resolution, as a landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode];
+ * only the width moves.
+ */
+fun safeDisplayMode(context: Context): Triple<Int, Int, Int> {
+    val (w, h, hz) = nativeDisplayMode(context)
+    return Triple(SafeArea.insetWidth(w, displaySideInsetPx(context)), h, hz)
+}
+
+/**
  * True when this device's display can actually present HDR10, so we should advertise HDR to the
  * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
  * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
@@ -458,12 +574,21 @@ fun displaySupportsHdr(context: Context): Boolean {
     return supported
 }
 
-/** Resolve [Settings] (with its 0=native placeholders) to the concrete mode to request. */
+/**
+ * Resolve [Settings] (with its `0`=native and [SAFE_AREA_MODE] placeholders) to the concrete mode to
+ * request. The safe-area sentinel is checked first because it resolves BOTH axes together — it is one
+ * mode, not an independent width and height, and mixing half of it with a native height would ask
+ * for a size neither sentinel means.
+ */
 fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
-    val native = nativeDisplayMode(context)
-    val w = if (width > 0) width else native.first
-    val h = if (height > 0) height else native.second
-    val hz = if (hz > 0) hz else native.third
+    val base = if (width == SAFE_AREA_MODE && height == SAFE_AREA_MODE) {
+        safeDisplayMode(context)
+    } else {
+        nativeDisplayMode(context)
+    }
+    val w = if (width > 0) width else base.first
+    val h = if (height > 0) height else base.second
+    val hz = if (hz > 0) hz else base.third
     return Triple(w, h, hz)
 }
 
@@ -517,9 +642,10 @@ val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it)
 
 // ---- UI option tables (value, label). The first entry is always the "auto/native" default. ----
 
-/** (width, height, label). `(0,0)` = native display. */
+/** (width, height, label). `(0,0)` = native display; [SAFE_AREA_MODE] = native minus the cutout. */
 val RESOLUTION_OPTIONS = listOf(
     Triple(0, 0, "Native display"),
+    Triple(SAFE_AREA_MODE, SAFE_AREA_MODE, "Native display (safe area)"),
     Triple(1280, 720, "1280 × 720"),
     Triple(1920, 1080, "1920 × 1080"),
     Triple(2560, 1440, "2560 × 1440"),

@@ -176,6 +176,12 @@ try {
 	// with (a stale inherited value would otherwise advertise a port nothing is listening on).
 	process.env.PUNKTFUNK_UI_PLUGIN_PORT_ACTIVE = String(pluginPort);
 	process.env.PUNKTFUNK_UI_CONSOLE_PORT_ACTIVE = String(consolePort);
+	// …and the SCHEME, which the app cannot recover from a request: `localFetch` synthesises one with
+	// no TLS socket, so h3 reports `http:` on an HTTPS listener. `frame-ancestors` needs the scheme
+	// the operator's address bar actually shows, or the browser refuses to frame the plugin at all
+	// (see consoleOriginScheme() in server/util/pluginOrigin.ts). Both listeners share this `tls`
+	// object, so one stamp is correct for both.
+	process.env.PUNKTFUNK_UI_SCHEME_ACTIVE = tls ? "https" : "http";
 	console.log(
 		`punktfunk plugin-UI origin listening on ${pluginServer.url} (tls=${!!tls})`,
 	);

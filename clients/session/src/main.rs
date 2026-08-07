@@ -346,9 +346,13 @@ mod session_main {
             bitrate_kbps: settings.bitrate_kbps,
             audio_channels: settings.audio_channels,
             preferred_codec: settings.preferred_codec(),
+            // Nothing excluded on a fresh dial. Only the run loop's codec-fallback retry
+            // sets this, and it does so on a CLONE of these params — a Settings-level
+            // "never use HEVC" would be `preferred_codec`, not this.
+            exclude_codecs: 0,
             // HDR off = don't advertise 10-bit/HDR at all; the host then never upgrades.
             // MULTI_SLICE is decoder truth for THIS embedder: every desktop decode stack
-            // (FFmpeg software, VAAPI, D3D11VA, Vulkan Video) handles AUs carrying several
+            // (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) handles AUs carrying several
             // slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
             // The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges
             // on multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
@@ -357,12 +361,14 @@ mod session_main {
             // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
             // Welcome BEFORE we build a decoder. Advertised whenever the user asks because
             // every path can DISPLAY it: the Vulkan presenter samples the 2-plane 4:4:4 pool
-            // formats (hardware RExt decode where the driver offers it — NVIDIA today) and
-            // swscale converts anything else for the software rung, with the decoder ladder
-            // demoting on its own. No capability probe gates the bit — software decode is the
-            // guaranteed floor — but the cost is VISIBLE, not silent: the Detailed stats
-            // overlay prints the resolved chroma ("4:4:4→4:2:0" when the host declined) and
-            // the decode path frames actually took.
+            // formats (hardware RExt decode where the driver offers it — NVIDIA today),
+            // with the decoder ladder demoting on its own. No capability probe gates the
+            // bit — but note (M8) that the software rung below it is 4:2:0 8-bit ONLY and
+            // refuses anything else rather than mis-scaling it, so on a box whose hardware
+            // 4:4:4 decode fails the floor is a codec fallback, not a converted picture.
+            // The cost stays VISIBLE, not silent: the Detailed stats overlay prints the
+            // resolved chroma ("4:4:4→4:2:0" when the host declined) and the decode path
+            // frames actually took.
             video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
                 | if settings.hdr_enabled {
                     punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
@@ -488,7 +494,8 @@ mod session_main {
     ///
     /// RADV-only knob: ANV/NVIDIA/other drivers ignore `RADV_PERFTEST`, and a box where video
     /// decode is already the default just no-ops. Append rather than clobber so a user's own
-    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=vaapi` still overrides the decoder choice.
+    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=native-vaapi` still overrides the decoder
+    /// choice (the pre-M10 `vaapi` spelling reaches the same rung — it migrates, loudly).
     #[cfg(target_os = "linux")]
     fn enable_radv_video_decode() {
         const TOKEN: &str = "video_decode";
@@ -501,6 +508,65 @@ mod session_main {
             radv_perftest = %std::env::var("RADV_PERFTEST").unwrap_or_default(),
             "opted into RADV Vulkan Video decode (Mesa gates it behind RADV_PERFTEST on the Deck)"
         );
+    }
+
+    /// The driver's own answers about video images, printed with nothing in front of
+    /// them (`--probe-decode`).
+    ///
+    /// Passing the five conjuncts above only says Vulkan Video EXISTS on a device; this
+    /// says whether the zero-copy pipeline can be BUILT on it — a different question
+    /// with, on at least one shipping driver, a different answer. Verbatim on purpose:
+    /// the Intel Arc refusal was twice diagnosed from punktfunk's own error text and
+    /// twice the diagnosis was wrong, and what broke it open both times was reading what
+    /// the driver actually said.
+    fn print_video_formats(a: &pf_presenter::vk::AdapterDecode) {
+        use pf_presenter::vk::probe::{describe_create_flags, describe_usage};
+        for p in &a.formats {
+            println!("     {} (wants {:?}):", p.profile, p.wanted);
+            for u in &p.usages {
+                let answer = match &u.formats {
+                    Err(e) => format!("query failed: {e:?}"),
+                    Ok(entries) if entries.is_empty() => "no formats offered".to_string(),
+                    Ok(entries) => entries
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "{:?} usage={} create={} {:?} {:?}",
+                                f.format,
+                                describe_usage(f.image_usage),
+                                describe_create_flags(f.image_create_flags),
+                                f.image_type,
+                                f.image_tiling,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                println!("       {:<24} {answer}", u.label);
+                // The second opinion, printed only where it differs from the video
+                // format query. Worded as "also asked" rather than "disagrees" on
+                // purpose: measured on both vendors this call answers "creatable" for
+                // combinations the video query rejects (NVIDIA included, for SAMPLED
+                // alone), so it does not honour the profile list and a difference here
+                // is NOT the driver contradicting itself. Printed anyway because the
+                // question gets re-asked by everyone who reads a refusal.
+                let listed = u
+                    .wanted_entry(p.wanted)
+                    .is_some_and(|f| f.image_usage.contains(u.usage));
+                if listed != u.image_format_support.is_ok() {
+                    let second = match &u.image_format_support {
+                        Ok(()) => "creatable".to_string(),
+                        Err(e) => format!("{e:?}"),
+                    };
+                    println!(
+                        "       {:<24} (also asked: \
+                         vkGetPhysicalDeviceImageFormatProperties2 says {second} — that \
+                         call does not honour the profile list; not authority)",
+                        ""
+                    );
+                }
+            }
+        }
     }
 
     pub fn run() -> u8 {
@@ -525,6 +591,128 @@ mod session_main {
                 }
                 Err(e) => {
                     eprintln!("list-adapters: {e:#}");
+                    EXIT_PRESENTER_FAILED
+                }
+            };
+        }
+
+        // `--probe-decode`: per-adapter Vulkan Video decode capability, then exit. Human
+        // output on purpose — this is a triage tool, not a picker source, which is also
+        // why it is a separate flag: `--list-adapters` is parsed line-by-line by the
+        // desktop shells' GPU picker and must keep printing bare names.
+        if arg_flag("--probe-decode") {
+            return match pf_presenter::vk::probe_decode() {
+                Ok(adapters) => {
+                    if adapters.is_empty() {
+                        println!("no Vulkan physical devices");
+                    }
+                    for (i, a) in adapters.iter().enumerate() {
+                        // The bracketed number is the PUNKTFUNK_VK_DEVICE value, and the
+                        // FIRST listed entry is what
+                        // a default run presents on — the decoder shares that device, so
+                        // on a hybrid box this line is usually the answer.
+                        let kind = if a.discrete { "discrete" } else { "integrated" };
+                        // `a.index`, NOT the loop position. This list is sorted
+                        // discrete-first for reading, but PUNKTFUNK_VK_DEVICE indexes the
+                        // raw enumeration, which puts the iGPU first on some hybrids —
+                        // printing the loop position would name the other GPU on exactly
+                        // the machines this flag is for. The `i == 0` marker is still the
+                        // loop position, because sorted-first IS what pick_device lands on
+                        // when nothing overrides it.
+                        println!(
+                            "[{}] {} ({kind}){}",
+                            a.index,
+                            a.name,
+                            if i == 0 { "  <- default presenter" } else { "" }
+                        );
+                        println!(
+                            "     vulkan video decode: {}",
+                            if a.usable { "YES" } else { "no" }
+                        );
+                        // Name every bit, and ACCOUNT for the ones we cannot name. The
+                        // 5070 Ti reports 0xF — four bits — while punktfunk decodes three
+                        // codecs, so the first version of this line printed three names
+                        // beside a four-bit mask and looked complete. VP9 (bit 3) is a
+                        // real decode operation this client has no rung for; a codec the
+                        // tool cannot name must not silently vanish from a mask it prints,
+                        // or the reader is left to trust that the words cover the number.
+                        const OPS: [(u32, &str); 4] = [
+                            (0x1, "H.264"),
+                            (0x2, "H.265"),
+                            (0x4, "AV1"),
+                            (0x8, "VP9 (no punktfunk rung)"),
+                        ];
+                        let mut codecs: Vec<String> = OPS
+                            .iter()
+                            .filter(|(bit, _)| a.codec_ops & bit != 0)
+                            .map(|(_, n)| (*n).to_string())
+                            .collect();
+                        let named: u32 = OPS.iter().map(|(b, _)| b).sum();
+                        let unknown = a.codec_ops & !named;
+                        if unknown != 0 {
+                            codecs.push(format!("unrecognised bits 0x{unknown:X}"));
+                        }
+                        println!(
+                            "     driver decode ops:   {}",
+                            if codecs.is_empty() {
+                                format!("none (0x{:X})", a.codec_ops)
+                            } else {
+                                format!("{} (0x{:X})", codecs.join(", "), a.codec_ops)
+                            }
+                        );
+                        if !a.usable {
+                            // Say which conjunct failed. "no" with no reason is the thing
+                            // this whole flag exists to stop.
+                            let mut why: Vec<String> = Vec::new();
+                            if !a.api_1_3 {
+                                why.push("device is not Vulkan 1.3".into());
+                            }
+                            if !a.features_ok {
+                                why.push(
+                                    "missing samplerYcbcrConversion / timelineSemaphore / \
+                                     synchronization2"
+                                        .into(),
+                                );
+                            }
+                            if a.decode_family.is_none() {
+                                why.push("no queue family advertises VIDEO_DECODE".into());
+                            }
+                            if !a.base_missing.is_empty() {
+                                why.push(format!("missing {}", a.base_missing.join(", ")));
+                            }
+                            if a.codec_exts.is_empty() {
+                                why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".into());
+                            }
+                            println!("     why not:             {}", why.join("; "));
+                        } else {
+                            println!("     extensions:          {}", a.codec_exts.join(", "));
+                        }
+                        print_video_formats(a);
+                    }
+                    if adapters.len() > 1 {
+                        // The single most common misreading of this output: seeing a
+                        // capable GPU listed and concluding the decoder will use it.
+                        // Vulkan Video decodes on the PRESENTER's device, and the decoder
+                        // preference does not move the presenter.
+                        println!();
+                        println!(
+                            "Vulkan Video decodes on the presenter's device. PUNKTFUNK_DECODER \
+                             picks the rung,"
+                        );
+                        println!(
+                            "not the GPU — move the presenter with PUNKTFUNK_VK_DEVICE=<index \
+                             above> or"
+                        );
+                        println!(
+                            "PUNKTFUNK_VK_ADAPTER=<name substring>, which is the safer knob \
+                             where two"
+                        );
+                        println!("adapters share a name.");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("probe-decode: {e:#}");
                     EXIT_PRESENTER_FAILED
                 }
             };

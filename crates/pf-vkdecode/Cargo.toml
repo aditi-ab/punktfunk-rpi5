@@ -1,0 +1,27 @@
+[package]
+name = "pf-vkdecode"
+description = "Native Vulkan Video H.264 decode for the clients (M2): StdVideo parameter-set/picture conversion and DPB slot management over pf-bitstream's AuPlans — the CPU-testable half; session, memory and command recording follow in WP-B (design/client-native-decode.md §3.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = "0.38"
+# Direct dependency on the vendored parser crate, not just pf-bitstream: the parameter-set
+# conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
+# `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already
+# builds — no duplicate types.
+cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+pf-bitstream = { path = "../pf-bitstream" }
+tracing = "0.1"
+
+[dev-dependencies]
+# The GPU parity test hashes decoded frames against libavcodec goldens (already
+# in the workspace lock via other crates).
+sha2 = "0.10"
+
+[lints]
+workspace = true

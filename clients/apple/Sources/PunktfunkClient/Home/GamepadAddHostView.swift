@@ -12,8 +12,17 @@ import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 
 struct GamepadAddHostView: View {
+    @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
     let onAdd: (StoredHost) -> Void
+    /// How the in-place shell (iOS) closes this screen; nil (the macOS sheet, the tvOS cover)
+    /// falls back to the environment dismiss. Declared AFTER `onAdd` so the existing trailing-
+    /// closure call sites keep binding to it, not to this.
+    var close: (() -> Void)?
+    /// Whether this screen owns the controller — false while the shell is mid-transition or the
+    /// connect takeover is up (see GamepadSettingsView's twin).
+    var controllerActive = true
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — tighter chrome so the keyboard tray still fits.
@@ -35,8 +44,8 @@ struct GamepadAddHostView: View {
             items: rows,
             focusID: $focusID,
             onActivate: { activate(id: $0.id) },
-            onBack: { dismiss() },
-            isActive: editing == nil
+            onBack: { performClose() },
+            isActive: controllerActive && editing == nil
         ) { row, focused in
             rowView(row, focused: focused)
                 .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
@@ -44,23 +53,24 @@ struct GamepadAddHostView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 4) {
+            VStack(alignment: .leading, spacing: gamepadHeaderSpacing(compact: compact)) {
+                // Leading, like every gamepad heading — and no close chrome (B is the exit).
                 Text("Add Host")
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                 if !compact {
                     Text("Hosts on this network appear automatically — add one by address "
                         + "for everything else.")
                         .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
-                        .foregroundStyle(.white.opacity(0.55))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72)
+                        .foregroundStyle(ink.fg(0.55))
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72, alignment: .leading)
                 }
             }
+            .padding(.horizontal, 24)
             .padding(.top, gamepadTitleTopPadding(compact: compact))
-            .padding(.bottom, compact ? 4 : 8)
-            .frame(maxWidth: .infinity)
-            .overlay(alignment: .topTrailing) { closeButton.padding(.top, 20).padding(.trailing, 20) }
+            .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -72,11 +82,29 @@ struct GamepadAddHostView: View {
                 .background { GamepadTrayScrim(edge: .bottom) }
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
-        .background { GamepadFormBackground() }
+        // Hosted in the shell, the field is the shell's (see GamepadSettingsView's twin).
+        .background {
+            if !hostedInShell { GamepadFormBackground() }
+        }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
         // A port can't exceed 5 digits — cap while typing so the row can't grow absurd.
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
         }
+        #if !os(tvOS)
+        // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
+        // keyboard's Esc and the macOS sheet's cancel working without chrome.
+        .background {
+            Button("Cancel") { performClose() }
+                .keyboardShortcut(.cancelAction)
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        #endif
         #if os(tvOS)
         // tvOS types with the SYSTEM fullscreen keyboard (TVTextEntry) instead of the custom
         // tray — the remote and the pad both drive it natively. Same `editing` state as the
@@ -137,22 +165,10 @@ struct GamepadAddHostView: View {
         #endif
     }
 
-    /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
-    /// rides the cancel action.
-    private var closeButton: some View {
-        Button { dismiss() } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .glassBackground(Circle(), interactive: true)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        #if !os(tvOS)
-        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
-        #endif
-        .accessibilityLabel("Cancel")
+    /// Close this screen through whichever mechanism presents it: the shell's layer pop on iOS,
+    /// the environment dismiss under a macOS sheet / tvOS cover.
+    private func performClose() {
+        if let close { close() } else { dismiss() }
     }
 
     // MARK: - Rows
@@ -180,22 +196,22 @@ struct GamepadAddHostView: View {
             if row.isAction {
                 Label("Add Host", systemImage: "plus.circle.fill")
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(canAdd ? Color.brand : .white.opacity(0.35))
+                    .foregroundStyle(canAdd ? ink.accent : ink.fg(0.35))
                     .frame(maxWidth: .infinity)
             } else {
                 Text(row.label)
                     .font(.geist(m.labelFont, .semibold, relativeTo: .body))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ink.fg)
                 Spacer(minLength: 12)
                 Text(row.value.isEmpty ? row.placeholder : row.value)
                     .font(.geistFixed(m.valueFont, .medium))
-                    .foregroundStyle(row.value.isEmpty ? .white.opacity(0.35) : .white)
+                    .foregroundStyle(row.value.isEmpty ? ink.fg(0.35) : ink.fg)
                     .lineLimit(1)
                     .truncationMode(.head) // keep the end of a long address visible while typing
                 if editing == row.id {
                     // The live-edit caret: this row is what the keyboard tray is typing into.
                     Rectangle()
-                        .fill(Color.brand)
+                        .fill(ink.accent)
                         .frame(width: 2, height: m.labelFont + 2)
                 }
             }
@@ -206,12 +222,12 @@ struct GamepadAddHostView: View {
         // takes the brand wash, and the edited row keeps its brand caret border.
         .consoleGlass(
             RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
-            tint: (focused || editing == row.id) ? Color.brand.opacity(0.30) : nil,
+            tint: (focused || editing == row.id) ? ink.accent(0.30) : nil,
             interactive: focused)
         .overlay {
             RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
                 .strokeBorder(
-                    editing == row.id ? Color.brand.opacity(0.7) : .white.opacity(focused ? 0.28 : 0.06),
+                    editing == row.id ? ink.accent(0.7) : ink.fg(focused ? 0.28 : 0.06),
                     lineWidth: 1)
         }
         .scaleEffect(focused ? 1.0 : 0.98)
@@ -233,7 +249,7 @@ struct GamepadAddHostView: View {
                 name: name.trimmingCharacters(in: .whitespaces),
                 address: address.trimmingCharacters(in: .whitespaces),
                 port: UInt16(port) ?? 9777))
-            dismiss()
+            performClose()
         default:
             openKeyboard(id)
         }

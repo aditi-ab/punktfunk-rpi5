@@ -132,6 +132,27 @@ class HostDiscovery(context: Context) {
         handler.post(poll)
     }
 
+    /**
+     * Tear the browse down and start a fresh one. This is the manual rescan, and the recovery path
+     * for a browse that started while blocked (permission not yet granted, multicast filtered) or
+     * that never started at all ([start] gives up when `nativeDiscoveryStart` returns 0, and
+     * nothing else would ever retry it).
+     *
+     * It also puts a query back on the wire: `mdns-sd` re-queries on a doubling backoff that caps
+     * at an hour, so a long-lived browse is effectively passive — a host that appeared since, or
+     * whose announcement was lost to multicast, may never be asked for again.
+     *
+     * The currently-shown host set is left alone across the swap (rather than blinking empty via
+     * [stop]'s notification); the first poll of the new browse publishes the fresh set.
+     */
+    fun restart() {
+        val keep = onChange
+        onChange = null
+        stop()
+        onChange = keep
+        start()
+    }
+
     fun stop() {
         if (!running && nativeHandle == 0L) return
         running = false

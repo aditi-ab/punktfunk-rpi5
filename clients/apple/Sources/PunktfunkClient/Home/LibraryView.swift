@@ -12,6 +12,13 @@ struct LibraryView: View {
     /// Tapping a title starts a session that asks the host to launch it (the library id is passed
     /// through). `nil` ⇒ browse-only (cards aren't tappable).
     var onLaunch: ((String) -> Void)? = nil
+    /// How the gamepad shell (GamepadLibraryScreen) closes this screen; nil — every sheet/cover
+    /// presentation — falls back to the environment dismiss.
+    var onClose: (() -> Void)? = nil
+    /// Whether the gamepad coverflow owns the controller — the shell gates it during a push/pop
+    /// and while the connect takeover is up. Presentations that cover the launcher keep the
+    /// default (their being up IS the launcher's gate).
+    var controllerActive = true
     @Environment(\.dismiss) private var dismiss
 
     @State private var games: [GameEntry] = []
@@ -58,6 +65,17 @@ struct LibraryView: View {
                 imageSession?.finishTasksAndInvalidate()
                 imageSession = nil
             }
+            #if os(iOS) || os(macOS)
+            // B closes the library even before the coverflow exists (loading / error / empty):
+            // the coverflow's carousel owns B once games render; until then this zero-size
+            // listener does — without it a controller-only user is trapped on an error screen
+            // (the gamepad screens carry no close chrome).
+            .background {
+                if gamepadUIActive && games.isEmpty {
+                    LibraryBackCatcher(active: controllerActive) { (onClose ?? { dismiss() })() }
+                }
+            }
+            #endif
     }
 
     @ViewBuilder private var content: some View {
@@ -72,7 +90,8 @@ struct LibraryView: View {
             if gamepadUIActive {
                 LibraryCoverflowView(
                     games: games, imageSession: imageSession, onLaunch: onLaunch,
-                    onDismiss: { dismiss() })
+                    onDismiss: { (onClose ?? { dismiss() })() },
+                    controllerActive: controllerActive)
             } else {
                 grid
             }
@@ -80,19 +99,45 @@ struct LibraryView: View {
     }
 
     private var grid: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 18) {
-                ForEach(games) { game in
-                    if let onLaunch {
-                        Button { onLaunch(game.id) } label: { GameCard(game: game, imageSession: imageSession) }
-                            .buttonStyle(.plain)
-                    } else {
-                        GameCard(game: game, imageSession: imageSession)
-                    }
+        // Design D4: launcher entries get their own section above the titles, never interleaved.
+        // Both headers appear only when both groups exist, so a library without launcher entries
+        // renders exactly as it did before.
+        let launchers = games.filter(\.isLauncher)
+        let titles = games.filter { !$0.isLauncher }
+        let both = !launchers.isEmpty && !titles.isEmpty
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if !launchers.isEmpty {
+                    if both { sectionHeader("Launchers") }
+                    tiles(launchers)
+                }
+                if !titles.isEmpty {
+                    if both { sectionHeader("Games") }
+                    tiles(titles)
                 }
             }
             .padding()
         }
+    }
+
+    private func tiles(_ entries: [GameEntry]) -> some View {
+        LazyVGrid(columns: columns, spacing: 18) {
+            ForEach(entries) { game in
+                if let onLaunch {
+                    Button { onLaunch(game.id) } label: { GameCard(game: game, imageSession: imageSession) }
+                        .buttonStyle(.plain)
+                } else {
+                    GameCard(game: game, imageSession: imageSession)
+                }
+            }
+        }
+    }
+
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text)
+            .font(.geist(12, .semibold, relativeTo: .caption))
+            .tracking(1.1)
+            .foregroundStyle(.secondary)
     }
 
     private var columns: [GridItem] {
@@ -152,12 +197,15 @@ struct LibraryView: View {
             return
         }
         do {
+            // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid and
+            // the gamepad coverflow both inherit the D4 ordering.
             games = try await LibraryClient.fetch(
                 address: current.address,
                 port: current.effectiveMgmtPort,
                 certPEM: identity.certPEM,
                 keyPEM: identity.keyPEM,
-                hostFingerprint: current.pinnedSHA256)
+                hostFingerprint: current.pinnedSHA256
+            ).launchersFirst
             imageSession?.finishTasksAndInvalidate()
             imageSession = try LibraryImageLoader.session(
                 address: current.address,
@@ -173,6 +221,30 @@ struct LibraryView: View {
     }
 }
 
+#if os(iOS) || os(macOS)
+/// Zero-size controller listener for the library's pre-coverflow states — B backs out. The same
+/// shape as ConnectOverlay's `ConnectControllerInput`; `GamepadMenuInput.needsSnapshot` swallows
+/// the held press that opened the screen. Unmounts the moment the coverflow (and its own B) is up.
+private struct LibraryBackCatcher: View {
+    let active: Bool
+    let onBack: () -> Void
+    @State private var input = GamepadMenuInput(manager: .shared)
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                input.onBack = onBack
+                if active { input.start() }
+            }
+            .onChange(of: active) { _, nowActive in
+                if nowActive { input.start() } else { input.stop() }
+            }
+            .onDisappear { input.stop() }
+    }
+}
+#endif
+
 /// One poster tile. Steam vs custom is marked with a badge; the art walks the candidate URLs
 /// (portrait → header → hero) and finally a text placeholder.
 private struct GameCard: View {
@@ -185,7 +257,9 @@ private struct GameCard: View {
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .frame(maxWidth: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(alignment: .topLeading) { StoreBadge(isCustom: game.isCustom) }
+                .overlay(alignment: .topLeading) {
+                    StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
+                }
             Text(game.title)
                 .font(.geist(12, relativeTo: .caption))
                 .lineLimit(2)

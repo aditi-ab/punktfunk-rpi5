@@ -191,6 +191,7 @@ internal fun ConnectTakeover(
     onCancel: () -> Unit,
     onRetry: () -> Unit,
 ) {
+    val ink = LocalGamepadInk.current
     val copy = connectCopy(phase)
     val timedOut = phase is ConnectPhase.WakeTimedOut
 
@@ -212,7 +213,7 @@ internal fun ConnectTakeover(
                     Icon(
                         Icons.Filled.Bedtime,
                         contentDescription = null,
-                        tint = Color.White.copy(alpha = 0.9f),
+                        tint = ink.fg(0.9f),
                         modifier = Modifier.size(46.dp),
                     )
                 }
@@ -221,14 +222,14 @@ internal fun ConnectTakeover(
             }
             Text(
                 copy.title,
-                color = Color.White,
+                color = ink.fg,
                 fontWeight = FontWeight.Bold,
                 fontSize = 24.sp,
                 textAlign = TextAlign.Center,
             )
             Text(
                 copy.subtitle,
-                color = Color.White.copy(alpha = 0.65f),
+                color = ink.fg(0.65f),
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center,
                 fontFamily = if (copy.monoSubtitle) FontFamily.Monospace else FontFamily.Default,
@@ -249,6 +250,7 @@ internal fun ConnectTakeover(
  */
 @Composable
 private fun PulsingSpinner() {
+    val ink = LocalGamepadInk.current
     val transition = rememberInfiniteTransition(label = "connectPulse")
     val pulse by transition.animateFloat(
         initialValue = 0f,
@@ -262,14 +264,14 @@ private fun PulsingSpinner() {
             for (i in 0..1) {
                 val p = (pulse + i * 0.5f) % 1f
                 drawCircle(
-                    color = Color(0xFF8678F5).copy(alpha = (1f - p) * 0.35f),
+                    color = ink.accent.copy(alpha = (1f - p) * 0.35f),
                     radius = maxR * (0.42f + p * 0.58f),
                     style = Stroke(width = 2.dp.toPx()),
                 )
             }
         }
         CircularProgressIndicator(
-            color = Color.White,
+            color = ink.fg,
             strokeWidth = 3.dp,
             modifier = Modifier.size(54.dp),
         )

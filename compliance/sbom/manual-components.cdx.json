@@ -46,8 +46,8 @@
     {
       "type": "library",
       "name": "FFmpeg",
-      "version": "7.x/8.x (system-provided on Linux; replaceable DLLs bundled with the Windows packages)",
-      "description": "Dynamically linked libav* decode/encode; LGPL notice at packaging/windows/licenses/FFmpeg-LGPL-NOTICE.txt",
+      "version": "7.x/8.x (HOST only \u2014 system-provided on Linux; replaceable DLLs bundled with the Windows host installer)",
+      "description": "Dynamically linked libav* ENCODE for the host (pf-encode: NVENC-libav, VAAPI, AMF/QSV); LGPL notice at packaging/windows/licenses/FFmpeg-LGPL-NOTICE.txt. No punktfunk CLIENT links FFmpeg since M10 \u2014 client decode is Vulkan Video / DXVA / VAAPI / VideoToolbox / MediaCodec with openh264 + rav1d as the CPU floor.",
       "licenses": [{ "license": { "id": "LGPL-2.1-or-later" } }],
       "externalReferences": [{ "type": "website", "url": "https://ffmpeg.org" }]
     },
@@ -58,14 +58,6 @@
       "description": "Windowing/input layer for the desktop clients, dynamically linked",
       "licenses": [{ "license": { "id": "Zlib" } }],
       "externalReferences": [{ "type": "vcs", "url": "https://github.com/libsdl-org/SDL" }]
-    },
-    {
-      "type": "application",
-      "name": "VB-CABLE",
-      "version": "redistributed installer, see packaging/windows/install-vbcable.ps1",
-      "description": "Third-party kernel-mode virtual audio driver redistributed with the Windows host; notice at packaging/windows/licenses/VB-CABLE-NOTICE.txt. Planned to be replaced by an attestation-signed first-party driver.",
-      "licenses": [{ "license": { "name": "Proprietary freeware (VB-Audio Software, redistribution permitted per notice)" } }],
-      "externalReferences": [{ "type": "website", "url": "https://vb-audio.com/Cable/" }]
     },
     {
       "type": "application",

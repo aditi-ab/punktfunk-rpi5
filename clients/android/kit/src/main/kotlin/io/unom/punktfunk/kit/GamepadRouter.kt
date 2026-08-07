@@ -320,6 +320,19 @@ class GamepadRouter(
         return null
     }
 
+    /** Whether ANY live slot currently holds wire pad [pad]. Read from the phone-gyro thread. */
+    fun padPresent(pad: Int): Boolean = slots.values.any { it.index == pad }
+
+    /**
+     * Whether wire pad [pad] is held by a capture-link slot ([ExternalPad] — USB DualSense /
+     * SC2), whose motion arrives from the pad's OWN IMU. The phone-gyro mirror stands down for
+     * those: two motion writers on one wire pad would fight. Synthetic ids are negative
+     * ([EXTERNAL_ID_BASE]); real [InputDevice] ids are positive. Read from the phone-gyro thread
+     * (the slot table is concurrent).
+     */
+    fun padHasOwnMotion(pad: Int): Boolean =
+        slots.any { (id, slot) -> slot.index == pad && id < 0 }
+
     /**
      * A capture-link pad occupying a wire slot without an Android [InputDevice] — the as-is Steam
      * Controller 2 passthrough (USB/BLE claimed directly, invisible to the input stack). Shares

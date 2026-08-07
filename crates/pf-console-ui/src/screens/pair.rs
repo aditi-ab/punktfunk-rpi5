@@ -6,8 +6,9 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase};
+use crate::pointer::Pointer;
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{Fonts, DIM, ERROR, W};
+use crate::theme::{fg, Fonts, ERROR, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -206,6 +207,52 @@ impl PairScreen {
         }
         let roles = self.roles();
         let (msg, pulse) = self.list.menu(ev, roles.len());
+        self.activate(msg, pulse, &roles, ctx, fx)
+    }
+
+    /// Mouse/touch. The raised keyboard is modal, exactly as on the add-host screen: it
+    /// takes what lands on it, and a press outside closes it rather than reaching through.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        if self.editing.is_some() && !ctx.deck {
+            if !self.keyboard.covers(p) {
+                if p.press() {
+                    self.editing = None;
+                    return true;
+                }
+                return false;
+            }
+            let (msg, _) = self.keyboard.pointer(p);
+            match msg {
+                KeyMsg::Type(c) => {
+                    self.type_char(c);
+                }
+                KeyMsg::Backspace => {
+                    if let Some(f) = self.editing {
+                        self.field_mut(f).pop();
+                    }
+                }
+                KeyMsg::Done => self.editing = None,
+                KeyMsg::None => {}
+            }
+            return true;
+        }
+        let roles = self.roles();
+        let (msg, pulse) = self.list.pointer(p, roles.len());
+        if matches!(msg, ListMsg::None) && pulse.is_none() {
+            return false;
+        }
+        self.activate(msg, pulse, &roles, ctx, fx);
+        true
+    }
+
+    fn activate(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        roles: &[Role],
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
         match msg {
             ListMsg::Activate => {
                 match roles.get(self.list.cursor) {
@@ -297,7 +344,7 @@ impl PairScreen {
             intro,
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             cx,
             f64::from(rect.top) + 2.0 * k,
             f64::from(rect.width()) * 0.72,
@@ -336,7 +383,7 @@ impl PairScreen {
                 "Pairing… confirm the PIN on the host",
                 W::Regular,
                 13.0 * k,
-                DIM,
+                fg(0.55),
                 cx + 10.0 * k,
                 status_y,
                 f64::from(rect.width()) * 0.6,

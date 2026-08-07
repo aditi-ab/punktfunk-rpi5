@@ -9,7 +9,7 @@
 #
 # What goes in: scripts/ci/gen-sbom.sh = syft over the checkout (every lockfile-pinned dep in
 # both Rust workspaces + the JS trees + Swift Package.resolved) merged with
-# compliance/sbom/manual-components.cdx.json (vendored C/C++, bundled DLLs, VB-CABLE, gamescope).
+# compliance/sbom/manual-components.cdx.json (vendored C/C++, bundled DLLs, gamescope).
 name: sbom
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
 # it (a canary only needs the latest commit; each release tag is its own ref so tag runs never

@@ -82,8 +82,9 @@ parse breakage that silently failed installs on non-English boxes.
   firewall rules), removes the `PunktfunkWeb` task + its firewall rule, then `driver uninstall` (+
   `--gamepad`) removes the punktfunk virtual-device drivers — the pf-vdisplay device node(s) and the
   pf-vdisplay / pf-gamepad / pf-xusb driver-store packages (the field report was that they survived
-  uninstall). **VB-CABLE is intentionally NOT removed** (a third-party shared component the user may
-  use elsewhere — its own uninstaller is `VBCABLE_Setup_x64.exe -u -h`); the `%ProgramData%\punktfunk`
+  uninstall). **A VB-CABLE from an older punktfunk install is intentionally NOT removed** (a
+  third-party shared component the user may use elsewhere — its own uninstaller is
+  `VBCABLE_Setup_x64.exe -u -h`); the `%ProgramData%\punktfunk`
   config (incl. `web-password`) is also left in place.
 
 Silent install: `punktfunk-host-setup-<ver>.exe /VERYSILENT` (omit the driver with
@@ -100,21 +101,16 @@ fresh install uses the generated random console password — read it from
 - **Virtual gamepads need no prerequisite.** The DualSense / DualShock 4 / Xbox 360 (XUSB) UMDF drivers
   are **bundled** in the installer (the *Install the virtual gamepad drivers* task) and
   `pnputil`-installed. **ViGEmBus is no longer used.**
-- **The streaming microphone uses VB-CABLE**, bundled + silently installed by the installer (the *Install
-  VB-CABLE virtual audio* task). The host writes the client's mic into VB-CABLE's input; its `CABLE
-  Output` capture endpoint surfaces as a host mic. A Windows audio device can only be created by a
-  **kernel-mode** driver (no UMDF path exists), so unlike our self-signed UMDF drivers we cannot ship our
-  own — VB-CABLE is a vendor-signed cable that loads with no test-signing. It is **donationware** by
-  VB-Audio, redistributed under VB-Audio's bundling grant (only the single base cable) — the grant
-  requires the end user to see VB-CABLE's origin + donationware status, which the wizard task text and
-  `licenses/VB-CABLE-NOTICE.txt` surface. The package binary is **not** in the repo — CI provisions the
-  **pinned, SHA-256-verified official package** onto the runner (`scripts/ci/provision-windows-punktfunk-extras.ps1`
-  → `C:\Users\Public\vbcable`) and `windows-host.yml` passes it via `$env:VBCABLE_DIR`, so **published
-  installers always bundle it**; locally supply `-VbCableDir` / `$env:VBCABLE_DIR` (the extracted
-  official package, containing `VBCABLE_Setup_x64.exe`). Unset → the installer is built without it and
-  the host falls back to auto-installing the Steam Streaming pair; set-but-invalid → the pack **fails**
-  (a broken provisioning must not silently ship a mic-less installer again). *(Endgame:
-  attestation-sign our own MIT virtual-audio driver to drop this dependency.)*
+- **Audio uses Steam's streaming drivers — nothing is bundled.** A Windows audio device can only
+  be created by a **kernel-mode** driver (no UMDF path exists), so unlike our self-signed UMDF
+  drivers we cannot ship our own. The host instead mints its OWN devnode instances of Valve's
+  vendor-signed streaming-audio drivers on the target box: **"Punktfunk Speakers"** (the
+  client-only desktop-audio sink, from `SteamStreamingSpeakers.inf`) and **"Punktfunk
+  Microphone"** (mic passthrough, from `SteamStreamingMicrophone.inf`). Audio therefore requires
+  **Steam installed — never running**; the installer shows a suppressible notice when Steam is
+  absent, and the host re-checks live, so installing Steam later just works. VB-CABLE was
+  bundled for the mic until the audio-substrate change (2026-08) — a cable from an older install
+  (or one the user installs) keeps working as a fallback mic target.
 
 ## Files here
 
@@ -122,10 +118,9 @@ fresh install uses the generated random console password — read it from
 |------|------|
 | `punktfunk-host.iss` | Inno Setup script (the installer definition). |
 | `branding/` | Wizard branding: `gen-branding.ps1` renders the brand mark into the committed `wizard-image-*.bmp` / `wizard-small-*.bmp` (100–200% DPI) + `punktfunk.ico`. Re-run only on a brand change. |
-| `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + VB-CABLE + the **web console** (`.output` + bun) + the HDR layer + branding, run ISCC, sign setup.exe. |
+| `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + the **web console** (`.output` + bun) + the HDR layer + branding, run ISCC, sign setup.exe. |
 | `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
 | `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-gamepad` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
-| `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
 | `make-driver-cert.ps1` | Generate the stable `CN=punktfunk-driver` code-signing cert (the `DRIVER_CERT_PFX_B64` / `DRIVER_CERT_PASSWORD` secrets). No key container, so it works over SSH; self-tests with signtool where it can. See *Driver signing* above. |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
@@ -224,7 +219,7 @@ path below is the maintainer's test box — substitute your own `punktfunk-probe
 # Recover a WEDGED driver. Symptom: every session fails with
 #   create virtual output: pf-vdisplay ADD ...: DeviceIoControl(0x222400): Element nicht gefunden (0x80070490)
 # i.e. ERROR_NOT_FOUND — sustained ADD/REMOVE churn exhausted the IddCx monitor slots (ghost
-# "Generic Monitor (punktfunk)" nodes pile up, target_ids climb). A host restart's CLEAR_ALL does NOT
+# "Generic Monitor (Punktfunk)" nodes pile up, target_ids climb). A host restart's CLEAR_ALL does NOT
 # fix it; the driver instance must be reloaded. This clears the ghosts + cycles the adapter (no reboot —
 # this box boots to Proxmox).
 powershell -ExecutionPolicy Bypass -File reset-pf-vdisplay.ps1 -Verify -Probe C:\t-goal1\debug\punktfunk-probe.exe

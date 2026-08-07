@@ -83,9 +83,19 @@ BuildRequires:  pkgconfig(opus)
 # FFmpeg dev headers with NVENC — from RPM Fusion (ffmpeg-devel), NOT ffmpeg-free.
 # Version-agnostic: ffmpeg-sys-next auto-detects the installed FFmpeg, so this builds
 # against FFmpeg 7.x (libavcodec 61, e.g. Fedora 43 / Bazzite) or 8.x (libavcodec 62).
+# ALL SEVEN modules, not just the three we call directly: `ffmpeg-next` is pulled with default
+# features, so its `-sys` build script pkg-config-probes codec/device/filter/format/util/
+# resampling/scaling and panics on the first one missing. RPM Fusion's ffmpeg-devel ships the lot
+# in one package, which hid the gap — on a box where these resolve to Fedora's split
+# libav*-free-devel packages instead, dnf installed only the three named here and the build died
+# in ffmpeg-sys-next's build.rs on `libavfilter`.
 BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavdevice)
+BuildRequires:  pkgconfig(libavfilter)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswresample)
+BuildRequires:  pkgconfig(libswscale)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
@@ -93,10 +103,12 @@ BuildRequires:  pkgconfig(gbm)
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(sdl3)
-# The client's pf-ffvk crate runs bindgen over FFmpeg's libavutil/hwcontext_vulkan.h, which
-# #include <vulkan/vulkan.h> — provided by vulkan-headers (Fedora).
-BuildRequires:  vulkan-headers
-# It ALSO links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
+# No vulkan-headers BuildRequires: the only crate that ever needed the Vulkan C headers was the
+# client's pf-ffvk, whose bindgen ran over FFmpeg's libavutil/hwcontext_vulkan.h — and M10 deleted
+# it with the rest of the client's FFmpeg. Nothing has replaced that need: pf-vkdecode/pf-presenter
+# reach Vulkan through ash (loader dlopen'd, no headers), and pyrowave-sys builds against its own
+# vendored copy (crates/pyrowave-sys/build.rs).
+# The HOST links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
 # at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
 # without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
 # e.g. `ln -s $(rpm -ql cuda-cudart-devel | grep stubs/libcuda.so | head -1) /usr/lib64/`.
@@ -492,7 +504,11 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %endif
 
 %files client
-%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
+# The CLIENT-scoped notices, not the workspace-wide root file: the root one is the host's and still
+# carries ffmpeg-next plus the full FFmpeg licence text, while this subpackage links no FFmpeg at
+# all since M10. Same file the GTK shell shows on About → Legal (scripts/gen-third-party-notices.sh
+# generates both). `%%license` installs it under its basename, so the path stays the usual one.
+%license LICENSE-MIT LICENSE-APACHE clients/linux/THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-client
 %{_bindir}/punktfunk-session
 %{_bindir}/punktfunk
@@ -575,6 +591,18 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     echo "Firewall (firewalld): sudo firewall-cmd --reload &&"
     echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
     echo "    (use punktfunk-native for the native-only host)"
+fi
+# A RUNNING firewalld keeps serving the service definition it loaded at its last (re)start, so a
+# port added to the XML by this upgrade — 47993, the separate origin plugin UIs are served from —
+# is not open until a reload, and the console shows every plugin interface as an empty panel with
+# nothing to explain it. `--info-service` asks the daemon, i.e. reads that stale copy.
+if command -v firewall-cmd >/dev/null 2>&1 &&
+   firewall-cmd --state >/dev/null 2>&1 &&
+   firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
+   ! firewall-cmd --info-service=punktfunk-web 2>/dev/null | grep -q '47993'; then
+    echo ""
+    echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
+    echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
 fi
 # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so the
 # warning stays in one place. Exit 1 = something found; never fail the install on it.

@@ -110,6 +110,91 @@ pub struct MicUplinkStats {
 /// the control task is wedged, which callers treat as a closed session.
 const CTRL_QUEUE: usize = 32;
 
+/// Why a session ended — [`NativeClient::end_reason`], and `punktfunk_connection_end_reason` on the
+/// C surface.
+///
+/// The distinction that matters to a UI is **normal vs alarming**, and it is not a spectrum: a
+/// player quitting their game and a host falling off the network both arrive as "the session
+/// ended", and a client with no way to separate them has to word all of them the same. Every client
+/// worded them as failures.
+///
+/// Ordered loosely from "the user did this on purpose" to "something went wrong". Values are part
+/// of the C ABI: append only, never renumber.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunktfunkEndReason {
+    /// Not ended (or ended before a reason could be observed). Also what an unknown future value
+    /// decodes to, so an older client reading a newer core degrades to "no opinion".
+    None = 0,
+    /// **This client** closed the session — the user pressed stop, or the handle was dropped.
+    /// Nothing to report: the UI already knows, it initiated it.
+    Local = 1,
+    /// The host's launched game exited ([`crate::quic::APP_EXITED_CLOSE_CODE`]). A normal finish,
+    /// and the one reason a launcher client can act on: go back to the library the title was
+    /// launched from rather than all the way out to host selection.
+    GameExited = 2,
+    /// The host ended the session cleanly and deliberately — an operator "End" in the console, or
+    /// the session simply finishing. Normal; say so plainly or say nothing.
+    HostEnded = 3,
+    /// The host closed reporting a failure of its own. Worth showing, and the host's log has the
+    /// detail.
+    HostError = 4,
+    /// The connection died rather than being closed: idle timeout, reset, the network going away.
+    /// This — and only this — is the "the host may be asleep, wake it" case.
+    Lost = 5,
+}
+
+impl PunktfunkEndReason {
+    /// Decode the wire/ABI byte. Unknown values become [`Self::None`] rather than panicking: this
+    /// crosses an ABI where the writer may be newer than the reader.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Local,
+            2 => Self::GameExited,
+            3 => Self::HostEnded,
+            4 => Self::HostError,
+            5 => Self::Lost,
+            _ => Self::None,
+        }
+    }
+
+    /// Whether this ending is an ordinary outcome rather than something to alarm the user about.
+    ///
+    /// The single question nearly every client actually asks. `Local`, `GameExited` and `HostEnded`
+    /// are all things that were *meant* to happen; only a host-side failure or a dead connection
+    /// are not. [`Self::None`] counts as normal — no evidence of trouble is not evidence of it.
+    pub fn is_normal(self) -> bool {
+        !matches!(self, Self::HostError | Self::Lost)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl From<&quinn::ConnectionError> for PunktfunkEndReason {
+    /// Classify the QUIC close.
+    ///
+    /// Only two application codes ever arrive from a host at session end: `APP_EXITED` when the
+    /// game it launched quit, and the teardown's own `0` (clean) / `1` (the session returned an
+    /// error) from `native.rs`. Anything else with an application code is a deliberate host-side
+    /// close we do not have a name for, which is still closer to "the host ended it" than to a
+    /// dead link — but a code we have never issued is more likely a fault than a courtesy, so it
+    /// lands in `HostError` where it will at least be visible.
+    fn from(e: &quinn::ConnectionError) -> Self {
+        match e {
+            quinn::ConnectionError::LocallyClosed => Self::Local,
+            quinn::ConnectionError::ApplicationClosed(ac) => {
+                match u32::try_from(u64::from(ac.error_code)) {
+                    Ok(crate::quic::APP_EXITED_CLOSE_CODE) => Self::GameExited,
+                    Ok(0) => Self::HostEnded,
+                    _ => Self::HostError,
+                }
+            }
+            // TimedOut, Reset, VersionMismatch, TransportError, CidsExhausted, and the peer's
+            // transport-level close: the link failed, nobody said goodbye.
+            _ => Self::Lost,
+        }
+    }
+}
+
 pub struct NativeClient {
     // Each plane's receiver sits behind its own mutex so `NativeClient` is `Sync` and Rust
     // embedders can share one `Arc<NativeClient>` across their plane threads (the same
@@ -180,6 +265,9 @@ pub struct NativeClient {
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
+    /// A [`PunktfunkEndReason`] as `u8`, latched with `shutdown` — see
+    /// [`NativeClient::end_reason`].
+    end_reason: Arc<AtomicU8>,
     /// Deliberate-quit flag: [`NativeClient::disconnect_quit`] sets it, so the worker closes the QUIC
     /// connection with [`crate::quic::QUIT_CLOSE_CODE`] (a user "stop") instead of code 0 — telling the
     /// host to skip the keep-alive linger. A plain drop leaves it false → an unwanted-disconnect close.
@@ -448,6 +536,7 @@ impl NativeClient {
             std::sync::mpsc::sync_channel::<crate::quic::CursorState>(CURSOR_STATE_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let end_reason = Arc::new(AtomicU8::new(PunktfunkEndReason::None as u8));
         let quit = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
@@ -463,6 +552,7 @@ impl NativeClient {
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
         let shutdown_w = shutdown.clone();
+        let end_reason_w = end_reason.clone();
         let quit_w = quit.clone();
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
@@ -538,6 +628,7 @@ impl NativeClient {
                     clip_cmd_rx,
                     ready_tx,
                     shutdown: shutdown_w,
+                    end_reason: end_reason_w,
                     quit: quit_w,
                     mode_slot: mode_slot_w,
                     probe: probe_w,
@@ -591,6 +682,7 @@ impl NativeClient {
             host_caps: negotiated.host_caps,
             probe,
             shutdown,
+            end_reason,
             quit,
             worker: Some(worker),
             frames_dropped,
@@ -807,6 +899,29 @@ impl NativeClient {
     /// frame forever — the poll-friendly counterpart to reacting to a `Closed` in a plane loop.
     pub fn is_session_ended(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// WHY the session ended — see [`PunktfunkEndReason`].
+    ///
+    /// A refinement of [`is_session_ended`](Self::is_session_ended), never a substitute: it stays
+    /// [`PunktfunkEndReason::None`] until that is true, and every client that ignores it behaves
+    /// exactly as it did before this existed.
+    ///
+    /// What it is FOR: **most endings are not failures.** A client that cannot tell them apart has
+    /// to pick one wording for all of them, and every such client picked an error — "Session ended
+    /// by <host>", "Connection lost — the host may be asleep" — including when the player quit the
+    /// game themselves. This is the discriminator that lets each client stay quiet for a normal
+    /// finish, return to its library when a launched game exits, and reserve the alarming copy for
+    /// an ending that actually deserves it.
+    ///
+    /// Latches, so it is still readable while the connection is being torn down.
+    pub fn end_reason(&self) -> PunktfunkEndReason {
+        PunktfunkEndReason::from_u8(self.end_reason.load(Ordering::SeqCst))
+    }
+
+    /// Shorthand for the single most actionable reason: the host's launched game exited.
+    pub fn ended_because_game_exited(&self) -> bool {
+        self.end_reason() == PunktfunkEndReason::GameExited
     }
 
     /// Register the calling thread as latency-critical so a later

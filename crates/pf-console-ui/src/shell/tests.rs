@@ -167,6 +167,112 @@ fn wake_gates_input_in_the_same_press() {
     assert!(s.handle_menu(MenuEvent::Move(MenuDir::Left)).is_some());
 }
 
+/// Every settings tab actually RASTERS. The eyeball dump below is `#[ignore]`d, so without
+/// this nothing in the normal gate ever ran the tab strip's layout arithmetic or a settings
+/// screen's rows — a bad index there would only surface on a Deck. CPU raster: the SkSL
+/// backdrop, the layers and the text all run without a GPU.
+/// Tab / Shift+Tab change section. The strip shipped on the shoulder buttons and
+/// PgUp/PgDn only, and the legend names PgUp/PgDn solely when NO pad is attached — so with
+/// a controller plugged in a keyboard user had no way in, and no way to find one.
+#[test]
+fn tab_and_shift_tab_change_section() {
+    use sdl3::keyboard::Scancode;
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    s.motion = Motion::None; // skip the push transition, which drops input
+    let tab = |s: &Shell| match s.stack.last() {
+        Some(Screen::Settings(st)) => st.tab_for_test(),
+        _ => panic!("the settings screen is on top"),
+    };
+    assert_eq!(tab(&s), 0);
+    assert!(s.key(Scancode::Tab, false, false), "Tab is consumed");
+    assert_eq!(tab(&s), 1, "Tab goes forward");
+    assert!(s.key(Scancode::Tab, true, false));
+    assert_eq!(tab(&s), 0, "Shift+Tab goes back");
+    // …and it wraps backwards off the first tab, exactly as the shoulders do.
+    s.key(Scancode::Tab, true, false);
+    assert_eq!(tab(&s), crate::screens::settings::TAB_COUNT - 1);
+    // A key repeat must not run through the strip a section per frame held.
+    let before = tab(&s);
+    s.key(Scancode::Tab, false, true);
+    assert_eq!(tab(&s), before, "held Tab doesn't skip sections");
+}
+
+/// A right-click is Back on every screen, so a pointer always has a way out.
+#[test]
+fn a_secondary_press_goes_back() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    s.motion = Motion::None;
+    assert_eq!(s.stack.len(), 2);
+    assert!(s.pointer(crate::pointer::Pointer {
+        x: 10.0,
+        y: 10.0,
+        kind: crate::pointer::PointerKind::Back,
+    }));
+    // The pop runs through the same transition a B press does.
+    assert!(matches!(s.motion, Motion::Pop { .. }));
+}
+
+/// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
+#[test]
+fn up_opens_host_options_for_saved_tiles_only() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(
+        matches!(s.stack.last(), Some(Screen::HostOptions(_))),
+        "the first tile is a saved host"
+    );
+    s.motion = Motion::None;
+    s.handle_menu(MenuEvent::Back);
+    s.motion = Motion::None;
+    // The third fixture host is discovered-only (`saved: false`).
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Home(_))),
+        "an unsaved host has nothing to edit or forget"
+    );
+}
+
+#[test]
+fn every_settings_tab_rasters() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let (w, h) = (1280u32, 800u32);
+    let pads: Vec<PadInfo> = Vec::new();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+
+    let mut frame = |s: &mut Shell| {
+        s.render(
+            surface.canvas(),
+            w,
+            h,
+            &fonts,
+            Some("Xbox Wireless Controller"),
+            Some(GamepadPref::Xbox360),
+            &pads,
+        );
+    };
+    // One lap of the strip — R1 wraps back to where it started. Every tab's rows fit on an
+    // 800-tall window at once, so ONE frame per tab draws all of them; the cursor is walked to
+    // the end first (input only, no render) so the focused and unfocused row paths both run.
+    // Deliberately frugal: a full-screen SkSL field on the CPU costs the better part of a second
+    // per frame in a debug build, and this test's job is to catch a panic, not to look pretty.
+    for _ in 0..crate::screens::settings::TAB_COUNT {
+        for _ in 0..12 {
+            s.handle_menu(MenuEvent::Move(MenuDir::Down));
+        }
+        frame(&mut s);
+        s.handle_menu(MenuEvent::JumpForward);
+    }
+    // A narrow window is the case the strip has to shrink for (the pills are laid out from
+    // measured text, so a too-small width must clamp rather than lay out off-screen).
+    s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
+}
+
 /// Render every console scene to PNGs for the eyeball pass (ignored; run with
 /// `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`).
 /// CPU raster — the SkSL aurora, layers and text all run without a GPU.
@@ -202,11 +308,47 @@ fn dump_console_screens() {
     let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     dump(&mut s, 40, 8, "01-home", true);
 
+    // The host menu — Up on the focused saved tile. The home frame above carries the new
+    // ▲ Options hint that leads here, so the two are worth eyeballing together.
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    dump(&mut s, 40, 8, "01b-host-options", true);
+    s.handle_menu(MenuEvent::Back);
+    dump(&mut s, 20, 8, "_settle0", true);
+
     // Mid-push into Settings (the transition still): a couple of fast frames land
     // the capture around p ≈ 0.4 — both layers visible.
     s.handle_menu(MenuEvent::Tertiary);
     dump(&mut s, 3, 25, "02-transition", true);
     dump(&mut s, 40, 8, "03-settings", true);
+
+    // The Interface tab (5 shoulder presses along) leads with the Background row, so these
+    // frames show the strip mid-list AND the palette picker. Palettes are set directly rather
+    // than by counting Confirm presses, so reordering the table can't silently shoot the wrong
+    // one. Each is a whole LOOK, not just a backdrop: accent, ink and scrim move together, so
+    // the pale ones must be eyeballed with dark text on them.
+    for _ in 0..5 {
+        s.handle_menu(MenuEvent::JumpForward);
+    }
+    for id in ["violet", "ember", "abyss", "holo", "sunset", "mint"] {
+        s.settings.ui_palette = id.to_string();
+        dump(&mut s, 40, 8, &format!("03-settings-{id}"), true);
+    }
+    // Back to the first tab so the later scenes look like they always did.
+    for _ in 0..5 {
+        s.handle_menu(MenuEvent::JumpBack);
+    }
+    // …and the LAUNCHER at full contrast under a few of them — the backdrop's loudest form,
+    // and the one the palettes are really chosen by.
+    s.handle_menu(MenuEvent::Back);
+    dump(&mut s, 20, 8, "_settle", true);
+    for id in ["nebula", "sunset", "holo"] {
+        s.settings.ui_palette = id.to_string();
+        dump(&mut s, 40, 8, &format!("01-home-{id}"), true);
+    }
+    s.settings.ui_palette = "violet".to_string();
+    dump(&mut s, 20, 8, "_settle2", true);
+    s.handle_menu(MenuEvent::Tertiary); // back into Settings for the scenes below
+    dump(&mut s, 20, 8, "_settle3", true);
 
     // Add Host with the keyboard tray up (keyboard glyph style: no pad).
     s.handle_menu(MenuEvent::Back);
@@ -251,6 +393,7 @@ fn dump_console_screens() {
             id: format!("steam:{i}"),
             title: (*t).to_string(),
             store: "steam".into(),
+            launcher: false,
         })
         .collect(),
     );

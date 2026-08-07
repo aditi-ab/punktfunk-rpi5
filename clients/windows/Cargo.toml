@@ -78,11 +78,6 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "winuser",
 ] }
 
-# FFmpeg — used only to enumerate which codecs this client can decode (probe::decodable_codecs),
-# advertised to the host on the speed-test connect. Same pin as the host/Linux client. (Real
-# decode + present live in the spawned punktfunk-session binary.)
-ffmpeg-next = "8"
-
 # Gamepad enumeration + pin persistence for Settings runs on pf-client-core's shared SDL service
 # (see the `gamepad` field in app/); the spawned punktfunk-session does the actual forwarding. SDL3
 # itself (built from source via the bundled CMake on Windows) is pulled transitively by

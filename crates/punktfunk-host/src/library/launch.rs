@@ -19,6 +19,10 @@ use super::*;
 pub struct LaunchTarget {
     /// Identity for the status surface and the `game.*` events.
     pub game: crate::gamelease::GameRef,
+    /// This entry opens a LAUNCHER, not a game (design D4) — so there is no "the game exited"
+    /// moment to detect, and the lease stays untracked no matter what else is known about it.
+    /// See [`crate::gamelease::LeaseRequest::launcher`].
+    pub launcher: bool,
     /// How to recognize the running game ([`DetectSpec`]); empty when the store offers nothing.
     pub detect: DetectSpec,
     /// The resolved shell command. `Some` on Linux (where the host runs it); `None` on Windows,
@@ -51,6 +55,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
         let command = entry.launch.as_ref().and_then(command_for)?;
         Some(LaunchTarget {
             game,
+            launcher: entry.role == GameRole::Launcher,
             detect: entry.detect,
             command: Some(command),
         })
@@ -62,6 +67,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
         // the existing warning fires there.
         Some(LaunchTarget {
             game,
+            launcher: entry.role == GameRole::Launcher,
             detect: entry.detect,
             command: None,
         })
@@ -184,22 +190,59 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
         // shell:AppsFolder — which runs in the interactive user session (UWP activation fails as
         // SYSTEM/session-0; spawn_in_active_session uses the user token). Guard the charset (the value
         // is host-derived from MicrosoftGame.config + AppRepository, but belt-and-suspenders).
-        "aumid" => {
-            let valid = spec.value.split_once('!').is_some_and(|(pfn, app)| {
-                let part = |s: &str| {
-                    !s.is_empty()
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-                };
-                part(pfn) && part(app)
-            });
-            valid.then(|| {
-                (
-                    format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value),
-                    None,
-                )
-            })
+        "aumid" => valid_aumid(&spec.value).then(|| {
+            (
+                format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value),
+                None,
+            )
+        }),
+        // Xbox / Game Pass from a library PLUGIN: `<Identity>!<AppId>`, both read straight out of
+        // `MicrosoftGame.config`. The host completes it into the AUMID.
+        //
+        // This kind exists because of a measured privilege asymmetry (2026-08-06): resolving the
+        // PackageFamilyName means enumerating `%ProgramData%\…\AppRepository\Packages`, which is
+        // denied to `NT AUTHORITY\LocalService` — the principal the plugin runner runs as — and
+        // allowed to the host, which runs as LocalSystem. So the plugin sends what it can read and
+        // the host reads the authoritative publisher hash itself, at launch time.
+        //
+        // Resolving here rather than caching at install time also means a package update that
+        // changes the hash cannot leave a stale, unlaunchable tile behind.
+        "xbox" => {
+            let (identity, app_id) = spec.value.split_once('!')?;
+            if !aumid_part(identity) || !aumid_part(app_id) {
+                return None;
+            }
+            let pfn = xbox_pfn(identity)?;
+            Some((
+                format!("explorer.exe \"shell:AppsFolder\\{pfn}!{app_id}\""),
+                None,
+            ))
         }
+        // Playnite: open the game through Playnite's own URI handler, which is what actually knows
+        // how to start it (Playnite maps the id to whichever store owns the title). explorer.exe
+        // resolves the registered protocol as the user — the same pattern as the `epic` kind — and
+        // the id is GUID-validated, so the only variable part of the line is 36 hex-and-dash chars.
+        //
+        // This kind exists because the plugin used to publish `kind: "command"` (a `start ""` shell
+        // line). The 2026-08-05 review made `command` operator-only, which refuses a plugin's whole
+        // reconcile — so without a typed kind the Playnite plugin cannot publish anything at all.
+        "playnite" => valid_playnite_id(&spec.value).then(|| {
+            (
+                format!("explorer.exe \"playnite://playnite/start/{}\"", spec.value),
+                None,
+            )
+        }),
+        // A launcher entry (D4) on Windows: today that is Playnite's Fullscreen app, spawned
+        // directly (its `playnite://` handler opens the DESKTOP app, so no URI can do this). The
+        // value is the literal "playnite" — nothing from the entry reaches the command line — and
+        // the working directory is Playnite's own install dir, as a .NET app expects.
+        "launcher_ui" => match spec.value.as_str() {
+            "playnite" => playnite_fullscreen_exe().map(|exe| {
+                let dir = exe.parent().map(std::path::Path::to_path_buf);
+                (format!("\"{}\"", exe.display()), dir)
+            }),
+            _ => None,
+        },
         // Operator-typed custom command (host-owned, never client-set): run it through the shell in the
         // interactive session. `cmd.exe /c` is acceptable here precisely because the value is operator
         // input — the same trust as the operator typing it — not a client-influenced string.
@@ -260,6 +303,38 @@ pub(crate) fn valid_steam_ui(value: &str) -> bool {
     matches!(value, "bigpicture" | "desktop")
 }
 
+/// One half of an AUMID (a package family name or an app id): non-empty, and no character that
+/// could break out of the `shell:AppsFolder\…` argument. Both halves are host-derived, so this is
+/// belt-and-braces — but the `xbox` kind now takes an Identity straight off a plugin's wire, which
+/// makes it load-bearing rather than defensive.
+pub(crate) fn aumid_part(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A full `<PFN>!<AppId>` AUMID.
+pub(crate) fn valid_aumid(value: &str) -> bool {
+    value
+        .split_once('!')
+        .is_some_and(|(pfn, app)| aumid_part(pfn) && aumid_part(app))
+}
+
+/// A Playnite game id: the GUID Playnite's own database uses, and the only client-influenced part
+/// of a `playnite` launch. Interpolated into a URI handed to explorer.exe, so the charset is
+/// validated first — 8-4-4-4-12 lowercase-or-uppercase hex with dashes, nothing else.
+pub(crate) fn valid_playnite_id(value: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let mut parts = value.split('-');
+    for want in groups {
+        match parts.next() {
+            Some(p) if p.len() == want && p.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
 /// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
 ///
 /// One kind for every launcher but Steam, rather than one kind each: they all have exactly a single
@@ -280,17 +355,71 @@ fn launcher_ui_stores() -> &'static [&'static str] {
     {
         &["heroic", "lutris"]
     }
-    // Windows launchers (Epic, GOG Galaxy, the Xbox app) are not wired yet — each needs its own
-    // verified activation, and an unverified guess would ship a tile that does nothing.
-    #[cfg(not(target_os = "linux"))]
+    // Playnite's activation is verified (2026-08-06, on the .173 box); Epic, GOG Galaxy and the
+    // Xbox app are still unwired — each needs its own verified activation, and an unverified guess
+    // would ship a tile that does nothing.
+    #[cfg(windows)]
+    {
+        &["playnite"]
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         &[]
     }
 }
 
 /// Is this a `launcher_ui` value this host can resolve?
+///
+/// On Windows, Playnite is validated by *resolution* rather than by being on the list: a host
+/// without Playnite installed refuses the entry (a 400 the plugin author can act on) instead of
+/// publishing a tile that does nothing when a user clicks it.
 pub(crate) fn valid_launcher_ui(value: &str) -> bool {
-    launcher_ui_stores().contains(&value)
+    if !launcher_ui_stores().contains(&value) {
+        return false;
+    }
+    #[cfg(windows)]
+    if value == "playnite" {
+        return playnite_fullscreen_exe().is_some();
+    }
+    true
+}
+
+/// Windows: Playnite's **Fullscreen** app, if this host can find it.
+///
+/// Fullscreen rather than Desktop for two reasons: a launcher tile is opened from a couch over a
+/// stream, and — verified on 2026-08-06 — the registered `playnite://` protocol handler points at
+/// `Playnite.DesktopApp.exe`, so a URI cannot open fullscreen mode at all. The exe is launched
+/// directly, which is also why nothing here is interpolated from the entry: the whole value is the
+/// literal `"playnite"`.
+///
+/// Playnite installs per-user by default, so the install directory comes from its own uninstall
+/// entry (HKCU first, then HKLM for a machine-wide install), falling back to the default
+/// `%LOCALAPPDATA%\Playnite`. `None` when nothing resolves, which is what refuses the tile.
+#[cfg(windows)]
+fn playnite_fullscreen_exe() -> Option<std::path::PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Playnite";
+    const EXE: &str = "Playnite.FullscreenApp.exe";
+
+    let from_registry = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+        .into_iter()
+        .find_map(|root| {
+            RegKey::predef(root)
+                .open_subkey(KEY)
+                .ok()?
+                .get_value::<String, _>("InstallLocation")
+                .ok()
+        })
+        .map(std::path::PathBuf::from);
+
+    from_registry
+        .into_iter()
+        .chain(
+            std::env::var_os("LOCALAPPDATA").map(|l| std::path::PathBuf::from(l).join("Playnite")),
+        )
+        .map(|dir| dir.join(EXE))
+        .find(|p| p.is_file())
 }
 
 /// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
@@ -566,14 +695,76 @@ mod tests {
             // Not wired on this OS — refused inbound rather than becoming a tile that does nothing.
             assert!(!valid_launcher_ui("gog"));
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            // No Windows/macOS launcher UIs are wired yet, so every value is refused.
+            // Playnite is accepted only when this host can actually FIND its Fullscreen app:
+            // validation is resolution, so a box without Playnite refuses the entry rather than
+            // publishing a tile that does nothing when clicked.
+            assert_eq!(
+                valid_launcher_ui("playnite"),
+                playnite_fullscreen_exe().is_some()
+            );
+            // The Linux launchers, and the Windows ones whose activation is still unverified
+            // (Epic, GOG Galaxy, the Xbox app), stay refused.
+            assert!(!valid_launcher_ui("heroic"));
+            assert!(!valid_launcher_ui("gog"));
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            // No launcher UIs are wired on this OS, so every value is refused.
             assert!(!valid_launcher_ui("heroic"));
             assert!(!valid_launcher_ui("gog"));
         }
         assert!(!valid_launcher_ui(""));
         assert!(!valid_launcher_ui("lutris; rm -rf ~"));
+    }
+
+    /// The `xbox` kind is what a library PLUGIN can publish: the runner's principal cannot read
+    /// AppRepository (measured 2026-08-06), so it sends `<Identity>!<AppId>` and the host resolves
+    /// the publisher hash. The charset guard is load-bearing here — unlike `aumid`, this value
+    /// arrives over the wire.
+    #[test]
+    fn xbox_value_is_identity_bang_appid_and_charset_guarded() {
+        assert!(valid_aumid("Microsoft.Foo!Game"));
+        assert!(valid_aumid("A_b-c.d!App"));
+        // Both halves must be present and non-empty.
+        assert!(!valid_aumid("Microsoft.Foo"));
+        assert!(!valid_aumid("!Game"));
+        assert!(!valid_aumid("Microsoft.Foo!"));
+        assert!(!valid_aumid(""));
+        // Nothing that could break out of the `shell:AppsFolder\…` argument.
+        assert!(!valid_aumid("Foo\"!Game"));
+        assert!(!valid_aumid("Foo!Game\" & calc"));
+        assert!(!valid_aumid("Foo\\..\\Bar!Game"));
+        assert!(!valid_aumid("Foo Bar!Game"));
+    }
+
+    /// Windows' launcher tile opens Playnite's FULLSCREEN app. Both negatives are the point: the
+    /// desktop app is not what a couch tile should open, and the `playnite://` handler cannot be
+    /// used because it is registered to the desktop app (verified on .173, 2026-08-06).
+    #[cfg(windows)]
+    #[test]
+    fn playnite_launcher_opens_the_fullscreen_app() {
+        let ui = |v: &str| {
+            windows_launch_for(&LaunchSpec {
+                kind: "launcher_ui".into(),
+                value: v.into(),
+            })
+        };
+        // A launcher this host cannot open is refused, whatever the OS.
+        assert!(ui("gog").is_none());
+        assert!(ui("heroic").is_none());
+        assert!(ui("").is_none());
+
+        // The rest only means anything on a box that actually has Playnite.
+        let Some(exe) = playnite_fullscreen_exe() else {
+            return;
+        };
+        let (cmd, dir) = ui("playnite").expect("resolvable when the exe was found");
+        assert!(cmd.contains("Playnite.FullscreenApp.exe"), "{cmd}");
+        assert!(!cmd.contains("DesktopApp"), "{cmd}");
+        assert!(!cmd.contains("playnite://"), "{cmd}");
+        assert_eq!(dir.as_deref(), exe.parent());
     }
 
     #[cfg(target_os = "linux")]

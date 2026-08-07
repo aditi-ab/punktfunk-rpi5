@@ -6,6 +6,7 @@
 // per-plugin parity harness (design M5) then checks the whole pipeline against a live host, but
 // these catch a drift long before that.
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,8 @@ import {
 	fileUrl,
 	gridFilenames,
 	isSteamTool,
+	withReadOnlyDb,
+	openReadOnly,
 	parseAppManifest,
 	parseRegQuery,
 	parseShortcuts,
@@ -285,5 +288,81 @@ describe("reg.exe output", () => {
 			},
 			{ name: "Language", type: "REG_SZ", data: "english" },
 		]);
+	});
+});
+
+// The read-only SQLite helper, against a REAL database file.
+//
+// This exists because its absence shipped a total failure. `openReadOnly` built a
+// `file:…?immutable=1` URI but opened it with `{ readonly: true }`, which does not enable SQLite's
+// URI filename parsing — so the name was taken literally, the open threw, and `openReadOnly`
+// returned `undefined`. Every caller reads that as "this launcher isn't installed", and
+// `withReadOnlyDb(...) ?? []` turns it into an empty library. The lutris plugin therefore reported
+// "0 games" on every box, forever, while `detect` still said "present" (it only stats the file) —
+// and the only thing that caught it was a hand-run parity gate against a live host.
+//
+// So: assert the helper can actually READ, not merely that it returns something.
+describe("openReadOnly", () => {
+	const withDb = <T>(use: (file: string) => T): T => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-kit-sqlite-"));
+		const file = path.join(dir, "pga.db");
+		const seed = new Database(file);
+		seed.run("CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, installed INT)");
+		seed.run("INSERT INTO games (id, name, installed) VALUES (1, 'Ubisoft Connect', 1)");
+		seed.close();
+		try {
+			return use(file);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	};
+
+	test("opens a real database and returns its rows", () => {
+		withDb((file) => {
+			const db = openReadOnly(file);
+			expect(db).toBeDefined();
+			expect(db?.query("SELECT id, name FROM games WHERE installed = 1")).toEqual([
+				{ id: 1, name: "Ubisoft Connect" },
+			]);
+			db?.close();
+		});
+	});
+
+	// A path with a space is the realistic URI-encoding case (Flatpak roots, "Program Files").
+	test("opens a path that needs URI escaping", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf kit sqlite "));
+		const file = path.join(dir, "pga.db");
+		const seed = new Database(file);
+		seed.run("CREATE TABLE games (id INTEGER PRIMARY KEY)");
+		seed.run("INSERT INTO games (id) VALUES (7)");
+		seed.close();
+		try {
+			expect(openReadOnly(file)?.query("SELECT id FROM games")).toEqual([{ id: 7 }]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("withReadOnlyDb reads, then closes", () => {
+		withDb((file) => {
+			expect(withReadOnlyDb(file, (h) => h.query("SELECT name FROM games"))).toEqual([
+				{ name: "Ubisoft Connect" },
+			]);
+		});
+	});
+
+	// The "not installed" contract — an absent file is `undefined`, never a throw.
+	test("absent file is undefined, not an error", () => {
+		expect(openReadOnly(path.join(os.tmpdir(), "pf-kit-nope", "pga.db"))).toBeUndefined();
+		expect(withReadOnlyDb(path.join(os.tmpdir(), "pf-kit-nope", "pga.db"), () => 1)).toBeUndefined();
+	});
+
+	// Schema drift degrades to no rows rather than taking the plugin down.
+	test("a bad query returns [] rather than throwing", () => {
+		withDb((file) => {
+			const db = openReadOnly(file);
+			expect(db?.query("SELECT missing_column FROM games")).toEqual([]);
+			db?.close();
+		});
 	});
 });

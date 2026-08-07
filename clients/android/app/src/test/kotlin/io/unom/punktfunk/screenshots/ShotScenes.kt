@@ -31,6 +31,12 @@ import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
+import androidx.compose.runtime.CompositionLocalProvider
+import io.unom.punktfunk.GamepadInk
+import io.unom.punktfunk.GamepadPalette
+import io.unom.punktfunk.GamepadSettingsScreen
+import io.unom.punktfunk.LocalGamepadInk
+import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsCategory
@@ -406,3 +412,25 @@ internal fun WakeTimedOutScene() =
 @Composable
 internal fun ConnectConsoleScene() =
     ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
+
+/**
+ * The real console settings screen — the section tab strip, the glass rows, the focused row's
+ * unfolded detail, and the living (calmed) backdrop behind them. The touch [SettingsScene] can't
+ * stand in for it: this is a different screen with different navigation, and the strip is the part
+ * a layout regression would eat first.
+ */
+@Composable
+internal fun ConsoleSettingsScene(paletteId: String = "violet") {
+    // The scene calls the screen directly, so it has to publish the palette locals `App` would
+    // normally provide — without them a light palette would render with the default DARK ink and
+    // the shot would silently prove nothing.
+    val palette = GamepadPalette.named(paletteId)
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+    ) {
+        GamepadSettingsScreen(
+            initial = SHOT_SETTINGS.copy(uiPalette = paletteId), onChange = {}, onBack = {},
+        )
+    }
+}

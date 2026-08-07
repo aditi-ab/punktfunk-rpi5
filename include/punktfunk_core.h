@@ -76,7 +76,14 @@
 // capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
 // receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
 // arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 16
+// v17: added `punktfunk_connection_end_reason` + the `PUNKTFUNK_END_REASON_*` vocabulary — asks,
+// once a session has ended, WHY: this client closed it, the host's launched game exited (its close
+// carried [`quic::APP_EXITED_CLOSE_CODE`], which the host has sent since long before this bump
+// with nothing consuming it), the host ended it cleanly, the host reported a failure, or the
+// connection was simply lost. Purely a read of state the core already had: no new call is required
+// of an embedder, a client that never calls it is unchanged, and the host sends exactly the same
+// bytes either way, so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 17
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -653,15 +660,16 @@
 // [`Hello::video_caps`] bit: the client's decoder accepts **multi-slice access units** — H.264/
 // HEVC frames carrying several slice NALs (latency plan §7 LN1: the encoder splits frames so
 // sub-frame readback can ship early slices while the tail encodes). Decoder-level, so the
-// EMBEDDER sets it from what its decode stack actually handles: the desktop clients' FFmpeg/
-// D3D11VA/Vulkan-video decoders are fine, but mobile/TV MediaCodec is per-SoC — Amlogic HEVC
-// decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on multi-slice frames
-// (the 0.17.0 field regression: the 4-slice Linux default froze streams on first frame and
-// watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1 slice per frame for
-// every hardware decoder. The host defaults to >1 slice ONLY toward a client that sets this
-// bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in both directions);
-// every other client gets single-slice frames — the pre-0.17 wire shape. NOTE: this takes the
-// video_caps byte's last free bit — the next video cap needs a second byte (ABI bump).
+// EMBEDDER sets it from what its decode stack actually handles: every desktop decode stack
+// (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) is fine, but mobile/TV MediaCodec is per-SoC
+// — Amlogic HEVC decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on
+// multi-slice frames (the 0.17.0 field regression: the 4-slice Linux default froze streams on
+// first frame and watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1
+// slice per frame for every hardware decoder. The host defaults to >1 slice ONLY toward a
+// client that sets this bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in
+// both directions); every other client gets single-slice frames — the pre-0.17 wire shape.
+// NOTE: this takes the video_caps byte's last free bit — the next video cap needs a second
+// byte (ABI bump).
 #define PUNKTFUNK_VIDEO_CAP_MULTI_SLICE 128
 #endif
 
@@ -1617,6 +1625,63 @@ typedef uint8_t PunktfunkInputKind;
 #endif // __cplusplus
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Why a session ended — [`NativeClient::end_reason`], and `punktfunk_connection_end_reason` on the
+// C surface.
+//
+// The distinction that matters to a UI is **normal vs alarming**, and it is not a spectrum: a
+// player quitting their game and a host falling off the network both arrive as "the session
+// ended", and a client with no way to separate them has to word all of them the same. Every client
+// worded them as failures.
+//
+// Ordered loosely from "the user did this on purpose" to "something went wrong". Values are part
+// of the C ABI: append only, never renumber.
+enum PunktfunkEndReason
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // Not ended (or ended before a reason could be observed). Also what an unknown future value
+    // decodes to, so an older client reading a newer core degrades to "no opinion".
+    PUNKTFUNK_END_REASON_NONE = 0,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // **This client** closed the session — the user pressed stop, or the handle was dropped.
+    // Nothing to report: the UI already knows, it initiated it.
+    PUNKTFUNK_END_REASON_LOCAL = 1,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host's launched game exited ([`crate::quic::APP_EXITED_CLOSE_CODE`]). A normal finish,
+    // and the one reason a launcher client can act on: go back to the library the title was
+    // launched from rather than all the way out to host selection.
+    PUNKTFUNK_END_REASON_GAME_EXITED = 2,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host ended the session cleanly and deliberately — an operator "End" in the console, or
+    // the session simply finishing. Normal; say so plainly or say nothing.
+    PUNKTFUNK_END_REASON_HOST_ENDED = 3,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The host closed reporting a failure of its own. Worth showing, and the host's log has the
+    // detail.
+    PUNKTFUNK_END_REASON_HOST_ERROR = 4,
+#endif
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+    // The connection died rather than being closed: idle timeout, reset, the network going away.
+    // This — and only this — is the "the host may be asleep, wake it" case.
+    PUNKTFUNK_END_REASON_LOST = 5,
+#endif
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum PunktfunkEndReason PunktfunkEndReason;
+#else
+typedef uint8_t PunktfunkEndReason;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
 // encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
 // instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
@@ -1634,6 +1699,22 @@ typedef struct ColorInfo ColorInfo;
 // at a 20 ms one — the same source line meaning two very different latencies depending on what
 // else happened to be using the audio graph that day.
 typedef struct JitterTuning JitterTuning;
+
+// What a client's OWN bitstream parser saw about intra-refresh recovery on one decoded frame — the
+// in-band counterpart of the wire's [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT).
+//
+// Two facts rather than one verdict, because the gate needs both and only the gate knows how to
+// combine them. A recovery point SEI promises: *a decoder that starts at THIS AU has a correct
+// picture N frames later*. That promise covers a decoder which lost references BEFORE the SEI (the
+// wave re-codes every stripe after it, so the stale content is fully overwritten) and says nothing
+// at all about one which lost references AFTER it (the already-swept stripes still reference the
+// lost picture). So a recovery point may only lift a freeze when its SEI was observed at or after
+// the loss — which is the pairing [`ReanchorGate::on_local_recovery`] performs, since the gate is
+// the only party that knows when the loss was.
+//
+// Produced by pf-vkdecode's `RecoveryWatch` on the native decode lane. Every other lane leaves it
+// [`Default`] and nothing changes.
+typedef struct LocalRecovery LocalRecovery;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
@@ -2024,6 +2105,8 @@ typedef struct {
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
+
+
 
 
 
@@ -2499,6 +2582,28 @@ PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
+// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
+//
+// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
+// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
+// while the connection is torn down, and a client that never calls it behaves exactly as it did
+// before this existed.
+//
+// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
+// their game from a host falling off the network, so every client wrote one message for all of
+// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
+// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
+// for `HOST_ERROR` and `LOST`.
+//
+// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Pull the next audio frame and **decode it in-core** to interleaved f32 PCM — for embedders
 // without a multistream-capable Opus decoder (e.g. Apple, whose AudioToolbox Opus path is
 // stereo-only). The decoder is built once from the negotiated channel count and handles 2/6/8
@@ -2507,6 +2612,13 @@ PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint
 // connection memory until the next PCM call on this handle. Use EITHER this or
 // [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
 // not both (they share the underlying queue).
+//
+// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
+// recovery has had its chance) are synthesized via libopus packet-loss concealment and returned
+// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
+// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
+// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
+// pre-healed, exactly as they do on the clients that decode outside core.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.

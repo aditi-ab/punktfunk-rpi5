@@ -19,12 +19,18 @@ import SwiftUI
 import GameController
 
 struct LibraryCoverflowView: View {
+    @Environment(\.gamepadInk) private var ink
     let games: [GameEntry]
     let imageSession: URLSession?
     var onLaunch: ((String) -> Void)?
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
     var onDismiss: (() -> Void)?
+    /// Whether the carousel owns the controller — the in-place shell gates it (mid-transition,
+    /// and under the connect takeover after A launches a title, where this coverflow used to
+    /// keep polling underneath). Cover/sheet presentations keep the default.
+    var controllerActive = true
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — drives a tighter poster so everything still fits.
@@ -35,6 +41,18 @@ struct LibraryCoverflowView: View {
     private let compact = false // no size classes on macOS
     #endif
     @State private var selection: String?
+    /// How many covers have settled (art loaded, or every candidate exhausted).
+    @State private var artSettled = 0
+    /// The backstop below has fired: play the entrance regardless of what the art is doing.
+    @State private var artWaitOver = false
+
+    /// Whether the strip may play its entrance yet. Cards swinging in as grey placeholders and
+    /// then filling with artwork afterwards is the whole effect wasted, so the entrance waits for
+    /// the first few covers — every poster is fetched in parallel, so those land together and
+    /// cover the visible strip. The wait is capped: a slow or artless library still animates.
+    private var contentReady: Bool {
+        artWaitOver || artSettled >= min(4, games.count)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -45,19 +63,34 @@ struct LibraryCoverflowView: View {
                 .padding(.leading, 22)
                 .padding(.vertical, compact ? 6 : 10)
         }
-        .background { GamepadScreenBackground() }
+        // Hosted in the shell, the field is the shell's own persistent aurora (the library is
+        // an aurora screen — the calm mix simply stays 0, so nothing even chases).
+        .background {
+            if !hostedInShell { GamepadScreenBackground() }
+        }
+        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
+        // pale palette flips all of them, and no leaf should have to read the setting.
+        .gamepadPaletteInk()
+        // The entrance's backstop (see `contentReady`).
+        .task {
+            try? await Task.sleep(for: .milliseconds(700))
+            artWaitOver = true
+        }
     }
 
     @ViewBuilder private func content(for size: CGSize) -> some View {
         // Fit the tallest poster into the height the detail line + paddings leave (the hints are a
         // safe-area inset, already out of this budget) — capped so it never dwarfs a large iPad and
         // clamped by width on a narrow screen.
-        let reserved: CGFloat = compact ? 72 : 96 // detail line + spacers
+        let reserved: CGFloat = (compact ? 72 : 96) + (showsGroupHeading ? 26 : 0)
         let coverHeight = min(360, min(max(140, size.height - reserved), size.width * 0.9))
         let coverWidth = coverHeight * 2 / 3
 
         VStack(spacing: 0) {
             Spacer(minLength: 4)
+            if showsGroupHeading {
+                groupHeading.padding(.bottom, 6)
+            }
             carousel(coverWidth: coverWidth, coverHeight: coverHeight)
             detailPanel
                 .padding(.top, 12)
@@ -74,9 +107,11 @@ struct LibraryCoverflowView: View {
             spacing: 34,
             onActivate: { onLaunch?($0.id) },
             onBack: { onDismiss?() },
-            shoulderJump: 5
-        ) { game in
-            cover(game, width: coverWidth, height: coverHeight)
+            shoulderJump: 5,
+            isActive: controllerActive,
+            contentReady: contentReady
+        ) { game, entrance in
+            cover(game, width: coverWidth, height: coverHeight, entrance: entrance)
         }
         .frame(height: coverHeight + 44)
     }
@@ -85,16 +120,26 @@ struct LibraryCoverflowView: View {
     /// per-frame `phase` (real distance-from-centered), so the tilt tracks what's actually on screen
     /// mid-scroll. `.shadow` isn't a `VisualEffect`, so it's baked constant into the card; the
     /// scale/rotation/opacity ramp already makes the centered cover prominent.
-    private func cover(_ game: GameEntry, width: CGFloat, height: CGFloat) -> some View {
-        PosterImage(candidates: game.art.posterCandidates, title: game.title, session: imageSession)
+    private func cover(
+        _ game: GameEntry, width: CGFloat, height: CGFloat, entrance: CardEntrance
+    ) -> some View {
+        PosterImage(
+            candidates: game.art.posterCandidates, title: game.title, session: imageSession,
+            onLoaded: { artSettled += 1 })
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(alignment: .topLeading) { StoreBadge(isCustom: game.isCustom) }
+            .overlay(alignment: .topLeading) {
+                // `solid`: a frosted chip can't sample a backdrop through this card's own
+                // composited transform, so it would only show up on the centred card.
+                StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher, solid: true)
+            }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                    .strokeBorder(ink.fg(0.12), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.5), radius: 16, y: 12)
+            .shadow(color: ink.shadow(0.5), radius: 16, y: 12)
+            // Beneath the scroll transition, never around it — see CardEntrance.
+            .modifier(entrance)
             .scrollTransition { content, phase in
                 let v = phase.value
                 let d = CGFloat(min(abs(v), 1))
@@ -112,21 +157,42 @@ struct LibraryCoverflowView: View {
             }
     }
 
+    /// Does this library have both groups? Only then does the heading earn its row — a
+    /// launcher-less library gets exactly the layout it had before design D4.
+    private var showsGroupHeading: Bool {
+        games.contains(where: \.isLauncher) && games.contains { !$0.isLauncher }
+    }
+
+    /// Which group the cursor is in. A coverflow is one-dimensional, so instead of a second focus
+    /// rail (a whole new up/down nav model for two or three tiles) the heading names the group and
+    /// changes as the selection crosses the boundary — the launcher entries lead the strip.
+    private var groupHeading: some View {
+        let selected = games.first { $0.id == selection }
+        return Text(selected?.isLauncher == true ? "LAUNCHERS" : "GAMES")
+            .font(.geist(11, .semibold, relativeTo: .caption2))
+            .tracking(1.4)
+            .foregroundStyle(ink.fg(0.45))
+    }
+
     /// The centered title + store tag — empty (not hidden) so the layout doesn't jump.
     @ViewBuilder private var detailPanel: some View {
         let game = games.first { $0.id == selection }
         VStack(spacing: 6) {
             Text(game?.title ?? " ")
                 .font(.geist(compact ? 22 : 25, .bold, relativeTo: .title))
-                .foregroundStyle(.white)
+                .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
                 .multilineTextAlignment(.center)
             if let game {
-                Text(game.isCustom ? "CUSTOM" : "STEAM")
-                    .font(.geist(11, .semibold, relativeTo: .caption2))
-                    .tracking(1.2)
-                    .foregroundStyle(.white.opacity(0.5))
+                // main's richer store label, in the palette's ink.
+                Text(
+                    game.isLauncher
+                        ? "\(game.storeLabel.uppercased()) · LAUNCHER" : game.storeLabel.uppercased()
+                )
+                .font(.geist(11, .semibold, relativeTo: .caption2))
+                .tracking(1.2)
+                .foregroundStyle(ink.fg(0.5))
             }
         }
         .frame(maxWidth: .infinity)
@@ -139,7 +205,10 @@ struct LibraryCoverflowView: View {
     private var hints: [GamepadHint] {
         var hints: [GamepadHint] = []
         if onLaunch != nil {
-            hints.append(.init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Launch"))
+            // You *open* a launcher and *launch* a game — the hint follows the focused entry.
+            let opens = games.first { $0.id == selection }?.isLauncher == true
+            hints.append(
+                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: opens ? "Open" : "Launch"))
         }
         hints.append(.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close"))
         return hints

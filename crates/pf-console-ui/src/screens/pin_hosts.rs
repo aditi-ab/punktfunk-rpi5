@@ -7,8 +7,9 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
+use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
-use crate::theme::{Fonts, DIM, W};
+use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -67,6 +68,28 @@ impl PinHostsScreen {
         }
         let indices = host_indices(ctx);
         let (msg, pulse) = self.list.menu(ev, indices.len());
+        self.toggle(msg, pulse, &indices, ctx, fx)
+    }
+
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        let indices = host_indices(ctx);
+        let (msg, pulse) = self.list.pointer(p, indices.len());
+        if matches!(msg, ListMsg::None) && pulse.is_none() {
+            return false;
+        }
+        self.toggle(msg, pulse, &indices, ctx, fx);
+        true
+    }
+
+    /// One list message against the focused host's pin — shared by both input paths.
+    fn toggle(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        indices: &[usize],
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
         let Some(&host_idx) = indices.get(self.list.cursor) else {
             return pulse;
         };
@@ -115,7 +138,7 @@ impl PinHostsScreen {
                 "No saved hosts yet — pair with a host first, then pin this profile to it.",
                 W::Regular,
                 14.0 * k,
-                DIM,
+                fg(0.55),
                 cx,
                 f64::from(rect.top) + f64::from(rect.height()) / 2.0,
                 f64::from(rect.width()) * 0.7,
@@ -157,7 +180,7 @@ impl PinHostsScreen {
             "A pinned profile appears as its own card on the host — one press connects with it.",
             W::Regular,
             13.0 * k,
-            DIM,
+            fg(0.55),
             cx,
             f64::from(rect.bottom) - detail_h + 6.0 * k,
             f64::from(rect.width()) * 0.8,

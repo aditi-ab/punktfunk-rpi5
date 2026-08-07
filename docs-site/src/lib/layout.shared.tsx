@@ -3,7 +3,7 @@ import BrandMark from '@/components/BrandMark'
 import Wordmark from '@/components/Wordmark'
 
 // Shared chrome (nav title, links) for both the docs layout and the home layout.
-// The lens mark + wordmark mirror the punktfunk marketing site's header.
+// The lens mark + wordmark mirror the Punktfunk marketing site's header.
 export function baseOptions(): BaseLayoutProps {
   return {
     nav: {

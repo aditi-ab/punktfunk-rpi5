@@ -1,5 +1,5 @@
-# Layers punktfunk-specific tooling onto the shared unom Windows CI runner: per-arch FFmpeg
-# (host + client native builds), Inno Setup (the host installer), and the aarch64-pc-windows-msvc
+# Layers punktfunk-specific tooling onto the shared unom Windows CI runner: FFmpeg (the HOST's
+# amf-qsv encode leg, x64 only), Inno Setup (the host installer), and the aarch64-pc-windows-msvc
 # rustup target (windows-msix.yml's ARM64 leg). The runner itself - act_runner, Node, rustup,
 # VS Build Tools/NASM/CMake/LLVM - is provisioned generically by unom/infra
 # (windows-runner/windows-runner.pkr.hcl + proxmox/windows-runner's Terraform clone); this script
@@ -26,14 +26,19 @@ if (Test-Path $rustup) {
   Write-Warning "rustup not found at $rustup - has unom/infra's setup-gitea-runner-base.ps1 run on this box yet?"
 }
 
-# --- FFmpeg shared trees for the host (amf-qsv encode) + clients (decode). BtbN **lgpl-shared**
+# --- FFmpeg shared tree for the HOST's amf-qsv encode leg (windows-host.yml). BtbN **lgpl-shared**
 # builds: the AMD/Intel AMF + Intel QSV encoders, swscale, and the HEVC decoder are all present in
 # the LGPL build, and punktfunk never calls the GPL-only encoders (x264/x265 - software encode is
 # the separate BSD-2 openh264 crate; NVENC is the direct NVIDIA SDK). lgpl-shared keeps the
 # bundled DLLs LGPL-2.1+ (dynamic linking satisfies the relink duty) rather than GPL, so the
 # shipped installer/MSIX stay consistent with punktfunk's MIT OR Apache-2.0 posture.
-# MIGRATION: a runner previously provisioned with the old *gpl-shared* trees must be
-# re-provisioned - delete C:\Users\Public\ffmpeg and C:\Users\Public\ffmpeg-arm64, then re-run.
+# ⚠ The CLIENT no longer links FFmpeg at all (M10, design/client-native-decode.md §6): it decodes
+# with pf-vkdecode / pf-dxvadec / openh264 + rav1d. windows.yml and windows-msix.yml set no
+# FFMPEG_DIR and the MSIX bundles no libav* DLLs, so only the x64 tree is fetched now - the ARM64
+# one existed solely for the ARM64 client leg. Delete a stale C:\Users\Public\ffmpeg-arm64 by
+# hand; this script does not remove what it no longer installs.
+# MIGRATION: a runner previously provisioned with the old *gpl-shared* tree must be
+# re-provisioned - delete C:\Users\Public\ffmpeg, then re-run.
 # These DLLs are bundled verbatim into the code-signed host installer/MSIX, so the download is
 # SHA-256-pinned (like VB-CABLE below): BtbN's `latest` tag is a ROLLING release whose assets are
 # re-uploaded over time, so an unverified fetch would let a hijacked/MITM'd upstream asset land
@@ -42,7 +47,7 @@ if (Test-Path $rustup) {
 # that is intentional: re-download, re-verify the new archive, and update the two pins here.
 #   Refresh a pin:  (Get-FileHash .\ffmpeg-<tag>.zip -Algorithm SHA256).Hash
 function Get-BtbnFfmpeg {
-  param([string]$Dir, [string]$ZipTag, [string]$Sha)   # ZipTag: 'win64' (x64) or 'winarm64' (ARM64 cross tree)
+  param([string]$Dir, [string]$ZipTag, [string]$Sha)   # ZipTag: 'win64' (x64); BtbN also publishes 'winarm64'
   if (Test-Path (Join-Path $Dir 'lib\avcodec.lib')) { info "FFmpeg ($ZipTag) already present at $Dir"; return }
   info "fetching FFmpeg ($ZipTag, BtbN lgpl-shared, SHA-256 pinned)"
   $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-$ZipTag-lgpl-shared-7.1.zip"
@@ -60,27 +65,13 @@ function Get-BtbnFfmpeg {
   Move-Item -Path $inner.FullName -Destination $Dir
   Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
-Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'    -Sha '89F3469706E5D53AEA5CF34AEE63E62CE746E6159D7AEE473D330B02A47558E6'
-Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64' -Sha 'D96B4CE08CEBDCC6AD0E3934A3F962915E440EEFB9D73831AFEA4D80E35129A5'
+Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg" -ZipTag 'win64' -Sha '89F3469706E5D53AEA5CF34AEE63E62CE746E6159D7AEE473D330B02A47558E6'
 
-# --- Vulkan-Headers (pf-ffvk's bindgen: libavutil/hwcontext_vulkan.h includes <vulkan/vulkan.h>,
-# and Windows has no system copy). Headers only - the loader (vulkan-1.dll) is a GPU-driver
-# component and is never linked at build time, so the full Vulkan SDK is deliberately NOT
-# required. Pinned Khronos tag; bump deliberately alongside FFmpeg/driver expectations. ---
-$vkHdrDir = "C:\Users\Public\vulkan-headers"
-$vkHdrTag = "v1.4.309"
-if (-not (Test-Path (Join-Path $vkHdrDir 'include\vulkan\vulkan.h'))) {
-  info "fetching Vulkan-Headers $vkHdrTag"
-  $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/$vkHdrTag.zip"
-  $zip = "$vkHdrDir.zip"; $tmp = "$vkHdrDir-extract"
-  Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-  Expand-Archive -Path $zip -DestinationPath $tmp -Force   # one top-level Vulkan-Headers-<ver> folder
-  $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-  if (Test-Path $vkHdrDir) { Remove-Item -Recurse -Force $vkHdrDir }
-  Move-Item -Path $inner.FullName -Destination $vkHdrDir
-  Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-} else { info "Vulkan-Headers already present at $vkHdrDir" }
+# --- No Vulkan-Headers here any more: they existed only for pf-ffvk's bindgen over
+# libavutil/hwcontext_vulkan.h, and that crate is gone (M10). Nothing punktfunk builds on Windows
+# needs Vulkan headers at compile time - ash generates its own bindings and dlopens vulkan-1.dll,
+# which is a GPU-driver component. A stale C:\Users\Public\vulkan-headers is harmless; delete it
+# by hand if you want the disk back. ---
 
 # --- Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
 # locates it at its fixed Program Files path, so it need not be on PATH - just present. The .iss
@@ -95,37 +86,20 @@ if (-not (Test-Path $isccPath) -or ($innoVer -and [version]$innoVer -lt [version
   } else { Write-Warning "Inno Setup missing or pre-6.6 ($innoVer) and choco unavailable - install/upgrade it for windows-host.yml." }
 }
 
-# --- VB-CABLE (the streaming virtual microphone the host installer bundles). Pinned official
-# package, SHA-256 verified - a silent hash change means VB-Audio shipped a new pack: verify it,
-# then update BOTH the pin here and the notice if terms changed (packaging/windows/licenses/
-# VB-CABLE-NOTICE.txt). Donationware by VB-Audio (https://vb-audio.com), redistributed under
-# VB-Audio's bundling grant; only the base cable, never A+B/C+D. windows-host.yml points
-# VBCABLE_DIR here so pack-host-installer.ps1 bundles it. ---
-$vbDir = "C:\Users\Public\vbcable"
-$vbUrl = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
-$vbSha = "B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB"
-if (-not (Test-Path (Join-Path $vbDir 'VBCABLE_Setup_x64.exe'))) {
-  info "fetching VB-CABLE (official base package, pinned)"
-  $vbZip = "$vbDir.zip"
-  Invoke-WebRequest -Uri $vbUrl -OutFile $vbZip -UseBasicParsing
-  $got = (Get-FileHash $vbZip -Algorithm SHA256).Hash
-  if ($got -ne $vbSha) { Remove-Item $vbZip -Force; throw "VB-CABLE download hash mismatch (got $got, pinned $vbSha) - vendor package changed; re-verify before re-pinning." }
-  if (Test-Path $vbDir) { Remove-Item -Recurse -Force $vbDir }
-  Expand-Archive -Path $vbZip -DestinationPath $vbDir -Force   # flat zip (setup exes + signed drivers)
-  Remove-Item $vbZip -Force
-  info "VB-CABLE staged at $vbDir"
-} else { info "VB-CABLE already present at $vbDir" }
+# VB-CABLE provisioning removed (the audio-substrate program, 2026-08): the installer no longer
+# bundles a cable - the host mints its audio endpoints from Steam's streaming drivers on the
+# target box. A stale C:\Users\Public\vbcable on a runner is harmless and can be deleted.
 
 # --- Drop punktfunk's env vars into the generic runner's daemon wrapper extension point (see
 # unom/infra's scripts/setup-gitea-runner-base.ps1) so the act_runner daemon - and therefore every
-# job it runs - sees FFMPEG_DIR without unom/infra needing to know punktfunk exists. ---
+# job it runs - sees FFMPEG_DIR without unom/infra needing to know punktfunk exists.
+# FFMPEG_DIR + the PATH prepend are the HOST's (windows-host.yml amf-qsv: import libs at link time,
+# the DLLs at test time). The client workflows ignore both - they link no libav*. ---
 $projectEnv = "C:\Users\Public\act-runner\project-env.ps1"
 @'
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
-$env:VBCABLE_DIR = "C:\Users\Public\vbcable"
-$env:PF_FFVK_VULKAN_INCLUDE = "C:\Users\Public\vulkan-headers\include"
 $env:PATH = "C:\Users\Public\ffmpeg\bin;" + $env:PATH
 '@ | Set-Content -Encoding UTF8 $projectEnv
-info "wrote $projectEnv (FFMPEG_DIR, VBCABLE_DIR, PF_FFVK_VULKAN_INCLUDE) - restart the gitea-act-runner scheduled task to pick it up"
+info "wrote $projectEnv (FFMPEG_DIR) - restart the gitea-act-runner scheduled task to pick it up"
 
 info "punktfunk extras provisioned OK."

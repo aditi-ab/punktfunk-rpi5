@@ -1,26 +1,29 @@
 # Windows client CI — runs on a self-hosted windows-amd64 runner (host mode; the generic runner +
-# toolchain come from unom/infra's windows-runner/; punktfunk's own extras - FFmpeg,
-# Vulkan-Headers, WDK, Inno Setup, the ARM64 rustup target - self-provision via the "Ensure
-# Windows toolchain" step below, a fast no-op once already present, so any runner with that label
-# works with no manual dispatch step first). Build + clippy + fmt + test BOTH client binaries:
-# the WinUI 3 shell (windows-reactor + WASAPI + SDL3) and the punktfunk-session Vulkan client
-# (pf-presenter/pf-client-core/pf-console-ui/pf-ffvk — every stream runs in it, spawned by the
+# toolchain come from unom/infra's windows-runner/; punktfunk's own extras - WDK, Inno Setup,
+# the ARM64 rustup target - self-provision via the "Ensure Windows toolchain" step below, a fast
+# no-op once already present, so any runner with that label works with no manual dispatch step
+# first). Build + clippy + fmt + test BOTH client binaries: the WinUI 3 shell
+# (windows-reactor + WASAPI + SDL3) and the punktfunk-session Vulkan client
+# (pf-presenter/pf-client-core/pf-console-ui — every stream runs in it, spawned by the
 # shell). ARM64 note: rust-skia publishes no aarch64-pc-windows-msvc prebuilt binaries, so the
 # session builds --no-default-features there (no Skia console UI; streaming is unaffected) —
 # flip when skia-binaries adds the target.
+#
+# NO FFmpeg here since M10 (design/client-native-decode.md §6): the client decodes with
+# pf-vkdecode / pf-dxvadec / openh264+rav1d and links no libav* at all, so this workflow sets
+# no FFMPEG_DIR, no PF_FFVK_VULKAN_INCLUDE and prepends nothing to PATH. The provisioning
+# script still fetches the FFmpeg trees because the HOST keeps FFmpeg — windows-host.yml's
+# `amf-qsv` leg link-imports them.
 #
 # Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and
 # aarch64-pc-windows-msvc by cross-compiling. The x64 MSVC toolset ships an ARM64 cross compiler
 # (VC\Tools\MSVC\<ver>\bin\Hostx64\arm64\cl.exe) and aarch64-pc-windows-msvc is a tier-2 Rust
 # target with host tools, so no ARM64 runner is needed — the cc/cmake crates pick the ARM64
 # compiler from the target triple (SDL3 + libopus build-from-source cross-compile fine). The one
-# arch-specific external dep is FFmpeg's import libs: the runner keeps an x64 tree at
-# C:\Users\Public\ffmpeg and an ARM64 tree at C:\Users\Public\ffmpeg-arm64 (both FFmpeg 7.x /
-# avcodec-61); the matrix points FFMPEG_DIR at the right one. aarch64 can't *run* on the x64 host,
-# so fmt + test run only for x64.
+# thing the aarch64 build can't do is *run* on the x64 host, so fmt + test run only for x64.
 #
-# The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, the x64 FFmpeg,
-# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout
+# The MSVC/WinUI toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, CARGO_HOME,
+# CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout
 # / per-arch vars are set in a step:
 #   - CARGO_TARGET_DIR=C:\t…  the runner's host workdir is buried deep under
 #                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
@@ -29,7 +32,6 @@
 #                          can't create its .tlog (DirectoryNotFoundException -> MSB6003). A short
 #                          root keeps every nested path well under the limit (per-arch so the two
 #                          matrix legs don't share a target dir).
-#   - FFMPEG_DIR           per-arch FFmpeg import libs (x64 vs arm64 tree).
 #
 # Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
 # `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (that
@@ -55,7 +57,9 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-console-ui/**'
-      - 'crates/pf-ffvk/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows.yml'
@@ -67,7 +71,9 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-console-ui/**'
-      - 'crates/pf-ffvk/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows.yml'
@@ -110,7 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+      - name: Ensure Windows toolchain (WDK, Inno Setup, ARM64 target)
         shell: pwsh
         run: ./scripts/ci/ensure-windows-toolchain.ps1
 
@@ -120,21 +126,13 @@ jobs:
           # Per-arch short target root (dodges MAX_PATH; keeps the two legs from sharing target\).
           $td = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\t-a64' } else { 'C:\t' }
           "CARGO_TARGET_DIR=$td" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # Per-arch FFmpeg import libs (provision-windows-punktfunk-extras.ps1 fetches both).
-          $ff = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\Users\Public\ffmpeg-arm64' } else { 'C:\Users\Public\ffmpeg' }
-          "FFMPEG_DIR=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # pf-ffvk's bindgen needs Vulkan headers (arch-independent; provisioned alongside FFmpeg).
-          "PF_FFVK_VULKAN_INCLUDE=C:\Users\Public\vulkan-headers\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # $ff\bin on PATH too (not just FFMPEG_DIR, which only satisfies the linker): the test
-          # binary needs the actual DLLs to load at runtime. Set here rather than relying on the
-          # daemon's own env (project-env.ps1) - on a freshly cloned/registered runner the daemon
-          # starts before this job's "Ensure Windows toolchain" step ever writes that file, so its
-          # PATH doesn't include this yet on a first run (confirmed live: STATUS_DLL_NOT_FOUND).
-          "$ff\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # No FFMPEG_DIR / PF_FFVK_VULKAN_INCLUDE / PATH prepend: the client links no libav*
+          # since M10 (see this file's header), so nothing here needs import libs or runtime DLLs.
+          # The HOST still does — windows-host.yml sets them for its amf-qsv leg.
           rustup target add ${{ matrix.target }}
           rustc --version
           cargo --version
-          Write-Output "target ${{ matrix.target }}  target-dir $td  ffmpeg $ff"
+          Write-Output "target ${{ matrix.target }}  target-dir $td"
 
       # Both client binaries. ARM64: no skia-binaries prebuilt for the target, so the session
       # drops its `ui` feature there (pf-console-ui excluded; --no-default-features is a no-op
@@ -152,7 +150,10 @@ jobs:
       - name: Clippy (-D warnings)
         shell: pwsh
         run: |
-          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-ffvk')
+          # Every crate in the `paths:` trigger above is named here: `cargo clippy -p X` BUILDS a
+          # dependency but only LINTS the packages it is given, so a decode crate that starts the
+          # run but is missing from this list would be gated by nothing.
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-bitstream','-p','pf-vkdecode','-p','pf-dxvadec')
           $sf = @()
           if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui') }
           cargo clippy @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
@@ -160,9 +161,9 @@ jobs:
       - name: Rustfmt check
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk -- --check
+        run: cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec -- --check
 
       - name: Test
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo test -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk --target ${{ matrix.target }}
+        run: cargo test -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec --target ${{ matrix.target }}

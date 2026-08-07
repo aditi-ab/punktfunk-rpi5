@@ -28,6 +28,12 @@ struct State {
     req: ConnectRequest,
     stack: gtk::Stack,
     flow: gtk::FlowBox,
+    /// Launcher entries (design D4) get their own shelf above the games, so a handful of ways to
+    /// open a launcher aren't buried in a 400-title grid. Hidden outright when there are none.
+    launcher_flow: gtk::FlowBox,
+    launchers_group: gtk::Box,
+    /// The "Games" heading — only earns its space once a Launchers shelf is above it.
+    games_heading: gtk::Label,
     error_page: adw::StatusPage,
     /// Per-page poster cache (entry id → texture) — a Retry re-renders without refetching.
     art: RefCell<HashMap<String, gdk::Texture>>,
@@ -94,11 +100,44 @@ fn build(
     flow.connect_child_activated(|_, child| {
         child.activate();
     });
+    // The launcher shelf: same tile geometry as the games grid, its own FlowBox so the two
+    // groups never interleave and each wraps on its own.
+    let launcher_flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .activate_on_single_click(true)
+        .homogeneous(true)
+        .min_children_per_line(2)
+        .max_children_per_line(6)
+        .column_spacing(12)
+        .row_spacing(18)
+        .valign(gtk::Align::Start)
+        .build();
+    launcher_flow.connect_child_activated(|_, child| {
+        child.activate();
+    });
+    let launchers_heading = gtk::Label::new(Some("Launchers"));
+    launchers_heading.add_css_class("pf-group-heading");
+    launchers_heading.set_halign(gtk::Align::Start);
+    launchers_heading.set_margin_bottom(8);
+    let launchers_group = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    launchers_group.append(&launchers_heading);
+    launchers_group.append(&launcher_flow);
+    launchers_group.set_margin_bottom(24);
+    launchers_group.set_visible(false);
+
+    let games_heading = gtk::Label::new(Some("Games"));
+    games_heading.add_css_class("pf-group-heading");
+    games_heading.set_halign(gtk::Align::Start);
+    games_heading.set_margin_bottom(8);
+    games_heading.set_visible(false);
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_margin_top(24);
     content.set_margin_bottom(24);
     content.set_margin_start(12);
     content.set_margin_end(12);
+    content.append(&launchers_group);
+    content.append(&games_heading);
     content.append(&flow);
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -166,6 +205,9 @@ fn build(
         req,
         stack,
         flow,
+        launcher_flow,
+        launchers_group,
+        games_heading,
         error_page,
         art: RefCell::new(HashMap::new()),
         pics: RefCell::new(HashMap::new()),
@@ -224,18 +266,41 @@ fn load(state: &Rc<State>) {
 /// immediately; the rest keep their monogram placeholder until `load_art` delivers.
 fn render(state: &Rc<State>, games: &[GameEntry]) {
     state.flow.remove_all();
+    state.launcher_flow.remove_all();
     state.pics.borrow_mut().clear();
-    for game in games {
+    // Design D4: launchers never interleave with titles. The host already sorts by title, and
+    // `partition` is stable, so each group keeps that order.
+    let (launchers, titles): (Vec<&GameEntry>, Vec<&GameEntry>) =
+        games.iter().partition(|g| g.is_launcher());
+    for game in &launchers {
+        state.launcher_flow.append(&game_card(state, game));
+    }
+    for game in &titles {
         state.flow.append(&game_card(state, game));
     }
+    // A library with no launcher entries looks exactly as it did before this existed.
+    state.launchers_group.set_visible(!launchers.is_empty());
+    state
+        .games_heading
+        .set_visible(!launchers.is_empty() && !titles.is_empty());
 }
 
 /// One poster tile: 2:3 art (~150×225 logical) over the title, with a store badge and a
 /// monogram placeholder underneath the async art. Activation starts a session launching
 /// this title (silent on a pinned host — the normal trust gate applies).
 fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
-    let monogram = gtk::Label::new(Some(&initials(&game.title)));
-    monogram.add_css_class("pf-poster-monogram");
+    // A launcher usually ships no poster. Naming the launcher on an accent face says "opens
+    // Steam"; a title monogram on the neutral face would say "a game whose cover didn't load".
+    let launcher = game.is_launcher();
+    let monogram = if launcher {
+        let l = gtk::Label::new(Some(store_label(&game.store)));
+        l.add_css_class("pf-poster-launcher-name");
+        l
+    } else {
+        let l = gtk::Label::new(Some(&initials(&game.title)));
+        l.add_css_class("pf-poster-monogram");
+        l
+    };
     monogram.set_halign(gtk::Align::Center);
     monogram.set_valign(gtk::Align::Center);
     let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -252,6 +317,9 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     let badge = gtk::Label::new(Some(store_label(&game.store)));
     badge.add_css_class("pf-pill");
     badge.add_css_class("pf-store-badge");
+    if launcher {
+        badge.add_css_class("pf-launcher");
+    }
     badge.set_halign(gtk::Align::Start);
     badge.set_valign(gtk::Align::Start);
     badge.set_margin_start(6);
@@ -262,6 +330,9 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     poster.add_overlay(&pic);
     poster.add_overlay(&badge);
     poster.add_css_class("pf-poster");
+    if launcher {
+        poster.add_css_class("pf-launcher");
+    }
     poster.set_overflow(gtk::Overflow::Hidden);
     poster.set_size_request(150, 225);
     poster.set_halign(gtk::Align::Center);

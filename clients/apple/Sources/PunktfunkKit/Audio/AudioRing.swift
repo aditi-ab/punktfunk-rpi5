@@ -15,10 +15,16 @@ import os
 /// audible blip". It is now the same two-stage scheme the Rust clients share
 /// (`punktfunk_core::audio::JitterPolicy`): a slow depth average that sits above target for a
 /// sustained window sheds ONE 5 ms frame with a crossfade, and the hard cap is only a backstop.
-/// Keep the constants here in step with `JitterTuning.COREAUDIO`.
+///
+/// **Adaptive depth.** The target is a floor, not a constant: repeated genuine underruns grow it
+/// a step at a time (`noteRead`, mirroring `JitterPolicy::note_read`) up to `maxTargetMS`, and a
+/// long quiet spell relaxes it back toward the base — so a session on Wi-Fi that bunches arrivals
+/// deepens until it stops crackling, while a clean LAN keeps the tight base latency. Keep the
+/// constants here in step with `JitterTuning.COREAUDIO`.
 final class AudioRing: @unchecked Sendable {
     /// Mirrors `JitterTuning::COREAUDIO` — see that type for the rationale.
     private static let targetMS = 20
+    private static let maxTargetMS = 70
     private static let headroomMS = 30
     private static let hardCapMS = 90
     private static let deprimeAfter = 4
@@ -33,6 +39,15 @@ final class AudioRing: @unchecked Sendable {
     private static let crossfadeMS = 2
     /// Time constant of the depth average.
     private static let ewmaTauMS = 1_000
+    /// Adaptive target floor, mirroring `JitterPolicy::note_read`: this many genuine underruns
+    /// inside one window grow the live target a step (up to `maxTargetMS`), and a long quiet
+    /// spell relaxes it a step back toward the base — so only the sessions that actually starve
+    /// (Wi-Fi power-save bunching is the classic) pay for extra depth, and only while they need
+    /// it. All spans are measured in consumed samples, like the Rust policy.
+    private static let growUnderruns = 3
+    private static let growWindowMS = 5_000
+    private static let growStepMS = 10
+    private static let shrinkQuietMS = 30_000
 
     private var buf: [Float]
     private var readIdx = 0
@@ -42,6 +57,14 @@ final class AudioRing: @unchecked Sendable {
     private var emptyReads = 0
     private var depthAvg: Double = 0
     private var overRun = 0
+    /// The live target in interleaved samples — `targetMS` grown by underrun pressure
+    /// (`noteRead`), never below the base. Set in `init` (needs `perMS`).
+    private var targetLive = 0
+    /// Underruns seen in the current growth window, and the window's consumed-sample count.
+    private var underrunsInWindow = 0
+    private var windowRun = 0
+    /// Consumed samples since the last underrun (drives the relax-back-down step).
+    private var quietRun = 0
     /// Reported, not acted on: short reads that actually starved the callback, and smooth drift
     /// corrections. A rising underrun count means the ring is being starved (network or CPU),
     /// which is a different problem from the depth being wrong.
@@ -57,12 +80,14 @@ final class AudioRing: @unchecked Sendable {
         buf = [Float](repeating: 0, count: capacity)
         self.channels = channels
         perMS = 48 * channels
+        targetLive = Self.targetMS * perMS
     }
 
-    /// Live target depth in interleaved samples, lifted so it can always serve one device quantum
-    /// plus a packet (a large-buffer device cannot sustain a target below its own quantum).
+    /// Effective target depth in interleaved samples: the (adaptively grown) live target, lifted
+    /// so it can always serve one device quantum plus a packet (a large-buffer device cannot
+    /// sustain a target below its own quantum).
     private var target: Int {
-        max(Self.targetMS * perMS, renderQuantum + Self.frameMS * perMS)
+        max(targetLive, renderQuantum + Self.frameMS * perMS)
     }
 
     func write(_ samples: UnsafePointer<Float>, count: Int) {
@@ -80,8 +105,13 @@ final class AudioRing: @unchecked Sendable {
             buf[(writeIdx + i) % capacity] = samples[i]
         }
         writeIdx += count
-        // Backstop only: the smooth shed in `read` is what normally holds the depth down.
-        let cap = min(target + Self.headroomMS * perMS, Self.hardCapMS * perMS)
+        // Backstop only: the smooth shed in `read` is what normally holds the depth down. The
+        // hard cap must always leave room for one device quantum past the target (mirrors the
+        // Rust policy's `.max(target + want)`) or a large-quantum device would trim itself into
+        // a permanent underrun.
+        let cap = max(
+            min(target + Self.headroomMS * perMS, Self.hardCapMS * perMS),
+            target + renderQuantum)
         if writeIdx - readIdx > cap {
             readIdx = writeIdx - cap
             depthAvg = Double(cap)
@@ -133,13 +163,43 @@ final class AudioRing: @unchecked Sendable {
         readIdx += n
         if n < count {
             for i in n..<count { out[i] = 0 }
-            // De-prime only after a RUN of short reads: a single transient drain must not
-            // manufacture a whole target's worth of fresh silence.
+        }
+        noteRead(ranShort: n < count, count: count)
+    }
+
+    /// The outcome accounting of one primed read — the Swift mirror of
+    /// `JitterPolicy::note_read`. A short read drives both the de-prime hysteresis (a single
+    /// transient drain must not manufacture a whole target's worth of fresh silence) and the
+    /// adaptive target floor: a device that genuinely keeps starving gets more slack, one step
+    /// per window, capped — and gives it back after a long quiet spell, so one bad minute
+    /// doesn't cost latency for the rest of the session. Caller holds the lock.
+    private func noteRead(ranShort: Bool, count: Int) {
+        windowRun += count
+        if windowRun >= Self.growWindowMS * perMS {
+            windowRun = 0
+            underrunsInWindow = 0
+        }
+        if ranShort {
+            quietRun = 0
             emptyReads += 1
             underrunCount += 1
-            if emptyReads >= Self.deprimeAfter { primed = false }
+            if emptyReads >= Self.deprimeAfter {
+                primed = false
+                emptyReads = 0
+            }
+            underrunsInWindow += 1
+            if underrunsInWindow >= Self.growUnderruns {
+                underrunsInWindow = 0
+                windowRun = 0
+                targetLive = min(targetLive + Self.growStepMS * perMS, Self.maxTargetMS * perMS)
+            }
         } else {
             emptyReads = 0
+            quietRun += count
+            if quietRun >= Self.shrinkQuietMS * perMS {
+                quietRun = 0
+                targetLive = max(targetLive - Self.growStepMS * perMS, Self.targetMS * perMS)
+            }
         }
     }
 

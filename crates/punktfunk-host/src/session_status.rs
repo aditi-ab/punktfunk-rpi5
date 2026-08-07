@@ -381,8 +381,10 @@ mod tests {
                 // No signals: an inert lease, so no watcher thread races this test's assertions.
                 spec: crate::library::DetectSpec::default(),
                 nested: false,
+                launcher: false,
                 child: None,
                 launch_stamp: None,
+                procs: None,
             },
             Box::new(|| {}),
         );
