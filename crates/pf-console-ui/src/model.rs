@@ -156,6 +156,18 @@ pub enum ConsoleCmd {
         addr: String,
         port: u16,
     },
+    /// Rename / re-address a saved host (the host menu's "Edit…"). `key` addresses the
+    /// row; the fingerprint, pins and MACs already stored against it are kept — this edits
+    /// a host, it doesn't replace one.
+    UpdateHost {
+        key: String,
+        name: String,
+        addr: String,
+        port: u16,
+    },
+    /// Drop a saved host (the host menu's "Forget"). The next connect to that address
+    /// starts from scratch: no pin, no pairing, no pinned cards.
+    ForgetHost { key: String },
     /// Start the wake-and-wait loop for this saved host.
     Wake { key: String, then_connect: bool },
     /// Stop the wake loop (B on the wake card) and clear its status.

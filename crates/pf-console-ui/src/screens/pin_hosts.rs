@@ -7,6 +7,7 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
+use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
@@ -67,6 +68,28 @@ impl PinHostsScreen {
         }
         let indices = host_indices(ctx);
         let (msg, pulse) = self.list.menu(ev, indices.len());
+        self.toggle(msg, pulse, &indices, ctx, fx)
+    }
+
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        let indices = host_indices(ctx);
+        let (msg, pulse) = self.list.pointer(p, indices.len());
+        if matches!(msg, ListMsg::None) && pulse.is_none() {
+            return false;
+        }
+        self.toggle(msg, pulse, &indices, ctx, fx);
+        true
+    }
+
+    /// One list message against the focused host's pin — shared by both input paths.
+    fn toggle(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        indices: &[usize],
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
         let Some(&host_idx) = indices.get(self.list.cursor) else {
             return pulse;
         };
