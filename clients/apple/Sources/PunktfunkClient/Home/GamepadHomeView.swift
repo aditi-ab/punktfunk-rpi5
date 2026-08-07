@@ -124,6 +124,11 @@ struct GamepadHomeView: View {
             #if os(iOS)
             if let screen = topScreen {
                 screenLayer(screen)
+                    // Resolve the screen's internal layout (safe-area trays, the scrims'
+                    // `.ignoresSafeArea()` full-bleed) BEFORE the insertion animates: without
+                    // this the tray blurs entered at their content bounds and visibly grew to
+                    // the screen edges mid-push.
+                    .geometryGroup()
                     .zIndex(1)
                     .id(screen.id)
                     .transition(.gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
@@ -322,32 +327,27 @@ struct GamepadHomeView: View {
     // MARK: - Chrome
 
     private var titleBar: some View {
-        // The chip used to be a trailing `.overlay`, which reserves no width: on a portrait phone
-        // it sat directly on top of the centred title ("Select a Host" ran straight into the pad
-        // name). Laying it out as a row with a hidden mirror on the leading side keeps the title
-        // optically centred AND clear of the chip at every width; the title shrinks a little
-        // before it would ever truncate.
+        // Leading title (a console heading, not a floating label — field ask), chip trailing.
+        // The old hidden-mirror trick existed only to keep a CENTRED title clear of the chip;
+        // a leading title needs none of it — the flexible frame keeps the two apart, and the
+        // title shrinks a little before it would ever truncate.
         HStack(spacing: 12) {
-            statusChip(hidden: true)
             Text("Select a Host")
                 .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                 .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-                .frame(maxWidth: .infinity)
-            statusChip(hidden: false)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            statusChip
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 24)
     }
 
     /// Which pad is driving this UI (name + battery) — quiet, and only where there's room; a
-    /// compact-height phone gives the pixels to the carousel instead. `hidden` renders the same
-    /// chip purely as a width reserve.
-    @ViewBuilder private func statusChip(hidden: Bool) -> some View {
+    /// compact-height phone gives the pixels to the carousel instead.
+    @ViewBuilder private var statusChip: some View {
         if !compact, let active = gamepads.active {
             ControllerStatusChip(controller: active)
-                .opacity(hidden ? 0 : 1)
-                .accessibilityHidden(hidden)
         }
     }
 

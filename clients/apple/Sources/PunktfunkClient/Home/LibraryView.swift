@@ -65,6 +65,17 @@ struct LibraryView: View {
                 imageSession?.finishTasksAndInvalidate()
                 imageSession = nil
             }
+            #if os(iOS) || os(macOS)
+            // B closes the library even before the coverflow exists (loading / error / empty):
+            // the coverflow's carousel owns B once games render; until then this zero-size
+            // listener does — without it a controller-only user is trapped on an error screen
+            // (the gamepad screens carry no close chrome).
+            .background {
+                if gamepadUIActive && games.isEmpty {
+                    LibraryBackCatcher(active: controllerActive) { (onClose ?? { dismiss() })() }
+                }
+            }
+            #endif
     }
 
     @ViewBuilder private var content: some View {
@@ -209,6 +220,30 @@ struct LibraryView: View {
         loading = false
     }
 }
+
+#if os(iOS) || os(macOS)
+/// Zero-size controller listener for the library's pre-coverflow states — B backs out. The same
+/// shape as ConnectOverlay's `ConnectControllerInput`; `GamepadMenuInput.needsSnapshot` swallows
+/// the held press that opened the screen. Unmounts the moment the coverflow (and its own B) is up.
+private struct LibraryBackCatcher: View {
+    let active: Bool
+    let onBack: () -> Void
+    @State private var input = GamepadMenuInput(manager: .shared)
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                input.onBack = onBack
+                if active { input.start() }
+            }
+            .onChange(of: active) { _, nowActive in
+                if nowActive { input.start() } else { input.stop() }
+            }
+            .onDisappear { input.stop() }
+    }
+}
+#endif
 
 /// One poster tile. Steam vs custom is marked with a badge; the art walks the candidate URLs
 /// (portrait → header → hero) and finally a text placeholder.

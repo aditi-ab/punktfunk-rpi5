@@ -27,35 +27,29 @@ struct GamepadLibraryScreen: View {
             store: store, host: host, onLaunch: onLaunch,
             onClose: close, controllerActive: controllerActive)
             .safeAreaInset(edge: .top, spacing: 0) {
+                // Leading, like every gamepad heading — no close chrome, B is the exit (the
+                // coverflow's, or LibraryView's own back-catcher before the coverflow exists).
                 Text("\(host.displayName) — Library")
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
-                    .frame(maxWidth: .infinity)
-                    .overlay(alignment: .trailing) { closeButton.padding(.trailing, 20) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
                     .padding(.top, gamepadTitleTopPadding(compact: compact))
                     .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
                     .background { GamepadTrayScrim(edge: .top) }
             }
+            // A hardware keyboard's Esc still closes, without chrome.
+            .background {
+                Button("Close") { close() }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(.plain)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+            }
             .gamepadPaletteInk()
-    }
-
-    /// Touch/click fallback for closing — the controller path is B (the coverflow's onDismiss),
-    /// and it also covers the loading/error/empty states, which the coverflow (and its B) never
-    /// mounts under. A hardware keyboard's Esc rides the cancel action.
-    private var closeButton: some View {
-        Button { close() } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(ink.fg)
-                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .consoleGlassBackground(Circle(), interactive: true)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .keyboardShortcut(.cancelAction)
-        .accessibilityLabel("Close library")
     }
 }
 #endif

@@ -144,12 +144,14 @@ struct GamepadSettingsView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: gamepadHeaderSpacing(compact: compact)) {
+            VStack(alignment: .leading, spacing: gamepadHeaderSpacing(compact: compact)) {
+                // Leading, like a console section heading — centred read as a floating label,
+                // and a gamepad UI needs no close chrome next to it (B is the exit).
                 Text(title)
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
-                    .frame(maxWidth: .infinity)
-                    .overlay(alignment: .trailing) { closeButton.padding(.trailing, 20) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
                 // The picker is one layer deeper — its rows aren't sections of anything, so the
                 // strip would be a control that does nothing while it's up.
                 if pinTarget == nil { tabStrip }
@@ -191,6 +193,18 @@ struct GamepadSettingsView: View {
             gamepads.startDiscovery()
         }
         .onDisappear { gamepads.stopDiscovery() }
+        #if !os(tvOS)
+        // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
+        // keyboard's Esc and the macOS sheet's cancel working without chrome.
+        .background {
+            Button("Close") { performClose() }
+                .keyboardShortcut(.cancelAction)
+                .buttonStyle(.plain)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
+        #endif
     }
 
     /// The section switcher. Horizontally scrollable so a narrow phone in landscape never has to
@@ -294,24 +308,6 @@ struct GamepadSettingsView: View {
         if let close { close() } else { dismiss() }
     }
 
-    /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
-    /// rides the cancel action.
-    private var closeButton: some View {
-        Button { performClose() } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
-                .foregroundStyle(ink.fg)
-                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .consoleGlassBackground(Circle(), interactive: true)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        #if !os(tvOS)
-        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
-        #endif
-        .accessibilityLabel("Close settings")
-    }
-
     /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
     /// layer the row list currently is.
     private var title: String {
@@ -391,12 +387,10 @@ struct GamepadSettingsView: View {
                             .font(.geist(m.valueFont, .medium, relativeTo: .callout))
                             .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
                     } else {
-                        // Toggles and the flat rows keep the quiet slip: keyed by the value so
-                        // a change slides the new string in following the user's motion (a
-                        // right-step enters from the right), crossfading over ~14 pt. The
-                        // ZStack is the stable home the removed/inserted texts transition
-                        // within. (A two-position switch on a drum would read as a coin flip —
-                        // both sibling clients keep toggles a different control, too.)
+                        // The flat rows (profile pin counts, placeholders) keep the quiet slip:
+                        // keyed by the value so a change slides the new string in following the
+                        // user's motion, crossfading over ~14 pt. The ZStack is the stable home
+                        // the removed/inserted texts transition within.
                         let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
                         ZStack {
                             Text(row.value)
@@ -771,6 +765,8 @@ struct GamepadSettingsView: View {
                 value: pinned ? "Pinned" : "Off",
                 detail: "A pinned profile appears as its own card on the host — one press "
                     + "connects with it.",
+                optionLabels: ["Off", "Pinned"],
+                selectedIndex: pinned ? 1 : 0,
                 adjust: { delta in
                     let target = delta > 0
                     guard pinned != target else { return false }
@@ -868,6 +864,10 @@ struct GamepadSettingsView: View {
             id: id, tab: tab, icon: icon, label: label,
             value: value.wrappedValue ? "On" : "Off",
             detail: detail,
+            // Toggles ride the band too (field ask): Off sits left of On, matching the
+            // directional semantics below, so a right-step slides On in from the right.
+            optionLabels: ["Off", "On"],
+            selectedIndex: value.wrappedValue ? 1 : 0,
             enabled: enabled,
             adjust: { delta in
                 // Directional semantics: left = off, right = on; a no-op reads as a boundary.

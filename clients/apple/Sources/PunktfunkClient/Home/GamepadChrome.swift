@@ -32,7 +32,7 @@ func gamepadTitleTopPadding(compact: Bool) -> CGFloat {
     #elseif os(tvOS)
     24
     #else
-    compact ? 10 : 18
+    compact ? 18 : 28
     #endif
 }
 
@@ -57,12 +57,13 @@ func gamepadHeaderSpacing(compact: Bool) -> CGFloat {
 }
 
 /// Point size for a gamepad screen's pinned title: TV-large on tvOS (read from the couch), the
-/// in-hand compact-aware sizes elsewhere.
+/// in-hand compact-aware sizes elsewhere. Sized as a proper screen heading — the field verdict
+/// on the smaller first cut was "way too small" once the title moved off-centre.
 func gamepadTitleSize(compact: Bool) -> CGFloat {
     #if os(tvOS)
     44
     #else
-    compact ? 20 : 30
+    compact ? 24 : 34
     #endif
 }
 
@@ -82,8 +83,6 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 18
     static let rowMaxWidth: CGFloat = 920
     static let detailFont: CGFloat = 19
-    static let closeFont: CGFloat = 20
-    static let closeSide: CGFloat = 48
     static let bandWidth: CGFloat = 380
     #else
     static let headerFont: CGFloat = 12
@@ -97,8 +96,6 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 14
     static let rowMaxWidth: CGFloat = 620
     static let detailFont: CGFloat = 13
-    static let closeFont: CGFloat = 14
-    static let closeSide: CGFloat = 34
     /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
     static let bandWidth: CGFloat = 240
     #endif
