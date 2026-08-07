@@ -1,0 +1,16 @@
+[package]
+name = "pf-bitstream"
+description = "Client-side bitstream layer for native decode: AU parsing, POC/DPB/reference derivation and per-AU DecodePlans (H.264/HEVC/AV1) on the vendored cros-codecs parsers — the layer libavcodec used to be (design/client-native-decode.md §3.1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cros-codecs = { path = "vendor/cros-codecs" }
+tracing = "0.1"
+
+[lints]
+workspace = true

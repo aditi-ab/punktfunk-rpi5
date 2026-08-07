@@ -96,9 +96,12 @@ jobs:
       - name: Prep
         run: |
           git config --global --add safe.directory "$PWD"
-          # vulkan-headers: the client's pf-ffvk crate runs bindgen over FFmpeg's
-          # libavutil/hwcontext_vulkan.h (#include <vulkan/vulkan.h>).
-          dnf -y install gtk4-devel libadwaita-devel SDL3-devel vulkan-headers
+          # No vulkan-headers: nothing in the workspace compiles against the system Vulkan headers.
+          # The host's Vulkan encode hand-rolls its structs, pyrowave-sys bindgens its own vendored
+          # copy, and both host and client reach Vulkan through ash, which dlopens the loader. (The
+          # HDR gamescope leg further down does need them, and pulls them itself via `dnf builddep
+          # gamescope`.) Matches packaging/rpm/punktfunk.spec, which dropped its BuildRequires too.
+          dnf -y install gtk4-devel libadwaita-devel SDL3-devel
           # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
           dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted
           # Fedora's own gamescope, for its RUNTIME libraries only — never shipped, never run. The

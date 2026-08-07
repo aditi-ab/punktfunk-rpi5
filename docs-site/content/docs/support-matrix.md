@@ -297,11 +297,16 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 
 ## Client decode
 
+**No punktfunk client contains FFmpeg.** Every decoder below is the platform's own — Vulkan Video,
+DXVA, VAAPI, VideoToolbox, MediaCodec — driven directly from punktfunk's own bitstream parser, with
+openh264 + rav1d as the CPU floor on the desktop. There is no libav* in any client package, and
+nothing to install.
+
 | Client | Decode path (in order) | Codecs | 10-bit / HDR | 4:4:4 |
 |---|---|---|---|---|
-| Linux desktop | Vulkan Video → VAAPI → software ¹ | probed ² | ✅ ³ | ⚠️ ⁴ |
-| Windows desktop | Vulkan Video → D3D11VA → software ¹ | probed ² | ✅ ³ | ⚠️ ⁴ |
-| Steam Deck (via Decky) | as Linux desktop ⁵ | probed ² | ✅ | ⚠️ ⁴ |
+| Linux desktop | Vulkan Video → VAAPI → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ⚠️ ⁴ |
+| Windows desktop | Vulkan Video → D3D11VA → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ⚠️ ⁴ |
+| Steam Deck (via Decky) | as Linux desktop ⁵ | H.264, HEVC, AV1 ² | ✅ | ⚠️ ⁴ |
 | macOS · iOS · tvOS | VideoToolbox only | H.264, HEVC, AV1 ⁶ | ⚠️ ⁷ | ⚠️ ⁸ |
 | Android · Android TV | MediaCodec only ⁹ | H.264, HEVC, AV1 ¹⁰ | ⚠️ ⁷ | ❌ |
 | Moonlight | your Moonlight app's | negotiated | ⚠️ ¹¹ | ❌ |
@@ -309,24 +314,39 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 
 1. **The order depends on your GPU vendor.** NVIDIA and AMD get Vulkan Video first; Intel and
    unknown vendors get the platform decoder first (VAAPI on Linux, D3D11VA on Windows), because
-   FFmpeg's Vulkan path is field-broken on Intel Arc even though the driver advertises it. Pick one
-   explicitly in Preferences or with `PUNKTFUNK_DECODER` — an explicit choice that fails is a hard
-   error, never a silent fallback. Mid-session demotion is laddered, and each rung needs both three
+   Vulkan decode on Intel Arc was field-broken even though the driver advertises it. Pick one
+   explicitly in Preferences or with `PUNKTFUNK_DECODER` (`native-vulkan`, `native-vaapi`,
+   `native-d3d11va`, `software`). A pin skips the vendor order — that is what it is for —
+   but a pinned rung that cannot open still falls through rather than ending the session,
+   and says so in the log. Settings saved before M10 (`vulkan`, `vaapi`, `d3d11va`) name
+   the same hardware and are migrated onto the native rung automatically.
+   Mid-session demotion is laddered, and each rung needs both three
    consecutive decode errors *and* a full second of them: Vulkan Video first demotes to VAAPI on
    Linux or D3D11VA on Windows, and only that backend demotes to software — so a startup burst no
-   longer strands you.
-2. Enumerated from FFmpeg at startup, plus PyroWave when the GPU passes its compute probe.
+   longer strands you. The session log names the rung it landed on, and warns when that rung/codec
+   pair has no hardware run recorded behind it.
+2. A statement about the decoders punktfunk BUILT, not about a codec registry: the hardware rungs
+   cover all three, the CPU floor covers H.264 (openh264) and AV1 (rav1d) and has no HEVC at all.
+   AV1 is advertised only where the GPU can really decode it — a CPU AV1 rung exists but a 4K AV1
+   stream is not survivable on it, and the codec is fixed for the whole session once negotiated.
+   HEVC is the one codec advertised without a CPU floor underneath: if every hardware rung for it
+   fails, the session reconnects on a codec that has one rather than dying. PyroWave is added when
+   the GPU passes its compute probe and you pick it.
 3. On by default. It is presented on a real HDR10 surface where your desktop offers one (KDE HDR,
    gamescope), and tone-mapped in-shader otherwise. Software-decoded frames never take the HDR
-   surface.
+   surface — the CPU rung is 8-bit by contract and refuses a 10-bit stream rather than mis-scaling
+   it.
 4. Opt-in (Settings ▸ **Full chroma**), off by default, and advertised whenever you ask — unlike
-   Apple, **no client-side probe gates it**, because every rung here can display full chroma: the
-   Vulkan presenter samples the 2-plane 4:4:4 pool formats where the driver decodes RExt in
-   hardware (NVIDIA today), and swscale converts for the software rung otherwise. So the setting
-   always reaches the host; what varies is the *cost*, and that cost is visible rather than silent
-   — the Detailed [stats overlay](/docs/stats) prints the resolved chroma (`4:4:4→4:2:0` when the
-   host declined) and the decode path frames really took. Whether you get it is then the host's
-   answer: HEVC 4:4:4 means an NVIDIA host, or pick PyroWave, which does it on any vendor.
+   Apple, **no client-side probe gates it**. Full chroma is a *hardware* path here: the Vulkan
+   presenter samples the 2-plane 4:4:4 pool formats where the driver decodes HEVC Range Extensions
+   in hardware, which today means NVIDIA. There is no software safety net under it — the CPU floor
+   is 4:2:0 8-bit by contract and has no HEVC at all (note 2), so it refuses a 4:4:4 stream rather
+   than converting it, and a box whose hardware 4:4:4 decode fails lands on note 2's codec
+   reconnect instead of a downgraded picture. None of that is silent: the Detailed
+   [stats overlay](/docs/stats) prints the resolved chroma (`4:4:4→4:2:0` when the host declined)
+   and the rung frames really took. Whether you get it at all is then the host's half — HEVC 4:4:4
+   means an NVIDIA host, or pick PyroWave, which decodes on its own GPU compute path and so carries
+   full chroma on any vendor.
 5. The Decky plugin does not decode anything — it launches the Linux client, so the decode path is
    identical, including the Mesa `RADV_PERFTEST=video_decode` opt-in the session binary sets before
    any Vulkan call (without it RADV exposes no decode queue and the Deck silently falls back to
@@ -496,11 +516,11 @@ text from an IME), are covered in [Input](/docs/input).
 11. Decided entirely by the host and layered into what Moonlight is offered.
 12. Moonlight has its own overlay; [stats](/docs/stats) here describes Punktfunk's.
 13. Opt-in — the per-profile **Full chroma (4:4:4)** switch, off by default — and advertised with
-    no client-side probe, because every desktop decode rung can display it (note 4 under
-    [Client decode](#client-decode)). The ⚠️ is the host half: full chroma needs HEVC on an
-    **NVIDIA** host, or the PyroWave codec, which carries it on any vendor. On Windows it composes
-    with HDR; on a Linux host 4:4:4 is 8-bit, so asking for both gives you full chroma in SDR. The
-    stats overlay tells you which you got.
+    no client-side probe. Both halves earn the ⚠️. On the **client** it is a hardware path with no
+    software floor under it (note 4 under [Client decode](#client-decode)). On the **host** it
+    needs HEVC on an **NVIDIA** host, or the PyroWave codec, which carries it on any vendor. On
+    Windows it composes with HDR; on a Linux host 4:4:4 is 8-bit, so asking for both gives you full
+    chroma in SDR. The stats overlay tells you which you got.
 
 **File transfer through the clipboard does not exist yet** on any client. The wire format and the
 host-side policy for it are in place, but no client offers files, so a copied file never crosses.
@@ -554,7 +574,7 @@ own so that adding a client-side feature never locks a client out of a deployed 
 | Contract | Current | What it governs |
 |---|---|---|
 | `punktfunk/1` wire version | **2** | The `Hello`/`Welcome` handshake and the session planes. Hosts equality-check it, so this is the one that must match. |
-| C ABI version | **14** | The embeddable C surface a client links against. It grows far more often than the wire does. |
+| C ABI version | **17** | The embeddable C surface a client links against. It grows far more often than the wire does. |
 | Virtual-display driver protocol (Windows) | **6** (accepts **3** and up) | Between the Windows host and its display driver, so an older driver keeps working after a host update. |
 | Windows virtual-gamepad channel | **3** | Between the host and its pad driver. |
 

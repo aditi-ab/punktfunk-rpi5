@@ -6,26 +6,27 @@
 //! over the real data plane, so it stays here. [`decodable_codecs`] rode along for the same
 //! reason — the probe connect still advertises which codecs this client can decode.
 
-use ffmpeg_next as ffmpeg;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::time::{Duration, Instant};
 
-/// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
-/// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
+/// The `quic` codec bitfield this client can decode. Advertised to the host so it never emits
+/// a codec we can't decode.
+///
+/// It is pf-client-core's [`decodable_codecs`](pf_client_core::video::decodable_codecs) —
+/// the codecs the SESSION BINARY's rungs speak, which is the process that actually decodes.
+/// This shell used to walk libavcodec's registry (`ffmpeg::decoder::find` per id) for the
+/// same answer; that was wrong in two ways even before M10 deleted the dependency. It
+/// described the decoders in THIS process, which decodes nothing, and it answered "a
+/// decoder exists" where the question is "a rung can keep up" — the AV1-on-CPU promise
+/// `decodable_codecs_for` exists to refuse.
+///
+/// ⚠ Deliberately the DEVICE-FREE answer ([`decodable_codecs`], not
+/// `decodable_codecs_for`): this connect creates no presenter and has no `VulkanDecodeDevice`
+/// to gate AV1 on, and it decodes nothing — the codec it advertises is never exercised. A
+/// real session's Hello is built in the session binary, with the device in hand.
 pub fn decodable_codecs() -> u8 {
-    let _ = ffmpeg::init();
-    let mut bits = 0u8;
-    for (id, bit) in [
-        (ffmpeg::codec::Id::HEVC, punktfunk_core::quic::CODEC_HEVC),
-        (ffmpeg::codec::Id::H264, punktfunk_core::quic::CODEC_H264),
-        (ffmpeg::codec::Id::AV1, punktfunk_core::quic::CODEC_AV1),
-    ] {
-        if ffmpeg::decoder::find(id).is_some() {
-            bits |= bit;
-        }
-    }
-    bits
+    pf_client_core::video::decodable_codecs()
 }
 
 /// Blocking speed-test probe (the GUI's per-host "Test" and the `--headless --speed-test` CLI):

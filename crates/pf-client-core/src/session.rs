@@ -16,6 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// `Clone` so an embedder can keep the params a session was started with and re-dial with
+/// one field changed — which is what the codec fallback ([`SessionEvent::CodecFallback`])
+/// needs and the only reason the derive exists. Every field is either plain data or an
+/// `Arc` the retry deliberately SHARES: the same `force_software` flag and the same
+/// presenter-written `latch_grid`, because they belong to the presenter, not the session.
+#[derive(Clone)]
 pub struct SessionParams {
     pub host: String,
     pub port: u16,
@@ -28,6 +34,15 @@ pub struct SessionParams {
     /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
     /// it when it can emit it, else falls back; the resolved codec drives the decoder.
     pub preferred_codec: u8,
+    /// `quic::CODEC_*` bits to REMOVE from this session's advertised decode caps.
+    ///
+    /// `0` for every ordinary connect. It is set by a retry after
+    /// [`SessionEvent::CodecFallback`]: a session whose codec exhausted the decode ladder
+    /// (in practice HEVC, whose CPU rung M8 removed — no permissively licensed software
+    /// HEVC decoder exists) comes back advertising the codec set the host must pick
+    /// from instead. The codec is fixed at Welcome and the control stream renegotiates
+    /// shard payload only, so a fresh Hello is the ONLY lever; this field is it.
+    pub exclude_codecs: u8,
     /// The advertised `quic::VIDEO_CAP_*` bits. Normally 10-bit + HDR (Main10/PQ: the
     /// Vulkan presenter decodes P010 everywhere and presents PQ on an HDR10 swapchain
     /// where the desktop offers one, tonemapping in the CSC shader where it doesn't;
@@ -68,8 +83,8 @@ pub struct SessionParams {
     /// Library id for the host to launch this session (`"steam:570"`, from the library
     /// page); `None` = plain desktop session.
     pub launch: Option<String>,
-    /// The presenter's shared Vulkan device, when its stack can run FFmpeg's Vulkan
-    /// Video decoder (decode lands as VkImages the presenter samples directly).
+    /// The presenter's shared Vulkan device, when its stack can run Vulkan Video decode
+    /// (decode lands as VkImages the presenter samples directly).
     pub vulkan: Option<crate::video::VulkanDecodeDevice>,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
@@ -181,6 +196,48 @@ pub struct Stats {
     /// `chroma_444` false, the host declined — the OSD says so instead of leaving the
     /// switch's effect unobservable.
     pub asked_444: bool,
+    /// The decode lane can answer integrity questions AT ALL (M4). True on the native
+    /// hardware rungs and false on the CPU rung and PyroWave. It exists because the
+    /// libavcodec rungs it was written against could NOT answer — their Vulkan decoder
+    /// created no status queries (`nb_queries = 0`), never set `AV_FRAME_FLAG_CORRUPT`,
+    /// and reported trouble only as log lines, which is why the Xbox Ally X corruption
+    /// was undetectable rather than merely undetected.
+    ///
+    /// Everything below is meaningless without it, and a surface that renders the
+    /// four counters as zeros on a lane that cannot see damage is repeating the
+    /// exact mistake this program exists to end: "clean" and "unmeasured" are not
+    /// the same claim.
+    pub decode_integrity: bool,
+    /// AUs whose plan needed CONCEALMENT this window — a lost reference, a
+    /// `frame_num` gap, a short NALU walk. Each one cost a frame (released unshown)
+    /// and a re-anchor request.
+    pub decode_damaged: u32,
+    /// Frames the DRIVER reported corrupt this window through their per-op
+    /// `RESULT_STATUS` query — the Xbox Ally X class, and the count no libavcodec rung
+    /// could ever produce. Always 0 where `decode_status_queries` is false: there is no
+    /// verdict to read, not nothing to report. (`video::DecodeHealth::note`
+    /// enforces that, so the two fields can never contradict each other here.)
+    pub decode_failed: u32,
+    /// AUs the decoder REFUSED outright this window — a plan error, a
+    /// Vulkan/session failure. Distinct from `decode_damaged`, and the difference
+    /// is the whole diagnosis: concealment means the decoder coped with a damaged
+    /// stream, refusal means it could not run and the screen is frozen. A rung
+    /// refusing every AU used to report as a perfectly clean session.
+    pub decode_refused: u32,
+    /// Consecutive AUs with no showable picture as of this window's end (0 = the
+    /// stream is decoding clean right now). The field that separates a lossy link
+    /// from a stream that never came back — see `video::DecodeHealth::run`.
+    pub concealed_run: u32,
+    /// The LONGEST such run of the session so far — session-cumulative, not
+    /// windowed, and deliberately so: `concealed_run` is an instant sampled once a
+    /// second, which misses the bad moment almost every time. A window whose
+    /// `concealed_run` is 0 and whose `worst_concealed_run` is 40 is a session that
+    /// froze hard and recovered, and no other field on this struct says that.
+    pub worst_concealed_run: u32,
+    /// The device answers per-op decode-status queries (`queryResultStatusSupport`).
+    /// FALSE on RADV, where recording one HANGS the VCN ring, and there the integrity
+    /// report covers the parser's half only.
+    pub decode_status_queries: bool,
 }
 
 /// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
@@ -214,7 +271,53 @@ pub enum SessionEvent {
         trust_rejected: bool,
     },
     Ended(Option<String>),
+    /// The session's negotiated codec ran out of decode rungs and the client can finish
+    /// this stream only as a DIFFERENT codec — terminal, like [`Self::Ended`], but with
+    /// the retry already computed.
+    ///
+    /// The one case in practice is HEVC on a box whose hardware HEVC decode failed: M8
+    /// dropped software HEVC (no permissively licensed decoder exists), so the ladder's
+    /// last rung refuses instead of limping, and the answer is a reconnect advertising
+    /// [`Self::CodecFallback::retry_caps`] — which never contains the codec that just
+    /// failed. The other case is a picture SHAPE the CPU rung cannot decode (10-bit,
+    /// 4:4:4), which is a different diagnosis with the same available action; the two
+    /// pick different retry sets, and [`crate::video::last_rung_verdict`] is where that
+    /// is decided.
+    ///
+    /// An embedder that does not implement the retry MUST still show `msg` and stop —
+    /// treating it as an ordinary end is correct, just worse. It is a separate variant
+    /// rather than a flag on `Ended` so the compiler asks every embedder the question
+    /// once, which is how the two D3D11VA rungs' shared `stats:` tag went wrong when it
+    /// was not asked (`1573a987`).
+    CodecFallback {
+        /// What to pass as [`SessionParams::exclude_codecs`] on the retry — DERIVED from
+        /// [`Self::CodecFallback::retry_caps`], so applying it advertises exactly those
+        /// caps and nothing wider.
+        exclude_codecs: u8,
+        /// The caps the retry will advertise — non-empty by construction, and what
+        /// `exclude_codecs` above resolves to on the wire.
+        retry_caps: u8,
+        /// User-facing one-liner for the toast/status strip.
+        msg: String,
+    },
     Stats(Stats),
+}
+
+/// How many times THIS PROCESS has had a session's codec exhaust the decode ladder — the
+/// telemetry counter the risk register asks for ("telemetry on frequency") for the
+/// software-HEVC drop.
+///
+/// Process-scoped and monotonic because the thing being counted is a property of the
+/// machine, not of one session: a box whose hardware HEVC decode is broken produces one
+/// of these per connect, and it is the RATE across a session history that says whether
+/// dropping software HEVC hurt anybody. Read it with [`codec_fallbacks`].
+static CODEC_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`CODEC_FALLBACKS`]. Surfaced on the session's Detailed stats block as an
+/// additive `codec_fallbacks <N>` line once it is nonzero — appended last, never
+/// removed, never reordered (`run.rs`'s `stats_text`).
+pub fn codec_fallbacks() -> u64 {
+    CODEC_FALLBACKS.load(Ordering::Relaxed)
 }
 
 /// The in-stream microphone mute (B4), shared between the embedder's toggle (a keyboard chord
@@ -369,6 +472,23 @@ fn pump(
     // on their arrivals, so this bit alone changes nothing without a wired DualSense.
     let pad_speaker_on = crate::pad_audio::speaker_active(&params.pad_speaker);
     let pad_audio_on = params.pad_haptics || pad_speaker_on;
+    // What this session advertises it can decode, minus anything a previous attempt
+    // proved it cannot FINISH (see `SessionParams::exclude_codecs`). Held for the whole
+    // pump because the reconnect rule needs to know what was on the table, not just what
+    // the host picked.
+    let advertised_codecs = crate::video::decodable_codecs_for(
+        params.vulkan.as_ref(),
+        // The decoder pin is part of the answer: a session pinned to software has no HEVC
+        // rung at all, so advertising HEVC would promise what this build cannot keep.
+        &params.decoder,
+    ) & !params.exclude_codecs;
+    if params.exclude_codecs != 0 {
+        tracing::info!(
+            excluded = params.exclude_codecs,
+            advertising = advertised_codecs,
+            "retrying with reduced decode caps"
+        );
+    }
     let connector = match NativeClient::connect(
         &params.host,
         params.port,
@@ -378,8 +498,10 @@ fn pump(
         params.bitrate_kbps,
         params.video_caps,
         params.audio_channels,
-        // FFmpeg's codecs plus CODEC_PYROWAVE when the presenter device passed the probe.
-        crate::video::decodable_codecs_for(params.vulkan.as_ref()),
+        // The codecs OUR rungs speak (`video::decodable_codecs`), plus CODEC_PYROWAVE when
+        // the presenter device passed the probe, minus whatever a previous attempt proved
+        // undecodable end to end.
+        advertised_codecs,
         preferred, // the user's soft codec preference (0 = auto; see the pyrowave opt-in above)
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
         // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
@@ -400,8 +522,8 @@ fn pump(
         } else {
             0
         }),
-        // Slice-progressive delivery: off — this presenter feeds FFmpeg whole AUs; a partial
-        // avcodec feed path can flip it later.
+        // Slice-progressive delivery: off — every rung here is fed whole AUs; a partial-feed
+        // path can flip it later.
         false,
         params.launch.clone(),
         // The host's approval-list / trust-store label for this client. Without it every no-PIN
@@ -440,36 +562,29 @@ fn pump(
     });
 
     // Build the decoder for the codec the host resolved (never assume HEVC), honoring the
-    // Settings backend preference (auto/vaapi/software).
-    let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
-    // The WIRE codec is the negotiated truth; the FFmpeg id is meaningful only where
-    // FFmpeg decodes it. `ffmpeg_codec_id`'s fallthrough maps every unknown wire bit —
-    // PyroWave included — to HEVC, so logging it unconditionally claimed
-    // `codec_id=HEVC` for wavelet sessions that never touch FFmpeg at all.
-    let codec = match connector.codec {
-        punktfunk_core::quic::CODEC_H264 => "H264",
-        punktfunk_core::quic::CODEC_HEVC => "HEVC",
-        punktfunk_core::quic::CODEC_AV1 => "AV1",
-        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
-        _ => "unknown",
+    // Settings backend preference (auto/native-*/software).
+    //
+    // The WIRE codec bit IS the vocabulary now: M10 deleted the last libavcodec rung and
+    // with it `ffmpeg::codec::Id`, which this used to translate into here. That
+    // translation was also a small lie in the log — its fallthrough mapped every unknown
+    // wire bit, PyroWave included, to HEVC, so a wavelet session printed `codec_id=HEVC`.
+    //
+    // The picture shape the host RESOLVED (not what we asked for) goes with it — every
+    // native rung probes its device against it at construction, so a 4:4:4 or Main 10
+    // session that this GPU has no decode format for refuses BEFORE the rung is chosen
+    // instead of error-streaking past it mid-stream.
+    let stream_format = crate::video::StreamFormat {
+        chroma_format_idc: connector.chroma_format,
+        bit_depth: connector.bit_depth,
     };
-    if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
-        tracing::info!(
-            codec,
-            welcome_codec = connector.codec,
-            "negotiated video codec"
-        );
-    } else {
-        tracing::info!(
-            codec,
-            ?codec_id,
-            welcome_codec = connector.codec,
-            "negotiated video codec"
-        );
-    }
-    // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
-    // reachable only through the explicit preference above (resolve_codec never
-    // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
+    tracing::info!(
+        codec = crate::video::wire_codec_name(connector.codec),
+        welcome_codec = connector.codec,
+        "negotiated video codec"
+    );
+    // A negotiated PyroWave session decodes on the presenter's device — reachable only
+    // through the explicit preference above (resolve_codec never auto-picks the bit), so
+    // failing loudly here is failing an opted-in experiment.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
@@ -497,14 +612,46 @@ fn pump(
             )),
         }
     } else {
-        Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref())
+        Decoder::new(
+            connector.codec,
+            &params.decoder,
+            params.vulkan.as_ref(),
+            stream_format,
+        )
     };
     #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
-    let built = Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref());
+    let built = Decoder::new(
+        connector.codec,
+        &params.decoder,
+        params.vulkan.as_ref(),
+        stream_format,
+    );
     let mut decoder = match built {
         Ok(d) => d,
         Err(e) => {
-            let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));
+            // The ladder had NO rung for this codec at all — on a box with no hardware
+            // HEVC decode (or one that pinned `PUNKTFUNK_DECODER=software` on an HEVC
+            // session). Same answer as the mid-stream case below, one code path.
+            let refusal = e.downcast_ref::<crate::video::NoSoftwareRung>().map(|nr| {
+                codec_fallback_event(
+                    connector.codec,
+                    advertised_codecs,
+                    nr.loss(),
+                    &e.to_string(),
+                )
+            });
+            // Nothing has been spawned yet at this point — the audio / pad / clipboard
+            // threads and the mic uplink are all built BELOW — so "joined its threads" is
+            // vacuously true here. Set the stop flag and drop the connector anyway, in
+            // the same order the pump's end path does, so an embedder that reconnects on
+            // receipt of this event finds the same world whichever refusal site produced
+            // it (`run.rs` starts the retry the instant it reads one).
+            stop.store(true, Ordering::SeqCst);
+            mic.set_live(false);
+            drop(connector);
+            let _ = ev_tx.send_blocking(
+                refusal.unwrap_or_else(|| SessionEvent::Ended(Some(format!("video decoder: {e}")))),
+            );
             return;
         }
     };
@@ -630,6 +777,36 @@ fn pump(
     // ahead of `frames_dropped` (the reassembler only declares a straggler lost once it ages out of
     // the loss window, by which point the concealment already reached the screen).
     let mut next_expected_index: Option<u32> = None;
+    // Fixture capture for the native-decode program: every AU exactly as it reaches
+    // `decode_frame`, plus a boundary/flags index — see `au_dump.rs` for the format.
+    //
+    // NOTE for fault runs: this captures what the HOST sent. `PUNKTFUNK_AU_FAULT`'s
+    // injector lives one level down, at the native backend's decode entry, so on a
+    // faulted run the fixture is the CLEAN bitstream and replaying it will not
+    // reproduce the damage (reconstruct that from the spec — the injector is pure
+    // and deterministic). Deliberate: the dump's job is to preserve the host's
+    // output, and moving the injector above it would corrupt every backend's input
+    // rather than only the lane whose detectors it exists to fire.
+    let mut au_dump = crate::au_dump::AuDump::from_env(connector.codec);
+    // The decode-order watermark at the latest arm of the freeze gate (M4 review):
+    // a frame whose `decode_order` is at or below this was DECODED before the loss,
+    // whatever order it was delivered in, so its recovery point SEI describes a wave
+    // that completed before the loss and must not lift the freeze the loss raised.
+    // `gate.arms()` is the trigger to re-stamp — it moves at every arm site,
+    // including the two inside the gate, and not on the overdue backstop (which
+    // re-asks without re-arming, and where discarding an in-flight heal would be
+    // exactly wrong). Inert on every lane without its own parser: `decode_order` is
+    // 0 there and `local_recovery` is NONE anyway.
+    let mut gate_arms = gate.arms();
+    let mut arm_decode_order: u64 = 0;
+    // Decode-integrity window cursor (M4), the same per-window diffing as
+    // `window_dropped`: the decoder's counters are session-cumulative, the OSD shows
+    // the delta. `None` on every lane that cannot answer — see `Stats::decode_integrity`.
+    let mut window_health = decoder.decode_health();
+    // Set when the ladder ran out of rungs for this codec (M8): the loop breaks and this
+    // event replaces the plain `Ended` at the bottom. `Some` is the only way the pump
+    // ends with a retry attached.
+    let mut codec_fallback: Option<SessionEvent> = None;
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -743,40 +920,96 @@ fn pump(
                     Some(n) if frame.frame_index.wrapping_sub(n) > u32::MAX / 2 => n,
                     _ => frame.frame_index,
                 });
+                if let Some(d) = au_dump.as_mut() {
+                    if !d.write(&frame.data, frame.flags, frame.complete) {
+                        au_dump = None;
+                    }
+                }
+                // Re-stamp the arm watermark BEFORE this AU decodes and advances the
+                // decoder's ordinal, so it names the newest picture that existed when the
+                // freeze was armed. One site covers every arm: the frame-gap arm above
+                // happened moments ago in this same iteration, and the four sites below
+                // (`on_no_output` ×2, the decoder-recovery arm, `poll`'s dropped climb) all
+                // run AFTER the decode, so the next iteration reaches here with the ordinal
+                // still exactly as they left it.
+                if gate.arms() != gate_arms {
+                    gate_arms = gate.arms();
+                    arm_decode_order = decoder.decode_order();
+                }
                 match decoder.decode_frame(&frame.data, frame.flags, frame.complete) {
                     Ok(Some(image)) => {
-                        // Fold this decoded frame through the shared freeze gate: it reads the AU's
-                        // re-anchor wire flags (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT),
-                        // takes `image.is_keyframe()` as the ffmpeg keyframe belt, applies the two-mark
+                        // The decoder's OWN re-anchor observation FIRST (M4): a recovery point SEI
+                        // is the only clean point an intra-refresh session has when the host does not
+                        // mark the wire — its wave emits no IDR to flag, and only
+                        // one of the three encoder backends that run a wave sets
+                        // USER_FLAG_RECOVERY_POINT — so without this such a session freezes for the
+                        // full REANCHOR_FREEZE_MAX and then forces the very IDR the wave exists to
+                        // avoid. The gate pairs the mark against its own arm (only a wave that
+                        // STARTED after the loss proves anything about it) and lifts on the first
+                        // trusted one. Before `on_decoded`, so the frame that healed the picture is
+                        // itself presented rather than held one more round. Inert on every other
+                        // lane: `local_recovery` reports NONE and the wire path is untouched.
+                        //
+                        // The gate pairs by TIME; this pairs by DECODE ORDER, and both are
+                        // needed. A decoder that flushes its DPB after a failed AU hands back
+                        // every picture it still held — pictures decoded BEFORE the loss,
+                        // carrying the marks of the wave they were decoded in — and they
+                        // arrive after the arm, so the gate cannot tell. Their ordinal can.
+                        let local = match image.decode_order() {
+                            Some(order) if order <= arm_decode_order => {
+                                tracing::trace!(
+                                    order,
+                                    arm_decode_order,
+                                    "discarding the local recovery of a frame decoded before \
+                                     the loss"
+                                );
+                                punktfunk_core::reanchor::LocalRecovery::NONE
+                            }
+                            _ => image.local_recovery(),
+                        };
+                        if gate.on_local_recovery(local) {
+                            tracing::debug!(
+                                "re-anchored on the stream's own recovery point SEI — no IDR needed"
+                            );
+                        }
+                        // Then the shared freeze gate: it reads the AU's re-anchor wire flags
+                        // (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT), takes
+                        // `image.is_keyframe()` as the decoder's own IDR belt, applies the two-mark
                         // rule + the mark-patience backstop, clears the no-output streak, and returns
                         // whether to present this frame or withhold it as a post-loss concealment.
                         let present =
                             gate.on_decoded(frame.flags, image.is_keyframe(), Instant::now())
                                 == GateVerdict::Present;
                         total_frames += 1;
+                        // ⚠ The `stats:` decode-path tag is a machine interface —
+                        // additive only. M10 removed the rungs whose tags were `vaapi`,
+                        // `vulkan` and `d3d11va`; every surviving tag keeps its exact
+                        // spelling.
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
                             #[cfg(target_os = "linux")]
-                            DecodedImage::Dmabuf(_) => "vaapi",
-                            DecodedImage::VkFrame(_) => "vulkan",
+                            DecodedImage::NativeDmabuf(_) => "native-vaapi",
                             #[cfg(windows)]
-                            DecodedImage::D3d11(_) => "d3d11va",
+                            DecodedImage::D3d11(_) => "native-d3d11va",
                             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                             DecodedImage::PyroWave(_) => "pyrowave",
+                            DecodedImage::NativeVk(_) => "native-vulkan",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
                                 DecodedImage::Cpu(c) => (c.width, c.height, "software"),
                                 #[cfg(target_os = "linux")]
-                                DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
-                                DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
+                                DecodedImage::NativeDmabuf(d) => {
+                                    (d.width, d.height, "native-vaapi-dmabuf")
+                                }
                                 #[cfg(windows)]
-                                DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
+                                DecodedImage::D3d11(d) => (d.width, d.height, "native-d3d11va"),
                                 #[cfg(all(
                                     any(target_os = "linux", windows),
                                     feature = "pyrowave"
                                 ))]
                                 DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
+                                DecodedImage::NativeVk(f) => (f.width, f.height, "native-vulkan"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }
@@ -810,8 +1043,28 @@ fn pump(
                         // shows becomes that sample — honest, at zero pipeline cost on
                         // every other frame. Software keeps the synchronous stamp on
                         // every frame (its decode really is done by now).
+                        //
+                        // M4 re-examined this against the native rung's non-blocking
+                        // reads (`poll_status`, `get_semaphore_counter_value`) and left
+                        // it exactly as it is. Polling can only ever answer "complete
+                        // by NOW", and the only place this thread polls is once per AU
+                        // — so every sample would be quantized up by as much as a whole
+                        // frame interval (8.3 ms at 120 Hz, against decodes that
+                        // measure ~0.1-2 ms). That is not a cheaper measurement, it is
+                        // a wrong one, and it would replace a true figure with a
+                        // plausible-looking upper bound nothing downstream could tell
+                        // apart. Sampling faster needs either a spin (the CPU burn this
+                        // comment already warns about) or a second thread on a decoder
+                        // that is `Send` but deliberately not `Sync`. Correctness beats
+                        // the metric: one honest sample per window stands.
                         let hw_fence = match &image {
-                            DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
+                            // The native rung's frame carries the timeline pair: the
+                            // decode signals `semaphore_value` when the pixels are
+                            // ready (the presenter's write-back is the `+ 1`), so
+                            // waiting it measures received→decode-complete. Fed since
+                            // the WP-D hardware verdict landed (bit-exact parity, both
+                            // DPB modes).
+                            DecodedImage::NativeVk(f) => Some((f.semaphore, f.semaphore_value)),
                             _ => None,
                         };
                         if present {
@@ -868,6 +1121,25 @@ fn pump(
                             tracing::debug!("requested keyframe (decoder produced no output)");
                         }
                     }
+                    // NOT survivable, and the only decode error that isn't: the ladder
+                    // demoted to its last rung and there is no such rung for this codec.
+                    // Feeding more AUs would freeze the screen forever — the exact
+                    // "limping on software" outcome M8's HEVC drop replaces with an
+                    // action. Break out of the pump; the terminal event below carries the
+                    // retry the embedder reconnects with.
+                    Err(e) if e.downcast_ref::<crate::video::NoSoftwareRung>().is_some() => {
+                        let loss = e
+                            .downcast_ref::<crate::video::NoSoftwareRung>()
+                            .expect("just matched")
+                            .loss();
+                        codec_fallback = Some(codec_fallback_event(
+                            connector.codec,
+                            advertised_codecs,
+                            loss,
+                            &e.to_string(),
+                        ));
+                        break None;
+                    }
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error (recovering)");
@@ -895,9 +1167,31 @@ fn pump(
                 // GOP has no periodic keyframe, so a rebuilt/erroring decoder would stay
                 // gray/frozen until an unrelated packet drop happened to request one. Route it
                 // through the same throttle as loss recovery below.
+                //
+                // The native rung's DAMAGE path arrives here too (M4): an AU whose plan needed
+                // concealment answers `Ok(None)` and raises this flag rather than erroring, so
+                // the ask happens at exactly this moment and through exactly this throttle
+                // while the decoder keeps its rung — stream damage is not a decoder fault (see
+                // `video_vk_native`'s recovery policy). That also bounds the whole thing: one
+                // ask per 100 ms per session however fast the damage arrives, and once the gate
+                // is armed further damage refreshes an existing freeze rather than compounding
+                // into more requests.
+                //
+                // ARM ONLY WHEN NOT ALREADY HOLDING. This flag fires per DAMAGED AU, not per
+                // loss, and every `arm` zeroes the gate's recovery-mark count and its
+                // local-SEI credit. Re-arming on each one therefore made both re-anchor paths
+                // — the wire's two-mark rule and M4's local SEI — impossible to complete
+                // during exactly the sustained damage they were written for, leaving recovery
+                // resting entirely on the throttled keyframe ask. A genuinely NEW loss still
+                // re-arms with its marks zeroed: it arrives as a frame-index gap or a
+                // `frames_dropped` climb, both of which arm unconditionally. The keyframe ask
+                // below is untouched — it still fires per damaged AU, through the same 100 ms
+                // throttle.
                 if decoder.take_keyframe_request() {
                     let now = Instant::now();
-                    gate.arm(now);
+                    if !gate.is_holding() {
+                        gate.arm(now);
+                    }
                     if last_kf_req
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                     {
@@ -1048,6 +1342,28 @@ fn pump(
                 .saturating_sub(window_mic.dropped_full + window_mic.dropped_stale)
                 as u32;
             window_mic = mic_now;
+            // Decode integrity (M4): session-cumulative counters, diffed per window
+            // like `frames_dropped`. `None` on a lane that cannot see damage at all —
+            // and that stays distinguishable from "saw none" all the way to the OSD.
+            let health_now = decoder.decode_health();
+            let (decode_damaged, decode_failed, decode_refused) = match (health_now, window_health)
+            {
+                (Some(now), Some(prev)) => (
+                    now.damaged.saturating_sub(prev.damaged) as u32,
+                    now.failed.saturating_sub(prev.failed) as u32,
+                    now.refused.saturating_sub(prev.refused) as u32,
+                ),
+                // A lane that could not answer at the last window and can now.
+                // Unreachable today — the cursor is seeded from the decoder before
+                // the first AU and the ladder only ever demotes AWAY from the
+                // native rung, never back onto it — so this exists to keep the
+                // match total with a defensible answer (the cumulative figure)
+                // instead of an `unwrap` that would be a panic if that ever
+                // changed.
+                (Some(now), None) => (now.damaged as u32, now.failed as u32, now.refused as u32),
+                (None, _) => (0, 0, 0),
+            };
+            window_health = health_now;
             tracing::debug!(
                 fps = frames_n,
                 hostnet_p50_us = hn_p50,
@@ -1061,6 +1377,12 @@ fn pump(
                 lost,
                 mic_sent,
                 mic_dropped,
+                decode_damaged,
+                decode_failed,
+                decode_refused,
+                concealed_run = health_now.map(|h| h.run).unwrap_or(0),
+                worst_concealed_run = health_now.map(|h| h.worst_run).unwrap_or(0),
+                decode_status_queries = health_now.map(|h| h.status_queries).unwrap_or(false),
                 total_frames,
                 "stream window"
             );
@@ -1090,6 +1412,13 @@ fn pump(
                 auto_rate,
                 chroma_444,
                 asked_444,
+                decode_integrity: health_now.is_some(),
+                decode_damaged,
+                decode_failed,
+                decode_refused,
+                concealed_run: health_now.map(|h| h.run).unwrap_or(0),
+                worst_concealed_run: health_now.map(|h| h.worst_run).unwrap_or(0),
+                decode_status_queries: health_now.is_some_and(|h| h.status_queries),
             }));
             window_start = Instant::now();
             frames_n = 0;
@@ -1124,7 +1453,56 @@ fn pump(
     if let Some(t) = clipboard_thread {
         let _ = t.join(); // exits within its next_clip wait once `stop` is set
     }
-    let _ = ev_tx.send_blocking(SessionEvent::Ended(end));
+    // The codec-exhaustion end has its own terminal event — sent HERE, after the audio /
+    // pad / clipboard threads have joined, so an embedder that reconnects on receipt
+    // never has two sessions' worth of threads on the same connector.
+    let _ = ev_tx.send_blocking(codec_fallback.unwrap_or(SessionEvent::Ended(end)));
+}
+
+/// Build the terminal event for a session whose codec exhausted the decode ladder, and
+/// bump the telemetry counter.
+///
+/// One place, called from both refusal sites (decoder construction and the mid-stream
+/// demotion), because the two must produce the SAME retry — a construction-time refusal
+/// that reconnected onto a different codec set than the mid-stream one would make field
+/// reports unreadable.
+fn codec_fallback_event(
+    negotiated: u8,
+    advertised: u8,
+    loss: crate::video::RungLoss,
+    detail: &str,
+) -> SessionEvent {
+    use crate::video::{last_rung_verdict, wire_codec_name, LastRungVerdict};
+    CODEC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    let codec = wire_codec_name(negotiated);
+    match last_rung_verdict(negotiated, advertised, loss) {
+        LastRungVerdict::Retry { caps } => {
+            tracing::warn!(
+                codec,
+                retry_caps = caps,
+                detail,
+                "video decode ran out of rungs — reconnecting without this codec"
+            );
+            SessionEvent::CodecFallback {
+                // DERIVED from the verdict, never from the failed codec alone: the retry
+                // then advertises exactly `caps` (`decodable_codecs_for & !exclude`
+                // re-intersects to it), so the wire and the rule cannot disagree. They
+                // did before the M8 review — the rule dropped PyroWave and the wire
+                // re-offered it.
+                exclude_codecs: advertised & !caps,
+                retry_caps: caps,
+                msg: format!("{codec} decoding failed on this device — reconnecting"),
+            }
+        }
+        // Nothing left to advertise: reconnecting would negotiate the same dead end. End
+        // the session and say what actually happened, rather than loop.
+        LastRungVerdict::Dead => {
+            tracing::error!(codec, detail, "video decode ran out of rungs and of codecs");
+            SessionEvent::Ended(Some(format!(
+                "{codec} can't be decoded on this device, and no other codec is available"
+            )))
+        }
+    }
 }
 
 /// The dedicated audio thread: owns the Opus decoder, the PCM scratch, and the PipeWire
@@ -1251,5 +1629,114 @@ mod tests {
         mic.set_live(false);
         assert!(!mic.muted());
         assert_eq!(mic.toggle(), None);
+    }
+
+    /// M8's HEVC reconnect, as the terminal event both refusal sites produce.
+    ///
+    /// This is the "reconnect flow tested as a first-class path" the plan's risk register
+    /// asks for, at the layer where it can be tested without a host: the pump's two
+    /// call sites (decoder construction and the mid-stream demotion) both go through
+    /// `codec_fallback_event`, so pinning its output pins the flow — the retry never
+    /// re-offers the codec that just failed, the message is user-facing, and the
+    /// telemetry counter moves exactly once per occurrence.
+    /// `CODEC_FALLBACKS` is process-global and `codec_fallback_event` bumps it, so the
+    /// test that asserts "counted exactly once" cannot run beside another that calls the
+    /// same builder. Both take this.
+    static FALLBACK_COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_exhausted_codec_produces_a_retry_event_and_moves_the_counter() {
+        use crate::video::RungLoss;
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+        let _guard = FALLBACK_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        let before = codec_fallbacks();
+
+        // The shipping shape: HEVC negotiated, H.264 also advertised.
+        let ev = codec_fallback_event(
+            CODEC_HEVC,
+            CODEC_H264 | CODEC_HEVC,
+            RungLoss::Codec,
+            "no software HEVC",
+        );
+        match ev {
+            SessionEvent::CodecFallback {
+                exclude_codecs,
+                retry_caps,
+                ref msg,
+            } => {
+                assert_eq!(exclude_codecs, CODEC_HEVC, "the retry must drop HEVC");
+                assert_eq!(retry_caps, CODEC_H264);
+                // The toast is for a person: it names the codec and says what happens
+                // next, and does NOT read as an error the user has to act on.
+                assert!(msg.contains("HEVC"), "{msg}");
+                assert!(msg.contains("reconnect"), "{msg}");
+            }
+            _ => panic!("expected a CodecFallback"),
+        }
+        assert_eq!(codec_fallbacks(), before + 1, "counted exactly once");
+
+        // Hardware AV1 advertised too: both survivors stay on the table.
+        match codec_fallback_event(
+            CODEC_HEVC,
+            CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+            RungLoss::Codec,
+            "x",
+        ) {
+            SessionEvent::CodecFallback { retry_caps, .. } => {
+                assert_eq!(retry_caps, CODEC_H264 | CODEC_AV1);
+            }
+            _ => panic!("expected a CodecFallback"),
+        }
+
+        // Nothing left to offer: end honestly instead of a reconnect loop. Still counted
+        // — the failure happened, and its frequency is exactly what the counter is for.
+        let before = codec_fallbacks();
+        match codec_fallback_event(CODEC_HEVC, CODEC_HEVC, RungLoss::Codec, "x") {
+            SessionEvent::Ended(Some(msg)) => {
+                assert!(msg.contains("HEVC"), "{msg}");
+                assert!(msg.contains("no other codec"), "{msg}");
+            }
+            _ => panic!("expected a plain Ended"),
+        }
+        assert_eq!(codec_fallbacks(), before + 1);
+    }
+
+    /// `exclude_codecs` and `retry_caps` describe the SAME retry — the review found them
+    /// disagreeing, and the wire follows `exclude_codecs`, so a mismatch means the tested
+    /// rule is not the shipped one.
+    ///
+    /// The property is exact, not approximate: the retry advertises
+    /// `decodable_codecs_for(vk) & !exclude_codecs`, and this session already advertised
+    /// `decodable_codecs_for(vk) & !old_exclude` — so re-intersecting with the derived
+    /// mask must land on `retry_caps` itself.
+    #[test]
+    fn the_retrys_exclusion_resolves_to_exactly_its_advertised_caps() {
+        use crate::video::RungLoss;
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+        let _guard = FALLBACK_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        for advertised in 0u8..16 {
+            for negotiated in [CODEC_H264, CODEC_HEVC, CODEC_AV1, CODEC_PYROWAVE] {
+                for loss in [RungLoss::Codec, RungLoss::Shape] {
+                    let SessionEvent::CodecFallback {
+                        exclude_codecs,
+                        retry_caps,
+                        ..
+                    } = codec_fallback_event(negotiated, advertised, loss, "x")
+                    else {
+                        continue; // Dead — nothing is advertised at all
+                    };
+                    assert_eq!(
+                        advertised & !exclude_codecs,
+                        retry_caps,
+                        "advertised {advertised:#x} negotiated {negotiated:#x} {loss:?}"
+                    );
+                    assert_eq!(retry_caps & negotiated, 0, "the failed codec came back");
+                }
+            }
+        }
+        // Excluding twice is idempotent — a second fallback in the same run widens the
+        // set rather than resetting it (`run.rs` ORs into the existing value).
+        let full = CODEC_H264 | CODEC_HEVC | CODEC_AV1;
+        assert_eq!((full & !CODEC_HEVC) & !CODEC_HEVC, CODEC_H264 | CODEC_AV1);
     }
 }

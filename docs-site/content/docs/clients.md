@@ -49,11 +49,12 @@ protocol's FEC/encryption extensions, but for a healthy LAN that rarely matters.
 `punktfunk-client` is the native graphical Linux client — a GTK4 / libadwaita app that speaks
 `punktfunk/1` directly, with vendor-ordered hardware decode (**Vulkan Video first on NVIDIA and
 AMD**, **VAAPI dmabuf first on Intel**; whichever isn't first is the fallback, and software decode
-is last), PipeWire audio, and SDL3 controllers (rumble, lightbar, DualSense touchpad/motion). To
-force one, pick it in *Preferences → Display → Video decoder* or set
-`PUNKTFUNK_DECODER=vulkan|vaapi|software`. Like the Apple app it discovers hosts on your network
-automatically, does PIN pairing, pins reconnects, and browses the host's **game library** (with
-cover art) so you can launch a title straight into the stream.
+is last), PipeWire audio, and SDL3 controllers (rumble, lightbar, DualSense touchpad/motion). The
+decoders are Punktfunk's own — the client links no FFmpeg at all, and talks to your GPU's Vulkan
+and VAAPI drivers directly. To force one, pick it in *Preferences → Display → Video decoder* or
+set `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|software`. Like the Apple app it discovers hosts
+on your network automatically, does PIN pairing, pins reconnects, and browses the host's
+**game library** (with cover art) so you can launch a title straight into the stream.
 
 It ships as a real package, not just a source build — full steps in
 [Install a Client](/docs/install-client#linux-desktop-flatpak):

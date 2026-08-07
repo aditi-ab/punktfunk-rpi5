@@ -201,7 +201,7 @@ cargo build --release -p punktfunk-host -p punktfunk-client-linux -p punktfunk-c
 cargo build --release -p punktfunk-tray
 ```
 
-The shell exports `PF_FFVK_VULKAN_INCLUDE` (Vulkan headers for pf-ffvk bindgen) and an
+The shell exports an
 `LD_LIBRARY_PATH` that includes `/run/opengl-driver/lib` so `cargo run` finds the GPU driver.
 `nix fmt` formats the `.nix` files.
 

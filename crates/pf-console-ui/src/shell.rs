@@ -72,6 +72,10 @@ pub(crate) struct Shell {
     deck: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
+    /// The last host title a connect was raised for, kept past the connect itself so
+    /// [`Self::session_reconnecting`] can name the host it is re-dialing — that flow
+    /// raises no `Launch` of its own and therefore never passes a title through.
+    last_connect_title: Option<String>,
     wake: Option<WakeStatus>,
     /// True while `wake` is the shell's own optimistic placeholder — raised the instant a
     /// screen queues `ConsoleCmd::Wake` (see [`Self::apply`]), before the service thread has
@@ -136,6 +140,7 @@ impl Shell {
             deck: opts.deck,
             in_stream: false,
             connecting: None,
+            last_connect_title: None,
             wake: None,
             wake_optimistic: false,
             toast: None,
@@ -171,6 +176,7 @@ impl Shell {
     pub(crate) fn set_connecting(&mut self, title: Option<String>) {
         match title {
             Some(title) => {
+                self.last_connect_title = Some(title.clone());
                 self.connecting = Some(Connecting {
                     title,
                     canceling: false,
@@ -199,6 +205,38 @@ impl Shell {
         if let Some(reason) = reason {
             self.show_toast(format!("Session ended — {reason}"));
         }
+    }
+
+    /// The stream stopped and the client is dialing again on its own (M8's codec
+    /// fallback). Says what changed — the picture is about to come back as a different
+    /// codec and silence would read as a glitch — and raises the connecting modal.
+    ///
+    /// The modal is not cosmetic. Nothing raises a `Launch` for this retry (the run loop
+    /// starts the pump itself), so without it the shell would be in a state no other flow
+    /// produces: not streaming, not connecting, and a live pump behind the console. All
+    /// three gates would open at once — menu events flowing, the console drawn
+    /// full-screen over a frozen picture, and no modal interlock — and pressing A would
+    /// launch a SECOND session on top of the running one. This is also what gives B
+    /// somewhere to go: the modal's Back raises `CancelConnect`, which the run loop
+    /// applies to the retry's pump exactly as it does to a first dial.
+    ///
+    /// `appear = 1.0`: the takeover is already the thing on screen (the retry follows a
+    /// live stream), so fading it in would read as a flash rather than a transition.
+    pub(crate) fn session_reconnecting(&mut self, msg: &str) {
+        self.in_stream = false;
+        self.connecting = Some(Connecting {
+            // The host this session was dialed to. `None` only if the shell never raised
+            // the connect itself (a `--connect` run has no console at all, so it never
+            // reaches here) — name the codec change instead of an empty string.
+            title: self
+                .last_connect_title
+                .clone()
+                .unwrap_or_else(|| "the host".to_string()),
+            canceling: false,
+            appear: 1.0,
+            request_access: false,
+        });
+        self.show_toast(msg.to_string());
     }
 
     fn show_toast(&mut self, text: String) {

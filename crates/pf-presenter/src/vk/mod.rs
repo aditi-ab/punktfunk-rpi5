@@ -1,13 +1,21 @@
-//! The Vulkan presenter: swapchain + two frame paths into one device-local RGBA video
+//! The Vulkan presenter: swapchain + several frame paths into one device-local RGBA video
 //! image, then a letterboxed `vkCmdBlitImage` composite.
 //!
-//! * **Software** (`FrameInput::Cpu`): staging upload + `copy_buffer_to_image` (row
-//!   stride via `buffer_row_length`) — transfer-only, runs on every GPU.
+//! * **Software** (`FrameInput::Cpu`): since M8 the CPU rung hands over tightly-packed
+//!   8-bit I420 PLANES, not RGBA. They are staged into three R8 images
+//!   (`CpuPlanes`, no `buffer_row_length` — the planes carry no stride) and converted by
+//!   the PLANAR CSC render pass, the same pass and the same `csc_rows` coefficients the
+//!   hardware lanes use. That is what deleted this lane's second colour implementation
+//!   (swscale's BT.601 default) and its missing tone-map along with it.
 //! * **Hardware** (`FrameInput::Dmabuf`): the decoder's NV12 dmabuf imported per-plane
-//!   (`dmabuf.rs`) and converted by the CSC render pass (`csc.rs`) — zero-copy, gated on
-//!   the four import extensions at device creation; boxes without them (NVIDIA
+//!   (`dmabuf.rs`) and converted by the two-plane CSC render pass (`csc.rs`) — zero-copy,
+//!   gated on the four import extensions at device creation; boxes without them (NVIDIA
 //!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
 //!   decoder on software.
+//! * Plus the lanes that arrive already on this device: `NativeVk` (Vulkan Video —
+//!   pf-vkdecode on this very VkDevice), `D3d11` (Windows shared textures) and
+//!   `PyroWave` (three compute-decoded planes, through the same planar pass as the
+//!   software lane).
 //!
 //! Pacing: one frame in flight (the submit fence is waited before each record), MAILBOX
 //! when available, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate`
@@ -23,7 +31,7 @@ use crate::overlay::SharedDevice;
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
-use pf_client_core::video::{CpuFrame, VkVideoFrame};
+use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame};
 
 mod gpu;
 mod overlay_pipe;
@@ -39,11 +47,13 @@ pub use setup::{list_adapters, PresentPref};
 pub enum FrameInput<'a> {
     /// No new frame — re-composite the retained video image (expose/resize).
     Redraw,
-    Cpu(&'a CpuFrame),
+    /// Software-decoded I420 planes (M8): uploaded into three R8 images and converted by
+    /// the planar CSC pass, exactly like the hardware lanes' planes — so PQ tone-mapping,
+    /// range and matrix all come from the ONE shader, and the CPU lane stops being the
+    /// odd one out that arrived pre-converted (and pre-converted wrong).
+    Cpu(&'a CpuPlanarFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
-    /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
-    VkFrame(VkVideoFrame),
     /// D3D11VA hand-off — a shareable NT-handle texture to import (`d3d11.rs`).
     #[cfg(windows)]
     D3d11(pf_client_core::video::D3d11Frame),
@@ -51,6 +61,12 @@ pub enum FrameInput<'a> {
     /// fence-complete, GENERAL layout (`pf_client_core::video_pyrowave`).
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
+    /// Native Vulkan Video output (pf-vkdecode) — an NV12 image + plane views already
+    /// on THIS device: wait the frame's timeline pair on the submit, transition its
+    /// layer for sampling and BACK to its decode layout, CSC with the coded-vs-display
+    /// UV scale. Dropping the frame (after the sampling fence) releases the decoder's
+    /// slot via its guard.
+    NativeVk(NativeVkFrame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
@@ -67,17 +83,17 @@ struct HwCtxWin {
 }
 
 /// A submitted hardware frame parked until the in-flight fence proves the GPU reads
-/// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
-/// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
+/// done: imported dmabuf planes, an imported D3D11 shared texture, or a native
+/// Vulkan-Video frame.
 enum Retired {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     #[cfg(windows)]
     D3d11(crate::d3d11::HwFrame),
-    Vk {
-        frame: VkVideoFrame,
-        views: [vk::ImageView; 2],
-    },
+    /// A native (pf-vkdecode) frame: image + views are the DECODER's — nothing to
+    /// destroy here; dropping the frame after the fence wait sends its release token,
+    /// which is what returns the decode slot (the release-after-fence contract).
+    NativeVk(NativeVkFrame),
 }
 
 /// The overlay composite: one premultiplied-alpha quad blended over the swapchain image
@@ -97,8 +113,32 @@ struct OverlayPipe {
     framebuffers: Vec<vk::Framebuffer>,
 }
 
-/// The one video image (device-local RGBA the size of the decoded stream) + its staging.
-/// `view`/`framebuffer` exist only on hw-capable devices (the CSC pass renders into it).
+/// The software rung's plane images: three R8 pictures the CPU frame's tightly-packed
+/// I420 is uploaded into, then sampled by the planar CSC pass. Sized to the LUMA picture
+/// and its 4:2:0 chroma halves; rebuilt whenever the stream size changes.
+///
+/// Owned by the presenter rather than parked in `Retired` like the imported hardware
+/// frames: nothing outside this device ever refers to them, and the single in-flight
+/// fence is waited before each record, so re-uploading into the same images is safe
+/// without a ring.
+struct CpuPlanes {
+    images: [vk::Image; 3],
+    memory: [vk::DeviceMemory; 3],
+    views: [vk::ImageView; 3],
+    /// Luma size; chroma is derived (`div_ceil(2)`), the same rule the frame uses.
+    width: u32,
+    height: u32,
+    /// True once the images have been transitioned out of UNDEFINED at least once — the
+    /// first upload must come from UNDEFINED (nothing to preserve), every later one from
+    /// SHADER_READ_ONLY_OPTIMAL (where the previous frame's CSC pass left them).
+    initialized: bool,
+}
+
+/// The one video image: device-local RGBA the size of the decoded stream, the single
+/// target every lane converges on before the letterboxed blit. `view` + `framebuffer` are
+/// unconditional since M8 — the CSC pass renders into it on EVERY device, because the
+/// software lane goes through the planar pass too and there is no lane left that writes
+/// this image with a plain transfer.
 struct VideoImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -108,6 +148,8 @@ struct VideoImage {
     height: u32,
 }
 
+/// The host-visible upload buffer the software rung's three planes are copied into before
+/// the record step's `vkCmdCopyBufferToImage`s. Grows, never shrinks.
 struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -136,24 +178,29 @@ pub struct Presenter {
     #[cfg(windows)]
     hw_win: Option<HwCtxWin>,
     csc: CscPass,
-    /// The planar (3-plane) CSC variant for PyroWave frames; built only when the device
-    /// passed the pyrowave probe.
-    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    csc_planar: Option<CscPass>,
-    /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
+    /// The planar (3-plane) CSC variant. Unconditional since M8: the SOFTWARE rung
+    /// renders through it, and the software rung is the ladder's last one — a device that
+    /// failed the pyrowave probe (or a build without the feature) still has to be able to
+    /// show a picture.
+    csc_planar: CscPass,
+    /// The software rung's three uploaded plane images (Y/Cb/Cr, R8), rebuilt on a
+    /// stream-size change. `None` until the first CPU frame — a hardware session never
+    /// allocates them.
+    cpu_planes: Option<CpuPlanes>,
+    /// The shared Vulkan device handles the decode lane runs on — `None` when the stack
+    /// can't do Vulkan Video at all.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     /// The console-UI composite quad (§6.1's presenter half).
     overlay_pipe: OverlayPipe,
-    /// The submitted hardware frame (dmabuf plane images + guard, or a Vulkan-Video
-    /// frame + our plane views): its GPU reads end with the in-flight fence, so it's
-    /// destroyed right after the next fence wait.
+    /// The submitted hardware frame (dmabuf plane images + guard, an imported D3D11
+    /// texture, or a native Vulkan-Video frame): its GPU reads end with the in-flight
+    /// fence, so it's released right after the next fence wait.
     retired_hw: Option<Retired>,
-    /// External-sync lock over this device's queues, shared with FFmpeg (via
-    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`] → its
-    /// `lock_queue`/`unlock_queue` callbacks) and the Skia overlay: FFmpeg preps on the
-    /// SAME graphics queue from the pump thread, so every `vkQueueSubmit`/
-    /// `vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must hold it —
-    /// the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
+    /// External-sync lock over this device's queues, shared with the DECODE lane (via
+    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`]) and the Skia overlay:
+    /// the decoder submits on the SAME graphics queue from the pump thread, so every
+    /// `vkQueueSubmit`/`vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must
+    /// hold it — the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
     queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
     format: vk::SurfaceFormatKHR,
     /// The surface's HDR10/ST.2084 pairing, when the stack offers one.
@@ -217,15 +264,15 @@ impl Presenter {
         self.hw_win.is_some()
     }
 
-    /// The FFmpeg Vulkan Video decode handle bundle — `None` when this stack can't
-    /// (device < 1.3, missing video extensions/queue/features). The decoder chain
-    /// falls back to VAAPI/software then.
+    /// The Vulkan Video decode handle bundle — `None` when this stack can't
+    /// (device < 1.3, missing video extensions/queue/features). The decoder ladder
+    /// falls through to the platform rung / software then.
     pub fn vulkan_decode(&self) -> Option<pf_client_core::video::VulkanDecodeDevice> {
         self.video_export.clone()
     }
 
     /// Full device idle — TEARDOWN ONLY, and only after the session pump thread has
-    /// been joined (it submits FFmpeg decode work; wait-idle's external-sync rule
+    /// been joined (it submits decode work; wait-idle's external-sync rule
     /// covers every queue on the device). Mid-session code uses the fence quiesce.
     /// The queue lock is held as cheap insurance against a straggling submitter.
     pub fn wait_idle(&self) {
@@ -375,8 +422,8 @@ impl Drop for Presenter {
             #[cfg(target_os = "linux")]
             self.hw.take();
             self.csc.destroy(&self.device);
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            if let Some(p) = &self.csc_planar {
+            self.csc_planar.destroy(&self.device);
+            if let Some(p) = self.cpu_planes.take() {
                 p.destroy(&self.device);
             }
             self.overlay_pipe.destroy(&self.device);

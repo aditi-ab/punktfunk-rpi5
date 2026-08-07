@@ -1,13 +1,17 @@
 # Build the punktfunk Windows client as signed MSIX packages (x64 + ARM64) and publish them to
 # Gitea's generic package registry, so Windows boxes can download + install a real package (Start
 # tile, clean install/uninstall) instead of a loose exe. Runs on a self-hosted windows-amd64
-# runner (host mode; the MSVC/WinUI toolchain comes from unom/infra's windows-runner/, FFmpeg
+# runner (host mode; the MSVC/WinUI toolchain comes from unom/infra's windows-runner/, the rest
 # self-provisions via the "Ensure Windows toolchain" step below, same as windows.yml) — the
 # Windows SDK's makeappx/signtool are baked into the runner's daemon env.
 #
 # Both arches come off the ONE x64 runner: x86_64 natively, aarch64 cross-compiled (the x64 MSVC
-# toolset has the ARM64 cross compiler; the matrix points FFMPEG_DIR at the ARM64 FFmpeg tree). See
-# windows.yml for the cross-build rationale + the BOM/MAX_PATH runner gotchas.
+# toolset has the ARM64 cross compiler). See windows.yml for the cross-build rationale + the
+# BOM/MAX_PATH runner gotchas.
+#
+# NO FFmpeg since M10 (design/client-native-decode.md §6): the client decodes natively, so the
+# package carries no libav* DLLs and this workflow sets no FFMPEG_DIR. The host installer
+# (windows-host.yml) is unchanged.
 #
 # Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
 # Packaging internals: clients/windows/packaging/README.md.
@@ -49,7 +53,9 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-console-ui/**'
-      - 'crates/pf-ffvk/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-msix.yml'
@@ -80,12 +86,10 @@ jobs:
         include:
           - arch: x64
             target: x86_64-pc-windows-msvc
-            ffmpeg: C:\Users\Public\ffmpeg
             td: C:\t
             session_flags: ''
           - arch: arm64
             target: aarch64-pc-windows-msvc
-            ffmpeg: C:\Users\Public\ffmpeg-arm64
             td: C:\t-a64
             # No skia-binaries prebuilt for aarch64-pc-windows-msvc: the session ships
             # without the Skia console UI on ARM64 (streaming unaffected) — flip when
@@ -94,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+      - name: Ensure Windows toolchain (WDK, Inno Setup, ARM64 target)
         shell: pwsh
         run: ./scripts/ci/ensure-windows-toolchain.ps1
 
@@ -102,12 +106,9 @@ jobs:
         shell: pwsh
         run: |
           # CARGO_TARGET_DIR (per-arch, short) dodges the MAX_PATH wall in the CMake-from-source
-          # crates (see windows.yml). FFMPEG_DIR selects the arch's import libs + is read by
-          # pack-msix.ps1 for the runtime DLLs. All via GITHUB_ENV.
+          # crates (see windows.yml). No FFMPEG_DIR: nothing in this package links libav* (M10),
+          # and pack-msix.ps1 no longer copies runtime DLLs from one.
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "FFMPEG_DIR=${{ matrix.ffmpeg }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # pf-ffvk's bindgen needs Vulkan headers (arch-independent; provisioned alongside FFmpeg).
-          "PF_FFVK_VULKAN_INCLUDE=C:\Users\Public\vulkan-headers\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustup target add ${{ matrix.target }}
           $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
