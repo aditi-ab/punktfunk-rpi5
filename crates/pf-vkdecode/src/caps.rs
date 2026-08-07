@@ -605,9 +605,12 @@ pub(crate) unsafe fn query_h264_caps(
 
     let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
     let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+    // ⚠ ORDER IS LOAD-BEARING — see the measured Intel Arc swap in
+    // [`crate::caps_h265::query_h265_caps`]. `push_next` prepends, so pushing the codec
+    // struct FIRST leaves VkVideoDecodeCapabilitiesKHR directly after the base struct.
     let mut caps = vk::VideoCapabilitiesKHR::default()
-        .push_next(&mut decode_caps)
-        .push_next(&mut h264_caps);
+        .push_next(&mut h264_caps)
+        .push_next(&mut decode_caps);
     // SAFETY: physical device is live (DeviceHandles contract); `profile` roots a
     // fully wired, immovable chain; `caps` chains driver-fillable structs that all
     // outlive the call.

@@ -279,9 +279,22 @@ pub(crate) unsafe fn query_h265_caps(
 
     let mut h265_caps = vk::VideoDecodeH265CapabilitiesKHR::default();
     let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+    // ⚠ ORDER IS LOAD-BEARING on at least one shipping driver. `push_next` PREPENDS, so
+    // the chain is the reverse of the call order: pushing the codec struct last puts
+    // VkVideoDecodeCapabilitiesKHR FIRST after the base struct, which is the order every
+    // Vulkan sample writes it in.
+    //
+    // Measured on Intel Arc (Windows 101.8724) with the previous order — codec struct
+    // first — the driver filled the two by POSITION rather than by sType and returned
+    // them SWAPPED: `decode_caps.flags` came back 12 (= STD_VIDEO_H265_LEVEL_IDC_6_2)
+    // and `h265_caps.maxLevelIdc` came back 1 (= DPB_AND_OUTPUT_COINCIDE). Reading a
+    // level as a flag bitmask means neither COINCIDE nor DISTINCT appeared set, so the
+    // rung refused a device that in fact supports it, and every Arc fell back to D3D11VA.
+    // NVIDIA and RADV dispatch by sType and are indifferent to the order, which is why
+    // the fleet was green and this survived to the field.
     let mut caps = vk::VideoCapabilitiesKHR::default()
-        .push_next(&mut decode_caps)
-        .push_next(&mut h265_caps);
+        .push_next(&mut h265_caps)
+        .push_next(&mut decode_caps);
     // SAFETY: physical device is live (DeviceHandles contract); `profile` roots a
     // fully wired, immovable chain; `caps` chains driver-fillable structs that all
     // outlive the call.
