@@ -1766,9 +1766,20 @@ impl Decoder {
                         "native Vulkan decode init failed — demoting to the standard ladder"),
                 }
             } else {
+                // The gate is an AND of three, so name all three. `video_decode=true`
+                // beside "refused" is otherwise unreadable: it says the device decodes
+                // SOMETHING while refusing THIS codec, and the bit that would explain it
+                // — the decode family's advertised operations — went unprinted. That is
+                // the difference between "your GPU can't do this" and "we asked for the
+                // wrong thing", and only the second is our bug.
                 tracing::warn!(
                     codec = codec_name,
                     video_decode = vk.is_some_and(|v| v.video_decode),
+                    decode_video_caps =
+                        format_args!("0x{:X}", vk.map_or(0, |v| v.decode_video_caps)),
+                    codec_op_needed =
+                        format_args!("0x{:X}", native_codec(wire).map_or(0, |(_, op)| op)),
+                    device = vk.map_or("", |v| v.device_name.as_str()),
                     "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264, HEVC or AV1 \
                      session and a presenter device whose decode family advertises that \
                      codec) — standard ladder"

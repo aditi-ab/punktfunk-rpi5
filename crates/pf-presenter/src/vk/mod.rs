@@ -41,7 +41,7 @@ mod reconfig;
 mod resources;
 mod setup;
 
-pub use setup::{list_adapters, PresentPref};
+pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
 /// One presenter iteration's video input.
 pub enum FrameInput<'a> {
