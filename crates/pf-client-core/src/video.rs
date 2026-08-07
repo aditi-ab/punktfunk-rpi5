@@ -49,9 +49,9 @@
 //! | native Vulkan Video | | H.265 (Main / Main10 / 4:4:4) | **yes** — same parity run + HDR chain and Deck/VanGogh legs (M3) |
 //! | native Vulkan Video | | AV1 | **yes** — 250/250 bit-identical to libavcodec on an RTX 5070 Ti (M7); ONE vendor, no soak |
 //! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5) |
-//! | native D3D11VA | | AV1 | **NO** — has never decoded a frame anywhere (M7 wired it; the box was unavailable) |
+//! | native D3D11VA | | AV1 | **not proven** — it HAS now decoded (4K60, RTX 3500 Ada, 2026-08-07), but with no parity check and no soak it stays out of the admission filter. Its M7 wiring was right all along: what looked like a DXVA reference-mapping bug (`reference picture N holds no DPB slot`, 72 consecutive failures) was the HOST shipping half of every AV1 frame — see `pf_encode`'s `resolve_split_subframe` |
 //! | native VAAPI | [`crate::video_vaapi_native`] | H.264, H.265, AV1 | **NO** — has never decoded a frame anywhere (M6/M7; no VAAPI hardware was reachable) |
-//! | software | `video_software` | H.264, AV1 | **NO on glass** — openh264 + rav1d, CPU unit tests only (M8) |
+//! | software | `video_software` | H.264, AV1 | **NO** — openh264 has never run on glass; rav1d decodes 1080p AV1 there but **aborts the process** on 4K (rav1d 1.1.0 panics inside its own error handler, across an `extern "C"` boundary, so nothing can catch it) |
 //!
 //! The software rung's evidence is recorded for the same reason but does not gate
 //! anything: it is the LAST rung, so there is nothing below it to protect.
@@ -1109,17 +1109,31 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
             true,
             "frame-hash parity on an RTX 4090 and an AMD iGPU + 30-min soak (M5)",
         ),
+        // Decoded on hardware for the first time on 2026-08-07 (4K60, RTX 3500 Ada) once the
+        // host stopped truncating AV1 — so the old "NEVER decoded a frame anywhere" is no
+        // longer true and must not be printed. Still NOT `verified`: `verified` gates
+        // `native_rung_admitted`, i.e. whether `auto` may pick this rung AHEAD of Vulkan
+        // Video, and one 25-second session with no frame-hash parity and no soak does not
+        // buy that. Promoting it wants a `gpu_parity`-style run, deliberately.
         (NativeRung::D3d11va, CODEC_AV1) => (
             false,
-            "NEVER decoded a frame on any hardware - wired in M7, the box was unavailable",
+            "decoded 4K60 once on an RTX 3500 Ada (2026-08-07) but has NEVER been \
+             parity-checked or soaked (M7)",
         ),
         (NativeRung::Vaapi, _) => (
             false,
             "NEVER decoded a frame on any hardware - no VAAPI device was reachable (M6/M7)",
         ),
+        // ⚠ rav1d 1.1.0 ABORTS THE PROCESS on 4K AV1 (2026-08-07, .21): it takes an internal
+        // error path and then panics inside its own `on_error` (`decode.rs:4997`,
+        // `Option::unwrap()` on a `None` frame header). The panic crosses the `extern "C"`
+        // boundary in `dav1d_send_data`, so it is `panic_cannot_unwind` — an abort, which no
+        // rung demotion or `NoSoftwareRung` refusal can catch. 1080p AV1 decodes fine, and
+        // libdav1d decodes the same 4K stream 715/715, so this is rav1d's own defect.
         (NativeRung::Software, CODEC_H264 | CODEC_AV1) => (
             false,
-            "never run on glass - openh264/rav1d have CPU unit tests only (M8)",
+            "openh264 has never run on glass; rav1d decodes 1080p AV1 there but ABORTS the \
+             process on 4K (rav1d 1.1.0 panics in its own error handler) (M8)",
         ),
         _ => (false, "no hardware run recorded for this rung and codec"),
     };
@@ -3305,6 +3319,14 @@ mod tests {
     /// `warn` line carrying their note, and that line is what a field report about M10 gets
     /// read against. Which of them `auto` may pick FIRST is
     /// [`native_rung_admitted`]'s decision, asserted in the test after this one.
+    ///
+    /// `(D3d11va, AV1)` stays here after 2026-08-07 even though it has now decoded on
+    /// hardware, and its warn line is why: it named the rung as unproven moments before that
+    /// rung failed 72 access units running, which is exactly the job this test protects. (The
+    /// cause was the HOST shipping half of every AV1 frame — `pf_encode`'s
+    /// `resolve_split_subframe` — not the rung.) Unproven is about EVIDENCE, not about whether
+    /// it has ever worked: one 25-second session with no parity check and no soak must not
+    /// promote a rung past Vulkan Video in the admission filter.
     #[test]
     fn every_rung_runs_and_the_unproven_ones_are_named() {
         let unproven = [
