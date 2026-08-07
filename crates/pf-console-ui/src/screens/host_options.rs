@@ -17,7 +17,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::Fonts;
+use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -219,12 +219,38 @@ impl HostOptionsScreen {
         fonts: &Fonts,
         _ctx: &mut Ctx,
     ) {
+        // The explainer line, as on Add Host — it says what this menu is FOR, and the air it
+        // takes is what keeps the first row off the pinned title.
+        let blurb = if self.host.pin.is_some() {
+            "This card is a shortcut to one profile on this host. Unpinning it changes \
+             nothing about the host or the profile."
+        } else {
+            "Manage this saved host."
+        };
+        let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
+        fonts.centered(
+            canvas,
+            blurb,
+            W::Regular,
+            13.0 * k,
+            fg(0.55),
+            cx,
+            f64::from(rect.top) + 2.0 * k,
+            f64::from(rect.width()) * 0.72,
+        );
+        let list_rect = Rect::from_ltrb(
+            rect.left,
+            rect.top + (34.0 * k) as f32,
+            rect.right,
+            rect.bottom,
+        );
         let rows: Vec<RowSpec> = self
             .actions()
             .into_iter()
             .map(|a| RowSpec::action(self.label(a), true))
             .collect();
-        self.list.render(canvas, rect, &rows, fonts, k, dt, true);
+        self.list
+            .render(canvas, list_rect, &rows, fonts, k, dt, true);
     }
 }
 
