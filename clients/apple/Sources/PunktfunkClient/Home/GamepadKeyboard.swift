@@ -111,7 +111,9 @@ struct GamepadKeyboard: View {
                     .font(.geist(15, .semibold, relativeTo: .callout))
             }
         }
-        .foregroundStyle(focused ? Color.black : ink.fg)
+        // The focused keycap sits on `ink.accent`, so `onAccent` is what reads on it — a dark
+        // accent palette got black-on-dark with the old literal black.
+        .foregroundStyle(focused ? ink.onAccent : ink.fg)
         .frame(maxWidth: .infinity, minHeight: compact ? 34 : 42)
         .background {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
