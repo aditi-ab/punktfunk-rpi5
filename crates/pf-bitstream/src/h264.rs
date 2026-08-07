@@ -240,6 +240,16 @@ pub enum PlanWarning {
     /// hosts never emit MMCO 5, so this warning is the field signal if that
     /// assumption ever breaks.
     Mmco5Rebase,
+    /// The SPS carried no VUI `bitstream_restriction`, so the DPB had to be sized from
+    /// A.3.1's LEVEL ceiling — and that ceiling demands more hardware slots than a
+    /// mainstream decoder provides. See [`dpb_limit`] for why this is the H.264 shape
+    /// of the defect #96 fixed for HEVC, and why it is a warning here rather than a
+    /// clamp. Every H.264 encoder a punktfunk host can reach writes the restriction
+    /// (measured 2026-08-07), so this warning is the field signal if that ever breaks.
+    LevelDerivedDpb {
+        max_dpb_frames: usize,
+        level_idc: u8,
+    },
 }
 
 /// The AU cannot be planned at all.
@@ -296,10 +306,70 @@ impl From<&Sps> for NegotiationInfo {
             bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
             bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
             chroma_format_idc: sps.chroma_format_idc,
-            max_dpb_frames: sps.max_dpb_frames(),
+            max_dpb_frames: dpb_limit(sps),
             interlaced: !sps.frame_mbs_only_flag,
         }
     }
+}
+
+/// The hardware DPB slot count a mainstream decoder provides. NVIDIA's Vulkan Video
+/// reports `maxDpbSlots = 16` (RADV 17), and DXVA/D3D11VA's H.264 picture-parameter
+/// format indexes the DPB with a 16-entry array. Backends allocate one slot per DPB
+/// frame plus one for the picture in flight, so a stream whose DPB is sized at 16
+/// demands 17 and is refused outright — losing the codec, not merely a slower path.
+const MAINSTREAM_MAX_DPB_SLOTS: usize = 16;
+
+/// DPB size in frames — the same question [`crate::h265::dpb_limit`] answers, and the
+/// same trap, but H.264 gets a different answer and it is worth writing down why.
+///
+/// HEVC's SPS states its own requirement outright (`sps_max_dec_pic_buffering_minus1`),
+/// so #96 could simply stop consulting equation A-2's level ceiling. H.264 has no such
+/// unconditional field: the stream declares its need ONLY in the VUI's
+/// `bitstream_restriction` (`max_dec_frame_buffering`, E.2.1). Absent that, A.3.1's
+/// level ceiling — `min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)` — is all
+/// the spec leaves, and it is genuinely the correct inference, not a bug. It is also
+/// what the stream MAY use rather than what it needs, which is exactly the shape that
+/// killed HEVC at 720p and 1080p.
+///
+/// The ceiling saturates at 16 — thus [`MAINSTREAM_MAX_DPB_SLOTS`] + 1 hardware slots,
+/// the fatal value — whenever the picture is small relative to its level's `MaxDpbMbs`:
+///
+/// | picture | ceiling by level |
+/// |---|---|
+/// | 720p (3600 MBs) | L3.2 → 5, L4.2 → 9, **L5.0+ → 16** |
+/// | 1080p (8160 MBs) | L4.2 → 4, L5.0 → 13, **L5.1+ → 16** |
+/// | 1440p (14400 MBs) | L5.1 → 12, **L6.0+ → 16** |
+/// | 2160p (32400 MBs) | L5.2 → 5, **L6.0+ → 16** |
+///
+/// So H.264 escaped #96 twice over rather than by one piece of luck, and BOTH escapes
+/// are properties of the encoders, not of the format. Measured 2026-08-07 by reading
+/// the SPS each encoder actually emitted, at 720p/1080p/1440p/2160p:
+///
+/// | encoder | level picked | `bitstream_restriction` | `max_dec_frame_buffering` |
+/// |---|---|---|---|
+/// | NVENC (RTX 5070 Ti, 610.57.04) | 3.2 / 4.2 / 5.1 / 5.2 | present | 3 |
+/// | VAAPI via libavcodec (RDNA3, Mesa 26.0.3) | 4.1 / 4.2 / 5.1 / 5.2 | present | 1 |
+/// | openh264 (software rung) | 3.2 / 4.2 / 5.1 / 5.2 | present | 1 |
+///
+/// Every one of them picks a level proportionate to the picture AND states its real
+/// need in the VUI, so the ceiling is never reached and never consulted. That is why
+/// this function does NOT clamp: with the restriction present the value below IS the
+/// stream's own statement, and clamping a stream that genuinely asked for a deep DPB
+/// would corrupt its output. Absent the restriction there is no honest smaller number
+/// to substitute — [`PlanWarning::LevelDerivedDpb`] names the situation instead, so the
+/// field tells us if a driver ever stops writing the VUI, rather than a user silently
+/// losing H.264 the way #96's users silently lost HEVC.
+fn dpb_limit(sps: &Sps) -> usize {
+    // A.3.1's cap, the VUI override and the `max_num_ref_frames` floor all live in the
+    // vendored parser; this is the one named place the RESULT is interpreted.
+    sps.max_dpb_frames()
+}
+
+/// Whether [`dpb_limit`] had to fall back to A.3.1's level ceiling because the SPS
+/// carried no VUI `bitstream_restriction` — i.e. whether the number is the stream's own
+/// statement of need or merely the largest DPB its level permits.
+fn dpb_is_level_derived(sps: &Sps) -> bool {
+    !(sps.vui_parameters_present_flag && sps.vui_parameters.bitstream_restriction_flag)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -606,7 +676,7 @@ impl H264Planner {
         // uncapped. No hardware decoder implements a deeper DPB — a larger value is a
         // corrupt (or hostile) VUI, not a feature request — and backends size real
         // slot pools from this number, so it is gated here, at SPS activation.
-        if sps.max_dpb_frames() > 16 {
+        if dpb_limit(sps) > MAINSTREAM_MAX_DPB_SLOTS {
             return Err(PlanError::OutsideEnvelope(
                 "DPB deeper than 16 frames (max_dec_frame_buffering)",
             ));
@@ -1279,10 +1349,19 @@ impl H264Planner {
     }
 
     // Apply the parameters of `sps` to the planning state.
-    fn apply_sps(&mut self, sps: &Sps) {
+    fn apply_sps(&mut self, sps: &Sps, warnings: &mut Vec<PlanWarning>) {
         self.negotiation_info = NegotiationInfo::from(sps);
 
-        let max_dpb_frames = sps.max_dpb_frames();
+        let max_dpb_frames = dpb_limit(sps);
+        // Sized from the level ceiling rather than the stream's own declaration, and
+        // large enough that backends will ask for more slots than they can get. See
+        // [`dpb_limit`]: warned, not clamped, because there is no honest smaller number.
+        if dpb_is_level_derived(sps) && max_dpb_frames + 1 > MAINSTREAM_MAX_DPB_SLOTS {
+            warnings.push(PlanWarning::LevelDerivedDpb {
+                max_dpb_frames,
+                level_idc: sps.level_idc as u8,
+            });
+        }
         let interlaced = !sps.frame_mbs_only_flag;
         let max_num_order_frames = sps.max_num_order_frames() as usize;
         let max_num_reorder_frames = if max_num_order_frames > max_dpb_frames {
@@ -1300,13 +1379,17 @@ impl H264Planner {
         *old_negotiation_info != negotiation_info
     }
 
-    fn renegotiate_if_needed(&mut self, sps: &Sps) -> Result<(), PlanError> {
+    fn renegotiate_if_needed(
+        &mut self,
+        sps: &Sps,
+        warnings: &mut Vec<PlanWarning>,
+    ) -> Result<(), PlanError> {
         if Self::negotiation_possible(sps, &self.negotiation_info) {
             Self::check_envelope(sps)?;
             // Make sure all the frames planned so far are display-ready before the
             // stream parameters change under them.
             self.drain_dpb();
-            self.apply_sps(sps);
+            self.apply_sps(sps, warnings);
         }
 
         Ok(())
@@ -1412,7 +1495,7 @@ impl H264Planner {
         )?);
 
         // A picture's SPS may require renegotiation.
-        self.renegotiate_if_needed(&pps.sps)?;
+        self.renegotiate_if_needed(&pps.sps, warnings)?;
 
         let first_field = self.find_first_field(hdr).map_err(PlanError::Parse)?;
 
@@ -1706,7 +1789,7 @@ impl H264Planner {
             bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
             bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
             chroma_format_idc: sps.chroma_format_idc,
-            max_dpb_frames: sps.max_dpb_frames(),
+            max_dpb_frames: dpb_limit(sps),
             recovery_point,
         }
     }
@@ -1900,6 +1983,21 @@ mod tests {
         (sps, pps)
     }
 
+    /// The warnings a plan carries, minus the DPB-sizing signal.
+    ///
+    /// [`base_sps`]'s fixtures are 64x64 with no VUI bitstream restriction, so A.3.1's
+    /// ceiling saturates (`MaxDpbMbs(L1) = 396` over 16 macroblocks) and every plan
+    /// built on them carries [`PlanWarning::LevelDerivedDpb`]. That is the arithmetic
+    /// `the_level_ceiling_alone_would_reproduce_96_and_is_warned_about` exists to pin —
+    /// SMALL pictures saturate the ceiling most easily, not large ones — and it says
+    /// nothing about the picture, which is what the tests below are checking.
+    fn picture_warnings(plan: &AuPlan) -> Vec<&PlanWarning> {
+        plan.warnings
+            .iter()
+            .filter(|w| !matches!(w, PlanWarning::LevelDerivedDpb { .. }))
+            .collect()
+    }
+
     fn param_set_au(sps: &Sps, pps: &Pps) -> Vec<u8> {
         let mut au = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, sps, &mut au, true).unwrap();
@@ -2022,7 +2120,7 @@ mod tests {
         let p4 = planner.plan_au(&au4).unwrap();
         for plan in [&p0, &p1, &p2, &p3, &p4] {
             assert!(
-                plan.warnings.is_empty(),
+                picture_warnings(plan).is_empty(),
                 "authored stream must plan clean: {plan:?}"
             );
         }
@@ -2101,7 +2199,10 @@ mod tests {
         let p1 = planner.plan_au(&au1).unwrap();
         let p2 = planner.plan_au(&au2).unwrap();
         for plan in [&p0, &p1, &p2] {
-            assert!(plan.warnings.is_empty(), "must plan clean: {plan:?}");
+            assert!(
+                picture_warnings(plan).is_empty(),
+                "must plan clean: {plan:?}"
+            );
         }
         let idr_id = p0.dpb.stored.unwrap();
         let lt_id = p1.dpb.stored.unwrap();
@@ -2362,6 +2463,144 @@ mod tests {
             matches!(err, PlanError::OutsideEnvelope(what) if what.contains("DPB")),
             "{err:?}"
         );
+    }
+
+    /// An SPS at a given picture size and level, with the VUI bitstream restriction
+    /// either absent (so [`dpb_limit`] must fall back to A.3.1's level ceiling) or
+    /// present with an explicit `max_dec_frame_buffering`.
+    fn sps_at(width: u32, height: u32, level: Level, declared: Option<u32>) -> Sps {
+        Sps {
+            profile_idc: Profile::Main as u8,
+            level_idc: level,
+            frame_mbs_only_flag: true,
+            direct_8x8_inference_flag: true,
+            // Every H.264 encoder measured below sits at or under this; it is the
+            // A.3.1 floor `max_dpb_frames` applies, never the value under test.
+            max_num_ref_frames: 3,
+            pic_width_in_mbs_minus1: (width / 16 - 1) as u16,
+            pic_height_in_map_units_minus1: (height / 16 - 1) as u16,
+            vui_parameters_present_flag: declared.is_some(),
+            vui_parameters: VuiParams {
+                bitstream_restriction_flag: declared.is_some(),
+                max_dec_frame_buffering: declared.unwrap_or(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The H.264 half of `pf-encode`'s `rfi_dpb_fits_a_mainstream_vulkan_decoder`.
+    ///
+    /// That test guards the PRODUCER end for HEVC — that `RFI_DPB` never grows past
+    /// what a client can allocate. This is the CONSUMER end for H.264, where the
+    /// number is not ours to choose: the client derives it from whatever SPS arrives,
+    /// and #96 proved that deriving a DPB from a level's ceiling instead of a stream's
+    /// need costs the codec outright.
+    ///
+    /// Pinned here are the (picture, level) pairs a punktfunk host can actually reach,
+    /// with the level each shipping encoder was MEASURED to pick on 2026-08-07 (see
+    /// [`dpb_limit`] for the full table and the hardware). The property that has to
+    /// hold is the one the backends enforce: `dpb_limit + 1 <= 16` slots.
+    #[test]
+    fn every_reachable_h264_stream_fits_a_mainstream_slot_pool() {
+        // (picture, level measured on NVENC / VAAPI / openh264, their VUI declaration)
+        let measured = [
+            ((1280, 720), Level::L3_2, 3),  // NVENC, openh264
+            ((1280, 720), Level::L4_1, 1),  // VAAPI via libavcodec
+            ((1920, 1080), Level::L4_2, 3), // all three
+            ((2560, 1440), Level::L5_1, 3),
+            ((3840, 2160), Level::L5_2, 3),
+        ];
+        for ((w, h), level, declared) in measured {
+            let sps = sps_at(w, h, level, Some(declared));
+            assert!(
+                !dpb_is_level_derived(&sps),
+                "{w}x{h} L{:?}: the measured encoders all write the VUI restriction — \
+                 an SPS that carries it must never be treated as level-derived",
+                level
+            );
+            let slots = dpb_limit(&sps) + 1;
+            assert!(
+                slots <= MAINSTREAM_MAX_DPB_SLOTS,
+                "{w}x{h} L{level:?} declaring {declared} needs {slots} DPB slots, \
+                 mainstream hardware caps at {MAINSTREAM_MAX_DPB_SLOTS}"
+            );
+        }
+    }
+
+    /// The cliff the measured encoders walk past, pinned so it stays visible.
+    ///
+    /// These are the SAME resolutions, at levels a host could legally pick, with no
+    /// VUI restriction to state the real need. Each computes a 16-frame DPB — 17
+    /// hardware slots — which is precisely the arithmetic that killed HEVC at 720p and
+    /// 1080p before #96. H.264 escapes it because every encoder both picks a
+    /// proportionate level AND writes the restriction, not because the format is safe.
+    #[test]
+    fn the_level_ceiling_alone_would_reproduce_96_and_is_warned_about() {
+        // (picture, a level that saturates A.3.1's ceiling for it)
+        let cliff = [
+            ((1280, 720), Level::L5),
+            ((1280, 720), Level::L5_2),
+            ((1920, 1080), Level::L5_1),
+            ((2560, 1440), Level::L6),
+            ((3840, 2160), Level::L6_2),
+        ];
+        for ((w, h), level) in cliff {
+            let sps = sps_at(w, h, level, None);
+            assert!(dpb_is_level_derived(&sps), "{w}x{h} L{level:?}");
+            assert_eq!(
+                dpb_limit(&sps),
+                16,
+                "{w}x{h} L{level:?} should saturate A.3.1's 16-frame ceiling"
+            );
+            assert!(
+                dpb_limit(&sps) + 1 > MAINSTREAM_MAX_DPB_SLOTS,
+                "{w}x{h} L{level:?} is the #96 arithmetic and must be recognised as such"
+            );
+
+            // ...and the planner must NAME it rather than let a user silently lose the
+            // codec. The SPS activates on the first slice, so the warning rides out on
+            // the IDR's plan.
+            let sps = Rc::new(sps);
+            let pps = PpsBuilder::new(Rc::clone(&sps))
+                .pic_parameter_set_id(0)
+                .pic_init_qp(26)
+                .build();
+            let mut au = param_set_au(&sps, &pps);
+            au.extend(write_idr_slice());
+
+            let plan = H264Planner::new()
+                .plan_au(&au)
+                .unwrap_or_else(|e| panic!("{w}x{h} L{level:?} should plan, got {e:?}"));
+            assert!(
+                plan.warnings.contains(&PlanWarning::LevelDerivedDpb {
+                    max_dpb_frames: 16,
+                    level_idc: level as u8,
+                }),
+                "{w}x{h} L{level:?}: expected LevelDerivedDpb, got {:?}",
+                plan.warnings
+            );
+        }
+    }
+
+    /// A proportionate level is the other half of the escape: at the levels the
+    /// encoders actually pick, the ceiling is small enough that even a stream with no
+    /// VUI at all fits — so neither escape is doing all the work alone.
+    #[test]
+    fn a_proportionate_level_fits_even_without_a_vui_restriction() {
+        let proportionate = [
+            ((1280, 720), Level::L3_2, 5),
+            ((1280, 720), Level::L4_1, 9),
+            ((1920, 1080), Level::L4_2, 4),
+            ((2560, 1440), Level::L5_1, 12),
+            ((3840, 2160), Level::L5_2, 5),
+        ];
+        for ((w, h), level, expected) in proportionate {
+            let sps = sps_at(w, h, level, None);
+            assert_eq!(dpb_limit(&sps), expected, "{w}x{h} L{level:?}");
+            let slots = dpb_limit(&sps) + 1; // + the picture in flight
+            assert!(slots <= MAINSTREAM_MAX_DPB_SLOTS, "{w}x{h} L{level:?}");
+        }
     }
 
     /// MMCO 5 writer: op 5 takes NO argument (Table 7-9), so the generic
@@ -2688,11 +2927,11 @@ mod tests {
         let plan = planner.plan_au(&write_idr_slice()).unwrap();
         assert!(plan.picture.is_idr);
         assert_eq!(plan.picture.pic_order_cnt, 0);
-        assert!(plan.warnings.is_empty());
+        assert!(picture_warnings(&plan).is_empty());
 
         // And the stream continues cleanly on the reset state.
         let plan = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
-        assert!(plan.warnings.is_empty());
+        assert!(picture_warnings(&plan).is_empty());
         assert_eq!(plan.slices[0].ref_list0.len(), 1);
     }
 
@@ -2725,7 +2964,7 @@ mod tests {
         au.extend(write_idr_slice_at(8, 1));
 
         let plan = H264Planner::new().plan_au(&au).unwrap();
-        assert!(plan.warnings.is_empty());
+        assert!(picture_warnings(&plan).is_empty());
         assert_eq!(plan.slices.len(), 2);
         // The picture parameters come from the FIRST slice's PPS (the uncropped
         // SPS 0); they must not drift to the last slice's.
