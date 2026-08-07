@@ -97,6 +97,10 @@ const MMDEV_CAPTURE_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
 /// WASAPI endpoint-id prefix for render endpoints (`{0.0.0.00000000}.{guid}`).
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
+/// …and for CAPTURE endpoints, whose ids carry `{0.0.1.…}` (measured: the enumeration returns
+/// this form, and an id built with the render prefix never string-matches it — the minted
+/// mic's capture side resolved to nothing until this was split).
+const CAPTURE_ENDPOINT_ID_PREFIX: &str = "{0.0.1.00000000}.";
 /// How long [`ensure`] waits for the new render endpoint to materialise after driver install.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(10);
 /// How many times [`ensure`] re-stamps before giving up and asking for an AudioEndpointBuilder
@@ -837,17 +841,21 @@ fn install_sss_driver() -> Result<()> {
 /// The render endpoint owned by `instance_id`, identified through the endpoint store's devnode
 /// link (`"{1}.<instance id>"` under `…\MMDevices\Audio\Render\{ep}\Properties`).
 pub(crate) fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
-    endpoint_for_devnode_in(MMDEV_RENDER_PATH, instance_id)
+    endpoint_for_devnode_in(MMDEV_RENDER_PATH, ENDPOINT_ID_PREFIX, instance_id)
 }
 
 /// The CAPTURE endpoint owned by `instance_id` — the microphone half of a paired device like
-/// the Steam Streaming Microphone. Pad devices are render-only; the `audio-probe` devtest's
-/// S3 measurement is what needs this direction.
+/// the Steam Streaming Microphone. Pad devices are render-only; the minted-audio provider and
+/// the `audio-probe` devtest need this direction.
 pub(crate) fn find_capture_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
-    endpoint_for_devnode_in(MMDEV_CAPTURE_PATH, instance_id)
+    endpoint_for_devnode_in(MMDEV_CAPTURE_PATH, CAPTURE_ENDPOINT_ID_PREFIX, instance_id)
 }
 
-fn endpoint_for_devnode_in(reg_path: &str, instance_id: &str) -> Result<Option<String>> {
+fn endpoint_for_devnode_in(
+    reg_path: &str,
+    id_prefix: &str,
+    instance_id: &str,
+) -> Result<Option<String>> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let want = format!("{{1}}.{instance_id}");
@@ -862,7 +870,7 @@ fn endpoint_for_devnode_in(reg_path: &str, instance_id: &str) -> Result<Option<S
             continue;
         };
         if link.eq_ignore_ascii_case(&want) {
-            return Ok(Some(format!("{ENDPOINT_ID_PREFIX}{key}")));
+            return Ok(Some(format!("{id_prefix}{key}")));
         }
     }
     Ok(None)
