@@ -154,6 +154,28 @@ struct StreamHUDView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            // The AUDIO plane's own latency (detailed tier). Deliberately OUTSIDE the video branch
+            // above: it is not a term of that equation — audio is steered to MEET the video total,
+            // never summed into it — and the depth is exactly as worth seeing under the stage-1
+            // fallback presenter, which measures no end-to-end at all.
+            //
+            // `buffer` is how much decoded audio is queued ahead of the speaker; `a/v` is where
+            // that puts it relative to the picture (+ = audio behind). Both, not just the depth: a
+            // deep ring on a jittery link is the adaptive floor doing its job, and only the offset
+            // distinguishes that from a ring holding audio late. Neither number was renderable
+            // anywhere before — they lived in a periodic log line — which is how a report of "the
+            // audio delay seems way too high" got triaged to a conclusion with no instrument.
+            if verbosity == .detailed && model.audioValid && model.audioBufferMs > 0 {
+                // String(format:) for the signed offset: `%+d` has no specifier-interpolation
+                // equivalent, and Swift's Int is 64-bit (%lld, never the 32-bit %d).
+                Text(model.audioAvOffsetMs == 0
+                    ? "audio buffer \(model.audioBufferMs) ms"
+                    : String(
+                        format: "audio buffer %lld ms · a/v %+lld ms",
+                        model.audioBufferMs, model.audioAvOffsetMs))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
             if model.lostFrames > 0 {
                 // Unrecoverable network drops this window; hidden while the link is clean.
                 // String(format:) rather than specifier interpolation: the literal % would

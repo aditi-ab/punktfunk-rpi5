@@ -21,6 +21,12 @@ import os
 /// long quiet spell relaxes it back toward the base — so a session on Wi-Fi that bunches arrivals
 /// deepens until it stops crackling, while a clean LAN keeps the tight base latency. Keep the
 /// constants here in step with `JitterTuning.COREAUDIO`.
+///
+/// **A/V sync.** On top of all that the depth can be STEERED, by `setSyncTarget` from the drain
+/// thread's `AvSync` — because a ring that is the right depth for the link is not thereby the
+/// right depth for the picture. Continuity still outranks sync: the request is clamped between
+/// the underrun-driven floor above and the hard cap, so the loop can never buy alignment with a
+/// dropout. `nil` (the default) is exactly the pre-sync behaviour.
 final class AudioRing: @unchecked Sendable {
     /// Mirrors `JitterTuning::COREAUDIO` — see that type for the rationale.
     private static let targetMS = 20
@@ -48,6 +54,13 @@ final class AudioRing: @unchecked Sendable {
     private static let growWindowMS = 5_000
     private static let growStepMS = 10
     private static let shrinkQuietMS = 30_000
+    /// The same quiet span, while the A/V sync loop is actively asking to run shallower. A grown
+    /// target normally relaxes only after a long spell because, absent other evidence, the only
+    /// thing that can justify giving up hard-won slack is time; a sync request IS that evidence —
+    /// a measurement saying the extra depth is costing alignment right now — so a smaller target
+    /// gets tested sooner. Wrong guesses are cheap and self-correcting (one underrun and the
+    /// growth path takes it straight back). Mirrors `SHRINK_QUIET_SYNC_MS`.
+    private static let shrinkQuietSyncMS = 5_000
 
     private var buf: [Float]
     private var readIdx = 0
@@ -70,6 +83,14 @@ final class AudioRing: @unchecked Sendable {
     /// which is a different problem from the depth being wrong.
     private var underrunCount = 0
     private var shedCount = 0
+    /// The depth the A/V sync loop would like, in interleaved samples (`AvSync.desiredDepth`).
+    /// `nil` — the default, and what an un-wired session keeps — reproduces the pre-sync
+    /// behaviour exactly, so this ring could adopt sync without the other three diverging.
+    private var syncTarget: Int?
+    /// The sync loop's smoothed offset in ms, STORED not computed: the ring owns the depth but has
+    /// no timestamps, so the drain thread (which has both a packet's `pts_ns` and the video leg)
+    /// hands the number back for reporting. Mirrors `NativeClient::audio_av_offset_ms`.
+    private var avOffsetMS = 0
     private let channels: Int
     private let perMS: Int
     private let lock = OSAllocatedUnfairLock()
@@ -85,9 +106,64 @@ final class AudioRing: @unchecked Sendable {
 
     /// Effective target depth in interleaved samples: the (adaptively grown) live target, lifted
     /// so it can always serve one device quantum plus a packet (a large-buffer device cannot
-    /// sustain a target below its own quantum).
+    /// sustain a target below its own quantum) — then, if the A/V sync loop has asked for a depth,
+    /// its request CLAMPED into that band. Mirrors `JitterPolicy::effective_target`.
+    ///
+    /// The clamp order is the whole safety argument for steering playback depth off a network
+    /// measurement at all: sync may pull the ring shallower to catch the picture up, or push it
+    /// deeper when audio runs early, but never below what underrun pressure has proven this link
+    /// needs, and never past the hard cap that bounds added latency. A link whose jitter genuinely
+    /// demands more buffer than the picture is away keeps its buffer and the residual is REPORTED
+    /// (`Stats.avOffsetMS`) rather than taken out of the listener's stream.
+    ///
+    /// The ceiling is raised to the floor rather than used as-is: a device whose callback quantum
+    /// alone exceeds `hardCapMS` makes `floor > cap`, and a plain `min(max(s, floor), cap)` would
+    /// then return the CAP — i.e. quietly below the continuity floor, inverting the very ordering
+    /// this exists to guarantee, on exactly the awkward hardware it exists to survive. (Rust's
+    /// `Ord::clamp` announces the same condition by panicking; Swift would just get it wrong.)
     private var target: Int {
-        max(targetLive, renderQuantum + Self.frameMS * perMS)
+        let floor = max(targetLive, renderQuantum + Self.frameMS * perMS)
+        guard let want = syncTarget else { return floor }
+        let cap = max(Self.hardCapMS * perMS, floor)
+        return min(max(want, floor), cap)
+    }
+
+    /// The sync loop is asking to run shallower than the adaptive target has grown to — the
+    /// evidence `noteRead` relaxes a grown target on. Compared against the LIVE target, not the
+    /// effective one: it is the underrun-driven growth that a sync request is evidence against,
+    /// not the device-quantum lift, which no amount of measurement can argue with.
+    private var syncWantsLess: Bool {
+        guard let want = syncTarget else { return false }
+        return want < targetLive
+    }
+
+    /// Hand the ring the depth the A/V sync loop wants (`AvSync.desiredDepth`), in interleaved
+    /// samples, or `nil` to run unsynchronised. Called from the drain thread.
+    ///
+    /// This is a REQUEST, not a command — see `target` for what happens to it. `nil` is the
+    /// default and reproduces the pre-sync behaviour exactly.
+    func setSyncTarget(_ samples: Int?) {
+        lock.lock()
+        defer { lock.unlock() }
+        syncTarget = samples
+    }
+
+    /// Store the sync loop's smoothed A/V offset for reporting (positive = audio behind the
+    /// picture). The ring cannot compute this — it has no timestamps — but it is where the two
+    /// numbers a listener's complaint needs, depth and offset, can be read under one lock.
+    func noteAvOffset(_ ms: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        avOffsetMS = ms
+    }
+
+    /// Buffered depth in interleaved samples — what the sync loop measures against (`bufferedMS`
+    /// is the same quantity rounded for humans). Everything queued here must play before the frame
+    /// the drain thread is about to write, which is exactly what delays it.
+    var bufferedSamples: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeIdx - readIdx
     }
 
     func write(_ samples: UnsafePointer<Float>, count: Int) {
@@ -196,7 +272,12 @@ final class AudioRing: @unchecked Sendable {
         } else {
             emptyReads = 0
             quietRun += count
-            if quietRun >= Self.shrinkQuietMS * perMS {
+            // Without a sync request, time is the only evidence that hard-won slack is no longer
+            // needed, so a grown target waits out the long window. A request for less IS evidence,
+            // and without this branch a ring that ratcheted to the ceiling during a transient would
+            // hold audio a ceiling's worth late for minutes after the cause had gone.
+            let quietNeeded = syncWantsLess ? Self.shrinkQuietSyncMS : Self.shrinkQuietMS
+            if quietRun >= quietNeeded * perMS {
                 quietRun = 0
                 targetLive = max(targetLive - Self.growStepMS * perMS, Self.targetMS * perMS)
             }
@@ -239,6 +320,12 @@ final class AudioRing: @unchecked Sendable {
         let targetMS: Int
         let underruns: Int
         let sheds: Int
+        /// The A/V sync loop's smoothed offset (ms): **positive = audio playing BEHIND the
+        /// picture**, negative = ahead of it. `0` before the loop has evidence, or with sync off.
+        ///
+        /// Reported next to the depth, never instead of it: a deep ring on a jittery link is
+        /// CORRECT behaviour, and only the offset separates that from a ring holding audio late.
+        let avOffsetMS: Int
     }
 
     var stats: Stats {
@@ -248,7 +335,154 @@ final class AudioRing: @unchecked Sendable {
             bufferedMS: (writeIdx - readIdx) / max(perMS, 1),
             targetMS: target / max(perMS, 1),
             underruns: underrunCount,
-            sheds: shedCount)
+            sheds: shedCount,
+            avOffsetMS: avOffsetMS)
+    }
+}
+
+// MARK: - A/V sync
+
+/// The A/V synchronisation controller: turns "when will this audio actually play" and "when did
+/// the picture it belongs with reach the glass" into a ring depth `AudioRing` should aim for.
+/// The Swift mirror of `punktfunk_core::audio::AvSync` — keep the two in step.
+///
+/// **The defect it exists to fix.** The host stamps `pts_ns` on every audio datagram and the
+/// client decoded it into `AudioPCM` — and then never read it. Video's `pts_ns`, by contrast, is
+/// used end to end (`LatencyMeter` computes a true glass-to-glass `displayed + clockOffset − pts`
+/// per presented frame). So audio free-ran at whatever depth its jitter ring happened to settle
+/// at, video was presented on a wholly independent path, and nothing ever compared them: the A/V
+/// offset was an accident of buffer depths. It moved whenever the ring ratcheted under underrun
+/// pressure, and — the way this surfaced in the field — it got WORSE every time video got faster,
+/// because a quicker decoder lowers the video leg while leaving the audio leg exactly where it was.
+///
+/// **Video is the master.** In a game streamer the video leg is the input-feel budget and must
+/// never be inflated to satisfy the audio clock; audio tolerates small, crossfaded, rate-limited
+/// corrections that are inaudible, and `AudioRing.shedOneFrame` already applies them. So audio
+/// moves.
+///
+/// **Continuity outranks sync.** This type only ever PROPOSES a depth. `AudioRing` clamps the
+/// proposal to its own underrun-driven floor (see `AudioRing.target`), so a link whose jitter
+/// genuinely needs more buffer than the picture is away keeps its buffer and the residual is
+/// reported instead of being taken out of the listener's stream.
+///
+/// Not a class and not locked: it is owned outright by the drain thread that observes packets.
+struct AvSync {
+    /// Smoothing time constant for the measured offset, in ms of consumed audio. Long enough that
+    /// network jitter and a single late datagram do not move it; short enough to track real drift.
+    private static let ewmaTauMS = 2_000
+    /// Offsets inside this band are left alone. Correcting a few ms costs a (crossfaded, but real)
+    /// discontinuity and buys nothing a listener can perceive — detectability for A/V misalignment
+    /// sits an order of magnitude above it. The deadband is what keeps the loop from hunting
+    /// forever around zero, which would be audible in a way the misalignment it chased was not.
+    private static let deadbandMS = 10
+    /// Observations folded before the first correction is offered. The offset is derived from a
+    /// clock skew estimate and a video figure that both need a moment to settle after connect;
+    /// acting on the first sample would chase the handshake, not the stream.
+    private static let minObservations = 100
+    /// An offset larger than this is not believed. A wall-clock step, a paused host, or a stale
+    /// video figure can all produce an enormous apparent misalignment, and steering the ring by it
+    /// would empty or overfill it outright. Beyond this the loop reports and waits rather than acts.
+    private static let saneLimitMS = 1_000
+    /// The protocol's frame, in ms — the EWMA is weighted by it so the time constant means the
+    /// same thing however often the caller observes.
+    private static let frameMS = 5
+
+    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    private let perMS: Int
+    /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
+    /// the picture it belongs with.
+    private var offsetAvgNs: Double = 0
+    private var observations = 0
+    /// Set once an observation lands outside `saneLimitMS`, for reporting.
+    private(set) var implausible = false
+
+    /// `channels` is the negotiated interleaved channel count (2/6/8).
+    init(channels: Int) {
+        perMS = 48 * max(channels, 1)
+    }
+
+    /// One measurement handed to `observe`. Every field is in the units its source already
+    /// produces, so no caller has to do clock arithmetic to use it correctly.
+    struct Observation {
+        /// The host capture timestamp carried by the audio frame being queued (host clock).
+        let ptsNs: UInt64
+        /// Local `CLOCK_REALTIME` now — the same basis `LatencyMeter` stamps video in.
+        let nowLocalNs: Int64
+        /// Host clock minus client clock, from the skew handshake (`clockOffsetNs`).
+        ///
+        /// It very nearly CANCELS: the video figure this is differenced against was computed with
+        /// the same offset and the same sign, so as long as both terms use one value the skew
+        /// drops out of the result entirely. That is what makes the connect-time offset good
+        /// enough here even though the absolute legs would prefer a re-synced one.
+        let clockOffsetNs: Int64
+        /// How much audio is already queued AHEAD of this frame, in interleaved samples —
+        /// everything that must play before it does.
+        let bufferedAhead: Int
+        /// The video plane's current end-to-end figure in ns: `displayed + clockOffset − pts`, as
+        /// `LatencyMeter` already computes it per presented frame. `nil` while nothing has reached
+        /// the glass recently — no reference, no correction.
+        let videoE2eNs: Int64?
+    }
+
+    /// Fold one measurement. Returns the smoothed offset in ns once there is enough evidence to
+    /// believe it (positive = audio late), or `nil` while still settling.
+    ///
+    /// Rejecting the implausible rather than clamping it is deliberate: a wall-clock step or a
+    /// stale video figure produces a huge apparent offset, and a clamped-but-wrong value would be
+    /// acted on as though it were a small real one.
+    @discardableResult
+    mutating func observe(_ o: Observation) -> Int64? {
+        // No frame on the glass yet ⇒ no reference to align against, so nothing to say.
+        guard let videoE2eNs = o.videoE2eNs else { return nil }
+        // When this frame's samples will actually reach the speaker, expressed in the host's
+        // capture clock — the same clock, and the same shape, as the video figure it is compared
+        // against.
+        let bufferedNs = Int64(o.bufferedAhead / max(perMS, 1)) * 1_000_000
+        // Overflow-reporting arithmetic, NOT the wrapping `&+`/`&-` the meters use. Every term is
+        // a nanosecond count on the same epoch (~1.8e18), so the DIFFERENCE is tiny while the
+        // operands sit within a factor of five of `Int64.max` — and a garbage `pts_ns` would wrap
+        // a nonsense value round into a small, plausible-looking offset. This loop's entire
+        // defence is that it can tell nonsense from a real misalignment, so an overflow takes the
+        // same exit the sanity limit does rather than being silently believed.
+        let (playAtLocal, o1) = o.nowLocalNs.addingReportingOverflow(bufferedNs)
+        let (playAtHost, o2) = playAtLocal.addingReportingOverflow(o.clockOffsetNs)
+        let (audioE2eNs, o3) = playAtHost.subtractingReportingOverflow(Int64(bitPattern: o.ptsNs))
+        let (offsetNs, o4) = audioE2eNs.subtractingReportingOverflow(videoE2eNs)
+        guard !o1, !o2, !o3, !o4, abs(offsetNs) <= Int64(Self.saneLimitMS) * 1_000_000 else {
+            implausible = true
+            return nil
+        }
+        implausible = false
+
+        let alpha = min(1.0, Double(Self.frameMS) / Double(Self.ewmaTauMS))
+        if observations == 0 {
+            offsetAvgNs = Double(offsetNs)
+        } else {
+            offsetAvgNs += (Double(offsetNs) - offsetAvgNs) * alpha
+        }
+        observations += 1
+        return settled ? Int64(offsetAvgNs) : nil
+    }
+
+    /// Enough evidence folded to act on.
+    var settled: Bool { observations >= Self.minObservations }
+
+    /// The smoothed offset in ms (positive = audio late), for the HUD. Reported as soon as it is
+    /// measured, including while still settling — a number the operator can watch converge is more
+    /// useful than a blank that hides whether the loop is working at all.
+    var offsetMS: Int { Int(offsetAvgNs / 1_000_000) }
+
+    /// The ring depth that would place audio with the picture, given where the ring is now.
+    /// `nil` while unsettled or inside the deadband — the caller then leaves the ring alone.
+    ///
+    /// Audio late (offset > 0) means there is too much queued: aim shallower. Audio early means
+    /// aim deeper.
+    func desiredDepth(currentDepth: Int) -> Int? {
+        guard settled else { return nil }
+        let offsetMs = offsetAvgNs / 1_000_000
+        guard abs(offsetMs) >= Double(Self.deadbandMS) else { return nil }
+        let delta = Int(offsetMs * Double(perMS))
+        return max(0, currentDepth - delta)
     }
 }
 
