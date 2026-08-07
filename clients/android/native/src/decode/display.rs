@@ -5,7 +5,7 @@ use ndk::media::media_codec::MediaCodec;
 use ndk::native_window::NativeWindow;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::latency::now_realtime_ns;
@@ -35,6 +35,16 @@ pub(super) struct DisplayTracker {
     /// loaded per callback so mid-stream re-syncs apply. Holding the handle (not the client)
     /// keeps the leaked render-callback refcount from pinning the whole session alive.
     clock_offset: Arc<AtomicI64>,
+    /// Where the AUDIO plane reads the video leg it has to land with (ns) — `displayed +
+    /// clock_offset − pts`, published on every confirmed present. Written here, read by
+    /// [`crate::audio`]'s sync loop; the two planes never touch each other directly (the presenter
+    /// must not know about audio, and the audio thread cannot see the glass).
+    ///
+    /// Published RAW. The HUD shaves the OS present floor off its shown display / end-to-end
+    /// numbers (`StatsOverlay.osFloorMs` — metrics report what Punktfunk controls), but sound has
+    /// to reach the ear when the light reaches the eye, and a floor-shaved reference would place
+    /// audio a whole latch period early on every device. Presentation policy, not physics.
+    video_e2e: Arc<AtomicU64>,
     /// Always-on latch/display accumulator for the presenter's 1 Hz `pf-present` line —
     /// independent of the HUD gate, so a HUD-off A/B stays measurable from logcat.
     meter: Arc<super::presenter::PresentMeter>,
@@ -48,11 +58,13 @@ impl DisplayTracker {
     pub(super) fn new(
         stats: Arc<crate::stats::VideoStats>,
         clock_offset: Arc<AtomicI64>,
+        video_e2e: Arc<AtomicU64>,
         meter: Arc<super::presenter::PresentMeter>,
     ) -> Arc<DisplayTracker> {
         Arc::new(DisplayTracker {
             stats,
             clock_offset,
+            video_e2e,
             meter,
             rendered: Mutex::new(VecDeque::new()),
         })
@@ -105,7 +117,14 @@ pub(super) fn install_render_callback(
         }
         let sym = libc::dlsym(lib, c"AMediaCodec_setOnFrameRenderedCallback".as_ptr());
         if sym.is_null() {
-            log::info!("decode: no render callback on this API level (<33) — no display stage");
+            // No confirmed present ⇒ no `display` stage AND no reference for the audio plane's A/V
+            // sync, which then stays inert and leaves the ring exactly as it was. The release
+            // instant is NOT substituted: releases target a future vsync, so it runs a whole latch
+            // period (8-21 ms measured) ahead of glass — well outside the loop's deadband, i.e. it
+            // would place audio early on every frame while looking like it was working.
+            log::info!(
+                "decode: no render callback on this API level (<33) — no display stage, no A/V sync"
+            );
             return None;
         }
         std::mem::transmute::<*mut c_void, SetOnFrameRenderedFn>(sym)
@@ -145,8 +164,10 @@ pub(super) unsafe fn release_render_callback(ud: *const DisplayTracker) {
 /// between the frame rendering and the (batchable) callback delivery — to subtract against the
 /// receipt/decode stamps and the host capture pts. Records the HUD's `displayed` point:
 /// `end-to-end` = capture→displayed (skew-corrected) and `display` = decoded→displayed
-/// (single-clock local). Panic-free by construction (poison-proof lock, saturating math) — an
-/// unwind out of an `extern "C"` fn would abort the process.
+/// (single-clock local) — and publishes that end-to-end figure for the audio plane to align
+/// against, which is the only place in the client that knows when a frame truly reached glass.
+/// Panic-free by construction (poison-proof lock, saturating math) — an unwind out of an
+/// `extern "C"` fn would abort the process.
 unsafe extern "C" fn on_frame_rendered(
     _codec: *mut ndk_sys::AMediaCodec,
     userdata: *mut c_void,
@@ -186,13 +207,28 @@ unsafe extern "C" fn on_frame_rendered(
     let latch_us = paired.and_then(|(_, r)| clamp(displayed_ns - r));
     // Always-on half: the presenter's pf-present line reads these with the HUD off.
     t.meter.note_latch(latch_us);
-    if !t.stats.enabled() {
-        return; // HUD hidden — skip the skew math + the stats lock
-    }
+    // The glass-to-glass figure, computed ABOVE the HUD gate: the audio plane steers its ring by it
+    // (see `video_e2e`), and a sync loop that only worked while the overlay was up would be off on
+    // the exact devices that report latency — on a Deck-class report the overlay is precisely what
+    // the field cannot reach. The cost is one relaxed load and some integer arithmetic per confirmed
+    // present (≤ the panel rate); the stats LOCK stays behind the gate, which is what that
+    // early-return was really protecting.
     let e2e_ns =
         displayed_ns + t.clock_offset.load(Ordering::Relaxed) as i128 - pts_us as i128 * 1000;
-    let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
-    t.stats.note_displayed(e2e_us, display_us, latch_us);
+    // Same (0, 10 s) clamp as every other e2e sample — a vendor's first render callbacks can carry
+    // a garbage `system_nano`, and here that would step the audio ring rather than just a p95.
+    let e2e_valid = e2e_ns > 0 && e2e_ns < 10_000_000_000;
+    if e2e_valid {
+        t.video_e2e.store(e2e_ns as u64, Ordering::Relaxed);
+    }
+    if !t.stats.enabled() {
+        return; // HUD hidden — skip the stats lock
+    }
+    t.stats.note_displayed(
+        e2e_valid.then_some((e2e_ns / 1000) as u64),
+        display_us,
+        latch_us,
+    );
 }
 
 /// React to an output-format change by signalling the stream's HDR dataspace on the Surface (SDR

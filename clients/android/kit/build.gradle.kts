@@ -67,30 +67,37 @@ fun androidSdkDir(): String {
     return "${System.getProperty("user.home")}/Library/Android/sdk"
 }
 
+// Every cargo-ndk invocation needs the same discovery environment, and they must not drift apart:
+// a lint that ran against a different toolchain/sysroot than the build is a lint about a different
+// program. Applied by both `registerCargoNdk` (build) and `registerCargoNdkClippy` (lint).
+fun Exec.cargoNdkEnvironment() {
+    val sdk = androidSdkDir()
+    // A GUI Android Studio launch does not source the login shell, so make cargo, the NDK, and
+    // cmake (libopus builds via the cmake crate) discoverable explicitly — same as a bare CLI.
+    val cmakeBin = "$sdk/cmake/3.22.1/bin"
+    environment(
+        "PATH",
+        cargoBin + File.pathSeparator + cmakeBin + File.pathSeparator + System.getenv("PATH"),
+    )
+    environment("ANDROID_HOME", sdk)
+    environment("ANDROID_NDK_HOME", "$sdk/ndk/$ndkVer")
+    // CMake's built-in Android support (used by the cmake crate for libopus) finds the NDK via
+    // these, and uses Ninja (bundled next to the SDK cmake) since there's no `make`.
+    environment("ANDROID_NDK_ROOT", "$sdk/ndk/$ndkVer")
+    environment("ANDROID_NDK", "$sdk/ndk/$ndkVer")
+    environment("CMAKE_GENERATOR", "Ninja")
+    // audiopus_sys picks static-vs-dynamic by HOST not target — force the bundled static libopus
+    // (pure C) so the android .so links it instead of looking for the host's libopus.so.
+    environment("LIBOPUS_STATIC", "1")
+    environment("LIBOPUS_NO_PKG", "1")
+}
+
 fun registerCargoNdk(taskName: String, release: Boolean) =
     tasks.register<Exec>(taskName) {
         group = "rust"
         description = "cargo-ndk build of punktfunk-client-android (${if (release) "release" else "debug"})"
         workingDir = repoRoot
-        val sdk = androidSdkDir()
-        // A GUI Android Studio launch does not source the login shell, so make cargo, the NDK, and
-        // cmake (libopus builds via the cmake crate) discoverable explicitly — same as a bare CLI.
-        val cmakeBin = "$sdk/cmake/3.22.1/bin"
-        environment(
-            "PATH",
-            cargoBin + File.pathSeparator + cmakeBin + File.pathSeparator + System.getenv("PATH"),
-        )
-        environment("ANDROID_HOME", sdk)
-        environment("ANDROID_NDK_HOME", "$sdk/ndk/$ndkVer")
-        // CMake's built-in Android support (used by the cmake crate for libopus) finds the NDK via
-        // these, and uses Ninja (bundled next to the SDK cmake) since there's no `make`.
-        environment("ANDROID_NDK_ROOT", "$sdk/ndk/$ndkVer")
-        environment("ANDROID_NDK", "$sdk/ndk/$ndkVer")
-        environment("CMAKE_GENERATOR", "Ninja")
-        // audiopus_sys picks static-vs-dynamic by HOST not target — force the bundled static libopus
-        // (pure C) so the android .so links it instead of looking for the host's libopus.so.
-        environment("LIBOPUS_STATIC", "1")
-        environment("LIBOPUS_NO_PKG", "1")
+        cargoNdkEnvironment()
         // Resolve cargo by ABSOLUTE path: Gradle's Exec resolves command[0] via the JVM's
         // inherited PATH, NOT the environment("PATH", …) set above (that only reaches the spawned
         // child). A GUI Android Studio launch (and any daemon it started) has no ~/.cargo/bin on
@@ -112,6 +119,41 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         if (release) cmd += "--release"
         commandLine(cmd)
     }
+
+// ------------------------------------------------------------------------------------------------
+// Lint the ANDROID target. `punktfunk-client-android` and every `#[cfg(target_os = "android")]`
+// module elsewhere in the workspace were, until this task existed, **completely unlinted**: ci.yml
+// runs `cargo clippy --workspace` on the HOST, where all of that code is compiled out, and this
+// workflow only ever ran `build`. The gap was found in 2026-08 with five lints sitting in
+// clients/android/native (two of them `unnecessary_cast`, which is exactly the class that decides
+// whether a cast is redundant BY POINTER WIDTH).
+//
+// Both widths are linted, and that is the load-bearing part: arm64-v8a is 64-bit and armeabi-v7a is
+// 32-bit, so a cast that is redundant on one can be required on the other. Linting only the primary
+// ABI would license "fixes" that break the 32-bit build — the shipping ABI for the many 32-bit
+// Google TV / Android TV boxes this client targets. x86_64 is deliberately omitted: it is
+// emulator-only and shares its pointer width with arm64, so it costs a third of the job's lint time
+// for no signal these two do not already carry.
+//
+// `--all-targets` for the same reason ci.yml spells it out: without it the `#[cfg(test)]` modules
+// are never compiled, and un-compiled test code drifts silently.
+fun registerCargoNdkClippy(taskName: String) =
+    tasks.register<Exec>(taskName) {
+        group = "verification"
+        description = "clippy (deny warnings) for punktfunk-client-android on both Android widths"
+        workingDir = repoRoot
+        cargoNdkEnvironment()
+        commandLine(
+            // Absolute cargo path for the same reason as the build task above.
+            "$cargoBin/cargo", "ndk",
+            "-t", "arm64-v8a", "-t", "armeabi-v7a",
+            "--platform", "28",
+            "clippy", "-p", "punktfunk-client-android", "--all-targets",
+            "--", "-D", "warnings",
+        )
+    }
+
+val cargoNdkClippy = registerCargoNdkClippy("cargoNdkClippy")
 
 // Post-link floor check: every undefined symbol in the built .so must exist in the API-28 stubs,
 // else System.loadLibrary fails on devices at the minSdk floor (see the script header for the

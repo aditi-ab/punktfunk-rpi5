@@ -163,6 +163,9 @@ pub struct AudioPlayer {
     recycle_rx: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// A/V sync hand-off with the render thread: it publishes the ring depth, the decode thread
+    /// posts the depth the sync loop wants. See [`punktfunk_core::audio::AudioSyncCell`].
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 }
 
 impl AudioPlayer {
@@ -179,10 +182,13 @@ impl AudioPlayer {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         let stop_t = stop.clone();
+        let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
+        let sync_t = sync.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, channels as u8)
+                if let Err(e) =
+                    render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, channels as u8, sync_t)
                 {
                     tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
@@ -197,6 +203,7 @@ impl AudioPlayer {
                     recycle_rx,
                     stop,
                     thread: Some(thread),
+                    sync,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -211,6 +218,12 @@ impl AudioPlayer {
     /// (startup, or after the WASAPI side dropped chunks).
     pub fn take_buffer(&self) -> Vec<f32> {
         self.recycle_rx.try_recv().unwrap_or_default()
+    }
+
+    /// The A/V sync hand-off cell — the decode thread reads the ring depth from it and posts the
+    /// depth the sync loop wants back through it.
+    pub fn sync_cell(&self) -> Arc<punktfunk_core::audio::AudioSyncCell> {
+        self.sync.clone()
     }
 
     /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
@@ -237,6 +250,7 @@ fn render_thread(
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<()>>,
     channels: u8,
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
         .ok()
@@ -314,6 +328,12 @@ fn render_thread(
                 continue;
             }
             let want = avail_frames * channels as usize;
+
+            // A/V sync: same contract as the PipeWire ring — take the decode thread's request,
+            // publish where the ring actually is. The policy clamps the request against its own
+            // underrun floor, so continuity always outranks alignment.
+            policy.set_sync_target(sync.target());
+            sync.publish_depth(ring.len());
 
             let step = policy.step(ring.len(), want);
             if step.drop_front > 0 {

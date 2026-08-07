@@ -73,6 +73,7 @@ e2e 14.2/19.8 ms (p50/p95) · host 3.1 · net 6.7 · decode 2.1 · display 2.3 m
 host: queue 0.6 · encode 1.8 · xfer 0.2 · pace 0.5 ms
 present: mailbox
 lost 3 (2.4%)
+audio buffer 28 ms · a/v +4 ms
 ```
 
 Android (headline and `display` both floor-shaved, like the Apple clients — the raw
@@ -85,6 +86,7 @@ HEVC · 10-bit · HDR (BT.2020 PQ) · 4:2:0
 end-to-end 14.2 ms p50 · 19.8 p95 · capture→displayed
 = host 3.1 + network 6.7 + decode 2.1 + display 2.3   · presents 119
 os present +16.7 excluded (display pipeline minimum)
+audio buffer 28 ms · a/v +4 ms
 lost 3 (2.4%) · skipped 1 · FEC 12
 ```
 
@@ -185,6 +187,16 @@ lost 3 (2.4%)
   (frames your client chose not to display because a newer one had already arrived) and
   `FEC` (packet shards the error correction recovered this second — loss you *didn't*
   feel) are reported by the **Android client only**; the other clients show `lost` alone.
+- **The audio line** — Detailed only, on Linux · Windows · Steam Deck · Android, and shown
+  once sound is actually playing. `audio buffer` is how much decoded audio is queued ahead
+  of your speakers; `a/v` is where that *puts* it relative to the picture — **positive means
+  audio is playing behind the picture**, negative means ahead of it. The client steers the
+  buffer to drive `a/v` toward zero, but never below the depth your link's jitter needs, so
+  on a rough connection you may see the buffer hold and a small `a/v` remain: that is the
+  client choosing an unbroken stream over perfect lip-sync, and it is the honest reading
+  rather than a hidden compromise. The `a/v` term is omitted when it is zero — aligned, or
+  not yet measured (it needs a frame on screen to compare against, and a few seconds to
+  settle). The Apple clients do not report it yet.
 
 All values refresh once per second over the last second of frames.
 

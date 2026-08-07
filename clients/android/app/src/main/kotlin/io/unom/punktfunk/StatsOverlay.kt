@@ -18,12 +18,13 @@ import kotlin.math.roundToInt
  * The live stats overlay — the unified HUD (`design/stats-unification.md`): headline is
  * `capture→displayed` tiled by `host+network` + `decode` + `display` when the platform delivered
  * OnFrameRendered render callbacks this window (`dispValid`), falling back to the v1
- * `capture→decoded` headline without the `display` term when it didn't. Reads the 33-double
+ * `capture→decoded` headline without the `display` term when it didn't. Reads the 35-double
  * layout from [NativeBridge.nativeVideoStats] (that KDoc is the authoritative index list):
  * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries,
  * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms, lost, skipped,
  * fec, frames, dispValid, displayP50Ms, e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms,
- * presentsWindow, presenterActive, feedP50Ms, codecP50Ms, skippedOverflowWindow]`. Every read
+ * presentsWindow, presenterActive, feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs,
+ * audioAvOffsetMs]`. Every read
  * is length-guarded, so an older native lib simply omits the lines it can't feed.
  *
  * The shown `display` and `end-to-end` numbers EXCLUDE the OS present floor (see [osFloorMs]) at
@@ -44,7 +45,7 @@ import kotlin.math.roundToInt
  *   reliability counters (18–21) when nonzero.
  * - [StatsVerbosity.DETAILED] — also the decoder label, the video-feed descriptor (10–13), the
  *   stage equation (14/15, split into `host + network` when the Phase-2 terms at 16/17 are nonzero),
- *   and the excluded-floor line when one was measured.
+ *   the excluded-floor line when one was measured, and the audio plane's own latency (33/34).
  * [StatsVerbosity.OFF] renders nothing. Older native layouts simply omit the lines they lack (the
  * counter line falls back to the cumulative `lostTotal` at index 9 on a pre-window lib).
  */
@@ -178,8 +179,40 @@ internal fun StatsOverlay(
                 }
             }
         }
+        if (detailed) {
+            audioLine(s)?.let { statLine(it, Color.White) }
+        }
         counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }
     }
+}
+
+/**
+ * The audio plane's own latency from the live gauges at 33/34 — `audio buffer 42 ms · a/v +18 ms`,
+ * the same wording the desktop HUD uses. `buffer` is how much decoded audio is queued ahead of the
+ * speaker; `a/v` is where that PUTS it relative to the picture (positive = audio behind). `null`
+ * before any audio has been queued (buffer 0 — audio off, or the ring not yet primed) and on an
+ * older native layout.
+ *
+ * Both terms, not just the depth: a deep ring on a jittery link is correct behaviour — the
+ * underrun-driven floor earned that buffer — and only the offset distinguishes it from a ring that
+ * is simply holding audio late. The offset term is dropped at zero, which is both "aligned" and
+ * "no measurement yet"; the depth alone is still the triage number, and it is the one that did not
+ * exist at all before (the plane published nothing any surface could render, so a "the audio delay
+ * is way too high" report had no instrument behind it).
+ *
+ * NOT shaved by [osFloorMs], unlike every video figure above. That shave is a reporting policy —
+ * metrics report what Punktfunk controls — but sound has to reach the ear when the light reaches
+ * the eye, so the sync loop aligns against the RAW capture→displayed time (see the native
+ * `DisplayTracker`) and this offset is stated in those same terms. Subtracting the floor here would
+ * report an alignment the listener is not getting.
+ */
+private fun audioLine(s: DoubleArray): String? {
+    if (s.size < 35) return null
+    val bufferMs = s[33].roundToInt()
+    if (bufferMs <= 0) return null
+    val avOffset = s[34].roundToInt()
+    val avTerm = if (avOffset != 0) " · a/v ${if (avOffset > 0) "+" else ""}$avOffset ms" else ""
+    return "audio buffer $bufferMs ms$avTerm"
 }
 
 /** One monospace HUD line — the shared type ramp so every tier's rows line up. */

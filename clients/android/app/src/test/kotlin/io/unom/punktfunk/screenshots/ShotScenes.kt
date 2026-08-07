@@ -355,10 +355,12 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 Brush.linearGradient(listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B))),
             ),
     ) {
-        // The full 26-double unified layout (design/stats-unification.md): [fps, mbps, e2eP50,
-        // e2eP95, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries, colorTransfer,
-        // chromaFormatIdc, hostNetP50, decodeP50, hostP50, netP50, lost, skipped, fec, frames,
-        // dispValid, displayP50, e2eDispP50, e2eDispP95].
+        // The full 35-double unified layout — NativeBridge.nativeVideoStats' KDoc is the
+        // authoritative index list: [fps, mbps, e2eP50, e2eP95, latValid, skew, w, h, hz,
+        // lostTotal, bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50,
+        // decodeP50, hostP50, netP50, lost, skipped, fec, frames, dispValid, displayP50,
+        // e2eDispP50, e2eDispP95, paceP50, latchP50, presents, presenterActive, feedP50, codecP50,
+        // skippedOverflow, audioBufferMs, audioAvOffsetMs].
         // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
         // video-feed line; the display stage is valid (dispValid 1) so the headline is the
         // directly-measured capture→displayed pair, less the excluded OS present floor (the 0.3
@@ -376,6 +378,12 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 1.0, 0.5, 1.8, 2.6,
                 // Timeline-presenter split: pace + latch tile the display term; presents ≈ fps.
                 0.2, 0.3, 236.0, 1.0,
+                // The decode term's own split (feed + codec = 0.4), and no overflow — the one
+                // `skipped` above is benign newest-wins pacing, not a decoder falling behind.
+                0.1, 0.3, 0.0,
+                // The audio plane: a 28 ms ring placed 4 ms behind the picture — a converged sync
+                // loop, i.e. inside the deadband it deliberately leaves alone.
+                28.0, 4.0,
             ),
             verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",

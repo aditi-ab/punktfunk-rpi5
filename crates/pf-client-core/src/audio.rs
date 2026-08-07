@@ -107,6 +107,9 @@ pub struct AudioPlayer {
     recycle_rx: Receiver<Vec<f32>>,
     quit_tx: pipewire::channel::Sender<Terminate>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// A/V sync hand-off with the PipeWire callback: it publishes the ring depth, the decode
+    /// thread posts the depth the sync loop wants. See [`punktfunk_core::audio::AudioSyncCell`].
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 }
 
 impl AudioPlayer {
@@ -121,10 +124,12 @@ impl AudioPlayer {
         // as the data channel; a full pool just drops the Vec (plain deallocation).
         let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
+        let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
+        let sync_cb = sync.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, channels as usize) {
+                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, channels as usize, sync_cb) {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
@@ -134,7 +139,14 @@ impl AudioPlayer {
             recycle_rx,
             quit_tx,
             thread: Some(thread),
+            sync,
         })
+    }
+
+    /// The A/V sync hand-off cell — the decode thread reads the ring depth from it and posts the
+    /// depth the sync loop wants back through it.
+    pub fn sync_cell(&self) -> Arc<punktfunk_core::audio::AudioSyncCell> {
+        self.sync.clone()
     }
 
     /// A recycled chunk Vec from the pool, empty but with its capacity intact — fill it
@@ -180,6 +192,8 @@ struct PlayerData {
     underruns: u64,
     sheds: u64,
     callbacks: u64,
+    /// A/V sync hand-off with the decode thread (depth out, target in).
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 }
 
 fn pw_thread(
@@ -187,6 +201,7 @@ fn pw_thread(
     recycle_tx: SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: usize,
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -240,6 +255,7 @@ fn pw_thread(
         underruns: 0,
         sheds: 0,
         callbacks: 0,
+        sync,
     };
 
     let _listener = stream
@@ -266,6 +282,13 @@ fn pw_thread(
                 let data = &mut datas[0];
                 let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
                 let want = want_frames * ud.channels;
+
+                // A/V sync: take whatever depth the decode thread's sync loop last asked for, and
+                // publish where the ring actually is so it can measure the result. The policy
+                // clamps the request between its own underrun floor and the hard cap — continuity
+                // outranks sync, always (see `JitterPolicy::set_sync_target`).
+                ud.policy.set_sync_target(ud.sync.target());
+                ud.sync.publish_depth(ud.ring.len());
 
                 // Shared de-jitter policy: prime depth in MILLISECONDS, smooth drift correction
                 // (a crossfaded 5 ms shed) so latency returns to target instead of ratcheting,

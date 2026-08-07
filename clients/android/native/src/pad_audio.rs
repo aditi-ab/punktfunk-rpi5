@@ -408,8 +408,8 @@ pub(crate) unsafe fn self_test(fd: i32, seconds: i32, hz: i32) -> i32 {
             frame.fill(0);
             // Channels 2 and 3 are the voice coils; the speaker pair stays silent so a pass is
             // unambiguously FELT rather than merely audible.
-            for c in 2..channels {
-                frame[c] = sample;
+            for slot in frame.iter_mut().take(channels).skip(2) {
+                *slot = sample;
             }
         }
         if let Err(e) = playback.write_interleaved(&chunk) {

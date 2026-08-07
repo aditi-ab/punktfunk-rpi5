@@ -24,6 +24,10 @@ public final class LatencyMeter: @unchecked Sendable {
     private let lock = NSLock()
     private var samplesUs: [Int64] = []
     private var skewCorrected = false
+    /// The most recent sample and the instant it ended, for `latestSample(asOfNs:maxAgeMs:)` —
+    /// a LEVEL, not a window, so `drain` deliberately leaves both alone.
+    private var latestNs: Int64 = 0
+    private var latestAtNs: Int64 = 0
 
     public init() {}
 
@@ -49,8 +53,40 @@ public final class LatencyMeter: @unchecked Sendable {
         guard latNs > 0, latNs < 10_000_000_000 else { return }
         lock.lock()
         samplesUs.append(latNs / 1000)
+        latestNs = latNs
+        latestAtNs = atNs
         if offsetNs != 0 { skewCorrected = true }
         lock.unlock()
+    }
+
+    /// The most recent single sample in ns, or `nil` if none has landed or the last one ended more
+    /// than `maxAgeMs` before `nowNs` (both `CLOCK_REALTIME`). Unlike `drain`, this reports a level
+    /// rather than a window, and reading it consumes nothing.
+    ///
+    /// **What it is for.** Read off the END-TO-END meter, this is the video plane's live
+    /// glass-to-glass figure — `displayed + clockOffset − pts`, exactly the shape `AvSync` compares
+    /// audio against — and it is the reference the A/V sync loop needs. It is published from
+    /// `record`, so BOTH present paths (arrival and deadline) feed it without either knowing that
+    /// audio exists.
+    ///
+    /// **Why staleness is not optional.** The number is a level, so absent an age check it would
+    /// simply keep its last value forever. This client has a state where that matters: the
+    /// backgrounded keep-alive keeps audio playing and DROPS video decode entirely, so the loop
+    /// would go on steering the ring against a reference minutes old and frozen. Expiring it
+    /// returns `nil`, which is the same "no reference yet" case as session start — the loop holds
+    /// its last correction and stops chasing. `nowNs` is caller-supplied rather than read fresh so
+    /// the audio side compares against exactly the instant it timestamped its own frame at.
+    ///
+    /// Only the PAST is bounded. A present stamp can legitimately sit a hair ahead of the reader's
+    /// clock (the deadline presenter stamps at the link's target present time), and discarding the
+    /// only reference we have over a fraction of a refresh would make it flap in and out; a stamp
+    /// wildly in the future instead yields a huge offset, which `AvSync` refuses on its own terms.
+    public func latestSample(asOfNs nowNs: Int64, maxAgeMs: Int) -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard latestNs > 0 else { return nil }
+        guard (nowNs &- latestAtNs) <= Int64(maxAgeMs) * 1_000_000 else { return nil }
+        return latestNs
     }
 
     public struct Stats: Sendable {
