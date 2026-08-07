@@ -561,11 +561,29 @@ mod session_main {
                             "     vulkan video decode: {}",
                             if a.usable { "YES" } else { "no" }
                         );
-                        let codecs: Vec<&str> = [(0x1u32, "H.264"), (0x2, "H.265"), (0x4, "AV1")]
+                        // Name every bit, and ACCOUNT for the ones we cannot name. The
+                        // 5070 Ti reports 0xF — four bits — while punktfunk decodes three
+                        // codecs, so the first version of this line printed three names
+                        // beside a four-bit mask and looked complete. VP9 (bit 3) is a
+                        // real decode operation this client has no rung for; a codec the
+                        // tool cannot name must not silently vanish from a mask it prints,
+                        // or the reader is left to trust that the words cover the number.
+                        const OPS: [(u32, &str); 4] = [
+                            (0x1, "H.264"),
+                            (0x2, "H.265"),
+                            (0x4, "AV1"),
+                            (0x8, "VP9 (no punktfunk rung)"),
+                        ];
+                        let mut codecs: Vec<String> = OPS
                             .iter()
                             .filter(|(bit, _)| a.codec_ops & bit != 0)
-                            .map(|(_, n)| *n)
+                            .map(|(_, n)| (*n).to_string())
                             .collect();
+                        let named: u32 = OPS.iter().map(|(b, _)| b).sum();
+                        let unknown = a.codec_ops & !named;
+                        if unknown != 0 {
+                            codecs.push(format!("unrecognised bits 0x{unknown:X}"));
+                        }
                         println!(
                             "     driver decode ops:   {}",
                             if codecs.is_empty() {
