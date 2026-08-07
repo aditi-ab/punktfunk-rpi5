@@ -844,6 +844,12 @@ struct Slot {
     /// Resolved controller kind (captured at open) — selects the Deck rumble keep-alive and the
     /// DualSense raw-effect feedback path without re-querying SDL metadata under a `&mut` borrow.
     pref: GamepadPref,
+    /// The kind this slot DECLARED to the host in its [`InputKind::GamepadArrival`]
+    /// ([`declared_kind`] of the setting and `pref`) — what the host actually built this pad from,
+    /// which under `Auto` differs per pad. Captured at open beside `pref` for the same reason, and
+    /// kept distinct from it because the two answer different questions: `pref` is the controller
+    /// in the user's hands (local feedback), this is the one the host is pretending to have.
+    declared: GamepadPref,
     /// Wire axis state — zeroed on the wire when this slot closes (detach / unplug).
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
@@ -881,12 +887,19 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(id: u32, index: u8, pref: GamepadPref, pad: sdl3::gamepad::Gamepad) -> Slot {
+    fn new(
+        id: u32,
+        index: u8,
+        pref: GamepadPref,
+        declared: GamepadPref,
+        pad: sdl3::gamepad::Gamepad,
+    ) -> Slot {
         Slot {
             id,
             index,
             pad,
             pref,
+            declared,
             last_axis: [i32::MIN; 6],
             held_buttons: Vec::new(),
             held_touches: std::collections::HashSet::new(),
@@ -1242,7 +1255,7 @@ impl Worker {
         let declared = declared_kind(self.kind_override, pref);
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
-                let mut slot = Slot::new(id, index, pref, pad);
+                let mut slot = Slot::new(id, index, pref, declared, pad);
                 Self::set_slot_sensors(&mut slot, true);
                 slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
                 // Declare this pad's kind BEFORE any of its input, so the host builds a matching
@@ -2012,19 +2025,28 @@ impl Worker {
                         }
                     }
                     SensorType::Gyroscope => {
-                        // The host echoes the backend it actually RESOLVED, which is not
-                        // necessarily the one we asked for: an X-Box class pad has no motion plane,
-                        // so every sample below would be decoded and dropped. Say so once — the
-                        // player's gyro is silently doing nothing and the fix is the controller-type
-                        // setting — and stop paying to send ~250 Hz of them.
-                        if !c.resolved_gamepad.has_motion() {
+                        // An X-Box class pad has no motion plane, so every sample below would be
+                        // decoded and dropped. Say so once — the player's gyro is silently doing
+                        // nothing and the fix is the controller-type setting — and stop paying to
+                        // send ~250 Hz of them.
+                        //
+                        // Asked PER PAD, off this slot's own declaration. The session echo alone is
+                        // the wrong question: under `Auto` the Hello carries the active pad's kind,
+                        // so a couch with an X-Box pad on 0 and a DualSense on 1 echoes X-Box 360
+                        // while the host builds pad 1 a DualSense with a working gyro.
+                        if !punktfunk_core::config::pad_motion_reaches(
+                            slot.declared,
+                            c.requested_gamepad,
+                            c.resolved_gamepad,
+                        ) {
                             if !slot.motion_unreachable_logged {
                                 slot.motion_unreachable_logged = true;
                                 tracing::warn!(
                                     pad = slot.index,
+                                    declared = ?slot.declared,
                                     resolved = ?c.resolved_gamepad,
-                                    "this controller has a gyro but the host session resolved a \
-                                     backend without one — motion will not reach the game; pick a \
+                                    "this controller has a gyro but the host built it a backend \
+                                     without one — motion will not reach the game; pick a \
                                      DualSense-class controller type to get it"
                                 );
                             }
