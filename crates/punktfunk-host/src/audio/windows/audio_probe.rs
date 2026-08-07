@@ -649,12 +649,16 @@ fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -
 /// a 440 Hz tone reading back as ~220 Hz means some link runs at half the declared rate, which
 /// peaks alone can never see) read from an endpoint for `seconds`. `loopback` taps a RENDER
 /// endpoint's mix (the desktop-audio capture shape); otherwise a normal record from a CAPTURE
-/// endpoint (the virtual-mic consumer shape). MONO request — frequency counting needs a single
-/// channel, and autoconvert downmix changes no frequencies.
+/// endpoint (the virtual-mic consumer shape).
+///
+/// STEREO request, crossings counted on channel 0 — measured trap: a MONO ask made
+/// `Initialize` fail with 0x88890008 on the SSM endpoints even under `autoconvert` (this
+/// stack does not bridge channel counts on capture), and that probe artifact masqueraded as
+/// "the endpoint is unopenable" through an entire debugging round.
 fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32, f32)> {
     let device = pe::open_wasapi_device(endpoint_id)?;
     let mut client = device.get_iaudioclient().context("IAudioClient")?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 1, None);
+    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
     let (period, _) = client.get_device_period().context("device period")?;
     client
         .initialize_client(
@@ -697,16 +701,18 @@ fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32,
                 Err(e) => bail!("get_next_packet_size: {e}"),
             }
         }
-        let whole = (bytes.len() / 4) * 4;
+        // Whole stereo frames (8 bytes); peak over both channels, crossings on channel 0.
+        let whole = (bytes.len() / 8) * 8;
         if whole > 0 {
             let raw: Vec<u8> = bytes.drain(..whole).collect();
-            for c in raw.chunks_exact(4) {
-                let s = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                peak = peak.max(s.abs());
-                if s.abs() > 0.01 {
+            for f in raw.chunks_exact(8) {
+                let l = f32::from_le_bytes([f[0], f[1], f[2], f[3]]);
+                let r = f32::from_le_bytes([f[4], f[5], f[6], f[7]]);
+                peak = peak.max(l.abs()).max(r.abs());
+                if l.abs() > 0.01 {
                     first_signal.get_or_insert(frames);
                     last_signal = Some(frames);
-                    let pos = s > 0.0;
+                    let pos = l > 0.0;
                     if prev_positive.is_some_and(|p| p != pos) {
                         crossings += 1;
                     }
