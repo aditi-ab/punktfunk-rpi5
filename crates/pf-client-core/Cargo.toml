@@ -23,7 +23,67 @@ pf-ffvk = { path = "../pf-ffvk" }
 # video_vk_native.rs, running pf-vkdecode's VkH264Decoder/VkH265Decoder/VkAv1Decoder on
 # the presenter's shared device.
 pf-vkdecode = { path = "../pf-vkdecode" }
+# The one bitstream parser (M1): the SOFTWARE rung reads its per-picture colour
+# signalling, IDR flag and recovery-point SEI from the same `AuPlan` every hardware rung
+# already submits from (`video_software.rs`). That is what makes the swscale BT.601
+# default unrepresentable rather than merely fixed — there is no second colour source
+# left to disagree with.
+pf-bitstream = { path = "../pf-bitstream" }
 async-channel = "2"
+
+# M8's software rung, the ladder's last one — no FFmpeg in either half.
+#
+# H.264: openh264 (BSD-2), already a workspace dependency (the HOST's GPU-less encoder,
+# `pf-encode/src/enc/sw.rs`), so the licence posture and the bundled-source build are
+# both already settled and already compiled by every `--workspace` leg.
+#
+# AV1: rav1d (BSD-2) — dav1d itself, ported to Rust by the ISRG/Prossimo memory-safety
+# project. The plan of record names "dav1d"; the `dav1d` crate reaches it through
+# `dav1d-sys`, which is `system-deps`-only (no vendored build): it needs `dav1d.pc` +
+# headers at build time and `libdav1d.so`/`dav1d.dll` at run time on EVERY client
+# package. That is a new system codec dependency added by the milestone family whose
+# §6 excision checklist exists to delete exactly those. rav1d is the same decoder with
+# none of that: pure Rust, no linker, nothing new in any package.
+#
+# ⚠ Both of these are NEW COMPILE COST on the client packaging legs, which is easy to
+# miss because the workspace already built openh264: every client leg is `-p`-scoped and
+# excludes pf-encode (flatpak's `cargo build -p punktfunk-client-linux -p
+# punktfunk-client-session -p punktfunk-cli`, windows.yml/windows-msix.yml's
+# `-p punktfunk-client-windows …`, deb.yml's client job, packaging/nix's
+# `punktfunk-client`), so all of them compile the bundled OpenH264 tree for the FIRST
+# time here. Only the `--workspace` CI legs and the host packages built it before.
+#
+# `default-features = false` drops two things deliberately:
+#  * `asm` — rav1d's hand-written assembly needs `nasm` at build time, and it is NOT the
+#    same trade openh264 makes next to it: openh264-sys2's `try_compile_nasm` returns
+#    quietly when nasm is missing ("Failed to compile NASM files, not using any
+#    assembly") and the C build still succeeds, whereas rav1d's build.rs PANICS ("NASM
+#    build failed. Make sure you have nasm installed or disable the \"asm\" feature").
+#    So turning `asm` on makes nasm a hard build requirement of every client package,
+#    and `ci/rust-ci.Dockerfile` — the container the client .deb and the workspace CI
+#    build in — does not have it (arch, rpm, nix and the FFmpeg-building noble image
+#    all do; the flatpak GNOME SDK and the Windows runner are not provisioned by
+#    anything in this tree). Making the rung that only ever runs BECAUSE the GPU
+#    already failed a build-breaker for the legs that ship it is the wrong way round.
+#    Turn it back on the day every client leg provisions nasm — and expect a large
+#    speedup when you do; this is dav1d's asm, and the Rust fallbacks are much slower.
+#  * `bitdepth_16` — the CPU rung is 8-bit by contract (`video_software.rs` refuses
+#    anything else rather than mis-scaling it), so building the 10/12-bit half would be
+#    compiling a path the code refuses to take.
+#
+# One packaging risk this DOESN'T carry: rav1d exports dav1d's C ABI as `#[no_mangle]`
+# symbols (`dav1d_open`, `dav1d_send_data`, …), which could in principle interpose on a
+# real libdav1d loaded into the same process. It cannot here — these are Rust `staticlib`
+# symbols in an executable with no `-rdynamic` and no dynamic export table entry, so the
+# loader never offers them to anyone. That changes if pf-client-core ever becomes a
+# `cdylib` or a leg adds `-rdynamic`/`--export-dynamic`; re-check it then.
+openh264 = "0.9"
+rav1d = { version = "1", default-features = false, features = ["bitdepth_8"] }
+# errno names for rav1d's negated-`c_int` returns (`video_software.rs`): `ENOPROTOOPT` —
+# the code a `bitdepth_8`-only build answers a 10-bit stream with — is 92 on Linux and
+# 123 on Windows, and rav1d re-exports only `Dav1dResult`, so the typed enum that would
+# otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
+libc = "0.2"
 
 # Video decode (same FFmpeg pin as the host) and Opus for the audio planes.
 ffmpeg-next = "8"

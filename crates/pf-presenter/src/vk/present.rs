@@ -31,36 +31,17 @@ impl Presenter {
         // offers HDR10 — otherwise PQ stays on the SDR swapchain and the CSC shader
         // tonemaps (mode 1).
         //
-        // CPU frames NEVER take the HDR10 surface: software decode uploads swscale RGBA with
-        // no CSC/tonemap pass, so on a mode-0 swapchain that sRGB-encoded content would be
-        // composed as PQ — the field-reported psychedelic cyan/magenta picture (reproduced
-        // 2026-07-21: Fedora-class client, no hw HEVC decode, GNOME/Mesa offering HDR10 even
-        // on an SDR desktop). On the SDR swapchain the same frames are merely untonemapped
-        // (washed out) — wrong in the known, benign way until the CPU lane grows a real
-        // PQ→sRGB pass.
+        // The CPU lane used to be the exception here: it arrived as swscale RGBA with no
+        // CSC/tonemap pass at all, so it was pinned to the SDR swapchain (a mode-0
+        // composite of sRGB content as PQ is the field-reported psychedelic cyan/magenta
+        // picture, reproduced 2026-07-21 on a Fedora-class client with no hw HEVC decode
+        // and GNOME/Mesa offering HDR10 on an SDR desktop) and a PQ stream simply came out
+        // washed out. Since M8 it goes through the SAME planar CSC pass as every hardware
+        // lane, so it gets the same answer as every hardware lane: PQ where the surface
+        // offers HDR10, the shader's mode-1 tonemap where it does not.
         let frame_pq = match &input {
             FrameInput::Redraw => None,
-            FrameInput::Cpu(f) => {
-                // The swapchain answer stays `false` (above) — but a PQ stream on this
-                // lane is then shown RAW: no PQ→sRGB pass exists here (the CSC mode-1
-                // tonemap is hardware-lane only; CPU frames are a straight RGBA upload),
-                // so the picture is washed out and the pq-downgrade warn below never
-                // fires. Say so once, or the only trace is an OSD badge. (A process-once
-                // latch, same idiom as the decoders' first-frame layout dumps — the
-                // condition is a property of the lane, not of one Presenter.)
-                if f.color.is_pq() {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static WARNED: AtomicBool = AtomicBool::new(false);
-                    if !WARNED.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            "HDR10 (PQ) stream on the software-decode lane — it has no \
-                             PQ→sRGB pass, so the picture is shown untonemapped (washed \
-                             out). Hardware decode restores correct colour."
-                        );
-                    }
-                }
-                Some(false)
-            }
+            FrameInput::Cpu(f) => Some(f.color.is_pq()),
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
@@ -100,6 +81,10 @@ impl Presenter {
         let mut native_frame: Option<NativeVkFrame> = None;
         #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         let mut pyro_frame: Option<pf_client_core::video_pyrowave::PyroWavePlanarFrame> = None;
+        // A real frame that is NOT a CPU one — the signal that the software rung's plane
+        // images are dead weight (see below). `Redraw` is deliberately not one: it
+        // re-blits the retained video image and says nothing about which lane is decoding.
+        let mut hw_lane = false;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f),
@@ -110,6 +95,7 @@ impl Presenter {
                     .as_ref()
                     .context("hardware frame without dmabuf support")?;
                 hw_frame = Some(dmabuf::import(&self.device, &hw.ext_mem_fd, d)?);
+                hw_lane = true;
                 None
             }
             #[cfg(windows)]
@@ -119,22 +105,26 @@ impl Presenter {
                     .as_ref()
                     .context("D3D11 frame without win32 import support")?;
                 win_frame = Some(crate::d3d11::import(&self.device, &hw.ext_mem_win32, &d)?);
+                hw_lane = true;
                 None
             }
             FrameInput::VkFrame(v) => {
                 let views = self.vkframe_plane_views(&v)?;
                 vk_frame = Some((v, views));
+                hw_lane = true;
                 None
             }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => {
                 pyro_frame = Some(f);
+                hw_lane = true;
                 None
             }
             // Same device, and the decoder already made the per-plane views — no
             // import, no view creation, nothing that can fail out here.
             FrameInput::NativeVk(f) => {
                 native_frame = Some(f);
+                hw_lane = true;
                 None
             }
         };
@@ -153,10 +143,22 @@ impl Presenter {
         if let Some(old) = self.retired_hw.take() {
             old.destroy(&self.device);
         }
-
-        if let Some(f) = cpu_frame {
-            self.stage_frame(f)?;
+        // A hardware frame after a software one: the plane images are ~12 MB at 4K and
+        // nothing will sample them again. This is not hypothetical — M8's codec fallback
+        // starts a NEW session on this same presenter, and that one can be hardware where
+        // the one that raised it was not. The fence wait above is what makes them
+        // unreferenced, so this is the first safe moment.
+        if hw_lane {
+            if let Some(p) = self.cpu_planes.take() {
+                tracing::debug!("freeing the software rung's plane images (hardware lane)");
+                p.destroy(&self.device);
+            }
         }
+
+        let cpu_offsets = match cpu_frame {
+            Some(f) => Some(self.stage_frame(f)?),
+            None => None,
+        };
         #[cfg(target_os = "linux")]
         if let Some(f) = &hw_frame {
             if self
@@ -235,11 +237,26 @@ impl Presenter {
                 self.rebuild_video_image(f.width, f.height)?;
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
-            let planar = self
-                .csc_planar
+            // The decode leaves them in GENERAL — the software rung's uploaded planes are
+            // the other producer for this pass and arrive in SHADER_READ_ONLY_OPTIMAL.
+            self.csc_planar.bind_planes_planar(
+                &self.device,
+                f.views.map(vk::ImageView::from_raw),
+                vk::ImageLayout::GENERAL,
+            );
+        }
+        if cpu_offsets.is_some() {
+            // Safe while nothing in flight references the set — the fence wait above.
+            let views = self
+                .cpu_planes
                 .as_ref()
-                .context("PyroWave frame but the device failed the pyrowave probe")?;
-            planar.bind_planes_planar(&self.device, f.views.map(vk::ImageView::from_raw));
+                .context("software frame without plane images")?
+                .views;
+            self.csc_planar.bind_planes_planar(
+                &self.device,
+                views,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
         }
         if let Some(o) = overlay {
             // Point the composite at this overlay image (same fence-wait safety).
@@ -476,40 +493,80 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                self.record_csc_planar(v.framebuffer, extent, f.color);
+                // An HDR (PQ) pyrowave session carries P010-style 10-bit studio codes
+                // MSB-packed into 16-bit planes (design/pyrowave-444-hdr.md §2.2) — same
+                // sampling scale as the P010 path; SDR sessions are plain 8-bit BT.709
+                // limited. Depth follows THIS codec's colour contract (negotiation
+                // couples 10-bit ⟺ PQ for it), which is why it is decided here and not
+                // inside the shared record.
+                let (depth, msb_packed) = if f.color.is_pq() {
+                    (10, true)
+                } else {
+                    (8, false)
+                };
+                self.record_csc_planar(v.framebuffer, extent, f.color, depth, msb_packed);
             }
 
-            // New frame: staging → video image (stride carried by buffer_row_length).
-            if let (Some(f), Some(v), Some(s)) = (cpu_frame, &self.video, &self.staging) {
-                barrier(
-                    &self.device,
-                    self.cmd_buf,
-                    v.image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                );
-                let region = vk::BufferImageCopy::default()
-                    .buffer_row_length((f.stride / 4) as u32)
-                    .image_subresource(subresource_layers())
-                    .image_extent(vk::Extent3D {
-                        width: v.width,
-                        height: v.height,
-                        depth: 1,
-                    });
-                self.device.cmd_copy_buffer_to_image(
-                    self.cmd_buf,
-                    s.buffer,
-                    v.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
-                );
-                barrier(
-                    &self.device,
-                    self.cmd_buf,
-                    v.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                );
+            // Software frame (M8): staging → three R8 plane images → the planar CSC pass,
+            // the same pass and the same `csc_rows` coefficients the hardware lanes use.
+            // The planes are tightly packed by construction (`CpuPlanarFrame`), so no
+            // `buffer_row_length` is needed and none is set — a stride here would be a
+            // second place for the layout to be wrong.
+            if let (Some(f), Some(offsets), Some(v), Some(s), Some(p)) = (
+                cpu_frame,
+                cpu_offsets,
+                &self.video,
+                &self.staging,
+                &self.cpu_planes,
+            ) {
+                // First upload into freshly built images comes from UNDEFINED (there is
+                // nothing to preserve); every later one from where the previous frame's
+                // CSC pass left them.
+                let from = if p.initialized {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                };
+                for (i, offset) in offsets.iter().enumerate() {
+                    let (w, h) = f.plane_dims(i);
+                    barrier(
+                        &self.device,
+                        self.cmd_buf,
+                        p.images[i],
+                        from,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    );
+                    let region = vk::BufferImageCopy::default()
+                        .buffer_offset(*offset as u64)
+                        .image_subresource(subresource_layers())
+                        .image_extent(vk::Extent3D {
+                            width: w,
+                            height: h,
+                            depth: 1,
+                        });
+                    self.device.cmd_copy_buffer_to_image(
+                        self.cmd_buf,
+                        s.buffer,
+                        p.images[i],
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                    barrier(
+                        &self.device,
+                        self.cmd_buf,
+                        p.images[i],
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
+                }
+                let extent = vk::Extent2D {
+                    width: v.width,
+                    height: v.height,
+                };
+                // Always 8-bit, no MSB packing — R8 planes, whatever the stream signals.
+                // A PQ AV1 stream on this rung therefore tone-maps through the shader's
+                // mode 1 like every other lane, instead of being read as 10-bit.
+                self.record_csc_planar(v.framebuffer, extent, f.color, 8, false);
             }
 
             // Swapchain image: discard old content, clear to black (the letterbox bars),
@@ -628,6 +685,14 @@ impl Presenter {
                 );
             }
             self.device.end_command_buffer(self.cmd_buf)?;
+            // The plane images now have content and a real layout, so the NEXT upload
+            // must transition from SHADER_READ_ONLY_OPTIMAL rather than discard them from
+            // UNDEFINED. Recorded, not submitted — but the only path from here to another
+            // record goes through this command buffer, and a submit failure below tears
+            // the presenter down rather than re-recording.
+            if let Some(p) = self.cpu_planes.as_mut() {
+                p.initialized = true;
+            }
 
             let render_sem = self.render_sems[index as usize];
             let cmd_bufs = [self.cmd_buf];
@@ -883,18 +948,22 @@ impl Presenter {
         }
     }
 
-    /// [`record_csc`] over the planar (PyroWave) pass — always 8-bit, no MSB packing.
-    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+    /// [`record_csc`] over the planar (3-plane) pass — the PyroWave decode output and,
+    /// since M8, the software rung's uploaded I420.
+    ///
+    /// `depth`/`msb_packed` are the PRODUCER's, never inferred from the colour: pyrowave
+    /// couples 10-bit to PQ by negotiation, the software rung is 8-bit whatever it is
+    /// showing, and reading PQ as "therefore 10-bit MSB-packed" over an 8-bit plane
+    /// samples at a quarter scale — decoded correctly, displayed wrong.
     unsafe fn record_csc_planar(
         &self,
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
         color: pf_client_core::video::ColorDesc,
+        depth: u8,
+        msb_packed: bool,
     ) {
-        // The planar pass exists whenever a PyroWave frame reached us (checked at bind).
-        let Some(planar) = self.csc_planar.as_ref() else {
-            return;
-        };
+        let planar = &self.csc_planar;
         // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
         // and has begun, referencing handles it also owns; nothing is submitted until the
         // recording is ended.
@@ -943,15 +1012,6 @@ impl Presenter {
                 &[planar.desc_set],
                 &[],
             );
-            // An HDR (PQ) pyrowave session carries P010-style 10-bit studio codes MSB-packed
-            // into 16-bit planes (design/pyrowave-444-hdr.md §2.2) — same sampling scale as
-            // the P010 path; SDR sessions are plain 8-bit BT.709 limited. Depth follows the
-            // colour contract (negotiation couples 10-bit ⟺ PQ for this codec).
-            let (depth, msb_packed) = if color.is_pq() {
-                (10, true)
-            } else {
-                (8, false)
-            };
             let rows = csc_rows(color, depth, msb_packed);
             // Mode 1 = PQ→SDR tonemap (PQ stream without an HDR10 surface); mode 0 passes
             // the transfer through — identical to the NV12 arm above.

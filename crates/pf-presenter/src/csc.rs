@@ -40,9 +40,15 @@ impl CscPass {
         )
     }
 
-    /// The planar 3-plane variant (separate Cb/Cr R8 planes — the PyroWave decode
-    /// output, design/pyrowave-codec-plan.md §4.5). Same push-constant contract.
-    #[cfg(feature = "pyrowave")]
+    /// The planar 3-plane variant (separate Cb/Cr R8 planes). Same push-constant
+    /// contract.
+    ///
+    /// Two producers now: the PyroWave decode output
+    /// (design/pyrowave-codec-plan.md §4.5) and — since M8 — the SOFTWARE rung, whose
+    /// I420 planes the presenter uploads and converts here instead of receiving swscale's
+    /// RGBA. That is why this is no longer feature-gated or probe-gated: the CPU rung is
+    /// the ladder's last one, so it must exist on every device, including the ones that
+    /// failed the pyrowave probe.
     pub fn new_planar(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
         Self::build(
             device,
@@ -222,14 +228,19 @@ impl CscPass {
     }
 
     /// Planar variant of [`bind_planes`](Self::bind_planes): three single-component
-    /// plane views in GENERAL layout (the pyrowave decode leaves them there; same
-    /// fence-wait safety contract).
-    #[cfg(feature = "pyrowave")]
-    pub fn bind_planes_planar(&self, device: &ash::Device, planes: [vk::ImageView; 3]) {
+    /// plane views, in the layout their producer left them in — GENERAL for the pyrowave
+    /// decode, `SHADER_READ_ONLY_OPTIMAL` for the software rung's uploaded planes. Same
+    /// fence-wait safety contract.
+    pub fn bind_planes_planar(
+        &self,
+        device: &ash::Device,
+        planes: [vk::ImageView; 3],
+        layout: vk::ImageLayout,
+    ) {
         let infos = planes.map(|view| {
             [vk::DescriptorImageInfo::default()
                 .image_view(view)
-                .image_layout(vk::ImageLayout::GENERAL)]
+                .image_layout(layout)]
         });
         let writes = [0u32, 1, 2].map(|b| {
             vk::WriteDescriptorSet::default()

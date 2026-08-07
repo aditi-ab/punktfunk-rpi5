@@ -16,6 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// `Clone` so an embedder can keep the params a session was started with and re-dial with
+/// one field changed — which is what the codec fallback ([`SessionEvent::CodecFallback`])
+/// needs and the only reason the derive exists. Every field is either plain data or an
+/// `Arc` the retry deliberately SHARES: the same `force_software` flag and the same
+/// presenter-written `latch_grid`, because they belong to the presenter, not the session.
+#[derive(Clone)]
 pub struct SessionParams {
     pub host: String,
     pub port: u16,
@@ -28,6 +34,15 @@ pub struct SessionParams {
     /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
     /// it when it can emit it, else falls back; the resolved codec drives the decoder.
     pub preferred_codec: u8,
+    /// `quic::CODEC_*` bits to REMOVE from this session's advertised decode caps.
+    ///
+    /// `0` for every ordinary connect. It is set by a retry after
+    /// [`SessionEvent::CodecFallback`]: a session whose codec exhausted the decode ladder
+    /// (in practice HEVC, whose CPU rung M8 removed — no permissively licensed software
+    /// HEVC decoder exists) comes back advertising the codec set the host must pick
+    /// from instead. The codec is fixed at Welcome and the control stream renegotiates
+    /// shard payload only, so a fresh Hello is the ONLY lever; this field is it.
+    pub exclude_codecs: u8,
     /// The advertised `quic::VIDEO_CAP_*` bits. Normally 10-bit + HDR (Main10/PQ: the
     /// Vulkan presenter decodes P010 everywhere and presents PQ on an HDR10 swapchain
     /// where the desktop offers one, tonemapping in the CSC shader where it doesn't;
@@ -254,7 +269,53 @@ pub enum SessionEvent {
         trust_rejected: bool,
     },
     Ended(Option<String>),
+    /// The session's negotiated codec ran out of decode rungs and the client can finish
+    /// this stream only as a DIFFERENT codec — terminal, like [`Self::Ended`], but with
+    /// the retry already computed.
+    ///
+    /// The one case in practice is HEVC on a box whose hardware HEVC decode failed: M8
+    /// dropped software HEVC (no permissively licensed decoder exists), so the ladder's
+    /// last rung refuses instead of limping, and the answer is a reconnect advertising
+    /// [`Self::CodecFallback::retry_caps`] — which never contains the codec that just
+    /// failed. The other case is a picture SHAPE the CPU rung cannot decode (10-bit,
+    /// 4:4:4), which is a different diagnosis with the same available action; the two
+    /// pick different retry sets, and [`crate::video::last_rung_verdict`] is where that
+    /// is decided.
+    ///
+    /// An embedder that does not implement the retry MUST still show `msg` and stop —
+    /// treating it as an ordinary end is correct, just worse. It is a separate variant
+    /// rather than a flag on `Ended` so the compiler asks every embedder the question
+    /// once, which is how the two D3D11VA rungs' shared `stats:` tag went wrong when it
+    /// was not asked (`1573a987`).
+    CodecFallback {
+        /// What to pass as [`SessionParams::exclude_codecs`] on the retry — DERIVED from
+        /// [`Self::CodecFallback::retry_caps`], so applying it advertises exactly those
+        /// caps and nothing wider.
+        exclude_codecs: u8,
+        /// The caps the retry will advertise — non-empty by construction, and what
+        /// `exclude_codecs` above resolves to on the wire.
+        retry_caps: u8,
+        /// User-facing one-liner for the toast/status strip.
+        msg: String,
+    },
     Stats(Stats),
+}
+
+/// How many times THIS PROCESS has had a session's codec exhaust the decode ladder — the
+/// telemetry counter the risk register asks for ("telemetry on frequency") for the
+/// software-HEVC drop.
+///
+/// Process-scoped and monotonic because the thing being counted is a property of the
+/// machine, not of one session: a box whose hardware HEVC decode is broken produces one
+/// of these per connect, and it is the RATE across a session history that says whether
+/// dropping software HEVC hurt anybody. Read it with [`codec_fallbacks`].
+static CODEC_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`CODEC_FALLBACKS`]. Surfaced on the session's Detailed stats block as an
+/// additive `codec_fallbacks <N>` line once it is nonzero — appended last, never
+/// removed, never reordered (`run.rs`'s `stats_text`).
+pub fn codec_fallbacks() -> u64 {
+    CODEC_FALLBACKS.load(Ordering::Relaxed)
 }
 
 /// The in-stream microphone mute (B4), shared between the embedder's toggle (a keyboard chord
@@ -409,6 +470,23 @@ fn pump(
     // on their arrivals, so this bit alone changes nothing without a wired DualSense.
     let pad_speaker_on = crate::pad_audio::speaker_active(&params.pad_speaker);
     let pad_audio_on = params.pad_haptics || pad_speaker_on;
+    // What this session advertises it can decode, minus anything a previous attempt
+    // proved it cannot FINISH (see `SessionParams::exclude_codecs`). Held for the whole
+    // pump because the reconnect rule needs to know what was on the table, not just what
+    // the host picked.
+    let advertised_codecs = crate::video::decodable_codecs_for(
+        params.vulkan.as_ref(),
+        // The decoder pin is part of the answer: a session pinned to software has no HEVC
+        // rung at all, so advertising HEVC would promise what this build cannot keep.
+        &params.decoder,
+    ) & !params.exclude_codecs;
+    if params.exclude_codecs != 0 {
+        tracing::info!(
+            excluded = params.exclude_codecs,
+            advertising = advertised_codecs,
+            "retrying with reduced decode caps"
+        );
+    }
     let connector = match NativeClient::connect(
         &params.host,
         params.port,
@@ -418,8 +496,9 @@ fn pump(
         params.bitrate_kbps,
         params.video_caps,
         params.audio_channels,
-        // FFmpeg's codecs plus CODEC_PYROWAVE when the presenter device passed the probe.
-        crate::video::decodable_codecs_for(params.vulkan.as_ref()),
+        // FFmpeg's codecs plus CODEC_PYROWAVE when the presenter device passed the probe,
+        // minus whatever a previous attempt proved undecodable end to end.
+        advertised_codecs,
         preferred, // the user's soft codec preference (0 = auto; see the pyrowave opt-in above)
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
         // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
@@ -562,7 +641,29 @@ fn pump(
     let mut decoder = match built {
         Ok(d) => d,
         Err(e) => {
-            let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));
+            // The ladder had NO rung for this codec at all — on a box with no hardware
+            // HEVC decode (or one that pinned `PUNKTFUNK_DECODER=software` on an HEVC
+            // session). Same answer as the mid-stream case below, one code path.
+            let refusal = e.downcast_ref::<crate::video::NoSoftwareRung>().map(|nr| {
+                codec_fallback_event(
+                    connector.codec,
+                    advertised_codecs,
+                    nr.loss(),
+                    &e.to_string(),
+                )
+            });
+            // Nothing has been spawned yet at this point — the audio / pad / clipboard
+            // threads and the mic uplink are all built BELOW — so "joined its threads" is
+            // vacuously true here. Set the stop flag and drop the connector anyway, in
+            // the same order the pump's end path does, so an embedder that reconnects on
+            // receipt of this event finds the same world whichever refusal site produced
+            // it (`run.rs` starts the retry the instant it reads one).
+            stop.store(true, Ordering::SeqCst);
+            mic.set_live(false);
+            drop(connector);
+            let _ = ev_tx.send_blocking(
+                refusal.unwrap_or_else(|| SessionEvent::Ended(Some(format!("video decoder: {e}")))),
+            );
             return;
         }
     };
@@ -714,6 +815,10 @@ fn pump(
     // `window_dropped`: the decoder's counters are session-cumulative, the OSD shows
     // the delta. `None` on every lane that cannot answer — see `Stats::decode_integrity`.
     let mut window_health = decoder.decode_health();
+    // Set when the ladder ran out of rungs for this codec (M8): the loop breaks and this
+    // event replaces the plain `Ended` at the bottom. `Some` is the only way the pump
+    // ends with a retry attached.
+    let mut codec_fallback: Option<SessionEvent> = None;
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -1046,6 +1151,25 @@ fn pump(
                             tracing::debug!("requested keyframe (decoder produced no output)");
                         }
                     }
+                    // NOT survivable, and the only decode error that isn't: the ladder
+                    // demoted to its last rung and there is no such rung for this codec.
+                    // Feeding more AUs would freeze the screen forever — the exact
+                    // "limping on software" outcome M8's HEVC drop replaces with an
+                    // action. Break out of the pump; the terminal event below carries the
+                    // retry the embedder reconnects with.
+                    Err(e) if e.downcast_ref::<crate::video::NoSoftwareRung>().is_some() => {
+                        let loss = e
+                            .downcast_ref::<crate::video::NoSoftwareRung>()
+                            .expect("just matched")
+                            .loss();
+                        codec_fallback = Some(codec_fallback_event(
+                            connector.codec,
+                            advertised_codecs,
+                            loss,
+                            &e.to_string(),
+                        ));
+                        break None;
+                    }
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error (recovering)");
@@ -1339,7 +1463,56 @@ fn pump(
     if let Some(t) = clipboard_thread {
         let _ = t.join(); // exits within its next_clip wait once `stop` is set
     }
-    let _ = ev_tx.send_blocking(SessionEvent::Ended(end));
+    // The codec-exhaustion end has its own terminal event — sent HERE, after the audio /
+    // pad / clipboard threads have joined, so an embedder that reconnects on receipt
+    // never has two sessions' worth of threads on the same connector.
+    let _ = ev_tx.send_blocking(codec_fallback.unwrap_or(SessionEvent::Ended(end)));
+}
+
+/// Build the terminal event for a session whose codec exhausted the decode ladder, and
+/// bump the telemetry counter.
+///
+/// One place, called from both refusal sites (decoder construction and the mid-stream
+/// demotion), because the two must produce the SAME retry — a construction-time refusal
+/// that reconnected onto a different codec set than the mid-stream one would make field
+/// reports unreadable.
+fn codec_fallback_event(
+    negotiated: u8,
+    advertised: u8,
+    loss: crate::video::RungLoss,
+    detail: &str,
+) -> SessionEvent {
+    use crate::video::{last_rung_verdict, wire_codec_name, LastRungVerdict};
+    CODEC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    let codec = wire_codec_name(negotiated);
+    match last_rung_verdict(negotiated, advertised, loss) {
+        LastRungVerdict::Retry { caps } => {
+            tracing::warn!(
+                codec,
+                retry_caps = caps,
+                detail,
+                "video decode ran out of rungs — reconnecting without this codec"
+            );
+            SessionEvent::CodecFallback {
+                // DERIVED from the verdict, never from the failed codec alone: the retry
+                // then advertises exactly `caps` (`decodable_codecs_for & !exclude`
+                // re-intersects to it), so the wire and the rule cannot disagree. They
+                // did before the M8 review — the rule dropped PyroWave and the wire
+                // re-offered it.
+                exclude_codecs: advertised & !caps,
+                retry_caps: caps,
+                msg: format!("{codec} decoding failed on this device — reconnecting"),
+            }
+        }
+        // Nothing left to advertise: reconnecting would negotiate the same dead end. End
+        // the session and say what actually happened, rather than loop.
+        LastRungVerdict::Dead => {
+            tracing::error!(codec, detail, "video decode ran out of rungs and of codecs");
+            SessionEvent::Ended(Some(format!(
+                "{codec} can't be decoded on this device, and no other codec is available"
+            )))
+        }
+    }
 }
 
 /// The dedicated audio thread: owns the Opus decoder, the PCM scratch, and the PipeWire
@@ -1466,5 +1639,114 @@ mod tests {
         mic.set_live(false);
         assert!(!mic.muted());
         assert_eq!(mic.toggle(), None);
+    }
+
+    /// M8's HEVC reconnect, as the terminal event both refusal sites produce.
+    ///
+    /// This is the "reconnect flow tested as a first-class path" the plan's risk register
+    /// asks for, at the layer where it can be tested without a host: the pump's two
+    /// call sites (decoder construction and the mid-stream demotion) both go through
+    /// `codec_fallback_event`, so pinning its output pins the flow — the retry never
+    /// re-offers the codec that just failed, the message is user-facing, and the
+    /// telemetry counter moves exactly once per occurrence.
+    /// `CODEC_FALLBACKS` is process-global and `codec_fallback_event` bumps it, so the
+    /// test that asserts "counted exactly once" cannot run beside another that calls the
+    /// same builder. Both take this.
+    static FALLBACK_COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_exhausted_codec_produces_a_retry_event_and_moves_the_counter() {
+        use crate::video::RungLoss;
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+        let _guard = FALLBACK_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        let before = codec_fallbacks();
+
+        // The shipping shape: HEVC negotiated, H.264 also advertised.
+        let ev = codec_fallback_event(
+            CODEC_HEVC,
+            CODEC_H264 | CODEC_HEVC,
+            RungLoss::Codec,
+            "no software HEVC",
+        );
+        match ev {
+            SessionEvent::CodecFallback {
+                exclude_codecs,
+                retry_caps,
+                ref msg,
+            } => {
+                assert_eq!(exclude_codecs, CODEC_HEVC, "the retry must drop HEVC");
+                assert_eq!(retry_caps, CODEC_H264);
+                // The toast is for a person: it names the codec and says what happens
+                // next, and does NOT read as an error the user has to act on.
+                assert!(msg.contains("HEVC"), "{msg}");
+                assert!(msg.contains("reconnect"), "{msg}");
+            }
+            _ => panic!("expected a CodecFallback"),
+        }
+        assert_eq!(codec_fallbacks(), before + 1, "counted exactly once");
+
+        // Hardware AV1 advertised too: both survivors stay on the table.
+        match codec_fallback_event(
+            CODEC_HEVC,
+            CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+            RungLoss::Codec,
+            "x",
+        ) {
+            SessionEvent::CodecFallback { retry_caps, .. } => {
+                assert_eq!(retry_caps, CODEC_H264 | CODEC_AV1);
+            }
+            _ => panic!("expected a CodecFallback"),
+        }
+
+        // Nothing left to offer: end honestly instead of a reconnect loop. Still counted
+        // — the failure happened, and its frequency is exactly what the counter is for.
+        let before = codec_fallbacks();
+        match codec_fallback_event(CODEC_HEVC, CODEC_HEVC, RungLoss::Codec, "x") {
+            SessionEvent::Ended(Some(msg)) => {
+                assert!(msg.contains("HEVC"), "{msg}");
+                assert!(msg.contains("no other codec"), "{msg}");
+            }
+            _ => panic!("expected a plain Ended"),
+        }
+        assert_eq!(codec_fallbacks(), before + 1);
+    }
+
+    /// `exclude_codecs` and `retry_caps` describe the SAME retry — the review found them
+    /// disagreeing, and the wire follows `exclude_codecs`, so a mismatch means the tested
+    /// rule is not the shipped one.
+    ///
+    /// The property is exact, not approximate: the retry advertises
+    /// `decodable_codecs_for(vk) & !exclude_codecs`, and this session already advertised
+    /// `decodable_codecs_for(vk) & !old_exclude` — so re-intersecting with the derived
+    /// mask must land on `retry_caps` itself.
+    #[test]
+    fn the_retrys_exclusion_resolves_to_exactly_its_advertised_caps() {
+        use crate::video::RungLoss;
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+        let _guard = FALLBACK_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        for advertised in 0u8..16 {
+            for negotiated in [CODEC_H264, CODEC_HEVC, CODEC_AV1, CODEC_PYROWAVE] {
+                for loss in [RungLoss::Codec, RungLoss::Shape] {
+                    let SessionEvent::CodecFallback {
+                        exclude_codecs,
+                        retry_caps,
+                        ..
+                    } = codec_fallback_event(negotiated, advertised, loss, "x")
+                    else {
+                        continue; // Dead — nothing is advertised at all
+                    };
+                    assert_eq!(
+                        advertised & !exclude_codecs,
+                        retry_caps,
+                        "advertised {advertised:#x} negotiated {negotiated:#x} {loss:?}"
+                    );
+                    assert_eq!(retry_caps & negotiated, 0, "the failed codec came back");
+                }
+            }
+        }
+        // Excluding twice is idempotent — a second fallback in the same run widens the
+        // set rather than resetting it (`run.rs` ORs into the existing value).
+        let full = CODEC_H264 | CODEC_HEVC | CODEC_AV1;
+        assert_eq!((full & !CODEC_HEVC) & !CODEC_HEVC, CODEC_H264 | CODEC_AV1);
     }
 }

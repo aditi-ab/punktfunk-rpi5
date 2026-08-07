@@ -55,7 +55,9 @@ impl ColorDesc {
 /// `65535/65472` recovers exact `code/1023`.
 pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
     // BT.601 (5/6), BT.2020 (9/10); everything else — incl. unspecified — is the host's
-    // BT.709 SDR default (mirrors the software path's swscale coefficient choice).
+    // BT.709 SDR default. Since M8 this is the ONLY coefficient choice in the client:
+    // the software rung's swscale (which defaulted to BT.601 and needed correcting) is
+    // gone, and its planes come through this function like every hardware lane's.
     let (kr, kb) = match desc.matrix {
         5 | 6 => (0.299, 0.114),
         9 | 10 => (0.2627, 0.0593),

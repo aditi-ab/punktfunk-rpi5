@@ -421,14 +421,14 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
         });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
-        // Starts SDR like `csc`; an HDR (PQ) pyrowave session rebuilds it at the 10-bit
+        // Starts SDR like `csc`; an HDR (PQ) session rebuilds it at the 10-bit
         // intermediate via `set_hdr_mode`, exactly like the H.26x pass.
-        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-        let csc_planar = if pyrowave_ok {
-            Some(CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?)
-        } else {
-            None
-        };
+        //
+        // Unconditional since M8. It used to be built only for a device that passed the
+        // pyrowave probe; the SOFTWARE rung now renders through it too, and that rung is
+        // the ladder's last one — gating it on a probe would leave the boxes that failed
+        // the probe with no way to show a software-decoded frame at all.
+        let csc_planar = CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?;
 
         // The exported handle bundle: FFmpeg Vulkan Video handles when the device can
         // decode, AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
@@ -590,8 +590,8 @@ impl Presenter {
             #[cfg(windows)]
             hw_win,
             csc,
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             csc_planar,
+            cpu_planes: None,
             video_export,
             overlay_pipe,
             retired_hw: None,

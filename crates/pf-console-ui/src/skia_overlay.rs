@@ -333,6 +333,15 @@ impl Overlay for SkiaOverlay {
                 shell.session_ended(reason);
                 self.streaming_since = None;
             }
+            // The stream stopped but a new dial is already in flight: toast WHY (the
+            // codec changed under the user) AND raise the connecting takeover, because
+            // nothing else will — the run loop starts the retry's pump directly rather
+            // than through a `Launch`, so the shell would otherwise sit in a state where
+            // a menu press could start a second session over the running one.
+            SessionPhase::Reconnecting(msg) => {
+                shell.session_reconnecting(msg);
+                self.streaming_since = None;
+            }
         }
     }
 

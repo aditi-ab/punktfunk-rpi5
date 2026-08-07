@@ -346,6 +346,10 @@ mod session_main {
             bitrate_kbps: settings.bitrate_kbps,
             audio_channels: settings.audio_channels,
             preferred_codec: settings.preferred_codec(),
+            // Nothing excluded on a fresh dial. Only the run loop's codec-fallback retry
+            // sets this, and it does so on a CLONE of these params — a Settings-level
+            // "never use HEVC" would be `preferred_codec`, not this.
+            exclude_codecs: 0,
             // HDR off = don't advertise 10-bit/HDR at all; the host then never upgrades.
             // MULTI_SLICE is decoder truth for THIS embedder: every desktop decode stack
             // (FFmpeg software, VAAPI, D3D11VA, Vulkan Video) handles AUs carrying several
@@ -357,12 +361,14 @@ mod session_main {
             // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
             // Welcome BEFORE we build a decoder. Advertised whenever the user asks because
             // every path can DISPLAY it: the Vulkan presenter samples the 2-plane 4:4:4 pool
-            // formats (hardware RExt decode where the driver offers it — NVIDIA today) and
-            // swscale converts anything else for the software rung, with the decoder ladder
-            // demoting on its own. No capability probe gates the bit — software decode is the
-            // guaranteed floor — but the cost is VISIBLE, not silent: the Detailed stats
-            // overlay prints the resolved chroma ("4:4:4→4:2:0" when the host declined) and
-            // the decode path frames actually took.
+            // formats (hardware RExt decode where the driver offers it — NVIDIA today),
+            // with the decoder ladder demoting on its own. No capability probe gates the
+            // bit — but note (M8) that the software rung below it is 4:2:0 8-bit ONLY and
+            // refuses anything else rather than mis-scaling it, so on a box whose hardware
+            // 4:4:4 decode fails the floor is a codec fallback, not a converted picture.
+            // The cost stays VISIBLE, not silent: the Detailed stats overlay prints the
+            // resolved chroma ("4:4:4→4:2:0" when the host declined) and the decode path
+            // frames actually took.
             video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
                 | if settings.hdr_enabled {
                     punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR

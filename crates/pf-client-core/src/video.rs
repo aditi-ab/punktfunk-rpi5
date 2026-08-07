@@ -32,8 +32,12 @@
 //!   (nvidia-vaapi-driver is broken for this — Moonlight blacklists it); device
 //!   creation fails there. A mid-session error falls back — the host's IDR/RFI
 //!   recovery resynchronizes.
-//! * **Software**: libavcodec on the CPU + swscale to RGBA (staging upload).
-//!   Slice threading only — frame threading would add a frame of latency per thread.
+//! * **Software**: the CPU rung, FFmpeg-free since M8 — openh264 for H.264, rav1d
+//!   (dav1d) for AV1, planes uploaded straight to the presenter's planar CSC pass. It is
+//!   the LAST rung, so it never demotes further; and it has no HEVC decoder at all (none
+//!   exists under a permissive licence), which is a REFUSAL that reconnects the session
+//!   onto a codec this client can decode — see [`last_rung_verdict`] and
+//!   [`NoSoftwareRung`].
 //!
 //! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no
 //! B-frames, in-band parameter sets on every IDR), so decode is strictly one-in/one-out.
@@ -57,6 +61,9 @@ use ffmpeg_next as ffmpeg;
 use std::os::fd::RawFd;
 
 pub use crate::video_color::{csc_rows, ColorDesc};
+/// Re-exported so the SESSION layer (and its tests) can name the refusal by type — the
+/// module itself stays private, like every other backend's.
+pub use crate::video_software::NoSoftwareRung;
 use crate::video_software::SoftwareDecoder;
 #[cfg(target_os = "linux")]
 use crate::video_vaapi::VaapiDecoder;
@@ -81,7 +88,16 @@ pub struct DecodedFrame {
 pub use crate::video_d3d11::D3d11Frame;
 
 pub enum DecodedImage {
-    Cpu(CpuFrame),
+    /// The SOFTWARE rung's output (M8): tightly-packed 8-bit I420 planes for the
+    /// presenter to upload and run its planar CSC pass over.
+    ///
+    /// It REPLACES the old `Cpu(CpuFrame)` RGBA variant rather than joining it — there is
+    /// exactly one CPU rung, and the swscale conversion it used to carry (and its BT.601
+    /// default) is what this milestone deletes. Adding a second CPU variant would have
+    /// bought the [`DecodedImage::NativeDmabuf`] property below for a distinction that
+    /// does not exist: no `stats:` tag, no presenter path and no consumer would ever have
+    /// been able to reach the old one.
+    Cpu(CpuPlanarFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// The NATIVE VAAPI rung's output (`pf-vaadec` + `video_vaapi_native`, M6) —
@@ -545,14 +561,23 @@ impl DecodedImage {
     /// What the decoder's OWN bitstream parser saw about an intra-refresh heal on
     /// this frame's AU — the recovery point SEI, which no platform decoder exposes.
     ///
-    /// Only the native rung can answer: libavcodec parses the SEI internally and
-    /// surfaces nothing of it (its `AV_FRAME_FLAG_KEY` is IDR-only), MediaCodec and
-    /// VideoToolbox likewise. Everyone else reports
+    /// Only the rungs with their OWN parser can answer: libavcodec parses the SEI
+    /// internally and surfaces nothing of it (its `AV_FRAME_FLAG_KEY` is IDR-only),
+    /// MediaCodec and VideoToolbox likewise. That is the native Vulkan rung and — since
+    /// M8 — the CPU rung's H.264 leg, which plans every AU with the same `H264Planner`
+    /// and folds the SEI with the same `RecoveryWatch`. Everyone else reports
     /// [`LocalRecovery::NONE`](punktfunk_core::reanchor::LocalRecovery::NONE) and
     /// the pump's re-anchor behaviour on those lanes is byte-for-byte what it was.
+    ///
+    /// ⚠ The CPU rung reports no [`Self::decode_order`], so its mark cannot be dated
+    /// against the pump's arm the way the native rung's is. It does not need to be:
+    /// openh264 is one-AU-in, at-most-one-picture-out with no DPB flush that replays
+    /// pictures decoded before a loss, which is the only thing that ordinal defends
+    /// against.
     pub fn local_recovery(&self) -> punktfunk_core::reanchor::LocalRecovery {
         match self {
             DecodedImage::NativeVk(f) => f.recovery,
+            DecodedImage::Cpu(f) => f.recovery,
             _ => punktfunk_core::reanchor::LocalRecovery::NONE,
         }
     }
@@ -586,19 +611,123 @@ impl DecodedImage {
     }
 }
 
-/// RGBA pixels for `GdkMemoryTexture` (which takes a stride).
-pub struct CpuFrame {
+/// One software-decoded picture as 8-bit 4:2:0 PLANES (M8) — Y, Cb and Cr back to back
+/// in one allocation, every plane tightly packed at its own width.
+///
+/// "Tightly packed" is a load-bearing invariant, not a convenience: the presenter uploads
+/// the buffer with a single `copy_nonoverlapping` and three `vkCmdCopyBufferToImage`
+/// regions with `bufferRowLength = 0`, so a padded row here would shear the picture. The
+/// decoders' own strides (openh264 pads for SIMD, dav1d aligns) are undone once, in
+/// [`Self::from_i420`], which is also the only copy this rung makes per frame — where the
+/// old RGBA path made a full swscale conversion pass and then handed over 4 bytes per
+/// pixel instead of 1.5.
+///
+/// Colour is NOT applied here. The planes carry the stream's own Y′CbCr and `color`
+/// carries what the bitstream said about it; the presenter's planar CSC shader converts
+/// with [`csc_rows`], the same coefficients every hardware rung's frames go through. That
+/// is the whole point of the milestone: there is no second CSC implementation on this
+/// lane to get the matrix or the range wrong.
+pub struct CpuPlanarFrame {
     pub width: u32,
     pub height: u32,
-    /// RGBA row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
-    pub stride: usize,
-    pub rgba: Vec<u8>,
-    /// Signaling of the source frame. swscale already undid the YUV matrix + range (the
-    /// pixels are full-range RGB), but a PQ/BT.2020 stream keeps its transfer + primaries
-    /// baked in — the presenter tags the texture so GTK tone-maps it.
+    /// Y, then Cb, then Cr — see [`Self::plane`].
+    data: Vec<u8>,
+    /// Byte offset of each plane's first row in [`Self::data`].
+    offsets: [usize; 3],
+    /// Signalling of the source frame, read from the bitstream (not from the decoder —
+    /// see `video_software`'s module docs). Drives the CSC matrix/range AND, for a PQ
+    /// stream, the presenter's tone-map mode.
     pub color: ColorDesc,
-    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
+    /// Intra keyframe (IDR) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
     pub keyframe: bool,
+    /// What this frame's AU said about intra-refresh RECOVERY — the same
+    /// `pf-vkdecode` [`RecoveryWatch`](pf_vkdecode::RecoveryWatch) fold the native rung
+    /// runs, over the same `AuPlan`. [`Self::keyframe`] cannot answer for an
+    /// intra-refresh session (the wave emits no IDR), so without this the pump freezes
+    /// until its 500 ms backstop forces the very IDR the wave exists to avoid.
+    ///
+    /// H.264 only: AV1 carries no equivalent SEI (see `video_software`'s AV1 leg), so
+    /// that half reports [`LocalRecovery::NONE`](punktfunk_core::reanchor::LocalRecovery)
+    /// and behaves exactly as it did.
+    pub recovery: punktfunk_core::reanchor::LocalRecovery,
+}
+
+impl CpuPlanarFrame {
+    /// Chroma plane size for 4:2:0, rounding UP — an odd luma dimension still has a
+    /// chroma sample covering its last row/column, and rounding down would drop it.
+    pub fn chroma_dims(width: u32, height: u32) -> (u32, u32) {
+        (width.div_ceil(2), height.div_ceil(2))
+    }
+
+    /// Plane `i` (0 = Y, 1 = Cb, 2 = Cr), tightly packed.
+    pub fn plane(&self, i: usize) -> &[u8] {
+        let (w, h) = self.plane_dims(i);
+        let start = self.offsets[i];
+        &self.data[start..start + (w * h) as usize]
+    }
+
+    /// Plane `i`'s size in samples — `(width, height)` for luma, the 4:2:0 halves for
+    /// chroma. The presenter sizes its plane images from this.
+    pub fn plane_dims(&self, i: usize) -> (u32, u32) {
+        if i == 0 {
+            (self.width, self.height)
+        } else {
+            Self::chroma_dims(self.width, self.height)
+        }
+    }
+
+    /// Copy a decoder's strided I420 output into one tightly-packed allocation.
+    ///
+    /// Refuses rather than truncates: a plane the decoder reported shorter than its own
+    /// geometry means the decoder and we disagree about the picture, and reading the rows
+    /// that ARE there would produce a plausible-looking picture over uninitialized
+    /// memory.
+    pub(crate) fn from_i420(
+        width: u32,
+        height: u32,
+        planes: [&[u8]; 3],
+        strides: [usize; 3],
+        color: ColorDesc,
+        keyframe: bool,
+        recovery: punktfunk_core::reanchor::LocalRecovery,
+    ) -> Result<CpuPlanarFrame> {
+        anyhow::ensure!(width > 0 && height > 0, "empty picture {width}x{height}");
+        let (cw, ch) = Self::chroma_dims(width, height);
+        let dims = [(width, height), (cw, ch), (cw, ch)];
+        let total: usize = dims.iter().map(|(w, h)| *w as usize * *h as usize).sum();
+        let mut data = vec![0u8; total];
+        let mut offsets = [0usize; 3];
+        let mut at = 0usize;
+        for i in 0..3 {
+            let (w, h) = (dims[i].0 as usize, dims[i].1 as usize);
+            anyhow::ensure!(
+                strides[i] >= w,
+                "plane {i}: stride {} is narrower than {w} samples",
+                strides[i]
+            );
+            anyhow::ensure!(
+                planes[i].len() >= (h - 1) * strides[i] + w,
+                "plane {i}: decoder reported {} bytes for {w}x{h} at stride {}",
+                planes[i].len(),
+                strides[i]
+            );
+            offsets[i] = at;
+            for row in 0..h {
+                let src = row * strides[i];
+                data[at..at + w].copy_from_slice(&planes[i][src..src + w]);
+                at += w;
+            }
+        }
+        Ok(CpuPlanarFrame {
+            width,
+            height,
+            data,
+            offsets,
+            color,
+            keyframe,
+            recovery,
+        })
+    }
 }
 
 /// A decoded frame still on the GPU: dmabuf fds + plane layout for
@@ -716,6 +845,9 @@ enum Backend {
     /// Boxed: the decoder (pinned create-info hold + plane ring) dwarfs the other variants.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(Box<crate::video_pyrowave::PyroWaveDecoder>),
+    /// The CPU rung (M8: openh264 / rav1d, no libavcodec). Last in every ladder, so it
+    /// never demotes — and the only rung that can fail to EXIST for a codec, which is a
+    /// different answer from failing to decode: see [`last_rung_verdict`].
     Software(SoftwareDecoder),
 }
 
@@ -758,6 +890,12 @@ pub struct Decoder {
     /// The negotiated codec (from the host's Welcome), so a mid-session VAAPI→software demotion
     /// rebuilds the software decoder for the SAME codec.
     codec_id: ffmpeg::codec::Id,
+    /// The same codec as the WIRE states it — what the software rung is built for and
+    /// what a refusal names. Derived once from [`Self::codec_id`] rather than carried
+    /// through a widened `Decoder::new` signature, because the ladder above still speaks
+    /// FFmpeg ids and will until M10 deletes its last FFmpeg rung; this field is the one
+    /// place the two vocabularies meet.
+    wire_codec: u8,
     /// Consecutive hardware decode errors (Vulkan or VAAPI) — a single transient failure
     /// (e.g. a reference-missing frame after packet loss) shouldn't cost the whole
     /// session its hardware decoder.
@@ -962,6 +1100,120 @@ fn native_vulkan_gate(
     chosen && video_decode && decode_video_caps & codec_op != 0
 }
 
+/// The `quic::CODEC_*` bit's human name — for logs, errors and the user-visible
+/// reconnect toast. `?` for a bit this build does not know, which is honest: an unknown
+/// codec must not print as one of the known ones.
+pub fn wire_codec_name(wire: u8) -> &'static str {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => "H.264",
+        punktfunk_core::quic::CODEC_HEVC => "HEVC",
+        punktfunk_core::quic::CODEC_AV1 => "AV1",
+        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
+        _ => "?",
+    }
+}
+
+/// The `quic` codec bit for an FFmpeg decoder id — the inverse of [`ffmpeg_codec_id`],
+/// for the one place that has an id in hand and needs the WIRE truth (the software rung's
+/// refusal, which must name a codec the host understands). Dies with the ladder's last
+/// FFmpeg id at M10.
+fn wire_codec_of(id: ffmpeg::codec::Id) -> u8 {
+    match id {
+        ffmpeg::codec::Id::H264 => punktfunk_core::quic::CODEC_H264,
+        ffmpeg::codec::Id::AV1 => punktfunk_core::quic::CODEC_AV1,
+        _ => punktfunk_core::quic::CODEC_HEVC,
+    }
+}
+
+/// The `quic` codec bits this build can decode ON THE CPU — the ladder's last rung, and
+/// therefore the set a session is guaranteed to survive to the end of.
+///
+/// One function so the answer cannot drift between the rung that refuses (the software
+/// backend's own codec map) and the rule that decides what to reconnect as
+/// ([`last_rung_verdict`]).
+pub fn software_decodable_codecs() -> u8 {
+    punktfunk_core::quic::CODEC_H264 | punktfunk_core::quic::CODEC_AV1
+}
+
+/// What to do when the last rung has no decoder for the session's codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastRungVerdict {
+    /// Reconnect advertising these caps instead — they are non-empty, and they exclude
+    /// the codec that just ran out of rungs, so the host must pick something else.
+    Retry { caps: u8 },
+    /// Nothing is left to advertise: every codec this client offered has now exhausted
+    /// its rungs. Reconnecting would negotiate the same dead end, so the session ends
+    /// and says why.
+    Dead,
+}
+
+/// WHY the last rung had no answer — the two diagnoses behind a [`NoSoftwareRung`], and
+/// the reason [`last_rung_verdict`] needs more than "a codec failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungLoss {
+    /// The CODEC has no CPU rung in this build at all (HEVC). Every hardware rung for it
+    /// has already failed, so the retry may only offer codecs that DO have a CPU rung —
+    /// anything else is the same bet that just lost, one session later.
+    Codec,
+    /// The codec has a CPU rung; this stream's picture SHAPE is outside it (10-bit,
+    /// 4:4:4). The hardware rungs are not implicated at all — nothing failed, the CPU
+    /// decoder simply is not built for this picture — so every other advertised codec is
+    /// a genuine candidate and filtering by [`software_decodable_codecs`] here would end
+    /// sessions a plain HEVC retry would have finished.
+    Shape,
+}
+
+/// The reconnect rule, in one pure function: an HEVC session whose hardware rungs are
+/// exhausted must come back as a session this client can finish.
+///
+/// The codec is fixed at Welcome and the control stream renegotiates shard payload only,
+/// so there is no in-session move available — the only lever is what the NEXT Hello
+/// advertises. `advertised` is what this session offered; the answer removes `negotiated`
+/// from it, plus — for a [`RungLoss::Codec`] — any other codec that would land in the
+/// same hole (one whose only remaining rung is a software one that does not exist). Two
+/// sessions of the same failure is the shape this rules out.
+///
+/// `caps` is what the retry ACTUALLY advertises: the pump derives its `exclude_codecs`
+/// from this set rather than from the failed codec alone, so the wire and this verdict
+/// cannot disagree (they did until the M8 review — the wire re-offered PyroWave the rule
+/// had removed).
+///
+/// Pure and total on purpose — this is the piece that gets tested as a first-class path,
+/// because the on-glass version of it costs a real host with a real GPU failure.
+pub fn last_rung_verdict(negotiated: u8, advertised: u8, loss: RungLoss) -> LastRungVerdict {
+    let survivors = advertised & !negotiated;
+    let caps = match loss {
+        // Everything still on the table that ALSO has a CPU rung underneath it.
+        RungLoss::Codec => survivors & software_decodable_codecs(),
+        RungLoss::Shape => survivors,
+    };
+    // A retry the host's precedence ladder cannot PICK is not a retry: `resolve_codec`
+    // deliberately keeps PyroWave out of that ladder (it is opt-in only), so a Hello
+    // whose survivors are PyroWave alone resolves to nothing and the host refuses the
+    // session. Judge liveness on the pickable ones and carry the rest along.
+    const PICKABLE: u8 = punktfunk_core::quic::CODEC_H264
+        | punktfunk_core::quic::CODEC_HEVC
+        | punktfunk_core::quic::CODEC_AV1;
+    if caps & PICKABLE == 0 {
+        LastRungVerdict::Dead
+    } else {
+        LastRungVerdict::Retry { caps }
+    }
+}
+
+/// Is video decode PINNED to the CPU rung — the Settings "Video decoder" value, or the
+/// `PUNKTFUNK_DECODER` override that wins over it?
+///
+/// Same precedence as [`Decoder::new`] resolves (env first, then the setting), because a
+/// second reading of the same two inputs is a second place for them to drift.
+pub fn decode_pinned_to_software(pref: &str) -> bool {
+    std::env::var("PUNKTFUNK_DECODER")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| pref.to_string())
+        == "software"
+}
+
 /// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
 pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
     match wire {
@@ -1058,6 +1310,16 @@ pub(crate) unsafe fn codec_name(codec: *const ffmpeg::ffi::AVCodec) -> String {
 ///
 /// ⚠ **AV1 here is a decoder EXISTING, not a decoder that can keep up.** Use
 /// [`decodable_codecs_for`], which gates it on hardware — see [`av1_hardware_decodable`].
+///
+/// ⚠ **HEVC here is a HARDWARE decoder existing**, and since M8 that is the only kind
+/// there is: the CPU rung has no HEVC ([`software_decodable_codecs`]). Advertising it
+/// anyway is deliberate and is the plan's — hardware HEVC is the path most hosts and most
+/// clients actually take, and refusing it up front would cost every one of them the codec
+/// to protect the few whose hardware later fails. The exhaustion case is handled where it
+/// happens, by [`last_rung_verdict`], and it is the ONE codec whose advertisement is a
+/// promise this client cannot keep unconditionally. Where the client can KNOW in advance
+/// that it cannot keep it — decode pinned to software — [`decodable_codecs_for`] drops
+/// the bit before the first Hello instead.
 pub fn decodable_codecs() -> u8 {
     let _ = ffmpeg::init();
     let mut bits = 0u8;
@@ -1111,10 +1373,11 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
 }
 
 /// [`decodable_codecs`] plus the PyroWave bit when the presenter's device passed the
-/// compute-feature probe. Advertisement-only: `resolve_codec` never auto-picks PyroWave —
-/// the session must also name it `preferred_codec` (plan §3), which the client does only
-/// under its explicit opt-in.
-pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>) -> u8 {
+/// compute-feature probe, minus the codecs `decoder_pref` makes unreachable.
+/// Advertisement-only: `resolve_codec` never auto-picks PyroWave — the session must also
+/// name it `preferred_codec` (plan §3), which the client does only under its explicit
+/// opt-in.
+pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> u8 {
     let mut bits = decodable_codecs();
     // AV1 is hardware-gated (M7). Without this the bit rides on libdav1d's mere
     // presence and the host is told to send AV1 to a machine that would decode it on
@@ -1125,6 +1388,24 @@ pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>) -> u8 {
              decoder exists, but a 4K AV1 stream is not survivable on it)"
         );
         bits &= !punktfunk_core::quic::CODEC_AV1;
+    }
+    // The one HEVC case the client can answer BEFORE the Hello (M8 review): decode is
+    // pinned to the CPU rung, and the CPU rung has no HEVC — so the advertisement would
+    // be a promise this build cannot keep for the whole session, exactly what
+    // `av1_hardware_decodable` exists to stop for AV1. Every other HEVC failure is a
+    // per-device fact only the session can learn, and `last_rung_verdict` answers it
+    // there. Guarded on something remaining: a Hello advertising ZERO codecs reads as
+    // "HEVC-only" to a host (`resolve_codec`'s pre-negotiation default), which would be
+    // the precise opposite of this.
+    if bits & punktfunk_core::quic::CODEC_HEVC != 0
+        && bits & !punktfunk_core::quic::CODEC_HEVC != 0
+        && decode_pinned_to_software(decoder_pref)
+    {
+        tracing::info!(
+            "HEVC not advertised: decode is pinned to software and there is no software \
+             HEVC decoder in this build"
+        );
+        bits &= !punktfunk_core::quic::CODEC_HEVC;
     }
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     if vk.map(|v| v.pyrowave_decode).unwrap_or(false) {
@@ -1244,6 +1525,7 @@ impl Decoder {
             Ok(Decoder {
                 backend,
                 codec_id,
+                wire_codec: wire_codec_of(codec_id),
                 vaapi_fails: 0,
                 first_fail: None,
                 want_keyframe: false,
@@ -1577,7 +1859,13 @@ impl Decoder {
                  hardware decode not attempted"
             );
         }
-        done(Backend::Software(SoftwareDecoder::new(codec_id)?))
+        // `?` here can carry a `NoSoftwareRung` (an HEVC session that pinned software, or
+        // one whose device offered no hardware rung at all). It stays typed all the way
+        // to the pump, which turns it into the reconnect rather than a dead session —
+        // see [`last_rung_verdict`].
+        done(Backend::Software(SoftwareDecoder::new(wire_codec_of(
+            codec_id,
+        ))?))
     }
 
     /// Wait for a Vulkan-Video frame's GPU decode to complete (timeline semaphore) —
@@ -1658,6 +1946,7 @@ impl Decoder {
                 hdr16,
             )?)),
             codec_id: ffmpeg::codec::Id::HEVC,
+            wire_codec: punktfunk_core::quic::CODEC_PYROWAVE,
             vaapi_fails: 0,
             first_fail: None,
             want_keyframe: false,
@@ -1689,7 +1978,9 @@ impl Decoder {
             return Ok(());
         }
         tracing::warn!("presenter can't display hardware frames — demoting to software decode");
-        self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
+        // Same typed refusal as every other software-rung construction: on an HEVC
+        // session there is nothing below this and the pump reconnects.
+        self.backend = Backend::Software(SoftwareDecoder::new(self.wire_codec)?);
         self.vaapi_fails = 0;
         self.first_fail = None;
         self.delivered = false;
@@ -1935,7 +2226,13 @@ impl Decoder {
                     }
                     tracing::warn!(error = %e, fails = self.vaapi_fails,
                         "{which} decode failing repeatedly — demoting to software");
-                    self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
+                    // The ladder's bottom. On H.264/AV1 this always builds; on HEVC it
+                    // NEVER does, and the `?` carries the typed `NoSoftwareRung` up to
+                    // the pump, which reconnects with HEVC-less caps instead of leaving
+                    // the session on a rung that cannot decode a single AU. That
+                    // substitution — a refusal where a silently useless decoder used to
+                    // sit — is the whole reason the drop of software HEVC is safe.
+                    self.backend = Backend::Software(SoftwareDecoder::new(self.wire_codec)?);
                     self.vaapi_fails = 0;
                     self.first_fail = None;
                     self.delivered = false;
@@ -2158,6 +2455,185 @@ pub(crate) fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+
+    /// The reconnect rule, as the invariant it is: an exhausted codec must come back as
+    /// one this client can decode ALL THE WAY DOWN, and must never come back as itself.
+    ///
+    /// This is the "first-class path" the risk register asks for, tested where it can be
+    /// tested exhaustively — the on-glass half needs a host, a GPU and a decode failure
+    /// nobody can schedule.
+    #[test]
+    fn an_exhausted_codec_reconnects_only_onto_one_with_a_cpu_rung() {
+        let sw = software_decodable_codecs();
+        assert_eq!(sw, CODEC_H264 | CODEC_AV1, "M8's CPU rung set");
+        assert_eq!(sw & CODEC_HEVC, 0, "software HEVC is what M8 dropped");
+
+        // The shipping case: a desktop advertises H.264+HEVC, HEVC runs out of rungs.
+        assert_eq!(
+            last_rung_verdict(CODEC_HEVC, CODEC_H264 | CODEC_HEVC, RungLoss::Codec),
+            LastRungVerdict::Retry { caps: CODEC_H264 }
+        );
+        // With hardware AV1 also advertised, both survivors stay on the table — the host
+        // picks; we only ever REMOVE.
+        assert_eq!(
+            last_rung_verdict(
+                CODEC_HEVC,
+                CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+                RungLoss::Codec
+            ),
+            LastRungVerdict::Retry {
+                caps: CODEC_H264 | CODEC_AV1
+            }
+        );
+        // A client that offered HEVC alone has nowhere to go: reconnecting would
+        // negotiate the same dead end, so say so instead of looping.
+        assert_eq!(
+            last_rung_verdict(CODEC_HEVC, CODEC_HEVC, RungLoss::Codec),
+            LastRungVerdict::Dead
+        );
+        // The retry NEVER re-offers the codec that just failed...
+        for advertised in 0u8..16 {
+            for negotiated in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+                if let LastRungVerdict::Retry { caps } =
+                    last_rung_verdict(negotiated, advertised, RungLoss::Codec)
+                {
+                    assert_eq!(caps & negotiated, 0, "{negotiated:#x} re-offered");
+                    // ...and, when the CODEC is what has no CPU rung, never offers one
+                    // that would reach the same refusal a session later.
+                    assert_eq!(caps & !software_decodable_codecs(), 0);
+                    assert_ne!(caps, 0, "Retry must carry something to advertise");
+                }
+            }
+        }
+        // PyroWave is not in the software set and never reaches this rule (its sessions
+        // renegotiate the codec on failure instead of demoting) — but if it ever did, the
+        // answer must be Dead, not a retry that offers a codec with no CPU decoder.
+        assert_eq!(
+            last_rung_verdict(CODEC_PYROWAVE, CODEC_PYROWAVE, RungLoss::Codec),
+            LastRungVerdict::Dead
+        );
+    }
+
+    /// A picture SHAPE the CPU rung cannot decode is not "this codec has no CPU rung",
+    /// and the review found the rule conflating them: a 4:4:4 H.264 session ended with
+    /// "no other codec is available" while an HEVC retry — whose hardware rungs never
+    /// even ran — would have worked.
+    #[test]
+    fn a_shape_refusal_may_retry_onto_a_codec_with_no_cpu_rung() {
+        // The one that used to die. HEVC has no CPU rung, but nothing about HEVC failed:
+        // this client asked for 4:4:4, the host resolved it, and only the CPU DECODER is
+        // 4:2:0-only. A reconnect without H.264 re-resolves the shape too.
+        assert_eq!(
+            last_rung_verdict(CODEC_H264, CODEC_H264 | CODEC_HEVC, RungLoss::Shape),
+            LastRungVerdict::Retry { caps: CODEC_HEVC }
+        );
+        // Same inputs, the OTHER diagnosis: hardware H.264 exhausted and the CPU rung
+        // has no H.264 at all (impossible in this build, but the rule must not depend on
+        // that) — then HEVC really is the same losing bet and the session ends.
+        assert_eq!(
+            last_rung_verdict(CODEC_H264, CODEC_H264 | CODEC_HEVC, RungLoss::Codec),
+            LastRungVerdict::Dead
+        );
+        // The user's PyroWave opt-in survives a shape refusal — but never ALONE: the
+        // host's `resolve_codec` keeps PyroWave out of its precedence ladder, so a Hello
+        // offering nothing else resolves to no codec and the host refuses the session.
+        assert_eq!(
+            last_rung_verdict(
+                CODEC_H264,
+                CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE,
+                RungLoss::Shape
+            ),
+            LastRungVerdict::Retry {
+                caps: CODEC_HEVC | CODEC_PYROWAVE
+            }
+        );
+        assert_eq!(
+            last_rung_verdict(CODEC_H264, CODEC_H264 | CODEC_PYROWAVE, RungLoss::Shape),
+            LastRungVerdict::Dead
+        );
+        // And a shape refusal still never re-offers the codec that raised it — the codec
+        // is fixed at Welcome, so it is the only lever there is.
+        for advertised in 0u8..16 {
+            for negotiated in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+                if let LastRungVerdict::Retry { caps } =
+                    last_rung_verdict(negotiated, advertised, RungLoss::Shape)
+                {
+                    assert_eq!(caps & negotiated, 0, "{negotiated:#x} re-offered");
+                    assert_ne!(caps, 0, "Retry must carry something to advertise");
+                }
+            }
+        }
+    }
+
+    /// The one HEVC promise the client can refuse to make BEFORE the Hello: decode
+    /// pinned to software has no HEVC rung at any level, so advertising it guarantees
+    /// the reconnect flow rather than risking it.
+    #[test]
+    fn a_software_pin_takes_hevc_off_the_advertisement() {
+        // The pin is read the way `Decoder::new` reads it: env first, then the setting —
+        // so a run with the override actually set has nothing here to assert about.
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        assert!(decode_pinned_to_software("software"));
+        assert!(!decode_pinned_to_software("auto"));
+        assert!(!decode_pinned_to_software("vulkan"));
+        assert!(!decode_pinned_to_software(""));
+    }
+
+    /// The wire↔FFmpeg codec map must round-trip for every codec the software rung can
+    /// be built for. A mistake here builds an openh264 decoder for an AV1 session — which
+    /// then fails per AU rather than at construction, i.e. exactly the mid-stream burn
+    /// this ladder is written to avoid.
+    #[test]
+    fn the_wire_codec_of_an_ffmpeg_id_round_trips() {
+        for wire in [CODEC_H264, CODEC_HEVC, CODEC_AV1] {
+            assert_eq!(wire_codec_of(ffmpeg_codec_id(wire)), wire);
+        }
+        // PyroWave has no FFmpeg id (`ffmpeg_codec_id` folds it onto HEVC), so the
+        // inverse cannot round-trip it — the PyroWave decoder sets `wire_codec` itself.
+        assert_eq!(wire_codec_of(ffmpeg_codec_id(CODEC_PYROWAVE)), CODEC_HEVC);
+    }
+
+    /// `CpuPlanarFrame` is what the presenter uploads with no stride: prove the copy
+    /// really does undo the decoder's padding, and that a short plane is REFUSED rather
+    /// than read past.
+    #[test]
+    fn planar_frames_are_tightly_packed_and_short_planes_are_refused() {
+        let color = ColorDesc {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: false,
+        };
+        // 4x2 luma, 2x1 chroma, all planes padded by 3 bytes per row.
+        let y: Vec<u8> = vec![1, 2, 3, 4, 9, 9, 9, 5, 6, 7, 8, 9, 9, 9];
+        let u: Vec<u8> = vec![10, 11, 9, 9, 9];
+        let v: Vec<u8> = vec![20, 21, 9, 9, 9];
+        let none = punktfunk_core::reanchor::LocalRecovery::NONE;
+        let f =
+            CpuPlanarFrame::from_i420(4, 2, [&y, &u, &v], [7, 5, 5], color, true, none).unwrap();
+        assert_eq!(f.plane(0), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(f.plane(1), &[10, 11]);
+        assert_eq!(f.plane(2), &[20, 21]);
+        assert_eq!(f.plane_dims(0), (4, 2));
+        assert_eq!(f.plane_dims(1), (2, 1));
+        // Odd dimensions round the chroma plane UP — the last column/row still has a
+        // chroma sample and dropping it would read past the plane on the next frame.
+        assert_eq!(CpuPlanarFrame::chroma_dims(5, 3), (3, 2));
+        // A plane shorter than its own geometry is a disagreement with the decoder, not
+        // something to truncate into a plausible picture.
+        let short: Vec<u8> = vec![1, 2, 3];
+        assert!(
+            CpuPlanarFrame::from_i420(4, 2, [&short, &u, &v], [7, 5, 5], color, true, none)
+                .is_err()
+        );
+        // A stride narrower than the picture is the same class of disagreement.
+        assert!(
+            CpuPlanarFrame::from_i420(4, 2, [&y, &u, &v], [2, 5, 5], color, true, none).is_err()
+        );
+    }
 
     fn decode_device(vendor_id: u32, device_name: &str) -> VulkanDecodeDevice {
         VulkanDecodeDevice {

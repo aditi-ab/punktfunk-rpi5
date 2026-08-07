@@ -1,13 +1,20 @@
-//! The Vulkan presenter: swapchain + two frame paths into one device-local RGBA video
+//! The Vulkan presenter: swapchain + several frame paths into one device-local RGBA video
 //! image, then a letterboxed `vkCmdBlitImage` composite.
 //!
-//! * **Software** (`FrameInput::Cpu`): staging upload + `copy_buffer_to_image` (row
-//!   stride via `buffer_row_length`) — transfer-only, runs on every GPU.
+//! * **Software** (`FrameInput::Cpu`): since M8 the CPU rung hands over tightly-packed
+//!   8-bit I420 PLANES, not RGBA. They are staged into three R8 images
+//!   (`CpuPlanes`, no `buffer_row_length` — the planes carry no stride) and converted by
+//!   the PLANAR CSC render pass, the same pass and the same `csc_rows` coefficients the
+//!   hardware lanes use. That is what deleted this lane's second colour implementation
+//!   (swscale's BT.601 default) and its missing tone-map along with it.
 //! * **Hardware** (`FrameInput::Dmabuf`): the decoder's NV12 dmabuf imported per-plane
-//!   (`dmabuf.rs`) and converted by the CSC render pass (`csc.rs`) — zero-copy, gated on
-//!   the four import extensions at device creation; boxes without them (NVIDIA
+//!   (`dmabuf.rs`) and converted by the two-plane CSC render pass (`csc.rs`) — zero-copy,
+//!   gated on the four import extensions at device creation; boxes without them (NVIDIA
 //!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
 //!   decoder on software.
+//! * Plus the lanes that arrive already on this device: `VkFrame`/`NativeVk` (Vulkan
+//!   Video), `D3d11` (Windows shared textures) and `PyroWave` (three compute-decoded
+//!   planes, through the same planar pass as the software lane).
 //!
 //! Pacing: one frame in flight (the submit fence is waited before each record), MAILBOX
 //! when available, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate`
@@ -23,7 +30,7 @@ use crate::overlay::SharedDevice;
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
-use pf_client_core::video::{CpuFrame, NativeVkFrame, VkVideoFrame};
+use pf_client_core::video::{CpuPlanarFrame, NativeVkFrame, VkVideoFrame};
 
 mod gpu;
 mod overlay_pipe;
@@ -39,7 +46,11 @@ pub use setup::{list_adapters, PresentPref};
 pub enum FrameInput<'a> {
     /// No new frame — re-composite the retained video image (expose/resize).
     Redraw,
-    Cpu(&'a CpuFrame),
+    /// Software-decoded I420 planes (M8): uploaded into three R8 images and converted by
+    /// the planar CSC pass, exactly like the hardware lanes' planes — so PQ tone-mapping,
+    /// range and matrix all come from the ONE shader, and the CPU lane stops being the
+    /// odd one out that arrived pre-converted (and pre-converted wrong).
+    Cpu(&'a CpuPlanarFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
@@ -107,8 +118,32 @@ struct OverlayPipe {
     framebuffers: Vec<vk::Framebuffer>,
 }
 
-/// The one video image (device-local RGBA the size of the decoded stream) + its staging.
-/// `view`/`framebuffer` exist only on hw-capable devices (the CSC pass renders into it).
+/// The software rung's plane images: three R8 pictures the CPU frame's tightly-packed
+/// I420 is uploaded into, then sampled by the planar CSC pass. Sized to the LUMA picture
+/// and its 4:2:0 chroma halves; rebuilt whenever the stream size changes.
+///
+/// Owned by the presenter rather than parked in `Retired` like the imported hardware
+/// frames: nothing outside this device ever refers to them, and the single in-flight
+/// fence is waited before each record, so re-uploading into the same images is safe
+/// without a ring.
+struct CpuPlanes {
+    images: [vk::Image; 3],
+    memory: [vk::DeviceMemory; 3],
+    views: [vk::ImageView; 3],
+    /// Luma size; chroma is derived (`div_ceil(2)`), the same rule the frame uses.
+    width: u32,
+    height: u32,
+    /// True once the images have been transitioned out of UNDEFINED at least once — the
+    /// first upload must come from UNDEFINED (nothing to preserve), every later one from
+    /// SHADER_READ_ONLY_OPTIMAL (where the previous frame's CSC pass left them).
+    initialized: bool,
+}
+
+/// The one video image: device-local RGBA the size of the decoded stream, the single
+/// target every lane converges on before the letterboxed blit. `view` + `framebuffer` are
+/// unconditional since M8 — the CSC pass renders into it on EVERY device, because the
+/// software lane goes through the planar pass too and there is no lane left that writes
+/// this image with a plain transfer.
 struct VideoImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -118,6 +153,8 @@ struct VideoImage {
     height: u32,
 }
 
+/// The host-visible upload buffer the software rung's three planes are copied into before
+/// the record step's `vkCmdCopyBufferToImage`s. Grows, never shrinks.
 struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -146,10 +183,15 @@ pub struct Presenter {
     #[cfg(windows)]
     hw_win: Option<HwCtxWin>,
     csc: CscPass,
-    /// The planar (3-plane) CSC variant for PyroWave frames; built only when the device
-    /// passed the pyrowave probe.
-    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    csc_planar: Option<CscPass>,
+    /// The planar (3-plane) CSC variant. Unconditional since M8: the SOFTWARE rung
+    /// renders through it, and the software rung is the ladder's last one — a device that
+    /// failed the pyrowave probe (or a build without the feature) still has to be able to
+    /// show a picture.
+    csc_planar: CscPass,
+    /// The software rung's three uploaded plane images (Y/Cb/Cr, R8), rebuilt on a
+    /// stream-size change. `None` until the first CPU frame — a hardware session never
+    /// allocates them.
+    cpu_planes: Option<CpuPlanes>,
     /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     /// The console-UI composite quad (§6.1's presenter half).
@@ -385,8 +427,8 @@ impl Drop for Presenter {
             #[cfg(target_os = "linux")]
             self.hw.take();
             self.csc.destroy(&self.device);
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            if let Some(p) = &self.csc_planar {
+            self.csc_planar.destroy(&self.device);
+            if let Some(p) = self.cpu_planes.take() {
                 p.destroy(&self.device);
             }
             self.overlay_pipe.destroy(&self.device);

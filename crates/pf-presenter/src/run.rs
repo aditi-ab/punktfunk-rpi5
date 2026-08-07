@@ -221,10 +221,14 @@ struct StreamState {
     /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
     clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
     hdr: bool,
-    /// The presented lane was the CPU/software one, where a PQ stream is shown RAW — the
-    /// software path has no tone-map pass at all (the presenter uploads swscale RGBA
-    /// as-is; the CSC mode-1 tonemap is hardware-lane only) — so the OSD badge reads
-    /// `HDR→SDR (raw)` there instead of claiming a tone-map that never ran.
+    /// The presented lane shows a PQ stream RAW — no tone-map pass ran — so the OSD badge
+    /// reads `HDR→SDR (raw)` instead of claiming one that never did.
+    ///
+    /// Nothing sets it since M8. It used to mark the software lane, which arrived as
+    /// swscale RGBA and skipped the CSC pass entirely; that lane now uploads planes into
+    /// the same planar CSC pass as the hardware lanes and tone-maps in mode 1 like them.
+    /// Kept — not deleted — because the badge's distinction is real and the next lane that
+    /// bypasses the pass must be able to say so rather than quietly claim a tone-map.
     hdr_untonemapped: bool,
     // Presenter-side 1 s window (design/stats-unification.md): end-to-end
     // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
@@ -279,6 +283,10 @@ struct StreamState {
     /// warn on the first failure of a streak, then stay quiet until a present succeeds.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pyro_present_warned: bool,
+    /// The same latch for the SOFTWARE lane, which since M8 has real failure modes (three
+    /// plane images + their allocations and views, rebuilt on every size change, plus a
+    /// render pass) and — being the ladder's LAST rung — nothing left to demote to.
+    cpu_present_warned: bool,
     hw_fails: u32,
     /// The OSD's text (multi-line; rebuilt each Stats window and on a live tier cycle).
     osd_text: String,
@@ -322,6 +330,15 @@ struct StreamState {
     /// `None` = nothing sent yet. Edge-detected each iteration from the live mouse model, so
     /// the chord, the M3 auto-flip, and engage/release all reconcile through one path.
     sent_client_draws: Option<bool>,
+    /// The params this session was started with, kept so a codec fallback can re-dial
+    /// with `exclude_codecs` widened — see [`SessionEvent::CodecFallback`]. Cloned once
+    /// per session start, so anything the SESSION changed after launch (an accepted mode
+    /// switch) is not in here and the retry re-reads it from the connector.
+    ///
+    /// The latch grid rides along by `Arc` on purpose — it is the presenter's, not the
+    /// session's. `force_software` does NOT: it is a per-session demote latch, and the
+    /// retry replaces it (a fallback would otherwise open on software).
+    params: SessionParams,
 }
 
 impl StreamState {
@@ -343,6 +360,8 @@ impl StreamState {
         // pump reads (see `LatchGrid`), so keep the Arc before the params move. `None`
         // when the session didn't advertise the cap — the 1 Hz fold then skips the work.
         let latch_grid = params.phase_lock.then(|| params.latch_grid.clone());
+        // Kept for a codec-fallback re-dial (`SessionEvent::CodecFallback`).
+        let retry_params = params.clone();
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
@@ -392,6 +411,7 @@ impl StreamState {
             dmabuf_demoted: false,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             pyro_present_warned: false,
+            cpu_present_warned: false,
             hw_fails: 0,
             osd_text: String::new(),
             last_stats: None,
@@ -401,6 +421,7 @@ impl StreamState {
             shown_mode: None,
             resize_overlay: ResizeIndicator::default(),
             last_video: None,
+            params: retry_params,
         }
     }
 
@@ -1187,6 +1208,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                         opts.render_scale_max_dim,
                                     );
                                 }
+                                // A live pump here would be DETACHED by the assignment
+                                // below — `StreamState` has no `Drop`, so its thread
+                                // would keep decoding onto the shared Vulkan device that
+                                // gets destroyed at exit. The console normally gates the
+                                // launch behind `in_stream`/`connecting`, but M8's
+                                // Reconnecting phase is the first state that is neither
+                                // while the stream is still alive. Every other
+                                // replacement site takes-and-shuts-down; so does this
+                                // one.
+                                if let Some(prev) = stream.take() {
+                                    tracing::warn!(
+                                        "launch while a session was still attached — \
+                                         stopping it first"
+                                    );
+                                    prev.shutdown();
+                                }
                                 stream = Some(StreamState::new(
                                     *params,
                                     force_software,
@@ -1343,6 +1380,103 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             break;
                         }
                     }
+                }
+                // M8's HEVC path, as a first-class flow rather than a dead session: the
+                // negotiated codec ran out of decode rungs, so re-dial the SAME host with
+                // that codec removed from the advertised caps and let the host pick
+                // again. The pump computed the retry (never re-offering the failed codec,
+                // and — when the CODEC is what has no CPU rung — never offering one
+                // without a CPU rung either) and left nothing of its own running before
+                // sending this: the mid-stream site joins the audio/pad/clipboard threads
+                // and drops the connector, the construction-time site never spawned them.
+                // So starting the new session here is a clean start, not an overlap.
+                //
+                // Applies in BOTH modes. In single (`--connect`) mode there is no console
+                // to fall back to, which is exactly where limping-on-software used to be
+                // the only option; browse mode gets the same retry plus a toast.
+                SessionEvent::CodecFallback {
+                    exclude_codecs,
+                    retry_caps,
+                    msg,
+                } => {
+                    tracing::warn!(
+                        %msg,
+                        exclude_codecs,
+                        retry_caps,
+                        "decode ladder exhausted — reconnecting with reduced codec caps"
+                    );
+                    gamepad.detach();
+                    if let Some(cap) = &mut st.capture {
+                        cap.release(true);
+                    }
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                    // Widen the exclusion rather than replace it: a second fallback in the
+                    // same run must not re-offer what the first one already ruled out.
+                    let mut params = st.params.clone();
+                    params.exclude_codecs |= exclude_codecs;
+                    // The mode this session ENDED on, not the one it dialled with: a
+                    // mid-session `Reconfigure` the host accepted lives only in the
+                    // connector, and `st.params` is a clone taken at launch — re-sending
+                    // it would silently undo the switch on the retry.
+                    if let Some(c) = &st.connector {
+                        params.mode = c.mode();
+                    }
+                    // ...and then the window follower on top, exactly as
+                    // `ActionOutcome::Start` does, so a retry lands on the size the
+                    // window is NOW rather than the size it was at launch.
+                    if opts.match_window.is_some() {
+                        apply_match_window(
+                            &mut params,
+                            &window,
+                            opts.render_scale,
+                            opts.render_scale_max_dim,
+                        );
+                    }
+                    // A FRESH demote flag, like `ActionOutcome::Start` builds — never the
+                    // old session's. `force_software` is a latch the presenter sets when
+                    // the hardware PRESENT path fails three times; inheriting it made an
+                    // HEVC→H.264 retry open a SOFTWARE H.264 decoder on a box with
+                    // perfectly good hardware H.264. It is shared with `params` because
+                    // both ends of it belong to this presenter.
+                    let force_software = Arc::new(AtomicBool::new(false));
+                    params.force_software = force_software.clone();
+                    // ⚠ `params.launch` rides along VERBATIM, and that is a deliberate
+                    // choice between two wrong answers, not an assumption of idempotence.
+                    // The host has no "already running → attach" branch on the launch
+                    // path (`punktfunk-host`'s `native/stream.rs` launches
+                    // unconditionally; its "launched ONCE" guarantee is scoped to
+                    // mid-stream rebuilds WITHIN a session), and the game survives the
+                    // session end under the default `GameOnSessionEnd::Keep`. So the
+                    // re-send is idempotent only where the LAUNCHER dedupes it —
+                    // `steam://rungameid` focuses the running copy, an Epic/AUMID URI
+                    // likewise — while a `gog:`/`custom:` target really does start a
+                    // second copy. Dropping the field instead is worse where it matters
+                    // most: on Linux the per-session gamescope is re-adopted through
+                    // `pf-vdisplay`'s display registry, whose reuse key INCLUDES the
+                    // launch command, so a retry without it would miss the lingering
+                    // display and orphan the running game inside it. Keeping it is the
+                    // only option that preserves that attach; the real fix is host-side
+                    // (an idempotency key on `Hello::launch`, or a running-title check
+                    // before the spawn) and is not M8's to make.
+                    //
+                    // Known and unfixed here for the same reason: the RETRY's game lease
+                    // cannot adopt a game that predates its own launch stamp (`procscan`
+                    // rejects anything started more than 2 s before it), so a reconnected
+                    // session has no game-exit detection for the rest of its life.
+                    if let Some(st) = stream.take() {
+                        st.shutdown();
+                    }
+                    if let Some(o) = overlay.as_mut() {
+                        o.session_phase(SessionPhase::Reconnecting(&msg));
+                    }
+                    stream = Some(StreamState::new(
+                        params,
+                        force_software,
+                        events.event_sender(),
+                        present_priority,
+                        native.refresh_hz,
+                    ));
+                    break;
                 }
             }
         }
@@ -1630,10 +1764,42 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     DecodedImage::Cpu(c) => {
                         st.hdr = c.color.is_pq();
-                        // The software lane shows PQ raw (no tone-map pass exists there)
-                        // — the OSD badge must not claim `HDR→SDR` for it.
-                        st.hdr_untonemapped = true;
-                        presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
+                        // Since M8 the software lane uploads planes into the SAME planar
+                        // CSC pass as the hardware lanes, so a PQ stream is tone-mapped
+                        // there exactly like theirs — the badge no longer has to warn
+                        // that this lane shows PQ raw, because it does not.
+                        st.hdr_untonemapped = false;
+                        // Same treatment as the pyrowave arm below, and for the same
+                        // reason: since M8 this arm allocates three plane images (plus
+                        // memory and views) on every size change and runs a render pass,
+                        // so it has failure modes a staging upload never had — and it is
+                        // the LAST rung, so a present failure has nothing left to demote
+                        // to. Drop the frame and keep the session; only a lost device
+                        // ends it.
+                        match presenter.present(
+                            &window,
+                            FrameInput::Cpu(&c),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.cpu_present_warned = false;
+                                p
+                            }
+                            Err(e) => {
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
+                                if !st.cpu_present_warned {
+                                    st.cpu_present_warned = true;
+                                    tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "software present failed — suppressing repeats until it recovers"
+                                    );
+                                }
+                                false
+                            }
+                        }
                     }
                     // Both VAAPI rungs — libavcodec's and M6's native one — hand over
                     // the same thing: dmabuf fds plus a plane layout, with the guard
@@ -2425,10 +2591,12 @@ const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift
 ///
 /// The HDR tag is honest about the display path: `HDR` only when the swapchain actually
 /// runs HDR10 (`hdr_display`); a PQ stream tone-mapped onto an SDR surface (no HDR10
-/// format offered, HDR off in the compositor) shows `HDR→SDR`; and a PQ stream on the
-/// software-decode lane (`hdr_untonemapped`) shows `HDR→SDR (raw)` — that lane has no
-/// tone-map pass at all, so the washed-out picture is named for what it is rather than
-/// passed off as a tone-map.
+/// format offered, HDR off in the compositor) shows `HDR→SDR`; and a lane that shows PQ
+/// with no tone-map pass at all (`hdr_untonemapped`) shows `HDR→SDR (raw)`, so a
+/// washed-out picture is named for what it is rather than passed off as a tone-map.
+/// ⚠ Since M8 no lane sets that flag — the software lane, which used to, now goes through
+/// the same planar CSC pass as the hardware ones. The arm is kept for the next one that
+/// does not; see `StreamState::hdr_untonemapped`.
 ///
 /// `profile` (the session's settings profile, `None` for the global defaults) closes the
 /// first line at every tier — the cheapest possible answer to "which profile am I on?"
@@ -2621,6 +2789,19 @@ fn stats_text(
         if !parts.is_empty() {
             text.push_str(&format!("\nintegrity: {}", parts.join(" · ")));
         }
+    }
+    // M8's software-HEVC-drop telemetry ("telemetry on frequency", §7 risk register):
+    // how many times in THIS process a session's codec ran out of decode rungs and had
+    // to reconnect as another codec. Process-cumulative, appended LAST and only when
+    // nonzero — additive for the stdout `stats:` line's parsers, and invisible on the
+    // overwhelming majority of runs where it never happens.
+    //
+    // On the line rather than only in the log because the question it answers is a rate
+    // across a session history ("did dropping software HEVC cost anyone a stream?"), and
+    // a warn nobody greps for cannot answer it.
+    let fallbacks = pf_client_core::session::codec_fallbacks();
+    if detailed && fallbacks > 0 {
+        text.push_str(&format!("\ncodec_fallbacks {fallbacks}"));
     }
     text
 }
@@ -3126,10 +3307,14 @@ mod tests {
         }
     }
 
-    /// The honest HDR badges: a PQ stream on the software-decode lane is shown WITHOUT
-    /// tone-mapping (that lane has no PQ→sRGB pass), so its badge must not read as the
-    /// hardware lane's `HDR→SDR` tone-map — and an HDR10 swapchain shows plain `HDR`
-    /// whatever the lane claims (a CPU frame forces the swapchain to SDR anyway).
+    /// The honest HDR badges. ⚠ **The `(raw)` arm is currently unreachable in
+    /// production**: `hdr_untonemapped` is written `false` on every present arm since M8
+    /// took the software lane through the same planar CSC pass (and therefore the same
+    /// tone-map) as the hardware lanes — see `StreamState::hdr_untonemapped`. This tests
+    /// the FORMATTER, not a state the client can be in, and it is kept for the same
+    /// reason the field is: the next lane that bypasses the pass must be able to say so
+    /// rather than quietly claim a tone-map, and this is the assertion that will still be
+    /// here when it does.
     #[test]
     fn hdr_badge_names_the_untonemapped_cpu_lane() {
         let (s, p) = sample();
