@@ -353,11 +353,17 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
 }
 
 /// `audio-probe mint` devtest body: one synchronous provisioning pass, results printed.
-/// Synchronous provisioning for devtests: a fresh CLI process has no startup worker to have
-/// finished yet, so `audio-probe plan` would otherwise RACE the background thread and print
-/// the name ladder instead of tier-0. Existing marker devnodes re-resolve in milliseconds.
+/// Synchronous provisioning — for the mic pump's resolve and the devtests.
+///
+/// The pump's FIRST open must not race the startup worker: measured on the target box, the
+/// pump wired 2 s before the worker latched, took the cable as its write target, and the next
+/// wiring pass would then have pointed the default recording at the minted microphone —
+/// which nothing writes into: dead mic-air until a pump reopen. Blocking the first resolve
+/// (existing marker devnodes re-resolve in milliseconds; a cold boot pays the one-time mint)
+/// keeps the pump's target and the plan's verdict the same thing. Latched calls return
+/// immediately; the opt-out env is honoured like everywhere else.
 pub(crate) fn ensure_blocking() {
-    if PROVISIONED.get().is_some() {
+    if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() || PROVISIONED.get().is_some() {
         return;
     }
     if let Ok(m) = ensure_all() {

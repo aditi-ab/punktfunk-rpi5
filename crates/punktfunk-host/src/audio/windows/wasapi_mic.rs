@@ -217,6 +217,11 @@ impl VirtualMic for WasapiVirtualMic {
 /// Resolve the mic inject target from the wiring plan, auto-installing the Steam Streaming pair
 /// when nothing usable exists (then re-planning). Runs on the COM-initialized render thread.
 fn resolve_target() -> Result<(wasapi::Device, String)> {
+    // The minted endpoints must exist BEFORE this open resolves its write target: the pump
+    // holds one device for its lifetime, so racing the provisioning worker here left the pump
+    // on the cable while later plans paired the default recording with the minted microphone
+    // nothing wrote into (see `minted::ensure_blocking`). Instant once latched.
+    super::minted::ensure_blocking();
     // set_playback=false: the mic pump runs while the host is idle — only the desktop-audio
     // capture may park the playback default (on the silent sink) for a stream's lifetime.
     let mut wiring = audio_control::wire_now(false);
