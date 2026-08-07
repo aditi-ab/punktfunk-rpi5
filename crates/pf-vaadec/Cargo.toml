@@ -1,6 +1,6 @@
 [package]
 name = "pf-vaadec"
-description = "Native VAAPI H.264/HEVC decode for the Linux clients (M6): the hand-declared libva decode buffer layouts plus the profile/format/surface decisions — the CPU-testable half; the libva plumbing lives in pf-client-core (design/client-native-decode.md §3.4)"
+description = "Native VAAPI H.264/HEVC/AV1 decode for the Linux clients (M6, M7): the hand-declared libva decode buffer layouts plus the profile/format/surface decisions — the CPU-testable half; the libva plumbing lives in pf-client-core (design/client-native-decode.md §3.4)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -467,24 +467,32 @@ impl Display {
     /// `vaCreateBuffer` with the data copied in — libva's documented behaviour for a
     /// non-null `data` pointer, and what makes the caller's structs free to die
     /// straight after.
+    ///
+    /// `size` is ONE element's size and `count` is how many follow, because that is
+    /// how `vaCreateBuffer` is declared and the two are not interchangeable. Every
+    /// H.264 and H.265 buffer here passes `count = 1`; **AV1's tile-parameter buffer
+    /// is the one exception** — libavcodec's `vaapi_av1.c` sends a whole tile group's
+    /// records in a single buffer beside that group's one data buffer, and a driver
+    /// reads `num_elements` records out of it.
     fn create_buffer(
         &self,
         context: VaContextId,
         kind: u32,
         size: usize,
+        count: usize,
         data: *const c_void,
     ) -> Result<VaBufferId> {
         let mut id: VaBufferId = VA_INVALID_ID;
-        // SAFETY: a live display and context; `data` points at `size` readable bytes
-        // for the duration of the call (the caller's live struct or slice), and `id`
-        // is a local written through. libva copies the payload before returning.
+        // SAFETY: a live display and context; `data` points at `size * count` readable
+        // bytes for the duration of the call (the caller's live struct or slice), and
+        // `id` is a local written through. libva copies the payload before returning.
         self.va.check("vaCreateBuffer", unsafe {
             (self.va.create_buffer)(
                 self.display,
                 context,
                 kind as c_uint,
                 size as c_uint,
-                1,
+                count as c_uint,
                 data.cast_mut(),
                 &mut id,
             )
@@ -547,6 +555,7 @@ struct StreamShape {
 enum Planner {
     H264(Box<pf_vaadec::H264Planner>),
     H265(Box<pf_vaadec::H265Planner>),
+    Av1(Box<pf_vaadec::Av1Planner>),
 }
 
 impl Planner {
@@ -554,6 +563,7 @@ impl Planner {
         match self {
             Planner::H264(_) => "native-vaapi h264",
             Planner::H265(_) => "native-vaapi h265",
+            Planner::Av1(_) => "native-vaapi av1",
         }
     }
 }
@@ -885,6 +895,7 @@ impl NativeVaapiDecoder {
         let planner = match codec {
             pf_vaadec::Codec::H264 => Planner::H264(Box::new(pf_vaadec::H264Planner::new())),
             pf_vaadec::Codec::H265 => Planner::H265(Box::new(pf_vaadec::H265Planner::new())),
+            pf_vaadec::Codec::Av1 => Planner::Av1(Box::new(pf_vaadec::Av1Planner::new())),
         };
         let (release_tx, release_rx) = mpsc::channel();
         Ok(NativeVaapiDecoder {
@@ -949,10 +960,12 @@ impl NativeVaapiDecoder {
     ///   for a keyframe it has no reason to send.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
         self.drain_releases();
-        let result = if matches!(self.planner, Planner::H264(_)) {
-            self.decode_h264(au)
-        } else {
-            self.decode_h265(au)
+        let result = match self.planner {
+            Planner::H264(_) => self.decode_h264(au),
+            Planner::H265(_) => self.decode_h265(au),
+            // ⚠ An AV1 "access unit" is a TEMPORAL UNIT and may carry several
+            // frames; this arm is the only one whose planner returns a `Vec`.
+            Planner::Av1(_) => self.decode_av1(au),
         };
         // ONE verdict per access unit, folded here and nowhere else. Damage is
         // reported by the codec arm rather than counted inside it, so a failure
@@ -969,7 +982,7 @@ impl NativeVaapiDecoder {
     fn decode_h264(&mut self, au: &[u8]) -> Result<(Option<DmabufFrame>, bool)> {
         let plan = match &mut self.planner {
             Planner::H264(p) => p.plan_au(au).map_err(|e| anyhow!("{e:?}"))?,
-            Planner::H265(_) => unreachable!("dispatched on the planner's own arm"),
+            _ => unreachable!("dispatched on the planner's own arm"),
         };
         let shape = shape_of(
             plan.picture.coded_width,
@@ -1002,21 +1015,21 @@ impl NativeVaapiDecoder {
         let converted = pf_vaadec::plan_to_va(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
-        bind_setup(s, plan.dpb.stored, free);
+        bind_setup(s, plan.dpb.stored, Some(free));
 
         let iq = Some(as_ptr(&converted.iq_matrix));
-        let slice_ptrs: Vec<(*const c_void, usize)> = converted.slices.iter().map(as_ptr).collect();
+        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
         submit(
             display,
             s,
             target,
             as_ptr(&converted.pic_params),
             iq,
-            &slice_ptrs,
-            &converted.slice_data,
+            &slices,
             au,
         )?;
 
+        let display_size = (s.shape.display_width, s.shape.display_height);
         let frame = finish(
             display,
             s,
@@ -1025,6 +1038,7 @@ impl NativeVaapiDecoder {
             damaged,
             plan.picture.is_idr,
             colour_of(&plan.picture.colour),
+            display_size,
             &mut self.recovery_request,
             &self.release_tx,
         )?;
@@ -1041,7 +1055,7 @@ impl NativeVaapiDecoder {
                 Err(pf_vaadec::PlanErrorH265::RaslSkipped { .. }) => return Ok((None, false)),
                 Err(e) => return Err(anyhow!("{e:?}")),
             },
-            Planner::H264(_) => unreachable!("dispatched on the planner's own arm"),
+            _ => unreachable!("dispatched on the planner's own arm"),
         };
         let shape = shape_of(
             plan.picture.coded_width,
@@ -1077,7 +1091,7 @@ impl NativeVaapiDecoder {
         let converted = pf_vaadec::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
-        bind_setup(s, plan.dpb.stored, free);
+        bind_setup(s, plan.dpb.stored, Some(free));
 
         // The IQ matrix is submitted ONLY where the sequence codes scaling lists.
         // Handing the driver an all-zero matrix on a "use the defaults" stream is
@@ -1086,18 +1100,18 @@ impl NativeVaapiDecoder {
         // (M5's review caught exactly this on the DXVA rung, where the buffer was
         // unconditional. The conversion answers `None` here so the rung cannot.)
         let iq = converted.iq_matrix.as_ref().map(as_ptr);
-        let slice_ptrs: Vec<(*const c_void, usize)> = converted.slices.iter().map(as_ptr).collect();
+        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
         submit(
             display,
             s,
             target,
             as_ptr(&converted.pic_params),
             iq,
-            &slice_ptrs,
-            &converted.slice_data,
+            &slices,
             au,
         )?;
 
+        let display_size = (s.shape.display_width, s.shape.display_height);
         let frame = finish(
             display,
             s,
@@ -1106,10 +1120,308 @@ impl NativeVaapiDecoder {
             damaged,
             plan.picture.is_idr,
             colour_of(&plan.picture.colour),
+            display_size,
             &mut self.recovery_request,
             &self.release_tx,
         )?;
         Ok((frame, damaged))
+    }
+
+    /// One AV1 **temporal unit**: decode every frame in it, present at most one.
+    ///
+    /// This is the whole of what AV1 adds to this rung's contract, and it is the
+    /// SPEC's shape rather than an assumption about punktfunk hosts. A temporal unit
+    /// may carry several frame headers; the vendored 250-packet conformance vector
+    /// decodes **274 frames** and shows 250, so 24 of its units carry a hidden
+    /// picture (an alt-ref later frames predict from) ahead of the one that
+    /// displays. Those hidden frames must be DECODED — they are references — and
+    /// must never reach the presenter, which would show each of them for a frame and
+    /// stutter every time.
+    ///
+    /// AV1 admits at most one shown frame per temporal unit, so "the last shown
+    /// frame wins" cannot silently drop a picture.
+    ///
+    /// # Concealment is per UNIT here, per picture on the other two codecs
+    ///
+    /// A damaged frame is still CONVERTED and still SUBMITTED, exactly as the H.264
+    /// and H.265 arms above do it. Converting is what assigns its ledger slot, and
+    /// skipping that would desynchronise this rung's slot map from the planner's store
+    /// and turn every later reference to it into a hard `Err` — a demotion streak
+    /// earned by one lost packet. Submitting is what puts a decoded picture in the
+    /// surface, which matters because a hidden frame's surface is a REFERENCE for
+    /// later frames and can still be exported by a later `show_existing_frame`; a
+    /// surface the driver never wrote is uninitialised video memory, not a stale
+    /// picture.
+    ///
+    /// What concealment does instead is withhold the DISPLAY: nothing from the unit
+    /// is presented, because a shown frame that predicts from a concealed reference in
+    /// the same unit is not fit to display either, and the unit is the smallest thing
+    /// this rung can honestly drop.
+    ///
+    /// ⚠ Submitting a frame whose references were lost needs one thing from the
+    /// conversion, and `va_dec_av1.h:352` is where it comes from: *"Driver is not
+    /// responsible to validate reference frames' id … If missing frame is identified,
+    /// application may choose to perform error recovery by pointing problematic index
+    /// to an alternative frame buffer."* So `plan_to_va_av1` points every empty
+    /// `ref_frame_map` entry at a live surface and reports which
+    /// (`DecodePlanVaAv1::substituted_refs`); no `VA_INVALID_ID` reaches a driver that
+    /// says it will not check.
+    ///
+    /// The one frame that is NOT submitted is the one with nothing to submit: an
+    /// access unit whose tile groups were lost. That refusal is handled in
+    /// [`Self::frame_av1`] and binds no surface at all, so its picture can be neither
+    /// exported nor predicted from.
+    fn decode_av1(&mut self, au: &[u8]) -> Result<(Option<DmabufFrame>, bool)> {
+        let plans = match &mut self.planner {
+            Planner::Av1(p) => p.plan_au(au).map_err(|e| anyhow!("{e}"))?,
+            _ => unreachable!("dispatched on the planner's own arm"),
+        };
+        let mut shown = None;
+        let mut damaged_unit = false;
+        for plan in &plans {
+            let damaged = plan
+                .warnings
+                .iter()
+                .any(pf_vaadec::is_integrity_warning_av1);
+            damaged_unit |= damaged;
+            if !plan.warnings.is_empty() {
+                tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI AV1 plan warnings");
+            }
+            if let Some(frame) = self.frame_av1(au, plan, damaged)? {
+                shown = Some(frame);
+            }
+        }
+        if damaged_unit {
+            // A frame may already have been exported before a LATER frame of the
+            // same unit turned out to be damaged. Dropping it here is safe rather
+            // than merely tolerable: `DmabufFrame`'s guard closes its fds and returns
+            // the surface to the free list, which is exactly what an unshown picture
+            // should do.
+            drop(shown);
+            return Ok((None, true));
+        }
+        Ok((shown, false))
+    }
+
+    /// One frame of a temporal unit: converted, submitted, and exported only if it is
+    /// the frame the unit displays and the unit is clean.
+    ///
+    /// `damaged` changes two things and neither of them is the submission. It decides
+    /// whether the picture may be SHOWN (through [`finish`]), and it decides how a
+    /// conversion refusal is answered: a lost tile group on an already-damaged plan is
+    /// concealed, the same refusal on a plan that arrived whole is a defect and stays
+    /// an error.
+    fn frame_av1(
+        &mut self,
+        au: &[u8],
+        plan: &pf_vaadec::AuPlanAv1,
+        damaged: bool,
+    ) -> Result<Option<DmabufFrame>> {
+        // `show_existing_frame` decodes nothing at all: it re-displays a picture some
+        // earlier hidden frame put in a reference slot.
+        if plan.dpb.stored.is_none() {
+            return self.show_existing_av1(plan, damaged);
+        }
+        let shape = shape_of_av1(plan);
+        let Self {
+            display, session, ..
+        } = self;
+        let s = ensure_session(
+            display,
+            session,
+            pf_vaadec::Codec::Av1,
+            shape,
+            &mut self.generation,
+        )?;
+        let free = s
+            .free_surface()
+            .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
+        let target = s.surfaces[free];
+        let table = s.surface_table();
+        let converted = match pf_vaadec::plan_to_va_av1(plan, au, &mut s.slots, &table, target) {
+            Ok(converted) => converted,
+            Err(e) => {
+                // ⚠ The ledger has already been mutated — the conversion assigns the
+                // setup slot before its tile walk, so that a refusal here does not
+                // desynchronise it from the planner's store — and the caller's half of
+                // that contract is to bind NOTHING (see [`bind_setup`]). Unconditional,
+                // because it is also correct for the refusals that fire before any
+                // mutation: there is no slot to clear and no surface to bind either
+                // way.
+                bind_setup(s, plan.dpb.stored, None);
+                // A lost tile group on a plan the planner ALREADY called damaged is
+                // concealment, not a defect: the access unit simply did not carry the
+                // tiles its frame header announced, which is what one dropped packet
+                // looks like. Answering with an error instead would burn the demotion
+                // streak on exactly the lossy links this rung exists to diagnose. The
+                // frame is not submitted (there is nothing to submit), its surface is
+                // bound to nothing, and the unit is dropped by the caller.
+                if damaged && e.lost_tiles() {
+                    tracing::debug!(
+                        error = %e,
+                        id = plan.dpb.stored,
+                        "native VAAPI AV1: concealed a truncated access unit"
+                    );
+                    finish(
+                        display,
+                        s,
+                        &plan.dpb.outputs,
+                        &plan.dpb.removed,
+                        true,
+                        plan.picture.is_key,
+                        colour_of(&plan.picture.colour),
+                        // Unread — `finish` returns before it looks at the display
+                        // region when `damaged` — but written the same way as the
+                        // submitting path below, so the two cannot drift apart.
+                        (
+                            plan.picture.render_width.min(plan.picture.upscaled_width),
+                            plan.picture.render_height.min(plan.picture.frame_height),
+                        ),
+                        &mut self.recovery_request,
+                        &self.release_tx,
+                    )?;
+                    return Ok(None);
+                }
+                return Err(anyhow!("{e}"));
+            }
+        };
+
+        // `bind_setup` asks the LEDGER where the picture landed rather than being
+        // told, which is what makes it right for the AV1 frame that refreshes no
+        // slot: the conversion has already handed that slot back, so nothing binds
+        // the surface and only the pending-output claim keeps it out of the free
+        // list. (`DecodePlanVaAv1::setup_slot` is `None` there; it is not consulted
+        // here for exactly that reason.)
+        bind_setup(s, plan.dpb.stored, Some(free));
+
+        if converted.substituted_refs != 0 {
+            tracing::debug!(
+                slots = format_args!("{:#010b}", converted.substituted_refs),
+                "native VAAPI AV1: concealed reference slot(s) with a live surface"
+            );
+        }
+        let mut slices: Vec<SlicePair> = Vec::with_capacity(converted.tile_groups.len());
+        for group in &converted.tile_groups {
+            slices.push(SlicePair {
+                params: group.tiles.as_ptr().cast::<c_void>(),
+                record_size: size_of::<pf_vaadec::va_av1::VaSliceParameterBufferAV1>(),
+                // ⚠ Several records in ONE buffer — the only place this rung does
+                // that, and what libavcodec's `vaapi_av1.c` does per tile group.
+                records: group.tiles.len(),
+                data: group.data.clone(),
+            });
+        }
+        submit(
+            display,
+            s,
+            target,
+            as_ptr(&converted.pic_params),
+            // AV1 transmits no quantisation matrix: its matrices are SELECTED by
+            // index out of tables the decoder already holds.
+            None,
+            &slices,
+            au,
+        )?;
+
+        // AV1's display region is the RENDER size, not the coded size — and it is a
+        // per-FRAME value, so it cannot live in the session shape the way a
+        // conformance window does.
+        //
+        // ⚠ CLAMPED to the decoded picture. AV1 5.9.6 puts no upper bound on the
+        // render size — a stream may legally ask to be shown at more than it coded —
+        // and an unclamped crop would hand the presenter a region larger than the
+        // surface. The same clamp is in the Vulkan and D3D11 rungs.
+        //
+        // ⚠ Treated as a CROP, which is what both other native rungs do. libavcodec
+        // instead keeps the frame at `upscaled_width` x `frame_height` and expresses
+        // the render size as a sample aspect RATIO, so on a stream where the two
+        // differ this rung shows less picture than the FFmpeg rung would. No
+        // punktfunk host emits such a stream; the choice is here so the three native
+        // rungs answer alike, not because it is settled.
+        let display_size = (
+            plan.picture.render_width.min(plan.picture.upscaled_width),
+            plan.picture.render_height.min(plan.picture.frame_height),
+        );
+        let frame = finish(
+            display,
+            s,
+            &plan.dpb.outputs,
+            &plan.dpb.removed,
+            damaged,
+            plan.picture.is_key,
+            colour_of(&plan.picture.colour),
+            display_size,
+            &mut self.recovery_request,
+            &self.release_tx,
+        )?;
+
+        // A frame that enters no reference slot AND displays nothing is dead the
+        // moment it is decoded, and it is the one picture nothing else ever retires:
+        // the planner cannot report it removed (it was never stored) and cannot
+        // output it, so its pending entry — and therefore its surface — is held for
+        // the session's whole life. Seventeen of them exhaust the pool.
+        //
+        // Legal AV1 syntax that no encoder emits, which is exactly why it is worth a
+        // line: a damaged or truncated header can parse to it, and the symptom would
+        // be a session that dies of "pool exhausted" some minutes later with nothing
+        // pointing back here.
+        if converted.setup_slot.is_none() && !plan.dpb.outputs.contains(&converted.setup_id) {
+            s.pending.retain(|(id, _)| *id != converted.setup_id);
+        }
+        Ok(frame)
+    }
+
+    /// A `show_existing_frame` access unit: export a surface the pool already holds.
+    ///
+    /// No conversion and no submission — the picture was decoded by an earlier frame
+    /// of an earlier temporal unit and is still in [`Session::pending`], because a
+    /// hidden frame is never output when it decodes. [`finish`] resolves the output
+    /// id to its surface exactly as it does for any other picture, so this path needs
+    /// no per-surface facts table: the plan's own `picture` carries the SHOWN frame's
+    /// geometry and type, which the vendored parser restores from the reference
+    /// (`load_reference_frame` copies `ref_upscaled_width` / `ref_frame_height` /
+    /// `ref_render_*` / `ref_frame_type` into the display-only header).
+    ///
+    /// ⚠ **Untested.** The vendored conformance vector uses `show_existing_frame`
+    /// zero times — pf-bitstream's planner test asserts that count stays 0 — so
+    /// nothing in any gate reaches this function.
+    fn show_existing_av1(
+        &mut self,
+        plan: &pf_vaadec::AuPlanAv1,
+        damaged: bool,
+    ) -> Result<Option<DmabufFrame>> {
+        let Self {
+            display, session, ..
+        } = self;
+        // Nothing has decoded yet: the unit is already concealed (the planner
+        // reported `MissingShowExisting`) and there is no session to look in.
+        let Some(s) = session.as_mut() else {
+            return Ok(None);
+        };
+        // Showing a KEY frame this way resets the whole reference store (AV1 7.20),
+        // so the plan's removals are real and this rung's ledger has to follow them —
+        // or the map fills up and the next assignment fails. No conversion runs on
+        // this path, so this is the only place they can be applied.
+        for &id in &plan.dpb.removed {
+            s.slots.release(id);
+        }
+        s.sync_slot_bindings();
+        let display_size = (
+            plan.picture.render_width.min(plan.picture.upscaled_width),
+            plan.picture.render_height.min(plan.picture.frame_height),
+        );
+        finish(
+            display,
+            s,
+            &plan.dpb.outputs,
+            &plan.dpb.removed,
+            damaged,
+            plan.picture.is_key,
+            colour_of(&plan.picture.colour),
+            display_size,
+            &mut self.recovery_request,
+            &self.release_tx,
+        )
     }
 }
 
@@ -1217,6 +1529,39 @@ fn shape_of(
     })
 }
 
+/// The session shape one AV1 plan implies.
+///
+/// ⚠ The pool is sized from the SEQUENCE header's **maximum** frame size, not this
+/// frame's. AV1 lets every frame pick its own size up to that maximum without a key
+/// frame, and sizing the session from the frame would rebuild the config, the
+/// surface pool and the ledger — dropping every reference — the first time a stream
+/// resized downward. libavcodec does the same (`set_context_with_sequence` calls
+/// `ff_set_dimensions(avctx, seq->max_frame_width_minus_1 + 1, …)`).
+///
+/// The display fields carry the same maximum rather than the render region, for the
+/// same reason: the render size is a per-FRAME value and putting it here would make
+/// every render-size change a renegotiation. What actually reaches the presenter is
+/// [`finish`]'s `display` parameter.
+///
+/// The DPB depth is a constant of the codec — `NUM_REF_FRAMES` — never anything a
+/// sequence header says. There is no conformance window to refuse, so unlike
+/// [`shape_of`] this cannot fail.
+fn shape_of_av1(plan: &pf_vaadec::AuPlanAv1) -> StreamShape {
+    let coded_width = u32::from(plan.sequence.max_frame_width_minus_1) + 1;
+    let coded_height = u32::from(plan.sequence.max_frame_height_minus_1) + 1;
+    StreamShape {
+        coded_width,
+        coded_height,
+        display_width: coded_width,
+        display_height: coded_height,
+        max_dpb_frames: pf_vaadec::AV1_MAX_DPB_FRAMES,
+        chroma_format_idc: plan.picture.chroma_format_idc,
+        // AV1 codes ONE bit depth for all three planes, so there is no luma/chroma
+        // pair to reconcile the way H.264 and H.265 need.
+        bit_depth: plan.picture.bit_depth,
+    }
+}
+
 /// The session for this shape, rebuilt whole if the stream renegotiated.
 fn ensure_session<'a>(
     d: &Display,
@@ -1254,7 +1599,7 @@ fn ensure_session<'a>(
     Ok(slot.insert(built))
 }
 
-/// Record which surface holds the picture just planned.
+/// Record which surface holds the picture just planned — or that NOTHING does.
 ///
 /// The slot bindings are re-derived from the ledger FIRST — the conversion has
 /// already applied this AU's removals, so a slot the planner released binds nothing
@@ -1263,38 +1608,92 @@ fn ensure_session<'a>(
 /// picture with no free frame buffer is stored and evicted inside a single plan, so
 /// it holds NO slot when the conversion returns. Its surface is kept out of the free
 /// list by `pending` instead, until it has been output.
-fn bind_setup(s: &mut Session, stored: Option<u64>, surface: usize) {
+///
+/// ⚠ `surface` is `None` on the AV1 refusal path, and that call is not optional. The
+/// AV1 conversion assigns the ledger slot BEFORE its tile walk — deliberately, so a
+/// lost tile group does not desynchronise the ledger from the planner's store forever
+/// (`pf_vaadec::plan_to_va_av1`'s docs) — which means a refusal can leave a slot
+/// re-assigned to a picture that never decoded while `slot_surface` still holds the
+/// surface of whatever occupied that slot BEFORE. That is not a missing reference, it
+/// is a WRONG one, and nothing downstream could tell. Binding `None` makes the slot
+/// read back as `VA_INVALID_ID`, which the conversion then substitutes with a live
+/// surface. Nothing is pushed to `pending` either: an undecoded surface must never be
+/// exportable.
+fn bind_setup(s: &mut Session, stored: Option<u64>, surface: Option<usize>) {
     s.sync_slot_bindings();
-    if let Some(id) = stored {
-        if let Some(slot) = s.slots.slot_of(id) {
-            s.slot_surface[usize::from(slot)] = Some(surface);
-        }
+    let Some(id) = stored else { return };
+    if let Some(slot) = s.slots.slot_of(id) {
+        s.slot_surface[usize::from(slot)] = surface;
+    }
+    if let Some(surface) = surface {
         s.pending.push((id, surface));
     }
+}
+
+/// One slice-parameter (AV1: tile-parameter) buffer and the bitstream region its
+/// records address.
+///
+/// The two travel together because `vaRenderPicture` is what establishes which data
+/// buffer a record's `slice_data_offset` is relative to — it is handed the pair.
+struct SlicePair {
+    /// The record array. Borrowed from the caller's converted plan, which outlives
+    /// the `submit` call that reads it.
+    params: *const c_void,
+    /// ONE record's size. `vaCreateBuffer` takes the element size and the element
+    /// count separately and they are not interchangeable.
+    record_size: usize,
+    /// How many records this buffer carries: **1** for H.264 and H.265 — one slice,
+    /// one buffer, exactly as libavcodec sends them — and a whole tile group's worth
+    /// for AV1, which is the one codec libavcodec packs several records into a single
+    /// buffer for.
+    records: usize,
+    /// The bitstream those records address, in ACCESS-UNIT coordinates.
+    data: std::ops::Range<usize>,
+}
+
+/// The H.264/H.265 shape of the above: one record per buffer, parallel to its data
+/// range.
+///
+/// ⚠ The length check is not ceremony, even though both conversions build the two
+/// vectors in one loop today and cannot produce a mismatch. `zip` would answer a
+/// future divergence by SILENTLY TRUNCATING — a picture submitted with some of its
+/// slices, which decodes to a partial frame rather than to an error, and which no
+/// gate here has hardware to catch. A refusal is the honest answer and costs one
+/// comparison per access unit.
+fn one_record_each<T>(records: &[T], data: &[std::ops::Range<usize>]) -> Result<Vec<SlicePair>> {
+    if records.len() != data.len() {
+        bail!(
+            "{} slice record(s) for {} data range(s) — the conversion's two halves \
+             disagree",
+            records.len(),
+            data.len()
+        );
+    }
+    Ok(records
+        .iter()
+        .zip(data)
+        .map(|(record, range)| SlicePair {
+            params: (record as *const T).cast::<c_void>(),
+            record_size: size_of::<T>(),
+            records: 1,
+            data: range.clone(),
+        })
+        .collect())
 }
 
 /// One picture's buffers, in the order libavcodec's VAAPI path submits them: the
 /// parameter buffers in one `vaRenderPicture`, then the interleaved
 /// slice-parameter/slice-data pairs in another. Matching the path drivers are
 /// validated against is worth more than any tidier arrangement.
-#[allow(clippy::too_many_arguments)]
 fn submit(
     d: &Display,
     s: &Session,
     target: VaSurfaceId,
     pic: (*const c_void, usize),
     iq: Option<(*const c_void, usize)>,
-    slices: &[(*const c_void, usize)],
-    slice_data: &[std::ops::Range<usize>],
+    slices: &[SlicePair],
     au: &[u8],
 ) -> Result<()> {
-    if slices.len() != slice_data.len() {
-        bail!(
-            "{} slice records for {} data ranges",
-            slices.len(),
-            slice_data.len()
-        );
-    }
     let mut params: Vec<VaBufferId> = Vec::with_capacity(2);
     let mut slice_buffers: Vec<VaBufferId> = Vec::with_capacity(slices.len() * 2);
     // A picture that was BEGUN must be ended even if a step in between failed, or
@@ -1310,6 +1709,7 @@ fn submit(
                 s.context,
                 pf_vaadec::va::VA_PICTURE_PARAMETER_BUFFER_TYPE,
                 pic.1,
+                1,
                 pic.0,
             )
             .context("picture parameter buffer")?,
@@ -1320,24 +1720,30 @@ fn submit(
                     s.context,
                     pf_vaadec::va::VA_IQ_MATRIX_BUFFER_TYPE,
                     size,
+                    1,
                     ptr,
                 )
                 .context("IQ matrix buffer")?,
             );
         }
-        for (n, ((ptr, size), range)) in slices.iter().zip(slice_data).enumerate() {
+        for (n, pair) in slices.iter().enumerate() {
+            let range = pair.data.clone();
             let data = au.get(range.clone()).ok_or_else(|| {
                 anyhow!(
                     "slice {n}: range {range:?} is outside a {}-byte access unit",
                     au.len()
                 )
             })?;
+            if pair.records == 0 {
+                bail!("slice {n}: a parameter buffer with no records");
+            }
             slice_buffers.push(
                 d.create_buffer(
                     s.context,
                     pf_vaadec::va::VA_SLICE_PARAMETER_BUFFER_TYPE,
-                    *size,
-                    *ptr,
+                    pair.record_size,
+                    pair.records,
+                    pair.params,
                 )
                 .with_context(|| format!("slice {n} parameter buffer"))?,
             );
@@ -1346,6 +1752,7 @@ fn submit(
                     s.context,
                     pf_vaadec::va::VA_SLICE_DATA_BUFFER_TYPE,
                     data.len(),
+                    1,
                     data.as_ptr().cast::<c_void>(),
                 )
                 .with_context(|| format!("slice {n} data buffer"))?,
@@ -1427,6 +1834,10 @@ fn finish(
     damaged: bool,
     keyframe: bool,
     color: ColorDesc,
+    // The DISPLAY region for this picture. A parameter rather than a read of
+    // `s.shape` because AV1's is per-FRAME: its render size may change without a key
+    // frame, so it cannot live in the shape that rebuilds the session.
+    display: (u32, u32),
     recovery_request: &mut bool,
     tx: &mpsc::Sender<VaRelease>,
 ) -> Result<Option<DmabufFrame>> {
@@ -1504,8 +1915,8 @@ fn finish(
         // The DISPLAY region. The surface is allocated at the coded size and is
         // taller/wider than the picture; handing over the coded size would show the
         // codec's granule padding.
-        width: s.shape.display_width,
-        height: s.shape.display_height,
+        width: display.0,
+        height: display.1,
         fourcc: exported.fourcc,
         modifier: exported.modifier,
         planes,
@@ -1714,6 +2125,56 @@ mod tests {
         );
     }
 
+    /// A picture the conversion REFUSED binds no surface — so nothing can show it and
+    /// nothing can predict from it.
+    ///
+    /// Both halves matter and they fail differently. The AV1 conversion assigns its
+    /// ledger slot before the tile walk, so a refusal leaves a slot re-assigned to a
+    /// picture that never decoded; leaving the slot's PREVIOUS binding in place would
+    /// hand the next frame a real, decoded, WRONG picture, which no later check could
+    /// notice. And a `pending` entry for it would let a later `show_existing_frame`
+    /// claim the surface and ship it — a surface the driver never wrote, which is
+    /// uninitialised video memory rather than a stale frame.
+    #[test]
+    fn a_refused_picture_binds_nothing_and_can_never_be_exported() {
+        let mut s = session(4, 3);
+
+        // Picture 11 decoded into surface 0 and took slot 0.
+        s.slots.assign(11).expect("a free slot");
+        bind_setup(&mut s, Some(11), Some(0));
+        assert_eq!(s.slot_surface[0], Some(0));
+        assert_eq!(s.surface_table()[0], s.surfaces[0]);
+        assert_eq!(s.pending, vec![(11, 0)]);
+
+        // Picture 12's access unit lost its tile groups. The conversion released 11,
+        // handed 12 the slot it just gave back — the routine case, not a contrived one
+        // — and then refused.
+        s.slots.release(11);
+        assert_eq!(s.slots.assign(12).expect("the slot 11 gave back"), 0);
+        bind_setup(&mut s, Some(12), None);
+
+        assert_eq!(
+            s.slot_surface[0], None,
+            "the slot must not keep picture 11's surface: picture 12 never decoded, \
+             and a reference to 12 that reads 11 is a wrong picture, not a missing one"
+        );
+        assert_eq!(
+            s.surface_table()[0],
+            VA_INVALID_ID,
+            "and the table the conversion reads must say so, so it can substitute"
+        );
+        assert!(
+            !s.pending.iter().any(|(id, _)| *id == 12),
+            "an undecoded picture owes no output — a pending entry is what would let \
+             a later show_existing_frame export a surface the driver never wrote"
+        );
+
+        // The slot is still LIVE in the ledger, which is the whole point of the
+        // conversion mutating before it refuses: the next frame resolves picture 12
+        // rather than hard-erroring on it.
+        assert_eq!(s.slots.slot_of(12), Some(0));
+    }
+
     /// A conformance window with a non-zero ORIGIN is refused, not cropped from the
     /// wrong corner: nothing downstream carries an origin.
     #[test]
@@ -1749,6 +2210,127 @@ mod tests {
             8,
         )
         .is_err());
+    }
+
+    /// One synthetic AV1 plan: a sequence that permits `max` and a frame that codes
+    /// `frame`, so the two can be told apart.
+    fn av1_plan(max: (u16, u16), frame: (u32, u32), render: (u32, u32)) -> pf_vaadec::AuPlanAv1 {
+        let sequence = pf_vaadec::ParsedSequenceHeaderAv1 {
+            max_frame_width_minus_1: max.0 - 1,
+            max_frame_height_minus_1: max.1 - 1,
+            ..Default::default()
+        };
+        pf_vaadec::AuPlanAv1 {
+            picture: pf_vaadec::PicturePlanAv1 {
+                frame_type: pf_vaadec::FrameTypeAv1::KeyFrame,
+                is_key: true,
+                show_frame: true,
+                showable_frame: false,
+                order_hint: 0,
+                upscaled_width: frame.0,
+                frame_width: frame.0,
+                frame_height: frame.1,
+                render_width: render.0,
+                render_height: render.1,
+                bit_depth: 8,
+                chroma_format_idc: 1,
+                colour: pf_vaadec::ColourDescription {
+                    colour_primaries: 1,
+                    transfer_characteristics: 1,
+                    matrix_coefficients: 1,
+                    video_full_range: false,
+                },
+            },
+            tiles: Vec::new(),
+            refs: [None; 7],
+            dpb: pf_vaadec::DpbUpdateAv1::default(),
+            dpb_refs: Vec::new(),
+            warnings: Vec::new(),
+            sequence: std::rc::Rc::new(sequence),
+            header: std::rc::Rc::new(pf_vaadec::ParsedFrameHeaderAv1::default()),
+        }
+    }
+
+    /// An AV1 session is sized from the SEQUENCE, never from the frame — and its DPB
+    /// depth is the codec's constant.
+    ///
+    /// Both halves are the difference between a stream that survives a mid-GOP resize
+    /// and one that rebuilds its pool, drops every reference and conceals its way back
+    /// to a keyframe. AV1 permits a frame to code any size up to the sequence maximum
+    /// with no key frame in sight, so a shape derived from the frame changes when
+    /// nothing renegotiated.
+    #[test]
+    fn an_av1_session_is_sized_from_the_sequence_maximum_not_the_frame() {
+        let big = shape_of_av1(&av1_plan((1920, 1080), (1920, 1080), (1920, 1080)));
+        assert_eq!((big.coded_width, big.coded_height), (1920, 1080));
+        assert_eq!(
+            big.max_dpb_frames, 8,
+            "NUM_REF_FRAMES, not a stream property"
+        );
+
+        // The same sequence, a frame coded smaller and shown smaller still. Neither
+        // may move the shape, or this is a renegotiation.
+        let small = shape_of_av1(&av1_plan((1920, 1080), (1280, 720), (960, 540)));
+        assert_eq!(
+            small, big,
+            "a frame that resized itself must not rebuild the session"
+        );
+
+        // A genuinely different sequence does move it.
+        let other = shape_of_av1(&av1_plan((1280, 720), (1280, 720), (1280, 720)));
+        assert_ne!(other, big);
+    }
+
+    /// The render size reaches the presenter CLAMPED to the decoded picture.
+    ///
+    /// AV1 5.9.6 puts no upper bound on the render size, so a stream may legally ask
+    /// to be shown at more than it coded; handing that to the presenter as a crop
+    /// would address rows the surface does not have. This restates the clamp in
+    /// `frame_av1`, which cannot itself be reached without a device.
+    #[test]
+    fn an_oversized_render_region_is_clamped_to_the_decoded_picture() {
+        let plan = av1_plan((1920, 1080), (1280, 720), (4096, 4096));
+        let display = (
+            plan.picture.render_width.min(plan.picture.upscaled_width),
+            plan.picture.render_height.min(plan.picture.frame_height),
+        );
+        assert_eq!(display, (1280, 720));
+
+        let ordinary = av1_plan((1920, 1080), (1920, 1088), (1920, 1080));
+        let display = (
+            ordinary
+                .picture
+                .render_width
+                .min(ordinary.picture.upscaled_width),
+            ordinary
+                .picture
+                .render_height
+                .min(ordinary.picture.frame_height),
+        );
+        assert_eq!(display, (1920, 1080), "the ordinary crop still crops");
+    }
+
+    /// H.264 and H.265 send ONE record per parameter buffer; AV1 is the exception.
+    ///
+    /// `vaCreateBuffer` takes an element size and an element count, and getting the
+    /// pair backwards is a driver reading `size` records of `count` bytes. This pins
+    /// the side every codec but AV1 is on.
+    #[test]
+    fn a_slice_pair_carries_one_record_unless_av1_says_otherwise() {
+        let records = [7u32, 8, 9];
+        let ranges = vec![0..4, 4..8, 8..12];
+        let pairs = one_record_each(&records, &ranges).expect("parallel lengths");
+        assert_eq!(pairs.len(), 3);
+        for pair in &pairs {
+            assert_eq!(pair.records, 1);
+            assert_eq!(pair.record_size, size_of::<u32>());
+        }
+        assert_eq!(pairs[1].data, 4..8);
+
+        // A record without its data range REFUSES. `zip` would drop it silently and
+        // submit a picture missing a slice, which decodes rather than fails.
+        assert!(one_record_each(&records, &ranges[..2]).is_err());
+        assert!(one_record_each(&records[..1], &ranges).is_err());
     }
 
     /// A shape this rung cannot decode is refused BEFORE libva is even loaded.

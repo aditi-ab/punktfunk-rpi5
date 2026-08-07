@@ -897,6 +897,10 @@ fn native_vaapi_codec(codec_id: ffmpeg::codec::Id) -> Option<pf_vaadec::Codec> {
     match codec_id {
         ffmpeg::codec::Id::H264 => Some(pf_vaadec::Codec::H264),
         ffmpeg::codec::Id::HEVC => Some(pf_vaadec::Codec::H265),
+        // AV1 (M7). Not a widening of what this client can decode — the FFmpeg VAAPI
+        // rung already decodes AV1 Profile 0 through the same libva profile — but the
+        // native rung has to cover it, or dropping FFmpeg would drop a codec.
+        ffmpeg::codec::Id::AV1 => Some(pf_vaadec::Codec::Av1),
         _ => None,
     }
 }
@@ -1329,8 +1333,8 @@ impl Decoder {
                 }
                 None => tracing::warn!(
                     ?codec_id,
-                    "PUNKTFUNK_DECODER=native-vaapi refused (needs an H.264 or HEVC \
-                     session) — standard ladder"
+                    "PUNKTFUNK_DECODER=native-vaapi refused (needs an H.264, HEVC or \
+                     AV1 session) — standard ladder"
                 ),
             }
             choice = "auto".to_string();

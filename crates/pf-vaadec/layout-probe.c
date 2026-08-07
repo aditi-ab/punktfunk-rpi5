@@ -1,7 +1,8 @@
 /*
- * Layout probe for the hand-declared libva structures in `src/va.rs`.
+ * Layout probe for the hand-declared libva structures in `src/va.rs`,
+ * `src/va_h265.rs` and `src/va_av1.rs`.
  *
- * `src/va.rs` declares VAAPI's decode buffers as `#[repr(C)]` Rust structs, because
+ * Those modules declare VAAPI's decode buffers as `#[repr(C)]` Rust structs, because
  * this crate must build on macOS and in the Linux container where libva headers need
  * not exist. This file is how those declarations were CHECKED rather than eyeballed,
  * and it is committed so the check is reproducible instead of a claim in a commit
@@ -24,6 +25,7 @@
 #include <stddef.h>
 #include <va/va.h>
 #include <va/va_dec_hevc.h>
+#include <va/va_dec_av1.h>
 #include <va/va_drmcommon.h>
 
 #define S(t)        printf("size %-34s %zu align %zu\n", #t, sizeof(t), _Alignof(t))
@@ -220,6 +222,225 @@ int main(void) {
         s.LongSliceFlags.fields.slice_loop_filter_across_slices_enabled_flag = 1;
         printf("bits hevc LongSliceFlags.slice_loop_filter_across=1 -> 0x%08x\n", s.LongSliceFlags.value);
     }
+
+    /* ---- AV1 (va_dec_av1.h) ----
+     *
+     * Three things make this codec's layout worth measuring rather than counting:
+     * a POINTER member (`anchor_frames_list`) that forces eight-byte alignment and
+     * therefore padding nothing in the field list suggests; two bit-field unions
+     * that are NOT 32 bits wide (`loop_filter_info_fields` is a uint8_t,
+     * `qmatrix_fields` and `loop_restoration_fields` are uint16_t), so a u32 `pack`
+     * would write over the neighbouring field; and three nested structs whose own
+     * VA_PADDING_LOW tails sit inside the picture-parameter buffer.
+     */
+    S(VASegmentationStructAV1);
+    O(VASegmentationStructAV1, segment_info_fields);
+    O(VASegmentationStructAV1, feature_data);
+    O(VASegmentationStructAV1, feature_mask);
+    O(VASegmentationStructAV1, va_reserved);
+
+    S(VAFilmGrainStructAV1);
+    O(VAFilmGrainStructAV1, film_grain_info_fields);
+    O(VAFilmGrainStructAV1, grain_seed);
+    O(VAFilmGrainStructAV1, num_y_points);
+    O(VAFilmGrainStructAV1, point_y_value);
+    O(VAFilmGrainStructAV1, point_y_scaling);
+    O(VAFilmGrainStructAV1, num_cb_points);
+    O(VAFilmGrainStructAV1, point_cb_value);
+    O(VAFilmGrainStructAV1, point_cb_scaling);
+    O(VAFilmGrainStructAV1, num_cr_points);
+    O(VAFilmGrainStructAV1, point_cr_value);
+    O(VAFilmGrainStructAV1, point_cr_scaling);
+    O(VAFilmGrainStructAV1, ar_coeffs_y);
+    O(VAFilmGrainStructAV1, ar_coeffs_cb);
+    O(VAFilmGrainStructAV1, ar_coeffs_cr);
+    O(VAFilmGrainStructAV1, cb_mult);
+    O(VAFilmGrainStructAV1, cb_luma_mult);
+    O(VAFilmGrainStructAV1, cb_offset);
+    O(VAFilmGrainStructAV1, cr_mult);
+    O(VAFilmGrainStructAV1, cr_luma_mult);
+    O(VAFilmGrainStructAV1, cr_offset);
+    O(VAFilmGrainStructAV1, va_reserved);
+
+    S(VAWarpedMotionParamsAV1);
+    O(VAWarpedMotionParamsAV1, wmtype);
+    O(VAWarpedMotionParamsAV1, wmmat);
+    O(VAWarpedMotionParamsAV1, invalid);
+    O(VAWarpedMotionParamsAV1, va_reserved);
+
+    S(VADecPictureParameterBufferAV1);
+    O(VADecPictureParameterBufferAV1, profile);
+    O(VADecPictureParameterBufferAV1, order_hint_bits_minus_1);
+    O(VADecPictureParameterBufferAV1, bit_depth_idx);
+    O(VADecPictureParameterBufferAV1, matrix_coefficients);
+    O(VADecPictureParameterBufferAV1, seq_info_fields);
+    O(VADecPictureParameterBufferAV1, current_frame);
+    O(VADecPictureParameterBufferAV1, current_display_picture);
+    O(VADecPictureParameterBufferAV1, anchor_frames_num);
+    O(VADecPictureParameterBufferAV1, anchor_frames_list);
+    O(VADecPictureParameterBufferAV1, frame_width_minus1);
+    O(VADecPictureParameterBufferAV1, frame_height_minus1);
+    O(VADecPictureParameterBufferAV1, output_frame_width_in_tiles_minus_1);
+    O(VADecPictureParameterBufferAV1, output_frame_height_in_tiles_minus_1);
+    O(VADecPictureParameterBufferAV1, ref_frame_map);
+    O(VADecPictureParameterBufferAV1, ref_frame_idx);
+    O(VADecPictureParameterBufferAV1, primary_ref_frame);
+    O(VADecPictureParameterBufferAV1, order_hint);
+    O(VADecPictureParameterBufferAV1, seg_info);
+    O(VADecPictureParameterBufferAV1, film_grain_info);
+    O(VADecPictureParameterBufferAV1, tile_cols);
+    O(VADecPictureParameterBufferAV1, tile_rows);
+    O(VADecPictureParameterBufferAV1, width_in_sbs_minus_1);
+    O(VADecPictureParameterBufferAV1, height_in_sbs_minus_1);
+    O(VADecPictureParameterBufferAV1, tile_count_minus_1);
+    O(VADecPictureParameterBufferAV1, context_update_tile_id);
+    O(VADecPictureParameterBufferAV1, pic_info_fields);
+    O(VADecPictureParameterBufferAV1, superres_scale_denominator);
+    O(VADecPictureParameterBufferAV1, interp_filter);
+    O(VADecPictureParameterBufferAV1, filter_level);
+    O(VADecPictureParameterBufferAV1, filter_level_u);
+    O(VADecPictureParameterBufferAV1, filter_level_v);
+    O(VADecPictureParameterBufferAV1, loop_filter_info_fields);
+    O(VADecPictureParameterBufferAV1, ref_deltas);
+    O(VADecPictureParameterBufferAV1, mode_deltas);
+    O(VADecPictureParameterBufferAV1, base_qindex);
+    O(VADecPictureParameterBufferAV1, y_dc_delta_q);
+    O(VADecPictureParameterBufferAV1, u_dc_delta_q);
+    O(VADecPictureParameterBufferAV1, u_ac_delta_q);
+    O(VADecPictureParameterBufferAV1, v_dc_delta_q);
+    O(VADecPictureParameterBufferAV1, v_ac_delta_q);
+    O(VADecPictureParameterBufferAV1, qmatrix_fields);
+    O(VADecPictureParameterBufferAV1, mode_control_fields);
+    O(VADecPictureParameterBufferAV1, cdef_damping_minus_3);
+    O(VADecPictureParameterBufferAV1, cdef_bits);
+    O(VADecPictureParameterBufferAV1, cdef_y_strengths);
+    O(VADecPictureParameterBufferAV1, cdef_uv_strengths);
+    O(VADecPictureParameterBufferAV1, loop_restoration_fields);
+    O(VADecPictureParameterBufferAV1, wm);
+    O(VADecPictureParameterBufferAV1, va_reserved);
+    printf("count VADecPictureParameterBufferAV1 wm      %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->wm) /
+               sizeof(((VADecPictureParameterBufferAV1 *)0)->wm[0]));
+    printf("size  union seq_info_fields                  %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->seq_info_fields));
+    printf("size  union pic_info_fields                  %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->pic_info_fields));
+    printf("size  union loop_filter_info_fields          %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->loop_filter_info_fields));
+    printf("size  union qmatrix_fields                   %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->qmatrix_fields));
+    printf("size  union mode_control_fields              %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->mode_control_fields));
+    printf("size  union loop_restoration_fields          %zu\n",
+           sizeof(((VADecPictureParameterBufferAV1 *)0)->loop_restoration_fields));
+
+    S(VASliceParameterBufferAV1);
+    O(VASliceParameterBufferAV1, slice_data_size);
+    O(VASliceParameterBufferAV1, slice_data_offset);
+    O(VASliceParameterBufferAV1, slice_data_flag);
+    O(VASliceParameterBufferAV1, tile_row);
+    O(VASliceParameterBufferAV1, tile_column);
+    O(VASliceParameterBufferAV1, tg_start);
+    O(VASliceParameterBufferAV1, tg_end);
+    O(VASliceParameterBufferAV1, anchor_frame_idx);
+    O(VASliceParameterBufferAV1, tile_idx_in_tile_list);
+    O(VASliceParameterBufferAV1, va_reserved);
+
+    /*
+     * Bit-field allocation order for AV1's six unions — one field at a time, the
+     * same proof the H.264 block makes, repeated here because three of these
+     * unions are NARROWER than a word and a mistake there is invisible in a u32.
+     */
+    {
+        VADecPictureParameterBufferAV1 a;
+        a.seq_info_fields.value = 0;
+        a.seq_info_fields.fields.still_picture = 1;
+        printf("bits av1 seq_info.still_picture=1 -> 0x%08x\n", a.seq_info_fields.value);
+        a.seq_info_fields.value = 0;
+        a.seq_info_fields.fields.film_grain_params_present = 1;
+        printf("bits av1 seq_info.film_grain_params_present=1 -> 0x%08x\n",
+               a.seq_info_fields.value);
+        a.seq_info_fields.value = 0;
+        a.seq_info_fields.fields.mono_chrome = 1;
+        printf("bits av1 seq_info.mono_chrome=1 -> 0x%08x\n", a.seq_info_fields.value);
+
+        a.pic_info_fields.value = 0;
+        a.pic_info_fields.bits.frame_type = 3;
+        printf("bits av1 pic_info.frame_type=3 -> 0x%08x\n", a.pic_info_fields.value);
+        a.pic_info_fields.value = 0;
+        a.pic_info_fields.bits.large_scale_tile = 1;
+        printf("bits av1 pic_info.large_scale_tile=1 -> 0x%08x\n", a.pic_info_fields.value);
+        a.pic_info_fields.value = 0;
+        a.pic_info_fields.bits.use_ref_frame_mvs = 1;
+        printf("bits av1 pic_info.use_ref_frame_mvs=1 -> 0x%08x\n", a.pic_info_fields.value);
+
+        a.loop_filter_info_fields.value = 0;
+        a.loop_filter_info_fields.bits.sharpness_level = 7;
+        printf("bits av1 loop_filter_info.sharpness_level=7 -> 0x%02x\n",
+               a.loop_filter_info_fields.value);
+        a.loop_filter_info_fields.value = 0;
+        a.loop_filter_info_fields.bits.mode_ref_delta_update = 1;
+        printf("bits av1 loop_filter_info.mode_ref_delta_update=1 -> 0x%02x\n",
+               a.loop_filter_info_fields.value);
+
+        a.qmatrix_fields.value = 0;
+        a.qmatrix_fields.bits.using_qmatrix = 1;
+        printf("bits av1 qmatrix.using_qmatrix=1 -> 0x%04x\n", a.qmatrix_fields.value);
+        a.qmatrix_fields.value = 0;
+        a.qmatrix_fields.bits.qm_v = 0xf;
+        printf("bits av1 qmatrix.qm_v=0xf -> 0x%04x\n", a.qmatrix_fields.value);
+
+        a.mode_control_fields.value = 0;
+        a.mode_control_fields.bits.delta_q_present_flag = 1;
+        printf("bits av1 mode_control.delta_q_present_flag=1 -> 0x%08x\n",
+               a.mode_control_fields.value);
+        a.mode_control_fields.value = 0;
+        a.mode_control_fields.bits.skip_mode_present = 1;
+        printf("bits av1 mode_control.skip_mode_present=1 -> 0x%08x\n",
+               a.mode_control_fields.value);
+        a.mode_control_fields.value = 0;
+        a.mode_control_fields.bits.tx_mode = 3;
+        printf("bits av1 mode_control.tx_mode=3 -> 0x%08x\n", a.mode_control_fields.value);
+
+        a.loop_restoration_fields.value = 0;
+        a.loop_restoration_fields.bits.yframe_restoration_type = 3;
+        printf("bits av1 loop_restoration.yframe_restoration_type=3 -> 0x%04x\n",
+               a.loop_restoration_fields.value);
+        a.loop_restoration_fields.value = 0;
+        a.loop_restoration_fields.bits.lr_uv_shift = 1;
+        printf("bits av1 loop_restoration.lr_uv_shift=1 -> 0x%04x\n",
+               a.loop_restoration_fields.value);
+
+        VASegmentationStructAV1 s;
+        s.segment_info_fields.value = 0;
+        s.segment_info_fields.bits.enabled = 1;
+        printf("bits av1 segment_info.enabled=1 -> 0x%08x\n", s.segment_info_fields.value);
+        s.segment_info_fields.value = 0;
+        s.segment_info_fields.bits.update_data = 1;
+        printf("bits av1 segment_info.update_data=1 -> 0x%08x\n", s.segment_info_fields.value);
+
+        VAFilmGrainStructAV1 g;
+        g.film_grain_info_fields.value = 0;
+        g.film_grain_info_fields.bits.apply_grain = 1;
+        printf("bits av1 film_grain.apply_grain=1 -> 0x%08x\n", g.film_grain_info_fields.value);
+        g.film_grain_info_fields.value = 0;
+        g.film_grain_info_fields.bits.clip_to_restricted_range = 1;
+        printf("bits av1 film_grain.clip_to_restricted_range=1 -> 0x%08x\n",
+               g.film_grain_info_fields.value);
+        g.film_grain_info_fields.value = 0;
+        g.film_grain_info_fields.bits.grain_scale_shift = 3;
+        printf("bits av1 film_grain.grain_scale_shift=3 -> 0x%08x\n",
+               g.film_grain_info_fields.value);
+    }
+
+    printf("enum VAProfileAV1Profile0                   %d\n", VAProfileAV1Profile0);
+    printf("enum VAProfileAV1Profile1                   %d\n", VAProfileAV1Profile1);
+    printf("enum VAAV1TransformationIdentity            %d\n", VAAV1TransformationIdentity);
+    printf("enum VAAV1TransformationTranslation         %d\n", VAAV1TransformationTranslation);
+    printf("enum VAAV1TransformationRotzoom             %d\n", VAAV1TransformationRotzoom);
+    printf("enum VAAV1TransformationAffine              %d\n", VAAV1TransformationAffine);
+    printf("enum VA_RT_FORMAT_YUV420_10                 0x%08x\n", VA_RT_FORMAT_YUV420_10);
+    printf("enum VA_RT_FORMAT_YUV420                    0x%08x\n", VA_RT_FORMAT_YUV420);
 
     printf("VA_PADDING_LOW=%d VA_PADDING_MEDIUM=%d\n", VA_PADDING_LOW, VA_PADDING_MEDIUM);
 

@@ -1,5 +1,6 @@
-//! Native VAAPI decode for the Linux clients — M6 of the native-decode program, and
-//! the VAAPI counterpart of [`pf_vkdecode`] and `pf-dxvadec`.
+//! Native VAAPI decode for the Linux clients — M6 (H.264/HEVC) and M7 (AV1) of the
+//! native-decode program, and the VAAPI counterpart of [`pf_vkdecode`] and
+//! `pf-dxvadec`.
 //!
 //! Like `pf-dxvadec`, this crate is the **CPU-testable half**: everything between
 //! pf-bitstream's per-AU plan and the buffers a `vaRenderPicture` call delivers. It
@@ -8,19 +9,26 @@
 //! `cfg(target_os = "linux")` code that only a box can build, so anything left inside
 //! that boundary is verified by a remote `cargo check` and nothing more.
 //!
-//! - [`va`]: the libva decode buffer layouts, **hand-declared**, with every size and
-//!   offset measured off the real headers and pinned as compile-time assertions.
+//! - [`va`] / [`va_h265`] / [`va_av1`]: the libva decode buffer layouts,
+//!   **hand-declared**, with every size and offset measured off the real headers and
+//!   pinned as compile-time assertions.
 //! - [`config`]: profile, render-target format and surface-count decisions.
-//! - [`pic`]: one `AuPlan` into picture parameters, IQ matrices and slice records.
+//! - [`pic`] / [`pic_h265`] / [`pic_av1`]: one `AuPlan` into picture parameters, IQ
+//!   matrices and slice records (AV1: tile records, and no IQ matrix at all).
 //!
 //! # Status
 //!
-//! **Both codecs converted, and the rung is wired.** `pf-client-core`'s
+//! **All three codecs converted, and the rung is wired.** `pf-client-core`'s
 //! `video_vaapi_native` dlopens libva and drives these buffers; this crate holds
 //! everything decidable without a device — including [`drm`], the export
 //! descriptor the driver writes back and the plane walk that reads it.
 //!
-//! Four things this crate settled that a reader would otherwise have to re-derive:
+//! ⚠ **Nothing here has decoded a frame.** The rung is pin-only
+//! (`PUNKTFUNK_DECODER=native-vaapi`) and no VAAPI hardware has been reachable
+//! during M7, so everything below is a CPU-side conversion checked against
+//! libavcodec and against measured layouts, not against a picture.
+//!
+//! Five things this crate settled that a reader would otherwise have to re-derive:
 //!
 //! * **`slice_data_bit_offset` costs no new parsing.** VAAPI is the only one of the
 //!   three backends that wants a bit position — DXVA takes a byte offset, Vulkan
@@ -45,6 +53,12 @@
 //!   vendored `PredWeightTable` stores `luma_offset_l0` as `[i8; 32]` but
 //!   `luma_offset_l1` as `[i16; 32]`, an upstream inconsistency, while libva wants
 //!   `i16` for both.
+//! * **AV1's reference plumbing is a FIFTH convention**, and libva's AV1 buffers
+//!   break three of this rung's other habits: the "slice" parameter buffer is a TILE
+//!   parameter buffer, several of its records share ONE data buffer (the only place
+//!   `vaCreateBuffer`'s `num_elements` is not 1), and there is no IQ matrix buffer at
+//!   all. [`va_av1`] states the convention and what it was established from;
+//!   [`pic_av1`] is where it is applied.
 //!
 //! # Why the slot ledger is borrowed
 //!
@@ -59,14 +73,30 @@
 pub mod config;
 pub mod drm;
 pub mod pic;
+pub mod pic_av1;
 pub mod pic_h265;
 pub mod va;
+pub mod va_av1;
 pub mod va_h265;
 
 /// The DPB slot ledger — borrowed, not redefined (crate docs).
 pub use pf_vkdecode::SlotError;
 pub use pf_vkdecode::SlotMap;
 
+/// The AV1 planner and its plan. ⚠ Its `plan_au` returns a **`Vec`**: an AV1 access
+/// unit is a TEMPORAL UNIT and may carry several frames, of which at most one
+/// displays.
+pub use pf_bitstream::av1::AuPlan as AuPlanAv1;
+pub use pf_bitstream::av1::Av1Planner;
+pub use pf_bitstream::av1::DpbUpdate as DpbUpdateAv1;
+pub use pf_bitstream::av1::FrameType as FrameTypeAv1;
+pub use pf_bitstream::av1::ParsedFrameHeader as ParsedFrameHeaderAv1;
+pub use pf_bitstream::av1::ParsedSequenceHeader as ParsedSequenceHeaderAv1;
+pub use pf_bitstream::av1::PicId as PicIdAv1;
+pub use pf_bitstream::av1::PicturePlan as PicturePlanAv1;
+pub use pf_bitstream::av1::PlanError as PlanErrorAv1;
+pub use pf_bitstream::av1::PlanWarning as PlanWarningAv1;
+pub use pf_bitstream::av1::NUM_REF_SLOTS;
 /// The planners and plans this crate converts, re-exported so the Linux layer names
 /// every type it touches through `pf_vaadec` — the same courtesy `pf-dxvadec` does
 /// for the Windows layer.
@@ -83,6 +113,7 @@ pub use pf_bitstream::h265::PlanWarning as PlanWarningH265;
 /// Which warnings mean the PICTURE is damaged — pf-vkdecode's one list, so all three
 /// native rungs conceal on exactly the same predicate.
 pub use pf_vkdecode::is_integrity_warning;
+pub use pf_vkdecode::is_integrity_warning_av1;
 pub use pf_vkdecode::is_integrity_warning_h265;
 
 pub use drm::flatten;
@@ -101,10 +132,15 @@ pub use config::surface_count;
 pub use config::Codec;
 pub use config::ConfigError;
 pub use config::VaProfile;
+pub use config::AV1_MAX_DPB_FRAMES;
 pub use config::VA_ENTRYPOINT_VLD;
 pub use pic::plan_to_va;
 pub use pic::DecodePlanVa;
 pub use pic::PlanToVaError;
+pub use pic_av1::plan_to_va_av1;
+pub use pic_av1::DecodePlanVaAv1;
+pub use pic_av1::PlanToVaAv1Error;
+pub use pic_av1::TileGroupVa;
 pub use pic_h265::plan_to_va_h265;
 pub use pic_h265::DecodePlanVaH265;
 pub use pic_h265::PlanToVaH265Error;

@@ -80,14 +80,22 @@ pub struct RefPic {
 /// What one picture's own frame header said, kept for as long as that picture can
 /// serve as a reference.
 ///
-/// Every backend has a per-REFERENCE structure — Vulkan's
-/// `StdVideoDecodeAV1ReferenceInfo`, DXVA's `DXVA_PicEntry_AV1`, libva's
-/// `VAReferenceFrameAV1` — and each of them asks questions about the reference
-/// picture, not about the frame being decoded. Answering them from the CURRENT
-/// header is the shape of a whole bug class: it compiles, it looks like the fields
-/// are filled, and the hardware predicts from a picture it has been told the wrong
-/// things about. So the answers are recorded once, where they are unambiguous —
-/// when the picture is STORED into its slots — and travel on the slot.
+/// Two of the three backends have a per-REFERENCE structure — Vulkan's
+/// `StdVideoDecodeAV1ReferenceInfo` and DXVA's `DXVA_PicEntry_AV1` — and each of them
+/// asks questions about the reference picture, not about the frame being decoded.
+/// Answering them from the CURRENT header is the shape of a whole bug class: it
+/// compiles, it looks like the fields are filled, and the hardware predicts from a
+/// picture it has been told the wrong things about. So the answers are recorded once,
+/// where they are unambiguous — when the picture is STORED into its slots — and travel
+/// on the slot.
+///
+/// ⚠ **VA-API has no such structure at all.** An earlier revision of this comment
+/// named a `VAReferenceFrameAV1`; libva 2.23.0 does not declare one (measured, `grep
+/// -c` is 0). Its `ref_frame_map` is a bare array of `VASurfaceID`, and a driver reads
+/// every per-reference answer off the surface — which is why the same revision's claim
+/// about [`Self::upscaled_width`] below was wrong too, and why an invented type name
+/// is worth correcting rather than leaving as harmless prose: it is what sent somebody
+/// looking for a field to fill.
 ///
 /// [`Av1Planner::refresh_slots`] is the only writer, and [`RefState::of`] the only
 /// way to build one.
@@ -101,10 +109,15 @@ pub struct RefState {
     /// AV1 lets every frame pick its own size up to the sequence maximum without a
     /// key frame, and a decoder predicting from a differently-sized reference
     /// SCALES the motion (7.11.3.3 derives `xStep` from `RefUpscaledWidth[refIdx]`).
-    /// So the per-reference structures ask for it: DXVA's `DXVA_PicEntry_AV1` has
-    /// `width`/`height` fields, VA-API's `VADecPictureParameterBufferAV1` has
-    /// `ref_frame_width`/`height`. Answering from the CURRENT header makes every
+    /// So **DXVA** asks for it per reference: `DXVA_PicEntry_AV1` has `width` and
+    /// `height` fields, and answering them from the CURRENT header makes every
     /// scaled prediction read as unscaled.
+    ///
+    /// ⚠ **VA-API does not.** `VADecPictureParameterBufferAV1` carries no
+    /// `ref_frame_width`/`ref_frame_height` at all (measured against libva 2.23.0's
+    /// `va_dec_av1.h`: `grep -c ref_frame_width` is 0), because its `ref_frame_map`
+    /// holds `VASurfaceID`s and a driver reads each reference's dimensions off the
+    /// surface. An earlier revision of this comment claimed otherwise.
     pub upscaled_width: u32,
     /// The picture's own `FrameHeight`, on the same terms as
     /// [`Self::upscaled_width`]. (There is no superres in the vertical direction,
