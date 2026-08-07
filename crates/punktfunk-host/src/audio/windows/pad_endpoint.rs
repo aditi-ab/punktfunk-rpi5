@@ -132,13 +132,15 @@ pub struct PadEndpoint {
 // --- the stamp set -------------------------------------------------------------------------
 
 /// One endpoint property to stamp: the property-store key, the value, a short log label.
-struct Stamp {
-    label: &'static str,
-    key: PROPERTYKEY,
-    value: StampValue,
+/// pub(crate): the minted-audio provider stamps its endpoint names through the same machinery
+/// (store-first, registry fallback, served-check) — see [`write_stamps`].
+pub(crate) struct Stamp {
+    pub(crate) label: &'static str,
+    pub(crate) key: PROPERTYKEY,
+    pub(crate) value: StampValue,
 }
 
-enum StampValue {
+pub(crate) enum StampValue {
     Str(&'static str),
     /// The PFDS container (VT_CLSID / serialized-CLSID registry blob).
     Container(GUID),
@@ -154,9 +156,10 @@ const fn pkey(fmtid: u128, pid: u32) -> PROPERTYKEY {
 }
 
 /// `PKEY_Device_DeviceDesc` — the "description" half of the endpoint display name.
-const PKEY_DEVICE_DESC: PROPERTYKEY = pkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
+pub(crate) const PKEY_DEVICE_DESC: PROPERTYKEY = pkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
 /// Endpoint-store "device name" half of the display name.
-const PKEY_ENDPOINT_DEVICE_NAME: PROPERTYKEY = pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 6);
+pub(crate) const PKEY_ENDPOINT_DEVICE_NAME: PROPERTYKEY =
+    pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 6);
 /// Endpoint-store devnode link: `"{1}.<device instance id>"` — how an endpoint is tied back to
 /// the devnode that owns it.
 const PKEY_ENDPOINT_DEVNODE: PROPERTYKEY = pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 2);
@@ -991,7 +994,14 @@ fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
 /// restart), raw registry for whatever it rejects. Idempotent — already-served keys are
 /// skipped entirely.
 fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
-    let stamps = active_stamps(pad_index);
+    write_stamps(endpoint_id, &active_stamps(pad_index))
+}
+
+/// The generic stamp writer behind [`stamp_endpoint`], shared with the minted-audio provider
+/// (which stamps "Punktfunk Speakers/Microphone" names — field-measured necessity: without
+/// them even the box's owner could not tell the minted instances from Steam's primaries in
+/// the Sound settings zoo).
+pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
     let dev = open_mmdevice(endpoint_id)?;
     let pending: Vec<&Stamp> = {
         // SAFETY: read-only property store on a COM-initialized thread.
@@ -1000,7 +1010,7 @@ fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
         stamps.iter().filter(|s| !stamp_served(&store, s)).collect()
     };
     if pending.is_empty() {
-        tracing::debug!(endpoint = %endpoint_id, pad = pad_index, "pad endpoint already fully stamped");
+        tracing::debug!(endpoint = %endpoint_id, "endpoint already fully stamped");
         return Ok(());
     }
     let mut via_store: Vec<&'static str> = Vec::new();
@@ -1041,10 +1051,9 @@ fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
     }
     tracing::info!(
         endpoint = %endpoint_id,
-        pad = pad_index,
         property_store = ?via_store,
         registry = ?via_registry.iter().map(|s| s.label).collect::<Vec<_>>(),
-        "pad endpoint stamped (route per key)"
+        "endpoint stamped (route per key)"
     );
     Ok(())
 }
@@ -1197,6 +1206,11 @@ fn registry_stamp(endpoint_id: &str, stamps: &[&Stamp]) -> Result<()> {
 /// i.e. the audio stack SERVES the identity rather than merely storing it. Any error counts as
 /// "not served" (the only consumer is the needs-AEB-kick decision).
 fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
+    stamps_served(endpoint_id, &active_stamps(pad_index))
+}
+
+/// [`all_served`]'s generic body — shared with the minted-audio provider.
+pub(crate) fn stamps_served(endpoint_id: &str, stamps: &[Stamp]) -> bool {
     let Ok(dev) = open_mmdevice(endpoint_id) else {
         return false;
     };
@@ -1204,9 +1218,7 @@ fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
     let Ok(store) = (unsafe { dev.OpenPropertyStore(STGM_READ) }) else {
         return false;
     };
-    active_stamps(pad_index)
-        .iter()
-        .all(|s| stamp_served(&store, s))
+    stamps.iter().all(|s| stamp_served(&store, s))
 }
 
 // --- public provisioning API ----------------------------------------------------------------

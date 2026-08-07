@@ -230,6 +230,17 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
         Role::Speakers => None,
     };
 
+    // Stamp the human name onto every endpoint of the role. Field-measured necessity, not
+    // cosmetics: unstamped, the minted instances read "Lautsprecher (2- Steam Streaming
+    // Microphone)" etc. and even the box's owner picked the wrong device out of the Sound
+    // settings zoo. Names only (a wider stamp set makes AudioEndpointBuilder re-mint the
+    // endpoint under a new GUID — the pad program measured that); stamping needs the SYSTEM
+    // ACL route on the MMDevices keys, so a dev-run devtest may leave the names unstamped —
+    // the wiring never depends on them (identity is the recorded id).
+    for ep in [Some(&render), capture.as_ref()].into_iter().flatten() {
+        stamp_name(ep, role);
+    }
+
     // Freshly registered endpoints can grab a default; the wiring plan owns default policy,
     // not the mint.
     if let Some(prev) = prev_render {
@@ -253,6 +264,59 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
         }
     }
     Ok((devnode, render, capture))
+}
+
+/// How many stamp/settle passes a name gets before we accept "stored but not yet served"
+/// (a settled endpoint takes the stamp on the first pass; a freshly minted one may need the
+/// audio stack to notice — it serves after the next Audiosrv restart/reboot at the latest).
+const STAMP_ATTEMPTS: usize = 3;
+/// Settle time between a stamp write and its served-check (mirrors the pad provisioner:
+/// checking immediately reports success on passes that later get reverted).
+const STAMP_SETTLE: Duration = Duration::from_millis(1200);
+
+/// Best-effort: write the role's display name onto one endpoint and wait for the audio stack
+/// to SERVE it. Never fails the role — an unnamed endpoint still wires correctly by id.
+fn stamp_name(endpoint_id: &str, role: Role) {
+    let stamps = [
+        pe::Stamp {
+            label: "device-desc",
+            key: pe::PKEY_DEVICE_DESC,
+            value: pe::StampValue::Str(role.desc()),
+        },
+        pe::Stamp {
+            label: "device-name",
+            key: pe::PKEY_ENDPOINT_DEVICE_NAME,
+            value: pe::StampValue::Str("Punktfunk"),
+        },
+    ];
+    // Steady state (every boot after the first): the names are already served — no writes,
+    // no settle sleeps.
+    if pe::stamps_served(endpoint_id, &stamps) {
+        return;
+    }
+    for attempt in 0..STAMP_ATTEMPTS {
+        if let Err(e) = pe::write_stamps(endpoint_id, &stamps) {
+            tracing::info!(role = role.label(), endpoint = %endpoint_id,
+                error = %format!("{e:#}"),
+                "could not stamp the minted endpoint's name (needs the SYSTEM ACL route) — \
+                 the endpoint still wires correctly, it just keeps the driver's default name");
+            return;
+        }
+        thread::sleep(STAMP_SETTLE);
+        if pe::stamps_served(endpoint_id, &stamps) {
+            if attempt > 0 {
+                tracing::debug!(
+                    role = role.label(),
+                    attempt = attempt + 1,
+                    "minted endpoint name held after a re-pass"
+                );
+            }
+            return;
+        }
+    }
+    tracing::info!(role = role.label(), endpoint = %endpoint_id,
+        "minted endpoint name is stored but not yet served — it appears after the next \
+         audio-stack restart or reboot");
 }
 
 /// Poll audiosrv for the endpoint a minted devnode registers in one direction.
