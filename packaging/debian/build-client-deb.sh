@@ -2,10 +2,19 @@
 # Build the punktfunk-client .deb (the native GTK4 client) for Ubuntu/Debian desktops.
 #
 # Counterpart to build-deb.sh (the host package); same conventions: runtime Depends are
-# computed by dpkg-shlibdeps from the binary's DT_NEEDED (GTK4/libadwaita, SDL3, the
-# FFmpeg/PipeWire/Opus sonames), so build inside the Ubuntu 26.04 rust-ci image to pin
+# computed by dpkg-shlibdeps from the binaries' DT_NEEDED (GTK4/libadwaita, SDL3, the
+# PipeWire/Opus sonames), so build inside the Ubuntu 26.04 rust-ci image to pin
 # the package names the target boxes ship. The client links no NVIDIA libs — no filter
 # needed.
+#
+# NO libav* here since M10 (design/client-native-decode.md §6): the client decodes with
+# pf-vkdecode / pf-vaadec (libva is dlopen'd, never linked) / openh264+rav1d, so nothing in
+# either binary has an FFmpeg DT_NEEDED and shlibdeps stops emitting `libavcodec…` on its
+# own — there is no list here to prune, which is exactly the property to keep. That also
+# ends the soname coupling that forced the host package's BUNDLE_FFMPEG dance: a client
+# .deb built on 26.04 no longer names a libavcodec the target box must have.
+# The HOST package (build-deb.sh) is unchanged — it encodes with libavcodec and still
+# depends on / bundles it.
 #
 # Usage: VERSION=0.0.1~ci42.gdeadbee [ARCH=amd64] [TARGET=<rust triple>] \
 #          bash packaging/debian/build-client-deb.sh
@@ -103,7 +112,17 @@ install -Dm0644 LICENSE-MIT                              "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                           "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                                "$DOCDIR/README.md"
 # Third-party crate attributions (regenerate with scripts/gen-third-party-notices.sh).
-if [ -f THIRD-PARTY-NOTICES.txt ]; then
+#
+# The CLIENT-scoped copy, not the workspace-wide one at the repo root: the root file is the host's
+# and still lists ffmpeg-next plus the full FFmpeg licence text, while this package links no FFmpeg
+# at all since M10. It is the same file the GTK shell shows on its About → Legal page, so the
+# installed doc and the running app say the same thing. Falls back to the root file only if the
+# generated copy is missing (an old checkout), because shipping no attribution at all is worse.
+if [ -f clients/linux/THIRD-PARTY-NOTICES.txt ]; then
+    install -Dm0644 clients/linux/THIRD-PARTY-NOTICES.txt "$DOCDIR/THIRD-PARTY-NOTICES.txt"
+elif [ -f THIRD-PARTY-NOTICES.txt ]; then
+    echo "warning: clients/linux/THIRD-PARTY-NOTICES.txt missing — shipping the workspace-wide" \
+         "file, which attributes host-only dependencies to the client" >&2
     install -Dm0644 THIRD-PARTY-NOTICES.txt "$DOCDIR/THIRD-PARTY-NOTICES.txt"
 fi
 

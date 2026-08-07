@@ -1,13 +1,12 @@
 //! The stream's per-frame colour signalling (`ColorDesc`) + the Y′CbCr→RGB CSC matrix (`csc_rows`).
-#![allow(clippy::unnecessary_cast)]
 
-use ffmpeg_next as ffmpeg;
-
-/// The stream's colour signaling, read PER-FRAME from the decoder (HEVC VUI → the
-/// `AVFrame` CICP fields). The Windows host switches an HDR desktop to Main10 BT.2020 PQ
-/// **in-band** (the Welcome still says SDR — clients are expected to follow the VUI, as
-/// the Windows/Apple/Android clients do), so rendering must follow the frames, not the
-/// handshake — else PQ content drawn as BT.709 comes out washed out and desaturated.
+/// The stream's colour signaling, read PER-FRAME out of the bitstream's own VUI /
+/// sequence header (pf-bitstream, on every rung — the libavcodec `AVFrame` CICP read this
+/// used to have went with M10's rungs). The Windows host switches an HDR desktop to
+/// Main10 BT.2020 PQ **in-band** (the Welcome still says SDR — clients are expected to
+/// follow the VUI, as the Windows/Apple/Android clients do), so rendering must follow the
+/// frames, not the handshake — else PQ content drawn as BT.709 comes out washed out and
+/// desaturated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ColorDesc {
     /// H.273 code points as signaled (2 = unspecified → the renderer picks the SDR default).
@@ -18,24 +17,6 @@ pub struct ColorDesc {
 }
 
 impl ColorDesc {
-    /// Read the CICP fields off a raw decoded frame. Public: the Windows client's raw-FFI
-    /// D3D11VA/software decoders build their per-frame `ColorDesc` with it too (same
-    /// `ffmpeg-next` major, so the `AVFrame` type unifies across the workspace).
-    ///
-    /// # Safety
-    /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
-    pub unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
-        // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
-        unsafe {
-            ColorDesc {
-                primaries: (*frame).color_primaries as u32 as u8,
-                transfer: (*frame).color_trc as u32 as u8,
-                matrix: (*frame).colorspace as u32 as u8,
-                full_range: (*frame).color_range == ffmpeg::ffi::AVColorRange::AVCOL_RANGE_JPEG,
-            }
-        }
-    }
-
     /// PQ (SMPTE ST.2084) transfer — the HDR10 signal.
     pub fn is_pq(&self) -> bool {
         self.transfer == 16
@@ -55,7 +36,9 @@ impl ColorDesc {
 /// `65535/65472` recovers exact `code/1023`.
 pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
     // BT.601 (5/6), BT.2020 (9/10); everything else — incl. unspecified — is the host's
-    // BT.709 SDR default (mirrors the software path's swscale coefficient choice).
+    // BT.709 SDR default. Since M8 this is the ONLY coefficient choice in the client:
+    // the software rung's swscale (which defaulted to BT.601 and needed correcting) is
+    // gone, and its planes come through this function like every hardware lane's.
     let (kr, kb) = match desc.matrix {
         5 | 6 => (0.299, 0.114),
         9 | 10 => (0.2627, 0.0593),

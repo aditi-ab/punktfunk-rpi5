@@ -46,9 +46,11 @@ sudo apt install build-essential clang libclang-dev pkg-config cmake \
   libvulkan-dev
 ```
 
-(The last two groups are the Linux client shell and `pf-ffvk`; skip them only if you never build
-those crates. `scripts/bootstrap-ubuntu.sh` sets up an Ubuntu **capture-test host** — NVIDIA, Sway,
-PipeWire — and is not a substitute for the list above.)
+(The last two groups are the Linux client shell and the Vulkan session presenter; skip them only
+if you never build those crates. `libvulkan-dev` is for the LOADER's pkg-config/soname — ash
+dlopens it, and the client links no FFmpeg at all, so no libav*-dev appears here.
+`scripts/bootstrap-ubuntu.sh` sets up an Ubuntu **capture-test host** — NVIDIA, Sway, PipeWire —
+and is not a substitute for the list above.)
 
 ## Before you push
 

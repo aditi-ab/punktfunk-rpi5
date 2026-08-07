@@ -2,7 +2,7 @@
 
 The native **Windows** app for streaming a punktfunk host to your PC. A modern WinUI 3 app that
 discovers hosts on your network, pairs with a PIN, and streams at your display's own resolution and
-refresh rate — with a hardware-accelerated D3D11 video path and HDR.
+refresh rate — with hardware-accelerated video decode and HDR.
 
 It's **pure Rust**: the UI is WinUI 3 driven through [windows-reactor](https://github.com/microsoft/windows-rs)
 (a declarative, React-like framework), and it links the shared **`punktfunk-core`** directly to speak
@@ -10,9 +10,11 @@ the fast **`punktfunk/1`** protocol.
 
 ## Features
 
-- **Hardware decode, GPU present** — FFmpeg HEVC with a **D3D11VA zero-copy path** (decoder and
-  presenter share one D3D11 device; NV12/P010 textures sampled straight into a `SwapChainPanel`
-  composition swapchain), with a robust software-decode fallback.
+- **Hardware decode, GPU present** — Punktfunk's own decoders, no FFmpeg anywhere in the client:
+  **Vulkan Video** (`pf-vkdecode`) leads on NVIDIA and AMD, **D3D11VA** (`pf-dxvadec` driving
+  `ID3D11VideoDecoder`) leads on Intel, whichever isn't first is the fallback, and an
+  OpenH264/rav1d CPU rung is last. Either hardware rung hands its surface to the Vulkan presenter
+  without a CPU copy.
 - **HDR10** — advertise 10-bit/HDR, detect PQ in-band, and flip the swapchain to `R10G10B10A2` +
   ST.2084 with HDR10 metadata.
 - **Your display's native mode** — the host builds a virtual display at exactly your WxH@Hz.
@@ -42,9 +44,9 @@ A stock [Moonlight](https://moonlight-stream.org/) client also works over GameSt
 ## Build from source
 
 Windows-only (the crate builds as a stub on other platforms so the workspace stays green). You need
-the MSVC toolchain, an `FFMPEG_DIR` FFmpeg tree, and CMake (SDL3 builds from source). The Windows
-App SDK runtime bootstrap is staged next to the exe by `windows-reactor-setup` from this crate's
-own `build.rs` — no extra environment needed.
+the MSVC toolchain and CMake (SDL3 builds from source) — nothing else: decode is native since M10,
+so there is no `FFMPEG_DIR` to point anywhere, and the Windows App SDK runtime bootstrap is staged
+next to the exe by `windows-reactor-setup` from this crate's own `build.rs`.
 
 ```sh
 cargo build -p punktfunk-client-windows --target x86_64-pc-windows-msvc

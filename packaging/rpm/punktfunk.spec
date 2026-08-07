@@ -103,10 +103,12 @@ BuildRequires:  pkgconfig(gbm)
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(sdl3)
-# The client's pf-ffvk crate runs bindgen over FFmpeg's libavutil/hwcontext_vulkan.h, which
-# #include <vulkan/vulkan.h> — provided by vulkan-headers (Fedora).
-BuildRequires:  vulkan-headers
-# It ALSO links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
+# No vulkan-headers BuildRequires: the only crate that ever needed the Vulkan C headers was the
+# client's pf-ffvk, whose bindgen ran over FFmpeg's libavutil/hwcontext_vulkan.h — and M10 deleted
+# it with the rest of the client's FFmpeg. Nothing has replaced that need: pf-vkdecode/pf-presenter
+# reach Vulkan through ash (loader dlopen'd, no headers), and pyrowave-sys builds against its own
+# vendored copy (crates/pyrowave-sys/build.rs).
+# The HOST links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
 # at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
 # without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
 # e.g. `ln -s $(rpm -ql cuda-cudart-devel | grep stubs/libcuda.so | head -1) /usr/lib64/`.
@@ -502,7 +504,11 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %endif
 
 %files client
-%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
+# The CLIENT-scoped notices, not the workspace-wide root file: the root one is the host's and still
+# carries ffmpeg-next plus the full FFmpeg licence text, while this subpackage links no FFmpeg at
+# all since M10. Same file the GTK shell shows on About → Legal (scripts/gen-third-party-notices.sh
+# generates both). `%%license` installs it under its basename, so the path stays the usual one.
+%license LICENSE-MIT LICENSE-APACHE clients/linux/THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-client
 %{_bindir}/punktfunk-session
 %{_bindir}/punktfunk

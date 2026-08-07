@@ -16,8 +16,6 @@ repository.workspace = true
 # Otherwise a consumer that deliberately builds us without `pyrowave` still drags the vendored
 # C++ in — fatal on Windows ARM64, where Granite has no SIMD path.
 pf-client-core = { path = "../pf-client-core", default-features = false }
-# AVVkFrame access (Vulkan Video frames: live sync state under the frames lock).
-pf-ffvk = { path = "../pf-ffvk" }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 
 # `loaded` dlopens libvulkan at runtime (no link-time dependency — GPU-less boxes still

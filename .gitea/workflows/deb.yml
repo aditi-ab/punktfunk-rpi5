@@ -119,10 +119,15 @@ jobs:
         run: |
           apt-get update
           # python3 is used by scripts/ci/gitea-release.sh for the stable-tag release attach.
-          # libvulkan-dev: /usr/include/vulkan/vulkan.h for the client's pf-ffvk bindgen
-          # (FFmpeg's hwcontext_vulkan.h includes it).
+          # No libvulkan-dev: nothing here compiles or links against Vulkan (ash dlopens
+          # libvulkan and pf-vkdecode binds nothing at build time), so neither the compile nor
+          # dpkg-shlibdeps — which resolves DT_NEEDED sonames only — ever asks for it. The
+          # client's `Depends: libvulkan1` is added by hand in packaging/debian/build-client-deb.sh
+          # precisely because a dlopen is invisible to shlibdeps.
+          # No libav*-dev: the client links no FFmpeg since M10 (§6 of
+          # design/client-native-decode.md).
           apt-get install -y --no-install-recommends dpkg-dev python3 \
-            libgtk-4-dev libadwaita-1-dev libsdl3-dev libvulkan-dev
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev
 
       # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
       - name: Cache keys

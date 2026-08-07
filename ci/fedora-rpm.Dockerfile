@@ -27,8 +27,10 @@ RUN dnf -y install \
       mesa-libGL-devel mesa-libgbm-devel \
       # punktfunk-client link deps (GTK4 shell + SDL3 gamepads)
       gtk4-devel libadwaita-devel SDL3-devel \
-      # pf-ffvk bindgen over libavutil/hwcontext_vulkan.h needs <vulkan/vulkan.h>
-      vulkan-headers \
+      # No vulkan-headers: nothing in the workspace compiles against the system Vulkan headers
+      # (pyrowave-sys bindgens its own vendored copy; host and client both reach Vulkan through
+      # ash, which dlopens the loader), and packaging/rpm/punktfunk.spec BuildRequires none.
+      # rpm.yml's HDR gamescope leg needs them and pulls them with `dnf builddep gamescope`.
   && dnf clean all
 
 # bun — both the BUILD tool and the RUNTIME for the punktfunk-web console (`bun run build` -> the

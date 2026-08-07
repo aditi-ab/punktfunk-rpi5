@@ -29,15 +29,16 @@ RUN sed -i 's|^Types: deb$|Types: deb\nArchitectures: amd64|' /etc/apt/sources.l
     && dpkg --add-architecture arm64
 
 # 2. The cross toolchain + every arm64 dev lib the client links. Mirrors the client half of
-#    rust-ci.Dockerfile's list (FFmpeg, PipeWire, Opus, SDL3, GTK4/libadwaita, xkbcommon,
-#    Vulkan headers for pf-ffvk's bindgen over hwcontext_vulkan.h).
+#    rust-ci.Dockerfile's list (FFmpeg, PipeWire, Opus, SDL3, GTK4/libadwaita, xkbcommon). No
+#    Vulkan dev package: nothing compiles or links against Vulkan — ash dlopens the loader, and
+#    pyrowave-sys bindgens its own vendored headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     crossbuild-essential-arm64 \
     libavcodec-dev:arm64 libavformat-dev:arm64 libavutil-dev:arm64 libswscale-dev:arm64 \
     libavfilter-dev:arm64 libavdevice-dev:arm64 \
     libpipewire-0.3-dev:arm64 libopus-dev:arm64 \
     libsdl3-dev:arm64 libgtk-4-dev:arm64 libadwaita-1-dev:arm64 \
-    libwayland-dev:arm64 libxkbcommon-dev:arm64 libvulkan-dev:arm64 \
+    libwayland-dev:arm64 libxkbcommon-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. The Rust target — installed against the toolchain the WORKSPACE pins, not the image's

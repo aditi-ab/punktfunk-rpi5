@@ -55,7 +55,6 @@
   librsvg,
   gsettings-desktop-schemas,
   adwaita-icon-theme,
-  vulkan-headers,
   # web console (punktfunk-web): a bun-built Nitro SSR bundle, run on bun.
   bun,
   nodejs,
@@ -98,7 +97,7 @@ let
       cmake # pyrowave-sys (C++/Vulkan), the vendored libopus (opus crate), aws-lc-sys (rustls)
       nasm # libopus SIMD + OpenH264 (openh264 `source` feature)
       perl # aws-lc-sys asm generation (rustls' aws-lc-rs crypto provider)
-      rustPlatform.bindgenHook # LIBCLANG_PATH + clang args for ffmpeg-sys-next / pf-ffvk / pyrowave-sys bindgen
+      rustPlatform.bindgenHook # LIBCLANG_PATH + clang args for ffmpeg-sys-next (host) / pyrowave-sys bindgen
       addDriverRunpath # provides the `addDriverRunpath` shell fn used in postFixup
     ];
   };
@@ -227,15 +226,12 @@ in
         "--locked -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli "
         + "--no-default-features --features punktfunk-client-session/pyrowave";
 
-      # pf-ffvk runs bindgen over libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`.
-      # There is no /usr/include on NixOS, so hand it the Vulkan-Headers include dir explicitly
-      # (build.rs turns this into a clang `-I`). libavutil's own include path comes from pkg-config.
-      PF_FFVK_VULKAN_INCLUDE = "${vulkan-headers}/include";
-
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ wrapGAppsHook4 ];
 
+      # No ffmpeg: the client decodes natively since M10 (pf-vkdecode / pf-vaadec — libva is
+      # dlopen'd, never linked — / openh264 + rav1d, both built from vendored source). The HOST
+      # derivation above still has it.
       buildInputs = [
-        ffmpeg # FFmpeg decode (pf-client-core) + pf-ffvk links libavutil
         pipewire # PipeWire audio playback + mic capture
         libopus # audiopus_sys → system opus via pkg-config (Opus decode)
         sdl3 # window + gamepads (SDL3 HIDAPI: DualSense touchpad/motion/triggers)

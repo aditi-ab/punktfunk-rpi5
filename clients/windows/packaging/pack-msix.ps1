@@ -4,8 +4,13 @@
 
 .DESCRIPTION
   Builds a packaging layout from a release `cargo build` output (exe + the reactor/SDL3 auto-staged
-  DLLs + resources.pri + FFmpeg DLLs + the checked-in Assets + the manifest), runs makeappx, and
+  DLLs + resources.pri + the checked-in Assets + the manifest), runs makeappx, and
   signs with signtool. Idempotent; safe to re-run.
+
+  NO FFmpeg DLLs since M10 (design/client-native-decode.md §6): the client decodes natively
+  (pf-vkdecode / pf-dxvadec / openh264+rav1d) and link-imports no libav* at all, so the
+  wildcard copy and its LGPL notice are gone with it. The HOST installer is unchanged —
+  packaging/windows/pack-host-installer.ps1 still ships them for its amf-qsv encode path.
 
   Signing cert precedence:
     1. -PfxBase64 / -PfxPassword  (a real or shared code-signing cert, e.g. from CI secrets) — the
@@ -22,8 +27,7 @@
 .EXAMPLE
   # x64 (default arch):
   pwsh -File pack-msix.ps1 -Version 0.2.137.0 -TargetDir C:\t\x86_64-pc-windows-msvc\release -OutDir C:\t\msix
-  # arm64 (point -TargetDir + FFMPEG_DIR at the ARM64 build/tree):
-  $env:FFMPEG_DIR='C:\Users\Public\ffmpeg-arm64'
+  # arm64 (point -TargetDir at the ARM64 build):
   pwsh -File pack-msix.ps1 -Version 0.2.137.0 -Arch arm64 -TargetDir C:\t-a64\aarch64-pc-windows-msvc\release -OutDir C:\t-a64\msix
 #>
 [CmdletBinding()]
@@ -31,7 +35,6 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,                     # 4-part numeric, e.g. 0.2.137.0
     [Parameter(Mandatory = $true)][string]$TargetDir,                   # cargo --release output dir (has the exe)
     [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',                 # package ProcessorArchitecture + artifact suffix
-    [string]$FfmpegBin = $(if ($env:FFMPEG_DIR) { Join-Path $env:FFMPEG_DIR 'bin' } else { 'C:\Users\Public\ffmpeg\bin' }),
     [string]$OutDir = (Join-Path $TargetDir 'msix'),
     [string]$Publisher = 'CN=unom',                                     # MUST equal the signing cert subject DN
     [string]$PfxBase64 = $env:MSIX_CERT_PFX_B64,                        # optional: base64 of a code-signing .pfx
@@ -83,28 +86,32 @@ foreach ($f in $required) {
     Copy-Item $src (Join-Path $layout $f) -Force
 }
 
-# FFmpeg runtime DLLs (the exe link-imports the decode set; copy them all — small and correct).
-# These are unmodified BtbN *lgpl-shared* builds, linked dynamically (replaceable DLLs) — FFmpeg is
-# used under the LGPL v2.1+; the license text + notice ship in licenses\ below.
-$ff = Get-ChildItem -Path $FfmpegBin -Filter *.dll -ErrorAction SilentlyContinue
-if (-not $ff) { throw "no FFmpeg DLLs in $FfmpegBin" }
-$ff | ForEach-Object { Copy-Item $_.FullName (Join-Path $layout $_.Name) -Force }
-
-# license/attribution payload (MSIX has no installer EULA page, so ship them as files): FFmpeg's LGPL
-# notice + license text, the project's own MIT/Apache texts, and the generated third-party notices.
+# license/attribution payload (MSIX has no installer EULA page, so ship them as files): the
+# project's own MIT/Apache texts plus the generated third-party notices, which is where every
+# vendored/statically-linked dependency's attribution lives (openh264 BSD-2, rav1d BSD-2, …).
+#
+# The FFmpeg LGPL notice + license texts that used to be copied here went with the DLLs at M10:
+# nothing in this package links libav* any more, so shipping an LGPL notice would be claiming a
+# dependency that is not there.
+#
+# For the same reason the notices come from clients/windows/ and NOT from the repo root: the root
+# file is workspace-wide, it is what the HOST ships out of, and it still lists ffmpeg-next plus the
+# full FFmpeg licence text. The client-scoped file (same generator, `--packages
+# punktfunk-client-windows,punktfunk-client-session,punktfunk-cli`) is the one that describes what
+# is actually inside this .msix — and it is the same file the app's Licenses page shows.
 $licDir = Join-Path $layout 'licenses'
 New-Item -ItemType Directory -Force -Path $licDir | Out-Null
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
-Copy-Item (Join-Path $repoRoot 'packaging\windows\licenses\FFmpeg-LGPL-NOTICE.txt') $licDir -Force -ErrorAction SilentlyContinue
-foreach ($n in @('THIRD-PARTY-NOTICES.txt', 'LICENSE-MIT', 'LICENSE-APACHE')) {
+$clientRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+foreach ($n in @('LICENSE-MIT', 'LICENSE-APACHE')) {
     $p = Join-Path $repoRoot $n
     if (Test-Path $p) { Copy-Item $p $licDir -Force }
 }
-$ffRoot = Split-Path $FfmpegBin -Parent
-foreach ($lic in @('LICENSE.txt', 'LICENSE', 'COPYING.LGPLv2.1', 'COPYING.LGPLv3', 'COPYING.txt')) {
-    $p = Join-Path $ffRoot $lic
-    if (Test-Path $p) { Copy-Item $p $licDir -Force }
+$notices = Join-Path $clientRoot 'THIRD-PARTY-NOTICES.txt'
+if (-not (Test-Path $notices)) {
+    throw "missing $notices — run scripts/gen-third-party-notices.sh (it generates the per-client copies)"
 }
+Copy-Item $notices $licDir -Force
 
 # tile/store assets
 Copy-Item (Join-Path $assets '*') (Join-Path $layout 'Assets') -Force

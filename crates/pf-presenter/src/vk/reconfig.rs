@@ -42,7 +42,7 @@ impl Presenter {
         // OUR submit, not the presentation engine's semaphore consumption:
         // VUID-vkDestroySemaphore-05149 / VUID-vkDestroySwapchainKHR-01282 on every
         // recreate, and destroy-in-use is exactly the kind of misuse that turns into an
-        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's FFmpeg submits —
+        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's decode submits —
         // both sides hold the shared queue lock — and cheap: a recreate already stalls
         // the stream for a frame, and only happens on resize/HDR-flip/OUT_OF_DATE.
         {
@@ -274,14 +274,11 @@ impl Presenter {
         };
         self.csc.destroy(&self.device); // fence-safe: only our cmd bufs reference it
         self.csc = CscPass::new(&self.device, self.video_format)?;
-        // The planar (PyroWave) pass renders to the same intermediate — rebuild it at the
-        // new format too (an HDR pyrowave session needs the 10-bit intermediate exactly
-        // like the H.26x path; 8-bit PQ bands visibly).
-        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-        if let Some(p) = self.csc_planar.take() {
-            p.destroy(&self.device);
-            self.csc_planar = Some(CscPass::new_planar(&self.device, self.video_format)?);
-        }
+        // The planar pass (PyroWave + the software rung) renders to the same intermediate
+        // — rebuild it at the new format too (an HDR session needs the 10-bit
+        // intermediate exactly like the H.26x path; 8-bit PQ bands visibly).
+        self.csc_planar.destroy(&self.device);
+        self.csc_planar = CscPass::new_planar(&self.device, self.video_format)?;
         if let Some(v) = self.video.take() {
             // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
             // the GPU is known idle for them (the fence/queue-wait on the path here, or the

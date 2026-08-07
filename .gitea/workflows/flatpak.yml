@@ -34,7 +34,10 @@ on:
     # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
     # design/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
     # The bundle ships BOTH client binaries (shell + Vulkan session), so every crate in either
-    # binary's dependency closure must be listed here.
+    # binary's dependency closure must be listed here — including the native decode rungs, or a
+    # commit that only touches the decoder never rebuilds the bundle and the Deck canary quietly
+    # stops tracking it. pf-dxvadec is absent on purpose: it is `cfg(windows)` in pf-client-core
+    # and never enters the Linux closure (windows.yml / windows-msix.yml carry it instead).
     paths:
       - 'clients/linux/**'
       - 'clients/session/**'
@@ -42,6 +45,9 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-console-ui/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-vaadec/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
       - '.gitea/workflows/flatpak.yml'
@@ -128,7 +134,7 @@ jobs:
           # authselect trigger fires — so this line alone was never the fix for the failures
           # below. See the retry.sh bump for the real cause.
           sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
-          # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
+          # Flathub provides the GNOME runtime/SDK + the rust-stable and llvm20 extensions.
           #
           # ROOT CAUSE (confirmed 2026-07-11 by watching a live run on home-runner-1): this is
           # NOT a deterministic nsswitch/DNS-config bug. gitea-runner-fleet on home-runner-1 is
@@ -147,7 +153,7 @@ jobs:
           git config --global --add safe.directory "$PWD"
 
       # This job was the fleet's single heaviest network consumer: every run re-downloaded
-      # the GNOME runtime + SDK + llvm/rust/ffmpeg extensions (multi-GB from Flathub) and
+      # the GNOME runtime + SDK + llvm/rust extensions (multi-GB from Flathub) and
       # every crate source. Both live in well-defined directories, both are idempotently
       # verified/extended by the steps below, and the central cache server restores them
       # at LAN speed — so cache them. Keyed on what actually pins them: the manifest tree
@@ -251,7 +257,8 @@ jobs:
           # or TCP dial costs a backoff-retry instead of the whole (long) compile:
           #   1) --install-deps-only pulls everything the manifest declares from Flathub: the
           #      GNOME 50 runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK
-          #      extensions, plus the runtime's auto codecs-extra (HEVC libavcodec).
+          #      extensions. (No codec extension: the client links no FFmpeg — see the
+          #      manifest header.)
           #   2) --download-only fetches every source (all crates in cargo-sources.json) into
           #      the .flatpak-builder state dir. Both are resumable/idempotent, so re-running
           #      after a partial failure is safe and cheap.

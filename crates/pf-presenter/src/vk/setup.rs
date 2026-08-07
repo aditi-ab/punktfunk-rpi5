@@ -68,9 +68,9 @@ impl Presenter {
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
 
         let app_name = CString::new("punktfunk-session").unwrap();
-        // 1.3: FFmpeg's Vulkan hwcontext requires an instance of at least 1.3 (any
-        // current loader accepts it regardless of device support; device-level gating
-        // happens below).
+        // 1.3: Vulkan Video decode and PyroWave's compute kernels both need a 1.3
+        // device, and the instance version caps what the device can report (any current
+        // loader accepts 1.3 regardless of device support; device-level gating is below).
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .api_version(vk::API_VERSION_1_3);
@@ -189,10 +189,10 @@ impl Presenter {
             dev_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
 
-        // --- Vulkan Video decode (the FFmpeg-on-our-device path) ---------------------
+        // --- Vulkan Video decode (pf-vkdecode, on THIS device) -----------------------
         // Probed, never required: a capable stack gets the video extensions, a second
-        // (decode) queue, and the features FFmpeg's decoder needs; anything less means
-        // `vulkan_decode() == None` and the decoder chain falls back (VAAPI/software).
+        // (decode) queue, and the features the decoder needs; anything less means
+        // `vulkan_decode() == None` and the ladder falls through (VAAPI/D3D11VA/software).
         // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
         // filling locals returned by value.
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
@@ -305,7 +305,8 @@ impl Presenter {
         if video_ok {
             video_ext_names.extend(VIDEO_BASE);
             video_ext_names.extend(&codec_exts);
-            // Optional decoder niceties FFmpeg uses when present.
+            // Optional decoder niceties, enabled when present (pf-vkdecode probes for
+            // them rather than requiring them).
             for opt in [c"VK_KHR_video_maintenance1", c"VK_KHR_video_maintenance2"] {
                 if has(opt) {
                     video_ext_names.push(opt);
@@ -344,7 +345,7 @@ impl Presenter {
         let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
 
         // Enable only the features the video path needs, and only where supported
-        // (harmless when the path is off; reported to FFmpeg via device_features).
+        // (harmless when the path is off; reported to the decode lane via device_features).
         let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
             .sampler_ycbcr_conversion(have_f11.sampler_ycbcr_conversion == vk::TRUE);
         let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -421,31 +422,28 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
         });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
-        // Starts SDR like `csc`; an HDR (PQ) pyrowave session rebuilds it at the 10-bit
+        // Starts SDR like `csc`; an HDR (PQ) session rebuilds it at the 10-bit
         // intermediate via `set_hdr_mode`, exactly like the H.26x pass.
-        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-        let csc_planar = if pyrowave_ok {
-            Some(CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?)
-        } else {
-            None
-        };
+        //
+        // Unconditional since M8. It used to be built only for a device that passed the
+        // pyrowave probe; the SOFTWARE rung now renders through it too, and that rung is
+        // the ladder's last one — gating it on a probe would leave the boxes that failed
+        // the probe with no way to show a software-decoded frame at all.
+        let csc_planar = CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?;
 
-        // The exported handle bundle: FFmpeg Vulkan Video handles when the device can
-        // decode, AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
-        // consumer needs it; `video_decode`/`d3d11_import` tell the decoder chain which
-        // paths are real. Extension lists must mirror creation exactly — FFmpeg keys its
-        // code paths off the strings.
-        // One lock per device for queue external sync (FFmpeg + Skia + this presenter
-        // all funnel their queue calls through it — see the `queue_lock` field docs).
+        // The exported handle bundle: this device's Vulkan handles when it can decode,
+        // AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
+        // consumer needs it; `video_decode`/`d3d11_import` tell the decode ladder which
+        // paths are real. The extension LISTS must mirror creation exactly: the pyrowave
+        // decoder replays them verbatim into its pinned create-info reconstruction.
+        // One lock per device for queue external sync (the decode lane + Skia + this
+        // presenter all funnel their queue calls through it — see the `queue_lock` docs).
         let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         #[cfg(windows)]
         let export_worthy = video_ok || win_capable || pyrowave_ok;
         #[cfg(not(windows))]
         let export_worthy = video_ok || pyrowave_ok;
         let video_export = if export_worthy {
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
-            let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let mut device_extensions: Vec<CString> =
                 vec![CString::from(ash::khr::swapchain::NAME)];
             #[cfg(target_os = "linux")]
@@ -476,7 +474,6 @@ impl Presenter {
                     .map(|c| c.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 graphics_qf: qfi,
-                graphics_queue_flags: qf_props[qfi as usize].queue_flags.as_raw(),
                 decode_qf,
                 decode_video_caps: decode_caps.as_raw(),
                 instance_extensions: instance_extensions
@@ -590,8 +587,8 @@ impl Presenter {
             #[cfg(windows)]
             hw_win,
             csc,
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             csc_planar,
+            cpu_planes: None,
             video_export,
             overlay_pipe,
             retired_hw: None,

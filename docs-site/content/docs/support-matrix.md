@@ -286,11 +286,16 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 
 ## Client decode
 
+**No punktfunk client contains FFmpeg.** Every decoder below is the platform's own — Vulkan Video,
+DXVA, VAAPI, VideoToolbox, MediaCodec — driven directly from punktfunk's own bitstream parser, with
+openh264 + rav1d as the CPU floor on the desktop. There is no libav* in any client package, and
+nothing to install.
+
 | Client | Decode path (in order) | Codecs | 10-bit / HDR | 4:4:4 |
 |---|---|---|---|---|
-| Linux desktop | Vulkan Video → VAAPI → software ¹ | probed ² | ✅ ³ | ❌ ⁴ |
-| Windows desktop | Vulkan Video → D3D11VA → software ¹ | probed ² | ✅ ³ | ❌ ⁴ |
-| Steam Deck (via Decky) | as Linux desktop ⁵ | probed ² | ✅ | ❌ |
+| Linux desktop | Vulkan Video → VAAPI → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ❌ ⁴ |
+| Windows desktop | Vulkan Video → D3D11VA → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ❌ ⁴ |
+| Steam Deck (via Decky) | as Linux desktop ⁵ | H.264, HEVC, AV1 ² | ✅ | ❌ |
 | macOS · iOS · tvOS | VideoToolbox only | H.264, HEVC, AV1 ⁶ | ⚠️ ⁷ | ⚠️ ⁸ |
 | Android · Android TV | MediaCodec only ⁹ | H.264, HEVC, AV1 ¹⁰ | ⚠️ ⁷ | ❌ |
 | Moonlight | your Moonlight app's | negotiated | ⚠️ ¹¹ | ❌ |
@@ -298,16 +303,28 @@ This is a **GPU and encoder** question, not a compositor one, which is why it is
 
 1. **The order depends on your GPU vendor.** NVIDIA and AMD get Vulkan Video first; Intel and
    unknown vendors get the platform decoder first (VAAPI on Linux, D3D11VA on Windows), because
-   FFmpeg's Vulkan path is field-broken on Intel Arc even though the driver advertises it. Pick one
-   explicitly in Preferences or with `PUNKTFUNK_DECODER` — an explicit choice that fails is a hard
-   error, never a silent fallback. Mid-session demotion is laddered, and each rung needs both three
+   Vulkan decode on Intel Arc was field-broken even though the driver advertises it. Pick one
+   explicitly in Preferences or with `PUNKTFUNK_DECODER` (`native-vulkan`, `native-vaapi`,
+   `native-d3d11va`, `software`). A pin skips the vendor order — that is what it is for —
+   but a pinned rung that cannot open still falls through rather than ending the session,
+   and says so in the log. Settings saved before M10 (`vulkan`, `vaapi`, `d3d11va`) name
+   the same hardware and are migrated onto the native rung automatically.
+   Mid-session demotion is laddered, and each rung needs both three
    consecutive decode errors *and* a full second of them: Vulkan Video first demotes to VAAPI on
    Linux or D3D11VA on Windows, and only that backend demotes to software — so a startup burst no
-   longer strands you.
-2. Enumerated from FFmpeg at startup, plus PyroWave when the GPU passes its compute probe.
+   longer strands you. The session log names the rung it landed on, and warns when that rung/codec
+   pair has no hardware run recorded behind it.
+2. A statement about the decoders punktfunk BUILT, not about a codec registry: the hardware rungs
+   cover all three, the CPU floor covers H.264 (openh264) and AV1 (rav1d) and has no HEVC at all.
+   AV1 is advertised only where the GPU can really decode it — a CPU AV1 rung exists but a 4K AV1
+   stream is not survivable on it, and the codec is fixed for the whole session once negotiated.
+   HEVC is the one codec advertised without a CPU floor underneath: if every hardware rung for it
+   fails, the session reconnects on a codec that has one rather than dying. PyroWave is added when
+   the GPU passes its compute probe and you pick it.
 3. On by default. It is presented on a real HDR10 surface where your desktop offers one (KDE HDR,
    gamescope), and tone-mapped in-shader otherwise. Software-decoded frames never take the HDR
-   surface.
+   surface — the CPU rung is 8-bit by contract and refuses a 10-bit stream rather than mis-scaling
+   it.
 4. The 4:4:4 setting is stored and shown but is never advertised to the host, so these clients
    always receive 4:2:0.
 5. The Decky plugin does not decode anything — it launches the Linux client, so the decode path is

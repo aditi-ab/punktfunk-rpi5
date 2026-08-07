@@ -660,15 +660,16 @@
 // [`Hello::video_caps`] bit: the client's decoder accepts **multi-slice access units** — H.264/
 // HEVC frames carrying several slice NALs (latency plan §7 LN1: the encoder splits frames so
 // sub-frame readback can ship early slices while the tail encodes). Decoder-level, so the
-// EMBEDDER sets it from what its decode stack actually handles: the desktop clients' FFmpeg/
-// D3D11VA/Vulkan-video decoders are fine, but mobile/TV MediaCodec is per-SoC — Amlogic HEVC
-// decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on multi-slice frames
-// (the 0.17.0 field regression: the 4-slice Linux default froze streams on first frame and
-// watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1 slice per frame for
-// every hardware decoder. The host defaults to >1 slice ONLY toward a client that sets this
-// bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in both directions);
-// every other client gets single-slice frames — the pre-0.17 wire shape. NOTE: this takes the
-// video_caps byte's last free bit — the next video cap needs a second byte (ABI bump).
+// EMBEDDER sets it from what its decode stack actually handles: every desktop decode stack
+// (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) is fine, but mobile/TV MediaCodec is per-SoC
+// — Amlogic HEVC decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on
+// multi-slice frames (the 0.17.0 field regression: the 4-slice Linux default froze streams on
+// first frame and watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1
+// slice per frame for every hardware decoder. The host defaults to >1 slice ONLY toward a
+// client that sets this bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in
+// both directions); every other client gets single-slice frames — the pre-0.17 wire shape.
+// NOTE: this takes the video_caps byte's last free bit — the next video cap needs a second
+// byte (ABI bump).
 #define PUNKTFUNK_VIDEO_CAP_MULTI_SLICE 128
 #endif
 
@@ -1699,6 +1700,22 @@ typedef struct ColorInfo ColorInfo;
 // else happened to be using the audio graph that day.
 typedef struct JitterTuning JitterTuning;
 
+// What a client's OWN bitstream parser saw about intra-refresh recovery on one decoded frame — the
+// in-band counterpart of the wire's [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT).
+//
+// Two facts rather than one verdict, because the gate needs both and only the gate knows how to
+// combine them. A recovery point SEI promises: *a decoder that starts at THIS AU has a correct
+// picture N frames later*. That promise covers a decoder which lost references BEFORE the SEI (the
+// wave re-codes every stripe after it, so the stale content is fully overwritten) and says nothing
+// at all about one which lost references AFTER it (the already-swept stripes still reference the
+// lost picture). So a recovery point may only lift a freeze when its SEI was observed at or after
+// the loss — which is the pairing [`ReanchorGate::on_local_recovery`] performs, since the gate is
+// the only party that knows when the loss was.
+//
+// Produced by pf-vkdecode's `RecoveryWatch` on the native decode lane. Every other lane leaves it
+// [`Default`] and nothing changes.
+typedef struct LocalRecovery LocalRecovery;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
 // pumped on internal threads).
@@ -2088,6 +2105,8 @@ typedef struct {
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
+
+
 
 
 
