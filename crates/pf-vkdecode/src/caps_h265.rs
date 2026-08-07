@@ -308,6 +308,26 @@ pub(crate) unsafe fn query_h265_caps(
     let decode_flags = decode_caps.flags;
     let max_level_idc = h265_caps.max_level_idc;
 
+    // What the driver ACTUALLY said, before any of our interpretation. Nothing in this
+    // module logged, so a refusal downstream ("advertises neither COINCIDE nor DISTINCT")
+    // was indistinguishable from our own chain never reaching the struct: both present as
+    // a zero. Printing the BASE capabilities beside the decode ones is the discriminator —
+    // a populated `max_dpb_slots` next to `decode_flags: 0` means the driver filled the
+    // chain and genuinely declared no DPB mode; zeros across both mean the query never
+    // landed. Debug rather than info: one line per profile per session, wanted only when
+    // someone is asking this exact question.
+    tracing::debug!(
+        codec = "H.265",
+        ?capability_flags,
+        ?decode_flags,
+        max_dpb_slots,
+        max_active_reference_pictures,
+        ?min_coded_extent,
+        ?max_coded_extent,
+        ?picture_access_granularity,
+        "driver video capabilities, verbatim"
+    );
+
     // The three queries carry the REAL creation usages (SAMPLED included for the
     // presenter-facing roles) so the answers validate the images the pools build.
     let decode_profile = DecodeProfile::H265(key);
