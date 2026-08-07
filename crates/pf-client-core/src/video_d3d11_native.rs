@@ -55,8 +55,21 @@
 //!   [`NativeD3d11Decoder::frame_av1`] now applies the conversion's
 //!   `release_after_decode` once the decode op is issued.
 //!
-//!   ⚠ Still no SOAK on the goldens, so this leg's evidence is one 250-frame vector on two
-//!   vendors — narrower than the H.264/H.265 legs above.
+//!   Since 2026-08-07 a SECOND AV1 stream runs beside the vector: our own host's 4K
+//!   output, `low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec`. Not for
+//!   the aliasing — the vector covers that better than any host stream could — but
+//!   because every frame of the vector is `tile_cols = tile_rows = 1`, so every tile
+//!   array `plan_to_dxva_av1` fills had only ever been written at index 0. Our encoder
+//!   splits 4K into two tile rows carried in one Tile Group OBU, which is two tile
+//!   RECORDS from one group; 1440p and below measured single-tile, so 4K is the only
+//!   shape that has it.
+//!
+//!   ⚠ Still no SOAK on the goldens, so this leg's evidence is two vendored streams on two
+//!   vendors — narrower than the H.264/H.265 legs above. ⚠⚠ And both are FILES. "250/250
+//!   delivered frames bit-identical" was true for the entire period the host was shipping
+//!   only the FIRST TILE of every 4K frame: that verification ran against a vendored file
+//!   while the truncation lived in packetisation, and this suite stayed green throughout.
+//!   Nothing here covers fragmentation, reassembly or loss.
 //!
 //! A refusal or an init failure logs and falls through to the standard ladder, so neither the
 //! pin nor the `auto` admission can cost a session its decoder.
@@ -1835,6 +1848,42 @@ mod parity {
     const AV1_DECODED_COUNT: usize = 274;
     const AV1_SHOWN_COUNT: usize = 250;
 
+    /// The vendored AV1 vector's render region, and what its goldens hash.
+    const DISPLAY_AV1: (u32, u32) = (320, 240);
+
+    /// **Our own host's AV1**, and the only stream this rung decodes with more than
+    /// ONE TILE.
+    ///
+    /// Unlike the H.264 and H.265 low-delay siblings this is not about the
+    /// release-ordering defect — the vendored vector already aliases on 268 of its 274
+    /// frames, which is exactly why parity caught that one here. It closes a different
+    /// gap: no host-generated AV1 stream had pixel coverage anywhere, and our encoder's
+    /// AV1 is structurally unlike the vector. At 4K the split encode emits
+    /// `tile_cols = 1, tile_rows = 2` — `height_in_sbs_minus_1 = [16, 16]` — with both
+    /// tiles in a SINGLE Tile Group OBU. 1440p and below measured single-tile, so 4K is
+    /// the only shape that has the property; 60 frames rather than 120 pays for it, at
+    /// 261 KB.
+    ///
+    /// ⚠ A file fixture is not the wire path, and on AV1 that distinction has already
+    /// cost a release. "250/250 delivered frames bit-identical" was true for the whole
+    /// period the host was shipping only the first tile of every 4K frame — the
+    /// verification ran against a vendored file and the truncation lived in
+    /// packetisation. This leg gives the multi-tile shape pixel coverage on the DECODE
+    /// rung and proves nothing about fragmentation, reassembly or loss.
+    const LOWDELAY_AV1: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
+    const GOLDENS_LOWDELAY_AV1: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-3840x2160-av1.nv12.sha256");
+
+    /// 60 units, 60 decoded, 60 shown — three constants, never derived from each
+    /// other. Our host emits one shown frame per temporal unit with no hidden frames
+    /// and no `show_existing_frame`, which is the OPPOSITE shape to the vendored
+    /// vector's 250 / 274 / 250 and the reason the harness takes all three.
+    const LOWDELAY_AV1_UNIT_COUNT: usize = 60;
+    const LOWDELAY_AV1_DECODED_COUNT: usize = 60;
+    const LOWDELAY_AV1_SHOWN_COUNT: usize = 60;
+    const DISPLAY_LOWDELAY_AV1: (u32, u32) = (3840, 2160);
+
     /// The golden file's hash lines (comments and blanks skipped).
     fn golden_hashes(file: &'static str) -> Vec<&'static str> {
         file.lines()
@@ -2042,7 +2091,7 @@ mod parity {
     /// the whole difference. `display` is still the planner's own output list;
     /// AV1 has no bumping process, so a picture is output by the unit that shows
     /// it and there is no flush to drain at the end.
-    fn order_av1(units: &[&[u8]]) -> Order {
+    fn order_av1(units: &[&[u8]], render: (u32, u32)) -> Order {
         let mut planner = pf_dxvadec::Av1Planner::new();
         let mut order = Order {
             decode: Vec::new(),
@@ -2062,8 +2111,8 @@ mod parity {
                 );
                 assert_eq!(
                     (plan.picture.render_width, plan.picture.render_height),
-                    (320, 240),
-                    "unit {index}: the goldens are the 320x240 render region"
+                    render,
+                    "unit {index}: the goldens are the {render:?} render region"
                 );
                 if let Some(id) = plan.dpb.stored {
                     order.decode.push(id);
@@ -2350,18 +2399,45 @@ mod parity {
     /// ⚠ Still unexercised, because the vendored vector has none:
     /// `show_existing_frame`.
     fn av1_parity_run(units: &[&[u8]], order: &Order, goldens: &[&str]) {
+        av1_parity_run_against(
+            units,
+            order,
+            goldens,
+            AV1_UNIT_COUNT,
+            AV1_DECODED_COUNT,
+            AV1_SHOWN_COUNT,
+            "AV1",
+        );
+    }
+
+    /// [`av1_parity_run`] with its stream's own counts, for the leg that does not
+    /// decode the vendored vector.
+    ///
+    /// The three counts are three parameters, never derived from one another: the
+    /// vendored vector is 250 units / 274 decoded / 250 shown, and our host's stream is
+    /// 60 / 60 / 60. A harness that computed "hidden = 0" or "decoded = units" from
+    /// either would silently stop checking the other.
+    fn av1_parity_run_against(
+        units: &[&[u8]],
+        order: &Order,
+        goldens: &[&str],
+        unit_count: usize,
+        decoded_count: usize,
+        shown_count: usize,
+        label: &str,
+    ) {
         assert_eq!(
             units.len(),
-            AV1_UNIT_COUNT,
-            "the IVF reader disagrees with the vector's temporal-unit count"
+            unit_count,
+            "{label}: the IVF reader disagrees with the stream's temporal-unit count"
         );
-        assert_eq!(order.decode.len(), AV1_DECODED_COUNT);
+        assert_eq!(order.decode.len(), decoded_count);
         assert_eq!(order.per_unit.len(), units.len());
         assert_eq!(order.display.len(), goldens.len());
 
         let luid = pinned_adapter();
         let mut decoder = NativeD3d11Decoder::new(Codec::Av1, StreamFormat::SDR_420_8, luid, false)
-            .unwrap_or_else(|e| panic!("AV1: the box must host AV1 Profile 0 — {e:#}"));
+            .unwrap_or_else(|e| panic!("{label}: the box must host AV1 Profile 0 — {e:#}"));
         let mut readback = Readback {
             ctx: decoder.context.clone(),
             staging: None,
@@ -2409,20 +2485,23 @@ mod parity {
                 decoded += 1;
             }
         }
-        assert_eq!(decoded, AV1_DECODED_COUNT);
+        assert_eq!(decoded, decoded_count);
         assert_eq!(
-            presented, AV1_SHOWN_COUNT,
-            "every unit of this vector shows exactly one frame, so the production \
-             path must have handed back {AV1_SHOWN_COUNT} pictures"
+            presented, shown_count,
+            "{label}: every unit of this stream shows exactly one frame, so the \
+             production path must have handed back {shown_count} pictures"
         );
-        let hidden = AV1_DECODED_COUNT - presented;
+        let hidden = decoded_count - presented;
         assert_eq!(
             hidden,
-            AV1_DECODED_COUNT - AV1_SHOWN_COUNT,
-            "the rung must have decoded 24 frames it never handed back — this counts \
-             what `decode_av1` RETURNED against what it decoded, so at zero the \
-             `!sub.show` suppression is not working (or this vector stopped hiding \
-             frames, which `the_av1_vector_hides_frames…` would catch first)"
+            decoded_count - shown_count,
+            "{label}: the rung must have decoded {} frames it never handed back — this \
+             counts what `decode_av1` RETURNED against what it decoded, so a mismatch \
+             on the vendored vector means the `!sub.show` suppression is not working \
+             (or it stopped hiding frames, which `the_av1_vector_hides_frames…` would \
+             catch first). On a stream with no hidden frames both sides are zero and \
+             this is a tautology — deliberately, so one harness serves both shapes",
+            decoded_count - shown_count
         );
 
         let mut mismatches = 0usize;
@@ -2432,7 +2511,7 @@ mod parity {
                 .unwrap_or_else(|| panic!("display frame {n} names PicId {id}, never decoded"));
             if got != golden {
                 if mismatches < 10 {
-                    eprintln!("AV1: display frame {n} (PicId {id}): {got} != {golden}");
+                    eprintln!("{label}: display frame {n} (PicId {id}): {got} != {golden}");
                 }
                 mismatches += 1;
             }
@@ -2440,15 +2519,15 @@ mod parity {
         assert_eq!(
             mismatches,
             0,
-            "AV1: {mismatches}/{} frames diverge from libavcodec (first 10 above; frame \
+            "{label}: {mismatches}/{} frames diverge from libavcodec (first 10 above; frame \
              0 is a key frame — if IT mismatches suspect the readback geometry \
              (pitch/crop/plane offset) or the tile records rather than the reference \
              handling)",
             goldens.len()
         );
         eprintln!(
-            "AV1: {} delivered frames bit-identical to libavcodec, {hidden} hidden frames \
-             decoded and withheld",
+            "{label}: {} delivered frames bit-identical to libavcodec, {hidden} hidden \
+             frames decoded and withheld",
             goldens.len()
         );
     }
@@ -2500,7 +2579,7 @@ mod parity {
     #[ignore = "diagnostic, needs a Windows D3D11 video device (see module docs)"]
     fn av1_divergence_map() {
         let units = split_ivf(TEST_25FPS_AV1);
-        let order = order_av1(&units);
+        let order = order_av1(&units, DISPLAY_AV1);
         let goldens = golden_hashes(GOLDENS_AV1);
 
         // Plan facts per PicId, from a planner run alongside the decoder's own.
@@ -2628,8 +2707,33 @@ mod parity {
     #[ignore = "needs a Windows D3D11 video device (see module docs)"]
     fn av1_every_delivered_frame_hashes_bit_identical_to_libavcodec() {
         let units = split_ivf(TEST_25FPS_AV1);
-        let order = order_av1(&units);
+        let order = order_av1(&units, DISPLAY_AV1);
         av1_parity_run(&units, &order, &golden_hashes(GOLDENS_AV1));
+    }
+
+    /// **Our own host's AV1, at the only resolution where it emits more than one tile.**
+    ///
+    /// The leg above runs a vector whose every frame is `tile_cols = tile_rows = 1`, so
+    /// every tile field `plan_to_dxva_av1` fills is the degenerate case. This stream is
+    /// `tile_rows = 2` on all 60 frames with both tiles in one Tile Group OBU, which is
+    /// the 4K split-encode shape the host actually ships — and it is 4K, so the
+    /// readback moves 12.4 MB per frame rather than 115 KB. See [`LOWDELAY_AV1`] for
+    /// what it does and does not cover; the short version is that it is a file, and the
+    /// last AV1 truncation lived somewhere a file cannot reach.
+    #[test]
+    #[ignore = "needs a Windows D3D11 video device (see module docs)"]
+    fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
+        let units = split_ivf(LOWDELAY_AV1);
+        let order = order_av1(&units, DISPLAY_LOWDELAY_AV1);
+        av1_parity_run_against(
+            &units,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY_AV1),
+            LOWDELAY_AV1_UNIT_COUNT,
+            LOWDELAY_AV1_DECODED_COUNT,
+            LOWDELAY_AV1_SHOWN_COUNT,
+            "AV1 (low-delay host stream, 4K two-tile)",
+        );
     }
 
     #[test]
@@ -2817,7 +2921,7 @@ mod parity {
     fn the_ivf_reader_agrees_with_the_planner_and_the_av1_goldens() {
         let units = split_ivf(TEST_25FPS_AV1);
         assert_eq!(units.len(), AV1_UNIT_COUNT, "AV1 temporal units");
-        let order = order_av1(&units);
+        let order = order_av1(&units, DISPLAY_AV1);
         assert_eq!(
             order.decode.len(),
             AV1_DECODED_COUNT,

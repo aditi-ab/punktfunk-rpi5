@@ -46,17 +46,27 @@
 //! prefix for a driver to mis-skip and no second framing to test (see
 //! `common::split_av1_aus`). Its absence is deliberate.
 //!
-//! # The two legs that decode OUR OWN streams
+//! # The three legs that decode OUR OWN streams
 //!
-//! [`LOWDELAY_H264`] and [`LOWDELAY_H265`] are not conformance vectors — they are
-//! `punktfunk-host spike` output, vendored because a conformance vector proves
-//! conformance to itself and the encoder we ship behind is a different stream. The
-//! H.264 one is here because it caught a defect the vector is structurally blind to
-//! (117 of its 120 access units named one surface as both the decode target and a
-//! reference); the H.265 one is here because HEVC is EXEMPT from that defect for a
-//! structural reason, and an exemption with no stream behind it is how the H.264
-//! defect survived two milestones. Both are backed by a non-ignored CPU guard that
-//! asserts the stream still has the property it was vendored for.
+//! [`LOWDELAY_H264`], [`LOWDELAY_H265`] and [`LOWDELAY_AV1`] are not conformance
+//! vectors — they are `punktfunk-host spike` output, vendored because a conformance
+//! vector proves conformance to itself and the encoder we ship behind is a different
+//! stream. Each is here for its own reason:
+//!
+//! * **H.264** caught a defect the vector is structurally blind to — 117 of its 120
+//!   access units named one surface as both the decode target and a reference.
+//! * **H.265** is EXEMPT from that defect for a structural reason, and an exemption
+//!   with no stream behind it is how the H.264 defect survived two milestones.
+//! * **AV1** is neither: the vendored AV1 vector already aliases on 268 of its 274
+//!   frames, so that class was covered. It is here because the vector is ONE TILE on
+//!   every frame while our encoder splits 4K into two tile rows, so every tile array
+//!   the conversions fill had only ever been exercised at index 0.
+//!
+//! All three are backed by a non-ignored CPU guard asserting the stream still has the
+//! property it was vendored for. ⚠ And all three are FILES. A file fixture says
+//! nothing about packetisation, reassembly or loss — which for AV1 is not a
+//! hypothetical caveat but a recorded failure: this suite reported 250/250 throughout
+//! the period the host was shipping only the first tile of every 4K frame.
 //!
 //! # Why the AV1 leg exists at all
 //!
@@ -185,6 +195,40 @@ const DISPLAY_LOWDELAY: (u32, u32) = (640, 480);
 /// cross-check are in the golden file's header, as for the H.264 sibling.
 const LOWDELAY_H265: &[u8] = include_bytes!("data/lowdelay-640x480.h265");
 const GOLDENS_LOWDELAY_H265: &str = include_str!("data/lowdelay-640x480-h265.nv12.sha256");
+
+/// **Our own host's AV1**, and the only stream here with more than ONE TILE.
+///
+/// The vendored AV1 vector already exercises the reference-slot aliasing shape (268 of
+/// its 274 frames), so unlike the H.264 and H.265 siblings this is not vendored to
+/// close that. It closes a different gap: no host-generated AV1 stream was tested at
+/// pixel level anywhere, and our encoder's AV1 is structurally unlike the vector —
+/// `RFI_DPB = 5` references, reference-frame invalidation, and at 4K a split encode
+/// that puts **two tile rows in one frame**.
+///
+/// 4K is not a size choice, it is the only shape that has the property. Measured on
+/// .21, same command at four resolutions: 1280x720, 1920x1080 and 2560x1440 all give
+/// `tile_cols = tile_rows = 1`; 3840x2160 gives `tile_cols = 1, tile_rows = 2` with
+/// both tiles in ONE Tile Group OBU. It is paid for with 60 frames instead of 120,
+/// which lands at 261 KB — under both other low-delay fixtures.
+///
+/// ⚠ It is a FILE, and a file is not the wire path. "250/250 bit-identical to
+/// libavcodec" was true for AV1 throughout the period the host was shipping only the
+/// first tile of every 4K frame: that number came from a vendored file while the
+/// truncation lived in packetisation. This fixture gives the multi-tile shape pixel
+/// coverage on the DECODE rungs and says nothing whatever about fragmentation,
+/// reassembly or loss. The golden file's header says the same, at length.
+const LOWDELAY_AV1: &[u8] = include_bytes!("data/lowdelay-3840x2160.ivf.av1");
+const GOLDENS_LOWDELAY_AV1: &str = include_str!("data/lowdelay-3840x2160-av1.nv12.sha256");
+
+/// The low-delay AV1 stream's temporal units, DISPLAYED frames and render region.
+///
+/// Units and frames are two constants holding 60 rather than one, and that is
+/// deliberate: for the vendored vector they are 250 and 250 while the CODED count is
+/// 274, and a leg that derived one from the other would be asserting AV1's frame
+/// accounting instead of measuring it.
+const LOWDELAY_AV1_UNIT_COUNT: usize = 60;
+const LOWDELAY_AV1_FRAME_COUNT: usize = 60;
+const DISPLAY_LOWDELAY_AV1: (u32, u32) = (3840, 2160);
 
 /// The HEVC low-delay stream's own frame count and display region.
 ///
@@ -1050,24 +1094,52 @@ fn h265_four_byte_start_codes_decode_bit_identically() {
 /// `show_existing_frame`) is the point at which this should grow the same parameters
 /// the H.265 body carries — not before.
 fn av1_parity_run(aus: &[&[u8]], label: &str) {
+    av1_parity_run_against(
+        aus,
+        label,
+        GOLDENS_AV1,
+        "data/test-25fps-av1.nv12.sha256",
+        FRAME_COUNT,
+        FRAME_COUNT,
+        DISPLAY_AV1,
+    );
+}
+
+/// [`av1_parity_run`] with its stream's own goldens and geometry, for the leg that
+/// does not decode the vendored vector.
+///
+/// `units` and `frames` are SEPARATE parameters and must stay so. They are equal for
+/// the low-delay host stream (one shown frame per temporal unit) and unequal for the
+/// vendored vector only in the sense that its 250 units carry 274 coded frames of
+/// which 250 are shown — deriving either from the other is exactly the assumption
+/// AV1 punishes.
+fn av1_parity_run_against(
+    aus: &[&[u8]],
+    label: &str,
+    goldens_file: &'static str,
+    goldens_path: &str,
+    units: usize,
+    frames: usize,
+    display: (u32, u32),
+) {
     // As the other legs: one codec at a time on the device, and the `set_var` below
     // happens only under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
 
     std::env::set_var("PF_VKD_TEST_READBACK", "1");
 
-    let goldens = golden_hashes(GOLDENS_AV1);
+    let goldens = golden_hashes(goldens_file);
     // Non-vacuity, before any hardware is touched: the right number of entries, all
     // real digests, all distinct (see the helper's docs — a frozen-frame decoder
     // must not be able to pass this leg).
-    assert_goldens_are_a_real_set(&goldens, FRAME_COUNT, "data/test-25fps-av1.nv12.sha256");
+    assert_goldens_are_a_real_set(&goldens, frames, goldens_path);
     // …and the leg must actually be fed something. An IVF whose packets failed to
     // parse would hand `collect_hashes` an empty AU list, which delivers no frames
     // and would then fail as a frame-count mismatch that reads like a decoder defect.
     assert_eq!(
         aus.len(),
-        FRAME_COUNT,
-        "{label}: the vector must split into {FRAME_COUNT} temporal units"
+        units,
+        "{label}: the stream must split into {units} temporal units"
     );
 
     let setup = common::bring_up(&common::Request {
@@ -1104,7 +1176,7 @@ fn av1_parity_run(aus: &[&[u8]], label: &str) {
                 setup.pd,
                 &setup.device,
                 setup.graphics_qf,
-                DISPLAY_AV1,
+                display,
                 EXPECTED_FORMAT,
             )
         };
@@ -1146,6 +1218,33 @@ fn av1_parity_run(aus: &[&[u8]], label: &str) {
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_every_frame_hashes_bit_identical_to_libavcodec() {
     av1_parity_run(&common::split_av1_aus(common::TEST_25FPS_AV1), "AV1");
+}
+
+/// **Our own host's AV1, at the only resolution where it emits more than one tile.**
+///
+/// The leg above proves the conversion against a vector with `tile_cols = tile_rows
+/// = 1` on every one of its 274 frames, so every tile-info field it exercises is the
+/// degenerate case: one `width_in_sbs_minus_1`, one `height_in_sbs_minus_1`, one
+/// `context_update_tile_id`, `TileCols = TileRows = 1`. This stream carries
+/// `tile_rows = 2` with `height_in_sbs_minus_1 = [16, 16]` on all 60 frames, and both
+/// tiles arrive in a single Tile Group OBU — so a conversion that got the tile arrays,
+/// the per-tile sizing or the tile-group range wrong would decode the vector perfectly
+/// and this stream visibly (see [`LOWDELAY_AV1`]).
+///
+/// It is also 4K, which no other parity leg in this program is: the readback moves
+/// 12,441,600 bytes per frame instead of 115,200.
+#[test]
+#[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
+fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
+    av1_parity_run_against(
+        &common::split_av1_aus(LOWDELAY_AV1),
+        "AV1 (low-delay host stream, 4K two-tile)",
+        GOLDENS_LOWDELAY_AV1,
+        "data/lowdelay-3840x2160-av1.nv12.sha256",
+        LOWDELAY_AV1_UNIT_COUNT,
+        LOWDELAY_AV1_FRAME_COUNT,
+        DISPLAY_LOWDELAY_AV1,
+    );
 }
 
 /// Frame 0's pixels against libavcodec's, byte for byte — the diagnostic leg.
@@ -1966,6 +2065,191 @@ fn the_low_delay_h265_stream_agrees_with_its_goldens_and_keeps_the_exemption_fal
          A regenerated stream that reordered, or that carried a DPB deeper than its \
          reference count, would report 0 here — and the zero above would then prove \
          nothing at all, exactly as `test-25fps.h264` proved nothing for two milestones"
+    );
+}
+
+/// The AV1 low-delay stream's CPU guard, and the property it was vendored for: **more
+/// than one tile**.
+///
+/// A regenerated fixture could lose that in two silent ways — a re-run at a lower
+/// resolution (1440p and below are single-tile on this encoder) or a driver/encoder
+/// change that stopped splitting — and in both cases the GPU leg would go on passing
+/// 60/60 while duplicating what the vendored vector already covers. So the tile shape
+/// is asserted per frame, not sampled.
+///
+/// It also pins AV1's frame accounting explicitly rather than by derivation. The
+/// vendored vector is 250 units / 274 coded / 24 hidden / 250 shown; this stream is
+/// 60 / 60 / 0 / 60. Neither is the general case, and a leg that assumed either would
+/// break on the other for reasons that look like a decoder defect.
+#[test]
+fn the_low_delay_av1_stream_agrees_with_its_goldens_and_still_carries_two_tiles() {
+    use pf_bitstream::av1::Av1Planner;
+
+    let goldens = golden_hashes(GOLDENS_LOWDELAY_AV1);
+    assert_goldens_are_a_real_set(
+        &goldens,
+        LOWDELAY_AV1_FRAME_COUNT,
+        "data/lowdelay-3840x2160-av1.nv12.sha256",
+    );
+
+    let aus = common::split_av1_aus(LOWDELAY_AV1);
+    assert_eq!(
+        aus.len(),
+        LOWDELAY_AV1_UNIT_COUNT,
+        "the low-delay AV1 stream is {LOWDELAY_AV1_UNIT_COUNT} temporal units"
+    );
+    assert!(
+        aus.iter().all(|au| !au.is_empty()),
+        "no temporal unit is empty — an IVF reader returning empty packets would make \
+         the parity leg decode nothing and blame the decoder"
+    );
+
+    let mut planner = Av1Planner::new();
+    let mut outputs = 0usize;
+    let mut coded_frames = 0usize;
+    let mut multi_frame_units = 0usize;
+    let mut hidden = 0usize;
+    let mut show_existing = 0usize;
+    let mut keys = 0usize;
+    let mut with_removals = 0usize;
+    let mut aliasing_shape = 0usize;
+    for (index, au) in aus.iter().enumerate() {
+        let plans = planner.plan_au(au).unwrap_or_else(|e| {
+            panic!("temporal unit {index}: the low-delay stream must plan, got {e:?}")
+        });
+        if plans.len() > 1 {
+            multi_frame_units += 1;
+        }
+        for plan in &plans {
+            coded_frames += 1;
+            outputs += plan.dpb.outputs.len();
+            keys += usize::from(plan.picture.is_key);
+            hidden += usize::from(!plan.picture.show_frame);
+            if plan.dpb.stored.is_none() {
+                show_existing += 1;
+            }
+            assert!(
+                plan.warnings.is_empty(),
+                "temporal unit {index}: a clean stream plans without warnings, got {:?}",
+                plan.warnings
+            );
+
+            // THE PROPERTY. Two tile ROWS, one tile COLUMN, both tiles in a single
+            // Tile Group OBU — the 4K split-encode shape, on every frame including
+            // the key frame.
+            let tile = &plan.header.tile_info;
+            assert_eq!(
+                (tile.tile_cols, tile.tile_rows),
+                (1, 2),
+                "frame {coded_frames} (unit {index}): this fixture exists because our \
+                 encoder emits TWO TILE ROWS at 4K. A single-tile stream here means it \
+                 was regenerated at a lower resolution (1440p and below measured \
+                 single-tile) or the encoder stopped splitting — either way the GPU leg \
+                 below is now a duplicate of the vendored vector's and this fixture's \
+                 260 KB buys nothing. Regenerate at 3840x2160; do NOT relax this"
+            );
+            assert_eq!(
+                (
+                    tile.width_in_sbs_minus_1[0],
+                    tile.height_in_sbs_minus_1[0],
+                    tile.height_in_sbs_minus_1[1],
+                ),
+                (59, 16, 16),
+                "frame {coded_frames}: the per-tile superblock sizing the conversions \
+                 copy into their tile arrays"
+            );
+            assert_eq!(
+                plan.tiles.len(),
+                1,
+                "frame {coded_frames}: both tiles ride in ONE Tile Group OBU"
+            );
+            assert_eq!(
+                (plan.tiles[0].tg_start, plan.tiles[0].tg_end),
+                (0, 1),
+                "frame {coded_frames}: the single tile group covers tiles 0..=1 — a \
+                 range of 0..=0 is the truncation shape the host once shipped"
+            );
+
+            // The picture shape both AV1 legs hard-code (`probe_stream_support(1, 8,
+            // false)` plus an NV12 pool). Film grain especially: it is part of the
+            // Vulkan decode PROFILE, so a grain-bearing stream is a different device
+            // requirement, not merely different pixels.
+            assert_eq!(
+                (
+                    plan.picture.chroma_format_idc,
+                    plan.picture.bit_depth,
+                    plan.sequence.film_grain_params_present,
+                ),
+                (1, 8, false),
+                "frame {coded_frames}: Main 4:2:0 8-bit, no film grain"
+            );
+            if coded_frames == 1 {
+                assert!(plan.picture.is_key, "the stream opens on a key frame");
+                assert_eq!(
+                    (plan.picture.render_width, plan.picture.render_height),
+                    DISPLAY_LOWDELAY_AV1,
+                    "the render region the readback crops to and the goldens hash"
+                );
+                assert_eq!(
+                    (plan.picture.upscaled_width, plan.picture.frame_height),
+                    DISPLAY_LOWDELAY_AV1,
+                    "no superres and no AV1 conformance-window equivalent — the coded \
+                     picture IS the render region"
+                );
+            }
+
+            if !plan.dpb.removed.is_empty() {
+                with_removals += 1;
+            }
+            aliasing_shape += plan
+                .dpb
+                .removed
+                .iter()
+                .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+                .count();
+        }
+    }
+
+    // AV1's frame accounting, pinned rather than derived. This stream is the SIMPLE
+    // shape — one shown frame per temporal unit — which is exactly why it must be
+    // stated: the vendored vector is not, and a leg that learned its habits from one
+    // of them silently mis-counts the other.
+    assert_eq!(
+        (
+            coded_frames,
+            outputs,
+            multi_frame_units,
+            hidden,
+            show_existing,
+            keys
+        ),
+        (
+            LOWDELAY_AV1_FRAME_COUNT,
+            LOWDELAY_AV1_FRAME_COUNT,
+            0,
+            0,
+            0,
+            1
+        ),
+        "coded / displayed / multi-frame units / hidden / show_existing / key frames — \
+         our host emits one shown frame per temporal unit and one key frame at the \
+         head, against the vendored vector's 274 / 250 / 24 / 24 / 0 / 1"
+    );
+    assert_eq!(
+        outputs,
+        goldens.len(),
+        "the planner outputs {outputs} pictures but the goldens carry {}",
+        goldens.len()
+    );
+
+    // Not the reason this fixture exists — the vendored vector already aliases on 268
+    // of its 274 frames — but recorded so a regeneration cannot quietly drop below the
+    // vector's coverage while claiming to be the host-shaped stream.
+    assert_eq!(
+        (with_removals, aliasing_shape),
+        (55, 55),
+        "55 of the 60 frames displace a reference they still name, which is the \
+         precondition `release_after_decode` exists for"
     );
 }
 
