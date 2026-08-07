@@ -380,12 +380,18 @@ struct GamepadTrayScrim: View {
             // to keep the pinned title legible, so it has to frost dark under white ink and
             // light under dark ink.
             .environment(\.colorScheme, ink.isLight ? .light : .dark)
-            // Fade the whole blur out toward the content so it dissolves rather than ending on a line.
+            // Sink the material's grey luminance lift toward the palette's shade (black on a
+            // dark field — field ask: the frost read GREY over the aurora). Inside the mask, so
+            // the tint dissolves with the blur.
+            .overlay(ink.shade(0.35))
+            // Fade the whole blur out toward the content so it dissolves rather than ending on a
+            // line. The strong region sits deep (0.65) because the first stretch of the gradient
+            // now runs over the fixed 80 pt outer overhang below.
             .mask {
                 LinearGradient(
                     stops: [
                         .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.92), location: 0.55),
+                        .init(color: .black.opacity(0.92), location: 0.65),
                         .init(color: .clear, location: 1),
                     ],
                     startPoint: fromEdge, endPoint: toContent)
@@ -395,12 +401,17 @@ struct GamepadTrayScrim: View {
             // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
             // the field verdict on the short reach was rows colliding visibly with the legend.
             .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
-            .ignoresSafeArea()
-            // This view's geometry must NEVER animate: mounted inside a pushed shell layer, the
-            // full-bleed growth above (the negative padding and the safe-area expansion) rode the
-            // push's transaction, so the blur visibly entered at content bounds and grew into
-            // place — and `.geometryGroup()` on the layer does not reach safe-area resolution.
-            // The layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
+            // Full-bleed by LAYOUT, not by `.ignoresSafeArea()`: safe-area expansion resolves a
+            // beat after insertion (outside any geometry group and outside this view's own
+            // transaction), which is exactly the pop the field kept seeing — vertically first,
+            // then, once the vertical runway became padding, on the X axis alone (the landscape
+            // side insets). 80 pt clears every inset on every device; backgrounds never clip,
+            // so the overhang simply draws.
+            .padding(edge == .top ? .top : .bottom, -80)
+            .padding(.horizontal, -80)
+            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
+            // geometry would ride the push's transaction and visibly grow into place. The
+            // layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
             .transaction { $0.animation = nil }
     }
 }
