@@ -243,7 +243,7 @@ private struct ShotGamepadHome: View {
         GamepadHomeView(
             store: store, model: model, discovery: discovery,
             libraryTarget: .constant(nil), waker: waker,
-            connect: { _, _ in }, connectDiscovered: { _ in })
+            connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in })
     }
 }
 
@@ -301,7 +301,7 @@ private struct ShotConnect: View {
             GamepadHomeView(
                 store: store, model: model, discovery: discovery,
                 libraryTarget: .constant(nil), waker: waker,
-                connect: { _, _ in }, connectDiscovered: { _ in })
+                connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in })
         } else {
             ShotHome()
         }

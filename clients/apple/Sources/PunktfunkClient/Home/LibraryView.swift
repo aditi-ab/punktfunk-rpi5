@@ -12,6 +12,13 @@ struct LibraryView: View {
     /// Tapping a title starts a session that asks the host to launch it (the library id is passed
     /// through). `nil` ⇒ browse-only (cards aren't tappable).
     var onLaunch: ((String) -> Void)? = nil
+    /// How the gamepad shell (GamepadLibraryScreen) closes this screen; nil — every sheet/cover
+    /// presentation — falls back to the environment dismiss.
+    var onClose: (() -> Void)? = nil
+    /// Whether the gamepad coverflow owns the controller — the shell gates it during a push/pop
+    /// and while the connect takeover is up. Presentations that cover the launcher keep the
+    /// default (their being up IS the launcher's gate).
+    var controllerActive = true
     @Environment(\.dismiss) private var dismiss
 
     @State private var games: [GameEntry] = []
@@ -72,7 +79,8 @@ struct LibraryView: View {
             if gamepadUIActive {
                 LibraryCoverflowView(
                     games: games, imageSession: imageSession, onLaunch: onLaunch,
-                    onDismiss: { dismiss() })
+                    onDismiss: { (onClose ?? { dismiss() })() },
+                    controllerActive: controllerActive)
             } else {
                 grid
             }

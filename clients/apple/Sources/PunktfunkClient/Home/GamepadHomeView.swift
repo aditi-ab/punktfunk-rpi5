@@ -74,6 +74,9 @@ struct GamepadHomeView: View {
     @ObservedObject var waker: HostWaker
     let connect: (StoredHost, ProfileSelection) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
+    /// Launch a library title on a host — the in-place library layer's activate path (iOS; the
+    /// cover/sheet presentations wire ContentView's `launchTitle` into LibraryView themselves).
+    let launchTitle: (StoredHost, String) -> Void
 
     /// The profile catalog — pinned host+profile combos render as their own tiles here, which is
     /// how a controller picks a profile: one focus-and-press instead of a menu (design §5.4).
@@ -93,29 +96,51 @@ struct GamepadHomeView: View {
     private let compact = false // no size classes on macOS; the window minimum keeps room
     #endif
     @ObservedObject private var gamepads = GamepadManager.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selection: GamepadHomeTarget?
     @State private var showSettings = false
     @State private var showAddHost = false
+    /// The console's input drop: true for the transition's 0.26 s, during which NO layer polls
+    /// the controller — a double-tapped A can't push two screens, and the held button that
+    /// caused the change is long released before the next poller starts (whose own
+    /// `needsSnapshot` seed swallows it if not).
+    @State private var transitioning = false
+    /// Guards the gate's release against an interrupted transition: only the newest hold clears.
+    @State private var transitionEpoch = 0
 
     var body: some View {
-        GeometryReader { geo in
-            hero(for: geo.size)
+        // The in-place shell (see GamepadShell.swift): the launcher is the base layer, the
+        // current sub-screen a transparent layer over it, both over ONE persistent backdrop
+        // that never unmounts — a push slides the screen up out of a fade while the launcher
+        // recedes underneath, the console's own choreography. On macOS/tvOS `topScreen` is
+        // constantly nil and this ZStack degenerates to the plain launcher, presented over by
+        // the sheets/covers below exactly as before.
+        ZStack {
+            homeLayer
+                .opacity(covered ? 0 : 1)
+                .scaleEffect(covered ? GamepadShellMotion.underScale : 1)
+                // The covers used to swallow touch; the recessed layer must too.
+                .allowsHitTesting(!covered)
+            #if os(iOS)
+            if let screen = topScreen {
+                screenLayer(screen)
+                    .zIndex(1)
+                    .id(screen.id)
+                    .transition(.gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+            }
+            #endif
         }
-        // Pinned inside the safe area, out of the carousel's vertical budget — never clipped.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            titleBar
-                .padding(.top, gamepadTitleTopPadding(compact: compact))
-                .padding(.bottom, compact ? 4 : 8)
+        // Value-keyed rather than `withAnimation` at the triggers: pushes originate outside
+        // this view too (`model.returnToLibrary` writes `libraryTarget`), and keying on the
+        // derived id catches every writer. Reduce Motion snaps.
+        .animation(reduceMotion ? nil : GamepadShellMotion.screen, value: topScreenID)
+        // ONE living field for every layer, still a `.background` (the layout rule in this
+        // file's header). Its calm is CHASED between the launcher's aurora and the form
+        // screens' quiet, never crossfaded per screen — the console's `bg_mix`.
+        .background {
+            GamepadScreenBackground(calmMix: calmTarget)
+                .animation(reduceMotion ? nil : GamepadShellMotion.calm, value: calmTarget)
         }
-        .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: hints)
-                // Equal distance from the left and bottom edges — the pill's corner inset was the
-                // real asymmetry (leading 22 vs bottom 10), not its internal padding.
-                .padding(.leading, compact ? 12 : 18)
-                .padding(.bottom, compact ? 12 : 18)
-                .padding(.top, compact ? 4 : 8)
-        }
-        .background { GamepadScreenBackground() }
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
@@ -129,6 +154,17 @@ struct GamepadHomeView: View {
                 try? await Task.sleep(for: .seconds(10))
             }
         }
+        #if os(iOS)
+        .onChange(of: topScreenID) { _, _ in
+            transitionEpoch += 1
+            let epoch = transitionEpoch
+            transitioning = true
+            let hold = reduceMotion ? 0.05 : GamepadShellMotion.duration + 0.02
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold) {
+                if epoch == transitionEpoch { transitioning = false }
+            }
+        }
+        #endif
         // The remote's Play/Pause mirrors the pad's X (Settings): the focus engine never surfaces
         // X, and historically tvOS maps a pad's X to this same press — the poll and this command
         // double-firing just sets the same Bool twice.
@@ -136,8 +172,9 @@ struct GamepadHomeView: View {
         .onPlayPauseCommand { showSettings = true }
         #endif
         // The settings / add-host screens take over the controller (the carousel's `isActive`
-        // gate above). iOS presents them full screen — the immersive console feel; macOS has no
-        // fullScreenCover, so they become generously sized sheets over the dimmed launcher.
+        // gate above). macOS has no fullScreenCover — they are generously sized sheets over the
+        // dimmed launcher; tvOS keeps its focus-engine covers. iOS needs nothing here: the
+        // shell's layers above ARE the presentation.
         #if os(macOS)
         .sheet(isPresented: $showSettings) {
             GamepadSettingsView(store: store)
@@ -148,11 +185,115 @@ struct GamepadHomeView: View {
                 .frame(width: 660, height: 620)
         }
         .frame(minWidth: 640, minHeight: 420)
-        #else
+        #elseif os(tvOS)
         .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView(store: store) }
         .fullScreenCover(isPresented: $showAddHost) {
             GamepadAddHostView { store.add($0) }
         }
+        #endif
+    }
+
+    // MARK: - The shell's layers (see GamepadShell.swift)
+
+    /// The launcher itself — everything the pre-shell body was, minus the backdrop (hoisted to
+    /// the shell) and the presentation modifiers (below).
+    private var homeLayer: some View {
+        GeometryReader { geo in
+            hero(for: geo.size)
+        }
+        // Pinned inside the safe area, out of the carousel's vertical budget — never clipped.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            titleBar
+                .padding(.top, gamepadTitleTopPadding(compact: compact))
+                .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+        }
+        .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
+            GamepadHintBar(hints: hints)
+                // Equal distance from the left and bottom edges — the pill's corner inset was the
+                // real asymmetry (leading 22 vs bottom 10), not its internal padding.
+                .padding(.leading, compact ? 12 : 18)
+                .padding(.bottom, compact ? 12 : 18)
+                .padding(.top, compact ? 4 : 8)
+        }
+    }
+
+    #if os(iOS)
+    /// The screen the shell shows over the launcher — derived from the same triggers every
+    /// platform sets, so `returnToLibrary`, the tiles, X and Y all keep writing what they wrote.
+    private var topScreen: GamepadScreen? {
+        if showSettings { return .settings }
+        if showAddHost { return .addHost }
+        if let host = libraryTarget { return .library(host) }
+        return nil
+    }
+
+    @ViewBuilder private func screenLayer(_ screen: GamepadScreen) -> some View {
+        // The layer owns the controller only once the push settles and nothing rides over the
+        // shell (the connect/wake takeover is an overlay in ContentView, above these layers).
+        let active = !transitioning && waker.waking == nil && model.phase != .connecting
+        Group {
+            switch screen {
+            case .settings:
+                GamepadSettingsView(
+                    store: store,
+                    close: { if !transitioning { showSettings = false } },
+                    controllerActive: active)
+            case .addHost:
+                GamepadAddHostView(
+                    onAdd: { store.add($0) },
+                    close: { if !transitioning { showAddHost = false } },
+                    controllerActive: active)
+            case .library(let host):
+                GamepadLibraryScreen(
+                    store: store, host: host,
+                    onLaunch: { launchTitle(host, $0) },
+                    close: { if !transitioning { libraryTarget = nil } },
+                    controllerActive: active)
+            }
+        }
+        .environment(\.gamepadHostedInShell, true)
+    }
+    #endif
+
+    private var covered: Bool {
+        #if os(iOS)
+        topScreen != nil
+        #else
+        false
+        #endif
+    }
+
+    private var topScreenID: String? {
+        #if os(iOS)
+        topScreen?.id
+        #else
+        nil
+        #endif
+    }
+
+    /// The backdrop's calm target: 1 under a form screen, 0 under the launcher/library. The
+    /// macOS sheets / tvOS covers mount their own calmed field, so the launcher behind them
+    /// keeps its aurora — exactly what shipped.
+    private var calmTarget: Double {
+        #if os(iOS)
+        topScreen?.isForm == true ? 1 : 0
+        #else
+        0
+        #endif
+    }
+
+    /// Stop consuming the controller while another screen (or the connect/wake takeover) is on
+    /// top — otherwise the launcher navigates behind it (invisibly on iPhone, visibly on iPad),
+    /// and a second A during a dial would launch a concurrent connect. `.connecting` covers the
+    /// takeover's Connecting phase; `waker.waking` its Waking phase. On iOS the shell adds the
+    /// transition's input drop, during which NOBODY polls.
+    private var homeOwnsController: Bool {
+        #if os(iOS)
+        topScreen == nil && !transitioning
+            && waker.waking == nil && model.phase != .connecting
+        #else
+        libraryTarget == nil && !showSettings && !showAddHost
+            && waker.waking == nil && model.phase != .connecting
         #endif
     }
 
@@ -229,12 +370,7 @@ struct GamepadHomeView: View {
             onActivate: { $0.activate() },
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
-            // Stop consuming the controller while another screen (or the connect/wake takeover) is on
-            // top — otherwise the launcher navigates behind it (invisibly on iPhone, visibly on iPad),
-            // and a second A during a dial would launch a concurrent connect. `.connecting` covers the
-            // takeover's Connecting phase; `waker.waking` covers its Waking phase.
-            isActive: libraryTarget == nil && !showSettings && !showAddHost
-                && waker.waking == nil && model.phase != .connecting
+            isActive: homeOwnsController
         ) { tile in
             hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight))
         }
@@ -402,10 +538,15 @@ private struct GamepadHostTile: View {
                             .foregroundStyle(ink.fg(0.5))
                     }
                     if tile.isOnline {
+                        // Status colours stay palette-independent (a pip must not change meaning
+                        // with the wallpaper) — only the glow softens on a pale field, where it
+                        // reads as a smudge at full strength.
                         Circle()
-                            .fill(Color.green)
+                            .fill(GamepadInk.onlineGreen)
                             .frame(width: Self.pipSide, height: Self.pipSide)
-                            .shadow(color: .green.opacity(0.7), radius: 5)
+                            .shadow(
+                                color: GamepadInk.onlineGreen.opacity(ink.isLight ? 0.45 : 0.7),
+                                radius: 5)
                     }
                 }
             }
@@ -441,7 +582,7 @@ private struct GamepadHostTile: View {
                         startPoint: .top, endPoint: .bottom),
                     style: StrokeStyle(lineWidth: 1, dash: tile.filled ? [] : [6, 5]))
         }
-        .shadow(color: .black.opacity(0.45), radius: 20, y: 14)
+        .shadow(color: ink.shadow(0.45), radius: 20, y: 14)
     }
 
     private var monogramBadge: some View {

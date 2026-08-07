@@ -26,6 +26,11 @@ struct LibraryCoverflowView: View {
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
     var onDismiss: (() -> Void)?
+    /// Whether the carousel owns the controller — the in-place shell gates it (mid-transition,
+    /// and under the connect takeover after A launches a title, where this coverflow used to
+    /// keep polling underneath). Cover/sheet presentations keep the default.
+    var controllerActive = true
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — drives a tighter poster so everything still fits.
@@ -46,7 +51,11 @@ struct LibraryCoverflowView: View {
                 .padding(.leading, 22)
                 .padding(.vertical, compact ? 6 : 10)
         }
-        .background { GamepadScreenBackground() }
+        // Hosted in the shell, the field is the shell's own persistent aurora (the library is
+        // an aurora screen — the calm mix simply stays 0, so nothing even chases).
+        .background {
+            if !hostedInShell { GamepadScreenBackground() }
+        }
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
@@ -81,7 +90,8 @@ struct LibraryCoverflowView: View {
             spacing: 34,
             onActivate: { onLaunch?($0.id) },
             onBack: { onDismiss?() },
-            shoulderJump: 5
+            shoulderJump: 5,
+            isActive: controllerActive
         ) { game in
             cover(game, width: coverWidth, height: coverHeight)
         }
@@ -103,7 +113,7 @@ struct LibraryCoverflowView: View {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .strokeBorder(ink.fg(0.12), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.5), radius: 16, y: 12)
+            .shadow(color: ink.shadow(0.5), radius: 16, y: 12)
             .scrollTransition { content, phase in
                 let v = phase.value
                 let d = CGFloat(min(abs(v), 1))

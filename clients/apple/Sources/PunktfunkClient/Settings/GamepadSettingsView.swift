@@ -47,10 +47,18 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 struct GamepadSettingsView: View {
     @Environment(\.gamepadInk) private var ink
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
     /// count pins from its live hosts. Threaded in from GamepadHomeView like the home screen
     /// itself (ContentView owns the instance).
     @ObservedObject var store: HostStore
+    /// How the in-place shell (iOS) closes this screen; nil (the macOS sheet, the tvOS cover)
+    /// falls back to the environment dismiss. See `performClose`.
+    var close: (() -> Void)?
+    /// Whether this screen owns the controller. The shell holds it false during a push/pop (the
+    /// console's input drop) and while the connect takeover is up; a system presentation never
+    /// needs the gate and keeps the default.
+    var controllerActive = true
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
@@ -127,7 +135,8 @@ struct GamepadSettingsView: View {
             onAdjust: { row, delta in adjust(id: row.id, by: delta) },
             onActivate: { activate(id: $0.id) },
             onBack: { back() },
-            onShoulder: { step(tabBy: $0) }
+            onShoulder: { step(tabBy: $0) },
+            isActive: controllerActive
         ) { row, focused in
             rowView(row, focused: focused)
                 .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
@@ -135,7 +144,7 @@ struct GamepadSettingsView: View {
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: compact ? 4 : 8) {
+            VStack(spacing: gamepadHeaderSpacing(compact: compact)) {
                 Text(title)
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
@@ -146,7 +155,7 @@ struct GamepadSettingsView: View {
                 if pinTarget == nil { tabStrip }
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
-            .padding(.bottom, compact ? 4 : 8)
+            .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
             .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
@@ -168,8 +177,12 @@ struct GamepadSettingsView: View {
         }
         // The launcher's living field, calmed (GamepadFormBackground) — the glass rows keep real
         // colour and luminance to lens without the launcher's contrast, and the palette setting
-        // applies here too, so this screen previews the row you're stepping.
-        .background { GamepadFormBackground() }
+        // applies here too, so this screen previews the row you're stepping. Hosted in the
+        // shell, the field is the SHELL's (one persistent backdrop, calm-chased) — mounting a
+        // second would double the mesh and snap where the shell crossfades.
+        .background {
+            if !hostedInShell { GamepadFormBackground() }
+        }
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
@@ -275,15 +288,21 @@ struct GamepadSettingsView: View {
         focusID = landing
     }
 
+    /// Close this screen through whichever mechanism presents it: the shell's layer pop on iOS,
+    /// the environment dismiss under a macOS sheet / tvOS cover.
+    private func performClose() {
+        if let close { close() } else { dismiss() }
+    }
+
     /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
     /// rides the cancel action.
     private var closeButton: some View {
-        Button { dismiss() } label: {
+        Button { performClose() } label: {
             Image(systemName: "xmark")
                 .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
                 .foregroundStyle(ink.fg)
                 .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
-                .glassBackground(Circle(), interactive: true)
+                .consoleGlassBackground(Circle(), interactive: true)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -338,7 +357,7 @@ struct GamepadSettingsView: View {
             pinTarget = nil
             focusID = "profile-\(profile.id)"
         } else {
-            dismiss()
+            performClose()
         }
     }
 
@@ -364,24 +383,33 @@ struct GamepadSettingsView: View {
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
                             ink.fg(focused && row.adjustable && row.enabled ? 0.6 : 0))
-                    // Keyed by the value so a change slides the new option in instead of
-                    // hard-swapping the string — a QUIET horizontal slip following the user's
-                    // motion (a right-step enters from the right), crossfading over ~14 pt.
-                    // Deliberately not `.push`: that travels the whole container width, loud
-                    // and visibly outside the row. The ZStack is the stable home the
-                    // removed/inserted texts transition within.
-                    let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
-                    ZStack {
-                        Text(row.value)
+                    if let labels = row.optionLabels, let idx = row.selectedIndex {
+                        // A choice row's value is a REAL band — the options ride a rotating
+                        // drum, so fast repeated steps spin it instead of restarting a fade.
+                        GamepadOptionBand(
+                            options: labels, selection: idx, focused: focused, width: bandWidth)
                             .font(.geist(m.valueFont, .medium, relativeTo: .callout))
                             .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
-                            .lineLimit(1)
-                            .id(row.value)
-                            .transition(.asymmetric(
-                                insertion: .offset(x: slide).combined(with: .opacity),
-                                removal: .offset(x: -slide).combined(with: .opacity)))
+                    } else {
+                        // Toggles and the flat rows keep the quiet slip: keyed by the value so
+                        // a change slides the new string in following the user's motion (a
+                        // right-step enters from the right), crossfading over ~14 pt. The
+                        // ZStack is the stable home the removed/inserted texts transition
+                        // within. (A two-position switch on a drum would read as a coin flip —
+                        // both sibling clients keep toggles a different control, too.)
+                        let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
+                        ZStack {
+                            Text(row.value)
+                                .font(.geist(m.valueFont, .medium, relativeTo: .callout))
+                                .foregroundStyle(focused ? ink.fg : ink.fg(0.6))
+                                .lineLimit(1)
+                                .id(row.value)
+                                .transition(.asymmetric(
+                                    insertion: .offset(x: slide).combined(with: .opacity),
+                                    removal: .offset(x: -slide).combined(with: .opacity)))
+                        }
+                        .animation(.smooth(duration: 0.22), value: row.value)
                     }
-                    .animation(.smooth(duration: 0.22), value: row.value)
                     Image(systemName: "chevron.right")
                         .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(
@@ -411,6 +439,17 @@ struct GamepadSettingsView: View {
         rows.first { $0.id == focusID }?.detail ?? " "
     }
 
+    /// The option band's fixed stage. A portrait phone is the one place the full 240 pt starves
+    /// the row's label (everywhere else the 620 pt row cap leaves room to spare), so it alone
+    /// narrows the stage.
+    private var bandWidth: CGFloat {
+        #if os(iOS)
+        hSizeClass == .compact && vSizeClass == .regular ? 170 : GamepadFormMetrics.bandWidth
+        #else
+        GamepadFormMetrics.bandWidth
+        #endif
+    }
+
     // MARK: - Row model
 
     private struct Row: Identifiable {
@@ -423,6 +462,11 @@ struct GamepadSettingsView: View {
         let value: String
         /// One-line explanation shown near the hint bar while this row is focused.
         let detail: String
+        /// A choice row's full option list (labels only — the tags stay inside the closures)
+        /// and where its drum currently rests. nil ⇒ the value renders as plain text (toggles,
+        /// actions, profiles — a two-position switch is not a drum; see GamepadOptionBand).
+        var optionLabels: [String]?
+        var selectedIndex: Int?
         /// Whether left/right means anything here — false hides the value's chevrons (the
         /// Profiles rows navigate, and the placeholder rows do nothing at all).
         var adjustable = true
@@ -793,6 +837,10 @@ struct GamepadSettingsView: View {
             id: id, tab: tab, icon: icon, label: label,
             value: index.map { options[$0].label } ?? "—",
             detail: detail,
+            // The band mounts only once the value is a known option — the "—" of an unknown
+            // current renders flat, and the first step's snap-to-first seats the drum.
+            optionLabels: index != nil ? options.map(\.label) : nil,
+            selectedIndex: index,
             enabled: enabled,
             adjust: { delta in
                 // Unknown current value: snap to the first option on any step.

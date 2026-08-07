@@ -23,12 +23,36 @@ func buttonGlyph(
 
 /// Top padding for a gamepad screen's pinned title. macOS gets extra clearance — the launcher
 /// title sits right under the window titlebar and the settings/add-host sheets have no titlebar
-/// at all, so the iOS value hugs the top edge there.
+/// at all. The other values follow the console shell's rhythm (title top = 18 design units,
+/// k-floored to 10 for a landscape phone): the title needs air to the screen edge or the whole
+/// header reads pressed against the bezel, which the tab strip's extra band made obvious.
 func gamepadTitleTopPadding(compact: Bool) -> CGFloat {
     #if os(macOS)
     26
+    #elseif os(tvOS)
+    24
     #else
-    compact ? 4 : 10
+    compact ? 10 : 18
+    #endif
+}
+
+/// Padding under a gamepad screen's pinned header block (title, and the tab strip where there is
+/// one) before the content: the console leaves ~14 units of air under its tab pills, and without
+/// it the first row sits shoulder-to-shoulder with the header.
+func gamepadTitleBottomPadding(compact: Bool) -> CGFloat {
+    #if os(tvOS)
+    16
+    #else
+    compact ? 8 : 12
+    #endif
+}
+
+/// Spacing between a header's stacked elements (title over tab strip / subtitle).
+func gamepadHeaderSpacing(compact: Bool) -> CGFloat {
+    #if os(tvOS)
+    13
+    #else
+    compact ? 6 : 10
     #endif
 }
 
@@ -60,6 +84,7 @@ enum GamepadFormMetrics {
     static let detailFont: CGFloat = 19
     static let closeFont: CGFloat = 20
     static let closeSide: CGFloat = 48
+    static let bandWidth: CGFloat = 380
     #else
     static let headerFont: CGFloat = 12
     static let labelFont: CGFloat = 16
@@ -74,6 +99,8 @@ enum GamepadFormMetrics {
     static let detailFont: CGFloat = 13
     static let closeFont: CGFloat = 14
     static let closeSide: CGFloat = 34
+    /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
+    static let bandWidth: CGFloat = 240
     #endif
 }
 
@@ -147,8 +174,21 @@ struct GamepadHintBar: View {
 /// header). Honors Reduce Motion by freezing the field at a fixed phase.
 struct GamepadScreenBackground: View {
     @Environment(\.gamepadInk) private var ink
-    /// Quiet the field for a form screen (see the type comment).
-    var calm = false
+    /// How far toward the form screens' quiet the field sits: 0 = the launcher's full aurora,
+    /// 1 = calm, fractional mid-chase. Continuous (not a Bool) so the in-place shell can CHASE
+    /// it during a push/pop — the console does the same with its `bg_mix` — and every
+    /// calm-dependent factor below rides an `.opacity` modifier, which animates reliably where
+    /// re-built gradient stops do not.
+    var calmMix: Double
+
+    /// The Bool spelling every non-shell call site uses (see the type comment for `calm`).
+    init(calm: Bool = false) {
+        calmMix = calm ? 1 : 0
+    }
+
+    init(calmMix: Double) {
+        self.calmMix = calmMix
+    }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
@@ -184,21 +224,22 @@ struct GamepadScreenBackground: View {
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
                 // Calm = col·0.6 + ground·0.4: over the ground, `.opacity` IS the multiply…
-                .opacity(calm ? 0.6 : 1)
-            if calm {
-                // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
-                // ground lands exactly where it was and the bright pools come down to meet it.
-                Self.color(palette.ground)
-                    .opacity(0.4)
-                    .blendMode(.plusLighter)
-            }
+                .opacity(1 - 0.4 * calmMix)
+            // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
+            // ground lands exactly where it was and the bright pools come down to meet it.
+            // Mounted unconditionally — at opacity 0 a plusLighter layer contributes nothing,
+            // and an always-present layer is what lets the mix animate instead of popping.
+            Self.color(palette.ground)
+                .opacity(0.4 * calmMix)
+                .blendMode(.plusLighter)
             // Cinematic vignette: the edges settle toward the scrim so the cards sit in the
             // pooled light. Soft (extends past the frame) so the corners deepen rather than
             // crush. Halved under calm: a launcher's cards sit in the pooled centre, but a form
             // screen's rows run out toward the edges, where crushing them just eats the list.
             EllipticalGradient(
-                colors: [.clear, scrim.opacity((calm ? 0.21 : 0.42) * strength)],
+                colors: [.clear, scrim.opacity(0.42 * strength)],
                 center: .center, startRadiusFraction: 0.25, endRadiusFraction: 1.15)
+                .opacity(1 - 0.5 * calmMix)
             // Legibility grounding for the pinned title (top) and hint pill (bottom). This one
             // works on the field itself (it's the backdrop's bottom layer — nothing behind it to
             // blur), so it stays a gradient, just a light one.
