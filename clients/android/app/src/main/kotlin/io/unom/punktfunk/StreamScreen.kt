@@ -73,6 +73,7 @@ import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.PadSensors
 import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
@@ -459,16 +460,36 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // "Gyro from this phone" (opt-in): this device's IMU speaks for controller 1's motion
         // while wire pad 0 is a controller without a gyro of its own — the rumble mirror's
         // sibling, data flowing the other way. The mirror gates itself per sample (it stands
-        // down whenever a capture link — USB DualSense / SC2, pads with a real IMU — holds
-        // pad 0), so it composes with the captures below without coordination here.
+        // down whenever pad 0's controller has motion of its own — a capture link below, or a
+        // pad whose own sensors PadSensors is reading), so it composes without coordination here.
         val phoneGyro = if (initialSettings.gyroOnPhone && initialSettings.gamepadForwarding) {
             DeviceGyro(context, handle, router).also { it.start() }
         } else {
             null
         }
+        // A Bluetooth controller's OWN gyro, through the platform sensor framework (API 31+):
+        // a BT DualSense / DS4 / Switch Pro / 8BitDo is an ordinary InputDevice, so none of the
+        // capture links below ever sees it and its motion used to go nowhere at all. No separate
+        // setting — this is the pad's own IMU doing what the pad is for, and unlike the USB
+        // captures it claims nothing; forwarding being off is the only thing that silences it.
+        val padSensors = if (initialSettings.gamepadForwarding) {
+            PadSensors(router).also { it.start() }
+        } else {
+            null
+        }
         // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
-        // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
-        router.onSlotClosed = feedback::onDeviceRemoved
+        // session leaks until the session ends), and take its sensor listeners off with it — the
+        // same callback also fires when a USB capture below CLAIMS the pad, which is what keeps
+        // the claimed pad from being fed motion twice. The router owns hot-plug; the feedback owns
+        // the binds. Assigned before the captures are constructed, so their claims land on it.
+        router.onSlotClosed = { deviceId ->
+            feedback.onDeviceRemoved(deviceId)
+            padSensors?.onSlotClosed(deviceId)
+        }
+        // The other edge: a controller that arrives (or first speaks) mid-session gets its sensors
+        // read too. The pads already connected were swept by PadSensors.start() above — both run
+        // on the main thread with nothing between them, so no controller falls through the gap.
+        router.onSlotOpened = { deviceId -> padSensors?.onSlotOpened(deviceId) }
         // Steam Controller 2 as-is passthrough (opt-out): capture a wired/Puck USB pad — or an
         // already-paired BLE one — and forward its raw reports; the host mirrors a real
         // 28DE:1302 that its Steam drives directly, and Steam's rumble/settings writes come back
@@ -599,6 +620,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             feedback.sink = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
             phoneGyro?.stop() // join the sensor thread + park pad 0's rotation at zero, same ordering rule
+            // After the mirror, so it cannot resume writing pad 0 in the gap when a pad's own
+            // sensors let go of it; before the router is released, so the parks still find slots.
+            padSensors?.stop()
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
             dsUsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }

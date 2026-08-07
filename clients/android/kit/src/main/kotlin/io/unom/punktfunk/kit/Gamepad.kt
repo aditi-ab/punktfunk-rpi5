@@ -3,6 +3,7 @@ package io.unom.punktfunk.kit
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import kotlin.math.roundToInt
 
 /**
  * Android gamepad capture → punktfunk/1 gamepad wire (the `input.rs::gamepad` contract; the host
@@ -53,6 +54,31 @@ object Gamepad {
     const val AXIS_RS_Y = 3
     const val AXIS_LT = 4
     const val AXIS_RT = 5
+
+    // Motion wire units — must equal punktfunk-core `input.rs::gamepad::MOTION_*`. Every motion
+    // sender on this client goes through the two converters below, so a scale that ever has to
+    // change changes in ONE place: the gyro program's first finding was a client sending 40× hot
+    // because a second copy of the number had drifted.
+    const val MOTION_GYRO_LSB_PER_DEG_S = 20
+    const val MOTION_ACCEL_LSB_PER_G = 10_000
+
+    /** Standard gravity, `punktfunk-core`'s `G` — the divisor that turns m/s² into g. */
+    const val GRAVITY = 9.80665f
+
+    /** [MOTION_GYRO_LSB_PER_DEG_S] restated for Android's rad/s sensors: 1 rad/s ⇒ ~1145.9 raw. */
+    const val MOTION_GYRO_LSB_PER_RAD_S = MOTION_GYRO_LSB_PER_DEG_S * 180f / Math.PI.toFloat()
+
+    /** One angular-rate component, Android's rad/s → the wire's signed-16 raw units. */
+    fun motionGyroWire(radPerSec: Float): Int =
+        (radPerSec * MOTION_GYRO_LSB_PER_RAD_S).roundToInt().coerceIn(-32768, 32767)
+
+    /**
+     * One acceleration component, Android's m/s² → the wire's signed-16 raw units. Android reports
+     * specific force (the axis pointing up reads +1 g at rest), which is the DualSense report's own
+     * convention — no sign flip, and a pad lying flat lands on the host's neutral +1 g exactly.
+     */
+    fun motionAccelWire(mPerSecSq: Float): Int =
+        (mPerSecSq / GRAVITY * MOTION_ACCEL_LSB_PER_G).roundToInt().coerceIn(-32768, 32767)
 
     // GamepadPref wire bytes — must equal punktfunk-core `config.rs::GamepadPref::to_u8`.
     const val PREF_AUTO = 0

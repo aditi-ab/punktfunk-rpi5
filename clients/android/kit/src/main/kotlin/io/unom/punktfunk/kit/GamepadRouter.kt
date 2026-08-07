@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -31,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Threading: slot mutation + dispatch run on the main thread (Android input dispatch and the
  * InputManager hot-plug callbacks both land there). [deviceForPad] is read from the feedback poll
- * threads, so the slot table is a [ConcurrentHashMap].
+ * threads, [padPresent]/[padHasOwnMotion] from the phone-gyro thread and [deviceMotion] from the
+ * pad-sensor thread, so the slot table is a [ConcurrentHashMap].
  */
 class GamepadRouter(
     context: Context,
@@ -85,11 +87,32 @@ class GamepadRouter(
     private val slots = ConcurrentHashMap<Int, Slot>()
 
     /**
-     * Invoked (main thread) with the deviceId whenever a slot closes — hot-unplug or session teardown.
-     * `StreamScreen` wires this to `GamepadFeedback.onDeviceRemoved` so a disconnected pad's rumble /
-     * lights bindings are released promptly instead of leaking until the feedback threads stop.
+     * deviceIds whose own gyro [PadSensors] is currently reading — see [setDeviceHasSensorMotion].
+     * Written on the main thread, read from the phone-gyro thread, hence a concurrent set.
+     */
+    private val sensorDevices: MutableSet<Int> =
+        Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+
+    /**
+     * Invoked (main thread) with the deviceId whenever a slot closes — hot-unplug, a capture link's
+     * [releaseDevice] claim, or session teardown. `StreamScreen` wires this to
+     * `GamepadFeedback.onDeviceRemoved` so a disconnected pad's rumble / lights bindings are
+     * released promptly instead of leaking until the feedback threads stop, and to
+     * [PadSensors.onSlotClosed] so the controller's own sensor listeners come off with it.
      */
     var onSlotClosed: ((deviceId: Int) -> Unit)? = null
+
+    /**
+     * Invoked (main thread) with the deviceId whenever a slot opens for a REAL controller — the
+     * hot-plug callback or the first input from a pad the session started without. Not fired for
+     * [openExternal]: a capture link's pad has no [InputDevice] behind it and streams motion from
+     * its own IMU already. `StreamScreen` wires this to [PadSensors.onSlotOpened].
+     *
+     * Slots opened in `init` (every controller already connected) predate any assignment here, so
+     * a listener must sweep [forwardedDevices] once when it starts. Both happen on the main thread
+     * inside one composition block, so nothing can slip between the sweep and the assignment.
+     */
+    var onSlotOpened: ((deviceId: Int) -> Unit)? = null
 
     /**
      * Invoked (main thread) when the emergency-exit chord has been HELD for [EXIT_HOLD_MS] — the caller
@@ -324,14 +347,48 @@ class GamepadRouter(
     fun padPresent(pad: Int): Boolean = slots.values.any { it.index == pad }
 
     /**
-     * Whether wire pad [pad] is held by a capture-link slot ([ExternalPad] — USB DualSense /
-     * SC2), whose motion arrives from the pad's OWN IMU. The phone-gyro mirror stands down for
-     * those: two motion writers on one wire pad would fight. Synthetic ids are negative
-     * ([EXTERNAL_ID_BASE]); real [InputDevice] ids are positive. Read from the phone-gyro thread
-     * (the slot table is concurrent).
+     * Whether wire pad [pad]'s motion already comes from the controller's OWN IMU — either a
+     * capture-link slot ([ExternalPad] — USB DualSense / SC2; synthetic ids are negative
+     * ([EXTERNAL_ID_BASE]), real [InputDevice] ids positive), or a real controller whose gyro
+     * [PadSensors] is reading through the platform sensor framework (a Bluetooth DualSense /
+     * Switch Pro / 8BitDo). The phone-gyro mirror stands down for both: two motion writers on one
+     * wire pad would fight, and the pad's own IMU is the one attached to the player's hands.
+     * Read from the phone-gyro thread (both tables are concurrent).
      */
     fun padHasOwnMotion(pad: Int): Boolean =
-        slots.any { (id, slot) -> slot.index == pad && id < 0 }
+        slots.any { (id, slot) -> slot.index == pad && (id < 0 || id in sensorDevices) }
+
+    /**
+     * Declare (or withdraw) that real controller [deviceId] is sourcing its own rotation — see
+     * [padHasOwnMotion]. Called by [PadSensors] as it registers and unregisters listeners, on the
+     * main thread; read from the phone-gyro thread, hence the concurrent set. Keyed by device
+     * rather than by pad index so a controller that changes wire index (a lower one freed up while
+     * it was captured) carries the fact with it.
+     */
+    fun setDeviceHasSensorMotion(deviceId: Int, has: Boolean) {
+        if (has) sensorDevices.add(deviceId) else sensorDevices.remove(deviceId)
+    }
+
+    /**
+     * One motion sample from real controller [deviceId]'s own sensors, on whatever wire index its
+     * slot currently holds — [ExternalPad.motion] for pads the input stack still owns. Silently
+     * drops when the slot is gone (unplugged, or claimed by a capture link between the sensor
+     * callback and here) rather than writing to an index that may already belong to someone else.
+     * Called from [PadSensors]' sensor thread.
+     */
+    fun deviceMotion(deviceId: Int, gyro: IntArray, accel: IntArray) {
+        val slot = slots[deviceId] ?: return
+        if (!forwarding) return
+        NativeBridge.nativeSendPadMotion(
+            handle, slot.index,
+            gyro[0], gyro[1], gyro[2],
+            accel[0], accel[1], accel[2],
+        )
+    }
+
+    /** Snapshot of the REAL controllers currently forwarded, as deviceIds — the set [PadSensors]
+     *  sweeps at start for the pads that were already connected when the session opened. */
+    fun forwardedDevices(): List<Int> = slots.keys.filter { it >= 0 }
 
     /**
      * A capture-link pad occupying a wire slot without an Android [InputDevice] — the as-is Steam
@@ -452,6 +509,9 @@ class GamepadRouter(
         if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
         val slot = Slot(index, Gamepad.AxisMapper(handle, index))
         slots[dev.id] = slot
+        // After the table holds the slot, so a listener that sends on this device the moment it is
+        // told ([PadSensors]) finds an index to send on rather than dropping its first samples.
+        onSlotOpened?.invoke(dev.id)
         return slot
     }
 
