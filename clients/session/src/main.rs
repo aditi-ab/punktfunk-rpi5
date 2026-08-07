@@ -537,6 +537,80 @@ mod session_main {
             };
         }
 
+        // `--probe-decode`: per-adapter Vulkan Video decode capability, then exit. Human
+        // output on purpose — this is a triage tool, not a picker source, which is also
+        // why it is a separate flag: `--list-adapters` is parsed line-by-line by the
+        // desktop shells' GPU picker and must keep printing bare names.
+        if arg_flag("--probe-decode") {
+            return match pf_presenter::vk::probe_decode() {
+                Ok(adapters) => {
+                    if adapters.is_empty() {
+                        println!("no Vulkan physical devices");
+                    }
+                    for (i, a) in adapters.iter().enumerate() {
+                        // The index IS the PUNKTFUNK_VK_DEVICE value, and entry 0 is what
+                        // a default run presents on — the decoder shares that device, so
+                        // on a hybrid box this line is usually the answer.
+                        let kind = if a.discrete { "discrete" } else { "integrated" };
+                        println!(
+                            "[{i}] {} ({kind}){}",
+                            a.name,
+                            if i == 0 { "  <- default presenter" } else { "" }
+                        );
+                        println!(
+                            "     vulkan video decode: {}",
+                            if a.usable { "YES" } else { "no" }
+                        );
+                        let codecs: Vec<&str> = [(0x1u32, "H.264"), (0x2, "H.265"), (0x4, "AV1")]
+                            .iter()
+                            .filter(|(bit, _)| a.codec_ops & bit != 0)
+                            .map(|(_, n)| *n)
+                            .collect();
+                        println!(
+                            "     driver decode ops:   {}",
+                            if codecs.is_empty() {
+                                format!("none (0x{:X})", a.codec_ops)
+                            } else {
+                                format!("{} (0x{:X})", codecs.join(", "), a.codec_ops)
+                            }
+                        );
+                        if !a.usable {
+                            // Say which conjunct failed. "no" with no reason is the thing
+                            // this whole flag exists to stop.
+                            let mut why: Vec<String> = Vec::new();
+                            if !a.api_1_3 {
+                                why.push("device is not Vulkan 1.3".into());
+                            }
+                            if !a.features_ok {
+                                why.push(
+                                    "missing samplerYcbcrConversion / timelineSemaphore / \
+                                     synchronization2"
+                                        .into(),
+                                );
+                            }
+                            if a.decode_family.is_none() {
+                                why.push("no queue family advertises VIDEO_DECODE".into());
+                            }
+                            if !a.base_missing.is_empty() {
+                                why.push(format!("missing {}", a.base_missing.join(", ")));
+                            }
+                            if a.codec_exts.is_empty() {
+                                why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".into());
+                            }
+                            println!("     why not:             {}", why.join("; "));
+                        } else {
+                            println!("     extensions:          {}", a.codec_exts.join(", "));
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("probe-decode: {e:#}");
+                    EXIT_PRESENTER_FAILED
+                }
+            };
+        }
+
         // `--list-audio`: the PipeWire endpoints the settings pickers offer, as
         // `sink|source<TAB>node.name<TAB>description` lines — a debug window into the
         // same enumeration the GTK shell probes.
