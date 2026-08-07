@@ -1340,11 +1340,30 @@ pub fn migrate_decoder_pref(pref: &str) -> String {
 /// Same precedence as [`Decoder::new`] resolves (env first, then the setting), because a
 /// second reading of the same two inputs is a second place for them to drift.
 pub fn decode_pinned_to_software(pref: &str) -> bool {
-    std::env::var("PUNKTFUNK_DECODER")
-        .ok()
+    resolve_decoder_pref(std::env::var("PUNKTFUNK_DECODER").ok().as_deref(), pref) == "software"
+}
+
+/// Resolve the decoder preference: the `PUNKTFUNK_DECODER` override if it carries a
+/// value, else the stored setting. Pure, so the rule is testable without touching the
+/// process environment — and shared, because [`Decoder::new`] and
+/// [`decode_pinned_to_software`] read the same two inputs and a second reading is a
+/// second place for them to drift.
+///
+/// **Trimmed**, which is the part that had to be fixed rather than merely factored out.
+/// `PUNKTFUNK_VK_ADAPTER` already trimmed; this did not, so `"native-vulkan "` — one
+/// trailing space, which a Windows `.cmd` produces for free because `echo x>> file`
+/// keeps the space before the redirect — matched no arm of [`native_vulkan_gate`] and
+/// fell through to `auto` SILENTLY. An operator's pin was ignored and nothing said so,
+/// which is the exact failure the rest of this module's logging exists to prevent. It
+/// cost a full on-glass session to find.
+///
+/// Whitespace-only is treated as absent, not as a pin to `""`: someone who exported the
+/// variable empty means "no override", and `""` is a value `native_vulkan_gate` happens
+/// to accept.
+pub(crate) fn resolve_decoder_pref(env: Option<&str>, pref: &str) -> String {
+    env.map(str::trim)
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| pref.to_string())
-        == "software"
+        .map_or_else(|| pref.to_string(), str::to_string)
 }
 
 /// The `quic` codec bitfield this client can decode — the union of the codecs the RUNGS
@@ -1609,10 +1628,7 @@ impl Decoder {
         vk: Option<&VulkanDecodeDevice>,
         stream: StreamFormat,
     ) -> Result<Decoder> {
-        let stored = std::env::var("PUNKTFUNK_DECODER")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| pref.to_string());
+        let stored = resolve_decoder_pref(std::env::var("PUNKTFUNK_DECODER").ok().as_deref(), pref);
         let choice = migrate_decoder_pref(&stored);
         if choice != stored {
             // Said once per session, at `warn`, because a developer who set the env var to
@@ -3006,6 +3022,49 @@ mod tests {
     /// device leg: admitting HEVC on an H.264-only decode family would create a video
     /// session for an operation the family cannot run, which is undefined behaviour
     /// rather than an error.
+    /// A pin with stray whitespace is still a pin, and the gate must accept it.
+    ///
+    /// This is a regression test with a field cost: `"native-vulkan "` (one trailing
+    /// space, which a Windows `.cmd` adds for free) matched no arm of
+    /// `native_vulkan_gate`, so the rung fell through to `auto` with nothing logged —
+    /// on a box where `auto` picks a different rung, that reads exactly like the pin
+    /// being refused for a hardware reason. The second half is what makes it a *shared*
+    /// rule: `decode_pinned_to_software` reads the same variable, and its own docs say
+    /// a second reading is a second place to drift.
+    #[test]
+    fn a_decoder_pin_survives_the_whitespace_a_shell_script_adds() {
+        assert_eq!(
+            resolve_decoder_pref(Some("native-vulkan "), "auto"),
+            "native-vulkan",
+            "a trailing space must not turn a pin into an unrecognised value"
+        );
+        assert_eq!(
+            resolve_decoder_pref(Some("  software\t"), "auto"),
+            "software"
+        );
+        // Trimmed to nothing means ABSENT — fall back to the stored setting rather than
+        // pinning to "", which the gate would otherwise accept as the auto family.
+        assert_eq!(
+            resolve_decoder_pref(Some("   "), "native-vaapi"),
+            "native-vaapi"
+        );
+        assert_eq!(
+            resolve_decoder_pref(Some(""), "native-vaapi"),
+            "native-vaapi"
+        );
+        assert_eq!(resolve_decoder_pref(None, "native-vaapi"), "native-vaapi");
+        // …and the trimmed value is what the gate actually admits.
+        assert!(
+            native_vulkan_gate(
+                &resolve_decoder_pref(Some("native-vulkan "), "auto"),
+                punktfunk_core::quic::CODEC_HEVC,
+                true,
+                VIDEO_CODEC_OP_DECODE_H265,
+            ),
+            "the whole point: the trimmed pin reaches the gate and is admitted"
+        );
+    }
+
     #[test]
     fn native_vulkan_gate_admits_pin_and_auto_family_per_codec_on_a_capable_family() {
         // Pin the raw spec values, not the implementation constants — a typo'd bit
