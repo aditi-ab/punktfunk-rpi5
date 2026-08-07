@@ -287,6 +287,12 @@ impl Encoder for TrackedEncoder {
     fn set_wire_chunking(&mut self, shard_payload: usize) {
         self.inner.set_wire_chunking(shard_payload)
     }
+    // Same trap class again: unforwarded, the default no-op would leave the split arbitration
+    // permanently blind to send cost and it would never arbitrate the sub-frame trade — failing
+    // silently in the safe direction, which is the hardest kind to notice.
+    fn set_send_spread_us(&mut self, us: u32) {
+        self.inner.set_send_spread_us(us)
+    }
     // Forwarded for the same reason as `set_wire_chunking` above — an unforwarded default here
     // would silently leave the in-place backends pipelining past the capturer's ring.
     fn set_input_ring_depth(&mut self, depth: usize) {

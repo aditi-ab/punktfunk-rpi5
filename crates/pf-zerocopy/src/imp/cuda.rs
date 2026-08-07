@@ -62,6 +62,47 @@ pub fn read_plane_to_host(
     Ok(host)
 }
 
+/// Upload a tightly-packed host plane into a pitched device plane `(dst_ptr, dst_pitch)`.
+/// Synchronous on the priority stream. The exact mirror of [`read_plane_to_host`].
+///
+/// Not a hot path and never used by a session — this exists so ENCODE BENCHMARKS can put real,
+/// high-entropy content in front of the encoder. Every synthetic frame this crate could otherwise
+/// produce is uninitialised device memory, which the driver hands back **zeroed**; under CBR the
+/// rate controller then runs out of things to code and every measurement collapses into the
+/// low-bits/frame corner (~300 B/AU against an 833 KB quota, measured). That made the entire
+/// split-encode programme blind to the bits/frame regime, which is the regime the field report
+/// came from.
+pub fn write_plane_from_host(
+    dst_ptr: CUdeviceptr,
+    dst_pitch: usize,
+    src: &[u8],
+    width_bytes: usize,
+    height: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        src.len() >= width_bytes * height,
+        "write_plane_from_host: source is {} bytes, need {}",
+        src.len(),
+        width_bytes * height
+    );
+    let copy = CUDA_MEMCPY2D {
+        srcMemoryType: 1, // CU_MEMORYTYPE_HOST
+        srcHost: src.as_ptr() as *const c_void,
+        srcPitch: width_bytes,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: dst_ptr,
+        dstPitch: dst_pitch,
+        WidthInBytes: width_bytes,
+        Height: height,
+        ..Default::default()
+    };
+    // SAFETY: mirrors `read_plane_to_host`. `&copy` is a live local `#[repr(C)] CUDA_MEMCPY2D`
+    // outliving the synchronous call; `srcHost` addresses `src`, checked above to hold at least
+    // `width_bytes*height` bytes, and `dstDevice`/`dstPitch` are the caller's live pitched device
+    // plane. The copy is synchronous, so `src` need not outlive the call.
+    unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(host->dev)") }
+}
+
 /// Export a device allocation (from `cuMemAllocPitch`/`cuMemAlloc`) as a cross-process CUDA IPC
 /// handle — an opaque 64-byte blob another process opens with [`ipc_open`]. The allocation must
 /// stay alive for as long as any importer has it open. The shared context must be current.

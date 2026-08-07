@@ -746,6 +746,11 @@ fn send_loop(
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     stop: Arc<AtomicBool>,
     perf: bool,
+    // Smoothed whole-AU paced-send time (µs) published for the ENCODE loop, which hands it to
+    // `Encoder::set_send_spread_us`. The split arbiter needs it to price what engaging split
+    // costs on HEVC (sub-frame readback, and with it the send/encode overlap) — a number the
+    // encoder cannot observe. Written here because this is the only thread that sees a send.
+    send_spread_us: Arc<AtomicU32>,
     // Streamed AUs go out as slice-granularity blocks ([`USER_FLAG_SLICE_STREAM`]'s contract)
     // instead of the legacy full-FEC-block shape.
     slice_wire: bool,
@@ -901,6 +906,19 @@ fn send_loop(
                                     punktfunk_core::quic::encode_host_timing_datagram(&t).into(),
                                 );
                             }
+                        }
+                        // Smooth before publishing: a single AU's spread swings with content and
+                        // FEC shape, and the arbiter turns this into a latency handicap that
+                        // decides an arm. EWMA (3:1) over completed AUs is enough to stop one
+                        // spike flipping a verdict.
+                        {
+                            let prev = send_spread_us.load(Ordering::Relaxed);
+                            let next = if prev == 0 {
+                                stat.spread_us
+                            } else {
+                                ((prev as u64 * 3 + stat.spread_us as u64) / 4) as u32
+                            };
+                            send_spread_us.store(next, Ordering::Relaxed);
                         }
                         if perf || stats.rec.is_armed() {
                             // `encode_us`/`pace_us`/fps are valid for every frame (always measured),
@@ -1770,6 +1788,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let force_idr = Arc::new(AtomicBool::new(false));
     // The send thread emits the web-console stats sample (it owns `session.stats()`); clone the
     // recorder so the capture loop keeps its own handle for the per-frame `is_armed()` gate.
+    // Shared with the send thread: it is the only place a paced send is observed, and the encode
+    // loop is the only place the encoder can be touched.
+    let send_spread_us = Arc::new(AtomicU32::new(0));
+    let send_spread_send = Arc::clone(&send_spread_us);
     let send_stats = SendStats {
         rec: stats.clone(),
         mode: live_mode.clone(),
@@ -1791,6 +1813,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     probe_result_tx,
                     stop,
                     perf,
+                    send_spread_send,
                     slice_wire,
                     burst_cap,
                     fec_target,
@@ -2320,6 +2343,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // off the driver into a full rebuild + IDR (~0.6 s each, four in one logged minute).
         // (The control task clamps its acks from the same atomic; this covers requests already
         // in flight when the ceiling was discovered.)
+        // Give the encoder the send cost it cannot measure. Cheap, and it is what lets the split
+        // arbiter price the sub-frame trade instead of refusing to arbitrate HEVC at all.
+        enc.set_send_spread_us(send_spread_us.load(Ordering::Relaxed));
         if let Some(k) = want_kbps.as_mut() {
             let ceiling = encoder_ceiling_kbps.load(Ordering::Relaxed);
             if ceiling != 0 && *k > ceiling {
