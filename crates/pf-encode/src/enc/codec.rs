@@ -538,10 +538,29 @@ pub const SPLIT_FORCE_PIXEL_RATE: u64 = 950_000_000;
 ///
 /// `nvenc_split_constants_match_the_sdk` (feature-gated) pins these against the real enum, so the
 /// hand-written values cannot rot.
+//
+// SPLIT-POLICY GATE — these constants and the three selectors below (`resolve_split_mode`,
+// `max_forced_split_mode`, `clamp_to_engines`) share one cfg: the UNION of their callers'.
+//   - Linux, any features: the libav NVENC path (`enc/linux/mod.rs`) calls `resolve_split_mode`
+//     unconditionally, which is the whole reason the policy lives in this featureless file.
+//   - Windows: the ONLY caller is the direct-SDK backend (`enc/windows/nvenc.rs`), which needs
+//     `feature = "nvenc"`. Without it nothing on Windows reads any of this.
+// `codec.rs` compiles everywhere, so ungated the whole cluster is dead code on a featureless
+// Windows build — and `dead_code` is an ITEM lint, so reasoning about the module's own cfg does
+// not catch it. That is exactly how this reached main: the CI step lints pf-encode itself WITH
+// `--features nvenc,amf-qsv,qsv --all-targets`, so the items are live there; the failure came
+// from the NEXT command in the same step, `clippy -p pf-vdisplay`, which pulls pf-encode in as a
+// plain default-features dependency. Same trap as `forced_split_width` below, `subframe_env_forced`
+// and the `nvenc_core` arbiter items — the fifth time in this crate.
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) const SPLIT_AUTO: u32 = 0;
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) const SPLIT_AUTO_FORCED: u32 = 1;
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) const SPLIT_TWO_FORCED: u32 = 2;
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) const SPLIT_THREE_FORCED: u32 = 3;
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) const SPLIT_DISABLE: u32 = 15;
 
 /// Resolved NVENC split-frame encode mode for a session — ONE selector shared by the Windows and
@@ -582,6 +601,8 @@ pub(crate) const SPLIT_DISABLE: u32 = 15;
 /// `engines` is the GPU's `NV_ENC_CAPS_NUM_ENCODER_ENGINES`; pass `0` when it could not be probed
 /// (treated as "unknown", which keeps the pre-probe behaviour of assuming a second engine exists
 /// and letting the open-time rejection fallback sort it out).
+// Split-policy gate — see the constants above.
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) fn resolve_split_mode(
     codec: Codec,
     bit_depth: u8,
@@ -634,6 +655,8 @@ pub(crate) fn resolve_split_mode(
 /// values 4..14 are unallocated, so a future API may extend it). Above that we fall back to
 /// `AUTO_FORCED` = "split, driver picks how many", which measurably does force a split (2.01× vs
 /// disabled on the same box) and is the only way to express "use everything you have".
+// Split-policy gate — see the constants above.
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) fn max_forced_split_mode(engines: u32) -> u32 {
     match engines {
         // Unknown (cap unreadable / not probed): keep the historical assumption of a second
@@ -670,6 +693,8 @@ pub(crate) fn forced_split_width(mode: u32) -> Option<u32> {
 /// Hold an operator's `PUNKTFUNK_SPLIT_ENCODE=2|3` to what the hardware can deliver, loudly.
 /// Without this the knob silently lies (see [`max_forced_split_mode`]); an override that asks for
 /// more engines than exist is a mistake worth surfacing, not honouring.
+// Split-policy gate — see the constants above.
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "nvenc")))]
 pub(crate) fn clamp_to_engines(requested: u32, hw_max: u32, engines: u32) -> u32 {
     // Only the named N-way modes are ordered; `hw_max` may be AUTO_FORCED (1) on a >3-engine part,
     // which is not "less than" TWO_FORCED and must not clamp a legitimate request down.
