@@ -181,7 +181,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             if isActive { input.start() }
             // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
             entranceAnchor = cursor
-            appeared = true
+            // Deferred one runloop turn ON PURPOSE. A state change made inside `onAppear` lands
+            // in the same transaction as the insertion, where SwiftUI runs animations disabled —
+            // so the cards just WERE there, no entrance (the library, whose strip mounts late
+            // when the fetch lands, showed this every time). One hop later it is an ordinary
+            // state change and every card's `.animation(_:value:)` picks it up.
+            DispatchQueue.main.async { appeared = true }
         }
         .onDisappear {
             input.stop()
@@ -222,14 +227,15 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 
     // MARK: - Entrance
 
-    /// The card's share of the strip's entrance: it rises into place out of a fade, the anchored
-    /// card landing first and its neighbours following outward.
+    /// The card's share of the strip's entrance: it swings in on the drum, the anchored card
+    /// landing first and its neighbours fanning outward to either side.
     private func entrance(_ idx: Int) -> CardEntrance {
         CardEntrance(
             shown: appeared,
             // Capped so a several-hundred-title library never queues a card behind a visibly long
             // wait — everything past the cap lands together, well off-screen anyway.
-            delay: min(0.3, Double(abs(idx - entranceAnchor)) * 0.05),
+            delay: min(0.36, Double(abs(idx - entranceAnchor)) * 0.055),
+            side: idx == entranceAnchor ? 0 : (idx < entranceAnchor ? -1 : 1),
             reduceMotion: reduceMotion)
     }
 
@@ -377,30 +383,42 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     }
 }
 
-/// How a card arrives when its strip does: it rises a little, growing out of a fade, on a spring
-/// soft enough to overshoot by a hair — so the launcher's hosts and the library's covers assemble
-/// themselves around the cursor instead of simply being there. Each card carries its own delay
-/// (see `entrance(_:)`), which is what makes the strip read as one gesture rather than a
-/// simultaneous flash.
+/// How a card arrives when its strip does: turned away on the drum, small, low and invisible —
+/// then it swings flat, grows and rises into place on a spring soft enough to overshoot. Cards to
+/// the left of the anchor hinge on their trailing edge and cards to its right on their leading
+/// one, so the strip FANS OPEN from the cursor rather than sweeping past it; the anchor card
+/// itself only grows, since it is already facing you. Each card carries its own delay (see
+/// `entrance(_:)`) — that stagger is what makes the strip read as one gesture instead of a
+/// simultaneous flash, and it is the same hinge/perspective language the coverflow's own recede
+/// speaks, so the arrival and the scrolling feel like one object.
 ///
 /// Transforms only — nothing here touches layout, so the scroll view's snapping, the caller's
 /// `.scrollTransition` (whose scale/rotation simply multiply with these) and the tvOS focus
-/// engine are all untouched. Reduce Motion drops the travel entirely for a plain, unstaggered
+/// engine are all untouched. Reduce Motion drops every bit of travel for a plain, unstaggered
 /// cross-fade.
 private struct CardEntrance: ViewModifier {
     let shown: Bool
     let delay: Double
+    /// Which way the card swings in: -1 hinged on its trailing edge (it sits left of the anchor),
+    /// +1 hinged on its leading edge (right of it), 0 for the anchor card, which never turns.
+    let side: Double
     let reduceMotion: Bool
 
     func body(content: Content) -> some View {
+        let away = !shown && !reduceMotion
         content
+            .scaleEffect(away ? 0.82 : 1)
+            .rotation3DEffect(
+                .degrees(away ? side * 72 : 0),
+                axis: (x: 0, y: 1, z: 0),
+                anchor: side < 0 ? .trailing : .leading,
+                perspective: 0.6)
+            .offset(y: away ? 44 : 0)
             .opacity(shown ? 1 : 0)
-            .scaleEffect(shown || reduceMotion ? 1 : 0.88)
-            .offset(y: shown || reduceMotion ? 0 : 34)
             .animation(
                 reduceMotion
                     ? .easeOut(duration: 0.25)
-                    : .spring(response: 0.52, dampingFraction: 0.78).delay(delay),
+                    : .spring(response: 0.58, dampingFraction: 0.74).delay(delay),
                 value: shown)
     }
 }

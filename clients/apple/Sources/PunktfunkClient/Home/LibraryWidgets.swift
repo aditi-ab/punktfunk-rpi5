@@ -80,12 +80,19 @@ struct PosterImage: View {
                 Image(platformImage: image)
                     .resizable()
                     .scaledToFill()
+                    .transition(.opacity)
             } else if index < candidates.count {
                 ZStack { placeholder; ProgressView() }
+                    .transition(.opacity)
             } else {
                 placeholder
+                    .transition(.opacity)
             }
         }
+        // Art crosses over its placeholder instead of replacing it between two frames. Cover
+        // fetches land one by one, so without this a freshly opened library is a run of cards
+        // visibly snapping from grey to artwork after the strip has already settled.
+        .animation(.easeOut(duration: 0.3), value: image != nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
         .task(id: index) { await loadCurrent() }
