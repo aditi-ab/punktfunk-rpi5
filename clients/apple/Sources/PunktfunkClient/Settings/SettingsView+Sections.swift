@@ -712,6 +712,15 @@ extension SettingsView {
                     Toggle("Rumble on this iPhone", isOn: $rumbleOnDevice)
                 }
             }
+            // The rumble mirror's sibling, data flowing the other way: hidden where the
+            // device has no motion hardware, engages only while the player-1 controller
+            // reports no rotation rate of its own.
+            if !inProfileScope, DeviceGyro.isAvailable {
+                described("When the controller has no gyro of its own, sends this device's "
+                    + "motion sensors as player 1's — for clip-on pads without one.") {
+                    Toggle("Gyro from this device", isOn: $gyroFromDevice)
+                }
+            }
             #endif
             #if !os(tvOS)
             if !inProfileScope {

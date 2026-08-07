@@ -85,6 +85,7 @@ struct GamepadSettingsView: View {
     #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
+    @AppStorage(DefaultsKey.gyroFromDevice) private var gyroFromDevice = false
     #endif
     @ObservedObject private var gamepads = GamepadManager.shared
     /// The profile catalog (ProfileStore.shared, like every other surface that reads it) — the
@@ -648,6 +649,22 @@ struct GamepadSettingsView: View {
                         + "for clip-on pads without rumble motors.",
                     value: $rumbleOnDevice),
                 at: at + 1)
+        }
+        // The phone-gyro mirror sits beside the rumble mirror: same clip-on-pad audience,
+        // opposite data direction. Hidden where the device has no motion hardware; engages
+        // in-session only while player 1's controller reports no rotation rate of its own.
+        if DeviceGyro.isAvailable,
+            let anchor = list.firstIndex(where: { $0.id == "deviceRumble" })
+                ?? list.firstIndex(where: { $0.id == "padType" }) {
+            list.insert(
+                toggleRow(
+                    id: "deviceGyro", tab: .controller,
+                    icon: "gyroscope",
+                    label: "Gyro from this device",
+                    detail: "When the controller has no gyro, send this device's motion "
+                        + "sensors as player 1's — for clip-on pads without one of their own.",
+                    value: $gyroFromDevice),
+                at: anchor + 1)
         }
         #endif
         return list + profileRows

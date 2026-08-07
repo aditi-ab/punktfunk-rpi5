@@ -193,6 +193,14 @@ public enum DefaultsKey {
     /// once per session by `GamepadFeedback`. The toggle is shown only where the device actually
     /// has a haptic actuator (no iPad/Mac/TV).
     public static let rumbleOnDevice = "punktfunk.rumbleOnDevice"
+    /// Use this device's own gyroscope as player 1's motion when the forwarded controller has
+    /// none of its own — for clip-on and third-party pads without an IMU, where the device body
+    /// moves with the player's hands. The rumble mirror's sibling, data flowing the other way.
+    /// Off by default (opt-in); read once per session by `GamepadCapture`, whose `DeviceGyro`
+    /// mirror engages only while pad 0's controller reports no rotation rate (a real gyro pad
+    /// always wins). The toggle is shown only where the device has motion hardware
+    /// (`DeviceGyro.isAvailable`).
+    public static let gyroFromDevice = "punktfunk.gyroFromDevice"
     /// Auto-wake on connect: when connecting to a saved host that isn't advertising on mDNS, fire
     /// Wake-on-LAN and, if the dial fails, wait for it to come back before retrying (the "Waking…"
     /// overlay). On by default. Turn off if a host that's already on just isn't seen on mDNS (a
