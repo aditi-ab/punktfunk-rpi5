@@ -80,132 +80,6 @@ pub(super) fn resolve_subframe(default_on: bool) -> bool {
     }
 }
 
-/// Resolved NVENC split-frame encode mode for a session — ONE selector shared by the Windows and
-/// Linux direct-SDK backends (they had drifted into byte-identical duplicates, one of which
-/// logged and one didn't). Precedence:
-/// 1. `PUNKTFUNK_SPLIT_ENCODE` = `0`/`disable` | `1`/`auto` (AUTO_FORCED) | `2` | `3` — operator
-///    override, always wins, except that `2`/`3` are clamped to the GPU's real engine count (see
-///    [`clamp_to_engines`]; the driver honours an over-ask and silently encodes narrower).
-/// 2. Pixel rate ≥ [`super::SPLIT_FORCE_PIXEL_RATE`] → force the WIDEST split the GPU can deliver
-///    ([`max_forced_split_mode`]), not a hard-coded 2 (AUTO never engages below ~2112 px height,
-///    so 4K120 must be forced onto the other engines; and a 3-NVENC part left at 2-way wastes a
-///    third of its encode silicon).
-/// 3. **HEVC** Main10 below that bar → DISABLE: 2-way split measured SLOWER on Ada for Main10 — at
-///    5120×1440@240 forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine, the
-///    "broken animations in HDR" cap. ⚠ This rule used to sit ABOVE the pixel-rate arm and take no
-///    codec, so it (a) vetoed 10-bit **4K120** — the very case the pixel-rate arm exists for — and
-///    (b) applied an HEVC-on-Ada result to **AV1 10-bit**, which has no such measurement. Both
-///    fixed; what remains is a conservative default in the regime where a second engine buys
-///    nothing anyway.
-///    ⚠⚠ **UNVALIDATED CONSEQUENCE:** 5120×1440@240 Main10 (1.77 Gpix/s) now clears the pixel-rate
-///    bar and WILL be forced to split — i.e. the exact configuration that measurement came from
-///    flips behaviour. That is deliberate (the datapoint is one sample, at low bits/frame, and the
-///    bits/frame hypothesis predicts it should not generalise) but it is **the first thing to
-///    re-measure on Ada**; `PUNKTFUNK_SPLIT_ENCODE=0` is the escape if it regresses.
-/// 4. Else AUTO — ⚠ whose behaviour is **conditional on sub-frame**, measured on `.21` at 4K:
-///    - sub-frame **ON** (the fleet default): AUTO **does not split** — 5023/5157 µs against
-///      DISABLE's 4979/5000. Split and sub-frame are mutually unsupported for HEVC, so the driver
-///      resolves AUTO to no-split and this arm silently means DISABLE.
-///    - sub-frame **OFF**: AUTO **does split** — 2401/2352 µs against TWO_FORCED's 2319/2378.
-///
-///    So AUTO is NOT dead in general and must not be retired: doing so would lose a real split on
-///    every sub-frame-off session. It is dead only in the sub-frame-on combination, which
-///    [`resolve_split_subframe`] logs rather than silently accepting.
-///
-/// The caller still owns the rejection fallback (retry split-disabled) — a codec/config that
-/// rejects the chosen mode downgrades at open, not here.
-///
-/// `engines` is the GPU's `NV_ENC_CAPS_NUM_ENCODER_ENGINES`; pass `0` when it could not be probed
-/// (treated as "unknown", which keeps the pre-probe behaviour of assuming a second engine exists
-/// and letting the open-time rejection fallback sort it out).
-pub(super) fn resolve_split_mode(
-    codec: Codec,
-    bit_depth: u8,
-    pixel_rate: u64,
-    engines: u32,
-) -> u32 {
-    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
-    let hw_max = max_forced_split_mode(engines);
-    let mode = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
-        Some("0") | Some("disable") => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
-        Some("1") | Some("auto") => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
-        Some("3") => clamp_to_engines(M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32, hw_max, engines),
-        Some("2") => clamp_to_engines(M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32, hw_max, engines),
-        // Use every engine the card has, not a hard-coded two: on a 3-NVENC part (GB202, AD102
-        // workstation) forcing 2 leaves a third of the silicon idle.
-        //
-        // ⚠ This arm now comes FIRST, ahead of the 10-bit rule. That reordering is the D1 fix: a
-        // 10-bit 4K120 session (995.3 Mpix/s) used to be vetoed by the depth rule before ever
-        // reaching the pixel-rate arm written for exactly it.
-        _ if pixel_rate >= super::SPLIT_FORCE_PIXEL_RATE => hw_max,
-        // Below that bar, HEVC Main10 keeps the conservative single-engine default. The one Ada
-        // measurement we have says split can be *slower* for Main10, and nothing under this bar
-        // needs a second engine anyway — so the cost of being wrong here is ~nil, unlike above it.
-        //
-        // ⚠ Now codec-scoped (the D2 fix): the measurement behind this was HEVC Main10 on Ada, and
-        // it used to veto **AV1 10-bit** too, which has neither the sub-frame conflict nor any
-        // measurement against it.
-        _ if codec == Codec::H265 && bit_depth >= 10 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
-        _ => M::NV_ENC_SPLIT_AUTO_MODE as u32,
-    };
-    tracing::debug!(
-        split_mode = mode,
-        ?codec,
-        bit_depth,
-        pixel_rate,
-        engines,
-        "NVENC split-encode mode selected"
-    );
-    mode
-}
-
-/// The strongest split mode this GPU's engine count can actually deliver.
-///
-/// ⚠ **The driver will NOT tell you when you over-ask.** Measured on `.21` (RTX 5070 Ti, 2 NVENC,
-/// driver 610.57.04, 4K HEVC): requesting `THREE_FORCED` was **HONOURED** — session opened in mode
-/// 3 — and ran at **2303 µs/frame, identical to `TWO_FORCED`'s 2308**. No rejection, no warning,
-/// no third engine; just a log line claiming 3-way over a 2-way encode. So the rejection fallback
-/// cannot be relied on to find the ceiling and the clamp has to happen here.
-///
-/// `NV_ENC_SPLIT_ENCODE_MODE` can only *name* counts up to three (SDK 0.4.0 / NVENCAPI 12.1;
-/// values 4..14 are unallocated, so a future API may extend it). Above that we fall back to
-/// `AUTO_FORCED` = "split, driver picks how many", which measurably does force a split (2.01× vs
-/// disabled on the same box) and is the only way to express "use everything you have".
-pub(super) fn max_forced_split_mode(engines: u32) -> u32 {
-    use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
-    match engines {
-        // Unknown (cap unreadable / not probed): keep the historical assumption of a second
-        // engine and let the open-time rejection fallback correct it.
-        0 => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
-        1 => M::NV_ENC_SPLIT_DISABLE_MODE as u32,
-        2 => M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
-        3 => M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
-        // More engines than the enum can name — let the driver use them all.
-        _ => M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32,
-    }
-}
-
-/// Hold an operator's `PUNKTFUNK_SPLIT_ENCODE=2|3` to what the hardware can deliver, loudly.
-/// Without this the knob silently lies (see [`max_forced_split_mode`]); an override that asks for
-/// more engines than exist is a mistake worth surfacing, not honouring.
-fn clamp_to_engines(requested: u32, hw_max: u32, engines: u32) -> u32 {
-    // Only the named N-way modes are ordered; `hw_max` may be AUTO_FORCED (1) on a >3-engine part,
-    // which is not "less than" TWO_FORCED and must not clamp a legitimate request down.
-    let named = |m: u32| (2..=3).contains(&m);
-    if engines != 0 && named(requested) && named(hw_max) && requested > hw_max {
-        tracing::warn!(
-            requested,
-            engines,
-            using = hw_max,
-            "PUNKTFUNK_SPLIT_ENCODE asks for more NVENC engines than this GPU has — clamping. \
-             (The driver would ACCEPT the over-ask and silently encode with fewer, so the log \
-             would otherwise claim a split width that never happened.)"
-        );
-        return hw_max;
-    }
-    requested
-}
-
 /// Whether the operator EXPLICITLY forced sub-frame readback on (`PUNKTFUNK_NVENC_SUBFRAME=1`)
 /// — the log-severity input to [`resolve_split_subframe`]: a forced knob being overridden
 /// deserves a `warn`, a default being tuned an `info`. Callers LATCH this once next to their
@@ -633,6 +507,7 @@ pub(super) fn clear_split_verdicts() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{clamp_to_engines, max_forced_split_mode, resolve_split_mode};
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
 
     // These assume PUNKTFUNK_SPLIT_ENCODE is unset (CI); an operator override deliberately wins.
@@ -1460,5 +1335,32 @@ mod arbiter_tests {
             "the settle window must hide the post-switch transient — otherwise a better arm is \
              rejected on its own warmup"
         );
+    }
+}
+
+/// The hand-written split constants in `codec.rs` MUST equal the SDK enum they mirror. They are
+/// duplicated there so the libav path — which builds without the `nvenc` feature, where the enum
+/// does not exist — can share one policy instead of keeping the copy that had already drifted.
+/// This is the only place both are visible at once.
+#[cfg(test)]
+mod split_constant_parity {
+    use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    #[test]
+    fn nvenc_split_constants_match_the_sdk() {
+        assert_eq!(crate::SPLIT_AUTO, M::NV_ENC_SPLIT_AUTO_MODE as u32);
+        assert_eq!(
+            crate::SPLIT_AUTO_FORCED,
+            M::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32
+        );
+        assert_eq!(
+            crate::SPLIT_TWO_FORCED,
+            M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+        );
+        assert_eq!(
+            crate::SPLIT_THREE_FORCED,
+            M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32
+        );
+        assert_eq!(crate::SPLIT_DISABLE, M::NV_ENC_SPLIT_DISABLE_MODE as u32);
     }
 }

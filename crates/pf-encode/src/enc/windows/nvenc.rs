@@ -44,10 +44,13 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_mode, resolve_split_subframe, resolve_subframe, store_ceiling,
-    subframe_env_forced, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
+    resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling, subframe_env_forced,
+    CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
 };
+// Moved to `codec.rs` (WP4) so the libav path, which builds without the `nvenc` feature, can share
+// one split policy instead of keeping the copy that had already drifted.
 use super::nvenc_status;
+use super::resolve_split_mode;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -595,7 +598,7 @@ pub struct NvencD3d11Encoder {
     /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
     /// [`query_caps`](Self::query_caps). `0` = not probed / unreadable. The split-encode ceiling:
     /// the driver accepts a split wider than the hardware and silently encodes narrower, so this
-    /// is the only honest source for how wide we may go (see `nvenc_core::max_forced_split_mode`).
+    /// is the only honest source for how wide we may go (see `codec::max_forced_split_mode`).
     encoder_engines: u32,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
     /// in-flight encode. The fourth field tags the first frame encoded after a successful

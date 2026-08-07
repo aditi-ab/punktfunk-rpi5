@@ -68,12 +68,12 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
-    max_forced_split_mode, plan_range_recovery, resolve_slices, resolve_split_mode,
-    resolve_split_subframe, resolve_subframe, store_ceiling, store_split_verdict,
-    subframe_env_forced, ArbAction, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
-    SplitArbiter, SplitKey,
+    plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling,
+    store_split_verdict, subframe_env_forced, ArbAction, CeilingKey, LowLatencyConfig, NvStatusExt,
+    RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
+use super::{max_forced_split_mode, resolve_split_mode};
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload};
@@ -826,7 +826,7 @@ pub struct NvencCudaEncoder {
     /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
     /// [`query_caps`]. `0` = not probed / unreadable. The split-encode ceiling: the driver accepts
     /// a split wider than the hardware and silently encodes narrower, so this is the only honest
-    /// source for how wide we may go (see `nvenc_core::max_forced_split_mode`).
+    /// source for how wide we may go (see `codec::max_forced_split_mode`).
     encoder_engines: u32,
     /// Submit stamp for the split arbiter's per-frame cost (sync depth-1 path only).
     last_submit_at: Option<std::time::Instant>,
