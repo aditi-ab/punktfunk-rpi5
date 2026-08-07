@@ -87,12 +87,19 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// confirm and end-stop events (moves trigger on `cursor`).
     @State private var activateTick = 0
     @State private var boundaryTick = 0
-    /// The strip's entrance (see `CardEntrance`): false for exactly one frame after mount, then
-    /// the cards rise in. Never reset — a strip that re-played its entrance every time a screen
-    /// popped off the top of it would be noise, and the shell's push/pop carries that motion
-    /// already. So it plays when a screen is entered: the launcher when the gamepad UI comes up,
-    /// the coverflow each time the library opens (its layer mounts fresh).
-    @State private var appeared = false
+    /// The strip's entrance, as ONE timeline: 0 = every card still away, 1 = every card landed
+    /// (see `CardEntrance`, which slices its own window out of this). Animated exactly once per
+    /// mount — a strip that re-played its entrance every time a screen popped off the top of it
+    /// would be noise, and the shell's push/pop carries that motion already. So it plays when a
+    /// screen is entered: the launcher when the gamepad UI comes up, the coverflow each time the
+    /// library opens (its layer mounts fresh).
+    ///
+    /// One animated Double rather than a Bool behind per-card `.animation(_:value:)` modifiers,
+    /// because those modifiers wrap the caller's card — INCLUDING its `.scrollTransition` — and a
+    /// delayed spring flipping while the scroll view was still settling captured the transition's
+    /// own per-frame phase updates, stranding the centred card in a half-receded state until the
+    /// next scroll re-drove it. Nothing here wraps the card in an animation at all.
+    @State private var entranceProgress: Double = 0
     /// Which card the entrance fans out from — the cursor as it stood when the strip was armed,
     /// so a restored selection assembles around where the eye already is instead of sweeping in
     /// from the left.
@@ -120,19 +127,22 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                             // below keeps the tile's own look — the `.scrollTransition` center pop
                             // is the focus treatment, since focus and center track each other.
                             Button { activate(item) } label: {
+                                // Entrance INSIDE the fixed frame: the scroll target's own
+                                // geometry stays exactly `itemWidth`, whatever the card is doing.
                                 card(item)
-                                    .frame(width: itemWidth)
                                     .modifier(entrance(idx))
+                                    .frame(width: itemWidth)
                             }
                             .buttonStyle(ConsoleBareButtonStyle())
                             .focused($focusedID, equals: item.id)
                             .id(item.id)
                             #else
                             card(item)
-                                .frame(width: itemWidth)
                                 .modifier(entrance(idx))
+                                .frame(width: itemWidth)
                                 .contentShape(Rectangle())
                                 .onTapGesture { tap(item) }
+                                .id(item.id) // explicit scroll-target identity for scrollPosition
                             #endif
                         }
                     }
@@ -224,32 +234,44 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         .onChange(of: items.map(\.id)) { _, _ in
             reconcile()
             wire()
+            // A strip that mounted empty (its content arrived after) still gets its entrance.
+            armEntrance()
         }
     }
 
     // MARK: - Entrance
 
-    /// Fire the entrance, once, as soon as the strip is mounted AND its cards are worth showing.
+    /// Run the entrance, once, as soon as the strip is mounted AND its cards are worth showing.
     ///
-    /// The flip is deferred one runloop turn ON PURPOSE: a state change made inside `onAppear`
-    /// lands in the same transaction as the view's insertion, where SwiftUI runs with animations
-    /// disabled — so the cards would simply BE there.
+    /// Deferred one runloop turn ON PURPOSE: a state change made inside `onAppear` lands in the
+    /// same transaction as the view's insertion, where SwiftUI runs with animations disabled — so
+    /// the cards would simply BE there. Note the failure mode is benign either way: progress
+    /// reaching 1 without animating leaves every card at exact identity, never stranded.
     private func armEntrance() {
-        guard !entranceArmed, contentReady else { return }
+        guard !entranceArmed, contentReady, !items.isEmpty else { return }
         entranceArmed = true
         // After `reconcile`, so the fan-out anchors on the seeded/restored cursor.
         entranceAnchor = cursor
-        DispatchQueue.main.async { appeared = true }
+        DispatchQueue.main.async {
+            // Linear on purpose: the master timeline is a clock, and each card eases its OWN
+            // slice of it (see `CardEntrance`) — a spring here would warp every card's curve.
+            withAnimation(
+                reduceMotion ? .easeOut(duration: 0.28) : .linear(duration: CardEntrance.total)
+            ) {
+                entranceProgress = 1
+            }
+        }
     }
 
     /// The card's share of the strip's entrance: it swings in on the drum, the anchored card
     /// landing first and its neighbours fanning outward to either side.
     private func entrance(_ idx: Int) -> CardEntrance {
-        CardEntrance(
-            shown: appeared,
-            // Capped so a several-hundred-title library never queues a card behind a visibly long
-            // wait — everything past the cap lands together, well off-screen anyway.
-            delay: min(0.42, Double(abs(idx - entranceAnchor)) * 0.07),
+        // Capped so a several-hundred-title library never queues a card behind a visibly long
+        // wait — everything past the cap lands together, well off-screen anyway.
+        let delay = min(CardEntrance.maxDelay, Double(abs(idx - entranceAnchor)) * 0.07)
+        return CardEntrance(
+            progress: entranceProgress,
+            start: delay / CardEntrance.total,
             // Never zero: the anchor is the card the eye is ON, so it must swing like the rest —
             // giving it "no rotation" left the one card you actually watch merely sliding up.
             side: idx < entranceAnchor ? -1 : 1,
@@ -413,44 +435,76 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 /// `.scrollTransition` (whose scale/rotation simply multiply with these) and the tvOS focus
 /// engine are all untouched. Reduce Motion drops every bit of travel for a plain, unstaggered
 /// cross-fade.
-private struct CardEntrance: ViewModifier {
-    let shown: Bool
-    let delay: Double
+private struct CardEntrance: ViewModifier, Animatable {
+    /// How long ONE card takes to travel, and the most any card waits before it starts.
+    static let perCard: Double = 0.6
+    static let maxDelay: Double = 0.42
+    /// The master timeline the carousel animates 0 → 1.
+    static var total: Double { perCard + maxDelay }
+
+    /// The interpolated master progress. `Animatable` is the whole point: SwiftUI hands this
+    /// modifier a fresh value every frame and re-runs `body`, so the card's transforms are a pure
+    /// FUNCTION of the clock. No `.animation` modifier wraps the card, so nothing here can catch
+    /// the caller's `.scrollTransition` mid-scroll and strand it.
+    var progress: Double
+    /// Where this card's window opens on that timeline, 0…1.
+    let start: Double
     /// Which way the card swings in: -1 hinged on its trailing edge (it sits left of the anchor),
     /// +1 hinged on its leading edge (right of it). Never 0 — every card turns, including the
     /// centred one.
     let side: Double
     let reduceMotion: Bool
 
+    var animatableData: Double {
+        get { progress }
+        set { progress = newValue }
+    }
+
     func body(content: Content) -> some View {
-        let away = !shown && !reduceMotion
-        content
-            // The fade runs on its OWN, much faster curve (this `.animation` only governs the
-            // modifiers above it). One shared curve meant the card spent the whole swing at
-            // near-zero opacity and only the last few degrees were visible — which is exactly
-            // why the entrance read as a small slide.
-            .opacity(shown ? 1 : 0)
-            .animation(
-                reduceMotion
-                    ? .easeOut(duration: 0.25)
-                    : .easeOut(duration: 0.22).delay(delay),
-                value: shown)
-            // Deep turn, well down, well shrunk — the card is genuinely edge-on and travelling.
-            // The sign matches the coverflow's own recede (right of centre turns negative about
-            // its leading edge), so the arrival deepens the turn the card already wears at rest
-            // and unwinds into it, instead of swinging the opposite way.
-            .scaleEffect(away ? 0.74 : 1)
+        // This card's own 0…1, sliced out of the master clock.
+        let span = Self.perCard / Self.total
+        let raw = min(max((progress - start) / span, 0), 1)
+        // The travel eases out with a whisker of overshoot, so a card settles rather than stops.
+        let travel = Self.easeOutBack(raw)
+        // The fade is FAR quicker than the travel — it finishes in the first third of the window.
+        // Sharing one curve meant the card spent its whole swing at near-zero opacity and only
+        // the last few degrees ever showed, which is why this read as a small slide.
+        let fade = Self.easeOut(min(raw / 0.34, 1))
+        // Deep turn, well down, well shrunk — the card is genuinely edge-on and travelling. The
+        // sign matches the coverflow's own recede (right of centre turns negative about its
+        // leading edge), so the arrival deepens the turn the card wears at rest and unwinds into
+        // it instead of swinging the opposite way.
+        let away = reduceMotion ? 0 : 1 - travel
+        return content
+            // The card's own updates must NEVER inherit the entrance's clock. `withAnimation`
+            // sets its animation on the whole transaction, so the caller's `.scrollTransition` —
+            // which is geometry-driven and expects to land per frame — got swept into the 1 s
+            // linear timeline while the scroll view settled, and the centred card only reached
+            // its focused look as that timeline ran out, arriving as a jump. Clearing the
+            // inherited animation here leaves the transforms below (pure functions of the
+            // interpolated `progress`) untouched, and explicit `.animation`s inside the card
+            // (the poster's cross-fade) still set their own.
+            .transaction { $0.animation = nil }
+            .opacity(reduceMotion ? raw : fade)
+            .scaleEffect(1 - 0.26 * away)
             .rotation3DEffect(
-                .degrees(away ? side * -64 : 0),
+                .degrees(side * -64 * away),
                 axis: (x: 0, y: 1, z: 0),
                 anchor: side < 0 ? .trailing : .leading,
                 perspective: 0.65)
-            .offset(y: away ? 58 : 0)
-            .animation(
-                reduceMotion
-                    ? nil
-                    : .spring(response: 0.62, dampingFraction: 0.72).delay(delay),
-                value: shown)
+            .offset(y: 58 * away)
+    }
+
+    /// `1 - (1-t)³`, with a small overshoot past 1 before it settles.
+    private static func easeOutBack(_ t: Double) -> Double {
+        let c1 = 1.2, c3 = c1 + 1
+        let u = t - 1
+        return 1 + c3 * u * u * u + c1 * u * u
+    }
+
+    private static func easeOut(_ t: Double) -> Double {
+        let u = 1 - t
+        return 1 - u * u * u
     }
 }
 #endif
