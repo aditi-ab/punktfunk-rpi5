@@ -963,6 +963,38 @@ mod range_policy_tests {
         assert!(matches!(plan(7, 5, 100), RangePlan::Decline));
     }
 
+    /// `RFI_DPB` is the one host-side knob that sets how many DPB slots a client must
+    /// find, so it may never grow past what a mainstream client can allocate.
+    ///
+    /// The chain, measured on `.21` (RTX 5070 Ti, 2026-08-07) by reading the SPS the
+    /// host actually emitted: `maxNumRefFramesInDPB = RFI_DPB` makes NVENC write
+    /// `sps_max_dec_pic_buffering_minus1 = 5`, i.e. `RFI_DPB + 1 = 6` pictures — five
+    /// references plus the current one. Decoder backends then allocate one slot per
+    /// DPB picture plus one for the picture in flight, so the hardware demand is
+    /// `RFI_DPB + 2 = 7`. NVIDIA's Vulkan Video reports `maxDpbSlots = 16` (RADV 17),
+    /// and a stream over that is refused outright — which on a client with no software
+    /// HEVC decoder means losing the codec, not merely a slower path.
+    ///
+    /// Raising `RFI_DPB` is a legitimate thing to want (a deeper DPB recovers from loss
+    /// with a clean P-frame instead of a 20-40x IDR spike), so this does not forbid it —
+    /// it forbids raising it past the point where clients stop being able to decode us
+    /// at all. There are nine slots of headroom; spend them knowingly.
+    #[test]
+    fn rfi_dpb_fits_a_mainstream_vulkan_decoder() {
+        /// `VkVideoCapabilitiesKHR::maxDpbSlots` on NVIDIA — the lowest cap among the
+        /// decoders punktfunk targets.
+        const VULKAN_MAX_DPB_SLOTS: u32 = 16;
+        // RFI_DPB references + the current picture = what the SPS declares; + 1 again
+        // for the picture being decoded = what the backend's slot pool must hold.
+        let slots_needed = RFI_DPB + 2;
+        assert!(
+            slots_needed <= VULKAN_MAX_DPB_SLOTS,
+            "RFI_DPB = {RFI_DPB} makes the host emit a stream needing {slots_needed} DPB \
+             slots, and mainstream Vulkan Video decode caps at {VULKAN_MAX_DPB_SLOTS} — \
+             every access unit would be refused and the client would drop the codec"
+        );
+    }
+
     #[test]
     fn covering_range_dedups_partial_overlap_does_not() {
         let prior = Some((90i64, 95i64));
