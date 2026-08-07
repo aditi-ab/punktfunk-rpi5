@@ -32,7 +32,7 @@ func gamepadTitleTopPadding(compact: Bool) -> CGFloat {
     #elseif os(tvOS)
     24
     #else
-    compact ? 10 : 18
+    compact ? 18 : 28
     #endif
 }
 
@@ -57,12 +57,13 @@ func gamepadHeaderSpacing(compact: Bool) -> CGFloat {
 }
 
 /// Point size for a gamepad screen's pinned title: TV-large on tvOS (read from the couch), the
-/// in-hand compact-aware sizes elsewhere.
+/// in-hand compact-aware sizes elsewhere. Sized as a proper screen heading — the field verdict
+/// on the smaller first cut was "way too small" once the title moved off-centre.
 func gamepadTitleSize(compact: Bool) -> CGFloat {
     #if os(tvOS)
     44
     #else
-    compact ? 20 : 30
+    compact ? 24 : 34
     #endif
 }
 
@@ -82,8 +83,6 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 18
     static let rowMaxWidth: CGFloat = 920
     static let detailFont: CGFloat = 19
-    static let closeFont: CGFloat = 20
-    static let closeSide: CGFloat = 48
     static let bandWidth: CGFloat = 380
     #else
     static let headerFont: CGFloat = 12
@@ -97,8 +96,6 @@ enum GamepadFormMetrics {
     static let rowCorner: CGFloat = 14
     static let rowMaxWidth: CGFloat = 620
     static let detailFont: CGFloat = 13
-    static let closeFont: CGFloat = 14
-    static let closeSide: CGFloat = 34
     /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
     static let bandWidth: CGFloat = 240
     #endif
@@ -383,20 +380,39 @@ struct GamepadTrayScrim: View {
             // to keep the pinned title legible, so it has to frost dark under white ink and
             // light under dark ink.
             .environment(\.colorScheme, ink.isLight ? .light : .dark)
-            // Fade the whole blur out toward the content so it dissolves rather than ending on a line.
+            // Sink the material's grey luminance lift toward the palette's shade (black on a
+            // dark field — field ask: the frost read GREY over the aurora). Inside the mask, so
+            // the tint dissolves with the blur.
+            .overlay(ink.shade(0.35))
+            // Fade the whole blur out toward the content so it dissolves rather than ending on a
+            // line. The strong region sits deep (0.65) because the first stretch of the gradient
+            // now runs over the fixed 80 pt outer overhang below.
             .mask {
                 LinearGradient(
                     stops: [
                         .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.9), location: 0.5),
+                        .init(color: .black.opacity(0.92), location: 0.65),
                         .init(color: .clear, location: 1),
                     ],
                     startPoint: fromEdge, endPoint: toContent)
             }
             // Grow past the tray so the fade-to-clear happens OUTSIDE its bounds — the tray's own
-            // text always sits on the strong part, rows blur out before they reach it.
-            .padding(edge == .top ? .bottom : .top, -32)
-            .ignoresSafeArea()
+            // text always sits on the strong part, rows blur out before they reach it. The bottom
+            // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
+            // the field verdict on the short reach was rows colliding visibly with the legend.
+            .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
+            // Full-bleed by LAYOUT, not by `.ignoresSafeArea()`: safe-area expansion resolves a
+            // beat after insertion (outside any geometry group and outside this view's own
+            // transaction), which is exactly the pop the field kept seeing — vertically first,
+            // then, once the vertical runway became padding, on the X axis alone (the landscape
+            // side insets). 80 pt clears every inset on every device; backgrounds never clip,
+            // so the overhang simply draws.
+            .padding(edge == .top ? .top : .bottom, -80)
+            .padding(.horizontal, -80)
+            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
+            // geometry would ride the push's transaction and visibly grow into place. The
+            // layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
+            .transaction { $0.animation = nil }
     }
 }
 

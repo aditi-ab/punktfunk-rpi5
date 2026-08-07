@@ -1,10 +1,19 @@
-// The gamepad settings' "select" value as a REAL band: every option sits on a drum rotating
-// about a vertical axis — the current one faces you flat, its neighbours curve away with
-// perspective, shrinking and fading toward the edges. The old presentation animated a single
-// Text keyed by its value (an old-out/new-in crossfade that merely implied motion), which fell
-// apart under fast repeated steps: each press restarted the fade. Here the drum's position is
-// one continuous value driven by a spring, and SwiftUI's spring retargeting preserves velocity —
-// rapid presses accumulate into one accelerating spin instead of five restarted crossfades.
+// The gamepad settings' "select" value as a REAL band: the options sit side by side on a drum
+// segment curving about a vertical axis — the current one faces you flat, and a step rotates the
+// next one in with perspective. The old presentation animated a single Text keyed by its value
+// (an old-out/new-in crossfade that merely implied motion), which fell apart under fast repeated
+// steps: each press restarted the fade. Here the drum's position is one continuous value driven
+// by a spring, and SwiftUI's spring retargeting preserves velocity — rapid presses accumulate
+// into one accelerating travel instead of five restarted crossfades.
+//
+// The band is LINEAR, not a ring (field verdict on the first cut): a ring showed the first
+// option waiting to the right of the last one, which left/right can't reach (adjust clamps) —
+// a promise the navigation doesn't keep. And on a 2-option ring the unselected option flipped
+// sides with every step. So positions are fixed: option i sits i steps from the start, the ends
+// are the ends, and A's wrap from the last option travels BACK across the list to the first.
+// Options other than the facing one exist only while the drum is actually moving — at rest a row
+// shows exactly its value (a resting neighbour under a long label rendered as overlapping,
+// unreadable text).
 //
 // The band is purely presentational: stepping semantics (left/right clamps with a boundary thud,
 // A cycles forward wrapping, disabled rows refuse input) stay in GamepadSettingsView's row
@@ -28,9 +37,8 @@ struct GamepadOptionBand: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// Where the drum rests, in option steps — UNBOUNDED: a forward wrap keeps adding 1, never
-    /// modded back, so the ring distance below is what brings option 0 around from the right.
-    /// Rendering only ever reads it modulo `options.count`.
+    /// Where the drum rests, in option steps — always chasing `Double(selection)`; only the
+    /// spring's interpolation ever puts it between integers.
     @State private var drumPosition: Double
 
     init(options: [String], selection: Int, focused: Bool, width: CGFloat) {
@@ -56,7 +64,6 @@ struct GamepadOptionBand: View {
                 Drum(
                     options: options,
                     rotation: drumPosition,
-                    neighborGate: focused ? 1 : 0,
                     target: drumPosition,
                     // Puts the ±1 neighbour ~40 % of the band off-centre, curling to the edge.
                     radius: width * 0.72)
@@ -77,8 +84,8 @@ struct GamepadOptionBand: View {
         }
         .onChange(of: selection) { old, new in step(from: old, to: new) }
         // The options list itself can mutate under the drum (a custom resolution appears, a
-        // controller connects, the buffer options re-derive from a new refresh rate) — the ring
-        // math is only valid while drumPosition ≡ selection (mod count), so re-seat without a spin.
+        // controller connects, the buffer options re-derive from a new refresh rate) — re-seat
+        // without a travel.
         .onChange(of: options.count) { _, _ in snap() }
         // One element to VoiceOver — the neighbour texts are rendering, not content.
         .accessibilityElement(children: .ignore)
@@ -89,22 +96,15 @@ struct GamepadOptionBand: View {
         options.indices.contains(selection) ? options[selection] : ""
     }
 
-    /// One step spins the drum; anything else (an external write from the touch settings, a
-    /// re-derived options list) re-seats it — a spin to a value the user didn't step to would
-    /// read as the UI acting on its own.
+    /// A step (or A's wrap — which on a linear band is a fast travel back to the start) springs
+    /// the drum; anything else (an external write from the touch settings, a re-derived options
+    /// list) re-seats it — a travel to a value the user didn't step to would read as the UI
+    /// acting on its own.
     private func step(from old: Int, to new: Int) {
-        let n = options.count
-        let raw = new - old
-        let delta: Int? = if n > 1 && old == n - 1 && new == 0 {
-            1 // A's wrap from the last option: keep spinning FORWARD, the way the thumb pressed.
-        } else if abs(raw) == 1 {
-            raw
-        } else {
-            nil
-        }
-        guard let delta, !reduceMotion else { return snap() }
+        let wrapped = options.count > 1 && old == options.count - 1 && new == 0
+        guard (abs(new - old) == 1 || wrapped), !reduceMotion else { return snap() }
         withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
-            drumPosition += Double(delta)
+            drumPosition = Double(new)
         }
     }
 
@@ -117,51 +117,44 @@ struct GamepadOptionBand: View {
 
 /// The rotating drum itself. `Animatable` so SwiftUI re-evaluates the body with the INTERPOLATED
 /// rotation every frame of the spring — each option's offset/scale/opacity follows the real arc,
-/// and options more than one step away genuinely enter and leave mid-spin. (A plain `.animation`
-/// on independent modifiers can't do that: each modifier would lerp its own endpoints and the
+/// and options along the travel genuinely enter and leave mid-flight. (A plain `.animation` on
+/// independent modifiers can't do that: each modifier would lerp its own endpoints and the
 /// in-between options would never appear.)
 private struct Drum: View, Animatable {
     let options: [String]
     /// The interpolated drum position, in option steps.
     var rotation: Double
-    /// 1 while the row is focused — the resting drum shows its neighbours only under focus (an
-    /// unfocused row is one flat Text, visually and costwise what it was before the band).
-    var neighborGate: Double
     /// Where the spring is headed (jumps instantly on a step; only `rotation` chases it). The
-    /// distance between them is "how mid-flight are we" — it keeps the neighbours visible while
-    /// an unfocused drum finishes settling, fading them continuously as it lands.
+    /// distance between them is "how mid-flight are we" — the neighbours exist exactly as long
+    /// as the drum is moving, fading continuously as it lands, so a resting row is one flat
+    /// Text and a long label never sits under a resting neighbour.
     let target: Double
     /// Drum radius in points (from the band width — see the caller).
     let radius: Double
 
-    var animatableData: AnimatablePair<Double, Double> {
-        get { AnimatablePair(rotation, neighborGate) }
-        set {
-            rotation = newValue.first
-            neighborGate = newValue.second
-        }
+    var animatableData: Double {
+        get { rotation }
+        set { rotation = newValue }
     }
 
     /// Angular pitch between adjacent options on the drum.
     private static let stepAngle = 34.0 * .pi / 180.0
 
     var body: some View {
-        let n = options.count
         let flight = min(1, abs(rotation - target) * 3)
         let content = ZStack {
-            ForEach(0..<n, id: \.self) { i in
-                // Signed ring distance to the drum position, wrapped into (-n/2, n/2] — the
-                // whole wrap story: a monotonically grown position brings option 0 around from
-                // the right of the last option with no special casing.
-                let d = (Double(i) - rotation).remainder(dividingBy: Double(n))
-                if abs(d) <= 2.5 {
-                    option(i, distance: d, gate: max(neighborGate, flight))
+            ForEach(0..<options.count, id: \.self) { i in
+                // Plain signed distance — the band is linear, so option i has ONE home and the
+                // ends are the ends (nothing waits beyond the last option).
+                let d = Double(i) - rotation
+                if abs(d) < 0.5 || (flight > 0.001 && abs(d) <= 2.5) {
+                    option(i, distance: d, gate: flight)
                 }
             }
         }
         #if os(tvOS)
-        // Flatten the transform stack while spinning — the 10-foot GPU already made these rows
-        // drop Liquid Glass, and five projected texts per step is the same class of cost.
+        // Flatten the transform stack while travelling — the 10-foot GPU already made these
+        // rows drop Liquid Glass, and five projected texts per step is the same class of cost.
         content.drawingGroup()
         #else
         content
@@ -171,7 +164,7 @@ private struct Drum: View, Animatable {
     @ViewBuilder private func option(_ i: Int, distance d: Double, gate: Double) -> some View {
         let angle = d * Self.stepAngle
         let depth = cos(angle)
-        // The facing option never gates: an unfocused row still shows its value.
+        // The facing option never gates: a resting row still shows its value.
         let alpha = pow(max(depth, 0), 3) * (abs(d) < 0.5 ? 1 : gate)
         Text(options[i])
             .lineLimit(1)
