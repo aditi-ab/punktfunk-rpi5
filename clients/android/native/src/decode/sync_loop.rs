@@ -185,9 +185,12 @@ pub(super) fn run_sync(
     // render = true are parked in the tracker; the OnFrameRendered callback pairs them with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
+    // The `video_e2e` cell is the audio plane's alignment reference (see `DisplayTracker`): this
+    // legacy loop feeds it too, so A/V sync works with "Low-latency mode" off as well.
     let tracker = DisplayTracker::new(
         stats.clone(),
         clock_offset.clone(),
+        client.video_e2e_shared(),
         std::sync::Arc::new(super::presenter::PresentMeter::new()),
     );
     let render_cb = install_render_callback(&codec, &tracker);

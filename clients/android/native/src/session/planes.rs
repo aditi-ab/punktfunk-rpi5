@@ -177,12 +177,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
-/// (unified stats spec, `design/stats-unification.md`). Returns 33 doubles
+/// (unified stats spec, `design/stats-unification.md`). Returns 35 doubles
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
 /// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
 /// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
 /// e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
-/// feedP50Ms, codecP50Ms, skippedOverflowWindow]`
+/// feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs]`
 /// (the flags are 1.0/0.0; indexes 0–21 match the previous 22-double layout — 0–13 the original
 /// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
 /// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
@@ -203,7 +203,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// received→queued (hand-off + input-slot wait) at 30 and `codec` = queued→decoded (codec-pure,
 /// from the AU's last piece) at 31, both 0.0 when no sample landed (sync loop); 32 is the
 /// parked-AU overflow subset of the window's `skipped` at 19 (decoder fell behind, vs benign
-/// newest-wins pacing)), or `null` when no decode thread is running.
+/// newest-wins pacing); 33/34 are the AUDIO plane's latency — the playback ring's live depth in ms
+/// and the A/V sync loop's smoothed offset in ms (positive = audio behind the picture) — both live
+/// gauges rather than windowed samples, like the cumulative drop total at 9), or `null` when no
+/// decode thread is running.
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
@@ -227,7 +230,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             .drain(h.client.frames_dropped(), h.client.fec_recovered_shards());
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 33] = [
+        let buf: [f64; 35] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -281,6 +284,15 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             snap.feed_p50_ms,
             snap.codec_p50_ms,
             snap.skipped_overflow as f64,
+            // The audio plane's own latency (`design/audio-latency-overhaul.md`): how much decoded
+            // audio is queued ahead of the speaker, and where the A/V sync loop measures that
+            // PUTS it relative to the picture (+ = audio behind). Both, because a deep ring on a
+            // jittery link is correct behaviour and only the offset tells that apart from audio
+            // simply held late. Live gauges written by the audio thread — before this the whole
+            // plane published nothing any surface could render, so a "the audio delay is way too
+            // high" report had no instrument behind it at all.
+            h.client.audio_buffer_ms() as f64,
+            h.client.audio_av_offset_ms() as f64,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

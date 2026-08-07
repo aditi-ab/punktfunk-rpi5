@@ -20,6 +20,16 @@
 //! (2) is now the SHARED `punktfunk_core::audio::JitterPolicy` at `JitterTuning::AAUDIO`, which also
 //! fixed what this ring was missing: it had a hard cap but nothing that walked the depth back down,
 //! so drift and arrival bursts raised latency permanently and Android settled on its ceiling.
+//!
+//! It is also **A/V synchronised** (`design/audio-latency-overhaul.md`): the decode thread reads the
+//! host capture `pts_ns` every `AudioPacket` has always carried, compares where this frame will
+//! actually play against where the picture it belongs with reached glass
+//! (`decode::DisplayTracker` publishes that), and asks the ring for a depth that closes the gap.
+//! Only ASKS — `JitterPolicy` clamps the request between its own underrun-driven floor and the hard
+//! cap, so continuity outranks sync and a link whose jitter genuinely needs more buffer than the
+//! picture is away keeps its buffer, with the residual reported on the HUD instead of taken out of
+//! the listener's stream. With no video reference (below API 33 there are no render callbacks, so
+//! nothing confirms a present) the target stays `None` and the ring behaves exactly as it did.
 
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
@@ -94,13 +104,43 @@ impl AudioDec {
 
 /// Diagnostics — written by the decode thread + the realtime callback, logged periodically. The
 /// audio analogue of the video `fed`/`rendered` counters (we can't "screenshot" sound).
+///
+/// The ring's DEPTH is not here: the A/V sync loop needs the same number in the same units, so it
+/// is published once through [`punktfunk_core::audio::AudioSyncCell`] and read from there by the
+/// log line below. One publisher, one reading — a second copy is a second thing to go stale.
 #[derive(Default)]
 struct Counters {
     opus_decoded: AtomicU64, // Opus packets decoded OK (~200/s at 5 ms frames)
     pcm_written: AtomicU64,  // PCM frames copied out to AAudio (device clock is pulling)
     underruns: AtomicU64,    // callbacks that emitted silence (ring not primed / drained)
-    ring_depth: AtomicU64,   // ring sample count at the last callback
     target_ms: AtomicU64,    // the policy's LIVE target depth (it grows on this device's underruns)
+}
+
+/// Whether the A/V sync loop runs this session. `false` leaves `JitterPolicy`'s sync target at
+/// `None`, which reproduces the pre-overhaul ring behaviour exactly — the point of the hatch.
+///
+/// Two levers because Android has neither of the other clients' launch surfaces. `PUNKTFUNK_NO_AV_SYNC`
+/// keeps the contract the desktop clients document (and works when the client is driven from a
+/// shell), but an app started from the launcher inherits no such environment, so the one a field
+/// tester can actually reach is the sysprop — `adb shell setprop debug.punktfunk.no_av_sync 1`,
+/// no rebuild, exactly like `debug.punktfunk.presenter`. A loop that steers PLAYBACK has to be
+/// bisectable on the device that reports the regression, not only on the bench.
+fn av_sync_enabled() -> bool {
+    if matches!(
+        std::env::var("PUNKTFUNK_NO_AV_SYNC").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        return false;
+    }
+    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
+                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
+    let n = unsafe {
+        libc::__system_property_get(
+            c"debug.punktfunk.no_av_sync".as_ptr(),
+            buf.as_mut_ptr().cast(),
+        )
+    };
+    !(n > 0 && matches!(&buf[..n as usize], b"1" | b"true"))
 }
 
 /// Owned by [`crate::session::SessionHandle`]: the live AAudio stream + the decode thread.
@@ -127,6 +167,10 @@ impl AudioPlayback {
         // Worst transient the ring can hold before the policy trims it.
         let hard_cap_max = tuning.hard_cap_ms as usize * ms;
         let counters = Arc::new(Counters::default());
+        // The A/V sync hand-off: the realtime callback owns the ring (so it publishes the depth and
+        // consumes the target), the decode thread owns the timestamps (so it computes the target).
+        // Two atomics, because the callback must not block on the thread that decodes Opus.
+        let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
 
         // One open attempt at a given sharing mode. Everything the realtime callback captures
         // (channels, ring, prime state) is rebuilt per attempt — `open_stream` consumes the builder
@@ -146,6 +190,7 @@ impl AudioPlayback {
             // Realtime consumer state, owned by the callback (FnMut) — no lock: AAudio calls it from
             // a single high-priority thread, and the decode thread only touches `tx`/`free_rx`.
             let cb_counters = counters.clone();
+            let cb_sync = sync.clone();
             // Pre-reserve the ring so `extend` never reallocates on the realtime thread. Worst
             // transient before the trim below = the hard cap plus one full channel of 5 ms (480-f32)
             // frames — the punktfunk protocol always sends 5 ms Opus frames (host `audio_thread`); a
@@ -171,6 +216,13 @@ impl AudioPlayback {
                     ring.extend(chunk.drain(..));
                     let _ = free_tx.try_send(chunk);
                 }
+                // A/V sync: take whatever depth the decode thread's sync loop last asked for, and
+                // publish where the ring actually is so it can measure the result. The policy
+                // clamps the request between its own underrun floor and the hard cap — continuity
+                // outranks sync, always (see `JitterPolicy::set_sync_target`). Read AFTER the
+                // drain, so the depth is everything a frame queued right now must wait behind.
+                policy.set_sync_target(cb_sync.target());
+                cb_sync.publish_depth(ring.len());
                 // Jitter buffer: the shared policy decides prime/silence, trims a burst, and —
                 // new here — sheds ONE crossfaded 5 ms frame when the depth average has sat above
                 // target long enough to be drift rather than jitter. Without that shed this ring
@@ -201,9 +253,6 @@ impl AudioPlayback {
                 // No-op while un-primed, so a deliberate priming silence is never counted as an
                 // underrun (which would otherwise drive the adaptive floor up for no reason).
                 policy.note_read(ran_short);
-                cb_counters
-                    .ring_depth
-                    .store(ring.len() as u64, Ordering::Relaxed);
                 cb_counters
                     .target_ms
                     .store(policy.target_ms() as u64, Ordering::Relaxed);
@@ -303,7 +352,7 @@ impl AudioPlayback {
         let sd = shutdown.clone();
         let join = std::thread::Builder::new()
             .name("pf-audio".into())
-            .spawn(move || decode_loop(client, tx, free_rx, sd, counters, channels))
+            .spawn(move || decode_loop(client, tx, free_rx, sd, counters, channels, sync))
             .ok();
 
         Some(AudioPlayback {
@@ -334,6 +383,7 @@ fn decode_loop(
     shutdown: Arc<AtomicBool>,
     counters: Arc<Counters>,
     channels: usize,
+    sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 ) {
     // Fold this Opus→AAudio thread into the client's hot-thread set so the ADPF session the decode
     // thread opens also keeps audio decode on a fast core (registered before the video pump's first
@@ -354,9 +404,44 @@ fn decode_loop(
     let mut window_peak = 0f32; // loudest |sample| since the last log — tells a tone from silence
     let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
     let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
+
+    // A/V sync (audio latency overhaul). This thread is the only place holding all three
+    // ingredients at once: the packet's host capture `pts_ns`, the ring depth (via the sync cell)
+    // and the video plane's end-to-end figure. `pts_ns` arrived in every `AudioPacket` and was
+    // dropped on the floor here for the plane's whole existence, which is why audio ran at whatever
+    // depth its jitter ring settled at with nothing ever placing it against the picture.
+    let av_sync_enabled = av_sync_enabled();
+    let mut av = punktfunk_core::audio::AvSync::new(channels as u8);
+    let video_e2e = client.video_e2e_shared();
+    let av_offset_out = client.audio_av_offset_shared();
+    let buffer_ms_out = client.audio_buffer_ms_shared();
+    if !av_sync_enabled {
+        log::info!("audio: A/V sync disabled (PUNKTFUNK_NO_AV_SYNC / debug.punktfunk.no_av_sync)");
+    }
     'pump: while !shutdown.load(Ordering::Relaxed) {
         match client.next_audio(Duration::from_millis(5)) {
             Ok(pkt) => {
+                // Place this frame against the picture it belongs with, BEFORE it is queued:
+                // `buffered_ahead` is everything that must still play first, so the depth read here
+                // is exactly what delays it.
+                let depth = sync.depth();
+                // Published unconditionally — the ring's depth is worth seeing even with sync off,
+                // and it is what makes a "the audio delay is way too high" report triageable at all.
+                buffer_ms_out.store((depth / ms.max(1)) as u32, Ordering::Relaxed);
+                if av_sync_enabled {
+                    let ve2e = video_e2e.load(Ordering::Relaxed);
+                    av.observe(punktfunk_core::audio::AvSyncObservation {
+                        pts_ns: pkt.pts_ns,
+                        now_local_ns: punktfunk_core::client::now_realtime_ns(),
+                        clock_offset_ns: client.clock_offset_now_ns(),
+                        buffered_ahead: depth,
+                        // 0 = nothing confirmed on the glass yet (no render callback below API 33,
+                        // or the stream has not presented a frame); no reference, no correction.
+                        video_e2e_ns: (ve2e > 0).then_some(ve2e),
+                    });
+                    sync.set_target(av.desired_depth(depth));
+                    av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
+                }
                 // Conceal lost packets (a seq gap) with libopus PLC before decoding the one that
                 // arrived: empty input synthesizes `frame_samples` of interpolation per missing
                 // packet — an inaudible fade instead of the click a hard gap makes in the ring.
@@ -404,12 +489,17 @@ fn decode_loop(
                             Err(TrySendError::Disconnected(_)) => break,
                         }
                         if count % 600 == 0 {
+                            // `av_ms` is the sync loop's smoothed placement error (+ = audio behind
+                            // the picture); 0 with sync off, or before it has a video reference.
+                            // Logged next to the depth because a deep ring on a jittery link is
+                            // correct and only the offset separates that from audio held late.
                             log::info!(
-                                "audio: opus={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} peak={window_peak:.3}",
+                                "audio: opus={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} av_ms={} peak={window_peak:.3}",
                                 counters.pcm_written.load(Ordering::Relaxed),
                                 counters.underruns.load(Ordering::Relaxed),
-                                counters.ring_depth.load(Ordering::Relaxed) / ms.max(1) as u64,
+                                (depth / ms.max(1)) as u64,
                                 counters.target_ms.load(Ordering::Relaxed),
+                                av.offset_ms(),
                             );
                             window_peak = 0.0;
                         }

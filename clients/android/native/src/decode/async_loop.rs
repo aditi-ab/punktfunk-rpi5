@@ -204,7 +204,15 @@ pub(super) fn run_async(
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
     let meter = Arc::new(PresentMeter::new());
-    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone(), meter.clone());
+    // The tracker also publishes each confirmed present's end-to-end into the shared cell the audio
+    // plane steers its jitter ring by (`design/audio-latency-overhaul.md`) — video is the master,
+    // and this is the only point that knows when a frame actually reached glass.
+    let tracker = DisplayTracker::new(
+        stats.clone(),
+        clock_offset.clone(),
+        client.video_e2e_shared(),
+        meter.clone(),
+    );
     let render_cb = install_render_callback(&codec, &tracker);
 
     // The timeline presenter (see `presenter.rs`): newest-wins / smoothing store, one-in-flight
