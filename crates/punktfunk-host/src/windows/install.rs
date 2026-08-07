@@ -159,14 +159,17 @@ fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     let verdict = (|| -> Result<()> {
         rc.ok().context("GetNamedSecurityInfoW(owner + DACL)")?;
         let privileged = privileged_sids()?;
-        // SAFETY: `owner` points into the descriptor returned above and is valid for this scope.
         let is_privileged = |sid: PSID| -> bool {
+            // SAFETY: callers pass SIDs that point into the live security descriptor returned
+            // above (freed only after this scope); IsValidSid only reads the structure.
             if sid.is_invalid() || !unsafe { IsValidSid(sid) }.as_bool() {
                 return false;
             }
-            privileged
-                .iter()
-                .any(|p| unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok())
+            privileged.iter().any(|p| {
+                // SAFETY: `sid` was just validated by IsValidSid; `p` is a self-contained SID
+                // byte copy built by `privileged_sids` (length measured by GetLengthSid).
+                unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok()
+            })
         };
 
         if !is_privileged(owner) {
@@ -235,8 +238,10 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
         // SAFETY: `wide` is NUL-terminated and outlives the call; psid is a live out-param.
         unsafe { ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid) }
             .with_context(|| format!("ConvertStringSidToSidW({s})"))?;
-        // SAFETY: psid is a valid SID; copy it out so the caller owns plain bytes.
+        // SAFETY: psid is a valid SID (the conversion above succeeded).
         let len = unsafe { GetLengthSid(psid) } as usize;
+        // SAFETY: a SID is `len` contiguous bytes at psid — GetLengthSid just measured it — and
+        // the copy detaches the bytes before the LocalFree below.
         let bytes = unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec();
         // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
         unsafe {
