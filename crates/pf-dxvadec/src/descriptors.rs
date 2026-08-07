@@ -304,6 +304,7 @@ mod tests {
             setup_slot: 0,
             setup_id: 1,
             setup_is_reference: true,
+            release_after_decode: Vec::new(),
             refs: Vec::<DxvaRef>::new(),
             mb_count,
         }

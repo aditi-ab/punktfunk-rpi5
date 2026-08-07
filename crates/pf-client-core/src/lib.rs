@@ -105,8 +105,8 @@ pub mod clipboard;
 pub mod video_d3d11;
 // Native D3D11VA (M5): `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the
 // hand-off ring `video_d3d11` owns. Since M10 it is the only DXVA rung there is. In `auto`
-// for the codecs that have hardware evidence (H.264/H.265) and, with nothing proven left
-// below it, for AV1 too — see `video`'s evidence table; `PUNKTFUNK_DECODER=native-d3d11va`
+// for all three codecs, each of which now has hardware evidence — H.264/H.265 since M5, AV1
+// since 2026-08-07 — see `video`'s evidence table; `PUNKTFUNK_DECODER=native-d3d11va`
 // reaches every leg by pin.
 #[cfg(windows)]
 pub mod video_d3d11_native;

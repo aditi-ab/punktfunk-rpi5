@@ -45,6 +45,46 @@
 //! no equivalent here. rav1d gets the machine's cores, and **at least two frame contexts**;
 //! [`Av1Software::new`] carries the whole argument, because "at least two" is not a
 //! performance choice but the difference between an error and `abort()`.
+//!
+//! # Why this rung is NOT process-isolated
+//!
+//! The frame-context floor closes the one abort we hit and can prove. It does not make the
+//! rung panic-proof, and nothing at this call site can: rav1d exposes dav1d's C ABI, every
+//! internal `rav1d_*` entry point is `pub(crate)`, so any reachable panic crosses
+//! `extern "C"` as `panic_cannot_unwind` → `abort()`. No `catch_unwind`, no rung demotion
+//! and no [`NoSoftwareRung`] refusal can contain it. Counted in rav1d 1.1.0's 60 source
+//! files: 285 `unwrap()`, 214 `assert!`, 19 `unreachable!`, 11 `expect()`, 10 `panic!` —
+//! 539 sites that are an `abort()` if a stream can reach them. #97 fixed ONE.
+//!
+//! Isolating the decoder in its own process is the only defence that actually works, and
+//! it is deliberately NOT taken. The decision, so it is not re-litigated from scratch:
+//!
+//! * **The defect is a dependency's, and it is one line.** memorysafety/rav1d#1497 was
+//!   filed 2026-08-07 with the fix (`is_some_and` for the `unwrap`) and a reproducer.
+//!   Paying a permanent architectural tax to route around a bug that costs upstream one
+//!   line is the wrong trade while that line is still plausibly coming.
+//! * **The residual risk is real but unquantified.** 539 panic sites is a scary number
+//!   and a meaningless one: not one of them is known to be reachable from a punktfunk
+//!   stream. The honest next step is to MEASURE reachability — fuzz this rung with
+//!   truncated, reordered and bit-flipped AUs and see whether any input aborts — not to
+//!   buy insurance against a number nobody has bounded. That is cheap; this is not.
+//! * **The cost lands on the video path, and on three platforms.** pf-client-core builds
+//!   into the Linux, Windows and Android clients (the Apple clients decode through
+//!   VideoToolbox and never reach here). Each needs its own shared-memory transport for
+//!   `CpuPlanarFrame`s, its own child lifecycle, crash detection and restart, and its own
+//!   backpressure — and it adds a scheduling boundary to the rung that is ALREADY the
+//!   slowest one on the ladder. Zero-copy is a hard requirement here; an IPC hop that
+//!   copies frames would be rejected on its own terms.
+//! * **What an abort actually costs is bounded.** This rung is reached because the GPU
+//!   rungs already failed, so the session is degraded before rav1d sees a byte. Losing
+//!   the process loses a session the user was going to have a bad time in regardless.
+//!   That is bad, and it is not the same as losing a working session.
+//!
+//! **Revisit when the calculus changes, which is a specific event, not a feeling:** a
+//! SECOND distinct abort observed in the field, or a fuzzer finding a reachable panic.
+//! Either turns this from one upstream bug into a class of them, and a class is what
+//! justifies isolation. Until then the floor plus the upstream fix is the proportionate
+//! answer, and the fuzzing is the work that would tell us we were wrong.
 
 use crate::video::{CpuPlanarFrame, RungLoss};
 use crate::video_color::ColorDesc;

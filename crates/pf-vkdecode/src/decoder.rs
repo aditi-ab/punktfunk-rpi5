@@ -822,175 +822,204 @@ impl VkH264Decoder {
         }
         let vk_plan = vk_plan.expect("the rebuilt session matches its own plan");
 
-        let state = self.state.as_mut().expect("ensured above");
-        // The per-AU active-reference gate: the session was created with
-        // maxActiveReferencePictures; binding more in one decode op would be a
-        // silent VUID violation on the drivers that matter most.
-        let max_active = state.session.config.max_active_references as usize;
-        if vk_plan.refs.len() > max_active {
-            return Err(VkDecodeError::Unsupported(format!(
-                "AU references {} pictures, session allows {max_active} active references",
-                vk_plan.refs.len()
-            )));
-        }
-
-        // Coincide binding sync: slots the planner released no longer bind their
-        // images (the pictures may still be pending/held — untouched), and the
-        // setup slot's PREVIOUS binding is cleared before it binds fresh.
-        let setup = usize::from(vk_plan.setup_slot);
-        if state.dpb.is_none() {
-            let mut held = vec![false; state.slot_image.len()];
-            for (slot, _id) in state.slots.held() {
-                held[usize::from(slot)] = true;
+        // Everything from here to the deferred release below is ONE unit of ledger
+        // work. `plan_to_vk` has already committed this AU's setup assignment and
+        // handed back the removals it deliberately did NOT apply
+        // (`DecodePlanVk::release_after_decode`); until those are applied the slot
+        // map holds one picture too many. A `?` anywhere in the region would skip
+        // them and leak a slot per failed AU — four `?`s and three early `return`s
+        // could — so the region's Result is HELD and the release runs either way.
+        let submitted = (|| -> Result<(), VkDecodeError> {
+            let state = self.state.as_mut().expect("ensured above");
+            // The per-AU active-reference gate: the session was created with
+            // maxActiveReferencePictures; binding more in one decode op would be a
+            // silent VUID violation on the drivers that matter most.
+            let max_active = state.session.config.max_active_references as usize;
+            if vk_plan.refs.len() > max_active {
+                return Err(VkDecodeError::Unsupported(format!(
+                    "AU references {} pictures, session allows {max_active} active references",
+                    vk_plan.refs.len()
+                )));
             }
-            for (slot, binding) in state.slot_image.iter_mut().enumerate() {
-                if let Some(picture) = *binding {
-                    if !held[slot] || slot == setup {
-                        state.pool.pictures[picture].bound = false;
-                        *binding = None;
+
+            // Coincide binding sync: slots the planner released no longer bind their
+            // images (the pictures may still be pending/held — untouched), and the
+            // setup slot's PREVIOUS binding is cleared before it binds fresh.
+            let setup = usize::from(vk_plan.setup_slot);
+            if state.dpb.is_none() {
+                let mut held = vec![false; state.slot_image.len()];
+                for (slot, _id) in state.slots.held() {
+                    held[usize::from(slot)] = true;
+                }
+                for (slot, binding) in state.slot_image.iter_mut().enumerate() {
+                    if let Some(picture) = *binding {
+                        if !held[slot] || slot == setup {
+                            state.pool.pictures[picture].bound = false;
+                            *binding = None;
+                        }
                     }
                 }
             }
-        }
 
-        // The decode target: a FREE pool image (never one a consumer holds — the
-        // whole point of the pool model). Exhaustion means the consumer owes
-        // more than HOLD_HEADROOM releases; no wait can free an image here.
-        let Some(dst) = state.pool.free_index() else {
-            debug!(
-                held = state.pool.held_total(),
-                "picture pool exhausted — release_frame owed"
-            );
-            return Err(VkDecodeError::NoFreeSlot);
-        };
+            // The decode target: a FREE pool image (never one a consumer holds — the
+            // whole point of the pool model). Exhaustion means the consumer owes
+            // more than HOLD_HEADROOM releases; no wait can free an image here.
+            let Some(dst) = state.pool.free_index() else {
+                debug!(
+                    held = state.pool.held_total(),
+                    "picture pool exhausted — release_frame owed"
+                );
+                return Err(VkDecodeError::NoFreeSlot);
+            };
 
-        // Cross-queue waits (the AVVkFrame contract): the dst image's last known
-        // timeline value (covers a presenter write-back after release), plus —
-        // coincide mode — every referenced image's value, so reference reads
-        // order after any presenter layout restore already reported back.
-        let mut waits: Vec<(vk::Semaphore, u64)> = Vec::new();
-        {
-            let dst_pic = &state.pool.pictures[dst];
-            if dst_pic.value > 0 {
-                waits.push((dst_pic.semaphore, dst_pic.value));
+            // Cross-queue waits (the AVVkFrame contract): the dst image's last known
+            // timeline value (covers a presenter write-back after release), plus —
+            // coincide mode — every referenced image's value, so reference reads
+            // order after any presenter layout restore already reported back.
+            let mut waits: Vec<(vk::Semaphore, u64)> = Vec::new();
+            {
+                let dst_pic = &state.pool.pictures[dst];
+                if dst_pic.value > 0 {
+                    waits.push((dst_pic.semaphore, dst_pic.value));
+                }
             }
-        }
-        if state.dpb.is_none() {
-            for r in &vk_plan.refs {
-                if let Some(picture) = state.slot_image[usize::from(r.slot)] {
-                    let pic = &state.pool.pictures[picture];
-                    if pic.value > 0 && !waits.iter().any(|(sem, _)| *sem == pic.semaphore) {
-                        waits.push((pic.semaphore, pic.value));
+            if state.dpb.is_none() {
+                for r in &vk_plan.refs {
+                    if let Some(picture) = state.slot_image[usize::from(r.slot)] {
+                        let pic = &state.pool.pictures[picture];
+                        if pic.value > 0 && !waits.iter().any(|(sem, _)| *sem == pic.semaphore) {
+                            waits.push((pic.semaphore, pic.value));
+                        }
                     }
                 }
             }
-        }
-        let signal_value = state.pool.pictures[dst].value + 1;
+            let signal_value = state.pool.pictures[dst].value + 1;
 
-        // Command buffer + query slot for this submission.
-        let submission = state.submitted;
-        let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
-        if let Some((sem, value)) = state.cmd_marks[cmd_index] {
-            // SAFETY: live device; the token is a pool image's semaphore.
-            unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
-        }
-        let query_index = (submission % u64::from(state.ops.query_count)) as u32;
+            // Command buffer + query slot for this submission.
+            let submission = state.submitted;
+            let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
+            if let Some((sem, value)) = state.cmd_marks[cmd_index] {
+                // SAFETY: live device; the token is a pool image's semaphore.
+                unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
+            }
+            let query_index = (submission % u64::from(state.ops.query_count)) as u32;
 
-        // Upload the AU (recycles/grows against submission-completion tokens).
-        let device = self.dev.ash().clone();
-        let mut poll = |token: &(vk::Semaphore, u64)| -> Result<bool, VkDecodeError> {
-            // SAFETY: live device; the token's semaphore is a pool semaphore.
-            let current = unsafe { device.get_semaphore_counter_value(token.0) }
-                .map_err(VkDecodeError::from)?;
-            Ok(current >= token.1)
-        };
-        let device2 = self.dev.ash().clone();
-        let mut wait = |token: &(vk::Semaphore, u64)| -> Result<(), VkDecodeError> {
-            // SAFETY: as above.
-            unsafe { wait_timeline(&device2, token.0, token.1, "bitstream slot drain") }
-        };
-        // The bitstream buffer carries the SLICE NALUs only, concatenated — a
-        // real AU opens with AUD/SEI (and, at IDRs, SPS/PPS) NALUs, and feeding
-        // those to the VCN firmware inside the decode range HANGS it (the .25
-        // `vcn_unified_0 ring timeout`; FFmpeg feeds slices-only for the same
-        // reason). `pack_slices` rebases the offsets into the packed buffer AND
-        // normalises each slice's Annex-B prefix to three bytes — the two go
-        // together by construction, see `crate::ring::three_byte_prefix`.
-        let plan_segments: Vec<std::ops::Range<usize>> =
-            plan.slices.iter().map(|s| s.data.clone()).collect();
-        let Some(packed) = pack_slices(au, &plan_segments) else {
-            return Err(VkDecodeError::Unsupported(
-                "packed slice data exceeds the u32 offsets Vulkan submits".into(),
-            ));
-        };
-        let slice_offsets = packed.offsets;
-        // SAFETY: live device; the segments are the plan's own in-bounds slice
-        // ranges (narrowed by the prefix normalisation, so still in bounds); every
-        // pending token is the completion signal of the submission that consumed
-        // the slot.
-        let upload = unsafe {
+            // Upload the AU (recycles/grows against submission-completion tokens).
+            let device = self.dev.ash().clone();
+            let mut poll = |token: &(vk::Semaphore, u64)| -> Result<bool, VkDecodeError> {
+                // SAFETY: live device; the token's semaphore is a pool semaphore.
+                let current = unsafe { device.get_semaphore_counter_value(token.0) }
+                    .map_err(VkDecodeError::from)?;
+                Ok(current >= token.1)
+            };
+            let device2 = self.dev.ash().clone();
+            let mut wait = |token: &(vk::Semaphore, u64)| -> Result<(), VkDecodeError> {
+                // SAFETY: as above.
+                unsafe { wait_timeline(&device2, token.0, token.1, "bitstream slot drain") }
+            };
+            // The bitstream buffer carries the SLICE NALUs only, concatenated — a
+            // real AU opens with AUD/SEI (and, at IDRs, SPS/PPS) NALUs, and feeding
+            // those to the VCN firmware inside the decode range HANGS it (the .25
+            // `vcn_unified_0 ring timeout`; FFmpeg feeds slices-only for the same
+            // reason). `pack_slices` rebases the offsets into the packed buffer AND
+            // normalises each slice's Annex-B prefix to three bytes — the two go
+            // together by construction, see `crate::ring::three_byte_prefix`.
+            let plan_segments: Vec<std::ops::Range<usize>> =
+                plan.slices.iter().map(|s| s.data.clone()).collect();
+            let Some(packed) = pack_slices(au, &plan_segments) else {
+                return Err(VkDecodeError::Unsupported(
+                    "packed slice data exceeds the u32 offsets Vulkan submits".into(),
+                ));
+            };
+            let slice_offsets = packed.offsets;
+            // SAFETY: live device; the segments are the plan's own in-bounds slice
+            // ranges (narrowed by the prefix normalisation, so still in bounds); every
+            // pending token is the completion signal of the submission that consumed
+            // the slot.
+            let upload = unsafe {
+                state
+                    .ring
+                    .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
+            };
+
+            // Record + submit, signalling the dst image's next timeline value.
+            // SAFETY: live device; every handle recorded below belongs to this
+            // session generation, and the packed slices sit uploaded in the ring slot.
+            unsafe {
+                record_and_submit(
+                    &self.dev,
+                    &*self.lock,
+                    state,
+                    &vk_plan,
+                    &slice_offsets,
+                    &upload,
+                    dst,
+                    cmd_index,
+                    query_index,
+                    &waits,
+                    signal_value,
+                )?;
+            }
+
+            // Post-submit bookkeeping.
+            let dst_sem = state.pool.pictures[dst].semaphore;
+            state.pool.pictures[dst].value = signal_value;
+            state.pool.pictures[dst].pending = true;
+            if state.dpb.is_none() {
+                state.pool.pictures[dst].bound = true;
+                state.slot_image[setup] = Some(dst);
+            }
+            state.cmd_marks[cmd_index] = Some((dst_sem, signal_value));
+            state.query_marks[query_index as usize] = submission;
+            state.submitted += 1;
+            state.last_submit = Some((dst_sem, signal_value));
             state
                 .ring
-                .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
-        };
+                .pending
+                .set_pending(upload.slot, (dst_sem, signal_value));
 
-        // Record + submit, signalling the dst image's next timeline value.
-        // SAFETY: live device; every handle recorded below belongs to this
-        // session generation, and the packed slices sit uploaded in the ring slot.
-        unsafe {
-            record_and_submit(
-                &self.dev,
-                &*self.lock,
-                state,
-                &vk_plan,
-                &slice_offsets,
-                &upload,
-                dst,
-                cmd_index,
-                query_index,
-                &waits,
-                signal_value,
-            )?;
+            // Refresh the per-slot reference cache from this AU's facts.
+            state.slot_refs[setup] = Some(vk_plan.setup_ref);
+            for r in &vk_plan.refs {
+                state.slot_refs[usize::from(r.slot)] = Some(r.std);
+            }
+
+            self.pending.insert(
+                vk_plan.setup_id,
+                PendingPic {
+                    image: dst,
+                    submission,
+                    query_slot: query_index,
+                    timeline_value: signal_value,
+                    crop: plan.picture.display_crop,
+                    colour: plan.picture.colour,
+                    poc: plan.picture.pic_order_cnt,
+                    is_idr: plan.picture.is_idr,
+                    recovery,
+                    decode_order,
+                },
+            );
+            Ok(())
+        })();
+
+        // The slots this AU's own 8.2.5 marking retired while the decode op still
+        // BOUND them (`DecodePlanVk::release_after_decode`). Held through the
+        // conversion, the coincide binding sync and the submission, so none of the
+        // three could take them; freed now that the op is recorded, so the next AU
+        // may have them. Their images stay pinned by `bound` until that AU's sync,
+        // the same one-frame grace every other released slot's image gets.
+        //
+        // This runs on the failure paths too, and must: the removals are the
+        // planner's verdict on pictures that left the DPB, which nothing this AU
+        // does can undo.
+        if let Some(state) = self.state.as_mut() {
+            for &id in &vk_plan.release_after_decode {
+                if !state.slots.release(id) {
+                    trace!(id, "deferred release of an id the slot map no longer holds");
+                }
+            }
         }
-
-        // Post-submit bookkeeping.
-        let dst_sem = state.pool.pictures[dst].semaphore;
-        state.pool.pictures[dst].value = signal_value;
-        state.pool.pictures[dst].pending = true;
-        if state.dpb.is_none() {
-            state.pool.pictures[dst].bound = true;
-            state.slot_image[setup] = Some(dst);
-        }
-        state.cmd_marks[cmd_index] = Some((dst_sem, signal_value));
-        state.query_marks[query_index as usize] = submission;
-        state.submitted += 1;
-        state.last_submit = Some((dst_sem, signal_value));
-        state
-            .ring
-            .pending
-            .set_pending(upload.slot, (dst_sem, signal_value));
-
-        // Refresh the per-slot reference cache from this AU's facts.
-        state.slot_refs[setup] = Some(vk_plan.setup_ref);
-        for r in &vk_plan.refs {
-            state.slot_refs[usize::from(r.slot)] = Some(r.std);
-        }
-
-        self.pending.insert(
-            vk_plan.setup_id,
-            PendingPic {
-                image: dst,
-                submission,
-                query_slot: query_index,
-                timeline_value: signal_value,
-                crop: plan.picture.display_crop,
-                colour: plan.picture.colour,
-                poc: plan.picture.pic_order_cnt,
-                is_idr: plan.picture.is_idr,
-                recovery,
-                decode_order,
-            },
-        );
+        submitted?;
 
         // The plan's DPB verdicts over the pending map: outputs become ready
         // frames (their images move pending → held until released);

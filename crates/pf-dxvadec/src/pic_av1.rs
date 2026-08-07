@@ -122,6 +122,47 @@ pub struct DecodePlanDxvaAv1 {
     pub bitstream: Av1Bitstream,
     pub setup_slot: u8,
     pub setup_id: PicId,
+    /// Pictures this frame's own `refresh_frame_flags` displaces from the store
+    /// while THIS submission still NAMES them — their surfaces may not be recycled
+    /// until the decode op has been issued, and the caller owes exactly that.
+    ///
+    /// AV1 applies `refresh_frame_flags` AFTER the frame is decoded (7.20), so
+    /// `ref_frame_idx` resolves against the store as it stood BEFORE this frame and
+    /// a frame that reads a slot it then overwrites is the ORDINARY case, not an
+    /// exotic one: **268 of the vendored vector's 274 frames** do it, first at frame
+    /// 6. Releasing such a picture inside this conversion — which is what the H.264
+    /// and H.265 siblings do with their whole `removed` list, and what this one did
+    /// until the parity harness caught it — hands its surface straight back to
+    /// [`Self::setup_slot`], because [`SlotMap::assign`] takes the lowest free slot
+    /// and the lowest free slot is the one just vacated. The submission then says
+    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` in the same
+    /// breath: decode into the surface you are predicting from.
+    ///
+    /// Neither vendored H.264 nor H.265 vector ever produces that shape (measured:
+    /// zero on the 250-AU clips), which is why the eager release survived two
+    /// codecs believed hardware-proven and opened on the first AV1 frame past the key
+    /// frame's neighbourhood.
+    ///
+    /// ⚠ That zero turned out to be a fact about the VECTORS. H.264 has the identical
+    /// defect on any low-delay stream — 117 of 120 access units of our own host's
+    /// output, wrong pixels on three GPUs — and now carries the identical deferral
+    /// ([`crate::pic::DecodePlanDxva::release_after_decode`], which records the
+    /// measurement). H.265 is the only one of the three that is genuinely safe, and
+    /// structurally: its planner snapshots `dpb_refs` after `decode_rps`. The Vulkan rung
+    /// carries the same contract for the same reason
+    /// (`pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`), and this
+    /// rung's constraint is the STRICTER of the two: Vulkan binds only the references
+    /// the frame names, while `RefFrameMapTextureIndex` declares the whole store, so
+    /// every picture the store still names has to survive — not just the seven the
+    /// frame reads.
+    ///
+    /// This is exactly `dpb.removed` less the picture being stored, and that is not a
+    /// coincidence to be tidied into a filter: the planner snapshots `dpb_refs` before
+    /// any mutation, so every removal is by construction a picture the store named
+    /// (see the conversion's own comment). Applying the list completes the plan's
+    /// bookkeeping and never invents a removal. A caller that drops it holds a surface
+    /// on nearly every frame and runs the ledger dry within ten.
+    pub release_after_decode: Vec<PicId>,
 }
 
 /// Why a plan cannot be expressed as DXVA AV1 buffers.
@@ -629,12 +670,32 @@ pub fn plan_to_dxva_av1(
     }
 
     // --- mutations, after every fallible step -----------------------------
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        let _ = slots.release(id);
-    }
+    // ⚠ EVERY removed picture is held back, and nothing is released here at all.
+    //
+    // A picture this submission NAMES may be displaced by this same frame's refresh;
+    // its surface is still in `ref_frame_map` above, so releasing it would hand that
+    // very surface to `setup_slot` below and the frame would decode into a picture it
+    // predicts from. What makes the rule "every removal" rather than "the removals
+    // the store names" is a property of the PLANNER: `Av1Planner::plan_frame`
+    // snapshots `dpb_refs` before any mutation, and `refresh_slots` can only report a
+    // picture that was in `self.slots` at that moment, so `dpb.removed` is always a
+    // SUBSET of the store `ref_frame_map` was built from. Filtering on `dpb_refs`
+    // here would be a condition that is never false wearing the clothes of a
+    // decision; the subset relation is asserted in
+    // `the_decode_target_never_aliases_a_surface_the_submission_names` instead, where
+    // a planner change that broke it fails loudly.
+    //
+    // `setup_id` is excluded as a safety property rather than as a live case: a
+    // picture this frame stores cannot also be one its own refresh displaced, because
+    // `refresh_slots` retains out any displaced id still held anywhere. Releasing it
+    // would return the surface being decoded into.
+    let release_after_decode: Vec<PicId> = plan
+        .dpb
+        .removed
+        .iter()
+        .copied()
+        .filter(|id| *id != setup_id)
+        .collect();
     let setup_slot = match slots.slot_of(setup_id) {
         Some(existing) => existing,
         None => slots.assign(setup_id)?,
@@ -642,6 +703,20 @@ pub fn plan_to_dxva_av1(
 
     let color = &seq.color_config;
     let mut pic_params = PicParamsAv1::zeroed();
+    // ⚠ UPSCALED width, where libavcodec sends the CODED one — a divergence that is
+    // inert on every stream that exists here and is written down rather than
+    // "fixed" because nothing can measure it.
+    //
+    // `dxva2_av1.c` sends `avctx->width`, and `update_context_with_frame_header`
+    // sets that from `frame_width_minus_1 + 1` — FrameWidth, the pre-superres coded
+    // width. The same goes for `frame_refs[i].width`, which libav reads off the
+    // reference's `AVFrame`. With superres OFF the two are equal by definition
+    // (7.20: `UpscaledWidth = FrameWidth` when `use_superres` is 0), which is every
+    // frame of both vendored vectors and every frame a punktfunk host emits — no
+    // encoder in this program codes superres. So the 250/250 parity result on two
+    // vendors says nothing either way about which is right, and changing it would
+    // be an unmeasured change to a rung that is finally proven. Revisit with a
+    // superres vector and a driver-by-driver measurement, not by reading.
     pic_params.width = h.upscaled_width;
     pic_params.height = h.frame_height;
     pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
@@ -758,6 +833,7 @@ pub fn plan_to_dxva_av1(
         bitstream,
         setup_slot,
         setup_id,
+        release_after_decode,
     })
 }
 
@@ -780,6 +856,157 @@ mod tests {
     const AV1_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
+
+    /// **Our own host's AV1 at 4K**, vendored beside the goldens the GPU legs decode it
+    /// against (`lowdelay-3840x2160-av1.nv12.sha256` carries the `punktfunk-host spike`
+    /// command and the ffmpeg cross-check).
+    ///
+    /// It is here for ONE property the vendored vector cannot supply: **two tiles**.
+    /// Every frame of `test-25fps.ivf.av1` is `tile_cols = tile_rows = 1`, so
+    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] can only ever
+    /// read index 0 of the tile arrays and assert the rest are zero. This stream is
+    /// `tile_cols = 1, tile_rows = 2` on all 60 frames, with both tiles in a single
+    /// Tile Group OBU — the 4K split-encode shape the host ships.
+    const LOWDELAY_3840X2160_AV1: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
+
+    /// Convert one plan the way the RUNG must: the conversion, then the releases it
+    /// defers past the decode op ([`DecodePlanDxvaAv1::release_after_decode`]).
+    ///
+    /// Not a convenience — it is the caller's half of the contract, and the same
+    /// helper the Vulkan rung's tests carry for the same reason. A loop that
+    /// converts without it holds a surface on 268 of this vector's 274 frames and
+    /// runs the nine-slot ledger dry inside ten.
+    fn convert(au: &[u8], plan: &AuPlan, slots: &mut SlotMap) -> DecodePlanDxvaAv1 {
+        let dx = plan_to_dxva_av1(au, plan, slots).expect("the clean vector converts");
+        for &id in &dx.release_after_decode {
+            assert!(
+                slots.release(id),
+                "a deferred release named picture {id}, which holds no surface"
+            );
+        }
+        dx
+    }
+
+    /// The decode target never shares a surface with a picture the submission names.
+    ///
+    /// The defect this pins is the one the Windows parity harness caught and nothing
+    /// on the CPU could see. AV1 applies `refresh_frame_flags` AFTER the frame is
+    /// decoded (7.20), so a frame that reads a slot it then overwrites is ordinary —
+    /// **268 of this vector's 274 frames**, first at frame 6 — and releasing the
+    /// displaced picture inside the conversion handed its surface straight to
+    /// `setup_slot`, because [`SlotMap::assign`] takes the lowest free slot and the
+    /// lowest free slot is the one just vacated. The submission then said
+    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` at once.
+    ///
+    /// Measured on hardware before the fix: Intel Arc decoded 245 of 250 delivered
+    /// frames wrong (47% of luma at the first bad frame, max |delta| 242, chroma
+    /// wrong too — a frame predicted from the wrong picture), and the only late
+    /// frame it got right was the one intra frame, which names no reference and so
+    /// could not alias. NVIDIA tolerated it.
+    ///
+    /// The assertion is against the WHOLE STORE, not just the seven names this frame
+    /// reads: `RefFrameMapTextureIndex` declares every occupied slot, so a driver is
+    /// entitled to consult one the frame never names.
+    #[test]
+    fn the_decode_target_never_aliases_a_surface_the_submission_names() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let (mut frames, mut deferring, mut deferred) = (0u32, 0u32, 0u32);
+        let mut peak = 0usize;
+
+        for packet in IvfIterator::new(AV1_25FPS) {
+            for plan in planner.plan_au(packet).expect("the clean vector plans") {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                // Deliberately NOT `convert` — this test applies the deferred
+                // releases itself, after checking each one.
+                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("the vector converts");
+                frames += 1;
+                peak = peak.max(slots.active());
+
+                // `#[repr(packed)]` — copy the fields out before reading them.
+                let curr = dx.pic_params.curr_pic_texture_index;
+                let store = dx.pic_params.ref_frame_map_texture_index;
+                assert!(
+                    store.iter().all(|surface| *surface != curr),
+                    "frame {frames}: surface {curr} is both CurrPicTextureIndex and a \
+                     RefFrameMapTextureIndex entry — the frame decodes into a picture \
+                     it predicts from"
+                );
+                // ⚠ THE PROPERTY THE DEFERRAL RESTS ON, asserted about the PLANNER
+                // rather than about the conversion's own output.
+                //
+                // The conversion holds back every removal, which is only safe-and-
+                // sufficient because `Av1Planner` snapshots `dpb_refs` before any
+                // mutation and `refresh_slots` can only report a picture that was in
+                // it — so `dpb.removed` is a subset of the store `ref_frame_map` was
+                // built from. Asserting instead that each DEFERRED id is in
+                // `dpb_refs` would be vacuous: the deferred list is filtered out of
+                // `removed`, so that check compares an expression with itself. This
+                // one can fail, and if a planner change ever makes it fail the
+                // conversion is releasing a surface the submission points at.
+                for &id in &plan.dpb.removed {
+                    assert!(
+                        plan.dpb_refs.iter().any(|r| r.id == id),
+                        "frame {frames}: the planner removed picture {id}, which the \
+                         pre-decode store never held — `ref_frame_map` is built from \
+                         that store, so a removal outside it is a picture this \
+                         conversion could release without aliasing, and the blanket \
+                         deferral above stops being justified"
+                    );
+                }
+                // Every deferred id is one this plan really removed, and it still
+                // holds the surface the caller is being asked to give back.
+                for &id in &dx.release_after_decode {
+                    assert!(
+                        plan.dpb.removed.contains(&id),
+                        "frame {frames}: deferred picture {id} is not in this plan's \
+                         removed list"
+                    );
+                    assert_ne!(
+                        id, dx.setup_id,
+                        "frame {frames}: the picture being decoded must never be \
+                         deferred — releasing it returns the surface being written"
+                    );
+                    assert!(
+                        slots.slot_of(id).is_some(),
+                        "frame {frames}: a deferred picture must still hold its surface"
+                    );
+                }
+                if !dx.release_after_decode.is_empty() {
+                    deferring += 1;
+                    deferred += dx.release_after_decode.len() as u32;
+                }
+                for &id in &dx.release_after_decode {
+                    assert!(slots.release(id));
+                }
+            }
+        }
+
+        assert_eq!(frames, 274);
+        assert_eq!(
+            deferring, 268,
+            "268 of 274 frames of this vector displace a picture their own submission \
+             names; at zero this test compares an empty list against itself and the \
+             deferral could be deleted without a single assertion noticing"
+        );
+        assert_eq!(deferred, 268, "one displaced picture per frame here");
+        // The nine-slot ledger is `NUM_REF_SLOTS + 1`, and holding a displaced
+        // picture one frame longer is exactly what that spare is for — the pool is
+        // allocated `SlotMap::capacity()` surfaces (`pf_dxvadec::pool_size`), so a
+        // peak above it would be a submission naming a surface that does not exist.
+        assert!(
+            peak <= slots.capacity(),
+            "peak {peak} surfaces held exceeds the {} the pool allocates",
+            slots.capacity()
+        );
+        eprintln!(
+            "frames {frames} · deferring {deferring} · peak surfaces held {peak}/{}",
+            slots.capacity()
+        );
+    }
 
     /// The whole vector, converted **and packed** — the closest a CPU gate gets to
     /// the hardware leg, and the test that would have caught the defect this
@@ -815,7 +1042,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 // Poison the mapping so a record can only be "right" by pointing
                 // at bytes this pack actually wrote.
@@ -949,8 +1176,7 @@ mod tests {
                         index_by_surface_would_differ += 1;
                     }
                 }
-                let dx =
-                    plan_to_dxva_av1(packet, &plan, &mut slots).expect("the clean vector converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
 
                 // Tile records must describe TILE PAYLOAD ranges inside the access
@@ -1153,7 +1379,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let lf = &plan.header.loop_filter_params;
                 // `#[repr(packed)]` — copy the block out before reading its fields.
@@ -1244,7 +1470,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let raw = &plan.header.cdef_params;
                 // `#[repr(packed)]` — copy the arrays out before indexing them.
@@ -1335,7 +1561,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let t = &plan.header.tile_info;
                 // `#[repr(packed)]` — copy the block out before reading its arrays.
@@ -1375,6 +1601,123 @@ mod tests {
         assert_eq!(frames, 274);
     }
 
+    /// The same tile arrays with a SECOND tile in them — the case the vendored vector
+    /// cannot reach and this conversion had therefore never been run against.
+    ///
+    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] asserts index 0
+    /// is right and `1..` are zero, which is everything a one-tile vector can say. Both
+    /// halves of that are shapes a multi-tile bug would satisfy: a conversion that
+    /// wrote only tile 0 and left the rest zero would pass it on every frame of the
+    /// vector and hand the driver a frame with half its height missing here.
+    ///
+    /// So this pins the row arrays with both entries live, that the second entry is the
+    /// SECOND tile's size rather than a repeat of the first, and that everything past
+    /// the grid is still zero. `tile_rows = 2` with `height_in_sbs_minus_1 = [16, 16]`
+    /// against a 2160-line frame is 17 + 17 = 34 superblocks of 64, i.e. 2176 lines —
+    /// the padded height, which is the arithmetic the one-tile test's `div_ceil` also
+    /// checks but cannot check twice.
+    #[test]
+    fn a_two_tile_frame_fills_both_row_entries_and_leaves_the_rest_zero() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let mut frames = 0u32;
+
+        for packet in IvfIterator::new(LOWDELAY_3840X2160_AV1) {
+            for plan in planner
+                .plan_au(packet)
+                .expect("the low-delay 4K stream plans")
+            {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let dx = convert(packet, &plan, &mut slots);
+                frames += 1;
+                let t = &plan.header.tile_info;
+                // `#[repr(packed)]` — copy the block out before reading its arrays.
+                let tiles = dx.pic_params.tiles;
+                let (widths, heights) = (tiles.widths, tiles.heights);
+                assert_eq!(
+                    (tiles.cols, tiles.rows),
+                    (1, 2),
+                    "frame {frames}: this stream is vendored FOR its second tile row. \
+                     One tile here means it was regenerated below 4K (1440p and down \
+                     measured single-tile) and this test has quietly become a duplicate \
+                     of the vendored vector's"
+                );
+                let sb = if plan.sequence.use_128x128_superblock {
+                    128
+                } else {
+                    64
+                };
+                assert_eq!(
+                    (widths[0], 0u16),
+                    (plan.header.frame_width.div_ceil(sb) as u16, 0u16),
+                    "frame {frames}: the single tile COLUMN spans the whole width"
+                );
+                // Both row entries, each the coded value plus one — and read
+                // independently, so a conversion that broadcast entry 0 across the
+                // array would still have to get entry 1's own coded value right.
+                assert_eq!(
+                    (heights[0], heights[1]),
+                    (
+                        t.height_in_sbs_minus_1[0] as u16 + 1,
+                        t.height_in_sbs_minus_1[1] as u16 + 1
+                    ),
+                    "frame {frames}: each tile row's height is its OWN \
+                     `height_in_sbs_minus_1 + 1`"
+                );
+                assert_eq!(
+                    u32::from(heights[0]) + u32::from(heights[1]),
+                    plan.header.frame_height.div_ceil(sb),
+                    "frame {frames}: the two tile rows must tile the frame exactly — a \
+                     short second row is a frame with missing lines, which is precisely \
+                     the shape the host once shipped over the wire"
+                );
+                // Past the grid the arrays stay zero: a driver reading `rows` entries
+                // never sees them, and a phantom entry is a tile the frame has not.
+                assert!(widths[1..].iter().all(|w| *w == 0));
+                assert!(heights[2..].iter().all(|h| *h == 0));
+
+                // TWO tile RECORDS from ONE tile group, with distinct rows and
+                // non-empty spans. `tile_cols * tile_rows` records is libavcodec's own
+                // count, and this stream is the only one here where it exceeds the
+                // number of tile GROUPS — so a conversion that emitted one record per
+                // group (the coarser shape the module docs warn against) is
+                // indistinguishable from a correct one on the vendored vector and
+                // fails here.
+                assert_eq!(
+                    plan.tiles.len(),
+                    1,
+                    "frame {frames}: both tiles arrive in one Tile Group OBU"
+                );
+                assert_eq!(
+                    dx.tiles.len(),
+                    2,
+                    "frame {frames}: one record per TILE, not per tile group"
+                );
+                assert_eq!(
+                    (dx.tiles[0].row, dx.tiles[0].column),
+                    (0, 0),
+                    "frame {frames}: tile 0 is row 0"
+                );
+                assert_eq!(
+                    (dx.tiles[1].row, dx.tiles[1].column),
+                    (1, 0),
+                    "frame {frames}: tile 1 is the SECOND ROW of a single column — a \
+                     (0, 1) here means rows and columns are transposed, which one \
+                     square tile grid could never show"
+                );
+                assert!(
+                    dx.tiles.iter().all(|r| r.data_size > 0),
+                    "frame {frames}: every tile record must span real bytes; a \
+                     zero-length second record is the whole bottom half of the frame \
+                     missing"
+                );
+            }
+        }
+        assert_eq!(frames, 60, "the low-delay 4K stream is 60 coded frames");
+    }
+
     /// Three fields whose correct value is a SENTINEL or a constant, on every frame
     /// of the vector — none of which any other assertion here would notice.
     ///
@@ -1398,7 +1741,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("converts");
+                let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
                 let pp = &dx.pic_params;
                 let status = pp.status_report_feedback_number;
@@ -1478,7 +1821,7 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                let dx = plan_to_dxva_av1(packet, plan, &mut slots).expect("converts");
+                let dx = convert(packet, plan, &mut slots);
                 decoded.push((dx.setup_id, dx.setup_slot));
             }
             if decoded.len() > 1 {
