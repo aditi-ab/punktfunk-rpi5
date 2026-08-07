@@ -764,6 +764,15 @@ struct ContentView: View {
                 // other in the seconds where they overlap.
                 .overlay(alignment: .bottom) {
                     VStack(spacing: 8) {
+                        // A forwarded pad has a gyro this session's virtual controller cannot
+                        // carry. Shown briefly at every stats tier and with the overlay off: the
+                        // failure is otherwise completely silent — the gyro just does nothing —
+                        // and the fix is a setting, so the hint has to name it. Every platform,
+                        // including tvOS, where a DualSense is an ordinary way to play.
+                        if captureEnabled, model.motionUnreachableKind != nil {
+                            MotionUnreachableBadge()
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         #if !os(tvOS)
                         // Shown for as long as the mic is muted, at every stats tier and with the
                         // overlay off — see MicMutedBadge. tvOS has no microphone to mute.

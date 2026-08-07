@@ -128,6 +128,15 @@ public final class GamepadCapture {
     /// gameplay can't end it (see ContentView's tvOS session branch).
     public var onDisconnectRequest: (() -> Void)?
 
+    /// Fired ON MAIN, once per slot at open, when a controller that HAS a gyro was given a host
+    /// backend without a motion plane — its motion is not being sent, because every sample would
+    /// be decoded and dropped. The argument is the kind this pad declared, so the UI can name it.
+    ///
+    /// It fires at open rather than on the first sample precisely because nothing is sampled: the
+    /// IMU is never powered in this case (see `openSlot`), which is also what stops the pad
+    /// burning battery streaming gyro nobody reads.
+    public var onMotionUnreachable: ((PunktfunkConnection.GamepadType) -> Void)?
+
     /// Forward this device's controllers to the host at all (`Settings.gamepadForwarding`,
     /// default true). Off is for a couch whose controller reaches the host another way — USB
     /// passthrough such as VirtualHere, or a pad plugged into the host itself — where
@@ -299,10 +308,24 @@ public final class GamepadCapture {
         // local feature reads it. Powering the IMU anyway costs the pad real battery (it streams
         // gyro + accel continuously over Bluetooth, which is why `closeSlot` is careful to power
         // it back down), so with nothing to forward we simply never turn it on.
+        //
+        // A host that built this pad a backend WITHOUT a motion plane is the same situation: every
+        // sample would be decoded and dropped, so there is equally nothing to forward. Asked per
+        // pad off what this slot declared, not off the session echo — under "Automatic" a couch
+        // with an X-Box pad on 0 and a DualSense on 1 echoes X-Box 360 while the host builds pad 1
+        // a DualSense whose gyro works.
+        let motionCanReach = connection.motionReaches(declared: slot.pref)
         if forwarding, let motion = c.motion {
-            if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
-            motion.valueChangedHandler = { [weak self, weak slot] m in
-                MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
+            if motionCanReach {
+                if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
+                motion.valueChangedHandler = { [weak self, weak slot] m in
+                    MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
+                }
+            } else if motion.hasRotationRate {
+                // Only for a pad that really has a gyro. A gravity-only pad (an X-Box controller's
+                // GCMotion) has nothing the player could expect to reach the game, so telling them
+                // it didn't would be a nag about a feature they never had.
+                onMotionUnreachable?(slot.pref)
             }
         }
     }

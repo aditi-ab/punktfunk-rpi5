@@ -153,6 +153,20 @@ final class SessionModel: ObservableObject {
     /// background's privacy mute never clears the user's choice. Local and instant: it gates
     /// capture on this device, nothing is sent to the host.
     @Published private(set) var micMuted = false
+    /// The kind a controller declared when it turned out this session cannot carry its motion —
+    /// set once per such pad, cleared after `motionHintSeconds`. Nil the rest of the time.
+    ///
+    /// It exists because the failure is otherwise entirely silent: the gyro simply does nothing,
+    /// with no way for the player to tell a dead sensor from a session that resolved a backend
+    /// without a motion plane. The fix is a settings change, so the hint has to name it.
+    @Published private(set) var motionUnreachableKind: PunktfunkConnection.GamepadType?
+    /// Drops `motionUnreachableKind` again — held so a second pad's hint replaces the first
+    /// cleanly, and so ending the session cancels a pending clear rather than letting it fire
+    /// into a torn-down model.
+    private var motionHintTimer: Task<Void, Never>?
+    /// How long the motion hint stays up — the start-of-stream shortcut banner's 6 s, since the
+    /// two share the bottom-centre stack and a player reads them the same way.
+    private static let motionHintSeconds: UInt64 = 6
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
@@ -524,6 +538,21 @@ final class SessionModel: ObservableObject {
         applyMicMute()
     }
 
+    /// A forwarded controller has a gyro this session cannot carry (see
+    /// `GamepadCapture.onMotionUnreachable`). Show it briefly, then let it go.
+    ///
+    /// Last pad wins, and its timer restarts: two such pads are the same one fact to a player, and
+    /// a second hint appearing under a still-visible first would only read as a stutter.
+    private func noteMotionUnreachable(_ kind: PunktfunkConnection.GamepadType) {
+        motionUnreachableKind = kind
+        motionHintTimer?.cancel()
+        motionHintTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.motionUnreachableKind = nil
+        }
+    }
+
     /// Push the EFFECTIVE mute — the user's choice OR the background keep-alive's privacy mute —
     /// onto the audio engine. The two reasons are composed here and nowhere else: whichever one
     /// changed, the other still holds, so returning from the background can't un-mute a user who
@@ -573,6 +602,11 @@ final class SessionModel: ObservableObject {
         // The mic mute is per-session and never persisted: the next stream starts live (if the
         // mic is enabled), rather than silently carrying a mute nobody remembers making.
         micMuted = false
+        // Cancel before clearing: a pending clear firing into a torn-down session would be
+        // harmless but pointless, and leaving the hint set would carry it into the next stream.
+        motionHintTimer?.cancel()
+        motionHintTimer = nil
+        motionUnreachableKind = nil
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the
@@ -722,6 +756,9 @@ final class SessionModel: ObservableObject {
         // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only
         // controller way out of a stream (B/Menu is swallowed during sessions; see ContentView).
         capture.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        // A pad with a gyro that this session cannot carry — say so once, briefly, and name the
+        // setting that fixes it. Already main-actor (GamepadCapture fires it there).
+        capture.onMotionUnreachable = { [weak self] kind in self?.noteMotionUnreachable(kind) }
         capture.start()
         gamepadCapture = capture
         let feedback = GamepadFeedback(connection: conn, manager: .shared)

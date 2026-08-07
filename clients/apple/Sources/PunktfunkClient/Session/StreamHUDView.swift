@@ -267,6 +267,39 @@ struct StreamHUDView: View {
     }
 }
 
+/// "This pad's gyro can't reach the game" — shown briefly when a forwarded controller with motion
+/// meets a session whose virtual controller has no motion plane (an X-Box class pad has no gyro in
+/// its HID contract, so every sample would be decoded and dropped).
+///
+/// Not a control, unlike `MicMutedBadge`: the fix is the Controller type setting, which is not
+/// reachable mid-stream on every platform, and changing it applies from the next session anyway.
+/// So this states the fact and names the setting, in the HUD's glass language, and gets out of the
+/// way — the alternative is what shipped before, which was a gyro that silently did nothing with
+/// no way to tell that from a broken sensor.
+///
+/// Every platform: a DualSense on an Apple TV is an ordinary way to play, and it is exactly the
+/// pad this can happen to.
+struct MotionUnreachableBadge: View {
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "gyroscope")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text("Motion won't reach this session — set Controller type to DualSense")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "This controller's motion will not reach the game. "
+                + "Set Controller type to DualSense to enable it.")
+    }
+}
+
 #if !os(tvOS)
 /// The muted-microphone badge — the mute STATE, as opposed to the buttons that flip it. It rides
 /// over the stream whenever the mic is muted, INDEPENDENT of the stats overlay (which the user
