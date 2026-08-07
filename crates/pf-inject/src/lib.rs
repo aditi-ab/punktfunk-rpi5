@@ -398,6 +398,12 @@ pub mod pad_gate;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
+/// The `sensor_timestamp` every virtual Sony pad stamps into its input reports
+/// ([`sensor_clock::SensorClock`]) — real elapsed time in the DualSense's 1/3 µs and the
+/// DualShock 4's 5.33 µs units, shared by all four backends.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/sensor_clock.rs"]
+pub mod sensor_clock;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]

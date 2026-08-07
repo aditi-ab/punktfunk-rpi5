@@ -210,6 +210,14 @@ impl PadProto for DeckWinProto {
         st.apply_rich(rich);
     }
 
+    fn neutralize_gyro(&self, st: &mut SteamState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut SteamState) {
+        st.clear_rich();
+    }
+
     fn write_state(&self, pad: &mut DeckWinPad, st: &SteamState) {
         pad.write_state(st);
     }

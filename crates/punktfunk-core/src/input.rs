@@ -180,6 +180,24 @@ pub mod gamepad {
     /// Triggers: value range 0..255.
     pub const AXIS_LT: u32 = 4;
     pub const AXIS_RT: u32 = 5;
+
+    /// Motion wire units — the DualSense convention, raw `i16` LSBs, carried by
+    /// `RichInput::Motion`. Gyro is angular velocity, accel is proper acceleration.
+    ///
+    /// Every capture path scales *into* these units (`pf-client-core::gamepad`, Swift
+    /// `GamepadWire`, the Android `DeviceGyro`) and every host backend decodes *from* them —
+    /// but the two sides never meet in one crate, which is how a virtual pad shipped for
+    /// months telling its consumers to read the same bytes 40× too fast. The host's virtual
+    /// pads carry fixed calibration blobs, and the resolution a consumer derives from those
+    /// blobs must land back on exactly these numbers; pf-inject's `motion_contract` test is
+    /// what pins that, for every backend, against these constants.
+    ///
+    /// Gyro saturates at `i16::MAX / 20` ≈ ±1638 °/s, below a real DualSense's ±2000; accel at
+    /// ±3.28 g against its ±4 g. Lifting those is a wire-v2 question, not a scale to quietly
+    /// re-tune here.
+    pub const MOTION_GYRO_LSB_PER_DEG_S: i32 = 20;
+    /// See [`MOTION_GYRO_LSB_PER_DEG_S`].
+    pub const MOTION_ACCEL_LSB_PER_G: i32 = 10_000;
 }
 
 impl InputKind {

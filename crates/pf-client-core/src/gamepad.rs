@@ -39,11 +39,13 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Motion scale constants, shared convention with the Swift client (`GamepadWire`):
-/// derived from hid-playstation's math over the host's fixed calibration blob. SDL hands
-/// us gyro in rad/s and accel in m/s²; the DualSense report wants raw LSBs.
-const GYRO_LSB_PER_RAD_S: f32 = 20.0 * 180.0 / std::f32::consts::PI;
-const ACCEL_LSB_PER_G: f32 = 10_000.0;
+/// Motion scale constants, shared convention with the Swift client (`GamepadWire`): the wire's
+/// units ([`wire::MOTION_GYRO_LSB_PER_DEG_S`] / [`wire::MOTION_ACCEL_LSB_PER_G`]), which the host's
+/// fixed calibration blobs declare back to their own consumers. SDL hands us gyro in rad/s and
+/// accel in m/s²; the DualSense report wants raw LSBs.
+const GYRO_LSB_PER_RAD_S: f32 =
+    wire::MOTION_GYRO_LSB_PER_DEG_S as f32 * 180.0 / std::f32::consts::PI;
+const ACCEL_LSB_PER_G: f32 = wire::MOTION_ACCEL_LSB_PER_G as f32;
 const G: f32 = 9.80665;
 
 /// The controller "escape" chord (Moonlight convention): L1 + R1 + Start + Select held
@@ -858,6 +860,10 @@ struct Slot {
     /// close lift a click held across detach/unplug.
     held_clicks: [bool; 2],
     last_accel: [i16; 3],
+    /// This slot has put at least one motion sample on the wire, so the host is holding one.
+    /// Gates the zero-gyro park in [`Worker::flush_slot`] — a pad with no gyro must not start
+    /// looking like one just because it closed.
+    sent_motion: bool,
     /// Hold-Select→guide state ([`SelectGesture`]) — only fed while the worker's
     /// `guide_gesture` policy is on.
     gesture: SelectGesture,
@@ -884,6 +890,7 @@ impl Slot {
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
+            sent_motion: false,
             gesture: SelectGesture::default(),
             audio_caps: 0,
             rumble_suppressed_logged: false,
@@ -1480,6 +1487,19 @@ impl Worker {
             };
             let _ = c.send_rich_input(rich);
         }
+        // Park motion. Gyro is level-triggered host-side — the last sample is preserved across
+        // button frames and re-emitted by the pad heartbeat — so a slot closing mid-rotation
+        // leaves the virtual pad turning, and a game integrating gyro aim turns with it. The host
+        // has an idle watchdog for the cases nobody can flush (a dropped link); this is the case
+        // we can, so take it immediately. Acceleration is kept: gravity doesn't stop when the
+        // session does.
+        if std::mem::take(&mut slot.sent_motion) {
+            let _ = c.send_rich_input(RichInput::Motion {
+                pad,
+                gyro: [0; 3],
+                accel: slot.last_accel,
+            });
+        }
     }
 
     /// True when any one forwarded pad holds the entire escape chord (any player can leave).
@@ -1992,6 +2012,7 @@ impl Worker {
                         for (i, v) in data.iter().enumerate() {
                             gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
                         }
+                        slot.sent_motion = true;
                         let _ = c.send_rich_input(RichInput::Motion {
                             pad: slot.index,
                             gyro,

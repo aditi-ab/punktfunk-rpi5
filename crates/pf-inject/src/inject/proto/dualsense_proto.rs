@@ -234,6 +234,26 @@ impl DsState {
         }
     }
 
+    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
+    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// `PadProto::neutralize_gyro`.
+    pub fn neutralize_gyro(&mut self) -> bool {
+        let changed = self.gyro != [0; 3];
+        self.gyro = [0; 3];
+        changed
+    }
+
+    /// Reset the rich-plane fields — touch contacts, pad clicks, motion — to a fresh pad's,
+    /// leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller that took over
+    /// this slot inside the replug grace must not inherit the last one's finger or rotation.
+    pub fn clear_rich(&mut self) {
+        let fresh = DsState::neutral();
+        self.touch = fresh.touch;
+        self.touch_click = fresh.touch_click;
+        self.gyro = fresh.gyro;
+        self.accel = fresh.accel;
+    }
+
     /// Map a GameStream/XInput pad frame (button bitmask + i16 sticks + u8 triggers) into the
     /// DualSense report fields. Sticks are recentred to `0x80`; the Y axes are inverted (XInput
     /// `+y = up`, DualSense `0 = up`). Triggers double as the L2/R2 buttons when pressed. Touchpad

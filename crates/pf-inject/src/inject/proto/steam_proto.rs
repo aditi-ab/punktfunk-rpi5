@@ -172,6 +172,33 @@ impl SteamState {
         SteamState::default()
     }
 
+    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
+    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// `PadProto::neutralize_gyro`.
+    pub fn neutralize_gyro(&mut self) -> bool {
+        let changed = self.gyro != [0; 3];
+        self.gyro = [0; 3];
+        changed
+    }
+
+    /// Reset the rich-plane fields — both trackpads' position/pressure/click, and motion — to a
+    /// fresh pad's, leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller
+    /// that took over this slot inside the replug grace must not inherit the last one's finger or
+    /// rotation.
+    pub fn clear_rich(&mut self) {
+        let fresh = SteamState::neutral();
+        self.lpad_x = fresh.lpad_x;
+        self.lpad_y = fresh.lpad_y;
+        self.rpad_x = fresh.rpad_x;
+        self.rpad_y = fresh.rpad_y;
+        self.lpad_pressure = fresh.lpad_pressure;
+        self.rpad_pressure = fresh.rpad_pressure;
+        self.lpad_click = fresh.lpad_click;
+        self.rpad_click = fresh.rpad_click;
+        self.gyro = fresh.gyro;
+        self.accel = fresh.accel;
+    }
+
     /// Set/clear a button (or group) by its [`btn`] mask.
     pub fn press(&mut self, mask: u64, down: bool) {
         if down {

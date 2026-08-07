@@ -1156,7 +1156,7 @@ async fn session(args: Args) -> Result<()> {
     if args.rich_input_test {
         let conn2 = conn.clone();
         tokio::spawn(async move {
-            use punktfunk_core::input::gamepad::AXIS_LS_X;
+            use punktfunk_core::input::gamepad::{AXIS_LS_X, MOTION_ACCEL_LSB_PER_G};
             use punktfunk_core::quic::RichInput;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             // A neutral gamepad axis event makes the host create the virtual DualSense pad 0.
@@ -1184,12 +1184,14 @@ async fn session(args: Args) -> Result<()> {
                 for i in 0..60u32 {
                     let x = ((i * 65535) / 60) as u16;
                     let _ = conn2.send_datagram(touch(true, x, 32768).encode().into());
-                    let g = (((i as i32 % 20) - 10) * 500) as i16; // gyro wobble
+                    let g = (((i as i32 % 20) - 10) * 500) as i16; // gyro wobble, ±250 °/s
                     let _ = conn2.send_datagram(
                         RichInput::Motion {
                             pad: 0,
                             gyro: [g, 0, 0],
-                            accel: [0, 0, 16384],
+                            // At rest, gravity is 1 g on +Z — in WIRE units, which are 10000 LSB/g
+                            // and not the 8192 or 16384 a particular driver happens to use.
+                            accel: [0, 0, MOTION_ACCEL_LSB_PER_G as i16],
                         }
                         .encode()
                         .into(),

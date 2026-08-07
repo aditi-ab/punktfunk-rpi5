@@ -16,10 +16,11 @@ use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
 };
 use super::gamepad_raii::PadChannel;
+use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The hardware id this pad's devnode carries. Must be one `pf_gamepad.inx` declares — a package
 /// rename must never touch it (`dualsense_windows::tests::hwid_matches_inf` enforces that).
@@ -37,7 +38,7 @@ pub struct Ds4WinPad {
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     counter: u8,
-    ts: u16,
+    clock: SensorClock,
     /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
     drain: OutputDrain,
 }
@@ -105,7 +106,7 @@ impl Ds4WinPad {
                 instance_id,
             ),
             counter: 0,
-            ts: 0,
+            clock: SensorClock::dualshock4(),
             drain: OutputDrain::new(),
         })
     }
@@ -113,9 +114,9 @@ impl Ds4WinPad {
     /// Serialize `st` into report `0x01` and publish it to the section's input slot.
     fn write_state(&mut self, st: &DsState) {
         self.counter = self.counter.wrapping_add(1);
-        self.ts = self.ts.wrapping_add(188); // ~1ms in the DS4's 5.33µs sensor-clock units
+        let ts = self.clock.ds4_ticks(Instant::now());
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.counter, self.ts);
+        serialize_state(&mut r, st, self.counter, ts);
         // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -214,6 +215,14 @@ impl PadProto for Ds4WinProto {
     /// split the one touchpad left/right, pad clicks ride touch_click.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
+    }
+
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut Ds4WinPad, st: &DsState) {

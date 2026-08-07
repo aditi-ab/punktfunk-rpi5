@@ -23,12 +23,13 @@ use super::dualsense_proto::{
     DS_TOUCH_W,
 };
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
+use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::RichInput;
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
@@ -216,7 +217,7 @@ pub struct DsWinPad {
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     seq: u8,
-    ts: u32,
+    clock: SensorClock,
     /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
     drain: OutputDrain,
 }
@@ -511,7 +512,7 @@ impl DsWinPad {
                 instance_id,
             ),
             seq: 0,
-            ts: 0,
+            clock: SensorClock::dualsense(),
             drain: OutputDrain::new(),
         })
     }
@@ -519,9 +520,9 @@ impl DsWinPad {
     /// Serialize `st` into report `0x01` and publish it to the section's input slot.
     pub(super) fn write_state(&mut self, st: &DsState) {
         self.seq = self.seq.wrapping_add(1);
-        self.ts = self.ts.wrapping_add(1);
+        let ts = self.clock.ds_ticks(Instant::now());
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, self.ts);
+        serialize_state(&mut r, st, self.seq, ts);
         // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64. Unlike the
         // XUSB `packet` / DualSense `out_seq` fields, the input path has NO driver-polled change-detect
         // field to publish last: the `pf_gamepad` driver streams the whole `input` region to game
@@ -629,6 +630,14 @@ impl PadProto for DsWinProto {
     /// split the one touchpad left/right, pad clicks ride touch_click.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
+    }
+
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DsWinPad, st: &DsState) {
