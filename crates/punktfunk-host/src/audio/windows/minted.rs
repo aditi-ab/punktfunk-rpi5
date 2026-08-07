@@ -351,38 +351,39 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
             value: pe::StampValue::Str("Punktfunk"),
         },
     ];
-    // The mic pair gets ONE coherent stereo format set on BOTH endpoints, in the exact
-    // PCM16-device/float-mix split the pad program's stamp bisect proved the driver accepts
-    // (its first "unopenable endpoint" and "format can't be changed" verdicts were both
-    // incoherent-stamp artifacts — this branch re-derived the same false verdicts before the
-    // pad recipe was re-applied). Both sides identical: the driver moves one stream between
-    // the two endpoints, and the octave-low voice was the two sides DISAGREEING (stereo
-    // render default vs mono capture default). `capture` steers nothing today — kept so a
-    // per-direction split stays one edit away.
-    let _ = capture;
+    // The mic pair runs STEREO 48 kHz on both sides — the pins accept it (micpins), and the
+    // octave-low voice was the two sides DISAGREEING (stereo render default vs mono capture
+    // default). The stamp sets differ per direction, bisected live:
+    //   * RENDER: the pad program's proven PCM16-device/float-mix split (its own bisect).
+    //   * CAPTURE: the DEVICE format ONLY — the mix/host keys are RENDER-engine properties,
+    //     and stamping them onto a capture endpoint broke its shared-mode graph
+    //     (IsFormatSupported said 2ch/48k OK while Initialize failed 0x88890008 on a fresh,
+    //     once-stamped endpoint; unstamped it opened fine).
     if role == Role::Mic {
-        stamps.extend([
-            pe::Stamp {
-                label: "device-format",
-                key: pe::PKEY_DEVICE_FORMAT,
-                value: pe::StampValue::Format(&WFX_PCM16_2CH_48K),
-            },
-            pe::Stamp {
-                label: "mix-format-2",
-                key: pe::PKEY_MIX_FORMAT_2,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
-            },
-            pe::Stamp {
-                label: "mix-format-3",
-                key: pe::PKEY_MIX_FORMAT_3,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
-            },
-            pe::Stamp {
-                label: "host-format",
-                key: pe::PKEY_HOST_FORMAT,
-                value: pe::StampValue::Format(&WFX_F32_2CH_48K),
-            },
-        ]);
+        stamps.push(pe::Stamp {
+            label: "device-format",
+            key: pe::PKEY_DEVICE_FORMAT,
+            value: pe::StampValue::Format(&WFX_PCM16_2CH_48K),
+        });
+        if !capture {
+            stamps.extend([
+                pe::Stamp {
+                    label: "mix-format-2",
+                    key: pe::PKEY_MIX_FORMAT_2,
+                    value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                },
+                pe::Stamp {
+                    label: "mix-format-3",
+                    key: pe::PKEY_MIX_FORMAT_3,
+                    value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                },
+                pe::Stamp {
+                    label: "host-format",
+                    key: pe::PKEY_HOST_FORMAT,
+                    value: pe::StampValue::Format(&WFX_F32_2CH_48K),
+                },
+            ]);
+        }
     }
     // Steady state (every boot after the first): the names are already served — no writes,
     // no settle sleeps.
