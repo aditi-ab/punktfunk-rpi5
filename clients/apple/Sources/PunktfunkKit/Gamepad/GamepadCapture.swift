@@ -66,7 +66,6 @@ public final class GamepadCapture {
         var buttons: UInt32 = 0
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
         var fingerActive: [Bool] = [false, false]
-        var lastMotionNs: UInt64 = 0
         // Hold-Select→guide gesture state (pf-client-core's `SelectGesture`, adapted to
         // this class's mask-diff model): a Select pressed ALONE is held out of the mask
         // until it resolves into a tap (delivered on release) or — past `guideHold` — a
@@ -88,9 +87,6 @@ public final class GamepadCapture {
     /// Open forwarded controllers, one Slot per physical pad on its own wire index. Reconciled
     /// against `manager.forwarded` (empty until a session's `start`, cleared by `stop`).
     private var slots: [Slot] = []
-
-    /// Motion forwarding floor: ≥ 4 ms between samples (≈ 250 Hz, the DualSense's own rate).
-    private static let motionIntervalNs: UInt64 = 4_000_000
 
     /// The cross-client controller escape chord (pf-client-core's `ESCAPE_CHORD`):
     /// L1+R1+Start+Select held together — four simultaneous buttons no game uses, so normal
@@ -314,17 +310,36 @@ public final class GamepadCapture {
         // pad off what this slot declared, not off the session echo — under "Automatic" a couch
         // with an X-Box pad on 0 and a DualSense on 1 echoes X-Box 360 while the host builds pad 1
         // a DualSense whose gyro works.
+        //
+        // Gated on `hasRotationRate`, not on `motion != nil`. An X-Box controller exposes a
+        // `GCMotion` that reports gravity and NOTHING else — attaching to it streamed a
+        // permanently-zero `rotationRate` to the host as authoritative gyro, under a declaration
+        // that says this pad has one. A game reading it sees a controller being held perfectly
+        // still forever, which is worse than seeing no motion plane at all: there is nothing to
+        // fall back to and nothing to notice.
         let motionCanReach = connection.motionReaches(declared: slot.pref)
-        if forwarding, let motion = c.motion {
+        if forwarding, let motion = c.motion, motion.hasRotationRate {
             if motionCanReach {
                 if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
+                // Delivered on the MAIN queue, like every other handler here, and deliberately so
+                // even though ~250 Hz of samples on main is not free.
+                //
+                // GameController's `handlerQueue` is a property of the CONTROLLER, not of an
+                // element, so there is no way to move motion off main without moving buttons,
+                // sticks, the touchpad and the escape chord with it. This whole class is
+                // `@MainActor` — eight `assumeIsolated` sites, the slot table, the gesture timers
+                // — so that is a rewrite of the isolation model, not a queue assignment. It would
+                // also put the tvOS escape chord (the ONLY controller way out of a stream there)
+                // on a background queue, which is a real risk taken for a speculative gain.
+                //
+                // If main-queue contention ever shows up as motion jitter, the measurement to make
+                // first is `motion_cadence`'s per-pad inter-arrival histogram on the host — it
+                // already reports exactly this, and would say whether the delay is here or on the
+                // wire before anyone restructures the class for it.
                 motion.valueChangedHandler = { [weak self, weak slot] m in
                     MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
                 }
-            } else if motion.hasRotationRate {
-                // Only for a pad that really has a gyro. A gravity-only pad (an X-Box controller's
-                // GCMotion) has nothing the player could expect to reach the game, so telling them
-                // it didn't would be a nag about a feature they never had.
+            } else {
                 onMotionUnreachable?(slot.pref)
             }
         }
@@ -584,9 +599,21 @@ public final class GamepadCapture {
 
     private func forwardMotion(_ slot: Slot, _ m: GCMotion) {
         guard !suspended else { return }
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard now &- slot.lastMotionNs >= Self.motionIntervalNs else { return }
-        slot.lastMotionNs = now
+        // Every sample goes out. There used to be a 4 ms floor here, and it was a DROP: a sample
+        // arriving 3.9 ms after the last one was discarded outright.
+        //
+        // That is the wrong shape for this signal. Buttons and sticks are absolute state, so a
+        // dropped frame costs nothing — the next one says everything it would have. Angular
+        // velocity is a RATE, and a consumer integrates it into an angle; a dropped sample is
+        // rotation that happened and can never be recovered. GameController's delivery is jittery
+        // around the pad's own ~250 Hz, so a floor set AT that rate does not shed a rare extra
+        // sample, it sheds a steady fraction of every turn — and the error is one-signed, so it
+        // accumulates into aim drifting short rather than into noise.
+        //
+        // Nothing needed the ceiling: GC delivers at the sensor's rate rather than faster, the SDL
+        // client has always forwarded every sample, and the host's own idle watchdog runs on a
+        // 100 ms timeout this cannot outpace. The throttle's `lastMotionNs`/`motionIntervalNs` went
+        // with it rather than being left set-but-unread — nothing else consumed either.
         // Total acceleration in g: gravity + user when split, else the raw vector — then NEGATED
         // into the wire's convention.
         //

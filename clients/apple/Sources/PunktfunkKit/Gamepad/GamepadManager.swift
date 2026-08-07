@@ -41,6 +41,10 @@ public final class GamepadManager: ObservableObject {
         public let kind: PunktfunkConnection.GamepadType
         public let hasLight: Bool
         public let hasHaptics: Bool
+        /// This controller has a GYROSCOPE — not merely a `GCMotion`. The distinction is the whole
+        /// point: an X-Box pad exposes a `GCMotion` that reports gravity and nothing else, so
+        /// `motion != nil` is true for a controller with no angular rate to give. Read
+        /// `hasRotationRate`, which is GameController's own answer to the question we mean.
         public let hasMotion: Bool
         public let hasAdaptiveTriggers: Bool
         /// Specifically a DualSense (incl. the Edge — same feedback surface) — gates the
@@ -265,7 +269,10 @@ public final class GamepadManager: ObservableObject {
             kind: kind,
             hasLight: c.light != nil,
             hasHaptics: c.haptics != nil,
-            hasMotion: c.motion != nil,
+            // `hasRotationRate`, not `motion != nil` — see the property. The settings row shows a
+            // gyroscope badge off this, and promising a gyro an X-Box pad does not have is the
+            // same lie as streaming its non-existent rotation to the host.
+            hasMotion: c.motion?.hasRotationRate ?? false,
             // GCDualSenseGamepad's triggers are GCDualSenseAdaptiveTrigger by declaration (the
             // Edge included); the DualShock 4 has none.
             hasAdaptiveTriggers: kind == .dualSense || kind == .dualSenseEdge,

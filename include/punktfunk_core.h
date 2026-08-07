@@ -2133,6 +2133,25 @@ typedef struct {
 
 
 
+// What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
+// axis** — which is index 1 — and nothing on the other two.
+//
+// This is a measured fact, not a convention we chose. On 2026-08-07 a real DualSense was read
+// over raw HID: at rest it reports `+0.997 g` on report axis 1, and the same session pinned
+// the frame as (Right, Up, Backward) — axis 0 carries pitch, 1 yaw, 2 roll. The wire is a unit
+// passthrough into that report, so the wire's up axis is the pad's.
+//
+// It exists because the alternative is worse than imprecise. A virtual pad that has never
+// received a motion sample used to report `[0, 0, 0]`, and zero acceleration is not "no
+// information" — it is a controller in **free fall**, which is a claim about the physical
+// world that is never true of a pad on a desk. A game deriving orientation from it gets a
+// definite wrong answer instead of a boring right one. `switch_proto`'s neutral has always
+// done this correctly (1 g on its own up axis); the DualSense family and the Deck did not.
+//
+// Backends whose units differ rescale this like any other sample rather than hard-coding
+// their own version of 1 g — see `steam_remap::motion_wire_to_deck`.
+#define MOTION_NEUTRAL_ACCEL { 0, (int16_t)MOTION_ACCEL_LSB_PER_G, 0, }
+
 
 
 
