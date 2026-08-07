@@ -857,6 +857,19 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
 
+    /// **Our own host's AV1 at 4K**, vendored beside the goldens the GPU legs decode it
+    /// against (`lowdelay-3840x2160-av1.nv12.sha256` carries the `punktfunk-host spike`
+    /// command and the ffmpeg cross-check).
+    ///
+    /// It is here for ONE property the vendored vector cannot supply: **two tiles**.
+    /// Every frame of `test-25fps.ivf.av1` is `tile_cols = tile_rows = 1`, so
+    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] can only ever
+    /// read index 0 of the tile arrays and assert the rest are zero. This stream is
+    /// `tile_cols = 1, tile_rows = 2` on all 60 frames, with both tiles in a single
+    /// Tile Group OBU — the 4K split-encode shape the host ships.
+    const LOWDELAY_3840X2160_AV1: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
+
     /// Convert one plan the way the RUNG must: the conversion, then the releases it
     /// defers past the decode op ([`DecodePlanDxvaAv1::release_after_decode`]).
     ///
@@ -1586,6 +1599,123 @@ mod tests {
             }
         }
         assert_eq!(frames, 274);
+    }
+
+    /// The same tile arrays with a SECOND tile in them — the case the vendored vector
+    /// cannot reach and this conversion had therefore never been run against.
+    ///
+    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] asserts index 0
+    /// is right and `1..` are zero, which is everything a one-tile vector can say. Both
+    /// halves of that are shapes a multi-tile bug would satisfy: a conversion that
+    /// wrote only tile 0 and left the rest zero would pass it on every frame of the
+    /// vector and hand the driver a frame with half its height missing here.
+    ///
+    /// So this pins the row arrays with both entries live, that the second entry is the
+    /// SECOND tile's size rather than a repeat of the first, and that everything past
+    /// the grid is still zero. `tile_rows = 2` with `height_in_sbs_minus_1 = [16, 16]`
+    /// against a 2160-line frame is 17 + 17 = 34 superblocks of 64, i.e. 2176 lines —
+    /// the padded height, which is the arithmetic the one-tile test's `div_ceil` also
+    /// checks but cannot check twice.
+    #[test]
+    fn a_two_tile_frame_fills_both_row_entries_and_leaves_the_rest_zero() {
+        let mut planner = Av1Planner::new();
+        let mut slots = SlotMap::new(NUM_REF_SLOTS);
+        let mut frames = 0u32;
+
+        for packet in IvfIterator::new(LOWDELAY_3840X2160_AV1) {
+            for plan in planner
+                .plan_au(packet)
+                .expect("the low-delay 4K stream plans")
+            {
+                if plan.dpb.stored.is_none() {
+                    continue;
+                }
+                let dx = convert(packet, &plan, &mut slots);
+                frames += 1;
+                let t = &plan.header.tile_info;
+                // `#[repr(packed)]` — copy the block out before reading its arrays.
+                let tiles = dx.pic_params.tiles;
+                let (widths, heights) = (tiles.widths, tiles.heights);
+                assert_eq!(
+                    (tiles.cols, tiles.rows),
+                    (1, 2),
+                    "frame {frames}: this stream is vendored FOR its second tile row. \
+                     One tile here means it was regenerated below 4K (1440p and down \
+                     measured single-tile) and this test has quietly become a duplicate \
+                     of the vendored vector's"
+                );
+                let sb = if plan.sequence.use_128x128_superblock {
+                    128
+                } else {
+                    64
+                };
+                assert_eq!(
+                    (widths[0], 0u16),
+                    (plan.header.frame_width.div_ceil(sb) as u16, 0u16),
+                    "frame {frames}: the single tile COLUMN spans the whole width"
+                );
+                // Both row entries, each the coded value plus one — and read
+                // independently, so a conversion that broadcast entry 0 across the
+                // array would still have to get entry 1's own coded value right.
+                assert_eq!(
+                    (heights[0], heights[1]),
+                    (
+                        t.height_in_sbs_minus_1[0] as u16 + 1,
+                        t.height_in_sbs_minus_1[1] as u16 + 1
+                    ),
+                    "frame {frames}: each tile row's height is its OWN \
+                     `height_in_sbs_minus_1 + 1`"
+                );
+                assert_eq!(
+                    u32::from(heights[0]) + u32::from(heights[1]),
+                    plan.header.frame_height.div_ceil(sb),
+                    "frame {frames}: the two tile rows must tile the frame exactly — a \
+                     short second row is a frame with missing lines, which is precisely \
+                     the shape the host once shipped over the wire"
+                );
+                // Past the grid the arrays stay zero: a driver reading `rows` entries
+                // never sees them, and a phantom entry is a tile the frame has not.
+                assert!(widths[1..].iter().all(|w| *w == 0));
+                assert!(heights[2..].iter().all(|h| *h == 0));
+
+                // TWO tile RECORDS from ONE tile group, with distinct rows and
+                // non-empty spans. `tile_cols * tile_rows` records is libavcodec's own
+                // count, and this stream is the only one here where it exceeds the
+                // number of tile GROUPS — so a conversion that emitted one record per
+                // group (the coarser shape the module docs warn against) is
+                // indistinguishable from a correct one on the vendored vector and
+                // fails here.
+                assert_eq!(
+                    plan.tiles.len(),
+                    1,
+                    "frame {frames}: both tiles arrive in one Tile Group OBU"
+                );
+                assert_eq!(
+                    dx.tiles.len(),
+                    2,
+                    "frame {frames}: one record per TILE, not per tile group"
+                );
+                assert_eq!(
+                    (dx.tiles[0].row, dx.tiles[0].column),
+                    (0, 0),
+                    "frame {frames}: tile 0 is row 0"
+                );
+                assert_eq!(
+                    (dx.tiles[1].row, dx.tiles[1].column),
+                    (1, 0),
+                    "frame {frames}: tile 1 is the SECOND ROW of a single column — a \
+                     (0, 1) here means rows and columns are transposed, which one \
+                     square tile grid could never show"
+                );
+                assert!(
+                    dx.tiles.iter().all(|r| r.data_size > 0),
+                    "frame {frames}: every tile record must span real bytes; a \
+                     zero-length second record is the whole bottom half of the frame \
+                     missing"
+                );
+            }
+        }
+        assert_eq!(frames, 60, "the low-delay 4K stream is 60 coded frames");
     }
 
     /// Three fields whose correct value is a SENTINEL or a constant, on every frame

@@ -1,0 +1,126 @@
+# SHA-256 per DELIVERED frame of lowdelay-3840x2160.ivf.av1, DISPLAY order — 60 frames.
+#
+# Each frame is the 3840x2160 render region as tightly packed NV12:
+# Y plane 3840*2160 bytes, then interleaved UV 3840*1080 bytes = 12441600 bytes/frame.
+# (`render_width`/`render_height` equal the frame size, so there is no crop.)
+#
+# THE STREAM IS OURS, not a conformance vector, and that is the point of it.
+# `punktfunk-host spike` on .21 (NVENC, RTX 5070 Ti, driver 610.57.04,
+# punktfunk-host 0.25.0-0.00011708), 2026-08-07:
+#
+#   punktfunk-host spike --source synthetic --codec av1 --width 3840 --height 2160 \
+#     --fps 60 --seconds 1 --bitrate 1 --no-loopback --out lowdelay-3840x2160.av1
+#   ffmpeg -f obu -i lowdelay-3840x2160.av1 -c copy -f ivf lowdelay-3840x2160.ivf.av1
+#
+# The spike writes the low-overhead OBU stream; the IVF wrapper is added so this file
+# is framed exactly like the vendored vector and `common::split_av1_aus` — the
+# vendored parser's own `IvfIterator` — splits it with no second implementation that
+# could disagree. `-c copy` re-frames, it does not re-encode.
+#
+# ⭐ WHY 4K, when every other fixture here is chosen to be small. It is the ONLY
+# resolution at which our encoder emits more than one tile. Measured on the same box,
+# same command, 2026-08-07: 1280x720, 1920x1080 and 2560x1440 all give
+# `tile_cols = tile_rows = 1`; 3840x2160 gives `tile_cols = 1, tile_rows = 2` —
+# `width_in_sbs_minus_1 = [59]`, `height_in_sbs_minus_1 = [16, 16]` — and BOTH tiles
+# ride in ONE Tile Group OBU (`tg_start = 0, tg_end = 1`). That is the exact shape
+# behind the defect where the host shipped only the first tile of every 4K frame, and
+# a single-tile fixture cannot express it at all.
+#
+# 60 frames rather than 120 to pay for it: one second at 60 fps is 261 KB, which is
+# SMALLER than the 282 KB H.264 and 270 KB H.265 low-delay fixtures, and still leaves
+# 55 of the 60 access units exercising the reference-slot pressure below.
+#
+# 60 = 60 = 60, and that is itself worth pinning. Unlike the vendored vector (250
+# temporal units carrying 274 coded frames, 24 of them hidden), THIS stream is one
+# coded frame per temporal unit, all shown: 60 units, 60 coded frames, 60 displayed,
+# one KEY frame, zero hidden, zero `show_existing_frame`. The parity legs' frame
+# accounting must not silently assume either shape, so the CPU guard asserts all of
+# these numbers rather than deriving one from another.
+#
+# Main 4:2:0 8-bit (`seq_profile = 0`, `high_bitdepth = 0`, `mono_chrome = 0`) and NO
+# FILM GRAIN, so the Vulkan decode profile is the grain-DISABLED one, exactly as for
+# the vendored vector — see that file's header for why grain is a profile property
+# rather than a per-frame toggle.
+#
+# ⚠ WHAT THIS FIXTURE DOES NOT COVER. It is a FILE, and a file is not the wire path.
+# The headline "250/250 delivered frames bit-identical to libavcodec" was true for AV1
+# the entire time the host was shipping only the first tile of every 4K frame: that
+# verification ran against a vendored file, the packetisation and reassembly it never
+# touched were where the frames were being truncated, and the suite stayed green. This
+# fixture closes a different gap — it is the first pixel evidence for AV1 from our own
+# encoder, in a multi-tile shape — and it closes NOTHING about fragmentation,
+# reassembly, loss or the session's AU boundaries. Those need an end-to-end test.
+#
+# Goldens from libavcodec's SOFTWARE decoder (AV1 decoding is exactly specified, so
+# every conformant decoder is bit-identical):
+#
+#   ffmpeg -i lowdelay-3840x2160.ivf.av1 -f rawvideo -pix_fmt nv12 \
+#     -fps_mode passthrough ref.yuv
+#   # then split ref.yuv into 12441600-byte frames and sha256 each
+#
+# CROSS-CHECKED between two independent builds on two architectures whose
+# 746,496,000-byte raw outputs are BYTE-IDENTICAL (not merely equal per frame):
+# sha256 90c5be20342cba4d80bd0ceb1568cc3e2037f427d34c658895c7742968c93600 from both
+#   ffmpeg n8.1.2 (Arch/CachyOS, gcc 16, x86_64, libdav1d)
+#   ffmpeg 8.1.1  (Homebrew, clang, macOS arm64, libdav1d)
+# 60 of 60 digests distinct.
+5c587f77a16733533c178c115cf4fad5866b13ebc4bf7673a72be062b4aab9d9
+b07527d4a8d7fb8b4ce53d97818e86493237e98c492e5718d42ea0974cd00da2
+59156f4f4d3ef030fe884e7085a2f1b3887ba00e0c8e58c5e3f425a31f5aade6
+693bbc7da0f499d2955e6c13ed6ee3c13603faed938bc357264c534bed9faa0f
+14d1722b39ef61ede697a87f5d11eafcf7d9a812fb966fd3142c483036a08b87
+94e6cd41d300298677b014650e5f19b420c38e82741452da573d189d947f1a41
+f832d8126cdf3195be4a25aa5e80eefdd2c1089dce5bb3d3531f9bdb58e9c3b0
+be9248bec91e4bd5ab06e3a32d1ac02b759ae94735ecc88b14b845c5e4f24120
+581fdce69ff5188c949612fd00bd801c717ab9fc1f2de635d734879aae0a7bdd
+9256582fc2d242e57a2fbd414a481d4cfca494fa56254bdb15004b4d65c866c6
+7955081dd59795399a1cb7a3eeade261ba01ef89c8c27f1e133c958be054ddec
+5c8e963f60385add18001a3992fe5c5abb697391213f0f992144e5bba8f00745
+13062b6a6e2c557f4b8956a2f05a9ec941b3bd15b6ff4c337662b3eeabc75c41
+a80151a16345232be1db60fe2c1e7e61df38a1f676868fcc1b367fa42cdfaf9e
+3bb8d3934ce8b772d922c3f9004a2ce4db0bb1b9dcc63c5ac2ac90900b5693ae
+0e2b7d0148bcb1873256fba13058607b6088dc0478e9ed4773b657cd5d2d736f
+a620a352fd7f71675ea408a53c65e193f986c4e03da8008df996858410804323
+d89b4fdf771dbae3422dc193b8425af78a8a27520a09f2c8039fc6bb1501fd9a
+8bbdfbcb580c3c2694b8666869abd4cc39083d3dcf68d9b9ddfcc0f87ba8579e
+f779dcc8cc901b9fd878ab7f7e0b74ffe6123711fca9a9cde5c7f79f8edfc2d7
+172994574f60daea3dc17097a9ef001528cdd469388ee1c168021e622fb9616b
+4ff8294a6e9866cab539ec30a434484370b74b529d4f1b8a83186b6cf3862abb
+4a23e983efa8d890f89f654813032996af9ec74967e0bfe3bde9c1157e7c31af
+3f35ff00a47818184adcc25d86546503d62dd15ee1992971fe8c8d378fb1112d
+dd39f5cb55e8ec815dc8608f59612823cbfb96bdf4a470c9255ce745fbe43a7d
+62208c265976740965ae43a75c63e18eb1f6dce9781c98db105c4b4e6bcaee05
+a4227c20e5b717c8d6f3bc02290bf5c6f14ffb5655ee0b5d56ea906de39471a8
+99e146b61d3591d32f297b87eb02957bbfe7a323bf6b09da0f25840018ff3168
+7abfa53dc8d8902eee943cad6bd3d9893954c04f52ef999f64822ebab935f474
+69a8db91bc8767047ee167362d235c494be63957efeef400e12d447c65136438
+8786d36d405ab6b2493e98415784e33fe09b49fe9730ad899ec1db418ab71122
+fe5bb80bdf4a100305b157fb1f60732bebb9c7b70ab22726004bb4fc9925705f
+264595ab85a2f8e30d316e48b02d8863c341d8ddc9d34e42affbad9520958027
+cc96871daa10607f13227d6dbabf56f9ffea7eb2acc4d71272cffae286da1970
+911bf0ef3c152bf45f527de8b4deb5a60d80f5793bf7488dd57009b1cbdf51be
+543851960eb05d8b2a0a3b7ee50ce6fcc975b4ac6404247464e535364e610804
+e650439e22ebc94c24479a3d28472afb776389f4eb9aff62c8eaa7b96223e014
+3ca9d4ba265c19540c73eb51c9d4003ca3b762cf4d89f6d771d6c9edb07df65f
+f106640e15ae6b53056c9fb64e94b2a3ccce80a32f8146a5cb170363c1a5d019
+b7004a617d142bb7238063c35e1173888aa028282fdbdad8ffaca3519fb0228d
+98f03d7add2fbd046b6805514d0844abbf7c2ee43de2509d3344843ad2d7220d
+15c7a6c87d1ded36db5b5aa9e8394b184d3a6c7ccee4e1041b2473db5a1d0d2c
+8d98f9655751c2c2afc7d4a87dac58c0d185e7bf2d897f93b0e999cef7897920
+91cc279dacbdae06ca5cde05c395e73cb675802e1a4f1ac3ae95a0344e2ef6ec
+d042152a54fb3a0c129c2beba6c73609c4e9e4abb77d5c0bd731832bd70c6ab8
+5a9a9ccfce845caefcbfca7ac553674f84ff9a7f2846c55541512290a89a9295
+6ed1c17c84a6c454600b079ab709782cfd494adc5433613738158c5163e60211
+116d24252b578e6e4519611b9542372175b3fbed7ff76276daae6e0c8d2cfa77
+edaf4b5827b58b5712266d84914706b76b4aaefffa2e70a703f5261e9c774c00
+85b63f4a86b1e5e19372dfa98040382c94114bdff710b301430ec1894c0d06ab
+bf19eb95a3fdeed167d2a2a65fbbcbd426125451de649d018f7c1e2bdfeced50
+e0dc2d2422909b997cd39d2d66842f2f9da9f9002f6b46b93ed2666a324e04ab
+68ae1aad5ed221897100680c932f5c5ce71ba4957cc6b784a9ebc0775342d714
+784acdc2a7cbb0cd135c01dac00d4d63385fce60f4d053d30e9b972d97bc6db6
+5a08dac838c5f012e79e60cdf17ab25db8b58ad83df9b2d1b94a7c1f40e04943
+0c53d382480cc0ef5402dcd71d80c23662a9c3078b3989371eca11a4000cc4dc
+a50fafe9ad90c4cc77dc6ada3184e8a7fcd744fd57855ee05d40cc96e6cc10af
+eb1b41ec865ab2b6090cba6603c687bd059aac1d183ed76846cad1b9a579c7e0
+92d9d93b9cccb596ac7022aaca97e32b4ec7417dc8f0047a9575957464d6b5d5
+210d44dfefe088b47caac2861171abdcef07c828ab673fa98a6e64cda8d42107

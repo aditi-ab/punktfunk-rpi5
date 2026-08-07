@@ -534,6 +534,95 @@ mod tests {
         aus
     }
 
+    /// **Our own host's low-delay HEVC**, vendored beside the goldens the GPU legs
+    /// decode it against (`tests/data/lowdelay-640x480-h265.nv12.sha256` carries the
+    /// `punktfunk-host spike` command and the ffmpeg cross-check). 120 pictures of
+    /// 640x480 IPPP, a five-picture DPB against four marked references and
+    /// `sps_max_num_reorder_pics = 0`, so 115 of its 120 access units retire a picture.
+    const LOWDELAY_640X480_H265: &[u8] = include_bytes!("../tests/data/lowdelay-640x480.h265");
+
+    /// This rung is immune to the release-ordering defect for a STRONGER reason than
+    /// the DXVA one, and this pins the difference instead of asserting it in prose.
+    ///
+    /// Both HEVC conversions release `removed` inline and let [`SlotMap::assign`] hand
+    /// the freed slot to the decode target. DXVA survives that because `H265Planner`
+    /// snapshots `dpb_refs` AFTER `decode_rps`, so the retired picture is not in the
+    /// marked DPB `RefPicList` is built from — a property of the PLANNER, one call
+    /// away from being untrue, which is why `pf_dxvadec::pic_h265` drives the
+    /// counterfactual through its conversion.
+    ///
+    /// This conversion never reads `dpb_refs` at all. `pReferenceSlots` is spec-defined
+    /// as the slots the decode operation USES, so it binds `plan.rps` — the three
+    /// current sets, which `decode_rps` derives and which therefore cannot name a
+    /// picture that same RPS just dropped. The test proves it the only way that means
+    /// anything: it hands the conversion a `dpb_refs` deliberately widened to the
+    /// PRE-RPS marked set (the mutation that makes the DXVA rung alias on 115 of these
+    /// 120 access units) and asserts nothing changes here.
+    ///
+    /// If this ever fails, someone has made this conversion bind the marked DPB — a
+    /// legitimate thing to want, since a *Foll* long-term anchor invisible to the
+    /// hardware is the RFI failure shape — and it now needs the `release_after_decode`
+    /// deferral the H.264 and AV1 conversions carry.
+    #[test]
+    fn a_pre_rps_marked_dpb_changes_nothing_here_because_the_current_sets_are_what_bind() {
+        let aus = split_into_aus(LOWDELAY_640X480_H265);
+        let mut planner = H265Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut prev: Option<AuPlan> = None;
+        let mut converted = 0usize;
+        let mut widened = 0usize;
+
+        for au in aus {
+            let plan = planner.plan_au(au).expect("the low-delay stream plans");
+            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+
+            // The marked DPB as this AU's `decode_rps` found it: the previous AU's
+            // snapshot plus the picture it stored. Exactly what `dpb_snapshot()` would
+            // return from above `decode_rps` instead of below it.
+            let mut as_if = plan.clone();
+            as_if.dpb_refs = match &prev {
+                None => Vec::new(),
+                Some(prev) => {
+                    let mut marked = prev.dpb_refs.clone();
+                    if let Some(id) = prev.dpb.stored {
+                        assert!(
+                            prev.picture.is_reference,
+                            "this stream carries no sub-layer non-reference pictures"
+                        );
+                        marked.push(RefPic {
+                            id,
+                            pic_order_cnt: prev.picture.pic_order_cnt,
+                            is_long_term: false,
+                        });
+                    }
+                    marked
+                }
+            };
+            if as_if.dpb_refs.len() > plan.dpb_refs.len() {
+                widened += 1;
+            }
+
+            let vk = plan_to_vk_h265(&as_if, map).expect("conversion");
+            converted += 1;
+            for r in &vk.refs {
+                assert_ne!(
+                    r.slot, vk.setup_slot,
+                    "a reference aliases the setup slot even though this conversion \
+                     binds only the current RPS sets — it has started reading \
+                     `dpb_refs`, and now needs a deferred release"
+                );
+            }
+            prev = Some(plan);
+        }
+
+        assert_eq!(converted, 120);
+        assert_eq!(
+            widened, 115,
+            "the mutation must actually widen the marked set on the access units that \
+             retire a picture, else this test asserts nothing about anything"
+        );
+    }
+
     #[test]
     fn the_full_25fps_vector_converts_with_stable_slots_and_start_code_offsets() {
         let aus = split_into_aus(TEST_25FPS);

@@ -690,6 +690,18 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
     );
 
+    /// **Our own host's HEVC**, and the only stream in this repository that reaches
+    /// the DPB pressure HEVC's exemption is claimed against: low-delay IPPP, 120
+    /// pictures of 640x480, `sps_max_num_reorder_pics = 0`, and a five-picture DPB
+    /// against the four pictures 8.3.2 keeps marked.
+    ///
+    /// Vendored beside the goldens the GPU legs decode it against (that file's header
+    /// carries the `punktfunk-host spike` command and the ffmpeg cross-check), the
+    /// same way `lowdelay-640x480.h264` is, and read from the same path by all three
+    /// crates that need it.
+    const LOWDELAY_640X480_H265: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
+
     /// Test-only AU splitter, mirroring pf-vkdecode's (which mirrors
     /// pf-bitstream's `#[cfg(test)]`-private helper).
     fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
@@ -936,12 +948,12 @@ mod tests {
     /// leave the first assertion passing and break the second on the first AU whose
     /// RPS drops a picture, which on this vector is most of them.
     ///
-    /// ⚠ No low-delay HEVC stream is vendored, so unlike H.264 this is not backed by a
-    /// hardware leg on our own encoder's output. It was MEASURED once, 2026-08-07, on
-    /// a 300-picture 1080p low-delay HEVC stream from a punktfunk host: 0 access units
-    /// with a `removed ∩ dpb_refs` intersection, against 297 of 300 for H.264 from the
-    /// same host and the same run. Vendoring that stream is the way to make this a
-    /// standing guarantee rather than a re-derivable argument.
+    /// This test covers the VENDORED VECTOR only, which reorders and therefore cannot
+    /// reach the DPB pressure the exemption is really claimed against. The stream that
+    /// can is [`LOWDELAY_640X480_H265`], and it carries its own pair of tests below —
+    /// [`the_low_delay_stream_reaches_the_dpb_pressure_and_hevc_still_does_not_alias`]
+    /// and [`the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps`],
+    /// the second of which drives the alias through this very conversion.
     #[test]
     fn the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference() {
         let mut aus_with_removals = 0usize;
@@ -979,6 +991,200 @@ mod tests {
              ahead of `decode_rps`. Restore the ordering, or give this conversion the \
              `release_after_decode` deferral the other two carry; do NOT relax this \
              number"
+        );
+    }
+
+    /// The marked DPB as an access unit's `decode_rps` FINDS it — the set
+    /// `dpb_snapshot()` would return from the other side of that call.
+    ///
+    /// Exact, not approximate. `H265Planner::begin_picture` runs `decode_rps` →
+    /// `update_dpb_before_decoding` → `dpb_snapshot`, and the only thing between AU
+    /// N-1's snapshot and AU N's `decode_rps` is `finish_picture(N-1)` storing its
+    /// picture marked "used for short-term reference". So the pre-RPS marked set is
+    /// exactly `dpb_refs(N-1) ∪ {stored(N-1)}` — no DPB replay needed, and no
+    /// dependence on the planner internals staying reachable from a test.
+    ///
+    /// A sub-layer non-reference picture is stored but NOT marked, so it is excluded;
+    /// the callers assert their streams contain none, which keeps the reconstruction
+    /// honest rather than merely defensive.
+    fn pre_rps_marked(prev: Option<&AuPlan>) -> Vec<RefPic> {
+        let Some(prev) = prev else {
+            return Vec::new();
+        };
+        let mut marked = prev.dpb_refs.clone();
+        if let Some(id) = prev.dpb.stored {
+            if prev.picture.is_reference {
+                marked.push(RefPic {
+                    id,
+                    pic_order_cnt: prev.picture.pic_order_cnt,
+                    is_long_term: false,
+                });
+            }
+        }
+        marked
+    }
+
+    /// The exemption, measured on the stream that can actually falsify it.
+    ///
+    /// [`the_current_picture_is_named_by_curr_pic_and_never_aliases_a_reference`] runs
+    /// over `test-25fps.h265`, which REORDERS — a picture the RPS drops stays alive for
+    /// output past the access unit that dropped it, so the eviction and the unmarking
+    /// never land together and the vector cannot reach the precondition however hard it
+    /// is run. That is the same blindness that let the H.264 defect survive two
+    /// milestones behind a 250/250 green vector.
+    ///
+    /// This stream reaches it. Three numbers, and the third is what gives the second
+    /// its meaning:
+    ///
+    /// - **115 of 120** access units retire a picture (a five-picture DPB against four
+    ///   marked references and `sps_max_num_reorder_pics = 0`);
+    /// - **0** of those retirements intersect the access unit's own `dpb_refs` — the
+    ///   exemption, measured on our own encoder's output rather than argued;
+    /// - **115** of them intersect the PRE-RPS marked set, so a snapshot taken one call
+    ///   earlier would alias on every single one.
+    ///
+    /// [`the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps`]
+    /// then drives that counterfactual through the conversion itself.
+    #[test]
+    fn the_low_delay_stream_reaches_the_dpb_pressure_and_hevc_still_does_not_alias() {
+        let converted = convert_stream(LOWDELAY_640X480_H265);
+        assert_eq!(converted.len(), 120, "the low-delay stream is 120 pictures");
+
+        let mut with_removals = 0usize;
+        let mut both = 0usize;
+        let mut would_alias = 0usize;
+        for (i, (plan, dxva)) in converted.iter().enumerate() {
+            // The consequence, over every access unit of the stream: the decode target
+            // is `CurrPic` and appears in no reference entry.
+            assert_eq!(dxva.pic_params.CurrPic.index(), dxva.setup_slot);
+            assert!(!dxva.pic_params.CurrPic.associated());
+            for r in &dxva.refs {
+                assert_ne!(
+                    r.slot, dxva.setup_slot,
+                    "AU {i}: reference picture {} shares surface {} with the decode \
+                     target — HEVC has acquired the H.264/AV1 defect",
+                    r.id, r.slot
+                );
+            }
+
+            assert!(
+                plan.picture.is_reference,
+                "AU {i}: this stream carries no sub-layer non-reference pictures, \
+                 which is what makes `pre_rps_marked` exact"
+            );
+            if !plan.dpb.removed.is_empty() {
+                with_removals += 1;
+            }
+            both += plan
+                .dpb
+                .removed
+                .iter()
+                .filter(|id| plan.dpb_refs.iter().any(|r| r.id == **id))
+                .count();
+            let before = pre_rps_marked(i.checked_sub(1).map(|prev| &converted[prev].0));
+            would_alias += plan
+                .dpb
+                .removed
+                .iter()
+                .filter(|id| before.iter().any(|r| r.id == **id))
+                .count();
+        }
+
+        assert_eq!(
+            with_removals, 115,
+            "the stream must still retire a picture on nearly every access unit; \
+             without that both numbers below are trivially zero"
+        );
+        assert_eq!(
+            both, 0,
+            "{both} picture(s) are in an access unit's own marked DPB AND removed by \
+             it — the H.264/AV1 aliasing precondition, which HEVC is supposed to be \
+             structurally incapable of. `H265Planner`'s snapshot has moved ahead of \
+             `decode_rps`. Restore the ordering, or give this conversion the \
+             `release_after_decode` deferral the other two carry; do NOT relax this"
+        );
+        assert_eq!(
+            would_alias, 115,
+            "the fixture must stay CAPABLE of exposing the defect it rules out. A \
+             regenerated stream that reordered, or whose DPB was deeper than its \
+             reference count, would report 0 here — and the zero above would then \
+             prove exactly as much as `test-25fps.h264`'s zero proved, which was nothing"
+        );
+    }
+
+    /// The counterfactual driven through the CONVERSION, not just the planner's
+    /// arithmetic.
+    ///
+    /// `H265Planner` snapshotting one call earlier is a plausible refactor — it is
+    /// where `H264Planner` and `Av1Planner` both snapshot, and both needed
+    /// `release_after_decode` because of it. This test simulates exactly that by
+    /// handing `plan_to_dxva_h265` the PRE-RPS marked set as `dpb_refs` and nothing
+    /// else changed, then asserts the alias appears: the dropped picture enters
+    /// `RefPicList` as a *Foll* entry with its slot resolved BEFORE the removals are
+    /// released, `SlotMap::assign` hands that freed slot straight to `CurrPic`, and one
+    /// surface is named as both the decode target and a picture the frame predicts from.
+    ///
+    /// So the guarantee is not "we looked and it was fine". It is: this stream reaches
+    /// the shape, this conversion breaks on it under the other snapshot ordering, and
+    /// the ordering we ship is why it does not.
+    #[test]
+    fn the_low_delay_stream_would_alias_if_the_snapshot_moved_ahead_of_the_rps() {
+        let mut planner = H265Planner::new();
+        let mut slots: Option<SlotMap> = None;
+        let mut plans: Vec<AuPlan> = Vec::new();
+        let mut aliased = 0usize;
+        let mut converted = 0usize;
+
+        for (i, au) in split_into_aus(LOWDELAY_640X480_H265)
+            .into_iter()
+            .enumerate()
+        {
+            let plan = planner.plan_au(au).expect("the low-delay stream plans");
+            let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
+
+            // The ONE mutation: the marked DPB as it stood before this AU's RPS ran.
+            let mut as_if = plan.clone();
+            as_if.dpb_refs = pre_rps_marked(plans.last());
+
+            // The reconstruction validates itself, so a planner change that broke the
+            // reasoning behind `pre_rps_marked` fails HERE with its reason rather than
+            // quietly turning the count below into a different measurement. Marking
+            // only ever grows between two access units' RPS derivations (the previous
+            // picture is stored marked; C.5.2.2's removal takes only already-unmarked
+            // pictures), so the pre-RPS set is a strict SUPERSET of the post-RPS one.
+            for rp in plan.dpb_refs.iter().chain(
+                as_if
+                    .rps
+                    .st_curr_before
+                    .iter()
+                    .chain(&as_if.rps.st_curr_after)
+                    .chain(&as_if.rps.lt_curr),
+            ) {
+                assert!(
+                    as_if.dpb_refs.iter().any(|r| r.id == rp.id),
+                    "AU {i}: picture {} is in the post-RPS marked DPB (or a current \
+                     set) but not in the reconstructed pre-RPS one — marking is no \
+                     longer monotone across an access unit boundary, and this test is \
+                     measuring a different mutation than the one it documents",
+                    rp.id
+                );
+            }
+
+            let dxva = plan_to_dxva_h265(&as_if, map, i as u32 + 1).expect("conversion");
+            converted += 1;
+            if dxva.refs.iter().any(|r| r.slot == dxva.setup_slot) {
+                aliased += 1;
+            }
+            plans.push(plan);
+        }
+
+        assert_eq!(converted, 120);
+        assert_eq!(
+            aliased, 115,
+            "the pre-RPS snapshot must alias on every access unit that retires a \
+             picture. {aliased} of 120 did — if this is 0, the stream no longer \
+             reaches the shape and the exemption asserted by the test above is \
+             unfalsifiable again; regenerate the fixture rather than relaxing this"
         );
     }
 
