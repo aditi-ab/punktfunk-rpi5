@@ -505,5 +505,53 @@ int main(void) {
     S(VAConfigAttrib);
     O(VAConfigAttrib, type);
     O(VAConfigAttrib, value);
+
+    /*
+     * The IMAGE pair — `vaDeriveImage` / `vaCreateImage` + `vaGetImage` write these,
+     * and they are the only way anything reads a decoded VAAPI surface back on the
+     * CPU. `VAImage` is the awkward one of the whole file: `width` and `height` are
+     * `unsigned short`, so the four-byte fields around them are NOT where counting
+     * 32-bit words would put them, and `component_order` is four `char` rather than a
+     * padded word. Both are measured here rather than reasoned about.
+     *
+     * ⚠ The readback these describe is TEST-ONLY (see `video_vaapi_native`'s `parity`
+     * module). The production path exports a DRM-PRIME dmabuf and never maps a
+     * surface; the structures are declared for the same reason every other structure
+     * in this file is, so a parity harness can be written without a libva build
+     * dependency.
+     */
+    S(VAImageFormat);
+    O(VAImageFormat, fourcc);
+    O(VAImageFormat, byte_order);
+    O(VAImageFormat, bits_per_pixel);
+    O(VAImageFormat, depth);
+    O(VAImageFormat, red_mask);
+    O(VAImageFormat, green_mask);
+    O(VAImageFormat, blue_mask);
+    O(VAImageFormat, alpha_mask);
+    O(VAImageFormat, va_reserved);
+
+    S(VAImage);
+    O(VAImage, image_id);
+    O(VAImage, format);
+    O(VAImage, buf);
+    O(VAImage, width);
+    O(VAImage, height);
+    O(VAImage, data_size);
+    O(VAImage, num_planes);
+    O(VAImage, pitches);
+    O(VAImage, offsets);
+    O(VAImage, num_palette_entries);
+    O(VAImage, entry_bytes);
+    O(VAImage, component_order);
+    O(VAImage, va_reserved);
+    printf("count VAImage pitches                       %zu\n",
+           sizeof(((VAImage *)0)->pitches) / sizeof(((VAImage *)0)->pitches[0]));
+    printf("count VAImage offsets                       %zu\n",
+           sizeof(((VAImage *)0)->offsets) / sizeof(((VAImage *)0)->offsets[0]));
+    printf("count VAImage component_order               %zu\n",
+           sizeof(((VAImage *)0)->component_order));
+    printf("enum VA_LSB_FIRST                           %d\n", VA_LSB_FIRST);
+    printf("enum VA_MSB_FIRST                           %d\n", VA_MSB_FIRST);
     return 0;
 }

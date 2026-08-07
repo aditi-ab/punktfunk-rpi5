@@ -23,10 +23,18 @@
 //! everything decidable without a device — including [`drm`], the export
 //! descriptor the driver writes back and the plane walk that reads it.
 //!
-//! ⚠ **Nothing here has decoded a frame.** The rung is pin-only
-//! (`PUNKTFUNK_DECODER=native-vaapi`) and no VAAPI hardware has been reachable
-//! during M7, so everything below is a CPU-side conversion checked against
-//! libavcodec and against measured layouts, not against a picture.
+//! **Every conversion in this crate has now been checked in PIXELS.** On 2026-08-08,
+//! on `.25` (Radeon 780M, RDNA3, radeonsi, Mesa 26.0.3, VA-API 1.23),
+//! `pf-client-core`'s `video_vaapi_native::parity` decoded seven streams through the
+//! rung and hashed every delivered frame against libavcodec's software decode — the
+//! same golden files the Vulkan and D3D11VA rungs are held to — and all seven came
+//! back bit-identical: 250 + 120 H.264, 250 + 120 H.265, 50 HEVC Main 10 (P010), and
+//! 250 + 60 AV1. That was possible at all because [`va::pack_two_plane`] and the
+//! `VAImage` pair below give a TEST-ONLY readback of a decoded surface; nothing on the
+//! production path maps one, and that module's docs say how it is kept that way.
+//!
+//! ⚠ ONE vendor. AMD/radeonsi only — Intel's iHD driver has neither run these legs nor
+//! been asked to.
 //!
 //! Five things this crate settled that a reader would otherwise have to re-derive:
 //!
@@ -150,3 +158,19 @@ pub use va::VaIqMatrixBufferH264;
 pub use va::VaPictureH264;
 pub use va::VaPictureParameterBufferH264;
 pub use va::VaSliceParameterBufferH264;
+
+// The CPU-readable view of a decoded surface, and the pure walk that packs one into
+// the layout this program's goldens hash.
+//
+// ⚠ TEST-ONLY. Nothing on the production video path maps a surface — the rung exports
+// a DRM-PRIME dmabuf and the presenter samples it, which is the zero-copy contract —
+// so the only caller is `pf-client-core`'s `video_vaapi_native::parity`, which exists
+// solely under `#[cfg(test)]`. These are declared here so that harness needs no
+// `libva-dev` and so its geometry can be checked with no device at all (`va`'s module
+// docs say why at length).
+pub use va::pack_two_plane;
+pub use va::packed_len;
+pub use va::ImageReadError;
+pub use va::VaImage;
+pub use va::VaImageFormat;
+pub use va::VA_LSB_FIRST;

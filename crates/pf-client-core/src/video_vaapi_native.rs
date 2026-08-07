@@ -3283,7 +3283,7 @@ mod tests {
     /// file `pf-vkdecode`'s Vulkan parity leg and `video_d3d11_native`'s D3D11VA leg
     /// walk, so a count that disagrees with 250 is this rung's problem, not the
     /// vector's.
-    const AV1_25FPS: &[u8] = include_bytes!(
+    pub(super) const AV1_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
 
@@ -3292,7 +3292,7 @@ mod tests {
     /// not depend on the vendored parser crate — the same reason and the same walk as
     /// `video_d3d11_native`'s `split_ivf`, and kept honest by the unit count asserted
     /// at the top of the test below.
-    fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
+    pub(super) fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
         assert_eq!(&stream[0..4], b"DKIF", "the AV1 vector must be an IVF file");
         let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
         let mut out = Vec::new();
@@ -3314,17 +3314,17 @@ mod tests {
     /// Does this machine's VAAPI actually DECODE AV1 — the question the evidence table
     /// has answered "no hardware has ever tried" since M6.
     ///
-    /// This is deliberately weaker than the Vulkan and D3D11VA AV1 legs, and the
-    /// difference is worth stating rather than hiding: those two hash every decoded
-    /// frame against libavcodec's goldens, because both can read their decoded surface
-    /// back. This rung hands out a **DRM-PRIME dmabuf** whose memory is tiled by the
-    /// driver, so there is no CPU-readable image to hash without adding a
-    /// `vaDeriveImage`/`vaGetImage` path that production does not use and does not
-    /// want. So this asserts what CAN be asserted honestly — that every temporal unit
-    /// is accepted, that the expected number of frames comes back, and that each one
-    /// is a real exported surface of the right shape — and it is NOT frame-hash parity.
-    /// It is what turns "never decoded a frame anywhere" into a measurement; promoting
-    /// the rung to `verified` still wants parity, and that wants a readback path first.
+    /// A DECODE measurement, not frame-hash parity: it asserts that every temporal unit
+    /// is accepted, that the expected number of frames comes back, and that each one is
+    /// a real exported surface of the right shape. It says nothing about the PIXELS.
+    ///
+    /// That used to be all this rung could claim — it hands out a **DRM-PRIME dmabuf**
+    /// whose memory the driver tiles, so there was no CPU-readable image to hash. The
+    /// `parity` module below adds one, test-only, and
+    /// `parity::av1_every_delivered_frame_hashes_bit_identical_to_libavcodec` is the leg
+    /// that checks the pixels. This one is kept because it is the cheaper question and
+    /// it fails FIRST: a rung that stopped decoding at all should say so without
+    /// waiting for 250 hashes.
     ///
     /// Fails loudly rather than skipping when the device has no AV1 entry point: it is
     /// `#[ignore]`d, so it only runs when someone deliberately points it at a box that
@@ -3399,13 +3399,13 @@ mod tests {
     /// file, at the same relative path, that `pf-vkdecode`'s Vulkan legs and
     /// `video_d3d11_native`'s D3D11VA leg decode — so a count that disagrees with
     /// theirs is this rung's problem rather than the vector's.
-    const H264_25FPS: &[u8] = include_bytes!(
+    pub(super) const H264_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
     /// The vendored H.265 twin: 250 access units, 320x240 Main 8-bit 4:2:0, ONE slice
     /// per picture, one `IDR_N_LP` then 249 TRAIL pictures.
-    const H265_25FPS: &[u8] = include_bytes!(
+    pub(super) const H265_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
     );
 
@@ -3418,7 +3418,8 @@ mod tests {
     /// path every HDR session takes. `finish` refuses a surface whose exported fourcc
     /// is not the one the pool was created with, so this leg is also the only thing
     /// that would catch a driver quietly handing back NV12 for a ten-bit stream.
-    const MAIN10_H265: &[u8] = include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
+    pub(super) const MAIN10_H265: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
 
     /// Both 8-bit vectors are 250 access units.
     const H26X_AU_COUNT: usize = 250;
@@ -3538,7 +3539,7 @@ mod tests {
     /// slice, 5 = IDR slice), and `first_mb_in_slice == 0` is the top bit of the byte
     /// after it. Load-bearing rather than decorative on this vector: it codes two
     /// slices per picture, so without the flag every picture would be split in two.
-    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
+    pub(super) fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
         split_aus(stream, |s, h| {
             let is_slice = matches!(s[h] & 0x1f, 1 | 5);
             let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
@@ -3551,7 +3552,7 @@ mod tests {
     /// the top bit of the byte at `+2` where H.264 reads `+1`. Getting either wrong
     /// silently merges or splits AUs, which surfaces as a frame-count mismatch a long
     /// way from its cause.
-    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
+    pub(super) fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
         split_aus(stream, |s, h| {
             let is_slice = (s[h] >> 1) & 0x3f < 32;
             let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
@@ -3972,18 +3973,17 @@ mod tests {
     ///
     /// # What these legs prove, and what they do not
     ///
-    /// Deliberately weaker than the Vulkan and D3D11VA H.26x legs, and the difference
-    /// is worth stating rather than hiding behind a test name: those hash every decoded
-    /// frame against libavcodec's goldens, because both can read their decoded surface
-    /// back. This rung hands out a **DRM-PRIME dmabuf** whose memory the driver tiles,
-    /// so there is no CPU-readable image to hash without adding a
-    /// `vaDeriveImage`/`vaGetImage` path that production does not use and does not
-    /// want. So this asserts what CAN be asserted honestly — that every access unit is
-    /// accepted, that the expected number of frames comes back, and that each one is a
-    /// real exported surface of the right shape and fourcc — and it is **NOT frame-hash
-    /// parity**. It is what turns "never decoded a frame anywhere" into a measurement;
-    /// promoting these legs to `verified` still wants parity, and parity wants a
-    /// readback path that does not exist yet.
+    /// A DECODE measurement, not frame-hash parity: every access unit is accepted, the
+    /// expected number of frames comes back, and each one is a real exported surface of
+    /// the right shape and fourcc. Nothing here looks at a PIXEL.
+    ///
+    /// That used to be all this rung could claim, because it hands out a **DRM-PRIME
+    /// dmabuf** whose memory the driver tiles and there was no CPU-readable image to
+    /// hash. The `parity` module below adds one, test-only, and its legs are what check
+    /// the pixels against libavcodec's goldens — the same goldens the Vulkan and
+    /// D3D11VA rungs are held to. These legs stay because they are the cheaper question
+    /// and they fail FIRST: a rung that stopped decoding at all should say so without
+    /// waiting for 250 hashes.
     ///
     /// Fails loudly rather than skipping when the device has no entry point for the
     /// profile: these legs are `#[ignore]`d, so they only run when someone deliberately
@@ -4061,7 +4061,8 @@ mod tests {
     /// table has answered "no hardware has ever tried" since M6.
     ///
     /// See [`run_annex_b`] for what this proves and, more importantly, what it does
-    /// not: it is a decode measurement, not frame-hash parity.
+    /// not: it is a decode measurement. The pixels are
+    /// `parity::h264_every_frame_hashes_bit_identical_to_libavcodec`'s business.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn h264_decodes_the_vendored_vector_on_this_machines_vaapi() {
@@ -4169,5 +4170,1996 @@ mod tests {
             first.keyframe,
             "the same picture-not-access-unit label the H.264 leg documents"
         );
+    }
+}
+
+#[cfg(test)]
+mod parity {
+    //! Frame-hash parity for this rung — the evidence M6 and M7 shipped without, and
+    //! the last rung of the ladder that had none.
+    //!
+    //! `#[ignore]`d: every leg needs a real VAAPI device. Run them on a box with
+    //!
+    //! ```text
+    //! cargo test -p pf-client-core --lib video_vaapi_native -- --include-ignored --nocapture
+    //! ```
+    //!
+    //! and pin a GPU on a multi-GPU box with `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderD…`
+    //! (the same pin the rung itself honours).
+    //!
+    //! # What it proves, and against what
+    //!
+    //! Exactly what `pf-vkdecode`'s `gpu_parity` proves for the Vulkan rung and
+    //! `video_d3d11_native`'s `parity` for the D3D11VA one, against the same reference
+    //! and — deliberately — the SAME GOLDEN FILES, read across the crate boundary
+    //! rather than copied: H.264, H.265 and AV1 decoding are exactly specified, so a
+    //! conformant decoder must reproduce libavcodec's SOFTWARE output bit for bit. One
+    //! golden set for three rungs is what makes their verdicts directly comparable;
+    //! three copies would be three measurements.
+    //!
+    //! Until this module existed the VAAPI rung's four legs could only claim that every
+    //! access unit was ACCEPTED and that a surface of the right shape came back. That
+    //! is a much weaker claim than it reads as, and this program has now been shown
+    //! exactly how much weaker: the D3D11VA AV1 rung streamed 4K60 for five clean
+    //! minutes while producing wrong pixels for 186 of 250 frames on one GPU and 245 of
+    //! 250 on another. Nothing but a golden caught it.
+    //!
+    //! # Measured
+    //!
+    //! **All seven legs, 2026-08-08, on `.25`** — Radeon 780M (RDNA3), radeonsi, Mesa
+    //! 26.0.3, VA-API 1.23, `/dev/dri/renderD128`:
+    //!
+    //! | leg | frames | flush tail | verdict |
+    //! |---|---|---|---|
+    //! | H.264, vendored vector | 250 | 7 | bit-identical |
+    //! | H.264, our host's low-delay 640x480 | 120 | 3 | bit-identical |
+    //! | H.265, vendored vector | 250 | 2 | bit-identical |
+    //! | H.265, our host's low-delay 640x480 | 120 | 0 | bit-identical |
+    //! | HEVC Main 10, P010 | 50 | 2 | bit-identical |
+    //! | AV1, vendored vector | 250 delivered of 274 decoded | 0 | bit-identical, and display frame 0 byte-identical to libavcodec's own PIXELS |
+    //! | AV1, our host's 4K two-tile | 60 | 0 | bit-identical |
+    //!
+    //! `vaDeriveImage` answers on radeonsi and is the route every leg took. `vaGetImage`
+    //! also answers; the two agreed byte for byte on every leg's first frame, and
+    //! `PF_VAAPI_READBACK=getimage` reproduces the H.264 leg's 250/250 through the
+    //! copying route alone — so the fallback is exercised rather than merely written.
+    //!
+    //! ⚠ ONE vendor. This is AMD/radeonsi only; Intel's iHD driver has a different
+    //! surface layout and a different `vaDeriveImage` answer, and no Intel box has run
+    //! these legs. The D3D11VA AV1 defect was invisible on NVIDIA for 64 frames and
+    //! structural on Intel from frame 4 — one driver passing is evidence about that
+    //! driver.
+    //!
+    //! # ⚠ The readback is TEST-ONLY, and that is structural rather than a promise
+    //!
+    //! The production path exports a DRM-PRIME dmabuf and the presenter samples it.
+    //! Nothing on it maps a surface, and nothing may: a per-frame CPU readback on the
+    //! live path would cost exactly the copy zero-copy exists to avoid. Four things
+    //! keep this module off it, and the first is the one that matters:
+    //!
+    //! 1. **The entry points are resolved HERE, in `#[cfg(test)]` code.** [`ImageApi`]
+    //!    dlopens `libva.so.2` itself and stores the image function pointers in a type
+    //!    that does not exist outside `cargo test`. In a shipped build there is no
+    //!    `vaMapBuffer` pointer to call, so no production path can reach one however
+    //!    wrong it becomes.
+    //! 2. **The production [`Libva`] gains no field.** Its list of entry points is
+    //!    unchanged by this module, which is the one-screen check a reviewer can do.
+    //! 3. [`the_readback_entry_points_are_resolved_only_inside_this_module`] asserts
+    //!    (1) and (2) mechanically, by scanning this file's own source: every `dlsym`
+    //!    of an image entry point must sit after this module's header. It is a CPU
+    //!    test, so ordinary `cargo test` enforces it on every platform.
+    //! 4. `sha2` is a DEV dependency, so nothing shipped links the hashing either.
+    //!
+    //! # Two routes, because derive is not guaranteed
+    //!
+    //! libva offers two ways to read a surface, and a driver need only implement one:
+    //!
+    //! * **`vaDeriveImage`** maps the surface's own memory. Cheap, and refused outright
+    //!   by drivers whose decode surfaces are tiled or otherwise not linearly
+    //!   addressable.
+    //! * **`vaCreateImage` + `vaGetImage`** asks the driver to copy — and detile — the
+    //!   region into an image of a format it declares it can produce.
+    //!
+    //! [`Readback`] tries derive first, falls back to create+get, and **fails loudly
+    //! naming what the driver gave it** if neither yields the pool's own fourcc. A
+    //! parity test that quietly passed because it could not read anything is the
+    //! failure mode this program has been bitten by three times; there is no skip path
+    //! here. `PF_VAAPI_READBACK=derive|getimage` forces one route, and the first frame
+    //! of every leg is read through BOTH when both work and the two must agree — which
+    //! is the only check that can catch a derive that "succeeds" onto tiled bytes.
+    //!
+    //! # It hashes what the rung DELIVERS, in the order it delivers it
+    //!
+    //! The goldens are one hash per DISPLAY frame. Since the delivery fix this rung
+    //! hands back every displayed picture in display order — `settle` claims every
+    //! output rather than only the last, and [`NativeVaapiDecoder::flush`] drains the
+    //! tail the DPB is still holding — so delivery order IS golden order and the
+    //! comparison is a straight zip. Three things follow, and all three are why this
+    //! shape was chosen over hashing decoded pictures by `PicId`:
+    //!
+    //! * a frame's surface comes from its OWN release token, so the harness never has
+    //!   to infer which surface holds which picture — an inference that was subtly
+    //!   wrong in an earlier draft of this file, because a surface freed at the top of
+    //!   an access unit can be taken as that same unit's decode target and so never
+    //!   looks newly held;
+    //! * the DELIVERY path is under test too. A rung that decoded perfectly and
+    //!   presented in the wrong order, or dropped a picture, fails here — and dropping
+    //!   pictures is precisely what this rung did until 2026-08-08;
+    //! * the frame carries its own display region and keyframe flag
+    //!   ([`PictureFacts`]), so the harness reads geometry from the same place the
+    //!   presenter does rather than from a second guess.
+    //!
+    //! ⚠ What this shape does NOT cover: AV1's **hidden frames**. 24 of the vendored
+    //! vector's 274 decoded pictures are never displayed, so they are never delivered
+    //! and never hashed here. They are not unverified — every shown frame after one
+    //! predicts from it, so a hidden picture decoded wrong shows up as a wrong hash on
+    //! the frames that reference it — but a defect confined to a hidden frame's own
+    //! pixels would be seen one frame late rather than at once.
+    //!
+    //! # The crop, and the ten-bit trap
+    //!
+    //! Surfaces are allocated at the CODED size and are taller than the picture, so the
+    //! chroma plane starts at the driver's own `offsets[1]` and never at
+    //! `pitch * display_height` — the 1088-row smear this project has already paid for.
+    //! That walk is [`pf_vaadec::pack_two_plane`], and it is unit-tested with no device
+    //! at all. Main 10's goldens are **P010**, two bytes per sample with the ten bits in
+    //! the HIGH end of each little-endian word; a driver handing back LSB-aligned
+    //! samples produces a buffer of exactly the right length and the wrong content,
+    //! which [`Divergence::low_bits_set`] is here to name.
+
+    use sha2::Digest;
+
+    use super::tests::split_h264_aus;
+    use super::tests::split_h265_aus;
+    use super::tests::split_ivf;
+    use super::tests::AV1_25FPS;
+    use super::tests::H264_25FPS;
+    use super::tests::H265_25FPS;
+    use super::tests::MAIN10_H265;
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // The vectors and their goldens — the same files the other two rungs use
+    // -----------------------------------------------------------------------
+
+    /// libavcodec's per-display-frame NV12 hashes for the vendored H.264 vector.
+    /// Read across the crate boundary rather than copied — see the module docs.
+    const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
+    const GOLDENS_H265: &str =
+        include_str!("../../pf-vkdecode/tests/data/test-25fps-h265.nv12.sha256");
+    const GOLDENS_MAIN10: &str =
+        include_str!("../../pf-vkdecode/tests/data/test-main10.p010.sha256");
+    const GOLDENS_AV1: &str =
+        include_str!("../../pf-vkdecode/tests/data/test-25fps-av1.nv12.sha256");
+
+    /// **Our own host's low-delay H.264** and its goldens — the stream shape a
+    /// conformance vector cannot be, and the one that caught the D3D11VA rung's
+    /// release-ordering defect. 120 pictures of 640x480 IPPP with
+    /// `max_num_reorder_frames = 0` and a DPB exactly as deep as its three references.
+    ///
+    /// This rung is argued EXEMPT from that defect for a reason that is a property of
+    /// the interface rather than of any stream (this file's module docs): a slot is not
+    /// a surface here, and [`Session::acquire_target`] takes the target and the
+    /// reference table from one snapshot. That argument is good; it had never been
+    /// checked in PIXELS on the stream it is about, and "we reasoned it cannot happen"
+    /// is what the other two rungs also believed.
+    const LOWDELAY_H264: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
+    const GOLDENS_LOWDELAY_H264: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480.nv12.sha256");
+
+    /// The HEVC twin of [`LOWDELAY_H264`]: 120 pictures of 640x480 IPPP,
+    /// `sps_max_num_reorder_pics = 0`, 115 of the 120 access units retiring a picture.
+    const LOWDELAY_H265: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
+    const GOLDENS_LOWDELAY_H265: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480-h265.nv12.sha256");
+
+    /// **Our own host's AV1**, and the only stream this rung decodes with more than ONE
+    /// TILE: at 4K the split encode emits `tile_cols = 1, tile_rows = 2` with both tiles
+    /// in a single Tile Group OBU. 1440p and below measured single-tile, so 4K is the
+    /// only shape that has the property.
+    ///
+    /// ⚠ A file fixture is not the wire path, and on AV1 that distinction has already
+    /// cost a release: "250/250 delivered frames bit-identical" was true for the whole
+    /// period the host was shipping only the first tile of every 4K frame, because the
+    /// truncation lived in packetisation. This leg gives the multi-tile shape pixel
+    /// coverage on the DECODE rung and proves nothing about fragmentation or loss.
+    const LOWDELAY_AV1: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
+    const GOLDENS_LOWDELAY_AV1: &str =
+        include_str!("../../pf-vkdecode/tests/data/lowdelay-3840x2160-av1.nv12.sha256");
+
+    /// libavcodec's decode of the AV1 vector's FIRST display frame, as raw NV12 —
+    /// 115200 bytes, and the only golden in this program that is pixels rather than a
+    /// hash.
+    ///
+    /// It buys the one thing a hash cannot: when display frame 0 diverges, this says
+    /// WHERE. Frame 0 of that vector is a key frame with no references at all, so a
+    /// divergence there is readback geometry (pitch, crop, plane offset) or the tile
+    /// records — never reference handling — and [`localise`] separates those by naming
+    /// the plane, the bounding box and the magnitude.
+    const AV1_FRAME0_NV12: &[u8] =
+        include_bytes!("../../pf-vkdecode/tests/data/test-25fps-av1.frame0.nv12");
+
+    /// The vendored vectors' access-unit / temporal-unit counts.
+    const H26X_AU_COUNT: usize = 250;
+    const MAIN10_AU_COUNT: usize = 50;
+    const AV1_UNIT_COUNT: usize = 250;
+    /// 250 temporal units carrying **274 frames**, of which 250 are shown.
+    const AV1_DECODED_COUNT: usize = 274;
+    const AV1_SHOWN_COUNT: usize = 250;
+    const DISPLAY_AV1: (u32, u32) = (320, 240);
+
+    /// Our host's streams. Three separate constants per AV1 stream, never derived from
+    /// one another: the vendored vector is 250 / 274 / 250 and this one is 60 / 60 / 60,
+    /// and a harness that computed "hidden = 0" from either would stop checking the
+    /// other.
+    const LOWDELAY_H264_AU_COUNT: usize = 120;
+    const LOWDELAY_H265_AU_COUNT: usize = 120;
+    const LOWDELAY_AV1_UNIT_COUNT: usize = 60;
+    const LOWDELAY_AV1_DECODED_COUNT: usize = 60;
+    const LOWDELAY_AV1_SHOWN_COUNT: usize = 60;
+    const DISPLAY_LOWDELAY_AV1: (u32, u32) = (3840, 2160);
+
+    /// The golden file's hash lines (comments and blanks skipped).
+    fn golden_hashes(file: &'static str) -> Vec<&'static str> {
+        file.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use std::fmt::Write as _;
+        sha2::Sha256::digest(data)
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+
+    // -----------------------------------------------------------------------
+    // The readback — libva's image entry points, resolved ONLY here
+    // -----------------------------------------------------------------------
+
+    /// The image half of libva, dlopen'd by the harness itself.
+    ///
+    /// Deliberately NOT fields on the production [`Libva`]: keeping them in a
+    /// `#[cfg(test)]` type is what makes "the readback cannot reach the production
+    /// path" a fact about what is COMPILED rather than a claim about what is called
+    /// (module docs). `dlopen` is reference-counted, so resolving these out of a second
+    /// handle on `libva.so.2` reaches the same mapped library and the same
+    /// per-`VADisplay` driver state as the rung's own handle — the display pointer they
+    /// are handed is the rung's.
+    struct ImageApi {
+        _va: libloading::Library,
+        derive_image:
+            unsafe extern "C" fn(VaDisplay, VaSurfaceId, *mut pf_vaadec::VaImage) -> VaStatus,
+        create_image: unsafe extern "C" fn(
+            VaDisplay,
+            *mut pf_vaadec::VaImageFormat,
+            c_int,
+            c_int,
+            *mut pf_vaadec::VaImage,
+        ) -> VaStatus,
+        get_image: unsafe extern "C" fn(
+            VaDisplay,
+            VaSurfaceId,
+            c_int,
+            c_int,
+            c_uint,
+            c_uint,
+            c_uint,
+        ) -> VaStatus,
+        destroy_image: unsafe extern "C" fn(VaDisplay, c_uint) -> VaStatus,
+        map_buffer: unsafe extern "C" fn(VaDisplay, VaBufferId, *mut *mut c_void) -> VaStatus,
+        unmap_buffer: unsafe extern "C" fn(VaDisplay, VaBufferId) -> VaStatus,
+        max_image_formats: unsafe extern "C" fn(VaDisplay) -> c_int,
+        query_image_formats:
+            unsafe extern "C" fn(VaDisplay, *mut pf_vaadec::VaImageFormat, *mut c_int) -> VaStatus,
+    }
+
+    impl ImageApi {
+        fn load() -> Result<ImageApi> {
+            // SAFETY: the same contract `Libva::load` documents — `Library::new` runs
+            // the trusted system libva's initialisers (already loaded by the rung, so
+            // this is a refcount bump), and each `lib.get` resolves a documented libva
+            // symbol AT the field's own type, transcribed from `va.h`. The `Library`
+            // handle is stored beside the pointers, so every one outlives its uses.
+            unsafe {
+                let va = libloading::Library::new("libva.so.2")
+                    .map_err(|e| anyhow!("libva.so.2 (no VAAPI runtime on this system): {e}"))?;
+                macro_rules! get {
+                    ($lib:expr, $name:literal) => {
+                        *$lib
+                            .get(concat!($name, "\0").as_bytes())
+                            .map_err(|e| anyhow!(concat!("dlsym ", $name, ": {}"), e))?
+                    };
+                }
+                let derive_image = get!(va, "vaDeriveImage");
+                let create_image = get!(va, "vaCreateImage");
+                let get_image = get!(va, "vaGetImage");
+                let destroy_image = get!(va, "vaDestroyImage");
+                let map_buffer = get!(va, "vaMapBuffer");
+                let unmap_buffer = get!(va, "vaUnmapBuffer");
+                let max_image_formats = get!(va, "vaMaxNumImageFormats");
+                let query_image_formats = get!(va, "vaQueryImageFormats");
+                Ok(ImageApi {
+                    derive_image,
+                    create_image,
+                    get_image,
+                    destroy_image,
+                    map_buffer,
+                    unmap_buffer,
+                    max_image_formats,
+                    query_image_formats,
+                    _va: va,
+                })
+            }
+        }
+    }
+
+    /// Which libva call read the surface.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Route {
+        Derive,
+        GetImage,
+    }
+
+    /// A `vaCreateImage`d image, reused for every frame of a leg.
+    struct Staging {
+        image: pf_vaadec::VaImage,
+        size: (u32, u32),
+        fourcc: u32,
+    }
+
+    /// GPU→CPU readback of one decoded surface, cropped to the picture and packed
+    /// tightly as NV12/P010 — byte for byte the layout the goldens hash.
+    struct Readback {
+        api: ImageApi,
+        /// Every `VAImageFormat` this driver offers, from `vaQueryImageFormats`. The
+        /// descriptor `vaCreateImage` is handed is the driver's OWN rather than one
+        /// this file guessed a `bits_per_pixel` for.
+        formats: Vec<pf_vaadec::VaImageFormat>,
+        staging: Option<Staging>,
+        /// `PF_VAAPI_READBACK`, if it pinned a route.
+        forced: Option<Route>,
+        /// The route that worked, once one has. Latched so a driver that refuses derive
+        /// pays for that refusal once rather than once per frame.
+        route: Option<Route>,
+        /// The image size `vaGetImage` accepted — the picture, or the whole surface on
+        /// a driver that refuses a sub-region.
+        get_size: Option<(u32, u32)>,
+        derived: u64,
+        fetched: u64,
+    }
+
+    impl Readback {
+        fn new(d: &Display) -> Readback {
+            let api = ImageApi::load().expect("libva's image entry points must resolve");
+            // SAFETY: a live display; the vector is allocated to the size libva itself
+            // reports and `count` is a local written through by the call.
+            let formats = unsafe {
+                let max = (api.max_image_formats)(d.display);
+                if max <= 0 {
+                    Vec::new()
+                } else {
+                    let mut formats =
+                        vec![pf_vaadec::VaImageFormat::default(); max.unsigned_abs() as usize];
+                    let mut count: c_int = 0;
+                    let status =
+                        (api.query_image_formats)(d.display, formats.as_mut_ptr(), &mut count);
+                    if status == VA_STATUS_SUCCESS {
+                        formats.truncate(count.clamp(0, max) as usize);
+                        formats
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            let forced = match std::env::var("PF_VAAPI_READBACK").ok().as_deref() {
+                Some("derive") => Some(Route::Derive),
+                Some("getimage") => Some(Route::GetImage),
+                Some(other) => panic!("PF_VAAPI_READBACK={other} — expected derive or getimage"),
+                None => None,
+            };
+            Readback {
+                api,
+                formats,
+                staging: None,
+                forced,
+                route: None,
+                get_size: None,
+                derived: 0,
+                fetched: 0,
+            }
+        }
+
+        /// The fourccs this driver says it can produce, for a refusal that names them.
+        fn offered(&self) -> String {
+            self.formats
+                .iter()
+                .map(|f| {
+                    let b = f.fourcc.to_le_bytes();
+                    std::str::from_utf8(&b)
+                        .map(str::to_string)
+                        .unwrap_or_else(|_| format!("{:#010x}", f.fourcc))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        /// Map an image, pack the picture out of it, unmap. The only place a raw
+        /// pointer becomes a slice.
+        fn read_mapped(
+            &self,
+            d: &Display,
+            image: &pf_vaadec::VaImage,
+            display: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<Vec<u8>, String> {
+            let mut base: *mut c_void = std::ptr::null_mut();
+            // SAFETY: a live display and an image id this call site owns; `base` is a
+            // local written through.
+            let status = unsafe { (self.api.map_buffer)(d.display, image.buf, &mut base) };
+            if status != VA_STATUS_SUCCESS {
+                return Err(format!("{:#}", d.va.err("vaMapBuffer", status)));
+            }
+            if base.is_null() {
+                // SAFETY: pairing the successful map above.
+                unsafe { (self.api.unmap_buffer)(d.display, image.buf) };
+                return Err("vaMapBuffer succeeded and returned a null pointer".to_string());
+            }
+            // SAFETY: `vaMapBuffer` returned a pointer to `data_size` readable bytes —
+            // that is what the field means — and the mapping stays valid until the
+            // `vaUnmapBuffer` below, which is after the last read. `pack_two_plane`
+            // bounds-checks every row it takes against this length, so a descriptor
+            // that disagrees with its own buffer is a refusal rather than a read past
+            // the end.
+            let mapped =
+                unsafe { std::slice::from_raw_parts(base.cast::<u8>(), image.data_size as usize) };
+            let packed = pf_vaadec::pack_two_plane(image, mapped, display, fourcc).map_err(|e| {
+                format!(
+                    "{e} — the driver's image is {}x{}, {} plane(s), pitches {:?}, \
+                     offsets {:?}, data_size {}",
+                    image.width,
+                    image.height,
+                    image.num_planes,
+                    image.pitches,
+                    image.offsets,
+                    image.data_size
+                )
+            });
+            // SAFETY: pairing the successful map above; nothing reads `mapped` after.
+            unsafe { (self.api.unmap_buffer)(d.display, image.buf) };
+            packed
+        }
+
+        /// What a derived image says about the surface's real layout, for the probe.
+        ///
+        /// Worth printing rather than assuming, and this is not idle: on `.25`'s
+        /// radeonsi the decode surfaces for every fixture here turned out to have NO
+        /// vertical padding — `offsets[1]` is exactly `pitch * height` — so the
+        /// chroma-plane trap that walk exists to avoid is not exercised by ANY hardware
+        /// leg on this driver. That is why `pf-vaadec`'s
+        /// `reading_chroma_at_the_display_height_would_have_been_caught` drives a
+        /// deliberately padded surface on the CPU: it is the only place that geometry is
+        /// checked at all, and a reader who assumed the hardware legs covered it would
+        /// be wrong.
+        fn describe(&self, d: &Display, surface: VaSurfaceId) -> String {
+            let mut image = pf_vaadec::VaImage::zeroed();
+            // SAFETY: a live display and a surface from its own pool; `image` is a
+            // zeroed local of the measured layout that outlives the call.
+            let status = unsafe { (self.api.derive_image)(d.display, surface, &mut image) };
+            if status != VA_STATUS_SUCCESS {
+                return format!("vaDeriveImage: {:#}", d.va.err("vaDeriveImage", status));
+            }
+            let text = format!(
+                "{}x{}, {} plane(s), pitches {:?}, offsets {:?}, data_size {} — chroma \
+                 at pitch*height would be {}, so this surface is {}",
+                image.width,
+                image.height,
+                image.num_planes,
+                image.pitches,
+                image.offsets,
+                image.data_size,
+                image.pitches[0] * u32::from(image.height),
+                if image.offsets[1] == image.pitches[0] * u32::from(image.height) {
+                    "NOT vertically padded (the crop trap is untested here)"
+                } else {
+                    "vertically PADDED (the crop trap is live here)"
+                }
+            );
+            // SAFETY: destroying the image this call derived, exactly once.
+            unsafe { (self.api.destroy_image)(d.display, image.image_id) };
+            text
+        }
+
+        /// `vaDeriveImage` — the surface's own memory, when the driver can address it
+        /// linearly.
+        fn read_via_derive(
+            &self,
+            d: &Display,
+            surface: VaSurfaceId,
+            display: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<Vec<u8>, String> {
+            let mut image = pf_vaadec::VaImage::zeroed();
+            // SAFETY: a live display and a surface from its own pool; `image` is a
+            // zeroed local of the measured layout that outlives the call.
+            let status = unsafe { (self.api.derive_image)(d.display, surface, &mut image) };
+            if status != VA_STATUS_SUCCESS {
+                return Err(format!("{:#}", d.va.err("vaDeriveImage", status)));
+            }
+            let out = self.read_mapped(d, &image, display, fourcc);
+            // SAFETY: destroying the image this call derived, exactly once. Required
+            // even on the failure path — the derive succeeded, so the image exists.
+            unsafe { (self.api.destroy_image)(d.display, image.image_id) };
+            out
+        }
+
+        /// Ensure the staging image is `size` in `fourcc`, creating or recreating it.
+        fn ensure_staging(
+            &mut self,
+            d: &Display,
+            size: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<(), String> {
+            if self
+                .staging
+                .as_ref()
+                .is_some_and(|s| s.size == size && s.fourcc == fourcc)
+            {
+                return Ok(());
+            }
+            self.destroy_staging(d);
+            let mut format = *self
+                .formats
+                .iter()
+                .find(|f| f.fourcc == fourcc)
+                .ok_or_else(|| {
+                    format!(
+                        "this driver offers no VAImageFormat for the surface pool's own \
+                         fourcc; it offers [{}]",
+                        self.offered()
+                    )
+                })?;
+            let mut image = pf_vaadec::VaImage::zeroed();
+            // SAFETY: a live display; `format` and `image` are locals of the measured
+            // layouts that outlive the call, and libva copies the format it is handed.
+            let status = unsafe {
+                (self.api.create_image)(
+                    d.display,
+                    &mut format,
+                    size.0 as c_int,
+                    size.1 as c_int,
+                    &mut image,
+                )
+            };
+            if status != VA_STATUS_SUCCESS {
+                return Err(format!("{:#}", d.va.err("vaCreateImage", status)));
+            }
+            self.staging = Some(Staging {
+                image,
+                size,
+                fourcc,
+            });
+            Ok(())
+        }
+
+        fn destroy_staging(&mut self, d: &Display) {
+            if let Some(s) = self.staging.take() {
+                // SAFETY: an image this type created on this display, destroyed once.
+                unsafe { (self.api.destroy_image)(d.display, s.image.image_id) };
+            }
+        }
+
+        /// `vaCreateImage` + `vaGetImage` at one image size.
+        fn get_into(
+            &mut self,
+            d: &Display,
+            surface: VaSurfaceId,
+            size: (u32, u32),
+            display: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<Vec<u8>, String> {
+            self.ensure_staging(d, size, fourcc)?;
+            let image = self.staging.as_ref().expect("just ensured").image;
+            // SAFETY: a live display, a surface from its own pool and an image this
+            // type created on it. The region is inside the surface: `size` is either
+            // the picture (which the surface contains) or the surface itself.
+            let status = unsafe {
+                (self.api.get_image)(
+                    d.display,
+                    surface,
+                    0,
+                    0,
+                    size.0 as c_uint,
+                    size.1 as c_uint,
+                    image.image_id,
+                )
+            };
+            if status != VA_STATUS_SUCCESS {
+                return Err(format!(
+                    "{:#} (image {}x{})",
+                    d.va.err("vaGetImage", status),
+                    size.0,
+                    size.1
+                ));
+            }
+            self.read_mapped(d, &image, display, fourcc)
+        }
+
+        /// `vaGetImage`, trying the picture-sized region first and the whole surface
+        /// second — a driver that refuses a sub-region still answers, and the crop then
+        /// happens in [`pf_vaadec::pack_two_plane`] instead.
+        fn read_via_get_image(
+            &mut self,
+            d: &Display,
+            surface: VaSurfaceId,
+            display: (u32, u32),
+            coded: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<Vec<u8>, String> {
+            if let Some(size) = self.get_size {
+                return self.get_into(d, surface, size, display, fourcc);
+            }
+            let mut sizes = vec![display];
+            if coded != display {
+                sizes.push(coded);
+            }
+            let mut why = Vec::new();
+            for size in sizes {
+                match self.get_into(d, surface, size, display, fourcc) {
+                    Ok(bytes) => {
+                        self.get_size = Some(size);
+                        return Ok(bytes);
+                    }
+                    Err(e) => why.push(e),
+                }
+            }
+            Err(why.join("; "))
+        }
+
+        fn read_route(
+            &mut self,
+            route: Route,
+            d: &Display,
+            surface: VaSurfaceId,
+            display: (u32, u32),
+            coded: (u32, u32),
+            fourcc: u32,
+        ) -> std::result::Result<Vec<u8>, String> {
+            match route {
+                Route::Derive => {
+                    let out = self.read_via_derive(d, surface, display, fourcc);
+                    if out.is_ok() {
+                        self.derived += 1;
+                    }
+                    out
+                }
+                Route::GetImage => {
+                    let out = self.read_via_get_image(d, surface, display, coded, fourcc);
+                    if out.is_ok() {
+                        self.fetched += 1;
+                    }
+                    out
+                }
+            }
+        }
+
+        /// The picture in `surface`, by whichever route this driver supports.
+        ///
+        /// Panics — loudly, with what every route said — when none of them can read it.
+        /// There is deliberately no skip: a leg that could not read a surface must
+        /// fail, not pass quietly (module docs).
+        fn read(
+            &mut self,
+            d: &Display,
+            surface: VaSurfaceId,
+            display: (u32, u32),
+            coded: (u32, u32),
+            fourcc: u32,
+            what: &str,
+        ) -> Vec<u8> {
+            // The surface must be finished before it is read. The production export
+            // does exactly this before the fds leave, and for the same reason: VAAPI
+            // exposes no fence to the consumer.
+            //
+            // SAFETY: a live display and a surface from its own pool.
+            let status = unsafe { (d.va.sync_surface)(d.display, surface) };
+            if status != VA_STATUS_SUCCESS {
+                panic!("{what}: {:#}", d.va.err("vaSyncSurface", status));
+            }
+            if let Some(route) = self.route {
+                return match self.read_route(route, d, surface, display, coded, fourcc) {
+                    Ok(bytes) => bytes,
+                    Err(e) => panic!(
+                        "{what}: the {route:?} readback stopped working part-way through \
+                         a run — {e}"
+                    ),
+                };
+            }
+            let order = match self.forced {
+                Some(r) => vec![r],
+                None => vec![Route::Derive, Route::GetImage],
+            };
+            let mut why = Vec::new();
+            for route in order {
+                match self.read_route(route, d, surface, display, coded, fourcc) {
+                    Ok(bytes) => {
+                        eprintln!("readback route: {route:?}");
+                        self.route = Some(route);
+                        return bytes;
+                    }
+                    Err(e) => why.push(format!("{route:?}: {e}")),
+                }
+            }
+            panic!(
+                "{what}: NO readback route could read the decoded surface, so this leg \
+                 can prove nothing and refuses to pass — {}. The driver offers image \
+                 formats [{}]",
+                why.join(" | "),
+                self.offered()
+            );
+        }
+
+        /// Read one surface through BOTH routes and require them to agree.
+        ///
+        /// The only check that can catch a `vaDeriveImage` which "succeeds" onto tiled
+        /// bytes: the descriptor looks ordinary, the walk reads it happily, and the
+        /// pixels are a permutation of the picture. `vaGetImage` asks the driver to
+        /// detile, so where both answer, agreement is evidence that derive's mapping
+        /// really is linear.
+        ///
+        /// A route that refuses is reported, not failed: that is exactly the case
+        /// [`Self::read`] is written to survive.
+        fn cross_check(
+            &mut self,
+            d: &Display,
+            surface: VaSurfaceId,
+            display: (u32, u32),
+            coded: (u32, u32),
+            fourcc: u32,
+            what: &str,
+        ) {
+            let derived = self.read_via_derive(d, surface, display, fourcc);
+            let fetched = self.read_via_get_image(d, surface, display, coded, fourcc);
+            match (&derived, &fetched) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        a.len(),
+                        b.len(),
+                        "{what}: the two readback routes disagree on the picture's size"
+                    );
+                    if a != b {
+                        let diff = localise(a, b, display, fourcc);
+                        panic!(
+                            "{what}: vaDeriveImage and vaGetImage read DIFFERENT pixels \
+                             out of one surface — {diff}. Derive is handing back memory \
+                             this walk cannot address linearly (tiled or swizzled), so \
+                             every hash taken through it is meaningless. Re-run with \
+                             PF_VAAPI_READBACK=getimage"
+                        );
+                    }
+                    eprintln!("{what}: both readback routes agree ({} bytes)", a.len());
+                }
+                (Ok(a), Err(e)) => eprintln!(
+                    "{what}: vaDeriveImage answers ({} bytes); vaGetImage does not — {e}",
+                    a.len()
+                ),
+                (Err(e), Ok(b)) => eprintln!(
+                    "{what}: vaGetImage answers ({} bytes); vaDeriveImage does not — {e}",
+                    b.len()
+                ),
+                (Err(a), Err(b)) => panic!(
+                    "{what}: NEITHER readback route can read this surface — derive: {a} \
+                     | getimage: {b}. The driver offers image formats [{}]",
+                    self.offered()
+                ),
+            }
+        }
+
+        /// One line naming which route answered and how often, so a run says it rather
+        /// than leaving it to be inferred from a passing test.
+        fn summary(&self) -> String {
+            format!(
+                "readback via {:?} ({} derived, {} vaGetImage)",
+                self.route, self.derived, self.fetched
+            )
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Divergence: what a hash mismatch will not tell you
+    // -----------------------------------------------------------------------
+
+    /// Where two same-shaped pictures differ.
+    ///
+    /// "N frames differ" is not a lead; "first divergence at frame 3, one 16x24 luma
+    /// block, chroma clean" is what solved the last two defects in this program. This
+    /// is what turns the former into the latter wherever a reference picture exists —
+    /// [`AV1_FRAME0_NV12`] for AV1 display frame 0, the two readback routes against
+    /// each other, and the harness's own bytes in the counterfactual that proves the
+    /// comparison can fail.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Divergence {
+        luma_samples: usize,
+        chroma_samples: usize,
+        /// Inclusive bounding box of the differing LUMA samples, in picture
+        /// coordinates.
+        luma_box: Option<(u32, u32, u32, u32)>,
+        max_delta: u32,
+        /// Ten-bit only: samples whose low six bits are set. P010 puts the ten
+        /// meaningful bits in the HIGH end of each 16-bit word, so a non-zero count
+        /// here means the driver handed back LSB-aligned samples and the divergence is
+        /// a format misunderstanding rather than a decode fault.
+        low_bits_set: usize,
+    }
+
+    impl std::fmt::Display for Divergence {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.luma_samples == 0 && self.chroma_samples == 0 {
+                return write!(f, "identical");
+            }
+            write!(
+                f,
+                "{} luma sample(s), {} chroma sample(s), max |delta| {}",
+                self.luma_samples, self.chroma_samples, self.max_delta
+            )?;
+            if let Some((x0, y0, x1, y1)) = self.luma_box {
+                write!(
+                    f,
+                    ", luma bounding box ({x0},{y0})..({x1},{y1}) = {}x{}",
+                    x1 - x0 + 1,
+                    y1 - y0 + 1
+                )?;
+            }
+            if self.chroma_samples == 0 {
+                write!(f, ", chroma CLEAN")?;
+            }
+            if self.low_bits_set > 0 {
+                write!(
+                    f,
+                    ", and {} sample(s) have their low six bits set — P010's ten bits \
+                     belong in the HIGH end of each word, so suspect the FORMAT before \
+                     the decode",
+                    self.low_bits_set
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Compare two tightly packed pictures of the same shape.
+    fn localise(got: &[u8], want: &[u8], display: (u32, u32), fourcc: u32) -> Divergence {
+        let stride = if fourcc == pf_vaadec::VA_FOURCC_P010 {
+            2usize
+        } else {
+            1
+        };
+        let (width, height) = (display.0 as usize, display.1 as usize);
+        let luma_bytes = width * height * stride;
+        let sample = |buf: &[u8], at: usize| -> u32 {
+            if stride == 2 {
+                u32::from(u16::from_le_bytes([buf[at], buf[at + 1]]))
+            } else {
+                u32::from(buf[at])
+            }
+        };
+        let mut d = Divergence {
+            luma_samples: 0,
+            chroma_samples: 0,
+            luma_box: None,
+            max_delta: 0,
+            low_bits_set: 0,
+        };
+        let end = got.len().min(want.len());
+        let mut at = 0usize;
+        while at + stride <= end {
+            let (a, b) = (sample(got, at), sample(want, at));
+            if stride == 2 && a & 0x3f != 0 {
+                d.low_bits_set += 1;
+            }
+            if a != b {
+                d.max_delta = d.max_delta.max(a.abs_diff(b));
+                if at < luma_bytes {
+                    d.luma_samples += 1;
+                    let index = at / stride;
+                    let (x, y) = ((index % width) as u32, (index / width) as u32);
+                    d.luma_box = Some(match d.luma_box {
+                        None => (x, y, x, y),
+                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                    });
+                } else {
+                    d.chroma_samples += 1;
+                }
+            }
+            at += stride;
+        }
+        d
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode and display order, from a planner run alongside the decoder's own
+    // -----------------------------------------------------------------------
+
+    /// The decode order and the display order of a stream's pictures, as `PicId`s.
+    ///
+    /// Both come from a planner run ALONGSIDE the rung's own, over the same access
+    /// units: the planner is deterministic, so the ids it hands this walk are the ids
+    /// it hands the rung, and no production code has to grow a test accessor.
+    ///
+    /// The hardware legs do not USE this to find surfaces — they hash what the rung
+    /// delivers, in delivery order (module docs). It is what the CPU guards check the
+    /// golden files and the frame counts against, so a regenerated vector fails on a
+    /// laptop rather than on the one box with a VAAPI driver.
+    struct Order {
+        /// Every DECODED picture in submission order — one per access unit on
+        /// H.264/H.265, one per FRAME on AV1 where a unit may carry several.
+        decode: Vec<u64>,
+        /// The same ids in the planner's output (bumping) order, flush included.
+        display: Vec<u64>,
+        /// The ids each ACCESS UNIT decodes, in submission order. An access unit that
+        /// decodes nothing — an HEVC RASL skipped after an open-GOP join — contributes
+        /// an EMPTY entry rather than none, so the index stays the unit's own.
+        per_unit: Vec<Vec<u64>>,
+    }
+
+    impl Order {
+        fn empty() -> Order {
+            Order {
+                decode: Vec::new(),
+                display: Vec::new(),
+                per_unit: Vec::new(),
+            }
+        }
+    }
+
+    fn order_h264(aus: &[&[u8]]) -> Order {
+        let mut planner = pf_vaadec::H264Planner::new();
+        let mut order = Order::empty();
+        for (index, au) in aus.iter().enumerate() {
+            let plan = planner
+                .plan_au(au)
+                .unwrap_or_else(|e| panic!("AU {index}: the clean vector must plan, got {e:?}"));
+            assert_eq!(
+                (plan.picture.display_crop.x, plan.picture.display_crop.y),
+                (0, 0),
+                "AU {index}: this rung REFUSES a non-zero conformance-window origin \
+                 (`shape_of`), so a vector that had one could not be decoded here at all"
+            );
+            let id = plan
+                .dpb
+                .stored
+                .unwrap_or_else(|| panic!("AU {index}: every picture of this vector is stored"));
+            order.decode.push(id);
+            order.per_unit.push(vec![id]);
+            order.display.extend(plan.dpb.outputs.iter().copied());
+        }
+        order.display.extend(planner.flush().outputs);
+        order
+    }
+
+    /// [`order_h264`] for HEVC, with the one thing H.264 has no counterpart to: a
+    /// **RASL picture skipped after an open-GOP join** decodes nothing.
+    ///
+    /// `PlanErrorH265::RaslSkipped` is the spec's own answer (8.1.3 NOTE) and the rung
+    /// treats it as an Ok-skip, so such an access unit contributes no picture and no
+    /// output.
+    fn order_h265(aus: &[&[u8]]) -> Order {
+        let mut planner = pf_vaadec::H265Planner::new();
+        let mut order = Order::empty();
+        for (index, au) in aus.iter().enumerate() {
+            let plan = match planner.plan_au(au) {
+                Ok(plan) => plan,
+                Err(pf_vaadec::PlanErrorH265::RaslSkipped { .. }) => {
+                    order.per_unit.push(Vec::new());
+                    continue;
+                }
+                Err(e) => panic!("AU {index}: the clean vector must plan, got {e:?}"),
+            };
+            assert_eq!(
+                (plan.picture.display_crop.x, plan.picture.display_crop.y),
+                (0, 0),
+                "AU {index}: this rung refuses a non-zero conformance-window origin"
+            );
+            let id = plan
+                .dpb
+                .stored
+                .unwrap_or_else(|| panic!("AU {index}: every picture of this vector is stored"));
+            order.decode.push(id);
+            order.per_unit.push(vec![id]);
+            order.display.extend(plan.dpb.outputs.iter().copied());
+        }
+        order.display.extend(planner.flush().outputs);
+        order
+    }
+
+    /// The AV1 stream's decode and display orders.
+    ///
+    /// Where the H.264/H.265 walks push one decoded picture per access unit, this one
+    /// pushes one per FRAME and a unit may carry several — which is the whole
+    /// difference. `display` is still the planner's own output list; AV1 has no bumping
+    /// process, so a picture is output by the unit that shows it and there is no flush
+    /// to drain at the end.
+    fn order_av1(units: &[&[u8]], render: (u32, u32)) -> Order {
+        let mut planner = pf_vaadec::Av1Planner::new();
+        let mut order = Order::empty();
+        for (index, unit) in units.iter().enumerate() {
+            let plans = planner
+                .plan_au(unit)
+                .unwrap_or_else(|e| panic!("unit {index}: the clean vector must plan, got {e}"));
+            let mut this_unit = Vec::new();
+            for plan in &plans {
+                assert!(
+                    plan.warnings.is_empty(),
+                    "unit {index}: a clean vector must plan without warnings, got {:?}",
+                    plan.warnings
+                );
+                assert_eq!(
+                    (plan.picture.render_width, plan.picture.render_height),
+                    render,
+                    "unit {index}: the goldens are the {render:?} render region"
+                );
+                if let Some(id) = plan.dpb.stored {
+                    order.decode.push(id);
+                    this_unit.push(id);
+                }
+                order.display.extend(plan.dpb.outputs.iter().copied());
+            }
+            order.per_unit.push(this_unit);
+        }
+        order
+    }
+
+    // -----------------------------------------------------------------------
+    // The runs
+    // -----------------------------------------------------------------------
+
+    /// Read back the picture a delivered frame carries, packed as the goldens hash it.
+    ///
+    /// The frame names its own surface — [`VaRelease::surface`], stamped when `finish`
+    /// exported it — so nothing here has to work out which pool entry holds which
+    /// picture. It also carries its own display region and fourcc, recorded when the
+    /// picture DECODED (`PictureFacts`), which is the same pair the presenter is handed;
+    /// reading them from anywhere else would be a second guess that could differ.
+    fn read_frame(
+        decoder: &NativeVaapiDecoder,
+        readback: &mut Readback,
+        frame: &DmabufFrame,
+        what: &str,
+    ) -> Vec<u8> {
+        let release = frame.guard.0.release;
+        let (surface, coded, fourcc) = {
+            let s = decoder
+                .session
+                .as_ref()
+                .unwrap_or_else(|| panic!("{what}: a frame came back with no session behind it"));
+            assert_eq!(
+                release.generation, s.generation,
+                "{what}: this frame names a RETIRED surface pool, so its pixels are not \
+                 this session's — nothing in these vectors renegotiates, so a mismatch \
+                 here is a bookkeeping defect rather than a stream that resized"
+            );
+            (
+                s.surfaces[release.surface],
+                (s.shape.coded_width, s.shape.coded_height),
+                s.fourcc,
+            )
+        };
+        assert_eq!(
+            frame.fourcc, fourcc,
+            "{what}: the frame's fourcc is not the pool's — `finish` is supposed to \
+             refuse that before it ships"
+        );
+        let display = (frame.width, frame.height);
+        // The first frame of a leg is read through BOTH routes, and they must agree.
+        // Skipped when a route was PINNED: the pin exists precisely for a box where one
+        // of them is wrong, and failing the run because it is wrong would defeat it.
+        if readback.route.is_none() && readback.forced.is_none() {
+            readback.cross_check(&decoder.display, surface, display, coded, fourcc, what);
+        }
+        let bytes = readback.read(&decoder.display, surface, display, coded, fourcc, what);
+        assert_eq!(
+            bytes.len(),
+            pf_vaadec::packed_len(display, fourcc).expect("the pool's fourcc is one of ours"),
+            "{what}: the readback is not the golden's own layout"
+        );
+        bytes
+    }
+
+    /// Compare the hash of every DELIVERED frame against the goldens, in order,
+    /// printing the first ten divergences and returning how many there were and where
+    /// the first one is.
+    ///
+    /// A separate function from the run that produces the hashes so it can be driven
+    /// from a CPU test with a deliberately corrupted list —
+    /// [`the_comparison_catches_a_corrupted_frame`] is that counterfactual, and it is
+    /// the answer to "prove this harness can fail".
+    fn compare(hashes: &[String], goldens: &[&str], label: &str) -> (usize, Option<usize>) {
+        let mut mismatches = 0usize;
+        let mut first = None;
+        for (n, (got, golden)) in hashes.iter().zip(goldens.iter()).enumerate() {
+            if got != golden {
+                if mismatches < 10 {
+                    eprintln!("{label}: display frame {n}: {got} != {golden}");
+                }
+                if first.is_none() {
+                    first = Some(n);
+                }
+                mismatches += 1;
+            }
+        }
+        (mismatches, first)
+    }
+
+    /// The verdict, spelled the way the last two defects were localised from.
+    fn verdict(
+        mismatches: usize,
+        first: Option<usize>,
+        total: usize,
+        label: &str,
+        readback: &str,
+        opening: &str,
+    ) {
+        assert_eq!(
+            mismatches, 0,
+            "{label}: {mismatches}/{total} frames diverge from libavcodec's software \
+             decode (first ten above; first divergence at display frame {first:?}). \
+             {opening} Read the signature as evidence about WHERE, not about WHAT — the \
+             D3D11VA AV1 defect had two unlike signatures on two vendors and was ONE \
+             bug. Readback was {readback}; PF_VAAPI_READBACK=getimage forces the copying \
+             route, and PF_VAAPI_DUMP=<tag> writes the raw planes"
+        );
+        eprintln!(
+            "{label}: {total} frames bit-identical to libavcodec software decode ({readback})"
+        );
+    }
+
+    /// Write one frame's raw planes to the temp directory when `PF_VAAPI_DUMP` is set —
+    /// the lever that turned "186 frames differ" into a located defect on the D3D11VA
+    /// rung, by giving `ffmpeg -f rawvideo` something to compare against.
+    fn dump(tag: &Option<String>, label: &str, what: &str, bytes: &[u8]) {
+        let Some(tag) = tag else { return };
+        let path = std::env::temp_dir().join(format!(
+            "pf-vaapi-{tag}-{}-{what}.bin",
+            label.replace([' ', '(', ')', ',', '.'], "")
+        ));
+        std::fs::write(&path, bytes).expect("write the dump");
+        eprintln!("dumped {what} -> {}", path.display());
+    }
+
+    /// Everything a run collects, so the two drivers below can share the assertions
+    /// that matter rather than two hand-copied sets.
+    struct Delivered {
+        hashes: Vec<String>,
+        /// The first delivered frame's keyframe flag — a fact about the DELIVERY path
+        /// that used to be wrong on every reordering stream.
+        first_keyframe: bool,
+        /// The first delivered frame's pixels, for the one leg that has libavcodec's.
+        first_bytes: Vec<u8>,
+        /// How many frames the deliverable queue had to DROP. Anything but zero is a
+        /// golden that can never be checked.
+        dropped: u64,
+    }
+
+    /// Drive one stream's access units through a real rung, hashing every frame it
+    /// hands back, then drain the tail.
+    ///
+    /// The tail is not optional and not bookkeeping: `flush` is where the pictures the
+    /// DPB is still buffering for reorder come from — seven of the H.264 vector's 250,
+    /// two of the HEVC vector's, two of Main 10's — and a run that stopped at the last
+    /// access unit would be exactly that many frames short of the goldens, which reads
+    /// like missing pictures rather than like a harness that never asked.
+    fn drive(
+        decoder: &mut NativeVaapiDecoder,
+        readback: &mut Readback,
+        units: &[&[u8]],
+        label: &str,
+    ) -> Delivered {
+        let mut hashes = Vec::new();
+        let mut first_keyframe = false;
+        let mut first_bytes = Vec::new();
+        for (index, unit) in units.iter().enumerate() {
+            let frame = decoder
+                .decode(unit)
+                .unwrap_or_else(|e| panic!("{label} AU {index}: decode failed — {e:#}"));
+            if let Some(frame) = frame {
+                let what = format!("{label} AU {index} -> display frame {}", hashes.len());
+                let bytes = read_frame(decoder, readback, &frame, &what);
+                if hashes.is_empty() {
+                    first_keyframe = frame.keyframe;
+                    first_bytes = bytes.clone();
+                }
+                hashes.push(sha256_hex(&bytes));
+            }
+        }
+        let tail = decoder.flush();
+        eprintln!("{label}: {} frame(s) came out of the flush", tail.len());
+        for frame in &tail {
+            let what = format!("{label} flush -> display frame {}", hashes.len());
+            let bytes = read_frame(decoder, readback, frame, &what);
+            if hashes.is_empty() {
+                first_keyframe = frame.keyframe;
+                first_bytes = bytes.clone();
+            }
+            hashes.push(sha256_hex(&bytes));
+        }
+        Delivered {
+            hashes,
+            first_keyframe,
+            first_bytes,
+            dropped: decoder.health().dropped,
+        }
+    }
+
+    /// The assertions every leg makes about what came back, before a single hash is
+    /// compared.
+    fn check_delivery(d: &Delivered, goldens: &[&str], label: &str) {
+        assert_eq!(
+            d.dropped, 0,
+            "{label}: the rung DROPPED {} display-ready frame(s) because its deliverable \
+             queue overflowed. Every one of them is a golden that can never be checked, \
+             so the comparison below would be measuring a shorter stream than the \
+             goldens describe",
+            d.dropped
+        );
+        assert_eq!(
+            d.hashes.len(),
+            goldens.len(),
+            "{label}: the rung delivered {} frames and the goldens carry {}. This is the \
+             delivery path, not the decode: the rung must hand back every picture the \
+             planner outputs, `flush` included",
+            d.hashes.len(),
+            goldens.len()
+        );
+        assert!(
+            d.first_keyframe,
+            "{label}: the FIRST delivered frame is not flagged as a keyframe. Every one \
+             of these streams opens on an IDR or an AV1 key frame, and that frame is the \
+             first thing displayed — a rung that labels the access unit rather than the \
+             picture it displays gets this wrong on any stream that reorders, and \
+             `DecodedImage::is_keyframe` is the pump's post-loss re-anchor signal"
+        );
+    }
+
+    /// Decode `aus` through a real [`NativeVaapiDecoder`] and compare every delivered
+    /// frame against libavcodec's goldens.
+    fn parity_run(
+        codec: pf_vaadec::Codec,
+        stream: StreamFormat,
+        aus: &[&[u8]],
+        order: &Order,
+        goldens: &[&str],
+        expected_aus: usize,
+        label: &str,
+    ) {
+        assert_eq!(
+            aus.len(),
+            expected_aus,
+            "{label}: the vector must split into {expected_aus} access units — a \
+             different count means this file's splitter disagrees with pf-bitstream's, \
+             and nothing below it is meaningful"
+        );
+        assert_eq!(
+            order.display.len(),
+            goldens.len(),
+            "{label}: the planner outputs {} pictures, the goldens carry {}",
+            order.display.len(),
+            goldens.len()
+        );
+
+        let mut decoder = NativeVaapiDecoder::new(codec, stream)
+            .unwrap_or_else(|e| panic!("{label}: this box must host this profile — {e:#}"));
+        let mut readback = Readback::new(&decoder.display);
+        let dump_tag = std::env::var("PF_VAAPI_DUMP").ok();
+
+        let delivered = drive(&mut decoder, &mut readback, aus, label);
+        dump(&dump_tag, label, "display0", &delivered.first_bytes);
+        check_delivery(&delivered, goldens, label);
+
+        let (mismatches, first) = compare(&delivered.hashes, goldens, label);
+        let readback_note = readback.summary();
+        readback.destroy_staging(&decoder.display);
+        verdict(
+            mismatches,
+            first,
+            goldens.len(),
+            label,
+            &readback_note,
+            "Display frame 0 is intra-only — if IT diverges suspect the readback \
+             geometry (pitch, crop, plane offset) or the surface format rather than the \
+             decode.",
+        );
+    }
+
+    /// The AV1 leg of [`parity_run`].
+    ///
+    /// It drives the same production entry point — [`NativeVaapiDecoder::decode`] takes
+    /// a whole temporal unit, exactly as the stream does — so the unit loop,
+    /// `frame_av1`'s slot bookkeeping and the `show` suppression are all under test. Two
+    /// things make it a separate function rather than a parameter:
+    ///
+    /// * a temporal unit is not a picture. 24 of the vendored vector's 250 units carry a
+    ///   HIDDEN frame as well as the shown one, so 274 pictures decode and 250 display,
+    ///   and this leg asserts that gap from the planner rather than assuming it;
+    /// * it has libavcodec's actual PIXELS for display frame 0 ([`AV1_FRAME0_NV12`]),
+    ///   which is the only place in this program a divergence can be localised without
+    ///   a second GPU to compare against.
+    #[allow(clippy::too_many_arguments)]
+    fn av1_parity_run(
+        units: &[&[u8]],
+        order: &Order,
+        goldens: &[&str],
+        unit_count: usize,
+        decoded_count: usize,
+        shown_count: usize,
+        frame0_golden: Option<&[u8]>,
+        label: &str,
+    ) {
+        assert_eq!(
+            units.len(),
+            unit_count,
+            "{label}: the IVF reader disagrees with the stream's temporal-unit count"
+        );
+        assert_eq!(order.decode.len(), decoded_count);
+        assert_eq!(order.per_unit.len(), units.len());
+        assert_eq!(order.display.len(), goldens.len());
+        assert_eq!(order.display.len(), shown_count);
+
+        let mut decoder = NativeVaapiDecoder::new(pf_vaadec::Codec::Av1, StreamFormat::SDR_420_8)
+            .unwrap_or_else(|e| panic!("{label}: this box must host AV1 Profile 0 — {e:#}"));
+        let mut readback = Readback::new(&decoder.display);
+        let dump_tag = std::env::var("PF_VAAPI_DUMP").ok();
+
+        let delivered = drive(&mut decoder, &mut readback, units, label);
+        dump(&dump_tag, label, "display0", &delivered.first_bytes);
+        check_delivery(&delivered, goldens, label);
+
+        let hidden = decoded_count - shown_count;
+        assert_eq!(
+            delivered.hashes.len(),
+            shown_count,
+            "{label}: {decoded_count} pictures decode and {shown_count} display, so \
+             {hidden} must have been decoded and WITHHELD. On a stream with no hidden \
+             frames both sides are equal and this is a tautology — deliberately, so one \
+             harness serves both shapes"
+        );
+
+        // The one place in this program where a divergence can be localised without a
+        // second GPU to compare against: libavcodec's own first frame, as pixels.
+        if let Some(golden) = frame0_golden {
+            if delivered.first_bytes.as_slice() != golden {
+                let diff = localise(
+                    &delivered.first_bytes,
+                    golden,
+                    DISPLAY_AV1,
+                    pf_vaadec::VA_FOURCC_NV12,
+                );
+                panic!(
+                    "{label}: display frame 0 does not match libavcodec's own pixels — \
+                     {diff}. It is a KEY frame with no references, so this is readback \
+                     geometry, the surface format, or the tile records — never reference \
+                     handling"
+                );
+            }
+            eprintln!("{label}: display frame 0 is byte-identical to libavcodec's pixels");
+        }
+
+        let (mismatches, first) = compare(&delivered.hashes, goldens, label);
+        let readback_note = readback.summary();
+        readback.destroy_staging(&decoder.display);
+        verdict(
+            mismatches,
+            first,
+            goldens.len(),
+            label,
+            &readback_note,
+            &format!(
+                "{hidden} hidden frame(s) were decoded and withheld. Display frame 0 is a \
+                 key frame — if IT diverges suspect the readback geometry or the tile \
+                 records rather than the reference handling."
+            ),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The legs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
+    fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h264_aus(H264_25FPS);
+        let order = order_h264(&aus);
+        parity_run(
+            pf_vaadec::Codec::H264,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_H264),
+            H26X_AU_COUNT,
+            "H.264",
+        );
+    }
+
+    /// **Our own host's output** rather than a conformance vector — the shape that
+    /// caught the D3D11VA rung's release-ordering defect after the vector had passed
+    /// 250/250 on four GPUs across two milestones.
+    ///
+    /// See [`LOWDELAY_H264`] for why this rung is argued exempt from that defect, and
+    /// why the argument being good is not the same as its having been checked.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
+    fn low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h264_aus(LOWDELAY_H264);
+        let order = order_h264(&aus);
+        parity_run(
+            pf_vaadec::Codec::H264,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY_H264),
+            LOWDELAY_H264_AU_COUNT,
+            "H.264 (low-delay host stream)",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an HEVC Main VLD entry point"]
+    fn h265_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h265_aus(H265_25FPS);
+        let order = order_h265(&aus);
+        parity_run(
+            pf_vaadec::Codec::H265,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_H265),
+            H26X_AU_COUNT,
+            "H.265",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an HEVC Main VLD entry point"]
+    fn low_delay_host_h265_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h265_aus(LOWDELAY_H265);
+        let order = order_h265(&aus);
+        parity_run(
+            pf_vaadec::Codec::H265,
+            StreamFormat::SDR_420_8,
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY_H265),
+            LOWDELAY_H265_AU_COUNT,
+            "H.265 (low-delay host stream)",
+        );
+    }
+
+    /// The ten-bit path, which every HDR session lands on.
+    ///
+    /// It exercises geometry the 8-bit legs cannot: **P010 samples are two bytes**, so a
+    /// row is `width * 2`, and HEVC's granule pads a 240-line picture to a 256-line
+    /// surface — the chroma plane therefore starts a long way from where the display
+    /// height would put it. And it is the only leg that can tell a Main 10 session that
+    /// BUILDS from one that decodes correctly: VAAPI has no per-picture decode status
+    /// query, so a stream decoding to garbage logs exactly as cleanly.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an HEVC Main 10 VLD entry point"]
+    fn main10_every_frame_hashes_bit_identical_to_libavcodec() {
+        let aus = split_h265_aus(MAIN10_H265);
+        let order = order_h265(&aus);
+        parity_run(
+            pf_vaadec::Codec::H265,
+            StreamFormat {
+                bit_depth: 10,
+                ..StreamFormat::SDR_420_8
+            },
+            &aus,
+            &order,
+            &golden_hashes(GOLDENS_MAIN10),
+            MAIN10_AU_COUNT,
+            "HEVC Main 10",
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an AV1 VLD entry point"]
+    fn av1_every_delivered_frame_hashes_bit_identical_to_libavcodec() {
+        let units = split_ivf(AV1_25FPS);
+        let order = order_av1(&units, DISPLAY_AV1);
+        av1_parity_run(
+            &units,
+            &order,
+            &golden_hashes(GOLDENS_AV1),
+            AV1_UNIT_COUNT,
+            AV1_DECODED_COUNT,
+            AV1_SHOWN_COUNT,
+            Some(AV1_FRAME0_NV12),
+            "AV1",
+        );
+    }
+
+    /// **Our own host's AV1, at the only resolution where it emits more than one tile.**
+    /// The leg above runs a vector whose every frame is `tile_cols = tile_rows = 1`, so
+    /// every tile field `plan_to_va_av1` fills is the degenerate case. This stream is
+    /// `tile_rows = 2` on all 60 frames with both tiles in one Tile Group OBU — and it
+    /// is 4K, so the readback moves 12.4 MB per frame.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an AV1 VLD entry point"]
+    fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
+        let units = split_ivf(LOWDELAY_AV1);
+        let order = order_av1(&units, DISPLAY_LOWDELAY_AV1);
+        av1_parity_run(
+            &units,
+            &order,
+            &golden_hashes(GOLDENS_LOWDELAY_AV1),
+            LOWDELAY_AV1_UNIT_COUNT,
+            LOWDELAY_AV1_DECODED_COUNT,
+            LOWDELAY_AV1_SHOWN_COUNT,
+            // The raw golden is the vendored vector's frame 0, at 320x240. This stream
+            // is 4K, so there is nothing to compare pixels against.
+            None,
+            "AV1 (low-delay host stream, 4K two-tile)",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The harness's own evidence: that it reads real pixels and CAN fail
+    // -----------------------------------------------------------------------
+
+    /// Which readback routes this machine's driver supports, on a real decoded surface,
+    /// and what they hand back.
+    ///
+    /// A diagnostic, not a gate — but it FAILS rather than skips if neither route works,
+    /// because a box someone deliberately pointed this at is a box that is supposed to
+    /// be able to answer.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
+    fn probe_this_machines_readback_routes() {
+        let aus = split_h264_aus(H264_25FPS);
+        let mut decoder = NativeVaapiDecoder::new(pf_vaadec::Codec::H264, StreamFormat::SDR_420_8)
+            .expect("this box is supposed to have a VAAPI H.264 decode entry point");
+        let mut frame = None;
+        for (index, au) in aus.iter().enumerate() {
+            frame = decoder
+                .decode(au)
+                .unwrap_or_else(|e| panic!("AU {index}: decode failed — {e:#}"));
+            if frame.is_some() {
+                break;
+            }
+        }
+        let frame = frame.expect("some access unit of the vendored vector must deliver a frame");
+        let release = frame.guard.0.release;
+        let (surface, display, coded, fourcc) = {
+            let s = decoder.session.as_ref().expect("a session");
+            (
+                s.surfaces[release.surface],
+                (frame.width, frame.height),
+                (s.shape.coded_width, s.shape.coded_height),
+                s.fourcc,
+            )
+        };
+        let mut readback = Readback::new(&decoder.display);
+        eprintln!("driver image formats: [{}]", readback.offered());
+        eprintln!("surface {surface:#x}: picture {display:?} in a {coded:?} pool");
+        eprintln!(
+            "derived layout: {}",
+            readback.describe(&decoder.display, surface)
+        );
+        // SAFETY: a live display and a surface from its own pool.
+        let status = unsafe { (decoder.display.va.sync_surface)(decoder.display.display, surface) };
+        assert_eq!(status, VA_STATUS_SUCCESS, "vaSyncSurface");
+        for route in [Route::Derive, Route::GetImage] {
+            match readback.read_route(route, &decoder.display, surface, display, coded, fourcc) {
+                Ok(bytes) => eprintln!("  {route:?}: {} bytes", bytes.len()),
+                Err(e) => eprintln!("  {route:?}: NO — {e}"),
+            }
+        }
+        readback.cross_check(
+            &decoder.display,
+            surface,
+            display,
+            coded,
+            fourcc,
+            "readback probe",
+        );
+        assert!(
+            readback.derived > 0 || readback.fetched > 0,
+            "neither readback route works on this device — parity is impossible here, \
+             and saying so is the point of this probe"
+        );
+        readback.destroy_staging(&decoder.display);
+    }
+
+    /// **The counterfactual on hardware**: the readback reads real, distinct pixels, and
+    /// the comparison the legs use catches a frame that is wrong by one byte.
+    ///
+    /// Three tests in this program have been found asserting nothing, so the parity legs
+    /// owe a proof that they can fail. This is it, driven through the same [`Readback`],
+    /// the same [`sha256_hex`], the same [`localise`] and the same [`compare`] the legs
+    /// use:
+    ///
+    /// * a readback that returned zeros, or the same surface every time, would make
+    ///   every hash equal — so two different pictures must hash differently;
+    /// * a readback that returned a constant would still have the right LENGTH — so the
+    ///   picture must not be one repeated byte;
+    /// * and one flipped byte must be caught, and LOCALISED to the pixel.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
+    fn the_readback_reads_real_pixels_and_the_comparison_can_fail() {
+        let aus = split_h264_aus(H264_25FPS);
+        let goldens = golden_hashes(GOLDENS_H264);
+        let mut decoder = NativeVaapiDecoder::new(pf_vaadec::Codec::H264, StreamFormat::SDR_420_8)
+            .expect("this box is supposed to have a VAAPI H.264 decode entry point");
+        let mut readback = Readback::new(&decoder.display);
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for (index, au) in aus.iter().take(20).enumerate() {
+            let frame = decoder.decode(au).expect("the clean vector decodes");
+            let Some(frame) = frame else { continue };
+            let what = format!("counterfactual AU {index}");
+            let bytes = read_frame(&decoder, &mut readback, &frame, &what);
+            assert!(
+                bytes.iter().any(|b| *b != bytes[0]),
+                "{what}: the readback handed back {} identical bytes — that is an \
+                 unwritten or unmapped surface, not a picture",
+                bytes.len()
+            );
+            frames.push(bytes);
+        }
+        readback.destroy_staging(&decoder.display);
+        assert!(
+            frames.len() >= 2,
+            "the first twenty access units must deliver at least two pictures"
+        );
+
+        let hashes: Vec<String> = frames.iter().map(|b| sha256_hex(b)).collect();
+        let distinct: std::collections::HashSet<&String> = hashes.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "{} decoded pictures produced ONE hash — the readback is reading the same \
+             surface, or the same bytes, every time",
+            hashes.len()
+        );
+        let here: Vec<&str> = goldens[..hashes.len()].to_vec();
+        assert_eq!(
+            compare(&hashes, &here, "counterfactual"),
+            (0, None),
+            "the first {} display frames must already agree with libavcodec, or this \
+             test is measuring a defect rather than its own falsifiability",
+            hashes.len()
+        );
+
+        // Now the corruption. One luma byte in the LAST frame checked, and the
+        // comparison must name that frame and only that frame.
+        let victim = hashes.len() - 1;
+        let mut corrupted = frames[victim].clone();
+        // The luma sample at the dead centre of this vector's 320x240 picture, so the
+        // bounding box is a statement about a PIXEL rather than about the first byte of
+        // the buffer or the edge of a plane.
+        let at = 120 * 320 + 160;
+        corrupted[at] ^= 0x01;
+        let diff = localise(
+            &corrupted,
+            &frames[victim],
+            (320, 240),
+            pf_vaadec::VA_FOURCC_NV12,
+        );
+        assert_eq!(
+            diff.luma_samples, 1,
+            "one flipped luma byte, one differing sample"
+        );
+        assert_eq!(diff.chroma_samples, 0, "chroma must read CLEAN");
+        assert_eq!(diff.max_delta, 1);
+        assert_eq!(
+            diff.luma_box,
+            Some((160, 120, 160, 120)),
+            "the divergence must be localised to the pixel that was flipped"
+        );
+
+        let mut dirty = hashes.clone();
+        dirty[victim] = sha256_hex(&corrupted);
+        assert_eq!(
+            compare(&dirty, &here, "counterfactual"),
+            (1, Some(victim)),
+            "the comparison every leg uses must catch a one-byte corruption, and name \
+             which display frame carries it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU guards — NOT `#[ignore]`d, so ordinary CI notices drift
+    // -----------------------------------------------------------------------
+
+    /// The invariant the module docs rest on, asserted mechanically: **the surface
+    /// readback's libva entry points are resolved only inside this test module.**
+    ///
+    /// Not a stylistic preference. A per-frame `vaMapBuffer` on the production video
+    /// path would be exactly the copy zero-copy exists to avoid, and this project has a
+    /// standing rule against it. Reading this file's own source is what turns "we were
+    /// careful" into something a refactor cannot quietly undo: the production [`Libva`]
+    /// must resolve none of these, and this module must resolve all of them.
+    ///
+    /// Doc comments elsewhere in the file name the same calls in prose; the scan looks
+    /// for the QUOTED symbol strings a `dlsym` needs, which prose never contains.
+    #[test]
+    fn the_readback_entry_points_are_resolved_only_inside_this_module() {
+        const SOURCE: &str = include_str!("video_vaapi_native.rs");
+        const MARKER: &str = "mod parity {";
+        let at = SOURCE
+            .find(MARKER)
+            .expect("this module's own header is in this module's own file");
+        let (production, harness) = SOURCE.split_at(at);
+        for symbol in [
+            "\"vaDeriveImage\"",
+            "\"vaCreateImage\"",
+            "\"vaGetImage\"",
+            "\"vaDestroyImage\"",
+            "\"vaMapBuffer\"",
+            "\"vaUnmapBuffer\"",
+            "\"vaQueryImageFormats\"",
+            "\"vaMaxNumImageFormats\"",
+        ] {
+            assert!(
+                !production.contains(symbol),
+                "{symbol} is resolved OUTSIDE the `#[cfg(test)] mod parity` block. The \
+                 surface readback is a test-only facility: a shipped build must not be \
+                 able to map a decode surface at all, which is what keeps the zero-copy \
+                 guarantee structural rather than a promise"
+            );
+            assert!(
+                harness.contains(symbol),
+                "{symbol} is no longer resolved by the parity harness — if the readback \
+                 moved, this guard has to move with it or it protects nothing"
+            );
+        }
+    }
+
+    /// The planners' display orders match the golden sets, on every one of the seven
+    /// streams these legs decode — checked on CPU so a regenerated vector or a change in
+    /// the bumping process fails here rather than as a mysterious hardware failure on a
+    /// machine somebody had to walk to.
+    #[test]
+    fn every_golden_set_matches_its_planners_display_order() {
+        for (label, order, goldens) in [
+            (
+                "H.264",
+                order_h264(&split_h264_aus(H264_25FPS)),
+                golden_hashes(GOLDENS_H264),
+            ),
+            (
+                "H.264 low-delay",
+                order_h264(&split_h264_aus(LOWDELAY_H264)),
+                golden_hashes(GOLDENS_LOWDELAY_H264),
+            ),
+            (
+                "H.265",
+                order_h265(&split_h265_aus(H265_25FPS)),
+                golden_hashes(GOLDENS_H265),
+            ),
+            (
+                "H.265 low-delay",
+                order_h265(&split_h265_aus(LOWDELAY_H265)),
+                golden_hashes(GOLDENS_LOWDELAY_H265),
+            ),
+            (
+                "HEVC Main 10",
+                order_h265(&split_h265_aus(MAIN10_H265)),
+                golden_hashes(GOLDENS_MAIN10),
+            ),
+            (
+                "AV1",
+                order_av1(&split_ivf(AV1_25FPS), DISPLAY_AV1),
+                golden_hashes(GOLDENS_AV1),
+            ),
+            (
+                "AV1 low-delay 4K",
+                order_av1(&split_ivf(LOWDELAY_AV1), DISPLAY_LOWDELAY_AV1),
+                golden_hashes(GOLDENS_LOWDELAY_AV1),
+            ),
+        ] {
+            assert_eq!(
+                order.display.len(),
+                goldens.len(),
+                "{label}: the planner outputs {} pictures and the golden file carries {}",
+                order.display.len(),
+                goldens.len()
+            );
+            assert!(
+                order.decode.len() >= order.display.len(),
+                "{label}: a picture cannot be displayed without being decoded"
+            );
+            for id in &order.display {
+                assert!(
+                    order.decode.contains(id),
+                    "{label}: display order names PicId {id}, which nothing decodes — the \
+                     hardware legs would fail on this with a message about the rung"
+                );
+            }
+            assert_eq!(
+                goldens.len(),
+                goldens
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                "{label}: two display frames carry the SAME golden hash. That is not \
+                 impossible in principle, but on these vectors it would mean the golden \
+                 file was generated from a stream that repeated a frame — and a parity \
+                 leg cannot tell a correctly repeated frame from a rung that delivered \
+                 one picture twice"
+            );
+        }
+    }
+
+    /// The counts the AV1 legs assert are what the PLANNER implies, and the two AV1
+    /// streams really are the opposite shapes their constants claim.
+    #[test]
+    fn the_two_av1_streams_are_the_opposite_shapes_the_legs_claim() {
+        let vendored = order_av1(&split_ivf(AV1_25FPS), DISPLAY_AV1);
+        assert_eq!(vendored.per_unit.len(), AV1_UNIT_COUNT);
+        assert_eq!(vendored.decode.len(), AV1_DECODED_COUNT);
+        assert_eq!(vendored.display.len(), AV1_SHOWN_COUNT);
+        assert_eq!(
+            vendored.per_unit.iter().filter(|u| u.len() > 1).count(),
+            AV1_DECODED_COUNT - AV1_SHOWN_COUNT,
+            "24 units must carry a hidden frame as well as the shown one — without them \
+             the AV1 leg proves nothing the H.264 leg does not already prove"
+        );
+
+        let ours = order_av1(&split_ivf(LOWDELAY_AV1), DISPLAY_LOWDELAY_AV1);
+        assert_eq!(ours.per_unit.len(), LOWDELAY_AV1_UNIT_COUNT);
+        assert_eq!(ours.decode.len(), LOWDELAY_AV1_DECODED_COUNT);
+        assert_eq!(ours.display.len(), LOWDELAY_AV1_SHOWN_COUNT);
+        assert!(
+            ours.per_unit.iter().all(|u| u.len() == 1),
+            "our host emits one frame per temporal unit and no hidden frames — the \
+             OPPOSITE shape to the vendored vector, which is why both legs exist"
+        );
+    }
+
+    /// Both vendored H.26x vectors REORDER, and our own streams do not.
+    ///
+    /// The first half is why the legs need `flush` and why delivery order is a claim
+    /// worth checking at all; the second is why our fixtures represent what punktfunk
+    /// actually streams. Asserted so neither claim can go stale.
+    #[test]
+    fn the_vendored_vectors_reorder_and_our_own_streams_do_not() {
+        for (label, order) in [
+            ("H.264", order_h264(&split_h264_aus(H264_25FPS))),
+            ("H.265", order_h265(&split_h265_aus(H265_25FPS))),
+        ] {
+            assert_ne!(
+                order.decode, order.display,
+                "{label}: this vector no longer reorders — the tail `flush` drains would \
+                 then be empty and these legs would stop covering the reordering path"
+            );
+        }
+        for (label, order) in [
+            (
+                "H.264 low-delay",
+                order_h264(&split_h264_aus(LOWDELAY_H264)),
+            ),
+            (
+                "H.265 low-delay",
+                order_h265(&split_h265_aus(LOWDELAY_H265)),
+            ),
+        ] {
+            assert_eq!(
+                order.decode, order.display,
+                "{label}: our host emits zero-reorder output, so decode order IS display \
+                 order — if that stops being true these fixtures no longer represent \
+                 what punktfunk streams"
+            );
+        }
+    }
+
+    /// **The counterfactual, on CPU**: the comparison every leg's verdict rests on
+    /// catches a wrong frame and names it.
+    ///
+    /// Runs on macOS and in the container with no device, so the falsifiability of the
+    /// parity legs is checked by ordinary CI rather than only on the one box that has a
+    /// VAAPI driver.
+    #[test]
+    fn the_comparison_catches_a_corrupted_frame() {
+        let goldens = ["aa", "bb", "cc"];
+        let clean: Vec<String> = goldens.iter().map(|g| (*g).to_string()).collect();
+        assert_eq!(
+            compare(&clean, &goldens, "cpu"),
+            (0, None),
+            "an agreeing set must report no divergence"
+        );
+
+        let mut one = clean.clone();
+        one[1] = "beef".to_string();
+        assert_eq!(
+            compare(&one, &goldens, "cpu"),
+            (1, Some(1)),
+            "one wrong frame must be reported once, at its DISPLAY index"
+        );
+
+        let mut two = one.clone();
+        two[0] = "dead".to_string();
+        assert_eq!(
+            compare(&two, &goldens, "cpu"),
+            (2, Some(0)),
+            "the first divergence must be the FIRST one, not the last seen"
+        );
+    }
+
+    /// [`localise`] separates the plane, the region and the magnitude — the three things
+    /// a hash cannot say and the three that located the last two defects.
+    #[test]
+    fn a_divergence_names_the_plane_the_box_and_the_magnitude() {
+        let (w, h) = (320u32, 240u32);
+        let clean = vec![0x40u8; (w * h + w * h / 2) as usize];
+
+        // One luma block, chroma clean — the NVIDIA signature.
+        let mut one_block = clean.clone();
+        for y in 24..48u32 {
+            for x in 16..32u32 {
+                one_block[(y * w + x) as usize] = 0x48;
+            }
+        }
+        let d = localise(&one_block, &clean, (w, h), pf_vaadec::VA_FOURCC_NV12);
+        assert_eq!(d.luma_samples, 16 * 24);
+        assert_eq!(d.chroma_samples, 0);
+        assert_eq!(d.luma_box, Some((16, 24, 31, 47)));
+        assert_eq!(d.max_delta, 8);
+        assert!(format!("{d}").contains("chroma CLEAN"));
+        assert!(format!("{d}").contains("16x24"));
+
+        // Chroma too, and badly — the Intel signature.
+        let structural = vec![0xffu8; clean.len()];
+        let d = localise(&structural, &clean, (w, h), pf_vaadec::VA_FOURCC_NV12);
+        assert_eq!(d.luma_samples, (w * h) as usize);
+        assert_eq!(d.chroma_samples, (w * h / 2) as usize);
+        assert_eq!(d.max_delta, 0xff - 0x40);
+        assert!(!format!("{d}").contains("chroma CLEAN"));
+
+        assert_eq!(
+            localise(&clean, &clean, (w, h), pf_vaadec::VA_FOURCC_NV12).luma_samples,
+            0
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                localise(&clean, &clean, (w, h), pf_vaadec::VA_FOURCC_NV12)
+            ),
+            "identical"
+        );
+    }
+
+    /// Ten-bit samples read as LSB-aligned are NAMED as a format problem rather than
+    /// reported as a decode divergence.
+    ///
+    /// The trap the Main 10 golden's header warns about, and the one thing about that
+    /// leg a reader would otherwise have to re-derive from 50 wrong hashes: P010 puts
+    /// the ten bits in the HIGH end of each 16-bit word, so a driver handing back
+    /// `yuv420p10le` produces a buffer of exactly the right LENGTH and entirely the
+    /// wrong content.
+    #[test]
+    fn lsb_aligned_ten_bit_samples_are_called_out_as_a_format_problem() {
+        let (w, h) = (16u32, 16u32);
+        let samples = (w * h + w * h / 2) as usize;
+        // MSB-aligned: 0x0200 is 8 << 6, and its low six bits are clear.
+        let msb: Vec<u8> = (0..samples).flat_map(|_| 0x0200u16.to_le_bytes()).collect();
+        // LSB-aligned: the same ten-bit value, 8, unshifted.
+        let lsb: Vec<u8> = (0..samples).flat_map(|_| 0x0008u16.to_le_bytes()).collect();
+
+        let d = localise(&lsb, &msb, (w, h), pf_vaadec::VA_FOURCC_P010);
+        assert_eq!(d.low_bits_set, samples, "every sample carries low bits");
+        assert!(
+            format!("{d}").contains("low six bits"),
+            "the report must point at the FORMAT: {d}"
+        );
+
+        let d = localise(&msb, &msb, (w, h), pf_vaadec::VA_FOURCC_P010);
+        assert_eq!(d.low_bits_set, 0);
+        assert_eq!(format!("{d}"), "identical");
     }
 }

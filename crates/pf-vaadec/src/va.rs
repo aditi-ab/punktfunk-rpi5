@@ -1,4 +1,5 @@
-//! The libva decode buffer layouts for H.264, **hand-declared**.
+//! The libva decode buffer layouts for H.264, **hand-declared** — plus the
+//! codec-independent `VAImage` pair the test-only surface readback needs.
 //!
 //! There is no libva binding in this workspace and this crate deliberately does not
 //! introduce one: it must compile and be tested on macOS and in the Linux container,
@@ -41,6 +42,24 @@
 //! This crate never invents one: the conversion (`plan_to_va`) takes the caller's
 //! slot → `VASurfaceID` table and indexes it, so the Linux layer owns surface
 //! allocation and this half stays pure.
+//!
+//! # The image half, and why it is here at all
+//!
+//! [`VaImage`] and [`VaImageFormat`] are not decode buffers: they are what
+//! `vaDeriveImage` (or `vaCreateImage` + `vaGetImage`) writes back when something
+//! wants to READ a decoded surface on the CPU. Nothing on the production video path
+//! does — the rung exports a DRM-PRIME dmabuf and the presenter samples it, which is
+//! the zero-copy contract this project refuses to spend — so the only caller is the
+//! frame-hash parity harness in `pf-client-core`'s `video_vaapi_native::parity`, which
+//! exists solely under `#[cfg(test)]`.
+//!
+//! They live here for the same reason every other structure in this file does: the
+//! harness must not force a `libva-dev` build dependency on a crate that compiles on
+//! macOS and in the container. Declaring them costs nothing at runtime (nothing
+//! constructs one outside a test) and lets the readback's geometry — the part that has
+//! already cost this program a release, in the shape of a chroma plane read at the
+//! DISPLAY height instead of the driver's reported offset — be unit-tested with no
+//! device at all. That walk is [`pack_two_plane`].
 
 /// `VA_INVALID_SURFACE` — what an unused `ReferenceFrames` / `RefPicList` entry
 /// carries. Paired with [`VA_PICTURE_H264_INVALID`]; drivers key on the flag, but a
@@ -389,6 +408,346 @@ const _: () = {
     assert!(offset_of!(VaSliceParameterBufferH264, va_reserved) == 3112);
 };
 
+// ---------------------------------------------------------------------------
+// The image pair — a CPU-readable view of a decoded surface (module docs).
+//
+// ⚠ TEST-ONLY BY CONSTRUCTION. Nothing on the production video path maps a surface;
+// these types exist so a parity harness can, without this crate growing a libva
+// build dependency. `pack_two_plane` below is pure and is the only logic here.
+// ---------------------------------------------------------------------------
+
+/// `VA_LSB_FIRST` — the byte order every YUV format libva describes uses. Named
+/// because [`VaImageFormat`] carries the field and a zero there is not a "left unset",
+/// it is an invalid enumerator.
+pub const VA_LSB_FIRST: u32 = 1;
+/// `VA_MSB_FIRST` — measured beside it so the pair reads as an enumeration rather
+/// than as one magic number.
+pub const VA_MSB_FIRST: u32 = 2;
+
+/// `VAImageFormat` — what a `VAImage` is in, and what `vaCreateImage` is asked for.
+///
+/// The RGB fields are dead weight for this crate's two formats (NV12 and P010) and
+/// are declared anyway: they occupy bytes 12..32 and dropping them would shift
+/// `va_reserved`, which is exactly the class of mistake the assertions below exist
+/// to make a compile error.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VaImageFormat {
+    pub fourcc: u32,
+    /// [`VA_LSB_FIRST`] or [`VA_MSB_FIRST`].
+    pub byte_order: u32,
+    pub bits_per_pixel: u32,
+    /// RGB only.
+    pub depth: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub alpha_mask: u32,
+    /// `va_reserved[VA_PADDING_LOW]` — "must be zero".
+    pub va_reserved: [u32; 4],
+}
+
+/// `VAImage` — the descriptor `vaDeriveImage` / `vaCreateImage` fills in.
+///
+/// ⚠ `width` and `height` are **`unsigned short`**, not `unsigned int`. That is the
+/// one thing about this structure a reader would get wrong by counting 32-bit words:
+/// every field after them sits two bytes earlier than the obvious arithmetic puts it,
+/// which is why `data_size` is at 60 and not 64. Measured, not reasoned about.
+///
+/// `pitches` and `offsets` are per PLANE and are the driver's own — the chroma plane
+/// begins at `offsets[1]`, which on a decode surface is nowhere near
+/// `pitches[0] * display_height` because the surface is padded to the codec's granule.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaImage {
+    /// `VAImageID`, and what `vaGetImage` / `vaDestroyImage` are handed.
+    pub image_id: u32,
+    pub format: VaImageFormat,
+    /// `VABufferID` — the buffer `vaMapBuffer` returns the pixels of.
+    pub buf: u32,
+    pub width: u16,
+    pub height: u16,
+    /// The whole mapped extent, in bytes. Everything [`pack_two_plane`] reads is
+    /// bounds-checked against it.
+    pub data_size: u32,
+    pub num_planes: u32,
+    pub pitches: [u32; 3],
+    pub offsets: [u32; 3],
+    /// Palette fields, meaningless for YUV and declared for their bytes.
+    pub num_palette_entries: i32,
+    pub entry_bytes: i32,
+    pub component_order: [i8; 4],
+    /// `va_reserved[VA_PADDING_LOW]`.
+    pub va_reserved: [u32; 4],
+}
+
+impl VaImage {
+    /// An all-zero descriptor — what a caller hands `vaDeriveImage` to fill.
+    ///
+    /// Zero rather than uninitialised on purpose: a failed derive leaves a descriptor
+    /// the caller still reads — to decide whether there is an image to destroy, and to
+    /// report what the driver DID hand back — and reading uninitialised bytes to do
+    /// that is undefined behaviour rather than a diagnostic.
+    pub const fn zeroed() -> VaImage {
+        VaImage {
+            image_id: 0,
+            format: VaImageFormat {
+                fourcc: 0,
+                byte_order: 0,
+                bits_per_pixel: 0,
+                depth: 0,
+                red_mask: 0,
+                green_mask: 0,
+                blue_mask: 0,
+                alpha_mask: 0,
+                va_reserved: [0; 4],
+            },
+            buf: 0,
+            width: 0,
+            height: 0,
+            data_size: 0,
+            num_planes: 0,
+            pitches: [0; 3],
+            offsets: [0; 3],
+            num_palette_entries: 0,
+            entry_bytes: 0,
+            component_order: [0; 4],
+            va_reserved: [0; 4],
+        }
+    }
+}
+
+/// Why a mapped image could not be read as the picture it was supposed to hold.
+///
+/// Every arm carries what the DRIVER said rather than a verdict, because the whole
+/// point of this walk refusing instead of guessing is that the refusal names the
+/// thing that has to be looked at next. A harness that quietly produced a short or
+/// mis-strided buffer would compare hashes of garbage against libavcodec's and report
+/// a decode defect that is not there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageReadError {
+    /// The caller asked for a format this walk does not describe. Only the two
+    /// two-plane YUV formats the surface pool is ever created with are supported.
+    UnsupportedFourcc { fourcc: u32 },
+    /// The image came back in a different format from the surface pool's — a driver
+    /// that substituted, which is precisely the "derive handed you something you
+    /// cannot interpret" case.
+    Fourcc { got: u32, want: u32 },
+    /// Fewer than two planes: a packed or opaque layout, not NV12/P010.
+    NotTwoPlane { planes: u32 },
+    /// The image is smaller than the region asked for.
+    TooSmall {
+        image: (u32, u32),
+        display: (u32, u32),
+    },
+    /// A row of the picture does not fit the plane's own pitch.
+    Pitch {
+        plane: usize,
+        pitch: u32,
+        need: usize,
+    },
+    /// A row would be read past the end of the mapped buffer.
+    OutOfBounds {
+        plane: usize,
+        row: u32,
+        at: usize,
+        end: usize,
+        mapped: usize,
+    },
+}
+
+impl std::fmt::Display for ImageReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImageReadError::UnsupportedFourcc { fourcc } => {
+                write!(f, "no two-plane layout for fourcc {}", fourcc_name(*fourcc))
+            }
+            ImageReadError::Fourcc { got, want } => write!(
+                f,
+                "the image is {} but the surface pool is {}",
+                fourcc_name(*got),
+                fourcc_name(*want)
+            ),
+            ImageReadError::NotTwoPlane { planes } => {
+                write!(f, "the image has {planes} plane(s), not two")
+            }
+            ImageReadError::TooSmall { image, display } => write!(
+                f,
+                "the image is {}x{} but the picture is {}x{}",
+                image.0, image.1, display.0, display.1
+            ),
+            ImageReadError::Pitch { plane, pitch, need } => write!(
+                f,
+                "plane {plane}'s pitch is {pitch} bytes, a row needs {need}"
+            ),
+            ImageReadError::OutOfBounds {
+                plane,
+                row,
+                at,
+                end,
+                mapped,
+            } => write!(
+                f,
+                "plane {plane} row {row} spans {at}..{end} of a {mapped}-byte mapping"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImageReadError {}
+
+/// A fourcc as its four characters, for a message a human can act on.
+fn fourcc_name(fourcc: u32) -> String {
+    let bytes = fourcc.to_le_bytes();
+    match std::str::from_utf8(&bytes) {
+        Ok(s) if bytes.iter().all(|b| b.is_ascii_graphic()) => s.to_string(),
+        _ => format!("{fourcc:#010x}"),
+    }
+}
+
+/// How many bytes one tightly packed `display`-sized picture of `fourcc` occupies —
+/// the layout every golden set in this program hashes.
+///
+/// `None` for a fourcc with no two-plane 4:2:0 layout here.
+pub fn packed_len(display: (u32, u32), fourcc: u32) -> Option<usize> {
+    let bytes_per_sample = bytes_per_sample(fourcc)?;
+    let (w, h) = (display.0 as usize, display.1 as usize);
+    Some(w * bytes_per_sample * (h + h.div_ceil(2)))
+}
+
+/// One luma sample's size in bytes for the two formats the pool is ever built with.
+fn bytes_per_sample(fourcc: u32) -> Option<usize> {
+    match fourcc {
+        crate::drm::VA_FOURCC_NV12 => Some(1),
+        // ⚠ P010 is 16 bits per sample with the ten meaningful bits in the HIGH end
+        // of each little-endian word. This walk moves bytes and never touches the
+        // alignment; a driver that handed back LSB-aligned samples would produce a
+        // buffer of exactly the right SIZE and the wrong content, which is a
+        // divergence the goldens catch and this function cannot.
+        crate::drm::VA_FOURCC_P010 => Some(2),
+        _ => None,
+    }
+}
+
+/// Read the `display`-sized picture out of a mapped `VAImage`, packed tightly — byte
+/// for byte the layout `pf-vkdecode`'s golden files hash.
+///
+/// This is the whole of the readback that can be wrong without a device, so it is the
+/// whole of what is worth testing without one. Three things it does deliberately:
+///
+/// * **The chroma plane starts at `offsets[1]`**, the driver's own number, never at
+///   `pitches[0] * height`. A decode surface is padded to the codec's granule — 240
+///   lines of HEVC live in a 256-line surface — so computing the offset from the
+///   display height reads the tail of the luma padding as chroma and smears every
+///   row. This project has already paid for that once on another rung.
+/// * **Padding columns are dropped per row.** `pitches[0]` is the surface's stride,
+///   which is wider than the picture; only `width * bytes_per_sample` bytes of each
+///   row belong to the golden.
+/// * **Every read is bounds-checked against the mapping the driver declared**, and a
+///   failure is returned rather than clamped. A short mapping means the descriptor
+///   and the buffer disagree, and no hash taken from it means anything.
+///
+/// `mapped` must be the buffer `vaMapBuffer` returned, of length
+/// [`VaImage::data_size`]; the caller passes it as a slice so this function needs no
+/// `unsafe` and can be driven from a plain array in a test.
+pub fn pack_two_plane(
+    image: &VaImage,
+    mapped: &[u8],
+    display: (u32, u32),
+    fourcc: u32,
+) -> Result<Vec<u8>, ImageReadError> {
+    let bytes_per_sample =
+        bytes_per_sample(fourcc).ok_or(ImageReadError::UnsupportedFourcc { fourcc })?;
+    if image.format.fourcc != fourcc {
+        return Err(ImageReadError::Fourcc {
+            got: image.format.fourcc,
+            want: fourcc,
+        });
+    }
+    if image.num_planes < 2 {
+        return Err(ImageReadError::NotTwoPlane {
+            planes: image.num_planes,
+        });
+    }
+    let (width, height) = display;
+    if u32::from(image.width) < width || u32::from(image.height) < height {
+        return Err(ImageReadError::TooSmall {
+            image: (u32::from(image.width), u32::from(image.height)),
+            display,
+        });
+    }
+    // One row of the picture, in both planes: 4:2:0 chroma is half the rows but
+    // interleaved (U,V) pairs, so a chroma row carries exactly as many BYTES as a
+    // luma row.
+    let row_bytes = width as usize * bytes_per_sample;
+    let rows = [height, height.div_ceil(2)];
+    let mut out = Vec::with_capacity(row_bytes * (rows[0] + rows[1]) as usize);
+    for (plane, plane_rows) in rows.iter().enumerate() {
+        let pitch = image.pitches[plane] as usize;
+        if pitch < row_bytes {
+            return Err(ImageReadError::Pitch {
+                plane,
+                pitch: image.pitches[plane],
+                need: row_bytes,
+            });
+        }
+        let base = image.offsets[plane] as usize;
+        for row in 0..*plane_rows {
+            let at = base + row as usize * pitch;
+            let end = at + row_bytes;
+            if end > mapped.len() {
+                return Err(ImageReadError::OutOfBounds {
+                    plane,
+                    row,
+                    at,
+                    end,
+                    mapped: mapped.len(),
+                });
+            }
+            out.extend_from_slice(&mapped[at..end]);
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Image layout proofs — the probe's output, pinned (libva 2.23.0-1ubuntu1,
+// x86_64-linux-gnu, measured 2026-08-07 by `layout-probe.c`).
+// ---------------------------------------------------------------------------
+
+const _: () = {
+    use std::mem::offset_of;
+    use std::mem::size_of;
+
+    assert!(size_of::<VaImageFormat>() == 48);
+    assert!(offset_of!(VaImageFormat, fourcc) == 0);
+    assert!(offset_of!(VaImageFormat, byte_order) == 4);
+    assert!(offset_of!(VaImageFormat, bits_per_pixel) == 8);
+    assert!(offset_of!(VaImageFormat, depth) == 12);
+    assert!(offset_of!(VaImageFormat, red_mask) == 16);
+    assert!(offset_of!(VaImageFormat, green_mask) == 20);
+    assert!(offset_of!(VaImageFormat, blue_mask) == 24);
+    assert!(offset_of!(VaImageFormat, alpha_mask) == 28);
+    assert!(offset_of!(VaImageFormat, va_reserved) == 32);
+
+    // ⚠ `width`/`height` are 16-bit, which is why `data_size` is at 60 rather than
+    // at the 64 that counting 32-bit fields would give.
+    assert!(size_of::<VaImage>() == 120);
+    assert!(offset_of!(VaImage, image_id) == 0);
+    assert!(offset_of!(VaImage, format) == 4);
+    assert!(offset_of!(VaImage, buf) == 52);
+    assert!(offset_of!(VaImage, width) == 56);
+    assert!(offset_of!(VaImage, height) == 58);
+    assert!(offset_of!(VaImage, data_size) == 60);
+    assert!(offset_of!(VaImage, num_planes) == 64);
+    assert!(offset_of!(VaImage, pitches) == 68);
+    assert!(offset_of!(VaImage, offsets) == 80);
+    assert!(offset_of!(VaImage, num_palette_entries) == 92);
+    assert!(offset_of!(VaImage, entry_bytes) == 96);
+    assert!(offset_of!(VaImage, component_order) == 100);
+    assert!(offset_of!(VaImage, va_reserved) == 104);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +943,242 @@ mod tests {
             .iter()
             .all(|e| e.picture_id == VA_INVALID_SURFACE));
         assert_eq!(s.slice_data_flag, VA_SLICE_DATA_FLAG_ALL);
+    }
+
+    // -----------------------------------------------------------------------
+    // The image walk. Every one of these runs on macOS and in the container: the
+    // geometry is the half of a surface readback that can be wrong without a
+    // device, and it is the half that has been wrong before.
+    // -----------------------------------------------------------------------
+
+    /// A driver-shaped `VAImage`: a surface PADDED past the picture in both axes,
+    /// with the chroma plane where the driver puts it rather than where the display
+    /// height would.
+    // `_picture` is named at every call site so each test reads as the shape it is
+    // about, and is deliberately not consulted: the walk takes the picture size from
+    // its own argument, which is the whole point of the crop.
+    fn padded_image(
+        _picture: (u16, u16),
+        surface: (u16, u16),
+        pitch: u32,
+        fourcc: u32,
+    ) -> (VaImage, Vec<u8>) {
+        let mut image = VaImage::zeroed();
+        image.format.fourcc = fourcc;
+        image.format.byte_order = VA_LSB_FIRST;
+        image.width = surface.0;
+        image.height = surface.1;
+        image.num_planes = 2;
+        image.pitches = [pitch, pitch, 0];
+        // The trap, expressed: chroma starts after the WHOLE padded luma plane.
+        image.offsets = [0, pitch * u32::from(surface.1), 0];
+        let total = pitch as usize * (surface.1 as usize + surface.1.div_ceil(2) as usize);
+        image.data_size = total as u32;
+        // Fill the mapping so every byte says where it came from: luma rows count
+        // 0.., chroma rows 128.., and the padding columns are 0xff so a walk that
+        // read them would produce something unmistakable.
+        let mut mapped = vec![0xffu8; total];
+        for y in 0..surface.1 as usize {
+            for x in 0..pitch as usize {
+                mapped[y * pitch as usize + x] = if x < surface.0 as usize {
+                    (y % 100) as u8
+                } else {
+                    0xff
+                };
+            }
+        }
+        let chroma = image.offsets[1] as usize;
+        for y in 0..surface.1.div_ceil(2) as usize {
+            for x in 0..pitch as usize {
+                mapped[chroma + y * pitch as usize + x] = if x < surface.0 as usize {
+                    128 + (y % 100) as u8
+                } else {
+                    0xff
+                };
+            }
+        }
+        (image, mapped)
+    }
+
+    #[test]
+    fn the_walk_crops_to_the_picture_and_takes_chroma_from_the_drivers_offset() {
+        // 320x240 picture in a 320x256 surface at a 384-byte pitch — HEVC's 128-line
+        // granule and a stride that is not the width, which is the everyday shape.
+        let (image, mapped) = padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        let out = pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12)
+            .expect("the walk must read a padded NV12 surface");
+        assert_eq!(out.len(), 320 * 240 + 320 * 120);
+        assert_eq!(
+            out.len(),
+            packed_len((320, 240), crate::drm::VA_FOURCC_NV12).unwrap()
+        );
+        // No padding byte reached the output: 0xff is only ever a padding column.
+        assert!(
+            !out.contains(&0xff),
+            "a padding column leaked into the packed picture"
+        );
+        // Luma row 3 is all 3s; chroma row 3 is all 131 — which is only true if the
+        // chroma plane was taken from offsets[1] and not from pitch * 240.
+        assert!(out[3 * 320..4 * 320].iter().all(|&b| b == 3));
+        let chroma = 320 * 240;
+        assert!(out[chroma + 3 * 320..chroma + 4 * 320]
+            .iter()
+            .all(|&b| b == 131));
+    }
+
+    #[test]
+    fn reading_chroma_at_the_display_height_would_have_been_caught() {
+        // The counterfactual for the assertion above: an image that claims chroma
+        // starts at `pitch * display_height` — the 1088-row smear — hands back
+        // LUMA padding rows where chroma belongs, and the walk cannot tell. So the
+        // guarantee is that the walk uses the DRIVER's offset, and this proves the
+        // two answers actually differ on the shape the drivers hand out (they would
+        // coincide on an unpadded surface, which is why the test above uses one that
+        // is padded in BOTH axes).
+        let (mut image, mapped) =
+            padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        let right = pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12)
+            .expect("the driver's own offset reads");
+        image.offsets[1] = 384 * 240;
+        let wrong = pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12)
+            .expect("the wrong offset also reads — that is the point");
+        assert_ne!(
+            right, wrong,
+            "chroma at the display height must differ from chroma at the driver's \
+             offset, or this walk's central claim is untestable"
+        );
+    }
+
+    #[test]
+    fn ten_bit_rows_are_twice_as_wide() {
+        // P010's samples are 16 bits, so a 320-sample row is 640 bytes and the packed
+        // picture is exactly twice an NV12 one. A walk that assumed one byte per
+        // sample would produce a half-width picture of the right total length for
+        // some other resolution, which is the kind of thing a length check alone
+        // misses.
+        let (image, mapped) = padded_image((320, 240), (320, 256), 768, crate::drm::VA_FOURCC_P010);
+        let out = pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_P010)
+            .expect("the walk must read a padded P010 surface");
+        assert_eq!(out.len(), 320 * 2 * 240 + 320 * 2 * 120);
+        assert_eq!(
+            out.len(),
+            packed_len((320, 240), crate::drm::VA_FOURCC_P010).unwrap()
+        );
+        assert_eq!(
+            out.len(),
+            2 * packed_len((320, 240), crate::drm::VA_FOURCC_NV12).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_odd_height_keeps_its_half_chroma_row() {
+        let (image, mapped) = padded_image((16, 9), (16, 16), 32, crate::drm::VA_FOURCC_NV12);
+        let out = pack_two_plane(&image, &mapped, (16, 9), crate::drm::VA_FOURCC_NV12)
+            .expect("an odd height still reads");
+        assert_eq!(out.len(), 16 * 9 + 16 * 5, "9 luma rows, 5 chroma rows");
+    }
+
+    #[test]
+    fn a_substituted_format_is_refused_rather_than_reinterpreted() {
+        let (mut image, mapped) =
+            padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        image.format.fourcc = crate::drm::VA_FOURCC_P010;
+        assert_eq!(
+            pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12),
+            Err(ImageReadError::Fourcc {
+                got: crate::drm::VA_FOURCC_P010,
+                want: crate::drm::VA_FOURCC_NV12
+            })
+        );
+    }
+
+    #[test]
+    fn a_packed_or_opaque_image_is_refused() {
+        let (mut image, mapped) =
+            padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        image.num_planes = 1;
+        assert_eq!(
+            pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12),
+            Err(ImageReadError::NotTwoPlane { planes: 1 })
+        );
+    }
+
+    #[test]
+    fn an_image_smaller_than_the_picture_is_refused() {
+        let (image, mapped) = padded_image((320, 240), (320, 240), 384, crate::drm::VA_FOURCC_NV12);
+        assert_eq!(
+            pack_two_plane(&image, &mapped, (321, 240), crate::drm::VA_FOURCC_NV12),
+            Err(ImageReadError::TooSmall {
+                image: (320, 240),
+                display: (321, 240)
+            })
+        );
+    }
+
+    #[test]
+    fn a_pitch_narrower_than_a_row_is_refused() {
+        let (mut image, mapped) =
+            padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        image.pitches[1] = 16;
+        assert_eq!(
+            pack_two_plane(&image, &mapped, (320, 240), crate::drm::VA_FOURCC_NV12),
+            Err(ImageReadError::Pitch {
+                plane: 1,
+                pitch: 16,
+                need: 320
+            })
+        );
+    }
+
+    #[test]
+    fn a_mapping_shorter_than_the_descriptor_claims_is_refused_not_truncated() {
+        // The failure mode that matters most: a short read must NOT silently produce
+        // a shorter picture, because its hash would then be a hash of something the
+        // decoder never wrote.
+        let (image, mapped) = padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        // One byte short of the LAST chroma row the picture needs. Cutting the tail
+        // of the allocation would not do it: the surface is padded past the picture,
+        // so there is slack after the last row this walk reads — which is itself
+        // worth pinning, since it is why a `data_size` check alone would not catch a
+        // driver whose offsets point outside its buffer.
+        let last_row_end = image.offsets[1] as usize + 119 * image.pitches[1] as usize + 320;
+        assert!(
+            last_row_end < mapped.len(),
+            "the padded surface must have slack after the picture's last chroma row"
+        );
+        let err = pack_two_plane(
+            &image,
+            &mapped[..last_row_end - 1],
+            (320, 240),
+            crate::drm::VA_FOURCC_NV12,
+        )
+        .expect_err("a short mapping must be refused");
+        assert!(
+            matches!(
+                err,
+                ImageReadError::OutOfBounds {
+                    plane: 1,
+                    row: 119,
+                    ..
+                }
+            ),
+            "expected the last chroma row to be refused, got {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_fourcc_has_no_packed_length_and_no_walk() {
+        assert_eq!(
+            packed_len((320, 240), 0x3132_3449),
+            None,
+            "I421 is not ours"
+        );
+        let (image, mapped) = padded_image((320, 240), (320, 256), 384, crate::drm::VA_FOURCC_NV12);
+        assert_eq!(
+            pack_two_plane(&image, &mapped, (320, 240), 0x3132_3449),
+            Err(ImageReadError::UnsupportedFourcc {
+                fourcc: 0x3132_3449
+            })
+        );
     }
 }
