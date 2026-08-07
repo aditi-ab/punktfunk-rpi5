@@ -10,7 +10,7 @@
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
     create_swdevice, publish_input, OutputDrain, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE,
-    OFF_DRIVER_PROTO, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    OFF_DRIVER_PROTO, OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
