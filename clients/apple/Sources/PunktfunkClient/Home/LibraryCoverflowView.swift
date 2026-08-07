@@ -21,7 +21,7 @@ import GameController
 struct LibraryCoverflowView: View {
     @Environment(\.gamepadInk) private var ink
     let games: [GameEntry]
-    let imageSession: URLSession?
+    let artLoader: LibraryArtLoader?
     var onLaunch: ((String) -> Void)?
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
@@ -124,7 +124,7 @@ struct LibraryCoverflowView: View {
         _ game: GameEntry, width: CGFloat, height: CGFloat, entrance: CardEntrance
     ) -> some View {
         PosterImage(
-            candidates: game.art.posterCandidates, title: game.title, session: imageSession,
+            candidates: game.art.posterCandidates, title: game.title, loader: artLoader,
             onLoaded: { artSettled += 1 })
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
