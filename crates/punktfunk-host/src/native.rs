@@ -71,6 +71,9 @@ mod pad_audio;
 /// The native input plane (plan §W1); the session setup spawns `input_thread` and feeds it a
 /// channel of `ClientInput`. The `Pads` router + rumble live there too.
 mod input;
+/// Per-pad motion inter-arrival statistics ([`motion_cadence::MotionCadence`]) — the "gyro feels
+/// floaty" measurement, summarized at `info` when a session ends.
+mod motion_cadence;
 use input::{input_thread, ClientInput};
 
 /// The Hello→Welcome→Start negotiation (plan §W1); `serve_session` calls `handshake::negotiate`

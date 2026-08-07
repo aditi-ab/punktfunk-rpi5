@@ -9,8 +9,8 @@
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
-    create_swdevice, OutputDrain, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE,
-    OFF_DRIVER_PROTO, OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, publish_input, OutputDrain, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE,
+    OFF_DRIVER_PROTO, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
@@ -39,6 +39,8 @@ pub struct Ds4WinPad {
     attach: super::gamepad_raii::DriverAttach,
     counter: u8,
     clock: SensorClock,
+    /// This pad's v2.3 input-seqlock generation — see `publish_input`.
+    input_gen: u32,
     /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
     drain: OutputDrain,
 }
@@ -107,6 +109,7 @@ impl Ds4WinPad {
             ),
             counter: 0,
             clock: SensorClock::dualshock4(),
+            input_gen: 0,
             drain: OutputDrain::new(),
         })
     }
@@ -117,14 +120,9 @@ impl Ds4WinPad {
         let ts = self.clock.ds4_ticks(Instant::now());
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.counter, ts);
-        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                r.as_ptr(),
-                self.channel.data_base().add(OFF_INPUT),
-                r.len(),
-            )
-        };
+        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
+        // input report. Publishes under the v2.3 seqlock — see `publish_input`.
+        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
     }
 
     /// Drain the section's output plane; parse every new `0x05` report (rumble / lightbar) into a
