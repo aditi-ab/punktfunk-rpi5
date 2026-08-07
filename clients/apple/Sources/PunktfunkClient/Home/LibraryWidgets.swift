@@ -17,16 +17,29 @@ struct StoreBadge: View {
     /// A launcher entry (design D4) gets the brand fill, so "opens Steam" is legible at poster size
     /// without reading the title.
     var isLauncher: Bool = false
+    /// Fill the chip with a flat wash instead of a frosted material.
+    ///
+    /// The coverflow MUST pass true. Its cards ride a `.scrollTransition` that composites them
+    /// with `opacity < 1` and a 3D rotation, and a material cannot sample a backdrop through an
+    /// offscreen composite — so the frost stayed blank on every card and only appeared on the one
+    /// card sitting at exactly full opacity in the centre, reading as a flash on focus. A flat
+    /// wash has no backdrop to sample: it is simply always there. (Deliberately black, not
+    /// palette ink: the chip sits on cover art, whose colours the palette has no business
+    /// fighting.)
+    var solid: Bool = false
+
+    private var fill: AnyShapeStyle {
+        if isLauncher { return AnyShapeStyle(Color.brand) }
+        return solid ? AnyShapeStyle(Color.black.opacity(0.58)) : AnyShapeStyle(.ultraThinMaterial)
+    }
 
     var body: some View {
         Text(label)
             .font(.geist(11, .semibold, relativeTo: .caption2))
-            .foregroundStyle(isLauncher ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+            .foregroundStyle(isLauncher || solid ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(
-                isLauncher ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.ultraThinMaterial),
-                in: Capsule())
+            .background(fill, in: Capsule())
             .padding(6)
     }
 }
@@ -58,6 +71,10 @@ struct PosterImage: View {
     let candidates: [URL]
     let title: String
     let session: URLSession?
+    /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
+    /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
+    /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
+    var onLoaded: (() -> Void)?
     @State private var index = 0
     @State private var image: PlatformImage?
 
@@ -67,19 +84,30 @@ struct PosterImage: View {
                 Image(platformImage: image)
                     .resizable()
                     .scaledToFill()
+                    .transition(.opacity)
             } else if index < candidates.count {
                 ZStack { placeholder; ProgressView() }
+                    .transition(.opacity)
             } else {
                 placeholder
+                    .transition(.opacity)
             }
         }
+        // Art crosses over its placeholder instead of replacing it between two frames. Cover
+        // fetches land one by one, so without this a freshly opened library is a run of cards
+        // visibly snapping from grey to artwork after the strip has already settled.
+        .animation(.easeOut(duration: 0.3), value: image != nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
         .task(id: index) { await loadCurrent() }
     }
 
     private func loadCurrent() async {
-        guard index < candidates.count else { return }
+        // Past the end: the placeholder IS the final look, so this poster has settled.
+        guard index < candidates.count else {
+            onLoaded?()
+            return
+        }
         guard let session, let data = try? await session.data(from: candidates[index]).0,
               let loaded = PlatformImage(data: data)
         else {
@@ -87,6 +115,7 @@ struct PosterImage: View {
             return
         }
         image = loaded
+        onLoaded?()
     }
 
     private var placeholder: some View {

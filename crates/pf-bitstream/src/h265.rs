@@ -158,8 +158,9 @@ pub struct PicturePlan {
     pub bit_depth_luma_minus8: u8,
     pub bit_depth_chroma_minus8: u8,
     pub chroma_format_idc: u8,
-    /// DPB size in frames per A.4 (equation A-2, capped at 16) — backends size their
-    /// slot pool from this.
+    /// DPB size in frames: the stream's own `sps_max_dec_pic_buffering_minus1 + 1`,
+    /// capped at 16 — backends size their slot pool from this. See [`dpb_limit`] for
+    /// why this is NOT equation A-2's level ceiling.
     pub max_dpb_frames: usize,
     /// Bits of the `st_ref_pic_set()` the FIRST slice carried inline (0 when the RPS
     /// came from the SPS by index) — Vulkan's `NumBitsForSTRefPicSetInSlice`.
@@ -311,16 +312,52 @@ impl From<&Sps> for NegotiationInfo {
     }
 }
 
-/// The DPB size the planner enforces: equation A-2 (via the vendored
-/// `Sps::max_dpb_size`), never above 16 — and never below the stream's
-/// `sps_max_dec_pic_buffering_minus1 + 1`, which C.5.2.2's bumping uses as its
-/// fullness bound. A conforming stream keeps the latter within A-2 (its constraint
-/// clause), so the `max` only widens the pool for streams that already violate A.4 —
-/// storing their pictures beats erroring the AU.
+/// The DPB size the planner enforces: the stream's own
+/// `sps_max_dec_pic_buffering_minus1[HighestTid] + 1`, capped at 16.
+///
+/// This deliberately does NOT consult equation A-2 (the vendored
+/// `Sps::max_dpb_size`). A-2 is a CEILING on what an SPS may signal — 7.4.3.2.1
+/// constrains `sps_max_dec_pic_buffering_minus1[i]` to `0..=MaxDpbSize - 1` — not a
+/// statement of what the stream needs. The size the stream actually needs is the
+/// signalled buffering, which is precisely what C.5.2.2's fullness clause bumps
+/// against, and A.4.1 bounds the total RPS entries by the same number: `buffering`
+/// pictures hold `buffering - 1` references plus the current one, exactly.
+///
+/// Reading A-2 as a requirement cost us HEVC outright, measured on `.21`
+/// (RTX 5070 Ti, 2026-08-07). The host's SPS is minimal and honest at every
+/// resolution — `general_level_idc = 153` (L5.1 High, which NVENC autoselects
+/// because 130 Mbps needs it), `sps_max_dec_pic_buffering_minus1 = 5`, i.e. six
+/// pictures: `RFI_DPB` references plus the current one. But A-2 branches on picture
+/// size against the LEVEL's `MaxLumaPs`, and at 1080p the coded 1920x1088 =
+/// 2 088 960 samples fall under `MaxLumaPs(L5.1) >> 2` = 2 228 224, taking the first
+/// branch: `min(4 * MaxDpbPicBuf, 16)` = 16. The old `max(A-2, buffering)` therefore
+/// reported 16 where the stream asked for 6, backends added the current picture and
+/// demanded 17 hardware DPB slots, and NVIDIA's Vulkan Video caps `maxDpbSlots` at
+/// 16 — so every access unit was refused, the ladder ran out of rungs, and the
+/// session reconnected without HEVC (fatal on a build with no software HEVC
+/// decoder).
+///
+/// A resolution sweep on the same box put the blast radius at the two commonest
+/// streaming resolutions and nowhere else, which is A-2's branch table exactly:
+/// 720p (1280x720 = 921 600) and 1080p died on branch 1 at 16 frames; 1440p
+/// (2560x1440 = 3 686 400, under `MaxLumaPs >> 1`) survived on branch 2 at 12; 4K
+/// (3840x2176 = 8 355 840, past `3 * MaxLumaPs >> 2`) survived on the `else` branch
+/// at 6 and decoded at 1.9 ms. One host, one level, one six-picture requirement —
+/// only which branch the picture size landed in decided whether HEVC worked at all.
+///
+/// The `max()` that produced the 16 bought nothing even for the malformed streams
+/// it was written for: `Dpb::needs_bumping` (C.5.2.2) already keys on the signalled
+/// buffering, not on `max_num_pics`, so a stream referencing more pictures than it
+/// declared was ALREADY being bumped below its own declared depth before every
+/// store. All the widened limit ever did was over-allocate hardware surfaces.
+///
+/// The cap stays: `check_envelope` rejects `buffering > 16` at activation, but this
+/// also runs from `NegotiationInfo::from`, which sees SPSes that have not reached
+/// the gate yet, and backends size real slot pools from the result.
 fn dpb_limit(sps: &Sps) -> usize {
     let buffering =
         usize::from(sps.max_dec_pic_buffering_minus1[usize::from(sps.max_sub_layers_minus1)]) + 1;
-    sps.max_dpb_size().max(buffering).min(16)
+    buffering.min(16)
 }
 
 /// The RefPicSet data (8.3.2), derived once per picture.
@@ -1755,6 +1792,10 @@ mod tests {
         width: u32,
         height: u32,
         bit_depth_minus8: u32,
+        /// `general_level_idc` (30 x the level number: 120 = L4, 153 = L5.1). Only the
+        /// DPB-sizing tests care, and they care because equation A-2 keys on it — the
+        /// planner deliberately does not.
+        level_idc: u32,
         /// (left, right, top, bottom) conf_win offsets, in chroma units.
         conf_win: Option<(u32, u32, u32, u32)>,
         max_dec_pic_buffering_minus1: u32,
@@ -1771,6 +1812,7 @@ mod tests {
                 width: 64,
                 height: 64,
                 bit_depth_minus8: 0,
+                level_idc: 120, // L4
                 conf_win: None,
                 max_dec_pic_buffering_minus1: 4,
                 max_num_reorder_pics: 0,
@@ -1801,7 +1843,7 @@ mod tests {
         s.bits(31, 0);
         s.bits(12, 0); // 43 zero bits total
         s.bit(0); // general_inbld_flag / reserved
-        s.bits(8, 120); // general_level_idc: level 4
+        s.bits(8, o.level_idc); // general_level_idc
 
         s.ue(0); // sps_seq_parameter_set_id
         s.ue(o.chroma_format_idc);
@@ -2093,7 +2135,11 @@ mod tests {
         assert_eq!(plan.picture.general_profile_idc, 1);
         assert_eq!(plan.picture.level_idc, Level::L4);
         assert_eq!(plan.picture.chroma_format_idc, 1);
-        assert_eq!(plan.picture.max_dpb_frames, 16, "A-2 for a 64x64 L4 stream");
+        assert_eq!(
+            plan.picture.max_dpb_frames, 5,
+            "the DPB is the stream's sps_max_dec_pic_buffering_minus1 + 1, NOT A-2's \
+             level ceiling (which would say 16 for a 64x64 L4 stream)"
+        );
         // Zero-reorder low-delay: the picture is display-ready in its own plan.
         assert_eq!(plan.dpb.outputs, vec![plan.dpb.stored.unwrap()]);
         // An IDR carries no RPS.
@@ -3072,8 +3118,10 @@ mod tests {
             other => panic!("the rebind must not activate the rejected SPS: {other:?}"),
         }
 
-        // Leg B: a 17-frame DPB, same geometry (dpb_limit caps both sides at 16, so
-        // NegotiationInfo alone cannot catch the rebind).
+        // Leg B: a 17-frame DPB, same geometry. The envelope gate is what must catch
+        // this on BOTH the direct AU and the PPS-only rebind: renegotiation runs only
+        // after `check_envelope` has passed, so a NegotiationInfo difference (5 vs the
+        // capped 16) is never reached and cannot stand in for the gate.
         let mut planner = H265Planner::new();
         planner
             .plan_au(&opening_idr_au(&SpsOpts::default()))
@@ -3092,6 +3140,121 @@ mod tests {
             planner.plan_au(&rebind),
             Err(PlanError::OutsideEnvelope(what)) if what.contains("DPB")
         ));
+    }
+
+    /// The DPB the planner reports is the stream's own declared depth, and it must fit
+    /// a mainstream Vulkan Video decoder — pinned at the exact stream that broke it.
+    ///
+    /// Field defect, `.21` (RTX 5070 Ti), 2026-08-07: a punktfunk 1080p HEVC session
+    /// refused EVERY access unit with "stream needs 17 DPB slots, device caps at 16",
+    /// exhausted the decode ladder and reconnected without HEVC — fatal, because there
+    /// is no permissively licensed software HEVC decoder to fall back to. The host was
+    /// blameless: its SPS asked for six pictures at both resolutions. The planner was
+    /// reporting equation A-2's LEVEL ceiling instead, and A-2 branches on picture size
+    /// against `MaxLumaPs`, so the identical stream reported 16 at 1080p and 6 at 4K.
+    ///
+    /// The three assertions below are the whole defect: the two resolutions must agree,
+    /// they must agree on the number the STREAM signalled, and `+ 1` for the current
+    /// picture must clear the 16-slot floor that NVIDIA's `maxDpbSlots` sets. The host
+    /// side of the same arithmetic — that `RFI_DPB` never grows past what this leaves
+    /// room for — is pinned in `pf-encode`'s `rfi_dpb_fits_a_mainstream_vulkan_decoder`.
+    #[test]
+    fn the_reported_dpb_is_the_streams_own_depth_and_fits_a_16_slot_decoder() {
+        /// `VkVideoCapabilitiesKHR::maxDpbSlots` on NVIDIA — the lowest cap among the
+        /// decoders punktfunk targets (RADV reports 17). A stream needing more than
+        /// this cannot be decoded natively at all.
+        const VULKAN_MAX_DPB_SLOTS: usize = 16;
+
+        // The field stream, byte for byte on the fields that matter: L5.1 High (which
+        // NVENC autoselects at 130 Mbps), coded 1920x1088, six pictures declared.
+        let field = SpsOpts {
+            width: 1920,
+            height: 1088,
+            level_idc: 153,
+            max_dec_pic_buffering_minus1: 5,
+            ..Default::default()
+        };
+        let mut planner = H265Planner::new();
+        let at_1080p = planner.plan_au(&opening_idr_au(&field)).unwrap();
+        assert_eq!(
+            at_1080p.picture.max_dpb_frames, 6,
+            "sps_max_dec_pic_buffering_minus1 = 5 means six pictures — five references \
+             plus the current one. A-2 would have said 16 here, because 1920x1088 = \
+             2088960 luma samples fall under MaxLumaPs(L5.1) >> 2 = 2228224."
+        );
+        // What the backends ask the driver for: one slot per DPB picture, plus one for
+        // the picture in flight (`pf_vkdecode::slots` pins the same convention).
+        let slots_for = |plan: &AuPlan| plan.picture.max_dpb_frames + 1;
+        assert!(
+            slots_for(&at_1080p) <= VULKAN_MAX_DPB_SLOTS,
+            "{} DPB frames need {} slots, over the {VULKAN_MAX_DPB_SLOTS} a mainstream \
+             Vulkan Video decoder offers — this is the refusal that cost HEVC",
+            at_1080p.picture.max_dpb_frames,
+            slots_for(&at_1080p)
+        );
+
+        // The same stream at the other three resolutions punktfunk streams at. 720p and
+        // 1080p died in the field and 1440p and 4K survived, purely because A-2 branches
+        // on picture size: 1280x720 and 1920x1088 fall under MaxLumaPs >> 2 (16 frames),
+        // 2560x1440 under MaxLumaPs >> 1 (12), and 3840x2176 past 3 * MaxLumaPs >> 2 (6).
+        // All four must now be indistinguishable, because the stream is.
+        for (w, h) in [(1280, 720), (2560, 1440), (3840, 2176)] {
+            let mut planner = H265Planner::new();
+            let plan = planner
+                .plan_au(&opening_idr_au(&SpsOpts {
+                    width: w,
+                    height: h,
+                    ..field.clone()
+                }))
+                .unwrap();
+            assert_eq!(
+                plan.picture.max_dpb_frames, at_1080p.picture.max_dpb_frames,
+                "{w}x{h}: the DPB requirement is a property of the stream, not of which \
+                 A-2 branch the picture size lands in"
+            );
+        }
+
+        // The invariant behind all of them: the reported depth is the declared one, and
+        // every depth that leaves a slot for the picture in flight fits a 16-slot device.
+        for minus1 in 0..=14u32 {
+            let mut planner = H265Planner::new();
+            let plan = planner
+                .plan_au(&opening_idr_au(&SpsOpts {
+                    max_dec_pic_buffering_minus1: minus1,
+                    ..field.clone()
+                }))
+                .unwrap();
+            assert_eq!(plan.picture.max_dpb_frames, minus1 as usize + 1);
+            assert!(slots_for(&plan) <= VULKAN_MAX_DPB_SLOTS);
+        }
+
+        // The one honest residue: A.4 lets a conforming stream declare a full 16-picture
+        // DPB, and 16 pictures plus the one in flight is 17 slots, which NVIDIA does not
+        // have. Refusing that is right — it genuinely does not fit, and decoding it with
+        // fewer slots would silently corrupt references. No punktfunk host comes near it
+        // (`RFI_DPB` puts us at 6), and this is pinned so the distinction stays visible:
+        // what was fixed is streams that never needed the slots, not this one.
+        let mut planner = H265Planner::new();
+        let deepest = planner
+            .plan_au(&opening_idr_au(&SpsOpts {
+                max_dec_pic_buffering_minus1: 15,
+                ..field.clone()
+            }))
+            .unwrap();
+        assert_eq!(deepest.picture.max_dpb_frames, 16);
+        assert_eq!(slots_for(&deepest), VULKAN_MAX_DPB_SLOTS + 1);
+        let mut planner = H265Planner::new();
+        assert!(
+            matches!(
+                planner.plan_au(&opening_idr_au(&SpsOpts {
+                    max_dec_pic_buffering_minus1: 16,
+                    ..field.clone()
+                })),
+                Err(PlanError::OutsideEnvelope(what)) if what.contains("DPB")
+            ),
+            "a 17-picture DPB is past A.4's cap and must be refused at activation, not \
+             clamped silently into a slot pool that cannot hold it"
+        );
     }
 
     /// Finding 4: the RASL refusal must run BEFORE renegotiation — a RASL AU carrying

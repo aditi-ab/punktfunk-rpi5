@@ -77,6 +77,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import io.unom.punktfunk.kit.DeviceGyro
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.security.KnownHostStore
@@ -886,6 +887,18 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                     subtitle = "Also play controller 1's rumble on this phone's motor",
                     checked = s.rumbleOnPhone,
                     onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
+                )
+            }
+            // The rumble mirror's sibling, data flowing the other way: needs a gyroscope to
+            // mirror FROM — a TV box has none, so the row would be a silent no-op there.
+            val hasGyroscope = remember { DeviceGyro.available(context) }
+            if (hasGyroscope) {
+                ToggleRow(
+                    title = "Gyro from this phone",
+                    subtitle = "When the controller has no gyro, send this phone's motion " +
+                        "sensors as controller 1's",
+                    checked = s.gyroOnPhone,
+                    onCheckedChange = { on -> update(s.copy(gyroOnPhone = on)) },
                 )
             }
             // NOT gated on the vibrator: SC2 passthrough is a USB/BLE capture that has nothing to do

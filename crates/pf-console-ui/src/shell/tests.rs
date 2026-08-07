@@ -171,6 +171,71 @@ fn wake_gates_input_in_the_same_press() {
 /// this nothing in the normal gate ever ran the tab strip's layout arithmetic or a settings
 /// screen's rows — a bad index there would only surface on a Deck. CPU raster: the SkSL
 /// backdrop, the layers and the text all run without a GPU.
+/// Tab / Shift+Tab change section. The strip shipped on the shoulder buttons and
+/// PgUp/PgDn only, and the legend names PgUp/PgDn solely when NO pad is attached — so with
+/// a controller plugged in a keyboard user had no way in, and no way to find one.
+#[test]
+fn tab_and_shift_tab_change_section() {
+    use sdl3::keyboard::Scancode;
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    s.motion = Motion::None; // skip the push transition, which drops input
+    let tab = |s: &Shell| match s.stack.last() {
+        Some(Screen::Settings(st)) => st.tab_for_test(),
+        _ => panic!("the settings screen is on top"),
+    };
+    assert_eq!(tab(&s), 0);
+    assert!(s.key(Scancode::Tab, false, false), "Tab is consumed");
+    assert_eq!(tab(&s), 1, "Tab goes forward");
+    assert!(s.key(Scancode::Tab, true, false));
+    assert_eq!(tab(&s), 0, "Shift+Tab goes back");
+    // …and it wraps backwards off the first tab, exactly as the shoulders do.
+    s.key(Scancode::Tab, true, false);
+    assert_eq!(tab(&s), crate::screens::settings::TAB_COUNT - 1);
+    // A key repeat must not run through the strip a section per frame held.
+    let before = tab(&s);
+    s.key(Scancode::Tab, false, true);
+    assert_eq!(tab(&s), before, "held Tab doesn't skip sections");
+}
+
+/// A right-click is Back on every screen, so a pointer always has a way out.
+#[test]
+fn a_secondary_press_goes_back() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    s.motion = Motion::None;
+    assert_eq!(s.stack.len(), 2);
+    assert!(s.pointer(crate::pointer::Pointer {
+        x: 10.0,
+        y: 10.0,
+        kind: crate::pointer::PointerKind::Back,
+    }));
+    // The pop runs through the same transition a B press does.
+    assert!(matches!(s.motion, Motion::Pop { .. }));
+}
+
+/// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
+#[test]
+fn up_opens_host_options_for_saved_tiles_only() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(
+        matches!(s.stack.last(), Some(Screen::HostOptions(_))),
+        "the first tile is a saved host"
+    );
+    s.motion = Motion::None;
+    s.handle_menu(MenuEvent::Back);
+    s.motion = Motion::None;
+    // The third fixture host is discovered-only (`saved: false`).
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Home(_))),
+        "an unsaved host has nothing to edit or forget"
+    );
+}
+
 #[test]
 fn every_settings_tab_rasters() {
     let fonts = crate::theme::build_fonts().unwrap();
@@ -242,6 +307,13 @@ fn dump_console_screens() {
     // Home, settled, with a pad (Letters glyphs).
     let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     dump(&mut s, 40, 8, "01-home", true);
+
+    // The host menu — Up on the focused saved tile. The home frame above carries the new
+    // ▲ Options hint that leads here, so the two are worth eyeballing together.
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    dump(&mut s, 40, 8, "01b-host-options", true);
+    s.handle_menu(MenuEvent::Back);
+    dump(&mut s, 20, 8, "_settle0", true);
 
     // Mid-push into Settings (the transition still): a couple of fast frames land
     // the capture around p ≈ 0.4 — both layers visible.

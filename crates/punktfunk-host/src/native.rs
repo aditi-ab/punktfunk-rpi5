@@ -362,6 +362,11 @@ pub(crate) async fn serve(
     // Failures log once and leave the feature off: pads still work, just without pad audio.
     #[cfg(target_os = "windows")]
     crate::audio::pad_endpoint::provision_at_startup();
+    // Windows: mint the punktfunk-owned audio endpoints ("Punktfunk Speakers/Microphone" —
+    // instances of Valve's streaming drivers, the wiring plan's tier-0). Best-effort on a
+    // worker thread; without Steam's drivers the wiring plan keeps its name-based ladder.
+    #[cfg(target_os = "windows")]
+    crate::audio::minted::provision_at_startup();
     // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
     // restores the box's autologin gaming session on idle, not per-disconnect — see
     // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.

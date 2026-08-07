@@ -48,12 +48,10 @@
 #ifdef GamepadStageDir
   #define WithGamepad
 #endif
-; AudioCableStageDir (the official base VB-CABLE package + install-vbcable.ps1) is optional - present
-; when the VB-CABLE package was supplied to the packer. It is the streaming virtual microphone; on a
-; headless host (no real audio output) a virtual cable is required for mic + desktop-audio passthrough.
-#ifdef AudioCableStageDir
-  #define WithAudioCable
-#endif
+; VB-CABLE is no longer bundled (retired 2026-08, the audio-substrate program): the host mints its
+; own audio endpoints from Steam's streaming drivers - "Punktfunk Speakers" for desktop audio and
+; "Punktfunk Microphone" for mic passthrough - so audio needs Steam INSTALLED (never running). A
+; VB-CABLE the user installed themselves keeps working as a fallback mic target.
 ; FfmpegBin (a dir of FFmpeg shared DLLs) is optional - present when the host is built with
 ; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
 #ifdef FfmpegBin
@@ -144,12 +142,6 @@ Name: "installdriver"; Description: "Install the pf-vdisplay virtual display dri
 #ifdef WithGamepad
 Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 - no ViGEmBus needed)"
 #endif
-#ifdef WithAudioCable
-; VB-Audio's bundling grant requires the end user to see VB-CABLE's origin + donationware status
-; at install time - keep the vendor, URL, and donationware wording in this visible task text (the
-; full notice ships in {app}\licenses\VB-CABLE-NOTICE.txt).
-Name: "installaudiocable"; Description: "Install VB-CABLE virtual audio for microphone passthrough (VB-CABLE by VB-Audio, www.vb-cable.com - donationware, all participations welcome)"
-#endif
 #ifdef WithVkLayer
 Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan games like Doom use HDR on the virtual display)"
 #endif
@@ -233,10 +225,6 @@ Source: "{#StageDir}\*"; DestDir: "{tmp}\pfvdisplay"; Flags: deleteafterinstall 
 ; The built-from-source UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
 Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installgamepad
 #endif
-#ifdef WithAudioCable
-; The official base VB-CABLE package + install-vbcable.ps1, extracted to {tmp}, removed after install.
-Source: "{#AudioCableStageDir}\*"; DestDir: "{tmp}\vbcable"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installaudiocable
-#endif
 #ifdef WithVkLayer
 ; The HDR Vulkan implicit layer (cdylib + its JSON manifest) laid into {app}\vklayer and registered
 ; below. The manifest's library_path is ".\pf_vkhdr_layer.dll" (relative to the JSON), so the two
@@ -292,15 +280,6 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --dir ""{tmp}\
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --gamepad --dir ""{tmp}\gamepad"""; WorkingDir: "{app}"; \
   StatusMsg: "Installing the virtual gamepad drivers..."; \
   Flags: runhidden waituntilterminated; Tasks: installgamepad
-#endif
-#ifdef WithAudioCable
-; Silently install the bundled VB-CABLE (the streaming virtual microphone). Best-effort: install-vbcable.ps1
-; always exits 0 (a missing cable just disables mic passthrough; the host falls back + retries), so a
-; cable hiccup never fails the whole install.
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\vbcable\install-vbcable.ps1"" -Dir ""{tmp}\vbcable"""; \
-  StatusMsg: "Installing VB-CABLE virtual audio (microphone passthrough)..."; \
-  Flags: runhidden waituntilterminated; Tasks: installaudiocable
 #endif
 ; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.
@@ -359,8 +338,10 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: ru
 ; driver packages). AFTER service uninstall so the host no longer holds the devices. Unconditional
 ; (not #ifdef'd on this build's bundled payload - an upgrade may have dropped a payload the original
 ; install laid down); `driver uninstall` is best-effort and no-ops when nothing is installed.
-; VB-CABLE is deliberately NOT removed: it is a third-party shared component the user may use
-; elsewhere - see licenses\VB-CABLE-NOTICE.txt for its own uninstall.
+; A VB-CABLE from an OLDER punktfunk install (bundled until the audio-substrate change) is
+; deliberately NOT removed: it is a third-party shared component the user may use elsewhere.
+; The host's own minted audio devnodes ("Punktfunk Speakers/Microphone") are likewise left in
+; place - they are plain instances of Steam's streaming drivers, inert without the host.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkVdisplayDriverUninstall"
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkGamepadDriverUninstall"
 #ifdef WithWeb
@@ -423,6 +404,18 @@ end;
 
 { Runs before any wizard page - the earliest point we can warn. Detect a conflicting host and let
   the user abort (default) or continue. Returning False cancels setup. }
+{ Steam's streaming-audio driver INFs - the host mints its audio endpoints from them (audio
+  needs Steam INSTALLED, never running). Checked per-arch like the host's own resolver. }
+function SteamAudioDriversPresent(): Boolean;
+var
+  Base: String;
+begin
+  Base := ExpandConstant('{commoncf32}\Steam\drivers\Windows10\');
+  Result := FileExists(Base + 'x64\SteamStreamingMicrophone.inf')
+    or FileExists(Base + 'arm64\SteamStreamingMicrophone.inf')
+    or FileExists(Base + 'x86\SteamStreamingMicrophone.inf');
+end;
+
 function InitializeSetup(): Boolean;
 var
   Found: String;
@@ -430,6 +423,17 @@ begin
   Result := True;
   { Record the fresh-vs-upgrade verdict while host.env still reflects the PREVIOUS run. }
   FreshHostInstall := not FileExists(HostEnvPath);
+  { Informational, suppressible (silent installs proceed): without Steam's streaming drivers
+    the host has no audio substrate to mint from - it streams video only, and says so in its
+    own logs/status too. The runtime re-checks live, so installing Steam later just works. }
+  if not SteamAudioDriversPresent() then
+    SuppressibleMsgBox(
+      'Steam does not appear to be installed on this PC.' + #13#10 + #13#10 +
+      'Punktfunk uses Steam''s streaming audio drivers for game audio and microphone ' +
+      'passthrough (Steam only needs to be installed - it never has to run). Without it, ' +
+      'this host streams video only.' + #13#10 + #13#10 +
+      'You can install Steam at any time; the host picks it up automatically.',
+      mbInformation, MB_OK, IDOK);
   Found := '';
   if StreamHostEnabled('SunshineService') then Found := Found + '    - Sunshine' + #13#10;
   if StreamHostEnabled('ApolloService') then Found := Found + '    - Apollo' + #13#10;

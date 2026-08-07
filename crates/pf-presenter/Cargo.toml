@@ -17,6 +17,12 @@ repository.workspace = true
 # C++ in — fatal on Windows ARM64, where Granite has no SIMD path.
 pf-client-core = { path = "../pf-client-core", default-features = false }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# `--probe-decode` reports the driver's own video-format answers through pf-vkdecode's
+# query rather than a second copy of it — a probe that keeps its own copy is a probe
+# that eventually disagrees with the code it exists to explain (VIDEO_BASE's doc says
+# the same thing about the extension list). Already in the tree via pf-client-core;
+# named here because setup.rs calls it directly.
+pf-vkdecode = { path = "../pf-vkdecode" }
 
 # `loaded` dlopens libvulkan at runtime (no link-time dependency — GPU-less boxes still
 # start and fail into a clean error; on Windows vulkan-1.dll is a GPU-driver component).

@@ -13,6 +13,90 @@ use ash::vk;
 use ash::vk::Handle as _;
 use std::ffi::{c_char, CString};
 
+/// The two extensions Vulkan Video decode cannot work without, whatever the codec.
+///
+/// Module scope, not function scope, because [`probe_decode`] answers "can this GPU do
+/// Vulkan Video decode?" and MUST answer it with the same list the device creation path
+/// gates on. A probe that keeps its own copy is a probe that eventually lies — and a
+/// lying capability report is worse than none, because it sends a field reporter looking
+/// in the wrong half of the stack.
+pub(crate) const VIDEO_BASE: [&std::ffi::CStr; 2] = [
+    ash::khr::video_queue::NAME,
+    ash::khr::video_decode_queue::NAME,
+];
+
+/// The per-codec decode extensions, same sharing rule as [`VIDEO_BASE`]. AV1's name is
+/// spelled out because ash 0.38's headers (1.3.281) predate its promotion.
+pub(crate) const VIDEO_CODECS: [&std::ffi::CStr; 3] = [
+    ash::khr::video_decode_h264::NAME,
+    ash::khr::video_decode_h265::NAME,
+    c"VK_KHR_video_decode_av1",
+];
+
+/// The Vulkan Video decode gate: all five must hold. One function so the device creation
+/// path and [`probe_decode`] cannot drift into disagreeing about what "supported" means —
+/// the failure that produces is a probe reporting a capability the session then refuses,
+/// which reads to everyone as a bug in the decoder rather than in the probe.
+pub(crate) fn video_decode_gate(
+    api_1_3: bool,
+    features_ok: bool,
+    has_decode_family: bool,
+    base_exts_present: bool,
+    any_codec_ext: bool,
+) -> bool {
+    api_1_3 && features_ok && has_decode_family && base_exts_present && any_codec_ext
+}
+
+/// What one physical device can do for Vulkan Video decode, without creating a logical
+/// device or a surface — the answer `punktfunk-session --probe-decode` prints.
+///
+/// Exists because "I pinned the Vulkan rung and got D3D11VA instead" was, until this,
+/// only answerable by starting a session and reading a log. Every field question about
+/// hardware decode starts here: WHICH adapter, and does it advertise the codec.
+#[derive(Debug, Clone)]
+pub struct AdapterDecode {
+    /// The device's position in the RAW `vkEnumeratePhysicalDevices` order — and
+    /// therefore the value `PUNKTFUNK_VK_DEVICE` takes, because `pick_device` indexes the
+    /// unsorted list (`devices.get(i)`) before any ranking runs.
+    ///
+    /// ⚠ NOT the display position. This list is sorted discrete-first for readability,
+    /// while enumeration order puts the iGPU first on some hybrids — so the two disagree
+    /// on exactly the machines this probe exists to diagnose. Printing the display
+    /// position as if it were the env value would hand a hybrid-laptop reporter the
+    /// number for the other GPU.
+    pub index: usize,
+    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key. Not necessarily
+    /// unique: a hybrid can expose the same iGPU twice, and a name match then resolves to
+    /// whichever enumerates first.
+    pub name: String,
+    /// Discrete GPUs sort first, exactly as `pick_device` ranks them, so index 0 here is
+    /// the device a default run will pick.
+    pub discrete: bool,
+    pub api_1_3: bool,
+    pub features_ok: bool,
+    /// The queue family index that advertises `VIDEO_DECODE_KHR`, if any.
+    pub decode_family: Option<u32>,
+    /// Raw `VkVideoCodecOperationFlagsKHR` from that family — what the DRIVER says it can
+    /// decode, independent of which extensions are exposed.
+    pub codec_ops: u32,
+    /// Required base extensions this device does NOT expose.
+    pub base_missing: Vec<String>,
+    /// Per-codec decode extensions it does.
+    pub codec_exts: Vec<String>,
+    /// [`video_decode_gate`] over the fields above.
+    pub usable: bool,
+    /// What the driver answers about video image formats, verbatim — one row per
+    /// (profile, usage) question ([`pf_vkdecode::probe`]).
+    ///
+    /// This is the half of the report that says why a device which passes every gate
+    /// above still cannot host the decoder. The five conjuncts answer "is Vulkan Video
+    /// here at all"; this answers "can the pipeline actually use it", which on at least
+    /// one shipping driver (Intel Arc, Windows) is a different question with a different
+    /// answer. Empty when the gate already failed — there is nothing to ask a device
+    /// with no video queue.
+    pub formats: Vec<pf_vkdecode::probe::ProfileProbe>,
+}
+
 /// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: it postdates the Vulkan headers
 /// ash 0.38 is generated from (1.3.281), so there is no binding for it — which is also why
 /// an unenabled driver reports the mode back as the bare number `1000361000`.
@@ -283,22 +367,15 @@ impl Presenter {
                 .map(|(i, (_, v))| (i as u32, v.video_codec_operations))
         };
 
-        const VIDEO_BASE: [&std::ffi::CStr; 2] = [
-            ash::khr::video_queue::NAME,
-            ash::khr::video_decode_queue::NAME,
-        ];
-        const VIDEO_CODECS: [&std::ffi::CStr; 3] = [
-            ash::khr::video_decode_h264::NAME,
-            ash::khr::video_decode_h265::NAME,
-            c"VK_KHR_video_decode_av1",
-        ];
         let codec_exts: Vec<&std::ffi::CStr> =
             VIDEO_CODECS.into_iter().filter(|n| has(n)).collect();
-        let video_ok = dev_is_13
-            && features_ok
-            && decode_family.is_some()
-            && VIDEO_BASE.iter().all(|n| has(n))
-            && !codec_exts.is_empty();
+        let video_ok = video_decode_gate(
+            dev_is_13,
+            features_ok,
+            decode_family.is_some(),
+            VIDEO_BASE.iter().all(|n| has(n)),
+            !codec_exts.is_empty(),
+        );
 
         let (decode_qf, decode_caps) = decode_family.unwrap_or((qfi, Default::default()));
         let mut video_ext_names: Vec<&std::ffi::CStr> = Vec::new();
@@ -320,11 +397,42 @@ impl Presenter {
                 "Vulkan Video decode available on this device"
             );
         } else {
+            // ALL FIVE conjuncts, and the evidence behind each. The three this used to
+            // print could every one be true while the answer was still no — a device with
+            // Vulkan 1.3, the features and a decode queue family, but missing a codec
+            // extension, logged `dev_is_13=true features_ok=true decode_family=true` next
+            // to the word "unavailable" and named nothing that could be acted on. A field
+            // reporter cannot then tell "this build never tried" from "the driver said
+            // no", which is the single most expensive ambiguity a fallback can have: it
+            // makes a missing capability and a bug in our gate look identical.
+            //
+            // `queue_codec_ops` matters most on a device that HAS a decode queue: the
+            // driver names the codecs it can decode there, so an empty `codec_exts`
+            // beside a non-empty ops mask means the extensions are what is missing, not
+            // the hardware.
+            let base_missing: Vec<&str> = VIDEO_BASE
+                .iter()
+                .filter(|n| !has(n))
+                .map(|n| n.to_str().unwrap_or("?"))
+                .collect();
+            let codec_ext_names: Vec<&str> = codec_exts
+                .iter()
+                .map(|n| n.to_str().unwrap_or("?"))
+                .collect();
             tracing::info!(
                 dev_is_13,
                 features_ok,
                 decode_family = decode_family.is_some(),
-                "Vulkan Video decode unavailable — decoder falls back (VAAPI/software)"
+                video_base_missing = ?base_missing,
+                codec_exts_present = ?codec_ext_names,
+                queue_codec_ops = ?decode_family.map(|(_, ops)| ops),
+                device = %dev_props
+                    .device_name_as_c_str()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                vendor_id = format_args!("0x{:04X}", dev_props.vendor_id),
+                "Vulkan Video decode unavailable on this device — the decoder falls back \
+                 one rung (D3D11VA on Windows, VAAPI on Linux, then software)"
             );
         }
 
@@ -619,6 +727,166 @@ impl Presenter {
         p.recreate_swapchain(window)?;
         Ok(p)
     }
+}
+
+/// Every physical device's Vulkan Video decode capability
+/// (`punktfunk-session --probe-decode`). No surface, no logical device, no session.
+///
+/// The question this answers is the one every hardware-decode field report starts with:
+/// the rung was pinned and something else ran — did this build never try, or did the
+/// driver refuse? Ordered like [`list_adapters`] (discrete first, `pick_device`'s
+/// tie-break), so the FIRST entry is the device a default run presents on — which is also
+/// the device Vulkan Video decodes on, because the decoder shares the presenter's device
+/// by design. On a hybrid laptop those two facts together are usually the whole answer:
+/// pinning the decoder does not move the presenter, so probing the iGPU's capability
+/// while the dGPU is presenting reports on the wrong GPU. `PUNKTFUNK_VK_DEVICE=<index>`
+/// is the knob that moves it.
+pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
+    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+    // builder structs that are locals outliving the call; the handle it returns is owned by the
+    // value being built here.
+    let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
+    let app_name = CString::new("punktfunk-session").unwrap();
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .api_version(vk::API_VERSION_1_3);
+    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
+    // builder structs that are locals outliving the call; the handle it returns is owned by the
+    // value being built here.
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app_info),
+            None,
+        )
+    }
+    .context("vkCreateInstance")?;
+
+    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
+    // filling locals returned by value.
+    let devices = unsafe { instance.enumerate_physical_devices() }?;
+    let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
+    // `enumerate()` BEFORE any filtering or sorting: this index is what
+    // `PUNKTFUNK_VK_DEVICE` selects, so it has to survive both.
+    for (raw_index, pdev) in devices.into_iter().enumerate() {
+        // SAFETY: per the Vulkan contract above - a read-only query on the live
+        // instance/device, filling locals returned by value.
+        let props = unsafe { instance.get_physical_device_properties(pdev) };
+        let name = props
+            .device_name_as_c_str()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let rank = match props.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+            _ => 2,
+        };
+        let api_1_3 = vk::api_version_major(props.api_version) > 1
+            || vk::api_version_minor(props.api_version) >= 3;
+
+        // The same three features the creation path demands (`features_ok` there).
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut feats = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f11)
+            .push_next(&mut f12)
+            .push_next(&mut f13);
+        // SAFETY: per the Vulkan contract above - a read-only query on the live
+        // instance/device, filling locals returned by value.
+        unsafe { instance.get_physical_device_features2(pdev, &mut feats) };
+        let features_ok = f11.sampler_ycbcr_conversion == vk::TRUE
+            && f12.timeline_semaphore == vk::TRUE
+            && f13.synchronization2 == vk::TRUE;
+
+        // SAFETY: per the Vulkan contract above - a read-only query on the live
+        // instance/device, filling locals returned by value.
+        let ext_props =
+            unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
+        let has = |n: &std::ffi::CStr| {
+            ext_props
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(n))
+        };
+        let base_missing: Vec<String> = VIDEO_BASE
+            .iter()
+            .filter(|n| !has(n))
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        let codec_exts: Vec<String> = VIDEO_CODECS
+            .iter()
+            .filter(|n| has(n))
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+
+        // The decode queue family and the codec operations the DRIVER claims for it —
+        // reported even when the extensions are absent, because "the hardware can, the
+        // driver does not expose it" is a different conversation from "this GPU cannot".
+        // SAFETY: per the Vulkan contract above - a read-only query on the live
+        // instance/device, filling locals returned by value.
+        let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
+        let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
+            vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
+        let mut qprops: Vec<vk::QueueFamilyProperties2> = video
+            .iter_mut()
+            .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
+            .collect();
+        // SAFETY: per the Vulkan contract above - a read-only query on the live
+        // instance/device, filling locals returned by value.
+        unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut qprops) };
+        let flags: Vec<vk::QueueFlags> = qprops
+            .iter()
+            .map(|p| p.queue_family_properties.queue_flags)
+            .collect();
+        drop(qprops);
+        let found = flags
+            .iter()
+            .zip(&video)
+            .enumerate()
+            .find(|(_, (f, _))| f.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
+            .map(|(i, (_, v))| (i as u32, v.video_codec_operations));
+
+        let usable = video_decode_gate(
+            api_1_3,
+            features_ok,
+            found.is_some(),
+            base_missing.is_empty(),
+            !codec_exts.is_empty(),
+        );
+        // Only where the gate passed: the format queries need `VK_KHR_video_queue`'s
+        // entry points, and asking a device that does not expose them produces a null
+        // dispatch, not an answer.
+        let formats = if usable {
+            // SAFETY: `instance` is the live instance created above and `pdev` one of
+            // the physical devices it enumerated; the probe only reads.
+            unsafe { pf_vkdecode::probe::probe_video_formats(&entry, &instance, pdev) }
+        } else {
+            Vec::new()
+        };
+        out.push((
+            rank,
+            AdapterDecode {
+                index: raw_index,
+                name,
+                discrete: rank == 0,
+                api_1_3,
+                features_ok,
+                decode_family: found.map(|(i, _)| i),
+                codec_ops: found.map_or(0, |(_, ops)| ops.as_raw()),
+                base_missing,
+                codec_exts,
+                usable,
+                formats,
+            },
+        ));
+    }
+    out.sort_by_key(|(rank, _)| *rank);
+    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and no
+    // logical device was created against this instance, so nothing is in flight on it.
+    unsafe { instance.destroy_instance(None) };
+    Ok(out.into_iter().map(|(_, a)| a).collect())
 }
 
 /// The physical devices' marketing names — the shells' GPU-picker source

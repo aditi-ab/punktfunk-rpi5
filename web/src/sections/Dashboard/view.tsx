@@ -2,6 +2,7 @@ import Section from "@unom/ui/section";
 import { MonitorPlay, RefreshCw, Video, Volume2, ZapOff } from "lucide-react";
 import type { FC, ReactNode } from "react";
 import type { ActiveGame } from "@/api/gen/model/activeGame";
+import type { AudioWiring } from "@/api/gen/model/audioWiring";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
 import { QueryState } from "@/components/query-state";
@@ -86,6 +87,12 @@ export const DashboardView: FC<{
 									</CardContent>
 								</Card>
 							</div>
+
+							{/* The wiring verdict (Windows hosts): WHICH endpoints carry game
+							    audio and the microphone, and the degradations that used to be
+							    visible only in the host log — a silent host looks identical to a
+							    quiet game without this. */}
+							{s.audio && <AudioWiringCard audio={s.audio} />}
 
 							{/* Above the session card: a game the host is about to close is the most
 							    time-sensitive thing on this page. */}
@@ -190,6 +197,57 @@ export const DashboardView: FC<{
 				</QueryState>
 			</div>
 		</Section>
+	);
+};
+
+/**
+ * One line per role plus a readiness badge; the degradation notes are spelled out because the
+ * failure they describe (silent audio, a mic that quietly vanished) is invisible everywhere
+ * else except the host log.
+ */
+const AudioWiringCard: FC<{ audio: AudioWiring }> = ({ audio }) => {
+	const badge: { variant: "success" | "secondary" | "destructive"; text: string } =
+		audio.readiness === "full"
+			? { variant: "success", text: m.audio_ready() }
+			: audio.readiness === "audio_only"
+				? { variant: "secondary", text: m.audio_ready_no_mic() }
+				: audio.readiness === "mic_only"
+					? { variant: "destructive", text: m.audio_no_output() }
+					: { variant: "destructive", text: m.audio_none() };
+	const notes = [
+		audio.mic_withheld ? m.audio_mic_withheld() : undefined,
+		audio.last_resort ? m.audio_last_resort() : undefined,
+		audio.narrowing,
+	].filter((n): n is string => !!n);
+	return (
+		<Card>
+			<CardHeader className="flex flex-row items-center justify-between space-y-0">
+				<CardTitle className="flex items-center gap-2">
+					<Volume2 className="size-4" />
+					{m.audio_wiring_title()}
+				</CardTitle>
+				<Badge variant={badge.variant}>{badge.text}</Badge>
+			</CardHeader>
+			<CardContent className="flex flex-col gap-3">
+				<dl className="grid gap-4 sm:grid-cols-2">
+					<Field
+						label={m.audio_output()}
+						value={audio.loopback ?? m.audio_unavailable()}
+					/>
+					<Field
+						label={m.audio_microphone()}
+						value={audio.mic ?? m.audio_unavailable()}
+					/>
+				</dl>
+				{notes.length > 0 && (
+					<ul className="flex flex-col gap-1 text-sm text-muted-foreground">
+						{notes.map((n) => (
+							<li key={n}>{n}</li>
+						))}
+					</ul>
+				)}
+			</CardContent>
+		</Card>
 	);
 };
 

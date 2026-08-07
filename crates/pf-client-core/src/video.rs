@@ -49,9 +49,9 @@
 //! | native Vulkan Video | | H.265 (Main / Main10 / 4:4:4) | **yes** — same parity run + HDR chain and Deck/VanGogh legs (M3) |
 //! | native Vulkan Video | | AV1 | **yes** — 250/250 bit-identical to libavcodec on an RTX 5070 Ti (M7); ONE vendor, no soak |
 //! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5) |
-//! | native D3D11VA | | AV1 | **NO** — has never decoded a frame anywhere (M7 wired it; the box was unavailable) |
+//! | native D3D11VA | | AV1 | **not proven** — it HAS now decoded (4K60, RTX 3500 Ada, 2026-08-07), but with no parity check and no soak it stays out of the admission filter. Its M7 wiring was right all along: what looked like a DXVA reference-mapping bug (`reference picture N holds no DPB slot`, 72 consecutive failures) was the HOST shipping half of every AV1 frame — see `pf_encode`'s `resolve_split_subframe` |
 //! | native VAAPI | [`crate::video_vaapi_native`] | H.264, H.265, AV1 | **NO** — has never decoded a frame anywhere (M6/M7; no VAAPI hardware was reachable) |
-//! | software | `video_software` | H.264, AV1 | **NO on glass** — openh264 + rav1d, CPU unit tests only (M8) |
+//! | software | `video_software` | H.264, AV1 | **not proven** — openh264 has never run on glass; rav1d HAS now decoded 1080p and 4K60 AV1 there (2026-08-07, .21) and recovers in-session from a mid-stream reference loss, but with no parity check and no soak. Its 4K "abort" was never about 4K: rav1d 1.1.0 kills the process on ANY decode error while it holds a single frame context, so `video_software` opens it with two — see [`crate::video_software`] |
 //!
 //! The software rung's evidence is recorded for the same reason but does not gate
 //! anything: it is the LAST rung, so there is nothing below it to protect.
@@ -1109,17 +1109,37 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
             true,
             "frame-hash parity on an RTX 4090 and an AMD iGPU + 30-min soak (M5)",
         ),
+        // Decoded on hardware for the first time on 2026-08-07 (4K60, RTX 3500 Ada) once the
+        // host stopped truncating AV1 — so the old "NEVER decoded a frame anywhere" is no
+        // longer true and must not be printed. Still NOT `verified`: `verified` gates
+        // `native_rung_admitted`, i.e. whether `auto` may pick this rung AHEAD of Vulkan
+        // Video, and one 25-second session with no frame-hash parity and no soak does not
+        // buy that. Promoting it wants a `gpu_parity`-style run, deliberately.
         (NativeRung::D3d11va, CODEC_AV1) => (
             false,
-            "NEVER decoded a frame on any hardware - wired in M7, the box was unavailable",
+            "decoded 4K60 once on an RTX 3500 Ada (2026-08-07) but has NEVER been \
+             parity-checked or soaked (M7)",
         ),
         (NativeRung::Vaapi, _) => (
             false,
             "NEVER decoded a frame on any hardware - no VAAPI device was reachable (M6/M7)",
         ),
+        // The 4K AV1 abort recorded here on 2026-08-07 is FIXED, and it was never about 4K.
+        // rav1d 1.1.0 aborts the process on ANY decode error while it holds a single frame
+        // context: `rav1d_decode_frame_exit` takes `f.frame_hdr`, and the error path then
+        // re-enters an `on_error` that unwraps it (`decode.rs:4997`), which crosses
+        // `dav1d_send_data`'s `extern "C"` frame as `panic_cannot_unwind`. 4K was only where
+        // an error first happened: the CPU rung cannot keep up at 3840x2160, the pump
+        // flushed its backlog and jumped to live, and the next AU referenced frames nobody
+        // had decoded. `video_software.rs` now opens rav1d with two frame contexts, which
+        // takes that `on_error` out of reach; the same damage now surfaces as the `EINVAL`
+        // the pump answers with a keyframe request. Still NOT `verified`: 4K60 AV1 ran to a
+        // clean exit on .21 and recovered from the damage in-session, but openh264 has
+        // still never run on glass and neither leg has a soak or a parity check.
         (NativeRung::Software, CODEC_H264 | CODEC_AV1) => (
             false,
-            "never run on glass - openh264/rav1d have CPU unit tests only (M8)",
+            "openh264 has never run on glass; rav1d decodes 1080p and 4K60 AV1 there and \
+             survives a mid-stream reference loss, but has no parity check or soak (M8)",
         ),
         _ => (false, "no hardware run recorded for this rung and codec"),
     };
@@ -1340,11 +1360,30 @@ pub fn migrate_decoder_pref(pref: &str) -> String {
 /// Same precedence as [`Decoder::new`] resolves (env first, then the setting), because a
 /// second reading of the same two inputs is a second place for them to drift.
 pub fn decode_pinned_to_software(pref: &str) -> bool {
-    std::env::var("PUNKTFUNK_DECODER")
-        .ok()
+    resolve_decoder_pref(std::env::var("PUNKTFUNK_DECODER").ok().as_deref(), pref) == "software"
+}
+
+/// Resolve the decoder preference: the `PUNKTFUNK_DECODER` override if it carries a
+/// value, else the stored setting. Pure, so the rule is testable without touching the
+/// process environment — and shared, because [`Decoder::new`] and
+/// [`decode_pinned_to_software`] read the same two inputs and a second reading is a
+/// second place for them to drift.
+///
+/// **Trimmed**, which is the part that had to be fixed rather than merely factored out.
+/// `PUNKTFUNK_VK_ADAPTER` already trimmed; this did not, so `"native-vulkan "` — one
+/// trailing space, which a Windows `.cmd` produces for free because `echo x>> file`
+/// keeps the space before the redirect — matched no arm of [`native_vulkan_gate`] and
+/// fell through to `auto` SILENTLY. An operator's pin was ignored and nothing said so,
+/// which is the exact failure the rest of this module's logging exists to prevent. It
+/// cost a full on-glass session to find.
+///
+/// Whitespace-only is treated as absent, not as a pin to `""`: someone who exported the
+/// variable empty means "no override", and `""` is a value `native_vulkan_gate` happens
+/// to accept.
+pub(crate) fn resolve_decoder_pref(env: Option<&str>, pref: &str) -> String {
+    env.map(str::trim)
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| pref.to_string())
-        == "software"
+        .map_or_else(|| pref.to_string(), str::to_string)
 }
 
 /// The `quic` codec bitfield this client can decode — the union of the codecs the RUNGS
@@ -1609,10 +1648,7 @@ impl Decoder {
         vk: Option<&VulkanDecodeDevice>,
         stream: StreamFormat,
     ) -> Result<Decoder> {
-        let stored = std::env::var("PUNKTFUNK_DECODER")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| pref.to_string());
+        let stored = resolve_decoder_pref(std::env::var("PUNKTFUNK_DECODER").ok().as_deref(), pref);
         let choice = migrate_decoder_pref(&stored);
         if choice != stored {
             // Said once per session, at `warn`, because a developer who set the env var to
@@ -1766,9 +1802,20 @@ impl Decoder {
                         "native Vulkan decode init failed — demoting to the standard ladder"),
                 }
             } else {
+                // The gate is an AND of three, so name all three. `video_decode=true`
+                // beside "refused" is otherwise unreadable: it says the device decodes
+                // SOMETHING while refusing THIS codec, and the bit that would explain it
+                // — the decode family's advertised operations — went unprinted. That is
+                // the difference between "your GPU can't do this" and "we asked for the
+                // wrong thing", and only the second is our bug.
                 tracing::warn!(
                     codec = codec_name,
                     video_decode = vk.is_some_and(|v| v.video_decode),
+                    decode_video_caps =
+                        format_args!("0x{:X}", vk.map_or(0, |v| v.decode_video_caps)),
+                    codec_op_needed =
+                        format_args!("0x{:X}", native_codec(wire).map_or(0, |(_, op)| op)),
+                    device = vk.map_or("", |v| v.device_name.as_str()),
                     "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264, HEVC or AV1 \
                      session and a presenter device whose decode family advertises that \
                      codec) — standard ladder"
@@ -2995,6 +3042,49 @@ mod tests {
     /// device leg: admitting HEVC on an H.264-only decode family would create a video
     /// session for an operation the family cannot run, which is undefined behaviour
     /// rather than an error.
+    /// A pin with stray whitespace is still a pin, and the gate must accept it.
+    ///
+    /// This is a regression test with a field cost: `"native-vulkan "` (one trailing
+    /// space, which a Windows `.cmd` adds for free) matched no arm of
+    /// `native_vulkan_gate`, so the rung fell through to `auto` with nothing logged —
+    /// on a box where `auto` picks a different rung, that reads exactly like the pin
+    /// being refused for a hardware reason. The second half is what makes it a *shared*
+    /// rule: `decode_pinned_to_software` reads the same variable, and its own docs say
+    /// a second reading is a second place to drift.
+    #[test]
+    fn a_decoder_pin_survives_the_whitespace_a_shell_script_adds() {
+        assert_eq!(
+            resolve_decoder_pref(Some("native-vulkan "), "auto"),
+            "native-vulkan",
+            "a trailing space must not turn a pin into an unrecognised value"
+        );
+        assert_eq!(
+            resolve_decoder_pref(Some("  software\t"), "auto"),
+            "software"
+        );
+        // Trimmed to nothing means ABSENT — fall back to the stored setting rather than
+        // pinning to "", which the gate would otherwise accept as the auto family.
+        assert_eq!(
+            resolve_decoder_pref(Some("   "), "native-vaapi"),
+            "native-vaapi"
+        );
+        assert_eq!(
+            resolve_decoder_pref(Some(""), "native-vaapi"),
+            "native-vaapi"
+        );
+        assert_eq!(resolve_decoder_pref(None, "native-vaapi"), "native-vaapi");
+        // …and the trimmed value is what the gate actually admits.
+        assert!(
+            native_vulkan_gate(
+                &resolve_decoder_pref(Some("native-vulkan "), "auto"),
+                punktfunk_core::quic::CODEC_HEVC,
+                true,
+                VIDEO_CODEC_OP_DECODE_H265,
+            ),
+            "the whole point: the trimmed pin reaches the gate and is admitted"
+        );
+    }
+
     #[test]
     fn native_vulkan_gate_admits_pin_and_auto_family_per_codec_on_a_capable_family() {
         // Pin the raw spec values, not the implementation constants — a typo'd bit
@@ -3196,7 +3286,11 @@ mod tests {
                 CODEC_H264,
                 "openh264 never ran on glass",
             ),
-            (NativeRung::Software, CODEC_AV1, "rav1d never ran on glass"),
+            (
+                NativeRung::Software,
+                CODEC_AV1,
+                "rav1d has decoded on glass but has no parity check and no soak",
+            ),
         ] {
             assert!(
                 !native_evidence(rung, codec).verified,
@@ -3235,6 +3329,14 @@ mod tests {
     /// `warn` line carrying their note, and that line is what a field report about M10 gets
     /// read against. Which of them `auto` may pick FIRST is
     /// [`native_rung_admitted`]'s decision, asserted in the test after this one.
+    ///
+    /// `(D3d11va, AV1)` stays here after 2026-08-07 even though it has now decoded on
+    /// hardware, and its warn line is why: it named the rung as unproven moments before that
+    /// rung failed 72 access units running, which is exactly the job this test protects. (The
+    /// cause was the HOST shipping half of every AV1 frame — `pf_encode`'s
+    /// `resolve_split_subframe` — not the rung.) Unproven is about EVIDENCE, not about whether
+    /// it has ever worked: one 25-second session with no parity check and no soak must not
+    /// promote a rung past Vulkan Video in the admission filter.
     #[test]
     fn every_rung_runs_and_the_unproven_ones_are_named() {
         let unproven = [

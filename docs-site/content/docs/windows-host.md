@@ -51,9 +51,10 @@ Download the signed `punktfunk-host-setup-<ver>.exe` from the
   displays,
 - installs the bundled **virtual gamepad drivers** (DualSense, DualShock 4, Xbox 360),
 - registers the bundled **HDR Vulkan layer** so Vulkan games can enable HDR over the virtual display,
-- installs **VB-CABLE** (VB-Audio, donationware) as the virtual microphone for client mic
-  passthrough — a checkbox in the installer, **ticked by default**; clear it, or pass
-  `/MERGETASKS="!installaudiocable"`, if you don't want it,
+- checks for **Steam** — game audio and microphone passthrough run through Punktfunk's own
+  instances of Steam's streaming audio drivers ("Punktfunk Speakers" / "Punktfunk Microphone"),
+  so Steam needs to be **installed** on the host (it never has to run). Without it the host
+  streams video only, and picks Steam up automatically whenever you install it,
 - adds a **status icon** to the notification area (see [Status tray](#status-tray)),
 - sets up the **web management console** (see below).
 
@@ -72,12 +73,13 @@ winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Res
 winget install unom.PunktfunkHost
 ```
 
-Before it downloads anything, winget shows the package's agreements — the bundled VB-CABLE notice,
-and that Moonlight compatibility is off by default — and asks you to accept them.
+Before it downloads anything, winget shows the package's agreements — that audio needs Steam
+installed on the host, and that Moonlight compatibility is off by default — and asks you to
+accept them.
 
 `winget install` runs setup silently with the same defaults the wizard shows, so the console
 password is generated for you (see [Unattended install](#unattended-install)). Add `--interactive`
-for the full wizard instead (the task checkboxes, the console-password page, the VB-CABLE notice).
+for the full wizard instead (the task checkboxes and the console-password page).
 To change an individual installer task on the silent path, pass the whole switch line through
 `--override` — not `--custom`, which *appends* and would leave two `/MERGETASKS` on one command
 line:
@@ -230,8 +232,9 @@ Open **Settings → Apps → Installed apps → Punktfunk Host → Uninstall**, 
 
 Three things are left behind on purpose: **`%ProgramData%\punktfunk`** (`host.env`, the host
 certificate and key, the management token, the console password, your paired devices and the logs —
-keeping it is what makes a reinstall pick up where you left off), **VB-CABLE** unless you cleared its
-checkbox, and **the publisher certificate** if you imported one by hand.
+keeping it is what makes a reinstall pick up where you left off), **VB-CABLE** if an older
+Punktfunk version installed it (releases used to bundle it for the microphone), and **the
+publisher certificate** if you imported one by hand.
 [Uninstalling → Windows host](/docs/uninstall#windows-host) shows how to clear each one, and has the
 same walkthrough for the other platforms.
 
@@ -251,9 +254,9 @@ the status icon's menu.
 Running as SYSTEM is what makes headless, log-in-optional streaming work — and it's why the host is a
 high-privilege component worth being deliberate about. Punktfunk mitigates this with **user-mode
 drivers** — the virtual display, the virtual gamepads and the virtual pointer are all UMDF, none of
-ours is kernel-mode (the optional third-party VB-CABLE mic driver is the one exception) — **sealed
-internal channels** between the host and its drivers, and Administrators/SYSTEM-only permissions on
-its secrets. See
+ours is kernel-mode; the audio endpoints are instances of Valve's own vendor-signed streaming
+drivers — **sealed internal channels** between the host and its drivers, and
+Administrators/SYSTEM-only permissions on its secrets. See
 [Security & Safe Use](/docs/security) for the full picture, including why we recommend not hosting on
 your most sensitive machine.
 
@@ -272,7 +275,7 @@ pipeline orchestration are all shared with the Linux host. The Windows host is a
 | **Input — mouse/keyboard** | libei / wlr protocols | **SendInput** (Win32 VK + absolute mouse) |
 | **Input — gamepads** | uinput Xbox 360 + UHID DualSense/DS4 | **UMDF** virtual pads — DualSense, DualShock 4, Xbox 360 (XUSB) + rumble |
 | **Audio capture** | PipeWire sink-monitor | **WASAPI loopback** |
-| **Virtual mic** | PipeWire `Audio/Source` | **VB-CABLE** virtual device (optional), captured via WASAPI |
+| **Virtual mic** | PipeWire `Audio/Source` | **"Punktfunk Microphone"** — the host's own instance of Steam's streaming-mic driver |
 
 The virtual display is **pf-vdisplay**, Punktfunk's own all-Rust **Indirect Display Driver (IDD)**. The
 host creates a shared GPU texture ring and the driver pushes finished frames straight into it — a real

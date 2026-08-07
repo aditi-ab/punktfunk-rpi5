@@ -83,6 +83,11 @@ struct ConnectOverlay: View {
         }
     }
 
+    /// The overlay's text/glyph colour: the palette's ink in the console takeover — over a pale
+    /// aurora, literal white was the one console surface that stayed white-on-white — and white
+    /// in the touch modal, whose branch is deliberately forced dark over a black scrim.
+    private var overlayFG: Color { gamepadUI ? ink.fg : .white }
+
     @ViewBuilder private func content(_ phase: Phase) -> some View {
         // The takeover carries larger type than the compact modal.
         let titleSize: CGFloat = gamepadUI ? 24 : 19
@@ -90,21 +95,24 @@ struct ConnectOverlay: View {
         VStack(spacing: gamepadUI ? 16 : 14) {
             switch phase {
             case .connecting(let name):
-                ProgressView().controlSize(.large).tint(.white)
+                ProgressView().controlSize(.large).tint(overlayFG)
                 Text("Connecting to \(name)")
-                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(overlayFG)
                     .multilineTextAlignment(.center)
                 Text("Establishing a secure connection…")
-                    .font(.geist(bodySize, relativeTo: .caption)).foregroundStyle(.white.opacity(0.6))
+                    .font(.geist(bodySize, relativeTo: .caption))
+                    .foregroundStyle(overlayFG.opacity(0.6))
                 Button("Cancel") { onCancelConnect() }.buttonStyle(.bordered).padding(.top, 6)
             case .waking(let w) where w.timedOut:
                 Image(systemName: "moon.zzz.fill")
-                    .font(.system(size: gamepadUI ? 40 : 34)).foregroundStyle(.white.opacity(0.9))
+                    .font(.system(size: gamepadUI ? 40 : 34))
+                    .foregroundStyle(overlayFG.opacity(0.9))
                 Text("\(w.hostName) didn't wake")
-                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(overlayFG)
                     .multilineTextAlignment(.center)
                 Text("It may still be booting, or it's powered off / off this network.")
-                    .font(.geist(bodySize, relativeTo: .caption)).foregroundStyle(.white.opacity(0.6))
+                    .font(.geist(bodySize, relativeTo: .caption))
+                    .foregroundStyle(overlayFG.opacity(0.6))
                     .multilineTextAlignment(.center)
                 HStack(spacing: 12) {
                     Button("Cancel") { waker.cancel() }.buttonStyle(.bordered)
@@ -112,12 +120,13 @@ struct ConnectOverlay: View {
                 }
                 .padding(.top, 6)
             case .waking(let w):
-                ProgressView().controlSize(.large).tint(.white)
+                ProgressView().controlSize(.large).tint(overlayFG)
                 Text("Waking \(w.hostName)…")
-                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(overlayFG)
                     .multilineTextAlignment(.center)
                 Text("Waiting for it to come online · \(w.seconds)s")
-                    .font(.geistFixed(bodySize)).foregroundStyle(.white.opacity(0.6)).monospacedDigit()
+                    .font(.geistFixed(bodySize)).foregroundStyle(overlayFG.opacity(0.6))
+                    .monospacedDigit()
                 // A wake-only wait (no dial after) offers "Stop Waiting"; a wake-&-connect is "Cancel".
                 Button(w.connectsAfter ? "Cancel" : "Stop Waiting") { waker.cancel() }
                     .buttonStyle(.bordered).padding(.top, 6)

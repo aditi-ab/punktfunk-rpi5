@@ -67,6 +67,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import io.unom.punktfunk.kit.DeviceGyro
 import io.unom.punktfunk.kit.DsCapture
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
@@ -471,6 +472,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             router,
             deviceVibrator = if (initialSettings.rumbleOnPhone) deviceBodyVibrator(context) else null,
         ).also { it.start() }
+        // "Gyro from this phone" (opt-in): this device's IMU speaks for controller 1's motion
+        // while wire pad 0 is a controller without a gyro of its own — the rumble mirror's
+        // sibling, data flowing the other way. The mirror gates itself per sample (it stands
+        // down whenever a capture link — USB DualSense / SC2, pads with a real IMU — holds
+        // pad 0), so it composes with the captures below without coordination here.
+        val phoneGyro = if (initialSettings.gyroOnPhone && initialSettings.gamepadForwarding) {
+            DeviceGyro(context, handle, router).also { it.start() }
+        } else {
+            null
+        }
         // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
         // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
         router.onSlotClosed = feedback::onDeviceRemoved
@@ -603,6 +614,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             feedback.onHidRaw = null
             feedback.sink = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
+            phoneGyro?.stop() // join the sensor thread + park pad 0's rotation at zero, same ordering rule
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
             dsUsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }

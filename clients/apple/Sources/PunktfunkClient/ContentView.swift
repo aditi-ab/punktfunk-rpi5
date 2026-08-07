@@ -384,7 +384,13 @@ struct ContentView: View {
             .frame(minWidth: 940, minHeight: 620)
         }
         #else
-        .fullScreenCover(item: $libraryTarget) { host in
+        // iOS: the cover is the TOUCH UI's presentation only. In gamepad mode the library is one
+        // of GamepadHomeView's in-place layers (the console shell — no bottom-up cover), so the
+        // proxy hides the target from the cover while that mode owns it; every writer (Y on a
+        // tile, `returnToLibrary`) keeps writing the same `libraryTarget` either way, and a
+        // controller arriving or leaving mid-browse hands the open library to whichever
+        // presentation the new mode owns.
+        .fullScreenCover(item: touchLibraryTarget) { host in
             NavigationStack {
                 LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
             }
@@ -399,6 +405,14 @@ struct ContentView: View {
 
     private var deepLinkNoticePresented: Binding<Bool> {
         Binding(get: { deepLinkNotice != nil }, set: { if !$0 { deepLinkNotice = nil } })
+    }
+
+    /// The iOS library cover's item: `libraryTarget`, hidden while the gamepad shell presents
+    /// the library in place (see the cover's comment).
+    private var touchLibraryTarget: Binding<StoredHost?> {
+        Binding(
+            get: { gamepadUIActive ? nil : libraryTarget },
+            set: { libraryTarget = $0 })
     }
 
     private var approvalChoicePresented: Binding<Bool> {
@@ -558,7 +572,8 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
+                    launchTitle: launchTitle)
             } else {
                 HomeView(
                     store: store, model: model, discovery: discovery,
@@ -574,7 +589,8 @@ struct ContentView: View {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
-                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered)
+                    connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
+                    launchTitle: launchTitle)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations
                 // — which aren't mounted while the gamepad launcher is up. Give the launcher its
                 // own presenters (exactly one of the two homes is mounted at a time, so these can

@@ -1668,10 +1668,19 @@ impl NvencCudaEncoder {
             // Sub-frame chunked poll (§7 LN1 Phase 1; default-on since Phase 3): armed iff this
             // session was CONFIGURED multi-slice + sub-frame readback (`self.slices` /
             // `self.subframe_on` were resolved once in `query_caps` and consumed by
-            // `build_config` / `build_init_params`, so the latch can't disagree with the session
-            // config) and the retrieve is sync — chunked poll is a depth-1 sync feature; a
-            // pipelined session's non-blocking poll owns the bitstream from the retrieve thread
-            // instead (the sub-frame write itself stays armed there; it's harmless).
+            // `build_config` / `build_init_params`) and the retrieve is sync — chunked poll is a
+            // depth-1 sync feature; a pipelined session's non-blocking poll owns the bitstream
+            // from the retrieve thread instead (sub-frame write is not armed there at all —
+            // `build_init_params` gates it on `!enable_async`).
+            //
+            // ⚠ THIS LATCH CAN DISAGREE WITH THE WRITER, and an earlier revision of this comment
+            // claimed it could not ("so the latch can't disagree with the session config"). It
+            // can: `build_init_params` arms `enableSubFrameWrite` from `subframe_on` ALONE,
+            // while this line additionally demands `slices >= 2`. AV1 resolves to 1 slice by
+            // construction, so it armed the writer with nothing to read the chunks and every
+            // frame reached the wire truncated to its first tile. `resolve_split_subframe` now
+            // disarms sub-frame for AV1 so the two agree; that function's docs carry the
+            // measurement.
             self.subframe_chunks = self.slices >= 2 && self.subframe_on && self.async_rt.is_none();
             if self.subframe_chunks {
                 tracing::info!(

@@ -279,9 +279,22 @@ pub(crate) unsafe fn query_h265_caps(
 
     let mut h265_caps = vk::VideoDecodeH265CapabilitiesKHR::default();
     let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+    // ⚠ ORDER IS LOAD-BEARING on at least one shipping driver. `push_next` PREPENDS, so
+    // the chain is the reverse of the call order: pushing the codec struct last puts
+    // VkVideoDecodeCapabilitiesKHR FIRST after the base struct, which is the order every
+    // Vulkan sample writes it in.
+    //
+    // Measured on Intel Arc (Windows 101.8724) with the previous order — codec struct
+    // first — the driver filled the two by POSITION rather than by sType and returned
+    // them SWAPPED: `decode_caps.flags` came back 12 (= STD_VIDEO_H265_LEVEL_IDC_6_2)
+    // and `h265_caps.maxLevelIdc` came back 1 (= DPB_AND_OUTPUT_COINCIDE). Reading a
+    // level as a flag bitmask means neither COINCIDE nor DISTINCT appeared set, so the
+    // rung refused a device that in fact supports it, and every Arc fell back to D3D11VA.
+    // NVIDIA and RADV dispatch by sType and are indifferent to the order, which is why
+    // the fleet was green and this survived to the field.
     let mut caps = vk::VideoCapabilitiesKHR::default()
-        .push_next(&mut decode_caps)
-        .push_next(&mut h265_caps);
+        .push_next(&mut h265_caps)
+        .push_next(&mut decode_caps);
     // SAFETY: physical device is live (DeviceHandles contract); `profile` roots a
     // fully wired, immovable chain; `caps` chains driver-fillable structs that all
     // outlive the call.
@@ -307,6 +320,28 @@ pub(crate) unsafe fn query_h265_caps(
     let std_header_version = caps.std_header_version;
     let decode_flags = decode_caps.flags;
     let max_level_idc = h265_caps.max_level_idc;
+
+    // What the driver ACTUALLY said, before any of our interpretation. Nothing in this
+    // module logged, so a refusal downstream ("advertises neither COINCIDE nor DISTINCT")
+    // was indistinguishable from our own chain never reaching the struct: both present as
+    // a zero. Printing the BASE capabilities beside the decode ones is the discriminator —
+    // a populated `max_dpb_slots` next to `decode_flags: 0` means the driver filled the
+    // chain and genuinely declared no DPB mode; zeros across both mean the query never
+    // landed. Debug rather than info: one line per profile per session, wanted only when
+    // someone is asking this exact question.
+    tracing::debug!(
+        codec = "H.265",
+        ?capability_flags,
+        ?decode_flags,
+        decode_flags_raw = decode_flags.as_raw(),
+        max_level_idc,
+        max_dpb_slots,
+        max_active_reference_pictures,
+        ?min_coded_extent,
+        ?max_coded_extent,
+        ?picture_access_granularity,
+        "driver video capabilities, verbatim"
+    );
 
     // The three queries carry the REAL creation usages (SAMPLED included for the
     // presenter-facing roles) so the answers validate the images the pools build.
@@ -348,6 +383,7 @@ mod tests {
             format,
             image_usage: usage,
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
+            ..Default::default()
         }
     }
 
@@ -687,6 +723,7 @@ mod tests {
                 format: P010,
                 image_usage: DPB_USAGE,
                 image_create_flags: vk::ImageCreateFlags::empty(),
+                ..Default::default()
             }],
             output_formats: vec![entry(NV12, OUTPUT_USAGE)],
             ..coincide_device(vec![])
@@ -723,6 +760,7 @@ mod tests {
             derive_caps_h265(&raw, P010).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "coincide (DPB|DST|SAMPLED)",
+                format: P010,
                 missing: vk::ImageUsageFlags::SAMPLED
             }
         );
@@ -732,11 +770,13 @@ mod tests {
             format: P010,
             image_usage: COINCIDE_USAGE,
             image_create_flags: vk::ImageCreateFlags::empty(),
+            ..Default::default()
         }]);
         assert_eq!(
             derive_caps_h265(&raw, P010).unwrap_err(),
             CapsError::NoMutableFormat {
-                mode: "coincide (DPB|DST|SAMPLED)"
+                mode: "coincide (DPB|DST|SAMPLED)",
+                format: P010,
             }
         );
     }

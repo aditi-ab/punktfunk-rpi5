@@ -107,8 +107,35 @@ pub(super) fn subframe_env_forced() -> bool {
 ///   plain AUTO the driver arbitrates — the shipped fleet state (1080p–1440p240 all run
 ///   AUTO+subframe); keying on `!= DISABLE` here would have disarmed the Phase-3 chunked-poll
 ///   feature fleet-wide.
-/// - **AV1**: both legal (sub-frame is per-tile; split is constrained only by
-///   output-into-vidmem, which we never use) — untouched.
+/// - **AV1**: split passes through untouched (it is constrained only by output-into-vidmem,
+///   which we never use), but sub-frame readback is **always disarmed** — see below.
+///
+/// # Why AV1 must never arm sub-frame readback
+///
+/// The two halves of this feature are armed by different conditions, and for AV1 they can only
+/// ever disagree:
+///
+/// * the WRITER (`enableSubFrameWrite` + `reportSliceOffsets`) is armed by
+///   [`build_init_params`] from this `subframe` alone;
+/// * the READER ([`Encoder::poll_chunk`]'s `subframe_chunks` latch) additionally requires
+///   `slices >= 2`, and [`resolve_slices`] returns 1 for AV1 **unconditionally** — before the
+///   `PUNKTFUNK_NVENC_SLICES` override is even read, because AV1 partitions via tiles rather
+///   than slices.
+///
+/// So an AV1 session armed the driver to publish its output unit by unit and then read it with
+/// a single blocking `lock_bitstream`, which returns only the FIRST completed unit. One tile
+/// per frame reached the wire. Measured on `.21` (RTX 5070 Ti, 4K60, split AUTO): every frame
+/// carried a frame header declaring two tile rows and a single Tile Group OBU with
+/// `tg_start = tg_end = 0` — half the picture missing — and libdav1d rejected **835 of 836**
+/// access units with "Error parsing frame header". NVIDIA's hardware decoder accepts the
+/// truncated stream, which is why native Vulkan Video looked healthy while both conformant
+/// software decoders (rav1d in-tree, libdav1d out-of-tree) refused every frame. With sub-frame
+/// disarmed and split still AUTO, the same session decoded 654/654 frames clean.
+///
+/// This is a plain disarm, NOT a codec restriction: `split_mode` is returned untouched, so AV1
+/// keeps every engine split encode gives it. Arming the reader for AV1 instead is not a
+/// drop-in alternative — `poll_chunk` cuts at `bitstreamSizeInBytes` on the reasoning that
+/// "slices are contiguous Annex-B", which AV1's OBUs are not.
 ///
 /// Returns the `(split_mode, subframe)` to ACTUALLY configure. The caller must store BOTH back
 /// (the chunked-poll latch and `CeilingKey` key on them) — a silent in-params drop would leave
@@ -123,6 +150,27 @@ pub(super) fn resolve_split_subframe(
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
     if codec == Codec::H264 {
         return (M::NV_ENC_SPLIT_DISABLE_MODE as u32, subframe);
+    }
+    // AV1: disarm sub-frame, keep split. The reader can never arm here (`resolve_slices` gives
+    // AV1 one slice by construction), so arming the writer only truncates every frame to its
+    // first tile — see this function's docs for the measurement.
+    if codec == Codec::Av1 && subframe {
+        if subframe_forced {
+            tracing::warn!(
+                split_mode,
+                "PUNKTFUNK_NVENC_SUBFRAME=1 cannot be honoured on AV1 — its sub-frame units are \
+                 TILES and the chunked reader cuts on Annex-B slice boundaries, so arming the \
+                 writer would ship only the first tile of every frame; sub-frame readback \
+                 disabled for this session (split encode is unaffected)"
+            );
+        } else {
+            tracing::debug!(
+                split_mode,
+                "NVENC: sub-frame readback disarmed on AV1 (tiles, not slices — nothing consumes \
+                 the chunks); split encode is unaffected"
+            );
+        }
+        return (split_mode, false);
     }
     let split_forced = split_mode == M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
         || split_mode == M::NV_ENC_SPLIT_THREE_FORCED_MODE as u32
@@ -164,7 +212,7 @@ pub(super) fn resolve_split_subframe(
 
 #[cfg(test)]
 mod split_subframe_tests {
-    use super::{resolve_split_subframe, Codec};
+    use super::{resolve_slices, resolve_split_subframe, Codec};
     use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_SPLIT_ENCODE_MODE as M;
 
     const AUTO: u32 = M::NV_ENC_SPLIT_AUTO_MODE as u32;
@@ -241,13 +289,73 @@ mod split_subframe_tests {
         );
     }
 
-    /// AV1: both features are legal together (per-tile sub-frame; split constrained only by
-    /// output-into-vidmem) — the arbitration must not touch it.
+    /// AV1 KEEPS ITS SPLIT AND LOSES ITS SUB-FRAME, and this test is the one that used to
+    /// assert the bug.
+    ///
+    /// It read `av1_untouched` and pinned `(TWO, true)` on the reasoning that "both features
+    /// are legal together (sub-frame is per-tile)". Legal for the DRIVER, yes — but the two
+    /// halves of the feature are armed by different conditions in this crate, and on AV1 they
+    /// cannot agree: `build_init_params` arms the WRITER from `subframe`, while the READER
+    /// needs `slices >= 2` and [`resolve_slices`] returns 1 for AV1 before the env override is
+    /// even read. So the session told the driver to publish tile by tile and then took only the
+    /// first tile with one blocking lock. Every 4K AV1 frame shipped half a picture; libdav1d
+    /// rejected 835/836 AUs, and only NVIDIA's lenient hardware decoder hid it.
+    ///
+    /// The `true` argument here is `subframe_forced` — even an operator's explicit
+    /// `PUNKTFUNK_NVENC_SUBFRAME=1` cannot buy a working AV1 sub-frame session, so it is
+    /// refused (loudly) rather than honoured into a truncated stream.
     #[test]
-    fn av1_untouched() {
+    fn av1_keeps_split_but_never_arms_subframe() {
+        // Forced split + forced sub-frame: split survives, sub-frame does not.
         assert_eq!(
             resolve_split_subframe(Codec::Av1, TWO, true, true),
-            (TWO, true)
+            (TWO, false),
+            "AV1 must keep its split mode and drop sub-frame readback"
+        );
+        // The fleet shape (plain AUTO + default-on sub-frame) — the one that shipped broken.
+        assert_eq!(
+            resolve_split_subframe(Codec::Av1, AUTO, true, false),
+            (AUTO, false)
+        );
+        // Widest split, still untouched: this fix costs AV1 no engines.
+        assert_eq!(
+            resolve_split_subframe(Codec::Av1, AUTO_F, true, false),
+            (AUTO_F, false)
+        );
+        // Already off stays off, and split still passes through.
+        assert_eq!(
+            resolve_split_subframe(Codec::Av1, TWO, false, false),
+            (TWO, false)
+        );
+    }
+
+    /// The two halves of the sub-frame feature, checked against each other on AV1 — the
+    /// comparison nothing made, which is why the truncation shipped.
+    ///
+    /// The reader's gate is `subframe_chunks = slices >= 2 && subframe_on && sync`. For AV1
+    /// [`resolve_slices`] returns 1 *by construction* (it early-returns for non-H.26x before
+    /// reading `PUNKTFUNK_NVENC_SLICES`, which is also what makes this test independent of the
+    /// environment it runs in), so the reader can never arm — and therefore the writer must
+    /// never arm either.
+    ///
+    /// Deliberately NOT generalised to a loop over all codecs: for H.264/HEVC `slices` is
+    /// `sliceModeData`, so a single-slice session really does produce ONE output unit and a
+    /// single blocking lock is complete. The hazard is specific to a codec whose unit count the
+    /// driver decides (AV1's tiles, via split encode) rather than our slice config. If AV1 ever
+    /// becomes genuinely multi-slice here, the first assert fires and sends whoever changed it
+    /// back to the arming rule.
+    #[test]
+    fn av1_can_never_arm_the_chunked_reader_so_it_must_not_arm_the_writer() {
+        assert_eq!(
+            resolve_slices(Codec::Av1, 4),
+            1,
+            "AV1 is single-slice by construction — `subframe_chunks` (slices >= 2) cannot arm"
+        );
+        let (_, subframe) = resolve_split_subframe(Codec::Av1, AUTO, true, false);
+        assert!(
+            !subframe,
+            "the sub-frame WRITER is armed on a session whose chunked READER cannot arm: every \
+             frame would reach the wire truncated to its first tile"
         );
     }
 }
@@ -853,6 +961,38 @@ mod range_policy_tests {
     fn nonsense_ranges_decline() {
         assert!(matches!(plan(-1, 5, 100), RangePlan::Decline));
         assert!(matches!(plan(7, 5, 100), RangePlan::Decline));
+    }
+
+    /// `RFI_DPB` is the one host-side knob that sets how many DPB slots a client must
+    /// find, so it may never grow past what a mainstream client can allocate.
+    ///
+    /// The chain, measured on `.21` (RTX 5070 Ti, 2026-08-07) by reading the SPS the
+    /// host actually emitted: `maxNumRefFramesInDPB = RFI_DPB` makes NVENC write
+    /// `sps_max_dec_pic_buffering_minus1 = 5`, i.e. `RFI_DPB + 1 = 6` pictures — five
+    /// references plus the current one. Decoder backends then allocate one slot per
+    /// DPB picture plus one for the picture in flight, so the hardware demand is
+    /// `RFI_DPB + 2 = 7`. NVIDIA's Vulkan Video reports `maxDpbSlots = 16` (RADV 17),
+    /// and a stream over that is refused outright — which on a client with no software
+    /// HEVC decoder means losing the codec, not merely a slower path.
+    ///
+    /// Raising `RFI_DPB` is a legitimate thing to want (a deeper DPB recovers from loss
+    /// with a clean P-frame instead of a 20-40x IDR spike), so this does not forbid it —
+    /// it forbids raising it past the point where clients stop being able to decode us
+    /// at all. There are nine slots of headroom; spend them knowingly.
+    #[test]
+    fn rfi_dpb_fits_a_mainstream_vulkan_decoder() {
+        /// `VkVideoCapabilitiesKHR::maxDpbSlots` on NVIDIA — the lowest cap among the
+        /// decoders punktfunk targets.
+        const VULKAN_MAX_DPB_SLOTS: u32 = 16;
+        // RFI_DPB references + the current picture = what the SPS declares; + 1 again
+        // for the picture being decoded = what the backend's slot pool must hold.
+        let slots_needed = RFI_DPB + 2;
+        assert!(
+            slots_needed <= VULKAN_MAX_DPB_SLOTS,
+            "RFI_DPB = {RFI_DPB} makes the host emit a stream needing {slots_needed} DPB \
+             slots, and mainstream Vulkan Video decode caps at {VULKAN_MAX_DPB_SLOTS} — \
+             every access unit would be refused and the client would drop the codec"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::library::{
     RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
 };
 use crate::model::{ConsoleCmd, HostRow};
+use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
 use crate::theme::{accent, fg, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
@@ -30,6 +31,9 @@ pub(crate) struct LibraryScreen {
     games: Vec<LibraryGame>,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
+    /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
+    /// is a few degrees and well inside a finger's slop), empty for culled cards.
+    geom: Vec<Rect>,
     anim: Spring,
     bump: Spring,
     /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
@@ -49,6 +53,7 @@ impl LibraryScreen {
             phase: LibraryPhase::Loading,
             games: Vec::new(),
             cursor: 0,
+            geom: Vec::new(),
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             art: HashMap::new(),
@@ -149,6 +154,43 @@ impl LibraryScreen {
                 }
                 None
             }
+        }
+    }
+
+    /// Mouse/touch on the coverflow. Same rule as the home carousel: the centre card
+    /// launches, any other one only comes to the front.
+    pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        match p.kind {
+            PointerKind::Scroll { up } => {
+                self.step(if up { -1 } else { 1 }, false);
+                true
+            }
+            PointerKind::Press => {
+                // The cards OVERLAP, and the ones nearest the cursor are drawn on top —
+                // so among the rects a press falls in, the topmost is the nearest. Picking
+                // the first by index would hand the press to a card buried underneath.
+                let hit = self
+                    .geom
+                    .iter()
+                    .enumerate()
+                    // The geometry is a frame old; a library refresh can shorten the shelf
+                    // between the render that recorded it and this press.
+                    .filter(|(i, r)| *i < self.games.len() && p.hits(**r))
+                    .min_by_key(|(i, _)| (*i as i32 - self.cursor).abs())
+                    .map(|(i, _)| i);
+                match hit {
+                    Some(i) if i == self.cursor as usize => {
+                        self.menu(MenuEvent::Confirm, ctx, fx);
+                        true
+                    }
+                    Some(i) => {
+                        self.cursor = i as i32;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -326,6 +368,8 @@ impl LibraryScreen {
         // dense side stacks overlap toward the focus.
         let mut order: Vec<usize> = (0..self.games.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse((i as i32 - self.cursor).abs()));
+        self.geom.clear();
+        self.geom.resize(self.games.len(), Rect::new_empty());
 
         for i in order {
             let d = i as f64 - pos;
@@ -342,6 +386,12 @@ impl LibraryScreen {
                 d.signum() * (FOCUS_GAP + (a - 1.0) * SIDE_SPACING) * k
             };
             let ccx = f64::from(rect.left) + w / 2.0 + offset + bump;
+            self.geom[i] = Rect::from_xywh(
+                (ccx - card_w * scale / 2.0) as f32,
+                (cy - card_h * scale / 2.0) as f32,
+                (card_w * scale) as f32,
+                (card_h * scale) as f32,
+            );
             let m = card_matrix(ccx, cy, angle, scale, card_w, card_h, PERSPECTIVE * k);
 
             let game = &self.games[i];

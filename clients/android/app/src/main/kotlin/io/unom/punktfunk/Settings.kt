@@ -158,6 +158,16 @@ data class Settings(
      * toggle is hidden on devices without a vibrator (TVs), where this would be a silent no-op.
      */
     val rumbleOnPhone: Boolean = false,
+    /**
+     * Opt-in: use this phone's own gyroscope as controller 1's motion when the forwarded pad has
+     * none of its own — for clip-on gamepads without an IMU, where the phone body moves with the
+     * player's hands. The rumble mirror's sibling, data flowing the other way. Off by default;
+     * read once per session by StreamScreen (it starts a [io.unom.punktfunk.kit.DeviceGyro] only
+     * when set), and the mirror stands down by itself whenever wire pad 0 is fed by a capture
+     * link (USB DualSense / SC2 — pads with a real gyro). The toggle is hidden on devices
+     * without a gyroscope (TVs), where this would be a silent no-op.
+     */
+    val gyroOnPhone: Boolean = false,
 
     /**
      * Capture a Steam Controller 2 (wired / Puck dongle over USB, or an already-paired BLE pad)
@@ -300,6 +310,7 @@ class SettingsStore(context: Context) {
         smoothBuffer = prefs.getInt(K_SMOOTH_BUFFER, 0),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
+        gyroOnPhone = prefs.getBoolean(K_GYRO_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
         dsCapture = prefs.getBoolean(K_DS_CAPTURE, true),
         padHaptics = prefs.getBoolean(K_PAD_HAPTICS, true),
@@ -340,6 +351,7 @@ class SettingsStore(context: Context) {
             .putInt(K_SMOOTH_BUFFER, s.smoothBuffer)
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
+            .putBoolean(K_GYRO_ON_PHONE, s.gyroOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
             .putBoolean(K_DS_CAPTURE, s.dsCapture)
             .putBoolean(K_PAD_HAPTICS, s.padHaptics)
@@ -390,6 +402,7 @@ class SettingsStore(context: Context) {
         const val K_SMOOTH_BUFFER = "smooth_buffer"
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
+        const val K_GYRO_ON_PHONE = "gyro_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
         const val K_DS_CAPTURE = "ds_capture"
         const val K_PAD_HAPTICS = "pad_haptics"

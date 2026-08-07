@@ -224,9 +224,18 @@ struct StreamHUDView: View {
 
     /// The card's inner content padding. Roomier on tvOS — the stat text auto-scales for the
     /// couch (relative system styles), so the card's chrome must keep pace or it reads cramped.
+    ///
+    /// On iOS it also has to CLEAR THE CORNER. A rounded corner of radius `r` pulls the card's
+    /// edge inward by `r − √(r² − (r−y)²)` at a distance `y` below the top, so the first and last
+    /// lines of a padded stack sit inside the arc unless the padding keeps pace with the radius.
+    /// At `0.45 · r` that intrusion stays well inside the padding across the whole range this
+    /// card can wear (≈4.6 pt of arc against 12.6 pt of padding at the 28 pt cap), so no line
+    /// ever runs into the curve.
     private var cardPadding: CGFloat {
         #if os(tvOS)
         return 16
+        #elseif os(iOS)
+        return max(10, cardCornerRadius * 0.45)
         #else
         return 10
         #endif
@@ -246,13 +255,20 @@ struct StreamHUDView: View {
         #endif
     }
 
-    /// The card's corner radius. On iOS it's concentric with the physical display corner —
-    /// `displayCornerRadius − edgeInset`, so the gap to the screen edge stays uniform right around the
-    /// corner instead of a small-radius card cutting into the very rounded glass. Clamped so a
-    /// flat-cornered device (or a hidden radius) still gets a sensibly rounded card.
+    /// The card's corner radius. On iOS it aims to be concentric with the physical display
+    /// corner — `displayCornerRadius − edgeInset`, so the gap to the screen edge stays uniform
+    /// right around the corner instead of a small-radius card cutting into the very rounded
+    /// glass — but that aim is BOUNDED by what a card this small can actually carry.
+    ///
+    /// Unbounded, a modern phone (~62 pt of display radius) asked for a 48 pt corner on a card
+    /// whose lines sit 10 pt from the edge: the arc reaches ~19 pt inward at the first line, so
+    /// the top and bottom lines rendered INSIDE the curve. Concentricity is only a virtue while
+    /// the radius is small next to the card; past that it is just a blob eating its own text.
+    /// 28 pt is the most this card's stack can wear (with `cardPadding` scaling alongside), and
+    /// devices whose display radius asks for less than that still get a truly concentric corner.
     private var cardCornerRadius: CGFloat {
         #if os(iOS)
-        return max(12, DeviceMetrics.displayCornerRadius - edgeInset)
+        return min(28, max(12, DeviceMetrics.displayCornerRadius - edgeInset))
         #elseif os(tvOS)
         return 16 // scales with the roomier padding
         #else

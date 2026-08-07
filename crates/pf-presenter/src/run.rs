@@ -17,7 +17,9 @@
 //! D disconnect, S stats tier, V microphone mute.
 
 use crate::input::{Capture, FingerPhase};
-use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
+use crate::overlay::{
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, SessionPhase,
+};
 use crate::present_pace::{
     Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, MARGIN_MAX_NS, MARGIN_STEP_NS,
 };
@@ -718,6 +720,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 if o.handle_event(&event) {
                     continue;
                 }
+                // …and the same for mouse/touch, which the console hit-tests in its own
+                // pixel space. Consumed while the console is up; ignored while streaming,
+                // where these belong to `Capture` below.
+                if let Some(input) = overlay_pointer(&event, &window) {
+                    if o.handle_pointer(input) {
+                        continue;
+                    }
+                }
             }
             match event {
                 Event::Quit { .. } => {
@@ -1196,6 +1206,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 st.canceled = true;
                                 st.handle.stop.store(true, Ordering::SeqCst);
                             }
+                        }
+                    }
+                    // The console already toasted "Link copied"; a clipboard SDL refuses is
+                    // worth a log line but not worth contradicting the toast over.
+                    OverlayAction::CopyText(text) => {
+                        if let Err(e) = video.clipboard().set_clipboard_text(&text) {
+                            tracing::warn!(error = %e, "copying to the clipboard");
                         }
                     }
                     action => {
@@ -2358,6 +2375,82 @@ fn apply_capture(
             }
         }
     }
+}
+
+/// One SDL mouse/touch event as the overlay wants it: swapchain PIXELS, which is the
+/// space the console renders and hit-tests in. `None` for events the console can't use.
+///
+/// Two different conversions, and mixing them up puts every click off by the display
+/// scale: SDL reports mouse positions in WINDOW coordinates (logical units — 1× on a
+/// HiDPI panel at 200 % is half a pixel), while fingers arrive window-NORMALIZED (0..1).
+/// Only DIRECT touch devices are offered; an indirect trackpad already drives the mouse,
+/// and forwarding both would double every tap.
+fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<PointerInput> {
+    let (pw, ph) = window.size_in_pixels();
+    let (lw, lh) = window.size();
+    // Logical → physical. A zero-sized window (minimized) would divide by zero.
+    let sx = pw as f32 / lw.max(1) as f32;
+    let sy = ph as f32 / lh.max(1) as f32;
+    let button = |b: sdl3::mouse::MouseButton| match b {
+        sdl3::mouse::MouseButton::Left => Some(PointerButton::Primary),
+        sdl3::mouse::MouseButton::Right => Some(PointerButton::Secondary),
+        _ => None,
+    };
+    Some(match event {
+        Event::MouseMotion { x, y, .. } => PointerInput::Move {
+            x: x * sx,
+            y: y * sy,
+        },
+        Event::MouseButtonDown {
+            mouse_btn, x, y, ..
+        } => PointerInput::Down {
+            x: x * sx,
+            y: y * sy,
+            button: button(*mouse_btn)?,
+        },
+        Event::MouseButtonUp {
+            mouse_btn, x, y, ..
+        } => PointerInput::Up {
+            x: x * sx,
+            y: y * sy,
+            button: button(*mouse_btn)?,
+        },
+        Event::MouseWheel {
+            y,
+            mouse_x,
+            mouse_y,
+            ..
+        } => PointerInput::Wheel {
+            x: mouse_x * sx,
+            y: mouse_y * sy,
+            dy: *y,
+        },
+        Event::FingerDown { touch_id, x, y, .. } if is_direct_touch(*touch_id) => {
+            PointerInput::Down {
+                x: x * pw as f32,
+                y: y * ph as f32,
+                button: PointerButton::Primary,
+            }
+        }
+        Event::FingerMotion { touch_id, x, y, .. } if is_direct_touch(*touch_id) => {
+            PointerInput::Move {
+                x: x * pw as f32,
+                y: y * ph as f32,
+            }
+        }
+        Event::FingerUp { touch_id, x, y, .. } if is_direct_touch(*touch_id) => PointerInput::Up {
+            x: x * pw as f32,
+            y: y * ph as f32,
+            button: PointerButton::Primary,
+        },
+        // The pointer left the window mid-press: drop the press rather than let a release
+        // that never comes leave a widget armed forever.
+        Event::Window {
+            win_event: WindowEvent::MouseLeave,
+            ..
+        } => PointerInput::Cancel,
+        _ => return None,
+    })
 }
 
 /// Is this SDL touch device a real touchscreen (DIRECT, window-relative coordinates)?

@@ -66,6 +66,13 @@ public final class GamepadCapture {
         var buttons: UInt32 = 0
         var axes: [Int32] = [0, 0, 0, 0, 0, 0]
         var fingerActive: [Bool] = [false, false]
+        /// A motion sample went out on this pad — `flush` then owes the wire a zero-gyro
+        /// sample: the host holds motion as STATE and re-emits it, so a nonzero angular
+        /// velocity left behind reads as endless rotation (the gyro-sweep latch).
+        var motionSent = false
+        /// The last accel sent, re-used by the flush zero so "rotation stopped" doesn't
+        /// also replace a plausible gravity vector with free-fall.
+        var lastAccel: (Int16, Int16, Int16) = (0, 0, 0)
         // Hold-Select→guide gesture state (pf-client-core's `SelectGesture`, adapted to
         // this class's mask-diff model): a Select pressed ALONE is held out of the mask
         // until it resolves into a tap (delivered on release) or — past `guideHold` — a
@@ -158,6 +165,15 @@ public final class GamepadCapture {
     /// everywhere but macOS). See `guideHold`.
     public let guideGesture: Bool
 
+    #if os(iOS)
+    /// Opt-in phone-gyro mirror (`DefaultsKey.gyroFromDevice`): while player 1's forwarded
+    /// controller has no rotation sensor, this device's IMU sources pad 0's motion instead —
+    /// for clip-on pads without a gyro. Session-scoped (the setting is read once here); nil
+    /// when off, unavailable, or forwarding is off (the mirror is wire-only, so with nothing
+    /// to send there is nothing to mirror). Engage/stand-down lives in `updateDeviceGyro`.
+    private let deviceGyro: DeviceGyro?
+    #endif
+
     public init(
         connection: PunktfunkConnection, manager: GamepadManager, forwarding: Bool = true,
         systemForward: Bool = true, guideGesture: Bool = false
@@ -167,6 +183,17 @@ public final class GamepadCapture {
         self.forwarding = forwarding
         self.systemForward = systemForward
         self.guideGesture = guideGesture
+        #if os(iOS)
+        if forwarding, DeviceGyro.isAvailable,
+            UserDefaults.standard.bool(forKey: DefaultsKey.gyroFromDevice) {
+            deviceGyro = DeviceGyro { [weak connection] gyro, accel in
+                // Thread-safe (sendMotion locks); pad 0 by the same rule as the rumble mirror.
+                connection?.sendMotion(pad: 0, gyro: gyro, accel: accel)
+            }
+        } else {
+            deviceGyro = nil
+        }
+        #endif
     }
 
     public func start() {
@@ -192,6 +219,9 @@ public final class GamepadCapture {
             MainActor.assumeIsolated {
                 self?.suspended = true
                 self?.releaseAll()
+                // The mirror pauses with capture (its stop parks the host pad's rotation
+                // at zero — an overlay pull-down must not leave the game spinning).
+                self?.updateDeviceGyro()
             }
         })
         observers.append(NotificationCenter.default.addObserver(
@@ -204,11 +234,15 @@ public final class GamepadCapture {
                 for slot in self.slots {
                     if let ext = slot.controller.extendedGamepad { self.sync(slot, ext) }
                 }
+                self.updateDeviceGyro()
             }
         })
     }
 
     public func stop() {
+        #if os(iOS)
+        deviceGyro?.stop()
+        #endif
         closeAllSlots()
         forwardedSub = nil
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -229,6 +263,8 @@ public final class GamepadCapture {
         }
         // A chord-holding pad may have just unplugged — re-evaluate so a stale hold disarms.
         updateEscapeChord()
+        // Pad 0 may have changed hands — re-evaluate whether this device's IMU speaks for it.
+        updateDeviceGyro()
     }
 
     /// Open one forwarded controller on its assigned wire index: attach GC handlers, claim its
@@ -599,6 +635,13 @@ public final class GamepadCapture {
 
     private func forwardMotion(_ slot: Slot, _ m: GCMotion) {
         guard !suspended else { return }
+        #if os(iOS)
+        // While the phone-gyro mirror speaks for pad 0, the controller's own motion —
+        // necessarily rotation-less, that's the engage condition — stays off the wire:
+        // two writers on one pad's motion state would fight, and this accel-only stream
+        // would keep stomping the mirror's gyro with zeros.
+        if slot.pad == 0, deviceGyro?.isRunning == true { return }
+        #endif
         // Every sample goes out. There used to be a 4 ms floor here, and it was a DROP: a sample
         // arriving 3.9 ms after the last one was discarded outright.
         //
@@ -650,18 +693,38 @@ public final class GamepadCapture {
         let g = GamepadWire.appleMotionToWire(
             (Float(m.rotationRate.x), Float(m.rotationRate.y), Float(m.rotationRate.z)))
         let a = GamepadWire.appleMotionToWire((ax, ay, az))
-        wire?.sendMotion(
-            pad: UInt8(slot.pad),
-            gyro: (
-                GamepadWire.motionRaw(g.0, scale: gs),
-                GamepadWire.motionRaw(g.1, scale: gs),
-                GamepadWire.motionRaw(g.2, scale: gs)
-            ),
-            accel: (
-                GamepadWire.motionRaw(a.0, scale: as_),
-                GamepadWire.motionRaw(a.1, scale: as_),
-                GamepadWire.motionRaw(a.2, scale: as_)
-            ))
+        let gyro = (
+            GamepadWire.motionRaw(g.0, scale: gs),
+            GamepadWire.motionRaw(g.1, scale: gs),
+            GamepadWire.motionRaw(g.2, scale: gs)
+        )
+        let accel = (
+            GamepadWire.motionRaw(a.0, scale: as_),
+            GamepadWire.motionRaw(a.1, scale: as_),
+            GamepadWire.motionRaw(a.2, scale: as_)
+        )
+        // Recorded AFTER the frame conversion, deliberately: `flush` replays `lastAccel` beside a
+        // zero gyro, so it has to be the vector that actually went on the wire. Stashing the
+        // pre-conversion one would park a still pad's gravity in the wrong axis.
+        if wire != nil {
+            slot.motionSent = true
+            slot.lastAccel = accel
+        }
+        wire?.sendMotion(pad: UInt8(slot.pad), gyro: gyro, accel: accel)
+    }
+
+    /// Engage or stand down the phone-gyro mirror: it speaks for pad 0 exactly while a
+    /// forwarded controller holds that index but can't rotate for itself — no `GCMotion`,
+    /// or a motion object without a rotation rate (gravity-only pads, e.g. an Xbox pad on
+    /// iOS). Re-evaluated on every reconcile and on suspend/resume; `DeviceGyro.stop`
+    /// parks the host pad's rotation at zero, so standing down never strands a spin.
+    private func updateDeviceGyro() {
+        #if os(iOS)
+        guard let gyro = deviceGyro else { return }
+        let pad0 = slots.first { $0.pad == 0 }
+        let wants = !suspended && pad0 != nil && pad0!.controller.motion?.hasRotationRate != true
+        if wants { gyro.start() } else { gyro.stop() }
+        #endif
     }
 
     /// Arm the disconnect timer when ANY forwarded pad holds the full escape chord, disarm the
@@ -704,6 +767,14 @@ public final class GamepadCapture {
         for (f, active) in slot.fingerActive.enumerated() where active {
             wire?.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(f), active: false, x: 0, y: 0)
             slot.fingerActive[f] = false
+        }
+        // Motion is host-side STATE, re-emitted until replaced — a nonzero angular velocity
+        // left behind reads as endless rotation (the gyro-sweep latch: Control Center
+        // pull-down froze the last sample for as long as the overlay stayed up). Rest means
+        // zero rotation; the last accel is kept so gravity doesn't become free-fall.
+        if slot.motionSent {
+            slot.motionSent = false
+            wire?.sendMotion(pad: UInt8(slot.pad), gyro: (0, 0, 0), accel: slot.lastAccel)
         }
     }
 
