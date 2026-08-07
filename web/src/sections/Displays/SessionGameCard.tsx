@@ -1,5 +1,4 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { type FC, type ReactNode, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
@@ -11,6 +10,7 @@ import {
 } from "@/api/gen/session/session";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -142,6 +142,13 @@ export const SessionGameCard: FC = () => {
 									htmlFor="session-grace-seconds"
 								>
 									<div className="flex items-center gap-2">
+										{/* Deliberately NOT `InputNumber`, unlike the numeric fields on
+										    the policy card next door. This one writes to the HOST on
+										    blur, and InputNumber commits while you type — so its own
+										    blur-time clamp would race the apply below, which still
+										    closes over the pre-clamp value. The host is the authority
+										    here regardless: it clamps to 10..=86400 on write and
+										    answers with what it actually stored. */}
 										<Input
 											id="session-grace-seconds"
 											type="number"

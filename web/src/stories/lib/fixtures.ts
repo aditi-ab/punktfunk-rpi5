@@ -3,6 +3,9 @@
 import type { AvailableCompositor } from "@/api/gen/model/availableCompositor";
 import type { Capture } from "@/api/gen/model/capture";
 import type { CaptureMeta } from "@/api/gen/model/captureMeta";
+import type { CustomPreset } from "@/api/gen/model/customPreset";
+import type { DisplayPolicy } from "@/api/gen/model/displayPolicy";
+import type { EffectivePolicy } from "@/api/gen/model/effectivePolicy";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { HostInfo } from "@/api/gen/model/hostInfo";
 import type { NativeClient } from "@/api/gen/model/nativeClient";
@@ -297,3 +300,96 @@ export const nativeClients: NativeClient[] = [
 ];
 
 export const pairingIdle: PairingStatus = { pin_pending: false };
+
+/** The six axes a preset expands to — the baseline the built-ins vary from. */
+const policyFields = (
+	over: Partial<EffectivePolicy> = {},
+): EffectivePolicy => ({
+	identity: "per-client",
+	keep_alive: { mode: "duration", seconds: 300 },
+	layout: { mode: "auto-row", positions: {} },
+	max_displays: 4,
+	mode_conflict: "separate",
+	topology: "auto",
+	...over,
+});
+
+/**
+ * The built-in presets as `GET /display/settings` returns them. Summaries are the host's own prose
+ * (it composes them from the fields), so they are literal strings here rather than i18n messages.
+ */
+export const displayPresets: {
+	id: string;
+	summary: string;
+	fields: EffectivePolicy;
+}[] = [
+	{
+		id: "default",
+		summary:
+			"A virtual display per client, released 5 minutes after it disconnects.",
+		fields: policyFields(),
+	},
+	{
+		id: "shared-desktop",
+		summary:
+			"Every client sees the same desktop — no extra displays are created.",
+		fields: policyFields({
+			identity: "shared",
+			topology: "primary",
+			mode_conflict: "join",
+		}),
+	},
+	{
+		id: "hotdesk",
+		summary:
+			"One display at a time; the physical heads go dark while you stream.",
+		fields: policyFields({
+			topology: "exclusive",
+			max_displays: 1,
+			keep_alive: { mode: "off" },
+		}),
+	},
+	{
+		id: "workstation",
+		summary: "Adds a display beside the monitors already on the desk.",
+		fields: policyFields({ topology: "extend" }),
+	},
+	{
+		id: "gaming-rig",
+		summary:
+			"Pins the display so it survives every disconnect — free it with Release.",
+		fields: policyFields({
+			topology: "exclusive",
+			keep_alive: { mode: "forever" },
+		}),
+	},
+];
+
+/** Two operator-saved bundles, so the custom-preset rail has something in it. */
+export const displayCustomPresets: CustomPreset[] = [
+	{
+		id: "cp-couch",
+		name: "Couch (TV only)",
+		fields: policyFields({
+			topology: "exclusive",
+			max_displays: 1,
+			keep_alive: { mode: "forever" },
+		}),
+		game_session: "dedicated",
+	},
+	{
+		id: "cp-office",
+		name: "Office desk",
+		fields: policyFields({ topology: "extend", identity: "shared" }),
+	},
+];
+
+/** What the host reports as in force — the `default` preset's expansion. */
+export const displayEffective: EffectivePolicy = policyFields();
+
+/** The stored policy: a plain built-in pick, which is what most hosts sit on. */
+export const displayPolicy: DisplayPolicy = {
+	preset: "default",
+	game_session: "auto",
+	version: 1,
+};

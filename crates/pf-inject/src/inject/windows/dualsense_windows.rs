@@ -23,12 +23,13 @@ use super::dualsense_proto::{
     DS_TOUCH_W,
 };
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
+use crate::sensor_clock::SensorClock;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::RichInput;
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
@@ -70,6 +71,46 @@ pub(super) const OFF_OUT_RING: usize =
 pub(super) const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
 pub(super) const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
 pub(super) const OUT_RING_LEN_V22: u32 = pf_driver_proto::gamepad::OUT_RING_LEN_V22;
+/// v2.3 input seqlock — see [`publish_input`] and the `PadShm` docs.
+pub(super) const OFF_INPUT_GEN: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, input_gen);
+
+/// Publish one HID input report into the section's input slot under the v2.3 seqlock, so a driver
+/// reading concurrently can tell a whole report from a half-written one.
+///
+/// The slot is a single unqueued buffer neither side locks: the driver's timer copies 64 bytes out
+/// of it whenever it likes, including in the middle of this write. The result is a frame that is
+/// part previous report and part next — a one-tick glitch for a button, but for motion a spike in
+/// angular velocity, and a game integrating gyro aim turns that spike into aim it never asked for.
+///
+/// `generation` is the pad's own counter, taken to **odd** before the body goes down and back to
+/// **even** after; a driver samples it either side of its read and retries when the two disagree.
+/// The `Release` fence keeps the body stores from sinking above the odd marker, and the `Release`
+/// store publishes them ahead of the even one — both no-ops on x86-TSO and load-bearing on ARM64.
+///
+/// # Safety
+/// `base` must point at a live mapped pad section of at least `PAD_SHM_SIZE` bytes, and `report`
+/// must be no longer than the 64-byte input slot.
+pub(super) unsafe fn publish_input(base: *mut u8, generation: &mut u32, report: &[u8]) {
+    debug_assert!(report.len() <= 64, "report overruns the input slot");
+    // Odd: a report is in flight.
+    *generation = generation.wrapping_add(1);
+    // SAFETY: the caller guarantees `base` maps the section; `OFF_INPUT_GEN` (== 168) is 4-aligned
+    // off the page-aligned base and sits in the v2 legacy region every driver generation maps.
+    unsafe {
+        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Relaxed)
+    };
+    // Ordered, not ordering: keeps the body stores below from being hoisted above the odd marker.
+    fence(Ordering::Release);
+    // SAFETY: the caller guarantees the mapping and that `report` fits the slot at OFF_INPUT.
+    unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), base.add(OFF_INPUT), report.len()) };
+    // Even: the slot holds a whole report again.
+    *generation = generation.wrapping_add(1);
+    // SAFETY: as the first store.
+    unsafe {
+        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Release)
+    };
+}
 
 /// Shared drain over a pad section's output plane — the lossless report ring when the driver
 /// publishes one (8 slots from a v2.1 driver, [`OUT_RING_LEN_V22`] once both sides negotiated the
@@ -216,7 +257,9 @@ pub struct DsWinPad {
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     seq: u8,
-    ts: u32,
+    clock: SensorClock,
+    /// This pad's v2.3 input-seqlock generation — see [`publish_input`].
+    input_gen: u32,
     /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
     drain: OutputDrain,
 }
@@ -511,7 +554,8 @@ impl DsWinPad {
                 instance_id,
             ),
             seq: 0,
-            ts: 0,
+            clock: SensorClock::dualsense(),
+            input_gen: 0,
             drain: OutputDrain::new(),
         })
     }
@@ -519,28 +563,17 @@ impl DsWinPad {
     /// Serialize `st` into report `0x01` and publish it to the section's input slot.
     pub(super) fn write_state(&mut self, st: &DsState) {
         self.seq = self.seq.wrapping_add(1);
-        self.ts = self.ts.wrapping_add(1);
+        let ts = self.clock.ds_ticks(Instant::now());
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, self.ts);
-        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64. Unlike the
-        // XUSB `packet` / DualSense `out_seq` fields, the input path has NO driver-polled change-detect
-        // field to publish last: the `pf_gamepad` driver streams the whole `input` region to game
-        // READ_REPORTs on its ~125 Hz timer, and the report's own sequence counter (r[7], mid-report)
-        // is consumed by the game's HID stack, not the driver — so it cannot serve as a separable
-        // publish flag without a seqlock generation the driver `Acquire`-reads (a `PadShm` layout +
-        // driver change, deferred). The `Release` fence after the copy orders the report-body stores
-        // ahead of this pad's next `Release` publish (the bootstrap/seq stores in `channel.pump()`),
-        // giving the copy Release visibility on a weakly-ordered core (ARM64); on x86-TSO it is a
-        // no-op. Residual: absent a driver-side `Acquire` on a per-frame input generation, a torn
-        // single frame is still theoretically possible but self-heals on the next ~250 Hz write.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                r.as_ptr(),
-                self.channel.data_base().add(OFF_INPUT),
-                r.len(),
-            );
-            fence(Ordering::Release);
-        };
+        serialize_state(&mut r, st, self.seq, ts);
+        // The input path has no driver-polled change-detect field the way the XUSB `packet` /
+        // DualSense `out_seq` planes do — the driver streams the whole `input` region to game
+        // READ_REPORTs on its timer, and the report's own counter (r[7], mid-report) belongs to
+        // the game's HID stack, not the driver. That used to leave a torn single frame possible.
+        // The v2.3 seqlock closes it: see `publish_input`.
+        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
+        // input report.
+        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
     }
 
     /// Drain the section's output plane; parse every new `0x02` report (rumble / LEDs / triggers)
@@ -629,6 +662,14 @@ impl PadProto for DsWinProto {
     /// split the one touchpad left/right, pad clicks ride touch_click.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
+    }
+
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DsWinPad, st: &DsState) {

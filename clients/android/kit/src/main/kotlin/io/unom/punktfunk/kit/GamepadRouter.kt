@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -31,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Threading: slot mutation + dispatch run on the main thread (Android input dispatch and the
  * InputManager hot-plug callbacks both land there). [deviceForPad] is read from the feedback poll
- * threads, so the slot table is a [ConcurrentHashMap].
+ * threads, [padPresent]/[padHasOwnMotion] from the phone-gyro thread and [deviceMotion] from the
+ * pad-sensor thread, so the slot table is a [ConcurrentHashMap].
  */
 class GamepadRouter(
     context: Context,
@@ -69,7 +71,18 @@ class GamepadRouter(
 ) {
 
     /** One forwarded controller: its stable wire pad index, per-device axis state, and held buttons. */
-    private class Slot(val index: Int, val mapper: Gamepad.AxisMapper) {
+    private class Slot(
+        val index: Int,
+        val mapper: Gamepad.AxisMapper,
+        /**
+         * Whether motion sent for this pad can reach the game at all, asked once at open off the
+         * kind it declared ([NativeBridge.nativePadMotionReaches]). False means the host built it a
+         * backend with no motion plane, so [deviceMotion] drops the sample here rather than paying
+         * to send one the host will decode and discard — at a controller's full sensor rate, for
+         * the whole session. The capture-link pads carry the same flag on [ExternalPad].
+         */
+        val motionReaches: Boolean = true,
+    ) {
         /** Forwarded button bits currently held (Gamepad.BTN_*) — for release-on-close + chord detection. */
         var held = 0
 
@@ -85,11 +98,32 @@ class GamepadRouter(
     private val slots = ConcurrentHashMap<Int, Slot>()
 
     /**
-     * Invoked (main thread) with the deviceId whenever a slot closes — hot-unplug or session teardown.
-     * `StreamScreen` wires this to `GamepadFeedback.onDeviceRemoved` so a disconnected pad's rumble /
-     * lights bindings are released promptly instead of leaking until the feedback threads stop.
+     * deviceIds whose own gyro [PadSensors] is currently reading — see [setDeviceHasSensorMotion].
+     * Written on the main thread, read from the phone-gyro thread, hence a concurrent set.
+     */
+    private val sensorDevices: MutableSet<Int> =
+        Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+
+    /**
+     * Invoked (main thread) with the deviceId whenever a slot closes — hot-unplug, a capture link's
+     * [releaseDevice] claim, or session teardown. `StreamScreen` wires this to
+     * `GamepadFeedback.onDeviceRemoved` so a disconnected pad's rumble / lights bindings are
+     * released promptly instead of leaking until the feedback threads stop, and to
+     * [PadSensors.onSlotClosed] so the controller's own sensor listeners come off with it.
      */
     var onSlotClosed: ((deviceId: Int) -> Unit)? = null
+
+    /**
+     * Invoked (main thread) with the deviceId whenever a slot opens for a REAL controller — the
+     * hot-plug callback or the first input from a pad the session started without. Not fired for
+     * [openExternal]: a capture link's pad has no [InputDevice] behind it and streams motion from
+     * its own IMU already. `StreamScreen` wires this to [PadSensors.onSlotOpened].
+     *
+     * Slots opened in `init` (every controller already connected) predate any assignment here, so
+     * a listener must sweep [forwardedDevices] once when it starts. Both happen on the main thread
+     * inside one composition block, so nothing can slip between the sweep and the assignment.
+     */
+    var onSlotOpened: ((deviceId: Int) -> Unit)? = null
 
     /**
      * Invoked (main thread) when the emergency-exit chord has been HELD for [EXIT_HOLD_MS] — the caller
@@ -114,6 +148,17 @@ class GamepadRouter(
      * chord adds a meaning to them rather than swallowing them, exactly as the exit chord does.
      */
     var onMicChord: (() -> Unit)? = null
+
+    /**
+     * Invoked (main thread) once per pad when a captured controller WITH a gyro turns out to be in
+     * a session whose virtual pad has no motion plane — its motion is not being sent, because every
+     * sample would be decoded and dropped host-side.
+     *
+     * It exists because the failure is otherwise completely silent: the gyro just does nothing, and
+     * from the couch that is indistinguishable from a broken sensor. The fix is the Controller type
+     * setting, so whatever shows this has to name it. `StreamScreen` wires it to a brief notice.
+     */
+    var onMotionUnreachable: (() -> Unit)? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     /** The pending exit-chord hold timer, or null when the chord isn't currently armed. */
@@ -324,14 +369,59 @@ class GamepadRouter(
     fun padPresent(pad: Int): Boolean = slots.values.any { it.index == pad }
 
     /**
-     * Whether wire pad [pad] is held by a capture-link slot ([ExternalPad] — USB DualSense /
-     * SC2), whose motion arrives from the pad's OWN IMU. The phone-gyro mirror stands down for
-     * those: two motion writers on one wire pad would fight. Synthetic ids are negative
-     * ([EXTERNAL_ID_BASE]); real [InputDevice] ids are positive. Read from the phone-gyro thread
-     * (the slot table is concurrent).
+     * Whether wire pad [pad]'s motion already comes from the controller's OWN IMU — either a
+     * capture-link slot ([ExternalPad] — USB DualSense / SC2; synthetic ids are negative
+     * ([EXTERNAL_ID_BASE]), real [InputDevice] ids positive), or a real controller whose gyro
+     * [PadSensors] is reading through the platform sensor framework (a Bluetooth DualSense /
+     * Switch Pro / 8BitDo). The phone-gyro mirror stands down for both: two motion writers on one
+     * wire pad would fight, and the pad's own IMU is the one attached to the player's hands.
+     * Read from the phone-gyro thread (both tables are concurrent).
      */
     fun padHasOwnMotion(pad: Int): Boolean =
-        slots.any { (id, slot) -> slot.index == pad && id < 0 }
+        slots.any { (id, slot) -> slot.index == pad && (id < 0 || id in sensorDevices) }
+
+    /**
+     * Declare (or withdraw) that real controller [deviceId] is sourcing its own rotation — see
+     * [padHasOwnMotion]. Called by [PadSensors] as it registers and unregisters listeners, on the
+     * main thread; read from the phone-gyro thread, hence the concurrent set. Keyed by device
+     * rather than by pad index so a controller that changes wire index (a lower one freed up while
+     * it was captured) carries the fact with it.
+     */
+    fun setDeviceHasSensorMotion(deviceId: Int, has: Boolean) {
+        if (has) sensorDevices.add(deviceId) else sensorDevices.remove(deviceId)
+        // This is the first moment we know a Bluetooth pad actually HAS a gyro — `openSlot` only
+        // knows what kind it declared. So it is the honest place to raise the notice when that
+        // gyro has nowhere to go, and the only one that cannot nag about a pad that never had one.
+        if (has && forwarding && slots[deviceId]?.motionReaches == false) {
+            onMotionUnreachable?.invoke()
+        }
+    }
+
+    /**
+     * One motion sample from real controller [deviceId]'s own sensors, on whatever wire index its
+     * slot currently holds — [ExternalPad.motion] for pads the input stack still owns. Silently
+     * drops when the slot is gone (unplugged, or claimed by a capture link between the sensor
+     * callback and here) rather than writing to an index that may already belong to someone else.
+     * Called from [PadSensors]' sensor thread.
+     */
+    fun deviceMotion(deviceId: Int, gyro: IntArray, accel: IntArray) {
+        val slot = slots[deviceId] ?: return
+        if (!forwarding) return
+        // The same gate the USB capture path takes: a backend with no motion plane decodes every
+        // sample and discards it, so sending is pure cost. Notified once per pad by
+        // [setDeviceHasSensorMotion], which is where we first know the controller HAS a gyro to
+        // lose — a pad without one must not produce a warning about motion.
+        if (!slot.motionReaches) return
+        NativeBridge.nativeSendPadMotion(
+            handle, slot.index,
+            gyro[0], gyro[1], gyro[2],
+            accel[0], accel[1], accel[2],
+        )
+    }
+
+    /** Snapshot of the REAL controllers currently forwarded, as deviceIds — the set [PadSensors]
+     *  sweeps at start for the pads that were already connected when the session opened. */
+    fun forwardedDevices(): List<Int> = slots.keys.filter { it >= 0 }
 
     /**
      * A capture-link pad occupying a wire slot without an Android [InputDevice] — the as-is Steam
@@ -339,7 +429,18 @@ class GamepadRouter(
      * the real slots' lifecycle: a stable lowest-free index, Arrival-before-input, held-state
      * flush + Remove on [close], and full participation in the emergency exit chord.
      */
-    inner class ExternalPad internal constructor(private val syntheticId: Int, val index: Int) {
+    inner class ExternalPad internal constructor(
+        private val syntheticId: Int,
+        val index: Int,
+        /**
+         * Whether this pad's motion can reach the game at all, asked once at open (see
+         * [NativeBridge.nativePadMotionReaches]). False means the host built this pad a backend
+         * without a motion plane, so [motion] drops the sample here instead of paying to send one
+         * the host will decode and discard — at a controller's full report rate, for the whole
+         * session.
+         */
+        private val motionReaches: Boolean,
+    ) {
         // Live lookup instead of a captured reference: after [close] (or a router release) the
         // slot is gone from the table and every entry point below degrades to a safe no-op.
         private val slot get() = slots[syntheticId]
@@ -370,7 +471,7 @@ class GamepadRouter(
         /** One motion sample on the rich plane (gyro pitch/yaw/roll + accel, raw device i16
          *  units — the host passes them straight into the virtual pad's report). Per report. */
         fun motion(gyro: IntArray, accel: IntArray) {
-            if (slot != null && forwarding) {
+            if (slot != null && forwarding && motionReaches) {
                 NativeBridge.nativeSendPadMotion(
                     handle, index,
                     gyro[0], gyro[1], gyro[2],
@@ -386,15 +487,26 @@ class GamepadRouter(
     /**
      * Open a slot for a capture-link pad, declaring [pref] as its kind; null when all 16 wire
      * indices are taken. Main thread (like the hot-plug callbacks).
+     *
+     * [hasGyro] says whether this link forwards motion on the RICH plane ([ExternalPad.motion]) —
+     * true for the Sony pads, whose IMU is a headline feature, and false for the Steam Controller 2,
+     * whose motion rides inside the opaque passthrough report that [ExternalPad.hidReport] carries
+     * and which nothing here may second-guess. It gates only the notice: a pad that never sends
+     * motion must not produce a warning about motion.
      */
-    fun openExternal(pref: Int): ExternalPad? {
+    fun openExternal(pref: Int, hasGyro: Boolean = false): ExternalPad? {
         val index = lowestFreeIndex() ?: return null
         // Synthetic ids live below any real InputDevice id (those are positive), so they can't
         // collide and InputDevice.getDevice(id) resolves them to null for the feedback path.
         val syntheticId = EXTERNAL_ID_BASE - index
         if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
+        // Asked once, here, off the kind this pad just DECLARED — not off the session's resolved
+        // backend, which under Automatic answers for whichever pad happened to be active at dial
+        // time. Cheap enough to ask unconditionally; the answer holds for the pad's lifetime.
+        val motionReaches = NativeBridge.nativePadMotionReaches(handle, pref)
+        if (forwarding && hasGyro && !motionReaches) onMotionUnreachable?.invoke()
         slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
-        return ExternalPad(syntheticId, index)
+        return ExternalPad(syntheticId, index, motionReaches)
     }
 
     /**
@@ -450,8 +562,18 @@ class GamepadRouter(
         // to that type (a single global choice — matches the handshake's session-default pref).
         val pref = if (setting == Gamepad.PREF_AUTO) Gamepad.prefFor(dev) else setting
         if (forwarding) NativeBridge.nativeSendGamepadArrival(handle, pref, index)
-        val slot = Slot(index, Gamepad.AxisMapper(handle, index))
+        // Asked here, off the kind this pad just DECLARED — not off the session's resolved backend,
+        // which under Automatic answers for whichever pad happened to be active at dial time. Held
+        // for the slot's life; the sensor path reads it on every sample.
+        val slot = Slot(
+            index,
+            Gamepad.AxisMapper(handle, index),
+            NativeBridge.nativePadMotionReaches(handle, pref),
+        )
         slots[dev.id] = slot
+        // After the table holds the slot, so a listener that sends on this device the moment it is
+        // told ([PadSensors]) finds an index to send on rather than dropping its first samples.
+        onSlotOpened?.invoke(dev.id)
         return slot
     }
 

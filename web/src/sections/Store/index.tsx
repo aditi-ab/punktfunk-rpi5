@@ -12,6 +12,7 @@ import {
 	useStoreJobs,
 	useUninstallPlugin,
 } from "@/api/store";
+import { useDialogs } from "@/components/dialogs";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
@@ -31,6 +32,7 @@ type StoreTab = "browse" | "installed" | "sources";
  */
 export const SectionStore: FC = () => {
 	useLocale();
+	const { confirm } = useDialogs();
 	const [tab, setTab] = useState<StoreTab>("browse");
 	// The catalog entry awaiting its install confirmation, and the raw-spec dialog's open state.
 	const [target, setTarget] = useState<StoreEntry | null>(null);
@@ -122,10 +124,13 @@ export const SectionStore: FC = () => {
 	};
 
 	const onUninstall = async (plugin: InstalledPlugin) => {
-		if (
-			!confirm(m.store_uninstall_confirm({ title: plugin.title ?? plugin.pkg }))
-		)
-			return;
+		const ok = await confirm({
+			title: m.store_uninstall_confirm({ title: plugin.title ?? plugin.pkg }),
+			description: m.store_uninstall_body(),
+			confirmLabel: m.store_uninstall(),
+			destructive: true,
+		});
+		if (!ok) return;
 		try {
 			const { job } = await uninstall.mutateAsync(plugin.pkg);
 			setJobId(job);

@@ -37,6 +37,14 @@ use punktfunk_core::input::gamepad as gs;
 pub const SWITCH_VENDOR: u32 = 0x057E; // Nintendo Co., Ltd
 pub const SWITCH_PRODUCT: u32 = 0x2009; // Pro Controller
 
+/// The raw IMU resolutions `hid-nintendo` reports a Pro Controller at — its own
+/// `JC_IMU_GYRO_RES_PER_DPS` (14.247, carried here in thousandths so the ratio stays exact) and
+/// `JC_IMU_ACCEL_RES_PER_G`. Fixed by the driver, not by us: the factory-calibration blob we serve
+/// is the driver's identity default, so it consumes our report at exactly these numbers.
+const JC_IMU_GYRO_MILLI_RES_PER_DPS: i32 = 14_247;
+/// See [`JC_IMU_GYRO_MILLI_RES_PER_DPS`].
+const JC_IMU_ACCEL_RES_PER_G: i32 = 4096;
+
 /// Nintendo Switch Pro Controller **USB** HID report descriptor (203 bytes) — a verbatim
 /// real-device capture (usbhid-dump off a wired Pro Controller; three independent public
 /// captures agree byte-for-byte: mzyy94's usbhid-dump, ToadKing's full USB capture, and
@@ -211,13 +219,32 @@ impl SwitchState {
         }
     }
 
+    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
+    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// `PadProto::neutralize_gyro`.
+    pub fn neutralize_gyro(&mut self) -> bool {
+        let changed = self.gyro != [0; 3];
+        self.gyro = [0; 3];
+        changed
+    }
+
+    /// Reset the rich-plane fields to a fresh pad's, leaving buttons/sticks alone — for the Pro
+    /// Controller that is motion only (it has no touchpad). `PadProto::clear_rich`.
+    pub fn clear_rich(&mut self) {
+        let fresh = SwitchState::neutral();
+        self.gyro = fresh.gyro;
+        self.accel = fresh.accel;
+    }
+
     /// Apply a wire motion sample (DualSense-convention units) as raw IMU values. No axis flip:
     /// both conventions are x-toward-triggers / z-up for a Pro Controller held like a DualSense,
     /// and the driver applies no negation for the Pro (only the right Joy-Con negates).
     pub fn apply_motion(&mut self, gyro: [i16; 3], accel: [i16; 3]) {
-        // gyro: wire 20 LSB/°·s → raw 14.247 LSB/°·s; accel: wire 10000 LSB/g → raw 4096 LSB/g.
-        self.gyro = gyro.map(|v| ((v as i32 * 14247) / 20000) as i16);
-        self.accel = accel.map(|v| ((v as i32 * 4096) / 10000) as i16);
+        // Wire units → the driver's raw units. Gyro is carried in thousandths so 14.247 stays exact.
+        let gyro_den = 1000 * gs::MOTION_GYRO_LSB_PER_DEG_S;
+        self.gyro = gyro.map(|v| ((v as i32 * JC_IMU_GYRO_MILLI_RES_PER_DPS) / gyro_den) as i16);
+        self.accel = accel
+            .map(|v| ((v as i32 * JC_IMU_ACCEL_RES_PER_G) / gs::MOTION_ACCEL_LSB_PER_G) as i16);
     }
 }
 

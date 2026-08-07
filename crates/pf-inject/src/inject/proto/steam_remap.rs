@@ -76,13 +76,15 @@ pub fn fold_paddles(mut buttons: u32, policy: PaddleFallback) -> u32 {
     buttons
 }
 
-// Motion rescale. The wire uses the DualSense convention (20 LSB/°·s gyro, 10000 LSB/g accel — the
-// scale every client capture applies). The Steam Deck's `hid-steam` report wants 16 LSB/°·s and
-// 16384 LSB/g, so the Deck backend rescales; the DualSense / DS4 backends consume the wire 1:1.
+// Motion rescale. The wire uses the DualSense convention (`gs::MOTION_*` — the scale every client
+// capture applies); the Steam Deck's `hid-steam` fixes STEAM_DECK_GYRO_RES_PER_DPS = 16 and
+// STEAM_DECK_ACCEL_RES_PER_G = 16384, so the Deck backend rescales. The DualSense / DS4 backends
+// consume the wire 1:1 instead, because their calibration blobs declare the wire's own units.
+// pf-inject's `motion_contract` test pins both halves of that sentence.
 const GYRO_NUM: i32 = 16;
-const GYRO_DEN: i32 = 20;
+const GYRO_DEN: i32 = gs::MOTION_GYRO_LSB_PER_DEG_S;
 const ACCEL_NUM: i32 = 16384;
-const ACCEL_DEN: i32 = 10000;
+const ACCEL_DEN: i32 = gs::MOTION_ACCEL_LSB_PER_G;
 
 fn scale(v: i16, num: i32, den: i32) -> i16 {
     ((v as i32 * num) / den).clamp(i16::MIN as i32, i16::MAX as i32) as i16

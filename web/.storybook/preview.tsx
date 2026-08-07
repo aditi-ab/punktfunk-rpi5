@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { defaultMaterialTheme, MaterialProvider } from "@unom/ui/material";
 import Section from "@unom/ui/section";
 import { useEffect } from "react";
+import { DialogsProvider } from "../src/components/dialogs";
 
 // React Query is present so any query-backed component mounts without a real
 // host. Stories should feed mock data rather than fetch — retries are off so a
@@ -51,15 +52,21 @@ export default definePreview({
 			return (
 				<QueryClientProvider client={queryClient}>
 					<MaterialProvider theme={defaultMaterialTheme}>
-						<div className={dark ? "dark" : ""}>
-							<Section maxWidth={false}>
-								<div
-									className={`min-h-screen bg-background text-foreground ${fullscreen ? "" : "p-6"}`}
-								>
-									<Story />
-								</div>
-							</Section>
-						</div>
+						{/* The console's confirm/prompt, same as __root mounts. Any section that can
+						    delete or discard something calls `useDialogs()`, which THROWS without
+						    this — so it belongs beside the other app-level providers rather than in
+						    each story's decorators. */}
+						<DialogsProvider>
+							<div className={dark ? "dark" : ""}>
+								<Section maxWidth={false}>
+									<div
+										className={`min-h-screen bg-background text-foreground ${fullscreen ? "" : "p-6"}`}
+									>
+										<Story />
+									</div>
+								</Section>
+							</div>
+						</DialogsProvider>
 					</MaterialProvider>
 				</QueryClientProvider>
 			);

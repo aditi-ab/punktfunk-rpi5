@@ -1,5 +1,4 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import type { FC } from "react";
 import {
@@ -10,6 +9,7 @@ import {
 import type { GpuState } from "@/api/gen/model";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
 import type { Loadable } from "@/lib/query";

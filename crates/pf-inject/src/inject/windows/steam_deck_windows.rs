@@ -18,8 +18,8 @@
 //! kernel's evdev parser; Steam-on-Windows reads the raw reports directly.
 
 use super::dualsense_windows::{
-    create_swdevice, OutputDrain, SwDeviceProfile, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT,
-    OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE, OFF_DRIVER_PROTO,
+    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::gamepad_raii::PadChannel;
 use super::steam_proto::{
@@ -45,6 +45,8 @@ pub struct DeckWinPad {
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     seq: u32,
+    /// This pad's v2.3 input-seqlock generation — see `publish_input`.
+    input_gen: u32,
     /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
     drain: OutputDrain,
 }
@@ -106,6 +108,7 @@ impl DeckWinPad {
                 instance_id,
             ),
             seq: 0,
+            input_gen: 0,
             drain: OutputDrain::new(),
         })
     }
@@ -115,14 +118,12 @@ impl DeckWinPad {
         self.seq = self.seq.wrapping_add(1);
         let mut r = [0u8; STEAM_REPORT_LEN];
         serialize_deck_state(&mut r, st, self.seq);
-        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                r.as_ptr(),
-                self.channel.data_base().add(OFF_INPUT),
-                r.len(),
-            )
-        };
+        // This path had neither the trailing `Release` its DualSense sibling carried nor any
+        // publish marker, so a driver read could land mid-copy AND the body stores had no ordering
+        // against the pad's next publish. `publish_input` gives it both (v2.3 seqlock).
+        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
+        // Deck state frame.
+        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
     }
 
     /// Poll the section's output slot; parse a newly-published Steam command (`0xEB` rumble /
@@ -208,6 +209,14 @@ impl PadProto for DeckWinProto {
 
     fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
         st.apply_rich(rich);
+    }
+
+    fn neutralize_gyro(&self, st: &mut SteamState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut SteamState) {
+        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DeckWinPad, st: &SteamState) {

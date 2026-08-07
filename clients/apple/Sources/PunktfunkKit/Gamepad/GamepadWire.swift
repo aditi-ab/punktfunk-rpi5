@@ -73,6 +73,30 @@ public enum GamepadWire {
     public static func motionRaw(_ value: Float, scale: Float) -> Int16 {
         Int16((value * scale).rounded().clamped(to: Float(Int16.min)...Float(Int16.max)))
     }
+
+    /// GameController's motion frame → the DualSense report frame the wire is defined in.
+    ///
+    /// The wire is a unit passthrough: the host writes these three components, in order, into the
+    /// virtual DualSense's report bytes 16../22.. — the same slots a real pad fills. So the frame
+    /// the wire is defined in is the pad's OWN report frame, and a client that forwards its
+    /// platform's axes unconverted is simply speaking a different language.
+    ///
+    /// Both frames were measured on 2026-08-07 from ONE physical DualSense on one desk — the pad
+    /// read twice, over raw HID and through GameController:
+    ///
+    ///   DualSense report frame: (Right, Up, Backward) — axis 0 carries pitch, 1 yaw, 2 roll
+    ///   GameController frame:   (Right, Forward, Up)
+    ///
+    /// Matching them up: Right is already slot 0; Up is GC's z, so it moves to slot 1; and slot 2
+    /// wants Backward, which is GC's y negated. Hence `(x, z, -y)`.
+    ///
+    /// Applied to gyro AND acceleration, because it is a change of basis and both are expressed in
+    /// that basis. The negation `forwardMotion` already does for acceleration is a separate matter
+    /// — that one converts Apple's gravity-VECTOR convention into the proper acceleration a real
+    /// pad reports, and it composes with this rather than replacing it.
+    public static func appleMotionToWire(_ v: (Float, Float, Float)) -> (Float, Float, Float) {
+        (v.0, v.2, -v.1)
+    }
 }
 
 extension Float {

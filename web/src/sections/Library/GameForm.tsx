@@ -10,6 +10,7 @@ import type { CustomInput } from "@/api/gen/model/customInput";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiErrorMessage } from "@/lib/errors";
@@ -313,12 +314,11 @@ export const GameForm: FC<{
 					    "Heroic" or "Lutris" tile without installing that source's plugin. */}
 					<div className="space-y-2">
 						<div className="flex items-center gap-2">
-							<input
+							<Checkbox
 								id="lib-isLauncher"
-								type="checkbox"
 								checked={form.isLauncher}
-								onChange={(e) =>
-									setForm((f) => ({ ...f, isLauncher: e.target.checked }))
+								onCheckedChange={(next) =>
+									setForm((f) => ({ ...f, isLauncher: next === true }))
 								}
 							/>
 							<Label htmlFor="lib-isLauncher">{m.library_field_role()}</Label>
@@ -362,6 +362,12 @@ export const GameForm: FC<{
 								onChange={set("publisher")}
 							/>
 						</div>
+						{/* These two stay `type="number"` over a STRING field rather than becoming
+						    `InputNumber` like the policy card's numbers: both are OPTIONAL metadata
+						    where empty means "don't send it" (see `int()` above), and InputNumber's
+						    contract is `value: number` — it cannot express "unset", so adopting it
+						    would invent a year for every entry that hasn't got one. The type here
+						    only asks for a numeric keypad. */}
 						<div className="grid grid-cols-2 gap-4">
 							<Field
 								id="releaseYear"

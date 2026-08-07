@@ -2,12 +2,13 @@
 //! UMDF-driver backend ([`super::dualshock4_windows`]) and the Linux UHID backend
 //! ([`super::dualshock4`]).
 //!
-//! The PS4 sibling of [`super::dualsense_proto`]: the pure report codec with no transport. The DS4
-//! reuses the DualSense [`DsState`] controller model + its `GameStream`/XInput mapper
-//! ([`DsState::from_gamepad`]) — only the report *byte layout*, the touchpad resolution, and the
-//! feedback report differ. The Linux backend writes report `0x01` to `/dev/uhid` and reads `0x05` via
-//! `UHID_OUTPUT`; the Windows backend pushes `0x01` to the UMDF driver and pulls `0x05` back over its
-//! shared-memory channel — both build/parse the exact same bytes here.
+//! The PS4 sibling of [`super::dualsense_proto`]: the pure report codec and the fixed feature
+//! blobs, with no transport. The DS4 reuses the DualSense [`DsState`] controller model + its
+//! `GameStream`/XInput mapper ([`DsState::from_gamepad`]) — only the report *byte layout*, the
+//! touchpad resolution, and the feedback report differ. The Linux backend writes report `0x01` to
+//! `/dev/uhid` and reads `0x05` via `UHID_OUTPUT`; the Windows backend pushes `0x01` to the UMDF
+//! driver and pulls `0x05` back over its shared-memory channel — both build/parse the exact same
+//! bytes here.
 //!
 //! Field offsets are the canonical real-DS4-USB layout the kernel `struct
 //! dualshock4_input_report_usb` / `_output_report_common` parse.
@@ -23,6 +24,82 @@ pub const DS4_INPUT_REPORT_LEN: usize = 64;
 /// than the DualSense's 1920×1080.
 pub const DS4_TOUCH_W: u16 = 1920;
 pub const DS4_TOUCH_H: u16 = 942;
+
+// Feature reports the host stack GET_REPORTs during DS4 init, the PS4 counterpart of
+// `dualsense_proto`'s DS_FEATURE_* blobs. PAIRING (0x12) is MANDATORY — without a valid reply
+// `dualshock4_create()` aborts and creates NO input devices; the kernel reads the 6-byte device MAC
+// from bytes 1..7. CALIBRATION (0x02) and FIRMWARE (0xa3) are non-fatal (the kernel warns and falls
+// back to identity IMU calibration), but we answer them so motion scales correctly. Each array's
+// first byte is the report id (the kernel hard-checks it).
+#[rustfmt::skip]
+pub const DS4_FEATURE_PAIRING: &[u8] = &[ // report 0x12 (MAC at bytes 1..7, LE → DE:AD:BE:EF:00:01)
+    0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// IMU calibration (report `0x02`) — the numbers that decide what a *degree per second* means to
+/// every consumer of this pad.
+///
+/// A consumer (kernel `hid-playstation`, SDL's `SDL_hidapi_ps4`) derives its scale from this blob,
+/// it does not assume one: gyro resolution = `(|pitch_plus| + |pitch_minus|) / (speed_plus +
+/// speed_minus)` LSB per °/s, accel resolution = `(acc_plus - acc_minus) / 2` LSB per g. So the
+/// blob is where the wire contract
+/// ([`MOTION_GYRO_LSB_PER_DEG_S`](punktfunk_core::input::gamepad::MOTION_GYRO_LSB_PER_DEG_S)) is
+/// *declared* on this backend, and it must state exactly what the wire delivers. These values are
+/// the DualSense blob's, which is the same statement in the same units — deliberately, since both
+/// pads consume the identical wire sample.
+///
+/// ⚠ The per-axis order is INTERLEAVED (`pitch±`, `yaw±`, `roll±`), which is the **USB** layout;
+/// Bluetooth groups all three plusses first. Our virtual pad declares `BUS_USB`, so interleaved is
+/// correct — do not "fix" it to grouped.
+///
+/// The Windows UMDF driver serves its own copy of this blob
+/// (`packaging/windows/drivers/pf-gamepad/src/lib.rs`) because it lives in a separate WDK
+/// workspace and cannot depend on this crate; the `motion_contract` test derives the units from
+/// *that* file's source too, so the two can't drift.
+#[rustfmt::skip]
+pub const DS4_FEATURE_CALIBRATION: &[u8] = &[ // report 0x02 (IMU calibration; all signed le16 words)
+    0x02,
+    0x00, 0x00, // gyro_pitch_bias  = 0
+    0x00, 0x00, // gyro_yaw_bias    = 0
+    0x00, 0x00, // gyro_roll_bias   = 0
+    0x10, 0x27, // gyro_pitch_plus  = +10000
+    0xF0, 0xD8, // gyro_pitch_minus = -10000
+    0x10, 0x27, // gyro_yaw_plus    = +10000
+    0xF0, 0xD8, // gyro_yaw_minus   = -10000
+    0x10, 0x27, // gyro_roll_plus   = +10000
+    0xF0, 0xD8, // gyro_roll_minus  = -10000
+    0xF4, 0x01, // gyro_speed_plus  = +500   ⇒ 20000/1000 = 20 LSB per °/s
+    0xF4, 0x01, // gyro_speed_minus = +500
+    0x10, 0x27, // acc_x_plus  = +10000      ⇒ 20000/2   = 10000 LSB per g
+    0xF0, 0xD8, // acc_x_minus = -10000
+    0x10, 0x27, // acc_y_plus  = +10000
+    0xF0, 0xD8, // acc_y_minus = -10000
+    0x10, 0x27, // acc_z_plus  = +10000
+    0xF0, 0xD8, // acc_z_minus = -10000
+    0x00, 0x00, // trailing pad (descriptor declares 36 data bytes)
+];
+#[rustfmt::skip]
+pub const DS4_FEATURE_FIRMWARE: &[u8] = &[ // report 0xa3 (build date string + hw/fw versions; cosmetic)
+    0xA3, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, // "Aug  3 2013"
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x30, 0x37, 0x3A, 0x30, 0x31, 0x3A, 0x31, 0x32, // "07:01:12"
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xA0, // hw_version = 0xA000 (buf[35])
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, // fw_version = 0x0100 (buf[41])
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // trailing pad (buf[43..49]) → 49 bytes total
+];
+
+/// The pairing reply (report `0x12`) for wire pad `pad`: [`DS4_FEATURE_PAIRING`] with the MAC's low
+/// octet offset by the pad index — same per-pad-serial contract as the DualSense's
+/// [`ds_pairing_reply`](super::dualsense_proto::ds_pairing_reply): the kernel adopts the MAC as the
+/// HID uniq, and SDL/Steam dedup controllers by that serial.
+pub fn ds4_pairing_reply(pad: u8) -> [u8; 16] {
+    let mut r = [0u8; 16];
+    r.copy_from_slice(DS4_FEATURE_PAIRING);
+    r[1] = r[1].wrapping_add(pad); // MAC lives at bytes 1..7, LSB first
+    r
+}
 
 /// Pack one touchpad contact into the DS4's 4-byte point (same bit layout as the DualSense's:
 /// byte0 bit7 = NOT-active, bits0-6 = id; 12-bit X then 12-bit Y).

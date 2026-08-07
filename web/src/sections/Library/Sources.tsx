@@ -16,6 +16,7 @@ import {
 	useInstallPlugin,
 	useStoreCatalog,
 } from "@/api/store";
+import { useDialogs } from "@/components/dialogs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -42,6 +43,7 @@ export const SourcesSection: FC<{
 	onFilter: (provider: string | null) => void;
 }> = ({ activeFilter, onFilter }) => {
 	const qc = useQueryClient();
+	const { confirm } = useDialogs();
 	const scanners = useListLibraryScanners();
 	const toggle = useSetLibraryScanner();
 	const purge = useDeleteProviderEntries();
@@ -68,7 +70,13 @@ export const SourcesSection: FC<{
 	const onPurge = async (source: ScannerInfo) => {
 		const provider = source.provider ?? source.id;
 		const count = source.entries ?? 0;
-		if (!confirm(m.library_provider_purge_confirm({ provider, count }))) return;
+		const ok = await confirm({
+			title: m.library_provider_purge_confirm({ provider, count }),
+			description: m.library_provider_purge_body(),
+			confirmLabel: m.common_remove(),
+			destructive: true,
+		});
+		if (!ok) return;
 		try {
 			await purge.mutateAsync({ provider });
 			qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });

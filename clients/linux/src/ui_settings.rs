@@ -1575,7 +1575,8 @@ pub fn show_scoped(
         &dialog,
         inline,
         "Gamepad type",
-        "The virtual pad on the host — Automatic matches your controller",
+        "The virtual pad on the host — Automatic matches your controller. An X-Box type has no \
+         gyroscope, so pick a DualSense-class one if you want motion.",
         &[
             "Automatic",
             "Xbox 360",

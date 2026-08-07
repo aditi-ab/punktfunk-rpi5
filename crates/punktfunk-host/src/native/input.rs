@@ -784,12 +784,9 @@ pub(super) fn input_thread(
     // — read back off the negotiated host_caps). Spawned on DualSense-family arrivals that
     // declare renderer bits, reaped on remove/teardown below.
     let mut pad_streams = PadAudioSlots::new();
-    // Motion-cadence observability (debug level): inter-arrival percentiles per 5 s window,
-    // the measurement a "gyro feels floaty" report needs. Bounded: 5 s at even a 1 kHz pad
-    // is 5000 u32s.
-    let mut motion_gaps_us: Vec<u32> = Vec::new();
-    let mut last_motion: Option<std::time::Instant> = None;
-    let mut motion_window = std::time::Instant::now();
+    // Motion-cadence observability, PER PAD and always on — see `motion_cadence`. Summarized at
+    // `info` when this session ends, which is when a field report is being written.
+    let mut motion_cadence = super::motion_cadence::MotionCadence::new();
     let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
     // Last applied snapshot seq per pad (`None` until the first one): the reorder gate for
@@ -848,42 +845,13 @@ pub(super) fn input_thread(
             // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
             // wakes for gyro samples instead of making them wait out the feedback poll interval.
             Ok(ClientInput::Rich(rich)) => {
-                // Debug-only instrument: skip the whole thing unless debug logging is actually
-                // enabled. It used to grow and `sort_unstable()` a Vec in the input hot loop
-                // regardless, so every session paid for a measurement nobody was reading — and the
-                // "bounded by a 5 s window at a plausible pad rate" reasoning was an assumption
-                // about the CLIENT's send rate, not a bound the host enforced (2026-08-05 review
-                // L-5). The explicit cap below makes it a bound.
-                if matches!(rich, punktfunk_core::quic::RichInput::Motion { .. })
-                    && tracing::enabled!(tracing::Level::DEBUG)
-                {
-                    let now = std::time::Instant::now();
-                    if let Some(prev) = last_motion.replace(now) {
-                        let gap = now.duration_since(prev);
-                        // 30k samples is 5 s at 6 kHz — well past any real pad, and a hard stop
-                        // for a client that simply sends motion as fast as the link allows.
-                        if gap < std::time::Duration::from_secs(1) && motion_gaps_us.len() < 30_000
-                        {
-                            motion_gaps_us.push(gap.as_micros() as u32);
-                        }
-                    }
-                    if motion_window.elapsed() >= std::time::Duration::from_secs(5)
-                        && !motion_gaps_us.is_empty()
-                    {
-                        motion_gaps_us.sort_unstable();
-                        let p = |q: f64| {
-                            motion_gaps_us[(q * (motion_gaps_us.len() - 1) as f64) as usize]
-                        };
-                        tracing::debug!(
-                            samples = motion_gaps_us.len() + 1,
-                            gap_p50_us = p(0.5),
-                            gap_p95_us = p(0.95),
-                            gap_max_us = motion_gaps_us.last().copied().unwrap_or(0),
-                            "motion cadence (client gyro inter-arrival, 5 s window)"
-                        );
-                        motion_gaps_us.clear();
-                        motion_window = std::time::Instant::now();
-                    }
+                // Per-pad inter-arrival, unconditionally: one subtraction and one array increment,
+                // cheap enough that a session no longer has to be re-run with debug logging on to
+                // answer "is the gyro feed even arriving evenly". The old instrument grew and
+                // sorted a Vec, which is why it had to be gated — and it shared ONE accumulator
+                // across pads, so two motion pads measured each other.
+                if let punktfunk_core::quic::RichInput::Motion { pad, .. } = rich {
+                    motion_cadence.record(pad, std::time::Instant::now());
                 }
                 pads.apply_rich(rich);
             }
@@ -1169,6 +1137,10 @@ pub(super) fn input_thread(
     // Reap the per-pad 0xD1 streamers with the session (after the instant release sends above
     // — this can block on a quiet pad's capturer timeout, see PadAudioSlots::stop_all).
     pad_streams.stop_all();
+    // One line per pad that carried motion. At `info` deliberately: the question it answers
+    // ("was the gyro feed even arriving evenly?") is asked from a field log after the fact, and a
+    // measurement that needs the session re-run with debug logging is a measurement nobody gets.
+    motion_cadence.log_summary();
 }
 
 #[cfg(test)]

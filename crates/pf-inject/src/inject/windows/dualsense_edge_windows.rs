@@ -68,6 +68,14 @@ impl PadProto for DsEdgeWinProto {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
 
+    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
+        st.neutralize_gyro()
+    }
+
+    fn clear_rich(&self, st: &mut DsState) {
+        st.clear_rich();
+    }
+
     fn write_state(&self, pad: &mut DsWinPad, st: &DsState) {
         pad.write_state(st);
     }

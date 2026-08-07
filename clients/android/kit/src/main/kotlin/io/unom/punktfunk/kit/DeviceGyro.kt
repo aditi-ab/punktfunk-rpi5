@@ -11,7 +11,6 @@ import android.os.HandlerThread
 import android.view.Display
 import android.view.Surface
 import android.view.WindowManager
-import kotlin.math.roundToInt
 
 /**
  * The opt-in phone-gyro mirror ("Gyro from this phone", off by default): while wire pad 0 is a
@@ -33,10 +32,10 @@ import kotlin.math.roundToInt
  *    host's virtual pad never keeps integrating an angular velocity this device stopped
  *    producing (the gyro-sweep "stale angular velocity re-sent forever" failure mode).
  *
- * Units are the wire contract (mirrors `pf-client-core`'s constants): gyro rad/s → 20 LSB/°·s,
- * accel m/s² → g → 10000 LSB/g. Android's accelerometer reads specific force (+1 g on the up
- * axis at rest), which is the DualSense report's own convention — no sign flip. The one thing
- * the phone adds is a frame remap: sensors report in the device's natural-portrait frame, while
+ * Units are the wire contract, converted by [Gamepad.motionGyroWire] / [Gamepad.motionAccelWire] —
+ * the same two functions [PadSensors] uses, so a scale this client ever has to correct is corrected
+ * once for every sender rather than once per sender that someone remembers. The one thing the
+ * phone adds is a frame remap: sensors report in the device's natural-portrait frame, while
  * the wire wants the controller frame the player sees (x right, y up, z out of the screen), so
  * each sample is rotated by the current display rotation — a phone clipped landscape must yaw
  * when the player yaws, not roll. The matrix is derived and pinned by `DeviceGyroTest`;
@@ -64,7 +63,7 @@ class DeviceGyro(
     private val thread = HandlerThread("pf-phone-gyro")
 
     /** Latest converted accel, paired with each gyro send (the wire fuses both per sample). */
-    private val lastAccel = intArrayOf(0, ACCEL_LSB_PER_G, 0)
+    private val lastAccel = intArrayOf(0, Gamepad.MOTION_ACCEL_LSB_PER_G, 0)
 
     /** Whether the last gyro event actually went to pad 0 — the stand-down zero-send edge. */
     private var wasWriting = false
@@ -103,10 +102,7 @@ class DeviceGyro(
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
                 val v = remap(rotation, event.values[0], event.values[1], event.values[2])
-                for (i in 0..2) {
-                    lastAccel[i] = (v[i] / GRAVITY * ACCEL_LSB_PER_G)
-                        .roundToInt().coerceIn(-32768, 32767)
-                }
+                for (i in 0..2) lastAccel[i] = Gamepad.motionAccelWire(v[i])
             }
             Sensor.TYPE_GYROSCOPE -> {
                 // The write gate, per sample: pad 0 must exist (motion never creates a pad)
@@ -124,9 +120,9 @@ class DeviceGyro(
                 val v = remap(rotation, event.values[0], event.values[1], event.values[2])
                 NativeBridge.nativeSendPadMotion(
                     handle, 0,
-                    (v[0] * GYRO_LSB_PER_RAD_S).roundToInt().coerceIn(-32768, 32767),
-                    (v[1] * GYRO_LSB_PER_RAD_S).roundToInt().coerceIn(-32768, 32767),
-                    (v[2] * GYRO_LSB_PER_RAD_S).roundToInt().coerceIn(-32768, 32767),
+                    Gamepad.motionGyroWire(v[0]),
+                    Gamepad.motionGyroWire(v[1]),
+                    Gamepad.motionGyroWire(v[2]),
                     lastAccel[0], lastAccel[1], lastAccel[2],
                 )
             }
@@ -149,17 +145,12 @@ class DeviceGyro(
             context.getSystemService(SensorManager::class.java)
                 ?.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null
 
-        /** ~200 Hz — between the sensor's usual FASTEST (~250-500 Hz) and GAME (~50 Hz). */
-        private const val SAMPLING_PERIOD_US = 5000
-
-        /** The wire contract (pf-client-core `GYRO_LSB_PER_RAD_S`): 20 LSB/°·s from rad/s. */
-        const val GYRO_LSB_PER_RAD_S = 20f * 180f / Math.PI.toFloat()
-
-        /** The wire contract (pf-client-core `ACCEL_LSB_PER_G`). */
-        const val ACCEL_LSB_PER_G = 10_000
-
-        /** pf-client-core's `G`. */
-        const val GRAVITY = 9.80665f
+        /**
+         * ~200 Hz — between the sensor's usual FASTEST (~250-500 Hz) and GAME (~50 Hz), and also
+         * the ceiling the framework grants an app without `HIGH_SAMPLING_RATE_SENSORS` (API 31+),
+         * so asking for more would only be silently capped. Shared with [PadSensors].
+         */
+        internal const val SAMPLING_PERIOD_US = 5000
 
         /**
          * Rotate one device-frame vector (rotation rate or acceleration — both transform the

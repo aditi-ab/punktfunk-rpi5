@@ -361,6 +361,40 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
     );
 }
 
+/// `NativeBridge.nativePadMotionReaches(handle, declaredPref)` — whether motion sent for a pad that
+/// declared `declaredPref` (the `GamepadPref` wire byte it passed to `nativeSendGamepadArrival`) can
+/// actually reach the game, or would be decoded and dropped by a host backend with no motion plane.
+///
+/// The whole question is answered here rather than in Kotlin so the reasoning lives in exactly one
+/// place — [`punktfunk_core::config::pad_motion_reaches`], which carries the argument and the tests.
+/// A third transcription of it would be a third thing to get subtly wrong, and every way of getting
+/// it wrong is silent: too strict kills a working gyro, too lax keeps ~250 Hz of samples flowing
+/// into a host that drops every one.
+///
+/// A `0` handle answers `true` — "don't suppress" is the safe answer when we cannot tell, matching
+/// the `Auto` rule inside the predicate itself.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionReaches(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    declared_pref: jint,
+) -> jboolean {
+    if handle == 0 {
+        return 1;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; both fields are plain Copy
+    // values read behind `&self`.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let declared =
+        punktfunk_core::config::GamepadPref::from_u8(declared_pref.clamp(0, u8::MAX as jint) as u8);
+    u8::from(punktfunk_core::config::pad_motion_reaches(
+        declared,
+        h.client.requested_gamepad,
+        h.client.resolved_gamepad,
+    ))
+}
+
 /// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
 /// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
 /// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the

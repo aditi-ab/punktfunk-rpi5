@@ -168,8 +168,46 @@ pub struct SteamState {
 }
 
 impl SteamState {
+    /// A fresh pad — and one that is sitting STILL, not falling.
+    ///
+    /// Acceleration is 1 g up, for the reason spelled out on [`gs::MOTION_NEUTRAL_ACCEL`]: zero is
+    /// free fall, which is a claim about the world that is never true of a controller. It is put
+    /// through [`super::steam_remap::motion_wire_to_deck`] rather than written out in Deck units,
+    /// so the neutral and every real sample can never disagree about what 1 g is — the Deck's
+    /// `hid-steam` resolution lives in exactly one place.
     pub fn neutral() -> SteamState {
-        SteamState::default()
+        let (_, accel) = super::steam_remap::motion_wire_to_deck([0; 3], gs::MOTION_NEUTRAL_ACCEL);
+        SteamState {
+            accel,
+            ..SteamState::default()
+        }
+    }
+
+    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
+    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
+    /// `PadProto::neutralize_gyro`.
+    pub fn neutralize_gyro(&mut self) -> bool {
+        let changed = self.gyro != [0; 3];
+        self.gyro = [0; 3];
+        changed
+    }
+
+    /// Reset the rich-plane fields — both trackpads' position/pressure/click, and motion — to a
+    /// fresh pad's, leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller
+    /// that took over this slot inside the replug grace must not inherit the last one's finger or
+    /// rotation.
+    pub fn clear_rich(&mut self) {
+        let fresh = SteamState::neutral();
+        self.lpad_x = fresh.lpad_x;
+        self.lpad_y = fresh.lpad_y;
+        self.rpad_x = fresh.rpad_x;
+        self.rpad_y = fresh.rpad_y;
+        self.lpad_pressure = fresh.lpad_pressure;
+        self.rpad_pressure = fresh.rpad_pressure;
+        self.lpad_click = fresh.lpad_click;
+        self.rpad_click = fresh.rpad_click;
+        self.gyro = fresh.gyro;
+        self.accel = fresh.accel;
     }
 
     /// Set/clear a button (or group) by its [`btn`] mask.
