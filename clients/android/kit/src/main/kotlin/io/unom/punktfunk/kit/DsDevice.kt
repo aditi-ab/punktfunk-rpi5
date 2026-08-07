@@ -17,6 +17,11 @@ package io.unom.punktfunk.kit
  * reaches this code — an uncaptured pad stays on the ordinary InputDevice path.
  */
 object DsDevice {
+    /** The pads' native acceleration resolution — `hid-playstation`'s `DS_ACC_RES_PER_G`. */
+    private const val DS_RAW_ACCEL_LSB_PER_G = 8192L
+    /** The wire's, from `punktfunk_core::input::gamepad::MOTION_ACCEL_LSB_PER_G`. */
+    private const val WIRE_ACCEL_LSB_PER_G = 10000L
+
     const val VID_SONY = 0x054C
     const val PID_DUALSENSE = 0x0CE6
     const val PID_DUALSENSE_EDGE = 0x0DF2
@@ -153,7 +158,7 @@ object DsDevice {
         out.buttons = w
         if (len >= 28) {
             for (i in 0 until 3) out.gyro[i] = i16(r, 16 + 2 * i)
-            for (i in 0 until 3) out.accel[i] = i16(r, 22 + 2 * i)
+            for (i in 0 until 3) out.accel[i] = accelToWire(i16(r, 22 + 2 * i))
         }
         if (len >= 41) {
             unpackTouch(r, 33, out, 0)
@@ -189,7 +194,7 @@ object DsDevice {
         out.buttons = w
         if (len >= 25) {
             for (i in 0 until 3) out.gyro[i] = i16(r, 13 + 2 * i)
-            for (i in 0 until 3) out.accel[i] = i16(r, 19 + 2 * i)
+            for (i in 0 until 3) out.accel[i] = accelToWire(i16(r, 19 + 2 * i))
         }
         if (len >= 43) {
             unpackTouch(r, 35, out, 0)
@@ -226,6 +231,28 @@ object DsDevice {
 
     private fun i16(r: ByteArray, o: Int): Int =
         ((r[o + 1].toInt() shl 8) or (r[o].toInt() and 0xFF)).toShort().toInt()
+
+    /**
+     * Raw DualSense/DualShock 4 acceleration → the wire's units.
+     *
+     * The pad reports acceleration in its own device units; the wire is fixed at
+     * `MOTION_ACCEL_LSB_PER_G` = 10000 LSB per g (`punktfunk_core::input::gamepad`). Forwarding the
+     * raw value verbatim — which this path did until 2026-08-07 — hands the host a number ~18 %
+     * short, because the pad's native resolution is the 8192 LSB/g that `hid-playstation` calls
+     * `DS_ACC_RES_PER_G`. Measured on glass: a DualSense flat and face up arrived as 0.811 g where
+     * 1.000 was owed, against 8192/10000 = 0.819 predicted.
+     *
+     * The residual ~1 % is this unit's factory bias, which only its calibration feature report can
+     * remove — that read is still owed (it also fixes gyro, whose factory calibration is emphatically
+     * NOT near-identity and so cannot be corrected by a nominal constant like this one).
+     *
+     * Clamped because the rescale is a >1 multiplier: a real ±4 g slam near full scale would
+     * otherwise wrap the i16 and read as an impossible acceleration in the opposite direction.
+     */
+    private fun accelToWire(raw: Int): Int =
+        ((raw.toLong() * WIRE_ACCEL_LSB_PER_G) / DS_RAW_ACCEL_LSB_PER_G)
+            .coerceIn(-32768L, 32767L)
+            .toInt()
 
     // Device stick byte (0..255, centre 0x80, +y down) → wire i16 (+y up) — the exact inverse of
     // the host's `to_u8` mapping (`lx = to_u8(x)`, `ly = 255 - to_u8(y)`).
