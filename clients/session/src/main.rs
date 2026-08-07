@@ -548,12 +548,21 @@ mod session_main {
                         println!("no Vulkan physical devices");
                     }
                     for (i, a) in adapters.iter().enumerate() {
-                        // The index IS the PUNKTFUNK_VK_DEVICE value, and entry 0 is what
+                        // The bracketed number is the PUNKTFUNK_VK_DEVICE value, and the
+                        // FIRST listed entry is what
                         // a default run presents on — the decoder shares that device, so
                         // on a hybrid box this line is usually the answer.
                         let kind = if a.discrete { "discrete" } else { "integrated" };
+                        // `a.index`, NOT the loop position. This list is sorted
+                        // discrete-first for reading, but PUNKTFUNK_VK_DEVICE indexes the
+                        // raw enumeration, which puts the iGPU first on some hybrids —
+                        // printing the loop position would name the other GPU on exactly
+                        // the machines this flag is for. The `i == 0` marker is still the
+                        // loop position, because sorted-first IS what pick_device lands on
+                        // when nothing overrides it.
                         println!(
-                            "[{i}] {} ({kind}){}",
+                            "[{}] {} ({kind}){}",
+                            a.index,
                             a.name,
                             if i == 0 { "  <- default presenter" } else { "" }
                         );
@@ -619,6 +628,26 @@ mod session_main {
                         } else {
                             println!("     extensions:          {}", a.codec_exts.join(", "));
                         }
+                    }
+                    if adapters.len() > 1 {
+                        // The single most common misreading of this output: seeing a
+                        // capable GPU listed and concluding the decoder will use it.
+                        // Vulkan Video decodes on the PRESENTER's device, and the decoder
+                        // preference does not move the presenter.
+                        println!();
+                        println!(
+                            "Vulkan Video decodes on the presenter's device. PUNKTFUNK_DECODER \
+                             picks the rung,"
+                        );
+                        println!(
+                            "not the GPU — move the presenter with PUNKTFUNK_VK_DEVICE=<index \
+                             above> or"
+                        );
+                        println!(
+                            "PUNKTFUNK_VK_ADAPTER=<name substring>, which is the safer knob \
+                             where two"
+                        );
+                        println!("adapters share a name.");
                     }
                     0
                 }

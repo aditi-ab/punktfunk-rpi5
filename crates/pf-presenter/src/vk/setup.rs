@@ -55,7 +55,19 @@ pub(crate) fn video_decode_gate(
 /// hardware decode starts here: WHICH adapter, and does it advertise the codec.
 #[derive(Debug, Clone)]
 pub struct AdapterDecode {
-    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key.
+    /// The device's position in the RAW `vkEnumeratePhysicalDevices` order — and
+    /// therefore the value `PUNKTFUNK_VK_DEVICE` takes, because `pick_device` indexes the
+    /// unsorted list (`devices.get(i)`) before any ranking runs.
+    ///
+    /// ⚠ NOT the display position. This list is sorted discrete-first for readability,
+    /// while enumeration order puts the iGPU first on some hybrids — so the two disagree
+    /// on exactly the machines this probe exists to diagnose. Printing the display
+    /// position as if it were the env value would hand a hybrid-laptop reporter the
+    /// number for the other GPU.
+    pub index: usize,
+    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key. Not necessarily
+    /// unique: a hybrid can expose the same iGPU twice, and a name match then resolves to
+    /// whichever enumerates first.
     pub name: String,
     /// Discrete GPUs sort first, exactly as `pick_device` ranks them, so index 0 here is
     /// the device a default run will pick.
@@ -743,7 +755,9 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     // filling locals returned by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
-    for pdev in devices {
+    // `enumerate()` BEFORE any filtering or sorting: this index is what
+    // `PUNKTFUNK_VK_DEVICE` selects, so it has to survive both.
+    for (raw_index, pdev) in devices.into_iter().enumerate() {
         // SAFETY: per the Vulkan contract above - a read-only query on the live
         // instance/device, filling locals returned by value.
         let props = unsafe { instance.get_physical_device_properties(pdev) };
@@ -834,6 +848,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
         out.push((
             rank,
             AdapterDecode {
+                index: raw_index,
                 name,
                 discrete: rank == 0,
                 api_1_3,
