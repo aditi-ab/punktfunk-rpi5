@@ -20,17 +20,21 @@
 //! * **H.264 and H.265** — frame-hash parity against libavcodec on an RTX 4090 and an AMD
 //!   iGPU plus a 30-minute soak (M5), re-confirmed on an RTX 3500 Ada and an Intel Arc on
 //!   2026-08-07 (250/250 both codecs, plus 50/50 HEVC Main 10 on both).
-//! * **AV1** — wired in M7. It streams: 4K60 on an RTX 3500 Ada and on an Intel Arc, with a
-//!   clean 5-minute soak. But it **fails frame-hash parity on both of those GPUs**, measured
-//!   2026-08-07 — 186/250 diverging frames on the NVIDIA part and 245/250 on the Intel one,
-//!   deterministically, against the same libavcodec goldens the Vulkan rung reproduces
-//!   250/250 on the SAME box. So this rung's AV1 leg produces wrong pixels and the session
-//!   log says so at `warn`. `av1_divergence_map` (below) carries the two signatures; the
-//!   tool that would localise it — an AV1 leg for pf-dxvadec's `libav_picparams_parity`,
-//!   which covers only H.264 and HEVC — does not exist yet.
+//! * **AV1** — wired in M7, and frame-hash parity on the SAME two GPUs since 2026-08-07:
+//!   250/250 delivered frames bit-identical to libavcodec on the RTX 3500 Ada and on the
+//!   Intel Arc. It streams 4K60 on both with a clean 5-minute soak, but that is throughput
+//!   and not pixels — the leg streamed exactly as cleanly while 186 and 245 of those 250
+//!   frames were WRONG, which is what the first run of this harness measured on 2026-08-07
+//!   and what `av1_divergence_map` (below) records. The defect was one line of DPB
+//!   bookkeeping in [`pf_dxvadec::plan_to_dxva_av1`]: it released the picture this frame's
+//!   own `refresh_frame_flags` displaces before assigning the decode target a slot, and
+//!   `SlotMap::assign` hands back the slot just vacated, so 268 of the vector's 274 frames
+//!   named one surface as both `CurrPicTextureIndex` and a `RefFrameMapTextureIndex` entry.
+//!   [`NativeD3d11Decoder::frame_av1`] now applies the conversion's
+//!   `release_after_decode` once the decode op is issued.
 //!
-//!   Until M10 `auto` skipped AV1 here in favour of the libavcodec rung below; with that
-//!   gone the alternative is the CPU, so it still runs.
+//!   ⚠ Still no SOAK on the goldens, so this leg's evidence is one 250-frame vector on two
+//!   vendors — narrower than the H.264/H.265 legs above.
 //!
 //! A refusal or an init failure logs and falls through to the standard ladder, so neither the
 //! pin nor the `auto` admission can cost a session its decoder.
@@ -572,43 +576,19 @@ impl NativeD3d11Decoder {
             return self.show_existing_av1(plan);
         }
         let sub = self.plan_frame_av1(au, plan)?;
-        let shown = if damaged {
-            // Converted (so the slot map stayed in step with the planner's store),
-            // deliberately not submitted (fn docs).
-            //
-            // ⚠ And the surface's `held` entry is CLEARED rather than left. The slot
-            // map now says this slot holds THIS picture, while the surface still
-            // carries whatever the previous occupant decoded; a later
-            // `show_existing_frame` naming it would find the old picture's facts and
-            // blit the old picture's pixels. `None` makes that path return
-            // `Ok(None)` — nothing shown — which is what the unit's concealment
-            // already asked for.
-            if let Some(session) = self.session.as_mut() {
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
-                    *held = None;
-                }
-            }
-            None
-        } else {
-            self.decode_into(au, &sub)?;
-            if let Some(session) = self.session.as_mut() {
-                // What this surface now holds, for a later `show_existing_frame`.
-                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
-                    *held = Some(sub.facts);
-                }
-            }
-            if sub.show {
-                Some(self.present(sub.setup_slot, sub.facts)?)
-            } else {
-                None
-            }
-        };
+        // ⚠ The decode's `Result` is held rather than `?`-ed, so that the two slot
+        // releases below run on the FAILURE path too. `decode_av1` treats an error
+        // here as a health note and keeps the session — it does not rebuild the slot
+        // map — so an early return would leak a surface per failed frame and reach
+        // `SlotError::Full` after nine, which is a session that dies of an error it
+        // had already recovered from.
+        let shown = self.decode_and_present_av1(au, &sub, damaged);
 
         // The surfaces this frame's own refresh displaced while its submission still
         // NAMED them (fn docs). Released here for the same reason the block below
         // waits: the decode op has been issued, so nothing can be assigned them
-        // until the next frame — and on the `damaged` path there is no op at all,
-        // where dropping the release would leak a surface just the same.
+        // until the next frame — and on the `damaged` and failed paths there is no
+        // op at all, where dropping the release would leak a surface just the same.
         if let Some(session) = self.session.as_mut() {
             for &id in &sub.release_after_decode {
                 if !session.slots.release(id) {
@@ -640,6 +620,49 @@ impl NativeD3d11Decoder {
                 }
             }
         }
+        shown
+    }
+
+    /// Submit one converted AV1 frame and blit it if it displays — the part of
+    /// [`Self::frame_av1`] that can fail, split out so its caller can run the slot
+    /// releases on the failure path as well as on the two clean ones.
+    fn decode_and_present_av1(
+        &mut self,
+        au: &[u8],
+        sub: &Submission,
+        damaged: bool,
+    ) -> Result<Option<D3d11Frame>> {
+        let shown = if damaged {
+            // Converted (so the slot map stayed in step with the planner's store),
+            // deliberately not submitted (fn docs).
+            //
+            // ⚠ And the surface's `held` entry is CLEARED rather than left. The slot
+            // map now says this slot holds THIS picture, while the surface still
+            // carries whatever the previous occupant decoded; a later
+            // `show_existing_frame` naming it would find the old picture's facts and
+            // blit the old picture's pixels. `None` makes that path return
+            // `Ok(None)` — nothing shown — which is what the unit's concealment
+            // already asked for.
+            if let Some(session) = self.session.as_mut() {
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = None;
+                }
+            }
+            None
+        } else {
+            self.decode_into(au, sub)?;
+            if let Some(session) = self.session.as_mut() {
+                // What this surface now holds, for a later `show_existing_frame`.
+                if let Some(held) = session.held.get_mut(usize::from(sub.setup_slot)) {
+                    *held = Some(sub.facts);
+                }
+            }
+            if sub.show {
+                Some(self.present(sub.setup_slot, sub.facts)?)
+            } else {
+                None
+            }
+        };
         Ok(shown)
     }
 
@@ -2280,25 +2303,39 @@ mod parity {
     /// goldens beside the plan facts that could explain it.
     ///
     /// Not a gate — it asserts nothing and always "passes". It exists because
-    /// [`av1_every_delivered_frame_hashes_bit_identical_to_libavcodec`] FAILS on
-    /// every device tried so far, and a count of diverging frames is not a lead. This
-    /// is what turned that count into one, on 2026-08-07:
+    /// [`av1_every_delivered_frame_hashes_bit_identical_to_libavcodec`] FAILED on both
+    /// GPUs of `.221` the first time it was ever run, and a count of diverging frames
+    /// is not a lead. This is what turned that count into one, on 2026-08-07:
     ///
     /// * **NVIDIA RTX 3500 Ada** — display frames 0..=63 bit-identical, then every one
-    ///   of the remaining 186 diverges. The first bad frame is the one whose
-    ///   `order_hint` first reaches **64**, and its error is 174 luma pixels in a
-    ///   single 16x24 block (max |delta| 8, chroma untouched) which then propagates
+    ///   of the remaining 186 diverged. The first bad frame was the one whose
+    ///   `order_hint` first reaches **64**, and its error was 174 luma pixels in a
+    ///   single 16x24 block (max |delta| 8, chroma untouched) which then propagated
     ///   through prediction. The stream keeps the key frame (`order_hint` 0) in the
     ///   BWDREF and ALTREF2 slots for its whole length, so 64 is where the distance to
     ///   it reaches the edge of what `get_relative_dist` can represent at
     ///   `OrderHintBits = 7`.
-    /// * **Intel Arc** — only display frames 0, 1, 2, 3 and 10 are bit-identical, and
-    ///   the divergence is STRUCTURAL rather than marginal (47% of luma at the first
+    /// * **Intel Arc** — only display frames 0, 1, 2, 3 and 10 were bit-identical, and
+    ///   the divergence was STRUCTURAL rather than marginal (47% of luma at the first
     ///   bad frame, max |delta| 242, chroma wrong too): a frame predicted from the
     ///   wrong picture, not a filter rounding.
     ///
-    /// Both are deterministic — three runs each, identical first-divergent frame and
-    /// identical hashes — so neither is a race against the decode queue.
+    /// Both were deterministic — three runs each, identical first-divergent frame and
+    /// identical hashes — so neither was a race against the decode queue.
+    ///
+    /// **⚠ Both were ONE defect, and the two unlike signatures argued for two.** The
+    /// submission named a single surface as `CurrPicTextureIndex` and as a
+    /// `RefFrameMapTextureIndex` entry on 268 of the vector's 274 frames — decode into
+    /// the picture you predict from — because [`pf_dxvadec::plan_to_dxva_av1`] released
+    /// the displaced reference before assigning the decode target its slot. Intel
+    /// followed the aliased surface immediately; NVIDIA tolerated it until the order-hint
+    /// wrap put one block's prediction on the far side of it. Fixing that one thing took
+    /// BOTH vendors to 250/250. Two readings this map invited and that were wrong:
+    /// "`primary_ref_frame` or its resolution" (Intel's one correct late frame is
+    /// PRIMARY_REF_NONE **because** it is the intra frame, which names no reference and
+    /// so cannot alias) and "motion-field projection at the `get_relative_dist` sign
+    /// flip" (the wrap is where an already-aliased surface first mattered on NVIDIA, not
+    /// what was wrong). Read a signature as evidence about WHERE, not about WHAT.
     ///
     /// Set `PF_AV1_DUMP=<tag>` to also write a few frames' raw NV12 to the temp
     /// directory. That is how "how badly" was answered: at a frame where ONE vendor

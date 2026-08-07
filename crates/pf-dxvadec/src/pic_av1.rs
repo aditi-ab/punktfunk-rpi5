@@ -687,6 +687,20 @@ pub fn plan_to_dxva_av1(
 
     let color = &seq.color_config;
     let mut pic_params = PicParamsAv1::zeroed();
+    // ⚠ UPSCALED width, where libavcodec sends the CODED one — a divergence that is
+    // inert on every stream that exists here and is written down rather than
+    // "fixed" because nothing can measure it.
+    //
+    // `dxva2_av1.c` sends `avctx->width`, and `update_context_with_frame_header`
+    // sets that from `frame_width_minus_1 + 1` — FrameWidth, the pre-superres coded
+    // width. The same goes for `frame_refs[i].width`, which libav reads off the
+    // reference's `AVFrame`. With superres OFF the two are equal by definition
+    // (7.20: `UpscaledWidth = FrameWidth` when `use_superres` is 0), which is every
+    // frame of both vendored vectors and every frame a punktfunk host emits — no
+    // encoder in this program codes superres. So the 250/250 parity result on two
+    // vendors says nothing either way about which is right, and changing it would
+    // be an unmeasured change to a rung that is finally proven. Revisit with a
+    // superres vector and a driver-by-driver measurement, not by reading.
     pic_params.width = h.upscaled_width;
     pic_params.height = h.frame_height;
     pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
