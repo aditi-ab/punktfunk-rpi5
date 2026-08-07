@@ -174,22 +174,37 @@ public final class DeviceGyro {
         state.lock.unlock()
         let rot = r.apply(
             x: Float(m.rotationRate.x), y: Float(m.rotationRate.y), z: Float(m.rotationRate.z))
-        // Same total-acceleration convention as GamepadCapture.forwardMotion.
+        // Total acceleration, NEGATED — the same convention as GamepadCapture.forwardMotion, which
+        // this file's header promises to track. Apple reports the gravity VECTOR (pointing down);
+        // an accelerometer measures proper acceleration (pointing up at rest), and the wire carries
+        // the latter. Without the minus a still phone told the host it was accelerating downward at
+        // 1 g.
         let acc = r.apply(
-            x: Float(m.gravity.x + m.userAcceleration.x),
-            y: Float(m.gravity.y + m.userAcceleration.y),
-            z: Float(m.gravity.z + m.userAcceleration.z))
+            x: -Float(m.gravity.x + m.userAcceleration.x),
+            y: -Float(m.gravity.y + m.userAcceleration.y),
+            z: -Float(m.gravity.z + m.userAcceleration.z))
+        // Then the SAME change of basis the controller path takes. `r` puts the sample in the
+        // controller frame this file's header describes — x right, y up, z out of the screen —
+        // which is exactly GameController's frame, and that is not the DualSense report frame the
+        // wire is defined in. Measured 2026-08-07; see `GamepadWire.appleMotionToWire`.
+        //
+        // Both corrections are here because the header states the intent plainly: units and axis
+        // semantics match `GamepadCapture.forwardMotion` so a sign/scale fix lands in one place for
+        // both sources. Fixing only the controller path would have left this one silently on the
+        // old convention — a mirror that disagrees with the thing it mirrors.
+        let g = GamepadWire.appleMotionToWire((rot.x, rot.y, rot.z))
+        let a = GamepadWire.appleMotionToWire((acc.x, acc.y, acc.z))
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
         let gyro = (
-            GamepadWire.motionRaw(rot.x, scale: gs),
-            GamepadWire.motionRaw(rot.y, scale: gs),
-            GamepadWire.motionRaw(rot.z, scale: gs)
+            GamepadWire.motionRaw(g.0, scale: gs),
+            GamepadWire.motionRaw(g.1, scale: gs),
+            GamepadWire.motionRaw(g.2, scale: gs)
         )
         let accel = (
-            GamepadWire.motionRaw(acc.x, scale: as_),
-            GamepadWire.motionRaw(acc.y, scale: as_),
-            GamepadWire.motionRaw(acc.z, scale: as_)
+            GamepadWire.motionRaw(a.0, scale: as_),
+            GamepadWire.motionRaw(a.1, scale: as_),
+            GamepadWire.motionRaw(a.2, scale: as_)
         )
         state.lock.lock()
         state.lastAccel = accel
