@@ -2423,6 +2423,12 @@ mod tests {
                         ("H.264 High", pf_vaadec::config::VA_PROFILE_H264_HIGH),
                         ("HEVC Main", pf_vaadec::config::VA_PROFILE_HEVC_MAIN),
                         ("HEVC Main 10", pf_vaadec::config::VA_PROFILE_HEVC_MAIN10),
+                        // AV1 was MISSING from this loop until 2026-08-07, which is part
+                        // of why the rung's evidence row could say "never decoded a frame"
+                        // for so long without anyone noticing what had not been asked.
+                        // `profile_for` maps both 8- and 10-bit AV1 4:2:0 onto Profile 0.
+                        ("AV1 Profile 0", pf_vaadec::config::VA_PROFILE_AV1_PROFILE0),
+                        ("AV1 Profile 1", pf_vaadec::config::VA_PROFILE_AV1_PROFILE1),
                     ] {
                         match d.require_entrypoint(profile) {
                             Ok(()) => eprintln!("    {name}: VLD decode"),
@@ -2436,6 +2442,110 @@ mod tests {
         eprintln!(
             "{opened} of {} node(s) initialised a VAAPI display",
             nodes.len()
+        );
+    }
+
+    /// The vendored AV1 vector, as IVF: 320x240 Main 4:2:0 8-bit, 250 temporal units
+    /// carrying 274 coded frames (24 units carry two, and those extras are HIDDEN —
+    /// decoded, referenced, never shown), so **250 frames are displayed**. The same
+    /// file `pf-vkdecode`'s Vulkan parity leg and `video_d3d11_native`'s D3D11VA leg
+    /// walk, so a count that disagrees with 250 is this rung's problem, not the
+    /// vector's.
+    const AV1_25FPS: &[u8] = include_bytes!(
+        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
+    );
+
+    /// One temporal unit per IVF packet: 32 bytes of `DKIF` header, then
+    /// `[u32 size][u64 pts][size bytes]`. Hand-rolled because `pf-client-core` does
+    /// not depend on the vendored parser crate — the same reason and the same walk as
+    /// `video_d3d11_native`'s `split_ivf`, and kept honest by the unit count asserted
+    /// at the top of the test below.
+    fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
+        assert_eq!(&stream[0..4], b"DKIF", "the AV1 vector must be an IVF file");
+        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
+        let mut out = Vec::new();
+        let mut at = header;
+        while at + 12 <= stream.len() {
+            let size =
+                u32::from_le_bytes(stream[at..at + 4].try_into().expect("four bytes")) as usize;
+            at += 12;
+            assert!(
+                at + size <= stream.len(),
+                "an IVF frame header claims {size} bytes past the end of the file"
+            );
+            out.push(&stream[at..at + size]);
+            at += size;
+        }
+        out
+    }
+
+    /// Does this machine's VAAPI actually DECODE AV1 — the question the evidence table
+    /// has answered "no hardware has ever tried" since M6.
+    ///
+    /// This is deliberately weaker than the Vulkan and D3D11VA AV1 legs, and the
+    /// difference is worth stating rather than hiding: those two hash every decoded
+    /// frame against libavcodec's goldens, because both can read their decoded surface
+    /// back. This rung hands out a **DRM-PRIME dmabuf** whose memory is tiled by the
+    /// driver, so there is no CPU-readable image to hash without adding a
+    /// `vaDeriveImage`/`vaGetImage` path that production does not use and does not
+    /// want. So this asserts what CAN be asserted honestly — that every temporal unit
+    /// is accepted, that the expected number of frames comes back, and that each one
+    /// is a real exported surface of the right shape — and it is NOT frame-hash parity.
+    /// It is what turns "never decoded a frame anywhere" into a measurement; promoting
+    /// the rung to `verified` still wants parity, and that wants a readback path first.
+    ///
+    /// Fails loudly rather than skipping when the device has no AV1 entry point: it is
+    /// `#[ignore]`d, so it only runs when someone deliberately points it at a box that
+    /// is supposed to have one, and a silent pass there is the invisible-failure mode
+    /// this whole program exists to end.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and an AV1 VLD entry point"]
+    fn av1_decodes_the_vendored_vector_on_this_machines_vaapi() {
+        let units = split_ivf(AV1_25FPS);
+        assert_eq!(
+            units.len(),
+            250,
+            "the vendored AV1 vector is 250 temporal units"
+        );
+
+        let mut decoder = NativeVaapiDecoder::new(pf_vaadec::Codec::Av1, StreamFormat::SDR_420_8)
+            .expect("this box is supposed to have a VAAPI AV1 decode entry point");
+        eprintln!("VAAPI AV1 rung constructed: {}", decoder.name());
+
+        let mut delivered = 0usize;
+        let mut first: Option<(u32, u32, u32, u64)> = None;
+        for (index, unit) in units.iter().enumerate() {
+            match decoder.decode(unit) {
+                Ok(Some(frame)) => {
+                    assert!(
+                        !frame.planes.is_empty(),
+                        "unit {index}: a delivered frame exported no dmabuf planes"
+                    );
+                    if first.is_none() {
+                        assert!(
+                            frame.keyframe,
+                            "the vector opens on a keyframe, so the first delivered \
+                             frame must be flagged as one"
+                        );
+                        first = Some((frame.width, frame.height, frame.fourcc, frame.modifier));
+                    }
+                    delivered += 1;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("unit {index}: VAAPI AV1 decode failed: {e:#}"),
+            }
+        }
+
+        let (w, h, fourcc, modifier) = first.expect("not one frame came back");
+        eprintln!(
+            "VAAPI AV1: {delivered} frames delivered, first {w}x{h} \
+             fourcc={:?} modifier={modifier:#x}",
+            std::str::from_utf8(&fourcc.to_le_bytes()).unwrap_or("?")
+        );
+        assert_eq!((w, h), (320, 240), "the vector is 320x240");
+        assert_eq!(
+            delivered, 250,
+            "the vector displays 250 frames (274 coded, 24 hidden)"
         );
     }
 }
