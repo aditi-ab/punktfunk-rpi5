@@ -42,12 +42,9 @@
 //!
 //! Threading: openh264's `num_threads` is documented upstream as "will probably just
 //! segfault", so this stays single-threaded — the old libavcodec rung's slice threading has
-//! no equivalent here. rav1d gets the machine's cores: `max_frame_delay = 1` is the knob
-//! that removes frame delay (dav1d's `get_num_threads` then computes `n_fc = min(1, n_tc)`,
-//! so exactly one frame is ever in flight whatever `n_threads` says), and `n_threads`
-//! drives the INTRA-frame tile/row workers, which cost no latency at all. Pinning it to 1
-//! bought nothing and gave the rung reached only because the GPU already failed a single
-//! core to decode 4K with.
+//! no equivalent here. rav1d gets the machine's cores, and **at least two frame contexts**;
+//! [`Av1Software::new`] carries the whole argument, because "at least two" is not a
+//! performance choice but the difference between an error and `abort()`.
 
 use crate::video::{CpuPlanarFrame, RungLoss};
 use crate::video_color::ColorDesc;
@@ -385,10 +382,19 @@ use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{Dav1dSequenceHeader, DAV1D_PIXEL_LAYOUT_I420};
 use rav1d::include::dav1d::picture::Dav1dPicture;
 use rav1d::src::lib::{
-    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
-    dav1d_open, dav1d_parse_sequence_header, dav1d_picture_unref, dav1d_send_data,
+    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings,
+    dav1d_get_frame_delay, dav1d_get_picture, dav1d_open, dav1d_parse_sequence_header,
+    dav1d_picture_unref, dav1d_send_data,
 };
 use std::ptr::NonNull;
+
+/// Frame contexts rav1d must end up with — see [`Av1Software::new`] for why ONE is fatal.
+///
+/// rav1d derives its count as `n_fc = min(max_frame_delay, n_threads)` (`get_num_threads`),
+/// so this is a floor on BOTH settings, not just on the delay. Two, not more: every extra
+/// context is another 4K working set, and the drain in [`Av1Software::decode`] takes the
+/// frame back out in the same call, so there is nothing to buy above the minimum.
+const AV1_MIN_FRAME_CONTEXTS: i32 = 2;
 
 struct Av1Software {
     /// `None` only between `Drop` taking it and the close returning — every other
@@ -438,29 +444,27 @@ unsafe impl Send for Av1Software {}
 
 impl Av1Software {
     fn new() -> Result<Av1Software> {
-        let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
-        // SAFETY: `dav1d_default_settings` fully initializes the `Dav1dSettings` behind
-        // the pointer it is given; the storage is a live local that outlives the call.
-        let mut settings = unsafe {
-            dav1d_default_settings(NonNull::new_unchecked(settings.as_mut_ptr()));
-            settings.assume_init()
-        };
-        // No frame delay: a punktfunk stream is zero-reorder and real-time, so the
-        // throughput a FRAME-threaded decoder buys costs exactly the latency this client
-        // spends the rest of its budget defending. `max_frame_delay = 1` is the knob that
-        // says so — dav1d's `get_num_threads` derives `n_fc = min(max_frame_delay, n_tc)`,
-        // so one frame stays in flight no matter how many threads exist. Same reasoning
-        // as the old libavcodec rung's `FF_THREAD_SLICE` + `AV_CODEC_FLAG_LOW_DELAY`, and
-        // `n_threads` is that rung's SLICE half: intra-frame tile/row workers, which add
-        // no delay. Capped at 8 — this is the rung reached because the GPU already
-        // failed, and it should not also take the machine over.
-        settings.max_frame_delay = 1;
-        settings.n_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
-            .unwrap_or(1) as i32;
-        // Film grain synthesis is a post-process the hosts never signal and nobody can
-        // afford on the rung that exists because the GPU already failed.
-        settings.apply_grain = 0;
+        let mut settings = av1_settings();
+        // Ask rav1d itself what those settings actually bought, and refuse to open a
+        // decoder that would abort the process on its first bad AU.
+        //
+        // `dav1d_get_frame_delay` IS `get_num_threads`' `n_fc`, so this is not a restatement
+        // of [`av1_settings`]' arithmetic — it is rav1d's own answer, and it stays right if
+        // rav1d's derivation ever changes. It is here because the alternative failure mode
+        // is uniquely bad: a settings edit that quietly reinstates `n_fc = 1` costs nothing
+        // at build time, nothing in the tests, nothing on a clean link, and then kills the
+        // whole client the first time a frame arrives damaged. A refusal is a `bail!` the
+        // session reports and recovers from; the thing it replaces is `abort()`.
+        let delay = frame_delay(&mut settings);
+        if delay < AV1_MIN_FRAME_CONTEXTS {
+            bail!(
+                "rav1d would run with {delay} frame context(s) (n_threads={}, \
+                 max_frame_delay={}); anything below {AV1_MIN_FRAME_CONTEXTS} takes the \
+                 single-frame-context path, which ABORTS the process on any decode error",
+                settings.n_threads,
+                settings.max_frame_delay,
+            );
+        }
         let mut ctx: Option<Dav1dContext> = None;
         // SAFETY: both pointers are live locals for the duration of the call, which is
         // dav1d_open's whole contract: it reads `settings` and writes the context out.
@@ -475,7 +479,79 @@ impl Av1Software {
         }
         Ok(Av1Software { ctx })
     }
+}
 
+/// The settings the AV1 CPU leg opens rav1d with. Its own function so the invariant the
+/// rung's life depends on — `n_fc >= AV1_MIN_FRAME_CONTEXTS` — is testable without opening
+/// a decoder.
+fn av1_settings() -> Dav1dSettings {
+    let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
+    // SAFETY: `dav1d_default_settings` fully initializes the `Dav1dSettings` behind
+    // the pointer it is given; the storage is a live local that outlives the call.
+    let mut settings = unsafe {
+        dav1d_default_settings(NonNull::new_unchecked(settings.as_mut_ptr()));
+        settings.assume_init()
+    };
+    // ⚠⚠⚠ TWO frame contexts, not one, and this is a CORRECTNESS setting.
+    //
+    // rav1d 1.1.0 (and upstream `main` as of 2026-08-07) aborts the process on ANY decode
+    // error whenever it is configured with a single frame context. The path, read out of
+    // `rav1d/src/decode.rs`:
+    //
+    //   * `rav1d_submit_frame`'s `c.fc.len() == 1` branch calls `rav1d_decode_frame`
+    //     inline, which ALWAYS finishes in `rav1d_decode_frame_exit` — and that does an
+    //     unconditional `mem::take(&mut f.frame_hdr)` (`decode.rs:4873`).
+    //   * If the decode returned `Err`, the same branch then re-enters the local
+    //     `on_error`, whose first act is `f.frame_hdr.as_ref().unwrap()`
+    //     (`decode.rs:4997`) — on the `None` the teardown above just left.
+    //   * That panic unwinds into `dav1d_send_data`, which is `extern "C"`, so it is
+    //     `panic_cannot_unwind` → `abort()`. No `catch_unwind` at our call site, no rung
+    //     demotion and no `NoSoftwareRung` refusal can catch an abort.
+    //
+    // The `c.fc.len() > 1` branch never calls `rav1d_decode_frame`, so it never reaches
+    // that `on_error` at all: it hands the frame to `rav1d_task_frame_init` and errors come
+    // back through `cached_error`/`task_thread.retval` as ordinary `EINVAL`s — which the
+    // pump already answers with a keyframe request.
+    //
+    // Measured on .21 (2026-08-07) against a captured 4K60 AV1 stream that the client had
+    // itself made undecodable by flushing its backlog and jumping to live, so the next AU
+    // referenced frames nobody had decoded (libdav1d gives the same verdict on the same
+    // capture: 13 frames, then "Invalid data"):
+    //
+    //   n_threads=8 max_frame_delay=1  → n_fc=1 → ABORT
+    //   n_threads=1 max_frame_delay=1  → n_fc=1 → ABORT
+    //   n_threads=1 max_frame_delay=2  → n_fc=1 → ABORT   ← the one that proves the rule
+    //   n_threads=8 max_frame_delay=2  → n_fc=2 → 13 pictures, EINVAL, survives
+    //   n_threads=8 max_frame_delay=0  → n_fc=3 → survives
+    //
+    // The third row is why `n_threads` has a floor of two and not one: `n_fc` is
+    // `min(max_frame_delay, n_threads)`, so a single thread silently puts the whole thing
+    // back on the aborting path. Pinning threads to 1 was also tested as the suspected
+    // trigger and is NOT one — the tile workers are innocent, the single frame context is
+    // the whole defect.
+    //
+    // The frame of latency this would normally cost is bought back in `decode`, which
+    // drains the in-flight frame in the same call instead of pipelining it — see there.
+    //
+    // Reported upstream as memorysafety/rav1d#1497, with the one-line fix
+    // (`is_some_and` for the `unwrap`) and a reproducer that needs no capture: any AV1
+    // stream with one temporal unit removed from the middle. If a release ever carries
+    // that fix, THIS floor is still the right default — it is what makes a decoder error
+    // an error — but the `bail!` in `Av1Software::new` could then relax.
+    settings.max_frame_delay = AV1_MIN_FRAME_CONTEXTS;
+    // `n_threads` drives the INTRA-frame tile/row workers, which add no delay, and now also
+    // floors `n_fc`. Capped at 8 — this is the rung reached because the GPU already failed,
+    // and it should not also take the machine over.
+    settings.n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(AV1_MIN_FRAME_CONTEXTS as usize, 8))
+        .unwrap_or(AV1_MIN_FRAME_CONTEXTS as usize) as i32;
+    // Film grain synthesis is a post-process the hosts never signal and nobody can
+    // afford on the rung that exists because the GPU already failed.
+    settings.apply_grain = 0;
+    settings
+}
+
+impl Av1Software {
     fn decode(&mut self, au: &[u8], color: &mut ColorDesc) -> Result<Option<CpuPlanarFrame>> {
         let ctx = self.ctx.context("rav1d context closed")?;
         if au.is_empty() {
@@ -536,14 +612,50 @@ impl Av1Software {
                 }
                 bail!("rav1d send_data: {}", r.0);
             }
+            // The AU is fully inside the decoder — stop feeding and go and drain it.
+            if sent && data.0.sz == 0 {
+                break;
+            }
             match self.take_picture(ctx, color)? {
                 Some(f) => out = Some(f),
-                // Nothing more to take and the AU is fully consumed — done.
-                None if sent && data.0.sz == 0 => break,
                 // Nothing to take and the decoder still would not accept the rest: it
                 // has neither produced nor consumed, which is a wedge, not back-pressure.
                 None if !sent => bail!("rav1d: decoder accepted no data and produced no picture"),
                 None => {}
+            }
+        }
+        // Now drain — and drain PAST the first `EAGAIN`, which is the whole trick that
+        // makes two frame contexts cost no latency.
+        //
+        // `rav1d_get_picture` only reaches its blocking `drain_picture` on a call whose own
+        // `drain` flag is ALREADY set, and that flag is set by the PREVIOUS `get_picture`
+        // and cleared by every `send_data` that carried bytes. So the first `EAGAIN` after
+        // a send does not mean "no picture for this AU" — it means "ask again", and the
+        // frame this AU coded comes out of the SECOND call, which waits for the tile
+        // workers instead of leaving the frame in flight. Stopping at the first `None` is
+        // what a single-frame-context reading of dav1d's API teaches, and with `n_fc = 2`
+        // it silently puts the pipeline two frames behind.
+        //
+        // Measured on .21 (2026-08-07), 4K60 AV1, 14 temporal units, `n_fc = 2`:
+        //   stopping at the first `None`  → units 0 and 1 produce NOTHING, then one frame
+        //                                   per unit: a standing two-frame delay
+        //   draining past it (this loop)  → one frame per unit from unit 0, and 20-42 ms
+        //                                   per unit against 21-53 ms at `n_fc = 1`
+        // i.e. it is not a trade at all — same cadence as the aborting configuration, and
+        // slightly faster, because the tile workers overlap the drain.
+        //
+        // Terminating: every `Some` consumes one picture and a temporal unit codes finitely
+        // many, and rav1d opens each frame context `finished = true` (`lib.rs:232`), so the
+        // drain walk over an idle context returns rather than waiting for a frame nobody
+        // submitted.
+        let mut idle = 0;
+        while idle < 2 {
+            match self.take_picture(ctx, color)? {
+                Some(f) => {
+                    out = Some(f);
+                    idle = 0;
+                }
+                None => idle += 1,
             }
         }
         Ok(out)
@@ -719,6 +831,21 @@ impl Drop for Av1Software {
 /// so the errno is the only handle the crate actually offers.
 fn dav1d_errno(r: rav1d::Dav1dResult) -> Option<i32> {
     (r.0 < 0).then_some(-r.0)
+}
+
+/// How many frame contexts (`n_fc`) rav1d will actually run with, given these settings.
+///
+/// rav1d's own `get_num_threads` answer rather than a copy of its arithmetic, so the floor
+/// [`Av1Software::new`] enforces cannot drift away from the thing it is protecting against.
+/// A negative return (settings rav1d would refuse outright) collapses to 0, which the
+/// caller's floor check then rejects — the right answer for that case too.
+fn frame_delay(settings: &mut Dav1dSettings) -> i32 {
+    // SAFETY: `settings` is a live local for the duration of the call, which is this
+    // function's whole contract — it `ptr::read`s the struct and writes nothing back. The
+    // read is a bitwise copy of a plain-data struct (`Rav1dSettings` has no `Drop`), so it
+    // cannot release anything the caller still owns.
+    let r = unsafe { dav1d_get_frame_delay(NonNull::new(settings as *mut Dav1dSettings)) };
+    r.0.max(0)
 }
 
 #[cfg(test)]
@@ -1039,6 +1166,58 @@ mod tests {
             .is_some());
     }
 
+    /// **The rung must never open rav1d with one frame context.**
+    ///
+    /// With `n_fc == 1`, rav1d 1.1.0 `abort()`s the whole client on ANY decode error:
+    /// `rav1d_submit_frame`'s single-frame-context branch runs `rav1d_decode_frame`, whose
+    /// `rav1d_decode_frame_exit` unconditionally takes `f.frame_hdr`, and then — only if
+    /// the decode failed — calls an `on_error` that opens with
+    /// `f.frame_hdr.as_ref().unwrap()`. The panic crosses `dav1d_send_data`'s `extern "C"`
+    /// frame as `panic_cannot_unwind`, so nothing in this crate can catch it: not the
+    /// pump's survivable-error arm, not a rung demotion, not a `NoSoftwareRung` refusal.
+    /// Reproduced on .21 on 2026-08-07 with a 4K60 AV1 capture, twice.
+    ///
+    /// The assertion is rav1d's OWN `n_fc` (`dav1d_get_frame_delay` is literally
+    /// `get_num_threads`' answer), not a re-derivation of it here, so it also holds if
+    /// rav1d changes how the number is computed.
+    #[test]
+    fn the_av1_rung_never_opens_rav1d_with_a_single_frame_context() {
+        let mut s = av1_settings();
+        let n_fc = frame_delay(&mut s);
+        assert!(
+            n_fc >= AV1_MIN_FRAME_CONTEXTS,
+            "rav1d would run with n_fc={n_fc} (n_threads={}, max_frame_delay={}) — one \
+             frame context ABORTS the process on the first damaged AU",
+            s.n_threads,
+            s.max_frame_delay,
+        );
+        // ...and the constructor refuses rather than opening such a decoder, so a machine
+        // whose settings somehow land there loses the rung instead of the process.
+        assert!(Av1Software::new().is_ok());
+    }
+
+    /// ⚠ The trap that makes the setting above look like a one-liner when it is two.
+    ///
+    /// `n_fc = min(max_frame_delay, n_threads)`, so `max_frame_delay = 2` on its own is NOT
+    /// enough: one decode thread drags `n_fc` back to 1 and reinstates the abort. Measured
+    /// on .21 — `n_threads=1, max_frame_delay=2` aborted on the same capture that
+    /// `n_threads=8, max_frame_delay=2` survives — which is also the datapoint that rules
+    /// out "the tile workers are the trigger": fewer threads made it worse, not better.
+    ///
+    /// Asserted against rav1d's own arithmetic so it cannot rot into folklore.
+    #[test]
+    fn one_decode_thread_would_put_the_rung_back_on_the_aborting_path() {
+        let mut one_thread = av1_settings();
+        one_thread.n_threads = 1;
+        assert_eq!(
+            frame_delay(&mut one_thread),
+            1,
+            "n_fc is min(max_frame_delay, n_threads) — this is why n_threads has a floor"
+        );
+        // And the floor in `av1_settings` is what keeps the shipping config off it.
+        assert!(av1_settings().n_threads >= AV1_MIN_FRAME_CONTEXTS);
+    }
+
     /// The AV1 leg decodes a real stream and reports the sequence header's own colour.
     /// Fixture: the vendored cros-codecs AV1 vector (IVF), whose first temporal unit is a
     /// key frame — enough to prove the rav1d FFI (open → send → get → unref → close),
@@ -1076,6 +1255,13 @@ mod tests {
             units > 100,
             "expected the full 25 fps vector, got {units} units"
         );
+        // ⚠ This equality is also the LATENCY guard for the two-frame-context config.
+        // rav1d with `n_fc = 2` pipelines by default: `dav1d_get_picture` answers `EAGAIN`
+        // once after each send and only reaches its blocking drain on the call after that.
+        // A `decode` that stopped at the first `EAGAIN` would still decode every frame
+        // eventually — it would just hand each one back two AUs late, and `frames` would
+        // come up exactly `n_fc` short of `units` here. So this line is what says the drain
+        // loop still returns THIS AU's picture in THIS call.
         assert_eq!(frames, units, "every temporal unit here shows a picture");
         let f = first.expect("no AV1 frame decoded");
         assert_eq!((f.width, f.height), (320, 240));

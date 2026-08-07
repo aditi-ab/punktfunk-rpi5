@@ -17,6 +17,60 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Read one of this client's JSON config files, or its `Default` — tolerating a byte order
+/// mark, and SAYING SO when the file is there but will not parse.
+///
+/// Both halves are the same bug seen twice.
+///
+/// **The BOM.** PowerShell's `Set-Content -Encoding UTF8` writes a UTF-8 BOM, and every
+/// Windows how-to reaches for it, so `%APPDATA%\punktfunk\client-windows-settings.json`
+/// edited from a shell arrives with `EF BB BF` in front of the `{`. `serde_json` rejects
+/// that at byte 0 — correctly, JSON has no BOM — and the old
+/// `.and_then(|s| from_str(&s).ok())` then turned the whole file into `Default`. Cost an
+/// hour on 2026-08-07: a `codec: "av1"` edit was ignored and the client negotiated HEVC,
+/// with the file plainly right on screen. So the mark is stripped, which is what every
+/// other JSON consumer on Windows does.
+///
+/// **The silence.** The `.ok()` that hid the BOM hides everything else too: a trailing
+/// comma, a truncated write, a hand-edit with a typo. Every one of them presents as "the
+/// app forgot all my settings", with nothing anywhere to say why. A parse failure now costs
+/// one `warn!` naming the file and serde's own line/column. The RESULT is unchanged —
+/// `Default`, never an error — because nothing about streaming may hinge on this file
+/// being readable, and refusing to start because a settings file is malformed would be a
+/// worse failure than the one being fixed.
+///
+/// A missing file is not a parse failure and stays silent: that is just first run. Every
+/// OTHER read failure is reported, which is not pedantry — `Set-Content -Encoding Unicode`
+/// writes UTF-16LE, `read_to_string` rejects it as invalid UTF-8, and that lands in exactly
+/// the same "the app forgot my settings, and said nothing" hole the BOM did.
+pub(crate) fn load_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "config file could not be read — every setting in it is being IGNORED \
+                 (a UTF-16 file reads as invalid UTF-8 here; re-save it as UTF-8)"
+            );
+            return T::default();
+        }
+    };
+    match serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(&raw)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "config file did not parse — falling back to defaults for it, and the \
+                 settings in it are being IGNORED (fix or delete the file)"
+            );
+            T::default()
+        }
+    }
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     {
@@ -358,9 +412,7 @@ impl KnownHosts {
     /// read cannot take part in that.
     pub fn read() -> KnownHosts {
         Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|p| load_json_or_default(&p))
             .unwrap_or_default()
     }
 
@@ -1355,9 +1407,7 @@ impl Settings {
 
     pub fn load() -> Settings {
         Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|p| load_json_or_default(&p))
             .unwrap_or_default()
     }
 
@@ -1444,6 +1494,54 @@ mod tests {
     /// per letter, which is all the known-hosts tests need one to be.
     fn fp(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// **A byte order mark must not silently erase every setting in the file.**
+    ///
+    /// PowerShell's `Set-Content -Encoding UTF8` writes one, so this is what a settings
+    /// file edited from a Windows shell actually looks like on disk. `serde_json` refuses
+    /// `EF BB BF` at byte 0, and the loader used to swallow that refusal and return
+    /// `Default` — which on 2026-08-07 cost an hour: a `codec: "av1"` edit was ignored and
+    /// the client negotiated HEVC, with the correct file open on screen. Nothing was
+    /// logged, because there was nothing in the code to log it.
+    ///
+    /// Asserts the three cases together, because the middle one is the whole point: a BOM
+    /// must LOAD, not merely fail loudly.
+    #[test]
+    fn a_bom_does_not_turn_a_settings_file_into_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "pf-client-core-bom-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"codec":"av1","bitrate_kbps":42000}"#;
+
+        let plain = dir.join("plain.json");
+        std::fs::write(&plain, body).unwrap();
+        let s: Settings = load_json_or_default(&plain);
+        assert_eq!(s.codec, "av1");
+        assert_eq!(s.bitrate_kbps, 42000);
+
+        // The same bytes with a UTF-8 BOM in front must load identically.
+        let bom = dir.join("bom.json");
+        std::fs::write(&bom, format!("\u{feff}{body}")).unwrap();
+        let s: Settings = load_json_or_default(&bom);
+        assert_eq!(s.codec, "av1", "a BOM must not discard the settings file");
+        assert_eq!(s.bitrate_kbps, 42000);
+
+        // Genuinely broken JSON still falls back to defaults (never an error — nothing
+        // about streaming may hinge on this file), and a missing file is not a failure
+        // at all, it is first run.
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, r#"{"codec":"av1",}"#).unwrap();
+        let d: Settings = load_json_or_default(&broken);
+        assert_eq!(d.codec, Settings::default().codec);
+        let gone: Settings = load_json_or_default(&dir.join("nope.json"));
+        assert_eq!(gone.codec, Settings::default().codec);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A settings file predating the touch-input model loads as `trackpad` (the shipped

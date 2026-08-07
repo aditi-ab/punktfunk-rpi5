@@ -51,7 +51,7 @@
 //! | native D3D11VA | [`crate::video_d3d11_native`] | H.264, H.265 | **yes** — frame-hash parity on an RTX 4090 and an AMD iGPU + a 30-minute soak (M5) |
 //! | native D3D11VA | | AV1 | **not proven** — it HAS now decoded (4K60, RTX 3500 Ada, 2026-08-07), but with no parity check and no soak it stays out of the admission filter. Its M7 wiring was right all along: what looked like a DXVA reference-mapping bug (`reference picture N holds no DPB slot`, 72 consecutive failures) was the HOST shipping half of every AV1 frame — see `pf_encode`'s `resolve_split_subframe` |
 //! | native VAAPI | [`crate::video_vaapi_native`] | H.264, H.265, AV1 | **NO** — has never decoded a frame anywhere (M6/M7; no VAAPI hardware was reachable) |
-//! | software | `video_software` | H.264, AV1 | **NO** — openh264 has never run on glass; rav1d decodes 1080p AV1 there but **aborts the process** on 4K (rav1d 1.1.0 panics inside its own error handler, across an `extern "C"` boundary, so nothing can catch it) |
+//! | software | `video_software` | H.264, AV1 | **not proven** — openh264 has never run on glass; rav1d HAS now decoded 1080p and 4K60 AV1 there (2026-08-07, .21) and recovers in-session from a mid-stream reference loss, but with no parity check and no soak. Its 4K "abort" was never about 4K: rav1d 1.1.0 kills the process on ANY decode error while it holds a single frame context, so `video_software` opens it with two — see [`crate::video_software`] |
 //!
 //! The software rung's evidence is recorded for the same reason but does not gate
 //! anything: it is the LAST rung, so there is nothing below it to protect.
@@ -1124,16 +1124,22 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
             false,
             "NEVER decoded a frame on any hardware - no VAAPI device was reachable (M6/M7)",
         ),
-        // ⚠ rav1d 1.1.0 ABORTS THE PROCESS on 4K AV1 (2026-08-07, .21): it takes an internal
-        // error path and then panics inside its own `on_error` (`decode.rs:4997`,
-        // `Option::unwrap()` on a `None` frame header). The panic crosses the `extern "C"`
-        // boundary in `dav1d_send_data`, so it is `panic_cannot_unwind` — an abort, which no
-        // rung demotion or `NoSoftwareRung` refusal can catch. 1080p AV1 decodes fine, and
-        // libdav1d decodes the same 4K stream 715/715, so this is rav1d's own defect.
+        // The 4K AV1 abort recorded here on 2026-08-07 is FIXED, and it was never about 4K.
+        // rav1d 1.1.0 aborts the process on ANY decode error while it holds a single frame
+        // context: `rav1d_decode_frame_exit` takes `f.frame_hdr`, and the error path then
+        // re-enters an `on_error` that unwraps it (`decode.rs:4997`), which crosses
+        // `dav1d_send_data`'s `extern "C"` frame as `panic_cannot_unwind`. 4K was only where
+        // an error first happened: the CPU rung cannot keep up at 3840x2160, the pump
+        // flushed its backlog and jumped to live, and the next AU referenced frames nobody
+        // had decoded. `video_software.rs` now opens rav1d with two frame contexts, which
+        // takes that `on_error` out of reach; the same damage now surfaces as the `EINVAL`
+        // the pump answers with a keyframe request. Still NOT `verified`: 4K60 AV1 ran to a
+        // clean exit on .21 and recovered from the damage in-session, but openh264 has
+        // still never run on glass and neither leg has a soak or a parity check.
         (NativeRung::Software, CODEC_H264 | CODEC_AV1) => (
             false,
-            "openh264 has never run on glass; rav1d decodes 1080p AV1 there but ABORTS the \
-             process on 4K (rav1d 1.1.0 panics in its own error handler) (M8)",
+            "openh264 has never run on glass; rav1d decodes 1080p and 4K60 AV1 there and \
+             survives a mid-stream reference loss, but has no parity check or soak (M8)",
         ),
         _ => (false, "no hardware run recorded for this rung and codec"),
     };
@@ -3280,7 +3286,11 @@ mod tests {
                 CODEC_H264,
                 "openh264 never ran on glass",
             ),
-            (NativeRung::Software, CODEC_AV1, "rav1d never ran on glass"),
+            (
+                NativeRung::Software,
+                CODEC_AV1,
+                "rav1d has decoded on glass but has no parity check and no soak",
+            ),
         ] {
             assert!(
                 !native_evidence(rung, codec).verified,
