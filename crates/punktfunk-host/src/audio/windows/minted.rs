@@ -233,12 +233,17 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
     // Stamp the human name onto every endpoint of the role. Field-measured necessity, not
     // cosmetics: unstamped, the minted instances read "Lautsprecher (2- Steam Streaming
     // Microphone)" etc. and even the box's owner picked the wrong device out of the Sound
-    // settings zoo. Names only (a wider stamp set makes AudioEndpointBuilder re-mint the
-    // endpoint under a new GUID — the pad program measured that); stamping needs the SYSTEM
-    // ACL route on the MMDevices keys, so a dev-run devtest may leave the names unstamped —
-    // the wiring never depends on them (identity is the recorded id).
-    for ep in [Some(&render), capture.as_ref()].into_iter().flatten() {
-        stamp_name(ep, role);
+    // settings zoo. The MIC RENDER additionally gets a MONO format set — measured (440 Hz in,
+    // 220 Hz out): the driver forwards the render stream RAW into its mono capture side, so a
+    // stereo-declared render plays back an octave low; declaring mono makes the engine
+    // downmix before the crossing. Minimal stamps only (a wider set makes
+    // AudioEndpointBuilder re-mint the endpoint under a new GUID — the pad program measured
+    // that); stamping needs the SYSTEM ACL route on the MMDevices keys, so a dev-run devtest
+    // may leave them unstamped — the wiring never depends on them (identity is the recorded
+    // id).
+    stamp_identity(&render, role, false);
+    if let Some(cap) = capture.as_ref() {
+        stamp_identity(cap, role, true);
     }
 
     // Freshly registered endpoints can grab a default; the wiring plan owns default policy,
@@ -274,10 +279,43 @@ const STAMP_ATTEMPTS: usize = 3;
 /// checking immediately reports success on passes that later get reverted).
 const STAMP_SETTLE: Duration = Duration::from_millis(1200);
 
-/// Best-effort: write the role's display name onto one endpoint and wait for the audio stack
-/// to SERVE it. Never fails the role — an unnamed endpoint still wires correctly by id.
-fn stamp_name(endpoint_id: &str, role: Role) {
-    let stamps = [
+/// `WAVEFORMATEXTENSIBLE`: 1 ch / 48 kHz / 16-bit PCM, mask 0x4 (FRONT_CENTER), PCM subtype —
+/// the mic render's device format. The driver's capture side is mono 48 kHz by its own
+/// default; the render must MATCH it (measured: a stereo render crosses the driver raw and
+/// plays back an octave low).
+const WFX_PCM16_1CH_48K: [u8; 40] = [
+    0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
+    0x01, 0x00, // nChannels = 1
+    0x80, 0xbb, 0x00, 0x00, // nSamplesPerSec = 48000
+    0x00, 0x77, 0x01, 0x00, // nAvgBytesPerSec = 96000
+    0x02, 0x00, // nBlockAlign = 2
+    0x10, 0x00, // wBitsPerSample = 16
+    0x16, 0x00, // cbSize = 22
+    0x10, 0x00, // wValidBitsPerSample = 16
+    0x04, 0x00, 0x00, 0x00, // dwChannelMask = SPEAKER_FRONT_CENTER
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+    0x71, // KSDATAFORMAT_SUBTYPE_PCM
+];
+/// The float leg of ↑ (mix/host formats).
+const WFX_F32_1CH_48K: [u8; 40] = [
+    0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
+    0x01, 0x00, // nChannels = 1
+    0x80, 0xbb, 0x00, 0x00, // nSamplesPerSec = 48000
+    0x00, 0xee, 0x02, 0x00, // nAvgBytesPerSec = 192000
+    0x04, 0x00, // nBlockAlign = 4
+    0x20, 0x00, // wBitsPerSample = 32
+    0x16, 0x00, // cbSize = 22
+    0x20, 0x00, // wValidBitsPerSample = 32
+    0x04, 0x00, 0x00, 0x00, // dwChannelMask = SPEAKER_FRONT_CENTER
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+    0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+];
+
+/// Best-effort: write the role's display name — plus, on the mic RENDER, the mono format set —
+/// onto one endpoint and wait for the audio stack to SERVE it. Never fails the role — an
+/// unstamped endpoint still wires correctly by id.
+fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
+    let mut stamps = vec![
         pe::Stamp {
             label: "device-desc",
             key: pe::PKEY_DEVICE_DESC,
@@ -289,6 +327,30 @@ fn stamp_name(endpoint_id: &str, role: Role) {
             value: pe::StampValue::Str("Punktfunk"),
         },
     ];
+    if role == Role::Mic && !capture {
+        stamps.extend([
+            pe::Stamp {
+                label: "device-format",
+                key: pe::PKEY_DEVICE_FORMAT,
+                value: pe::StampValue::Format(&WFX_PCM16_1CH_48K),
+            },
+            pe::Stamp {
+                label: "mix-format-2",
+                key: pe::PKEY_MIX_FORMAT_2,
+                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+            },
+            pe::Stamp {
+                label: "mix-format-3",
+                key: pe::PKEY_MIX_FORMAT_3,
+                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+            },
+            pe::Stamp {
+                label: "host-format",
+                key: pe::PKEY_HOST_FORMAT,
+                value: pe::StampValue::Format(&WFX_F32_1CH_48K),
+            },
+        ]);
+    }
     // Steady state (every boot after the first): the names are already served — no writes,
     // no settle sleeps.
     if pe::stamps_served(endpoint_id, &stamps) {
