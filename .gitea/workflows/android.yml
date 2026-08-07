@@ -160,6 +160,22 @@ jobs:
           key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
+      # Clippy for the ANDROID target. Like the kit tests below, this was running NOWHERE: ci.yml
+      # lints `--workspace` on the host, where `clients/android/native` and every
+      # `#[cfg(target_os = "android")]` module elsewhere compile out, and this workflow only ever
+      # built. Discovered in 2026-08 with five lints already resident — code no gate had ever read.
+      #
+      # Placed BEFORE assembleDebug deliberately: a lint failure should cost the ~10 s the lint
+      # takes, not the full three-ABI build first. It shares sccache and the target dir with the
+      # build that follows, so the compile is not paid twice.
+      #
+      # The task lints arm64-v8a AND armeabi-v7a, and reuses the build task's exact cargo-ndk
+      # environment — see the long note on `registerCargoNdkClippy` in kit/build.gradle.kts for why
+      # both pointer widths are load-bearing and why the environment must not be duplicated here.
+      - name: Clippy (Android target, deny warnings)
+        working-directory: clients/android
+        run: ./gradlew :kit:cargoNdkClippy --stacktrace
+
       # The kit's JVM unit tests — the pure parsers, migrations and feedback policies. They were
       # running nowhere: this workflow only assembled, and android-screenshots.yml runs the :app
       # module's tests, so nothing enforced :kit's. Cheap (a couple of seconds against an already

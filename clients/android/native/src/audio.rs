@@ -44,6 +44,14 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// What one playback open attempt yields: the stream, plus both halves of the PCM hand-off — the
+/// sender the decode thread fills and the receiver that returns drained buffers for refill.
+///
+/// Named rather than written inline because the closure's return type trips
+/// `clippy::type_complexity`, which the Android target is now linted for (`:kit:cargoNdkClippy`)
+/// after years of nothing checking it.
+type OpenedPlayback = ndk::audio::Result<(AudioStream, SyncSender<Vec<f32>>, Receiver<Vec<f32>>)>;
+
 const SAMPLE_RATE: i32 = 48_000;
 /// Decoded-chunk hand-off depth: 64 × 5 ms = 320 ms slack (matches the core's AUDIO_QUEUE).
 const RING_CHUNKS: usize = 64;
@@ -175,11 +183,7 @@ impl AudioPlayback {
         // One open attempt at a given sharing mode. Everything the realtime callback captures
         // (channels, ring, prime state) is rebuilt per attempt — `open_stream` consumes the builder
         // AND the callback, so nothing survives a failed try to reuse.
-        let try_open = |sharing: AudioSharingMode| -> ndk::audio::Result<(
-            AudioStream,
-            SyncSender<Vec<f32>>,
-            Receiver<Vec<f32>>,
-        )> {
+        let try_open = |sharing: AudioSharingMode| -> OpenedPlayback {
             let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
             // Recycle free-list: drained PCM buffers go BACK to the decode thread to be refilled, so
             // the realtime callback never frees heap (Android's Scudo allocator has unbounded free()
