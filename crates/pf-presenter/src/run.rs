@@ -550,7 +550,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             Some((x, y)) => b.position(x, y),
             None => b.position_centered(),
         };
-        b.resizable().vulkan();
+        // HIGH_PIXEL_DENSITY: give us a backbuffer in the panel's REAL pixels. Without it
+        // SDL leaves the Wayland surface at buffer scale 1, so on a fractionally scaled
+        // output (KDE at 150 %: a 2560×1600 panel reported as 1707×1067 points) the
+        // swapchain is built at 1707×1067 and the compositor upscales it to the glass —
+        // a 2560×1600 stream is resampled DOWN and back UP, and looks it. The flag only
+        // widens `size_in_pixels()`; `size()` stays logical, which is what the persisted
+        // window size and SDL's own mouse coordinates are in, and both callers already
+        // use the right one.
+        b.resizable().vulkan().high_pixel_density();
         if opts.fullscreen {
             b.fullscreen();
         }
@@ -644,11 +652,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let native = window
         .get_display()
         .and_then(|d| d.get_mode())
-        .map(|m| Mode {
-            width: m.w.max(0) as u32,
-            height: m.h.max(0) as u32,
-            refresh_hz: m.refresh_rate.round().max(0.0) as u32,
-        })
+        .map(|m| native_mode(m.w, m.h, m.pixel_density, m.refresh_rate))
+        .ok()
+        // A zero-sized mode is as useless as no mode at all — only `Err` used to reach
+        // the fallback, so a display that reported 0×0 streamed a 0×0 request.
+        .filter(|m: &Mode| m.width > 0 && m.height > 0)
         .unwrap_or(Mode {
             width: 1920,
             height: 1080,
@@ -2136,6 +2144,37 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     Ok(outcome)
 }
 
+/// An `SDL_DisplayMode` as the panel's REAL pixels — the `0 = native` stream mode.
+///
+/// SDL3 reports a display mode in SCREEN COORDINATES, not pixels, and hands you the ratio
+/// between the two separately as `pixel_density`. On X11 and Windows that ratio is always
+/// 1.0 (SDL never sets it there, and `SDL_video.c` normalizes the unset 0.0 up to 1.0), so
+/// this is a no-op — but under a Wayland compositor doing FRACTIONAL scaling it is the
+/// whole ballgame: KDE at 150 % advertises a 2560×1600 panel as 1707×1067 points with
+/// `pixel_density` ≈ 1.4997, and taking `m.w`/`m.h` raw is what made "Native resolution"
+/// negotiate 1706×1066 (1707×1067 even-floored by `render_scale::apply`) and stream a
+/// blurry two-thirds-size image. `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY=1` is the same fix
+/// from the outside — it makes SDL report the native mode itself — which is why setting it
+/// was a workaround.
+///
+/// The density is the exact `pixels / points` ratio SDL derived from the output, so the
+/// multiplication recovers the panel size to the pixel rather than approximating it.
+fn native_mode(w: i32, h: i32, pixel_density: f32, refresh_rate: f32) -> Mode {
+    // A non-finite or non-positive density is SDL telling us nothing useful; 1× at least
+    // preserves the pre-fix behaviour instead of collapsing the mode to zero.
+    let density = if pixel_density.is_finite() && pixel_density > 0.0 {
+        pixel_density
+    } else {
+        1.0
+    };
+    let px = |v: i32| (v.max(0) as f32 * density).round().max(0.0) as u32;
+    Mode {
+        width: px(w),
+        height: px(h),
+        refresh_hz: refresh_rate.round().max(0.0) as u32,
+    }
+}
+
 /// Match-window (D1): replace the params' requested w/h with the window's physical pixel
 /// size — even-floored (the host's `validate_dimensions` rejects odd) and clamped to a
 /// sane minimum — keeping the resolved refresh. Under `--fullscreen` the window IS the
@@ -2907,6 +2946,52 @@ fn stats_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The field report this exists for: CachyOS/KDE Plasma 6.7.4 Wayland, a 2560×1600@165
+    /// laptop panel at 150 % scaling. KDE advertises the output as 1707×1067 points, SDL
+    /// hands that back as the desktop mode with `pixel_density` = 2560/1707, and "Native
+    /// resolution" streamed 1706×1066 — the points, even-floored by `render_scale::apply`.
+    #[test]
+    fn native_is_the_panels_pixels_under_fractional_wayland_scaling() {
+        // SDL derives the density as the exact pixels-per-point ratio of the output.
+        let density = 2560.0 / 1707.0;
+        let m = native_mode(1707, 1067, density, 165.0);
+        assert_eq!((m.width, m.height, m.refresh_hz), (2560, 1600, 165));
+        // …and it survives the even-floor the host's `validate_dimensions` forces, which is
+        // where 1707×1067 lost its odd pixel and became the reported 1706×1066.
+        assert_eq!(
+            punktfunk_core::render_scale::apply(m.width, m.height, 1.0, 8192),
+            (2560, 1600)
+        );
+        assert_eq!(
+            punktfunk_core::render_scale::apply(1707, 1067, 1.0, 8192),
+            (1706, 1066),
+            "the pre-fix mode, kept here so the regression is legible"
+        );
+    }
+
+    #[test]
+    fn native_is_unchanged_where_the_density_is_one() {
+        // X11, Windows, and Wayland at 100 % all report 1.0 — the fix must be inert there.
+        let m = native_mode(2560, 1600, 1.0, 165.0);
+        assert_eq!((m.width, m.height, m.refresh_hz), (2560, 1600, 165));
+        // Integer scaling (a 200 % 4K panel reported as 1920×1080 points) doubles cleanly.
+        let m = native_mode(1920, 1080, 2.0, 60.0);
+        assert_eq!((m.width, m.height), (3840, 2160));
+    }
+
+    #[test]
+    fn a_nonsense_density_falls_back_to_one_rather_than_zeroing_the_mode() {
+        // SDL normalizes an unset density to 1.0, but this must not be the one place a
+        // driver quirk can hand the host a 0×0 mode request.
+        for bogus in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let m = native_mode(2560, 1600, bogus, 60.0);
+            assert_eq!((m.width, m.height), (2560, 1600), "density {bogus}");
+        }
+        // A negative mode size is clamped, not wrapped into a huge u32.
+        let m = native_mode(-1, -1, 1.5, 60.0);
+        assert_eq!((m.width, m.height), (0, 0));
+    }
 
     #[test]
     fn overlay_scale_follows_dpi_and_survives_a_bogus_display() {
