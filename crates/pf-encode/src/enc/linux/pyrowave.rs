@@ -3051,4 +3051,209 @@ mod tests {
             pw::pyrowave_device_destroy(dev);
         }
     }
+
+    /// Decode a whole AU stream through ONE decoder (a client's `last_seq` is not reset per frame)
+    /// and return each frame's luma plane.
+    ///
+    /// # Safety
+    /// Test-only FFI into the vendored decoder with locally-owned buffers.
+    unsafe fn decode_stream_luma(w: u32, h: u32, aus: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut dev: pw::pyrowave_device = std::ptr::null_mut();
+        assert_eq!(
+            pw::pyrowave_create_default_device(&mut dev),
+            pw::pyrowave_result_PYROWAVE_SUCCESS
+        );
+        let dinfo = pw::pyrowave_decoder_create_info {
+            device: dev,
+            width: w as i32,
+            height: h as i32,
+            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            fragment_path: false,
+        };
+        let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
+        assert_eq!(
+            pw::pyrowave_decoder_create(&dinfo, &mut dec),
+            pw::pyrowave_result_PYROWAVE_SUCCESS
+        );
+        let mut out = Vec::with_capacity(aus.len());
+        for (i, au) in aus.iter().enumerate() {
+            assert_eq!(
+                pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
+                pw::pyrowave_result_PYROWAVE_SUCCESS,
+                "frame {i} rejected"
+            );
+            assert!(
+                pw::pyrowave_decoder_decode_is_ready(dec, false),
+                "frame {i} never became decodable"
+            );
+            let mut y = vec![0u8; (w * h) as usize];
+            let mut cb = vec![0u8; (w * h / 4) as usize];
+            let mut cr = vec![0u8; (w * h / 4) as usize];
+            let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
+            buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+            buf.width = w as i32;
+            buf.height = h as i32;
+            buf.data = [
+                y.as_mut_ptr() as *mut _,
+                cb.as_mut_ptr() as *mut _,
+                cr.as_mut_ptr() as *mut _,
+            ];
+            buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+            buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
+            assert_eq!(
+                pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
+                pw::pyrowave_result_PYROWAVE_SUCCESS,
+                "frame {i} failed to decode"
+            );
+            out.push(y);
+        }
+        pw::pyrowave_decoder_destroy(dec);
+        pw::pyrowave_device_destroy(dev);
+        out
+    }
+
+    /// PSNR (dB) between two equal-sized 8-bit planes; `f64::INFINITY` when identical.
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mse = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = x as f64 - y as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / a.len() as f64;
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        }
+    }
+
+    /// **PW5 stage 6's ENCODER-side gate.** Two frames genuinely in flight at once must produce the
+    /// same pictures, in the same order, as the synchronous depth-1 path.
+    ///
+    /// This is the half of the depth-2 risk that lives in THIS crate: the slot resources
+    /// (`cmd`/`fence`/`csc_set`/y/uv/cursor) and the alternating encoder handles. Ground truth is
+    /// the encoder's OWN depth-1 output over the same frames, which is the honest reference —
+    /// pyrowave's raw AU bytes are not reproducible run-to-run (see the stage-3 commit), but its
+    /// DECODED planes are.
+    ///
+    /// Content moves every frame. Flat fills are the documented false-green trap here: a torn frame
+    /// assembled from two halves of a static card is invisible, and a gray fill once green-lit a
+    /// broken import.
+    ///
+    /// ⚠ WHAT THIS DOES **NOT** COVER, and no in-tree test can: the CAPTURE side. `.process`
+    /// requeues the SPA buffer to the compositor at callback return while the encode thread still
+    /// holds only a dup of its fd, so a second frame in flight widens the window in which the
+    /// producer may overwrite a buffer we are still reading by a full frame period. That needs a
+    /// live compositor, a real client and a long moving-content session — the on-glass tear-hunt
+    /// PW5 stage 6 is gated on. This test passing is necessary, not sufficient.
+    ///
+    /// Drives the backend at depth 2 by setting `max_inflight` directly rather than through a
+    /// shipped knob: the shipped value is 1 and this must not change that.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn overlapping_two_frames_reproduces_the_synchronous_picture() {
+        const FRAMES: u32 = 16;
+        let (w, h) = (256u32, 256u32);
+        // Odd seeds: `test_card` starts its LCG at `seed | 1`, so 2 and 3 build the same card.
+        let cards: Vec<CapturedFrame> = (0..FRAMES).map(|i| test_card(w, h, 2 * i + 1)).collect();
+        let open = || {
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open")
+        };
+
+        // --- reference: strictly synchronous, one frame at a time ---
+        let mut enc = open();
+        let sync: Vec<Vec<u8>> = cards
+            .iter()
+            .map(|c| {
+                enc.submit(c).expect("sync submit");
+                assert_eq!(
+                    enc.inflight.len(),
+                    1,
+                    "submit must leave exactly one in flight"
+                );
+                enc.poll()
+                    .expect("sync poll")
+                    .expect("one AU per frame")
+                    .data
+            })
+            .collect();
+        drop(enc);
+
+        // --- overlapped: submit N+1 before polling N ---
+        let mut enc = open();
+        enc.max_inflight = SLOTS;
+        let mut overlapped: Vec<Vec<u8>> = Vec::new();
+        let mut saw_two_in_flight = false;
+        for c in &cards {
+            enc.submit(c).expect("overlapped submit");
+            saw_two_in_flight |= enc.inflight.len() == 2;
+            if enc.inflight.len() >= SLOTS {
+                overlapped.push(
+                    enc.poll()
+                        .expect("overlapped poll")
+                        .expect("an AU once the pipeline is full")
+                        .data,
+                );
+            }
+        }
+        enc.flush().expect("flush drains the tail");
+        while let Some(au) = enc.poll().expect("tail poll") {
+            overlapped.push(au.data);
+        }
+        drop(enc);
+        assert!(
+            saw_two_in_flight,
+            "two frames were never actually in flight — this test proved nothing"
+        );
+        assert_eq!(
+            overlapped.len(),
+            sync.len(),
+            "the overlapped run emitted a different number of AUs — a frame was lost"
+        );
+
+        // --- decode both streams and compare, frame by frame ---
+        // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+        let (sy, oy) = unsafe {
+            (
+                decode_stream_luma(w, h, &sync),
+                decode_stream_luma(w, h, &overlapped),
+            )
+        };
+        let mut worst = f64::INFINITY;
+        for i in 0..sy.len() {
+            let p = psnr(&sy[i], &oy[i]);
+            worst = worst.min(p);
+            // 45 dB is far above "looks the same" — a torn frame stitched from two moving cards
+            // lands in the teens. Not an equality assert only because the wavelet RDO is not
+            // bit-reproducible; the printed worst-case is the number to read.
+            assert!(
+                p > 45.0,
+                "frame {i}: overlapped decode is {p:.1} dB from the synchronous one — the pipelined \
+                 path changed the picture"
+            );
+            // The discriminator that PSNR alone can miss: a frame delivered ONE POSITION OFF still
+            // scores well against a similar neighbour. It must match its OWN reference best.
+            if i > 0 {
+                let prev = psnr(&sy[i - 1], &oy[i]);
+                assert!(
+                    p > prev,
+                    "frame {i} matches the PREVIOUS reference better ({prev:.1} dB) than its own \
+                     ({p:.1} dB) — the pipeline is off by one"
+                );
+            }
+        }
+        eprintln!(
+            "depth-2 vs depth-1 over {} frames: worst-case PSNR {}",
+            sy.len(),
+            if worst.is_infinite() {
+                "identical (inf)".to_string()
+            } else {
+                format!("{worst:.1} dB")
+            }
+        );
+    }
 }
