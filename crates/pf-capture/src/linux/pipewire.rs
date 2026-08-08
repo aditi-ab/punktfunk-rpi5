@@ -70,6 +70,9 @@ struct UserData {
     linear_nv12_failed: bool,
     /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
     dbg_log_n: u64,
+    /// PW4 step 1: the producer-fence wait distribution, measured on this (the PipeWire loop)
+    /// thread. Per-session, like the fall-through tally.
+    fence_wait: FenceWaitStats,
     /// Raw-passthrough frames that silently fell through to the CPU de-pad path, by reason — see
     /// [`PassthroughFallbacks`]. Per-session: a fresh `UserData` is built per pipeline, so a
     /// compositor that starts serving dmabufs again after a rebuild gets a fresh log budget.
@@ -420,6 +423,86 @@ impl PassthroughFallback {
     }
 }
 
+/// Upper bounds (µs) of the fence-wait histogram's buckets; the last bucket is everything above.
+///
+/// Deliberately coarse and log-ish. The question this instrument exists to answer is not "what is
+/// the wait, to the microsecond" but "**is the tail ~0, or is it milliseconds?**" — the first
+/// answer retires PW4 as a comment correction, the second justifies moving the wait off the
+/// PipeWire loop thread. Bucket edges are placed so those two worlds cannot be confused: anything
+/// at or below 100 µs is noise, anything past 1 ms is a real stall on a 60 Hz budget of 16.6 ms.
+const FENCE_WAIT_BUCKETS_US: [u64; 6] = [100, 500, 1_000, 2_000, 5_000, 10_000];
+
+/// PW4 step 1: the distribution of the producer's implicit-fence wait, measured **on the PipeWire
+/// loop thread**, which is exactly where it is expensive — that thread is the compositor's
+/// consumer, so time spent blocked here delays buffer recycling for the NEXT frame.
+///
+/// PW4 is pre-registered to be **abandoned on evidence**: if the p99 sits in the first bucket the
+/// wait is already ~free and the package becomes a comment correction. Shipping the instrument
+/// before the change is the whole point — the alternative is moving load-bearing synchronisation
+/// off a thread on a hunch.
+///
+/// One caveat the reader needs: measure this AFTER the priority levers land. The win case for
+/// moving the wait is a loaded GPU, which is the same scenario PW1 targets, so a measurement taken
+/// before PW1 would hand PW4 credit for PW1's problem.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct FenceWaitStats {
+    samples: u64,
+    total_us: u64,
+    max_us: u64,
+    /// One more than the bucket bounds: the overflow bucket.
+    buckets: [u64; FENCE_WAIT_BUCKETS_US.len() + 1],
+    /// Outcome split — a `NoFence` majority means the wait is structurally free on this producer
+    /// (nothing to wait for), which is a different finding from "the wait is short".
+    signaled: u64,
+    no_fence: u64,
+    timed_out: u64,
+    failed: u64,
+}
+
+impl FenceWaitStats {
+    /// Record one wait. `bucket_of` is inlined here rather than exposed: the histogram is only
+    /// ever read through [`summary`](Self::summary).
+    pub(super) fn record(&mut self, us: u64) {
+        self.samples += 1;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+        let idx = FENCE_WAIT_BUCKETS_US
+            .iter()
+            .position(|&b| us <= b)
+            .unwrap_or(FENCE_WAIT_BUCKETS_US.len());
+        self.buckets[idx] += 1;
+    }
+
+    /// The bucket the `q`-quantile falls in, as its upper bound in µs — `None` for the overflow
+    /// bucket (i.e. "worse than the last edge"). Counting up to the quantile rather than
+    /// interpolating keeps this honest about what a histogram can actually say.
+    pub(super) fn quantile_bucket_us(&self, q: f64) -> Option<Option<u64>> {
+        if self.samples == 0 {
+            return None;
+        }
+        // The index of the sample at `q`, 0-based, so q=1.0 picks the last sample.
+        let target = ((self.samples as f64) * q).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (i, &count) in self.buckets.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return Some(FENCE_WAIT_BUCKETS_US.get(i).copied());
+            }
+        }
+        Some(None)
+    }
+
+    pub(super) fn mean_us(&self) -> u64 {
+        self.total_us.checked_div(self.samples).unwrap_or(0)
+    }
+
+    /// Whether enough has been seen for the p99 to mean anything. 100 frames is under two seconds
+    /// at 60 fps and is the point where one outlier stops dominating the answer.
+    pub(super) fn is_meaningful(&self) -> bool {
+        self.samples >= 100
+    }
+}
+
 /// Per-session tally of raw-passthrough frames that fell through to the CPU path, with a one-line
 /// budget per distinct reason.
 ///
@@ -554,8 +637,19 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     // closing the stale/old-frame race on NVIDIA. No-op for shm buffers or drivers that
     // attach no fence. Covers both the GPU import and the CPU mmap read below.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        match pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100) {
+        // PW4 step 1: time the wait. Two `Instant::now()` per frame on a path that is already
+        // making a syscall — and this is the measurement that decides whether PW4 ships at all.
+        let t0 = std::time::Instant::now();
+        let waited = pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100);
+        ud.fence_wait.record(t0.elapsed().as_micros() as u64);
+        match waited {
             Ok(outcome) => {
+                use pf_zerocopy::dmabuf_fence::WaitOutcome;
+                match outcome {
+                    WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
+                    WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
+                    WaitOutcome::TimedOut => ud.fence_wait.timed_out += 1,
+                }
                 static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
                 if F1.swap(false, Ordering::Relaxed) {
                     tracing::info!(
@@ -568,6 +662,7 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
                 }
             }
             Err(e) => {
+                ud.fence_wait.failed += 1;
                 static F2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
                 if F2.swap(false, Ordering::Relaxed) {
                     tracing::warn!(
@@ -577,6 +672,34 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
                     );
                 }
             }
+        }
+        // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — the same gate and cadence the
+        // encode backends use for their submit splits, so a perf run reads as one instrument.
+        if pf_host_config::config().perf
+            && ud.fence_wait.is_meaningful()
+            && ud.fence_wait.samples % 300 == 0
+        {
+            let q = |p: f64| match ud.fence_wait.quantile_bucket_us(p) {
+                Some(Some(us)) => format!("<={us}us"),
+                Some(None) => format!(
+                    ">{}us",
+                    FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
+                ),
+                None => "n/a".to_string(),
+            };
+            tracing::info!(
+                samples = ud.fence_wait.samples,
+                mean_us = ud.fence_wait.mean_us(),
+                max_us = ud.fence_wait.max_us,
+                p50 = %q(0.50),
+                p99 = %q(0.99),
+                signaled = ud.fence_wait.signaled,
+                no_fence = ud.fence_wait.no_fence,
+                timed_out = ud.fence_wait.timed_out,
+                failed = ud.fence_wait.failed,
+                "dmabuf implicit-fence wait on the PipeWire loop thread (PW4: a p99 in the first \
+                 bucket means this wait is already free and moving it off-thread buys nothing)"
+            );
         }
     }
 
@@ -1261,6 +1384,7 @@ pub fn pipewire_thread(
         yuv444: want_444,
         linear_nv12_failed: false,
         dbg_log_n: 0,
+        fence_wait: FenceWaitStats::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(cursor_id0_hides),
         expect_dims: if expect_exact_dims {
@@ -1991,8 +2115,8 @@ mod tests {
     // the logging sites call — the same rule `negotiation_plan_invariants` follows.
 
     use super::{
-        consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, PassthroughFallback,
-        PassthroughFallbacks,
+        consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, FenceWaitStats,
+        PassthroughFallback, PassthroughFallbacks, FENCE_WAIT_BUCKETS_US,
     };
 
     /// A PyroWave session is PyroWave even though it also flips `backend_is_vaapi` on (the
@@ -2121,5 +2245,89 @@ mod tests {
         assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
         assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
         assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
+    }
+
+    // ---- PW4 step 1: the fence-wait histogram ------------------------------------------------
+    //
+    // This instrument decides whether PW4 ships, so its arithmetic has to be right: a p99 that
+    // reads one bucket low would retire a package that was worth doing, and one that reads high
+    // would justify moving load-bearing synchronisation off a thread for nothing.
+
+    /// An empty histogram must say "no answer", not "zero" — those are different claims, and the
+    /// second one would look like a decisive p99 ≈ 0 result.
+    #[test]
+    fn an_empty_histogram_has_no_quantile() {
+        let s = FenceWaitStats::default();
+        assert_eq!(s.quantile_bucket_us(0.99), None);
+        assert_eq!(s.mean_us(), 0);
+        assert!(!s.is_meaningful(), "it must not be trusted yet either");
+    }
+
+    /// The all-fast case — the one that RETIRES PW4. Every sample in the first bucket must put the
+    /// p99 there too.
+    #[test]
+    fn an_all_fast_distribution_puts_p99_in_the_first_bucket() {
+        let mut s = FenceWaitStats::default();
+        for _ in 0..1000 {
+            s.record(3);
+        }
+        assert_eq!(
+            s.quantile_bucket_us(0.50),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0]))
+        );
+        assert_eq!(
+            s.quantile_bucket_us(0.99),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0]))
+        );
+        assert_eq!(s.mean_us(), 3);
+    }
+
+    /// The case PW4 exists for: a fast median with a heavy tail. The p50 must stay low AND the p99
+    /// must find the tail — a histogram that smeared them together could not tell the two worlds
+    /// apart, which is the entire decision.
+    #[test]
+    fn a_heavy_tail_moves_p99_without_moving_p50() {
+        let mut s = FenceWaitStats::default();
+        for _ in 0..980 {
+            s.record(10); // fast majority
+        }
+        for _ in 0..20 {
+            s.record(6_000); // 2 % of frames stall milliseconds
+        }
+        assert_eq!(
+            s.quantile_bucket_us(0.50),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0])),
+            "the median is still free"
+        );
+        assert_eq!(
+            s.quantile_bucket_us(0.99),
+            Some(Some(10_000)),
+            "...but the p99 must land in the 5-10ms bucket, not with the median"
+        );
+        assert_eq!(s.max_us, 6_000);
+    }
+
+    /// Anything past the last edge reports as overflow rather than being clamped into the last
+    /// bucket — "worse than 10 ms" is a distinct finding and must not read as "10 ms".
+    #[test]
+    fn waits_past_the_last_edge_report_as_overflow() {
+        let mut s = FenceWaitStats::default();
+        s.record(99_000);
+        assert_eq!(s.quantile_bucket_us(0.99), Some(None));
+    }
+
+    /// Bucket edges are inclusive upper bounds, so a sample exactly ON an edge belongs to that
+    /// bucket and not the next one up.
+    #[test]
+    fn bucket_edges_are_inclusive() {
+        for (i, &edge) in FENCE_WAIT_BUCKETS_US.iter().enumerate() {
+            let mut s = FenceWaitStats::default();
+            s.record(edge);
+            assert_eq!(
+                s.quantile_bucket_us(1.0),
+                Some(Some(edge)),
+                "a sample of exactly {edge}us belongs in bucket {i}"
+            );
+        }
     }
 }
