@@ -116,6 +116,79 @@ export const makeConfigHandler = <S extends Schema.Top>(
 	};
 };
 
+/** What a plugin answers when the host asks how to start one of its own library entries. */
+export interface PluginLaunchTarget {
+	/**
+	 * The command LINE to run. The plugin composes AND quotes it — the host runs it as-is, so
+	 * anything interpolated from untrusted input (a ROM filename) must already be quoted here.
+	 */
+	readonly command: string;
+	/** Absolute working directory, for a program that resolves cores or configs relative to one. */
+	readonly cwd?: string;
+}
+
+/**
+ * The `/__launch` request handler, split out so it can be driven directly in tests — the wire shape
+ * is a contract with the HOST, which deserves a real round-trip test rather than a mock.
+ *
+ * This is the plugin half of the `plugin` launch kind. A library entry published with
+ * `launch: {kind: "plugin", value: "<key>"}` carries no command; when a client picks that tile, the
+ * host asks the plugin that owns it — over this route, on the plugin's loopback UI port, with the
+ * per-boot secret — what to run, and runs the answer itself (only the host can put the process
+ * inside the captured session, and it needs the child to know when the game exits).
+ *
+ * **Answering `null` is load-bearing.** It becomes a 404, which is what the host gets for an entry
+ * this plugin never published — and therefore what makes a library entry forged by someone holding a
+ * stolen plugin token inert rather than arbitrary command execution. Resolve against your own state,
+ * never by trusting the key.
+ */
+export const makeLaunchHandler = (
+	resolve: (entry: string) => Effect.Effect<PluginLaunchTarget | null>,
+): ((req: Request) => Promise<Response>) => {
+	return async (req: Request): Promise<Response> => {
+		if (req.method !== "POST") {
+			return new Response("method not allowed", { status: 405 });
+		}
+		let body: unknown;
+		try {
+			body = await req.json();
+		} catch (cause) {
+			return Response.json(
+				{ error: "body must be JSON", issue: String(cause) },
+				{ status: 400 },
+			);
+		}
+		const entry = (body as { entry?: unknown } | null)?.entry;
+		if (typeof entry !== "string" || entry.length === 0) {
+			return Response.json(
+				{ error: "body must be {entry: string}" },
+				{ status: 400 },
+			);
+		}
+		let target: PluginLaunchTarget | null;
+		try {
+			target = await Effect.runPromise(resolve(entry));
+		} catch (cause) {
+			// A resolver that died is not the same as one that disowned the entry: keep 404 meaning
+			// "not mine" so the host's log says which of the two happened.
+			return Response.json(
+				{ error: "launch resolution failed", issue: String(cause) },
+				{ status: 500 },
+			);
+		}
+		if (target === null) {
+			return Response.json(
+				{ error: `no launchable entry "${entry}"` },
+				{ status: 404 },
+			);
+		}
+		return Response.json({
+			command: target.command,
+			...(target.cwd !== undefined ? { cwd: target.cwd } : {}),
+		});
+	};
+};
+
 export interface ServeUiOptions {
 	/** Console nav title. */
 	readonly title: string;
@@ -143,6 +216,19 @@ export interface ServeUiOptions {
 	 * `/plugin-ui/<id>/…` proxy, so there is no new host surface and nothing new exposed to the LAN.
 	 */
 	readonly config?: ServeUiConfig<Schema.Top>;
+	/**
+	 * Serve `POST /__launch` — how a plugin answers "what do I run for this entry?" for library
+	 * entries it published with `launch: {kind: "plugin", value: "<key>"}`.
+	 *
+	 * Set this when the plugin's tiles start something the host cannot name on its own (a ROM through
+	 * an emulator, say). The alternative — publishing `kind: "command"` — is refused from the plugin
+	 * lane outright: a stored command line is executed as the host user, and only the operator's own
+	 * token may write one.
+	 *
+	 * Resolve against the plugin's OWN state and answer `null` for anything else; see
+	 * {@link makeLaunchHandler} for why that 404 is the security-relevant case.
+	 */
+	readonly launch?: (entry: string) => Effect.Effect<PluginLaunchTarget | null>;
 	/**
 	 * The plugin API: `HttpApiBuilder.layer(api)` + group handler layers + raw routes
 	 * (e.g. `sseRoute`), with plugin services already provided. `httpApiEnv` is provided
@@ -183,6 +269,9 @@ export const serveUi = (
 		const serveConfig = opts.config
 			? makeConfigHandler(opts.config)
 			: undefined;
+		const serveLaunch = opts.launch
+			? makeLaunchHandler(opts.launch)
+			: undefined;
 
 		const fetch = async (req: Request): Promise<Response | undefined> => {
 			const url = new URL(req.url);
@@ -191,6 +280,9 @@ export const serveUi = (
 			// plugin's own routes can never shadow them.
 			if (url.pathname === "/__config") {
 				return serveConfig?.(req) ?? new Response("not found", { status: 404 });
+			}
+			if (url.pathname === "/__launch") {
+				return serveLaunch?.(req) ?? new Response("not found", { status: 404 });
 			}
 			if (!url.pathname.startsWith(prefix)) return undefined; // → static SPA
 			return handler(req);

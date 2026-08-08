@@ -16,7 +16,9 @@ export type Artwork = typeof Artwork.Type;
  * How the host should launch a title. **The host owns this vocabulary** — it validates the value
  * per kind and builds the actual URI / command line itself, so a plugin only ever supplies a
  * validated value, never a command. That is the security invariant behind the whole provider lane:
- * a client sends an entry id, and the host resolves what to run.
+ * a client sends an entry id, and the host resolves what to run. (`plugin`, below, is the one kind
+ * whose command the plugin composes — but it is still never *stored*: the host asks the live plugin
+ * at launch time, so an entry on its own executes nothing.)
  *
  * `kind` is a plain string rather than a union so the kit never has to ship a release to keep up
  * with a host that grew a new kind. The kinds the host understands today:
@@ -32,6 +34,13 @@ export type Artwork = typeof Artwork.Type;
  * | `epic` | `<namespace>:<catalogItemId>:<appName>` or a bare appName | windows |
  * | `gog` | `exe \t args \t workdir` | windows |
  * | `aumid` | `<PFN>!<AppId>` | windows |
+ * | `plugin` | an opaque key in THIS plugin's namespace — see below | both |
+ *
+ * `plugin` is the escape hatch for a tile the host cannot name on its own (a ROM through whichever
+ * emulator the operator configured). The value is meaningless to the host: it hands the key back to
+ * the plugin that published the entry, on its own loopback UI port, and runs the command line that
+ * comes back. Serve it with `serveUi({launch})`; a plugin that publishes this kind without serving
+ * `/__launch` grows unlaunchable tiles.
  *
  * An unknown kind is accepted on the wire and simply yields no launch recipe on that host, so a
  * plugin targeting a newer host degrades to an unlaunchable tile rather than a failed reconcile.

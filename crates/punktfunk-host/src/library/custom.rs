@@ -476,6 +476,15 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
                 ));
             }
+            // `plugin`: the value is an opaque key in the OWNING plugin's own namespace, handed back
+            // to it at launch time (see `library::ask_plugin_launch`). The host never parses it, so
+            // the only checks are the ones that keep it loggable and bounded.
+            if launch.kind == "plugin" && !valid_plugin_entry_key(&launch.value) {
+                return Err(format!(
+                    "entries[{i}]: `launch.value` for kind `plugin` must be 1–512 chars with no \
+                     control characters"
+                ));
+            }
         }
         if let Some(marker) = &e.detect.env_marker {
             if !valid_env_key(&marker.key) {

@@ -286,6 +286,38 @@ pub(crate) fn live_plugin_ids() -> Vec<String> {
     registry().live_ids()
 }
 
+/// The loopback `{port, secret}` a live plugin serves its UI on — the credential the **host itself**
+/// presents when it asks a library plugin what to run for one of its `plugin`-kind launch entries
+/// ([`crate::library::ask_plugin_launch`]).
+///
+/// The same lookup the console proxy gets from `GET /plugins/{id}/ui-credential`, exposed in-process
+/// so the launch path never round-trips through the management API to reach a port this process
+/// already holds. `None` for an unknown, expired, or UI-less plugin — which the launch path reports
+/// as "no recipe", exactly like any other unresolvable entry.
+pub(crate) fn ui_credential(id: &str) -> Option<UiCredential> {
+    registry().credential(id)
+}
+
+/// Put a live UI registration in the registry directly — **test only**, so the launch path
+/// ([`crate::library::ask_plugin_launch`]) can be driven against a stub server without standing up
+/// the whole management router just to reach `PUT /plugins/{id}`.
+#[cfg(test)]
+pub(crate) fn register_ui_for_test(id: &str, port: u16, secret: &str) {
+    registry().upsert(
+        id,
+        Valid {
+            title: id.to_string(),
+            version: None,
+            ui: Some(StoredUi {
+                port,
+                secret: secret.to_string(),
+                icon: None,
+            }),
+            category: None,
+        },
+    );
+}
+
 // ---------------------------------------------------------------- validation
 
 /// A plugin id: `definePlugin`'s kebab-case name (`^[a-z][a-z0-9-]*$`, ≤64) — the same regex the SDK
