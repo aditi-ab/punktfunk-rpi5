@@ -134,6 +134,12 @@ pf-vaadec = { path = "../pf-vaadec" }
 # container can then compile and clippy the whole rung without `libva-dev`, and a machine
 # without a VAAPI runtime gets a clean refusal instead of a packaging dependency.
 libloading = "0.8"
+# The gamescope overlay watcher (`overlay_focus`): read two CARDINAL properties off a
+# gamescope root window and block on PropertyNotify. `default-features = false` keeps the
+# pure-Rust `RustConnection` — no libxcb link, so no new C dependency on any client package
+# — the same stance pf-capture and pf-vdisplay already take on this crate. No extension
+# features: root-window properties and an event mask are core X11.
+x11rb = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"

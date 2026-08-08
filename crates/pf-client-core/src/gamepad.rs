@@ -381,6 +381,7 @@ enum Ctl {
     PadAudioPrefs(u8),
     MenuMode(bool),
     MenuRumble(MenuPulse),
+    Mask(bool),
 }
 
 #[derive(Clone)]
@@ -546,6 +547,31 @@ impl GamepadService {
     /// [`Settings::gamepad_forwarding`]: crate::trust::Settings::gamepad_forwarding
     pub fn set_forwarding(&self, on: bool) {
         let _ = self.ctl.send(Ctl::Forwarding(on));
+    }
+
+    /// A system overlay owns the controller right now — hold every forwarded pad NEUTRAL
+    /// until it closes. This is the Steam Input behaviour a streaming client has to
+    /// reproduce by hand: while the Deck's Steam menu or QAM is up, the same physical
+    /// sticks and buttons drive Steam's UI, and anything we keep forwarding lands in the
+    /// game underneath as a second, invisible player.
+    ///
+    /// **Masking is not [`set_forwarding`](Self::set_forwarding).** Forwarding-off closes the
+    /// slot and sends the host a [`GamepadRemove`](InputKind::GamepadRemove) — the game sees a
+    /// controller *unplug*, which is a hardware event with real in-game consequences (pause
+    /// menus, "reconnect your controller", player-slot churn). Opening the QAM must not look
+    /// like that. Masking keeps every slot open and merely stops the transitions, after
+    /// flushing what the host believes is held so a stick held at overlay-open stops steering
+    /// instead of freezing at its last value.
+    ///
+    /// SDL has this gate of its own — it drops presses while the process has windows but no
+    /// keyboard focus — and on a desktop it fires. It CANNOT fire on a Deck in Gaming Mode:
+    /// gamescope resolves focus per Xwayland ctx, and the client sits alone in its own ctx, so
+    /// its X input focus never moves when the overlay takes over (measured). That is why this
+    /// exists as an explicit lever rather than something inherited for free.
+    ///
+    /// Held state is adopted, not replayed, on the way back — see [`Ctl::Mask`]'s handling.
+    pub fn set_masked(&self, on: bool) {
+        let _ = self.ctl.send(Ctl::Mask(on));
     }
 
     /// The session's system-button policy, resolved from
@@ -1069,6 +1095,9 @@ struct Worker {
     menu_mode: bool,
     menu_nav: MenuNav,
     menu_tx: async_channel::Sender<MenuEvent>,
+    /// A system overlay owns input ([`GamepadService::set_masked`]): forwarded pads are held
+    /// neutral and menu translation is paused, with every slot still OPEN.
+    masked: bool,
 }
 
 impl Worker {
@@ -1519,6 +1548,87 @@ impl Worker {
         }
     }
 
+    /// Re-adopt what the pads are physically holding when an overlay mask lifts.
+    ///
+    /// Buttons are taken back into `held_buttons` **without** a wire press: a button pressed
+    /// inside the overlay (the A that picked a QAM row) must not fire in the game the instant it
+    /// closes — releasing it and pressing again is what arms it. Same rule menu mode already
+    /// applies across a screen handoff ([`MenuNav::reset`]), for the same reason.
+    ///
+    /// Axes ARE re-sent, because a stick has no press semantics to ghost — it is deflected or it
+    /// is not. The mask flushed them to zero, and SDL only speaks on *change*, so a stick still
+    /// held when the overlay closes would stay dead host-side until the user happened to move it.
+    ///
+    /// Neither half can run against a pad that is gone: this only walks open slots, and every SDL
+    /// read here is a state query on a handle the slot owns.
+    fn readopt_held(&mut self) {
+        use sdl3::gamepad::{Axis, Button};
+        // Every button `button_bit` maps — the same surface the press path forwards.
+        const BUTTONS: [Button; 21] = [
+            Button::South,
+            Button::East,
+            Button::West,
+            Button::North,
+            Button::Back,
+            Button::Start,
+            Button::Guide,
+            Button::LeftStick,
+            Button::RightStick,
+            Button::LeftShoulder,
+            Button::RightShoulder,
+            Button::DPadUp,
+            Button::DPadDown,
+            Button::DPadLeft,
+            Button::DPadRight,
+            Button::Touchpad,
+            Button::RightPaddle1,
+            Button::LeftPaddle1,
+            Button::RightPaddle2,
+            Button::LeftPaddle2,
+            Button::Misc1,
+        ];
+        const AXES: [Axis; 6] = [
+            Axis::LeftX,
+            Axis::LeftY,
+            Axis::RightX,
+            Axis::RightY,
+            Axis::TriggerLeft,
+            Axis::TriggerRight,
+        ];
+        // Copied out: the slot walk below borrows `self` mutably.
+        let system_forward = self.system_forward;
+        let attached = self.attached.clone();
+        for slot in &mut self.slots {
+            slot.held_buttons.clear();
+            for b in BUTTONS {
+                let Some(bit) = button_bit(b) else {
+                    continue;
+                };
+                // The press path returns before `held_buttons` for un-forwarded system
+                // buttons; tracking them here would invent state it never keeps.
+                if !system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                    continue;
+                }
+                if slot.pad.button(b) {
+                    slot.held_buttons.push(bit);
+                }
+            }
+            let Some(c) = &attached else {
+                continue;
+            };
+            for a in AXES {
+                let (id, v) = axis_value(a, slot.pad.axis(a));
+                if slot.last_axis[id as usize] != v {
+                    slot.last_axis[id as usize] = v;
+                    send(c, InputKind::GamepadAxis, id, v, slot.index);
+                }
+            }
+        }
+        // The chord latch was cleared on the way in; drop it again if what we just adopted
+        // doesn't actually hold it.
+        self.rearm_escape();
+    }
+
     /// True when any one forwarded pad holds the entire escape chord (any player can leave).
     fn chord_held(&self) -> bool {
         self.slots
@@ -1785,6 +1895,34 @@ impl Worker {
                             .push((pad, bit, Instant::now() + TAP_PRESS));
                     }
                 }
+                Ok(Ctl::Mask(on)) => {
+                    if self.masked == on {
+                        continue;
+                    }
+                    self.masked = on;
+                    if on {
+                        // Neutral NOW, and while the slots stay open: a stick held when the
+                        // overlay opened must stop steering, but the host must not see the pad
+                        // unplug (that is `close_slot_at`'s job, and a game reacts to it).
+                        if let Some(c) = self.attached.clone() {
+                            for slot in &mut self.slots {
+                                Self::flush_slot(&c, slot);
+                            }
+                        }
+                        // Nothing can be mid-chord across the flip: the transitions that would
+                        // complete or break it are about to be dropped.
+                        self.reset_chord();
+                    } else {
+                        // Coming back. Whatever is still physically held was never delivered —
+                        // adopt it silently rather than replay it as a fresh press, the same
+                        // rule menu mode uses across a screen handoff (`MenuNav::reset`). A
+                        // button you pressed *inside* the overlay must not fire in the game the
+                        // instant it closes; releasing and pressing again is what arms it.
+                        self.readopt_held();
+                        self.menu_nav.reset();
+                    }
+                    tracing::info!(masked = on, "overlay input mask");
+                }
                 Ok(Ctl::Forwarding(on)) => {
                     if self.forwarding == on {
                         continue;
@@ -1846,6 +1984,28 @@ impl Worker {
     /// "is a session live".
     fn handle_event(&mut self, event: sdl3::event::Event) {
         use sdl3::event::Event;
+        // A system overlay owns the controller ([`GamepadService::set_masked`]): drop every
+        // input transition. The pads were flushed neutral when the mask went on, so dropping
+        // the ups as well as the downs is what keeps the two in agreement — `readopt_held`
+        // rebuilds the held set from the hardware when it lifts.
+        //
+        // Device add/remove deliberately still count: a controller genuinely plugged in or
+        // pulled out behind an overlay is a fact about the world, not an input, and losing it
+        // would leave the slot table lying about what exists.
+        if self.masked
+            && matches!(
+                event,
+                Event::ControllerButtonDown { .. }
+                    | Event::ControllerButtonUp { .. }
+                    | Event::ControllerAxisMotion { .. }
+                    | Event::ControllerTouchpadDown { .. }
+                    | Event::ControllerTouchpadMotion { .. }
+                    | Event::ControllerTouchpadUp { .. }
+                    | Event::ControllerSensorUpdated { .. }
+            )
+        {
+            return;
+        }
         match event {
             Event::ControllerDeviceAdded { which, .. } => {
                 if !self.order.contains(&which) {
@@ -2074,7 +2234,9 @@ impl Worker {
     /// on and no session is attached (attach supersedes; SDL events merely wake the loop,
     /// so a press is translated the iteration it arrives).
     fn menu_poll(&mut self) {
-        if !self.menu_mode || self.attached.is_some() {
+        // Masked covers the launcher too: with the Deck's Steam menu up over our console, the
+        // same stick that scrolls Steam's UI would otherwise also be scrolling ours behind it.
+        if !self.menu_mode || self.attached.is_some() || self.masked {
             return;
         }
         let Some((_, pad)) = self.menu_open.as_ref() else {
@@ -2301,6 +2463,7 @@ impl Worker {
             menu_mode: false,
             menu_nav: MenuNav::new(),
             menu_tx,
+            masked: false,
         }
     }
 }

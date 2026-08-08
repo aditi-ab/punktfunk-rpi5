@@ -646,6 +646,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // translation automatically — the GTK launcher never turned it off either).
         gamepad.set_menu_mode(true);
     }
+    // Gaming Mode's Steam menu / QAM drive the SAME physical pad we forward, and gamescope
+    // never takes our X focus away (it resolves focus per Xwayland ctx, and we are alone in
+    // ours), so SDL's own background-input gate cannot fire there. `None` everywhere else,
+    // where window focus IS the signal — see the FocusLost/FocusGained arms below.
+    #[cfg(target_os = "linux")]
+    let overlay_focus = pf_client_core::overlay_focus::OverlayFocus::start();
+    // Two independent reasons the pad is not ours — window focus and the gamescope overlay —
+    // OR'd into ONE value that is pushed to the service on an edge. Kept as separate inputs
+    // rather than one flag each source writes: either would otherwise clear the other's mask
+    // (a focus-loss mask undone by the next overlay poll saying "no overlay", and vice versa).
+    let mut focus_lost = false;
+    let mut mask_applied = false;
 
     // The native display mode — the `0 = native` fallback for the requested stream mode
     // (the GTK client reads the monitor under its window; same idea).
@@ -758,8 +770,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 tracing::info!("focus lost — input released");
                             }
                         }
+                        // Controllers go with the keyboard and mouse. SDL already stops
+                        // delivering their PRESSES here, but nothing zeroed what the host
+                        // still believes is held — so a stick deflected at the moment focus
+                        // went away kept steering. Masking flushes it neutral.
+                        focus_lost = true;
                     }
                     WindowEvent::FocusGained => {
+                        // Unlike capture, the controller mask has no "the user meant it"
+                        // variant to respect — it exists only to mirror who owns the pad —
+                        // so regaining focus always lifts its half.
+                        focus_lost = false;
                         // An auto-release (Alt-Tab) undoes itself; a chord release
                         // stays released until the user opts back in.
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
@@ -1069,6 +1090,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 // the pumped gamepad worker's — it ignores what it doesn't know.
                 other => pump.handle_event(other),
             }
+        }
+        // Who owns the pad right now: window focus, plus Gaming Mode's overlay signal where it
+        // exists (one relaxed atomic load; `None` off gamescope). Edge-triggered — the service
+        // hears only about CHANGES, so an open QAM doesn't re-flush the pads every iteration.
+        #[cfg(target_os = "linux")]
+        let overlay_now = overlay_focus.as_ref().is_some_and(|of| of.is_open());
+        #[cfg(not(target_os = "linux"))]
+        let overlay_now = false;
+        let want_mask = focus_lost || overlay_now;
+        if want_mask != mask_applied {
+            mask_applied = want_mask;
+            gamepad.set_masked(want_mask);
         }
         pump.tick();
         // One coalesced MouseMove per iteration — pure motion must reach the host
