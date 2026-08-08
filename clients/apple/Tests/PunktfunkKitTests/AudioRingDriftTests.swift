@@ -53,11 +53,22 @@ final class AudioRingDriftTests: XCTestCase {
         XCTAssertEqual(silent, 0, "drift correction must never starve the callback")
     }
 
-    /// The mirror case: a host clock running SLOW must keep audio flowing rather than being
-    /// "corrected" into a stutter.
-    func testNegativeDriftKeepsPlaying() {
+    /// The mirror case: a host clock running SLOW is a genuine deficit — no depth is ever deep
+    /// enough forever — so the ring must spend it on RARE, clean re-banks (a hollow ring
+    /// re-primes on its first click and refills the whole target) rather than riding the knife
+    /// edge in permanent sub-frame chatter, which is what "silence-free" used to hide: every
+    /// callback a fraction of a frame short, none of them fully silent, all of them audible.
+    /// −200 ppm is an exaggeration of real DAC skew (tens of ppm); even so, two minutes may
+    /// cost at most a couple of refills' worth of silent callbacks.
+    func testNegativeDriftBanksRarelyInsteadOfChattering() {
         let (_, _, silent) = simulate(ms: 2 * 60 * 1_000, quantumMS: 5, driftPPM: -200)
-        XCTAssertEqual(silent, 0, "a draining ring must re-prime, not chatter")
+        XCTAssertLessThanOrEqual(
+            silent, 24,
+            "a draining ring re-banks a few times; a silent-callback stream means it is thrashing")
+        XCTAssertGreaterThan(
+            silent, 0,
+            "a persistent deficit cannot be ridden out silence-free — if this is zero the ring "
+                + "is back to sub-frame chatter, which is audible without ever being silent")
     }
 
     /// A device that pulls a large quantum cannot sustain a target below it — the ring must lift
@@ -79,11 +90,14 @@ final class AudioRingDriftTests: XCTestCase {
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
         XCTAssertTrue(scratch.contains { $0 != 0 }, "should be playing after priming")
 
-        // Drain it dry with one oversized read, then feed a normal quantum again. The length comes
-        // off the buffer pointer, not off `huge`: touching the array inside the closure that is
-        // already holding it exclusively is an exclusivity violation.
-        var huge = [Float](repeating: 0, count: 200 * perMS)
-        huge.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: $0.count) }
+        // Drain it dry at the device's own quantum — an oversized read would count as ITS OWN
+        // huge callback and legitimately read as hollow — then starve one callback and feed a
+        // normal quantum again. The ring is freshly primed, so its depth average is nowhere near
+        // hollow, and one short read must ride on the hysteresis.
+        while ring.bufferedMS > 0 {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+        }
+        scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
         let feed = [Float](repeating: 0.5, count: want)
         feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: want) }
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
@@ -92,14 +106,17 @@ final class AudioRingDriftTests: XCTestCase {
             "a single short read must not force a full re-prime")
     }
 
-    /// Mirror of the Rust `target_grows_on_underruns_and_relaxes_when_quiet`: clustered genuine
-    /// underruns raise the target floor (that session needs the slack), a long quiet spell gives
-    /// it back — and the floor never dips below the base.
+    /// Mirror of the Rust `target_grows_on_underruns_and_relaxes_when_quiet`, updated for
+    /// near-miss growth: the drain's LAST full read (less than a frame left over) already grows
+    /// the floor before anything was audible, clustered genuine underruns raise it further, and
+    /// a long — genuinely quiet — spell gives it back, never below the base. The quiet refill
+    /// runs DEEP: a knife-edge refill (exactly what each read takes) leaves the ring within a
+    /// frame of empty every callback, which now correctly reads as pressure, not quiet.
     func testTargetGrowsOnUnderrunsAndRelaxesWhenQuiet() {
         let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
-        let feed = [Float](repeating: 0.5, count: 25 * perMS)
+        let feed = [Float](repeating: 0.5, count: 60 * perMS)
         func write(ms: Int) {
             feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: ms * perMS) }
         }
@@ -108,20 +125,27 @@ final class AudioRingDriftTests: XCTestCase {
         }
         XCTAssertEqual(ring.stats.targetMS, 20, "base target must match JitterTuning.COREAUDIO")
 
-        // Prime, drain dry, then alternate starve/refill: each dry read is a genuine underrun,
-        // each full read in between keeps the de-prime hysteresis from tripping.
+        // Prime, then drain: the 5th read is still served in full but leaves nothing over — a
+        // near-miss, and the floor grows BEFORE any click.
         write(ms: 25)
-        for _ in 0..<5 { read() } // drains to zero
+        for _ in 0..<5 { read() }
+        XCTAssertEqual(ring.stats.targetMS, 30, "a near-miss must grow the floor pre-click")
+        XCTAssertEqual(ring.stats.underruns, 0, "nothing was audible yet")
+
+        // Then alternate starve/refill: each dry read is a genuine underrun, each full read in
+        // between keeps the de-prime hysteresis from tripping. (The refills land as further
+        // near-misses, but growth is one step per window — the cluster is what grows it again.)
         read() // short — underrun 1
         write(ms: 5); read() // full — hysteresis reset
         read() // short — underrun 2
         write(ms: 5); read() // full
         read() // short — underrun 3 → the floor grows one step
-        XCTAssertEqual(ring.stats.targetMS, 30, "3 clustered underruns must grow the target 10 ms")
+        XCTAssertEqual(ring.stats.targetMS, 40, "3 clustered underruns must grow the target 10 ms")
         XCTAssertEqual(ring.stats.underruns, 3)
 
-        // A long clean run (30 s of consumed audio) relaxes the growth back to the base…
-        for _ in 0..<(30_000 / 5 + 10) {
+        // A long clean run at a healthy depth relaxes the growth back to the base…
+        write(ms: 60)
+        for _ in 0..<(90_000 / 5 + 10) {
             write(ms: 5)
             read()
         }
@@ -435,10 +459,14 @@ final class AudioRingDriftTests: XCTestCase {
             write(ms: 5); read()
             read()
         }
-        /// Quiet (full) reads needed before the grown target relaxes one step.
+        /// Quiet (full) reads needed before the grown target relaxes one step. The ring is
+        /// refilled DEEP first: a knife-edge refill (exactly what each read takes) leaves less
+        /// than a frame over every callback, which now correctly reads as pressure — near-misses
+        /// — and pressure never relaxes anything.
         func quietToRelax(_ ring: AudioRing) -> Int {
             var scratch = [Float](repeating: 0, count: want)
-            let feed = [Float](repeating: 0.5, count: 5 * perMS)
+            let feed = [Float](repeating: 0.5, count: 60 * perMS)
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 60 * perMS) }
             let start = ring.stats.targetMS
             var reads = 0
             while ring.stats.targetMS == start, reads < 200_000 {
@@ -464,6 +492,118 @@ final class AudioRingDriftTests: XCTestCase {
         XCTAssertLessThan(
             fastReads, slowReads,
             "sync pressure should relax sooner: \(fastReads) vs \(slowReads) quiet reads")
+    }
+
+    /// A shrink answered by an underrun or near-miss inside its probe window is undone AT ONCE,
+    /// and the sync loop is backed off — mirrors the Rust `a_failed_shrink_probe_is_undone_at_once`
+    /// and `a_failed_probe_backs_the_sync_shrink_off`. Before this, the loop re-probed a proven
+    /// depth every five quiet seconds and paid an audible starvation event each time it was wrong,
+    /// forever — the 0.25.0 MacBook field report.
+    func testAFailedShrinkProbeIsUndoneAtOnceAndBacksTheSyncLoopOff() {
+        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        let feed = [Float](repeating: 0.5, count: 60 * perMS)
+        func write(ms: Int) {
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: ms * perMS) }
+        }
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+        }
+        // Grow the floor (near-miss + a cluster of genuine underruns), as the usual pattern does.
+        write(ms: 25)
+        for _ in 0..<5 { read() }
+        read()
+        write(ms: 5); read()
+        read()
+        write(ms: 5); read()
+        read()
+        let grown = ring.stats.targetMS
+        XCTAssertGreaterThan(grown, 20, "the test needs a GROWN floor to probe")
+
+        // Sync asks for less; a deep, genuinely quiet spell later the shrink probes.
+        ring.setSyncTarget(perMS)
+        write(ms: 60)
+        var reads = 0
+        while ring.stats.targetMS == grown, reads < 10_000 {
+            write(ms: 5)
+            read()
+            reads += 1
+        }
+        XCTAssertEqual(ring.stats.targetMS, grown - 10, "the sync-driven shrink must have probed")
+
+        // Drain to the knife edge: the last full read leaves nothing over — a near-miss, nobody
+        // heard anything — and the probe must be undone on the spot.
+        while ring.bufferedMS > 5 { read() }
+        read()
+        XCTAssertEqual(
+            ring.stats.targetMS, grown,
+            "a failed probe must restore the target on the first near-miss")
+        XCTAssertEqual(ring.stats.underruns, 3, "and nothing audible may have paid for it")
+
+        // Backed off: two accelerated windows of clean, deep audio must NOT shrink again…
+        write(ms: 60)
+        for _ in 0..<(2 * 5_000 / 5) {
+            write(ms: 5)
+            read()
+        }
+        XCTAssertEqual(
+            ring.stats.targetMS, grown,
+            "the five-second cadence must be suspended after a failure")
+        // …while the slow, pre-sync window eventually still tests one — backoff is not a freeze.
+        for _ in 0..<(2 * 30_000 / 5) {
+            write(ms: 5)
+            read()
+        }
+        XCTAssertLessThan(
+            ring.stats.targetMS, grown,
+            "the slow window must still be allowed to test a shrink")
+    }
+
+    /// Growth raises a promise; only a re-prime banks real depth. An underrun while the ring is
+    /// HOLLOW — its depth AVERAGE far below the target — re-primes immediately, spending the click
+    /// it already cost on the whole refill, instead of riding the knife edge and clicking once per
+    /// bunching period indefinitely. The average, not the instant, is what separates a hollow ring
+    /// from one late packet (`testSingleShortReadDoesNotDeprime` pins that side).
+    func testAHollowRingReprimesOnItsFirstClick() {
+        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        let feed = [Float](repeating: 0.5, count: 60 * perMS)
+        func write(ms: Int) {
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: ms * perMS) }
+        }
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+        }
+        // Grow the floor to 40 the usual way…
+        write(ms: 25)
+        for _ in 0..<5 { read() }
+        read()
+        write(ms: 5); read()
+        read()
+        write(ms: 5); read()
+        read()
+        XCTAssertEqual(ring.stats.targetMS, 40)
+        // …then ride the knife edge for ~2 s of audio, so the depth average genuinely sinks far
+        // below the promised 40 ms.
+        for _ in 0..<400 {
+            write(ms: 5)
+            read()
+        }
+        // One dry read — the click. The ring is hollow, so this single click must re-prime.
+        read()
+        // A packet arrives, but the ring stays SILENT: it is re-priming toward the full target
+        // rather than playing the packet and clicking again at the next bunch.
+        write(ms: 10)
+        read()
+        XCTAssertTrue(
+            scratch.allSatisfy { $0 == 0 },
+            "a hollow ring must spend its click on the whole refill, not keep limping")
+        // And once the refill reaches the target, it plays again.
+        write(ms: 40)
+        read()
+        XCTAssertTrue(scratch.contains { $0 != 0 }, "refilled to target — playback resumes")
     }
 
     /// The four client rings adopt sync one at a time; an un-wired one must behave exactly as it

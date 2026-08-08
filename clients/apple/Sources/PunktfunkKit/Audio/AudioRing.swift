@@ -16,11 +16,17 @@ import os
 /// (`punktfunk_core::audio::JitterPolicy`): a slow depth average that sits above target for a
 /// sustained window sheds ONE 5 ms frame with a crossfade, and the hard cap is only a backstop.
 ///
-/// **Adaptive depth.** The target is a floor, not a constant: repeated genuine underruns grow it
-/// a step at a time (`noteRead`, mirroring `JitterPolicy::note_read`) up to `maxTargetMS`, and a
-/// long quiet spell relaxes it back toward the base — so a session on Wi-Fi that bunches arrivals
-/// deepens until it stops crackling, while a clean LAN keeps the tight base latency. Keep the
-/// constants here in step with `JitterTuning.COREAUDIO`.
+/// **Adaptive depth.** The target is a floor, not a constant: a NEAR-MISS — a read served with
+/// less than one frame left over — grows it a step BEFORE anything was audible, repeated genuine
+/// underruns grow it too (`noteRead`, mirroring `JitterPolicy::note_read`) up to `maxTargetMS`,
+/// and a long quiet spell relaxes it back toward the base — so a session on Wi-Fi that bunches
+/// arrivals deepens until it stops crackling, while a clean LAN keeps the tight base latency.
+/// Growth only raises a promise; the one thing that re-banks real depth is a re-prime, so an
+/// underrun while the ring is HOLLOW (depth average far below the target) re-primes at once,
+/// spending the click it already cost on the whole refill. Every shrink is armed as a PROBE:
+/// answered by an underrun or near-miss within its window, it is undone on the spot, and a
+/// failed sync-driven shrink is not retried for a growing backoff. Keep the constants here in
+/// step with `JitterTuning.COREAUDIO`.
 ///
 /// **A/V sync.** On top of all that the depth can be STEERED, by `setSyncTarget` from the drain
 /// thread's `AvSync` — because a ring that is the right depth for the link is not thereby the
@@ -58,9 +64,29 @@ final class AudioRing: @unchecked Sendable {
     /// target normally relaxes only after a long spell because, absent other evidence, the only
     /// thing that can justify giving up hard-won slack is time; a sync request IS that evidence —
     /// a measurement saying the extra depth is costing alignment right now — so a smaller target
-    /// gets tested sooner. Wrong guesses are cheap and self-correcting (one underrun and the
-    /// growth path takes it straight back). Mirrors `SHRINK_QUIET_SYNC_MS`.
+    /// gets tested sooner. Mirrors `SHRINK_QUIET_SYNC_MS`.
     private static let shrinkQuietSyncMS = 5_000
+    /// Post-read depth below which a served callback counts as a NEAR-MISS: the device got its
+    /// samples, but with less than one protocol frame left in hand — the same evidence as an
+    /// underrun, except nobody heard it yet, so the target grows BEFORE the click instead of
+    /// after the third one. Mirrors `NEAR_MISS_MARGIN_MS`.
+    private static let nearMissMarginMS = frameMS
+    /// How long a shrink remains a PROBE, in consumed audio: an underrun or near-miss inside
+    /// this window means the shrink was wrong, and the previous target is restored at once.
+    /// Mirrors `SHRINK_PROBE_MS`.
+    private static let shrinkProbeMS = 5_000
+    /// How long a failed probe keeps the sync loop from driving another shrink — without it the
+    /// loop pays an audible starvation event every `shrinkQuietSyncMS` on any link whose jitter
+    /// genuinely needs the depth, forever. Doubles per consecutive failure, capped; a probe that
+    /// survives its window resets it. Mirror `SYNC_BACKOFF_MS` / `SYNC_BACKOFF_MAX_MS`.
+    private static let syncBackoffMS = 60_000
+    private static let syncBackoffMaxMS = 480_000
+    /// A ring is HOLLOW when its depth AVERAGE sits this far below the target: growth only ever
+    /// raises the promise, and the one thing that re-banks real depth is a re-prime — so an
+    /// underrun in a hollow ring re-primes AT ONCE, spending the click it already cost on the
+    /// whole refill instead of riding the knife edge one click per bunching period. Mirrors
+    /// `DEPRIME_DEBT_MS`.
+    private static let deprimeDebtMS = growStepMS
 
     private var buf: [Float]
     private var readIdx = 0
@@ -87,6 +113,24 @@ final class AudioRing: @unchecked Sendable {
     /// `nil` — the default, and what an un-wired session keeps — reproduces the pre-sync
     /// behaviour exactly, so this ring could adopt sync without the other three diverging.
     private var syncTarget: Int?
+    /// This read was served with less than `nearMissMarginMS` left over (set in `read`,
+    /// consumed by `noteRead`).
+    private var nearMiss = false
+    /// A near-miss already grew the target this window — one step per window, so a bunching
+    /// episode (a RUN of consecutive near-misses while the ring refills) buys one measured
+    /// step, not a sprint to the ceiling.
+    private var nearMissGrown = false
+    /// The depth average runs a `deprimeDebtMS` debt against the target (set in `read`): an
+    /// underrun should re-prime at once instead of waiting out the hysteresis.
+    private var hollow = false
+    /// Interleaved samples left in the current shrink-probe window (0 = no probe outstanding).
+    private var probeRun = 0
+    /// The live target before the probed shrink, restored if the probe fails.
+    private var probePrevTarget = 0
+    /// Interleaved samples before the sync loop may drive another shrink (0 = allowed now).
+    private var syncBackoffRun = 0
+    /// Length of the NEXT backoff, in ms — doubles per consecutive failed probe, capped.
+    private var syncBackoffLenMS = AudioRing.syncBackoffMS
     /// The sync loop's smoothed offset in ms, STORED not computed: the ring owns the depth but has
     /// no timestamps, so the drain thread (which has both a packet's `pts_ns` and the video leg)
     /// hands the number back for reporting. Mirrors `NativeClient::audio_av_offset_ms`.
@@ -121,8 +165,15 @@ final class AudioRing: @unchecked Sendable {
     /// then return the CAP — i.e. quietly below the continuity floor, inverting the very ordering
     /// this exists to guarantee, on exactly the awkward hardware it exists to survive. (Rust's
     /// `Ord::clamp` announces the same condition by panicking; Swift would just get it wrong.)
-    private var target: Int {
-        let floor = max(targetLive, renderQuantum + Self.frameMS * perMS)
+    private var target: Int { target(lift: renderQuantum) }
+
+    /// The effective target with an explicit quantum lift. The property above uses the high-water
+    /// `renderQuantum` (priming must survive the biggest callback seen); the hollow check in
+    /// `read` passes the CURRENT callback instead, mirroring the Rust side's `want` — a one-off
+    /// oversized read would otherwise inflate the debt threshold forever and turn the very next
+    /// late packet into a full re-prime.
+    private func target(lift quantum: Int) -> Int {
+        let floor = max(targetLive, quantum + Self.frameMS * perMS)
         guard let want = syncTarget else { return floor }
         let cap = max(Self.hardCapMS * perMS, floor)
         return min(max(want, floor), cap)
@@ -211,11 +262,23 @@ final class AudioRing: @unchecked Sendable {
             if available >= target {
                 primed = true
                 emptyReads = 0
+                // The refill just banked this much: seed the average with it rather than letting
+                // it climb from wherever the drought left it — a freshly-primed ring would
+                // otherwise read as hollow for the EWMA's whole settling time, and the FIRST
+                // late packet would re-prime a ring that is actually full.
+                depthAvg = Double(available)
             } else {
                 for i in 0..<count { out[i] = 0 }
                 return
             }
         }
+
+        // Hollow: the depth AVERAGE runs a debt against the target — the promise has been raised
+        // but the depth was never re-banked (see `deprimeDebtMS`). Judged on the average, not
+        // this instant: a single late packet empties the ring for a callback without making it
+        // hollow, and must keep the consecutive-empties hysteresis. Lifted by THIS callback's
+        // size, not the high-water quantum — see `target(lift:)`.
+        hollow = depthAvg + Double(Self.deprimeDebtMS * perMS) < Double(target(lift: count))
 
         // Drift correction: shed exactly one frame, crossfaded, once the AVERAGE has sat above
         // the threshold for the sustain window. Anything shorter is jitter and must be left alone.
@@ -240,6 +303,9 @@ final class AudioRing: @unchecked Sendable {
         if n < count {
             for i in n..<count { out[i] = 0 }
         }
+        // Near-miss: served in full, but with less than one frame left over — the next callback
+        // starves unless a packet lands within one frame time.
+        nearMiss = n == count && writeIdx - readIdx < Self.nearMissMarginMS * perMS
         noteRead(ranShort: n < count, count: count)
     }
 
@@ -254,19 +320,63 @@ final class AudioRing: @unchecked Sendable {
         if windowRun >= Self.growWindowMS * perMS {
             windowRun = 0
             underrunsInWindow = 0
+            nearMissGrown = false
+        }
+        syncBackoffRun = max(0, syncBackoffRun - count)
+        var restored = false
+        if probeRun > 0 {
+            probeRun = max(0, probeRun - count)
+            if ranShort || nearMiss {
+                // The probe FAILED: the link answered a shrink with (nearly) starving the ring.
+                // Take the depth straight back — re-learning it three audible underruns at a
+                // time is what made the sync-vs-growth tug-of-war audible — and keep the sync
+                // loop from probing again for a while, doubling per consecutive failure. The
+                // residual A/V offset is reported instead; continuity outranks sync. The
+                // restore CONSUMES this event as growth evidence: it answered a depth the ring
+                // is no longer at, so growing past the proven target on top would overshoot.
+                probeRun = 0
+                targetLive = max(targetLive, probePrevTarget)
+                syncBackoffRun = syncBackoffLenMS * perMS
+                syncBackoffLenMS = min(syncBackoffLenMS * 2, Self.syncBackoffMaxMS)
+                restored = true
+            } else if probeRun == 0 {
+                // Survived the whole window: the shallower depth is genuinely safe here, so the
+                // next probe starts from a clean slate.
+                syncBackoffLenMS = Self.syncBackoffMS
+            }
         }
         if ranShort {
             quietRun = 0
             emptyReads += 1
             underrunCount += 1
-            if emptyReads >= Self.deprimeAfter {
+            if emptyReads >= Self.deprimeAfter || hollow {
+                // The consecutive-empties hysteresis protects a FULL ring from one late packet.
+                // A hollow ring is the opposite case: the target has been raised but the depth
+                // never re-banked (growth is a promise; only a re-prime cashes it), and riding
+                // that out is a click per bunching period, forever. The click just heard has
+                // already paid for the refill — take it now.
                 primed = false
                 emptyReads = 0
             }
-            underrunsInWindow += 1
+            if !restored {
+                underrunsInWindow += 1
+            }
             if underrunsInWindow >= Self.growUnderruns {
                 underrunsInWindow = 0
                 windowRun = 0
+                targetLive = min(targetLive + Self.growStepMS * perMS, Self.maxTargetMS * perMS)
+            }
+        } else if nearMiss {
+            // Came within one frame of an underrun — the same evidence as one, heard by no one.
+            // Growing here, BEFORE the click, is what "no audible jitter" means: waiting for
+            // the third audible underrun means the user heard two. One step per window (a
+            // bunching episode is a RUN of near-misses while the ring refills, and must buy one
+            // measured step, not a sprint to the ceiling); if it worsens into real underruns
+            // the path above takes over. A near-miss is pressure, not quiet.
+            quietRun = 0
+            emptyReads = 0
+            if !nearMissGrown, !restored {
+                nearMissGrown = true
                 targetLive = min(targetLive + Self.growStepMS * perMS, Self.maxTargetMS * perMS)
             }
         } else {
@@ -275,11 +385,19 @@ final class AudioRing: @unchecked Sendable {
             // Without a sync request, time is the only evidence that hard-won slack is no longer
             // needed, so a grown target waits out the long window. A request for less IS evidence,
             // and without this branch a ring that ratcheted to the ceiling during a transient would
-            // hold audio a ceiling's worth late for minutes after the cause had gone.
-            let quietNeeded = syncWantsLess ? Self.shrinkQuietSyncMS : Self.shrinkQuietMS
+            // hold audio a ceiling's worth late for minutes after the cause had gone. Every shrink
+            // is armed as a PROBE — answered by an underrun or near-miss it is undone at once (see
+            // above), and a failed sync-driven guess is not retried for a backoff.
+            let syncShrink = syncWantsLess && syncBackoffRun == 0
+            let quietNeeded = syncShrink ? Self.shrinkQuietSyncMS : Self.shrinkQuietMS
             if quietRun >= quietNeeded * perMS {
                 quietRun = 0
+                let prev = targetLive
                 targetLive = max(targetLive - Self.growStepMS * perMS, Self.targetMS * perMS)
+                if targetLive < prev {
+                    probeRun = Self.shrinkProbeMS * perMS
+                    probePrevTarget = prev
+                }
             }
         }
     }

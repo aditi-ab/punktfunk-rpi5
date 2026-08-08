@@ -497,6 +497,31 @@ const SHRINK_QUIET_MS: u32 = 30_000;
 /// The same, while the A/V sync loop is actively asking for a shallower ring — see the branch in
 /// [`JitterPolicy::note_read`] that selects between them.
 const SHRINK_QUIET_SYNC_MS: u32 = 5_000;
+/// Post-read depth below which a served callback counts as a NEAR-MISS: the device got its
+/// samples, but less than one protocol frame was left in hand, so the next callback starves
+/// unless a packet lands inside one frame time. On a healthy link the post-read depth hovers a
+/// whole target above this, which is what makes a near-miss evidence of real delivery jitter —
+/// the same evidence as an underrun, except nobody heard it yet.
+const NEAR_MISS_MARGIN_MS: u32 = FRAME_MS;
+/// How long a shrink remains a PROBE, in consumed audio: an underrun or near-miss inside this
+/// window means the shrink was wrong, and the previous target is restored at once instead of
+/// being re-learned three audible underruns at a time.
+const SHRINK_PROBE_MS: u32 = 5_000;
+/// A ring is HOLLOW when its depth AVERAGE sits this far below the target: the target promises a
+/// depth the ring does not actually hold. Growth only ever raises the promise — the one thing
+/// that re-banks real depth is a re-prime — so an underrun in a hollow ring re-primes AT ONCE:
+/// the click has already happened, and spending it on the whole refill is strictly better than
+/// riding the knife edge and paying a click per bunching period indefinitely, which is what the
+/// consecutive-empties hysteresis alone converges to. A full ring's underrun (one packet a few
+/// ms late) is nowhere near hollow and keeps the hysteresis.
+const DEPRIME_DEBT_MS: u32 = GROW_STEP_MS;
+/// How long a failed probe keeps the sync loop from driving another shrink. Without this the
+/// loop pays an audible starvation event every [`SHRINK_QUIET_SYNC_MS`] on any link whose jitter
+/// genuinely needs the depth — sync asks for less, the ring shrinks, the link answers, the ring
+/// grows back, five quiet seconds later sync asks again, forever. Doubles per consecutive
+/// failure up to [`SYNC_BACKOFF_MAX_MS`]; a probe that survives its window resets it.
+const SYNC_BACKOFF_MS: u32 = 60_000;
+const SYNC_BACKOFF_MAX_MS: u32 = 480_000;
 
 /// The playback de-jitter state machine shared by every client's audio ring.
 ///
@@ -539,6 +564,24 @@ pub struct JitterPolicy {
     /// behaviour exactly, which is what lets the four client rings adopt this one at a time
     /// without diverging in the meantime.
     sync_target: Option<usize>,
+    /// Set by [`step`](Self::step) when the read it authorised leaves less than
+    /// [`NEAR_MISS_MARGIN_MS`] buffered; consumed by [`note_read`](Self::note_read).
+    near_miss: bool,
+    /// A near-miss already grew the target this window — one step per window, so a single
+    /// bunching episode (which lands as a RUN of consecutive near-misses while the ring refills)
+    /// buys one measured step, not a sprint to the ceiling.
+    near_miss_grown: bool,
+    /// Set by [`step`](Self::step): the depth average sits more than [`DEPRIME_DEBT_MS`] below
+    /// the target, so an underrun should re-prime at once instead of waiting out the hysteresis.
+    hollow: bool,
+    /// Consumed samples left in the current shrink-probe window (0 = no probe outstanding).
+    probe_run: usize,
+    /// The live target before the probed shrink, restored if the probe fails.
+    probe_prev_target: usize,
+    /// Consumed samples before the sync loop may drive another shrink (0 = allowed now).
+    sync_backoff_run: usize,
+    /// Length of the NEXT backoff, in ms — doubles per consecutive failed probe, capped.
+    sync_backoff_ms: u32,
 }
 
 impl JitterPolicy {
@@ -558,6 +601,13 @@ impl JitterPolicy {
             quiet_run: 0,
             last_want: 0,
             sync_target: None,
+            near_miss: false,
+            near_miss_grown: false,
+            hollow: false,
+            probe_run: 0,
+            probe_prev_target: 0,
+            sync_backoff_run: 0,
+            sync_backoff_ms: SYNC_BACKOFF_MS,
         }
     }
 
@@ -667,8 +717,26 @@ impl JitterPolicy {
         if !self.primed && depth.saturating_sub(out.drop_front) >= target {
             self.primed = true;
             self.empties = 0;
+            // The refill just banked this much: seed the average with it rather than letting it
+            // climb from wherever the drought left it — a freshly-primed ring would otherwise
+            // read as hollow for the EWMA's whole settling time, and the FIRST late packet
+            // would re-prime a ring that is actually full.
+            self.depth_avg = depth.saturating_sub(out.drop_front) as f32;
         }
         out.silence = !self.primed;
+        // Near-miss: this read will be served, but with less than one frame left over — the
+        // next callback starves unless a packet lands within one frame time. Unconditional
+        // assignment, so a stale flag can never survive a de-prime into the next primed read.
+        let after = depth.saturating_sub(out.drop_front);
+        self.near_miss = self.primed
+            && after >= want
+            && after - want < NEAR_MISS_MARGIN_MS as usize * self.per_ms;
+        // Hollow: the depth AVERAGE runs a debt against the target — the promise has been raised
+        // but the depth was never re-banked (see `DEPRIME_DEBT_MS`). Judged on the average, not
+        // this instant: a single late packet empties the ring for a callback without making it
+        // hollow, and must keep the consecutive-empties hysteresis.
+        self.hollow = self.primed
+            && (self.depth_avg as usize + DEPRIME_DEBT_MS as usize * self.per_ms) < target;
         out
     }
 
@@ -683,19 +751,51 @@ impl JitterPolicy {
             return;
         }
         let want = self.last_want.max(1);
+        let near_miss = std::mem::take(&mut self.near_miss);
         self.window_run += want;
         if self.window_run >= GROW_WINDOW_MS as usize * self.per_ms {
             self.window_run = 0;
             self.underruns = 0;
+            self.near_miss_grown = false;
+        }
+        self.sync_backoff_run = self.sync_backoff_run.saturating_sub(want);
+        let mut restored = false;
+        if self.probe_run > 0 {
+            self.probe_run = self.probe_run.saturating_sub(want);
+            if ran_short || near_miss {
+                // The probe FAILED: the link answered a shrink with (nearly) starving the ring.
+                // Take the depth straight back — re-learning it three audible underruns at a
+                // time is what made the sync-vs-growth tug-of-war audible — and keep the sync
+                // loop from probing again for a while, doubling per consecutive failure. The
+                // residual A/V offset is reported instead; continuity outranks sync. The
+                // restore CONSUMES this event as growth evidence: it answered a depth the ring
+                // is no longer at, so growing past the proven target on top would overshoot.
+                self.probe_run = 0;
+                self.target = self.target.max(self.probe_prev_target);
+                self.sync_backoff_run = self.sync_backoff_ms as usize * self.per_ms;
+                self.sync_backoff_ms = (self.sync_backoff_ms * 2).min(SYNC_BACKOFF_MAX_MS);
+                restored = true;
+            } else if self.probe_run == 0 {
+                // Survived the whole window: the shallower depth is genuinely safe here, so the
+                // next probe starts from a clean slate.
+                self.sync_backoff_ms = SYNC_BACKOFF_MS;
+            }
         }
         if ran_short {
             self.quiet_run = 0;
             self.empties += 1;
-            if self.empties >= self.tuning.deprime_after {
+            if self.empties >= self.tuning.deprime_after || self.hollow {
+                // The consecutive-empties hysteresis protects a FULL ring from one late packet.
+                // A hollow ring is the opposite case: the target has been raised but the depth
+                // never re-banked (growth is a promise; only a re-prime cashes it), and riding
+                // that out is a click per bunching period, forever. The click just heard has
+                // already paid for the refill — take it now.
                 self.primed = false;
                 self.empties = 0;
             }
-            self.underruns += 1;
+            if !restored {
+                self.underruns += 1;
+            }
             if self.underruns >= GROW_UNDERRUNS {
                 // This device genuinely needs more slack than the base target. Grow ONCE per
                 // window, capped — the alternative (every device pre-paying the worst device's
@@ -705,17 +805,33 @@ impl JitterPolicy {
                 let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
                 self.target = grown.min(self.tuning.max_target_ms as usize * self.per_ms);
             }
+        } else if near_miss {
+            // Came within one frame of an underrun — the same evidence as one, heard by no one.
+            // Growing here, BEFORE the click, is what "no audible jitter" means: waiting for
+            // the third audible underrun means the user heard two. One step per window (a
+            // bunching episode is a RUN of near-misses while the ring refills, and must buy one
+            // measured step, not a sprint to the ceiling); if it worsens into real underruns
+            // the path above takes over. A near-miss is pressure, not quiet.
+            self.quiet_run = 0;
+            self.empties = 0;
+            if !self.near_miss_grown && !restored {
+                self.near_miss_grown = true;
+                let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
+                self.target = grown.min(self.tuning.max_target_ms as usize * self.per_ms);
+            }
         } else {
             self.empties = 0;
             self.quiet_run += want;
             // A grown target normally relaxes only after a long quiet spell, because without other
             // evidence the only thing that can justify giving up hard-won slack is time. When the
             // sync loop is asking to run shallower it IS that evidence — a measurement saying the
-            // extra depth is costing alignment right now — so test a smaller target sooner. Wrong
-            // guesses are cheap and self-correcting: one underrun and the growth path takes it
-            // straight back. Without this a ring that ratcheted to the ceiling during a transient
-            // would hold the audio a ceiling's worth late for minutes after the cause had gone.
-            let quiet_needed = if self.sync_wants_less() {
+            // extra depth is costing alignment right now — so test a smaller target sooner. Every
+            // shrink is armed as a PROBE: answered by an underrun or near-miss it is undone at
+            // once (see above), and a failed sync-driven guess is not retried for a backoff —
+            // without that, a link whose jitter genuinely needs the depth pays an audible
+            // starvation event every five seconds, forever.
+            let sync_shrink = self.sync_wants_less() && self.sync_backoff_run == 0;
+            let quiet_needed = if sync_shrink {
                 SHRINK_QUIET_SYNC_MS
             } else {
                 SHRINK_QUIET_MS
@@ -725,10 +841,15 @@ impl JitterPolicy {
                 // doesn't cost latency for the rest of the session.
                 self.quiet_run = 0;
                 let base = self.tuning.base_target_ms as usize * self.per_ms;
+                let prev = self.target;
                 self.target = self
                     .target
                     .saturating_sub(GROW_STEP_MS as usize * self.per_ms)
                     .max(base);
+                if self.target < prev {
+                    self.probe_run = SHRINK_PROBE_MS as usize * self.per_ms;
+                    self.probe_prev_target = prev;
+                }
             }
         }
     }
@@ -1936,5 +2057,245 @@ mod tests {
             fast_reads < slow_reads,
             "sync pressure should relax sooner: {fast_reads} vs {slow_reads} quiet reads"
         );
+    }
+
+    // ---- near-miss growth and shrink probes (the audible-limit-cycle fixes) ---------------
+
+    /// A primed read that is served but leaves less than one frame buffered is a NEAR-MISS —
+    /// the same evidence as an underrun, heard by no one — and must grow the target BEFORE the
+    /// click, not after the third one. One step per window: a bunching episode lands as a run of
+    /// consecutive near-misses while the ring refills, and must not sprint to the ceiling.
+    #[test]
+    fn a_near_miss_grows_the_target_without_an_underrun() {
+        let t = JitterTuning::COREAUDIO;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(t, 2);
+        p.step(t.base_target_ms as usize * pm, want); // primes exactly at target
+        assert!(p.is_primed());
+        let base = p.target_ms();
+        // Serve the callback with less than one frame left over: depth = want + (margin − 1).
+        p.step(want + NEAR_MISS_MARGIN_MS as usize * pm - 1, want);
+        p.note_read(false); // NOT short — the device got its samples
+        assert_eq!(
+            p.target_ms(),
+            base + GROW_STEP_MS,
+            "a near-miss must buy one step"
+        );
+        // A second near-miss in the same window is the same episode: no further growth.
+        p.step(want + pm, want);
+        p.note_read(false);
+        assert_eq!(p.target_ms(), base + GROW_STEP_MS, "one step per window");
+        // A healthy read does not grow anything.
+        let grown = p.target_ms();
+        p.step(grown as usize * pm + want, want);
+        p.note_read(false);
+        assert_eq!(p.target_ms(), grown);
+    }
+
+    /// A healthy steady depth must never read as a near-miss: the margin is one frame, and a
+    /// ring hovering at target sits a whole target above it.
+    #[test]
+    fn steady_depth_never_grows_the_target() {
+        let t = JitterTuning::PIPEWIRE;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(t, 2);
+        for _ in 0..(60_000 / 5) {
+            // one minute of clean callbacks
+            p.step(t.base_target_ms as usize * pm + want, want);
+            p.note_read(false);
+        }
+        assert_eq!(p.target_ms(), t.base_target_ms);
+    }
+
+    /// A shrink answered by an underrun (or near-miss) inside its probe window is undone AT
+    /// ONCE — re-learning the depth three audible underruns at a time is what made the
+    /// sync-vs-growth tug-of-war audible in the field.
+    #[test]
+    fn a_failed_shrink_probe_is_undone_at_once() {
+        let t = JitterTuning::COREAUDIO;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(t, 2);
+        // Grow the floor two steps the audible way.
+        for _ in 0..(2 * GROW_UNDERRUNS) {
+            while !p.is_primed() {
+                p.step(200 * pm, want);
+            }
+            p.step(200 * pm, want);
+            p.note_read(true);
+        }
+        let grown = p.target_ms();
+        assert!(grown > t.base_target_ms);
+        // Sync asks for less; five quiet seconds later the shrink probes.
+        p.set_sync_target(Some(pm));
+        let depth = grown as usize * pm + want;
+        while p.target_ms() == grown {
+            p.step(depth, want);
+            p.note_read(false);
+        }
+        assert_eq!(p.target_ms(), grown - GROW_STEP_MS);
+        // ONE near-miss — nobody heard anything yet — and the depth is back.
+        p.step(want + pm, want);
+        p.note_read(false);
+        assert_eq!(
+            p.target_ms(),
+            grown,
+            "a failed probe must restore the target on the first near-miss"
+        );
+    }
+
+    /// After a failed probe the sync loop may not drive another shrink at the accelerated
+    /// cadence — the slow, pre-sync window still applies, the five-second one does not.
+    #[test]
+    fn a_failed_probe_backs_the_sync_shrink_off() {
+        let t = JitterTuning::COREAUDIO;
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(t, 2);
+        for _ in 0..(2 * GROW_UNDERRUNS) {
+            while !p.is_primed() {
+                p.step(200 * pm, want);
+            }
+            p.step(200 * pm, want);
+            p.note_read(true);
+        }
+        let grown = p.target_ms();
+        p.set_sync_target(Some(pm));
+        let depth = grown as usize * pm + want;
+        // First sync-driven shrink, then fail its probe.
+        while p.target_ms() == grown {
+            p.step(depth, want);
+            p.note_read(false);
+        }
+        p.step(want + pm, want);
+        p.note_read(false);
+        assert_eq!(p.target_ms(), grown, "restored");
+        // Twice the accelerated window of clean audio: the backed-off loop must NOT have
+        // shrunk again (before the fix this was exactly one audible failure per five seconds).
+        for _ in 0..(2 * SHRINK_QUIET_SYNC_MS / 5) {
+            p.step(depth, want);
+            p.note_read(false);
+        }
+        assert_eq!(
+            p.target_ms(),
+            grown,
+            "the accelerated cadence must be suspended after a failure"
+        );
+        // The slow pre-sync window still relaxes it eventually — backoff is not a freeze.
+        for _ in 0..(2 * SHRINK_QUIET_MS / 5) {
+            p.step(depth, want);
+            p.note_read(false);
+        }
+        assert!(
+            p.target_ms() < grown,
+            "the slow window must still be allowed to test a shrink"
+        );
+    }
+
+    /// One simulated bunching run's outcome.
+    #[derive(Debug, Default)]
+    struct BunchSim {
+        /// Reads that actually starved the device — each one is audible.
+        audible: u32,
+        /// Audible reads in the second half of the run: non-zero means the policy never
+        /// converged and the user hears it forever.
+        audible_tail: u32,
+    }
+
+    /// Drive a policy over a link that BUNCHES: delivery pauses for `gap_ms` every `period_ms`,
+    /// then the withheld audio arrives at once — the Wi-Fi power-save pattern from the field
+    /// reports, where the total rate is fine and only the spacing is wrong. `drift_ppm` is the
+    /// host-vs-DAC clock skew; a slightly slow host (negative) erodes the depth over minutes,
+    /// which is what keeps re-testing whatever target the policy has settled on — without it a
+    /// simulated ring freezes wherever priming left it and a wrong target is never punished.
+    fn simulate_bunching(
+        tuning: JitterTuning,
+        sync_target: Option<usize>,
+        ms: u32,
+        gap_ms: u32,
+        period_ms: u32,
+        drift_ppm: i64,
+    ) -> BunchSim {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(tuning, 2);
+        p.set_sync_target(sync_target);
+        let mut depth = 0usize;
+        let mut withheld = 0usize;
+        let mut carry: i64 = 0;
+        let mut out = BunchSim::default();
+        for cb in 0..(ms / 5) {
+            // The host keeps producing (want ± drift per callback); the link decides delivery.
+            carry += want as i64 * drift_ppm;
+            let extra = carry / 1_000_000;
+            carry -= extra * 1_000_000;
+            let produced = (want as i64 + extra).max(0) as usize;
+            let in_gap = (cb * 5) % period_ms < gap_ms;
+            if in_gap {
+                withheld += produced;
+            } else {
+                depth += produced + std::mem::take(&mut withheld);
+            }
+            let s = p.step(depth, want);
+            depth -= s.drop_front.min(depth);
+            if s.silence {
+                p.note_read(false);
+                continue;
+            }
+            let short = depth < want;
+            depth -= want.min(depth);
+            if short {
+                out.audible += 1;
+                if cb >= ms / 10 {
+                    out.audible_tail += 1;
+                }
+            }
+            p.note_read(short);
+        }
+        out
+    }
+
+    /// THE field regression this whole change is for. A link that bunches needs ~30 ms of ring;
+    /// the sync loop wants less. Before this change the policy paid an audible event nearly
+    /// every bunching period, indefinitely — this exact simulation measured ~2000 over ten
+    /// minutes: the sync loop re-probed a proven depth every five quiet seconds, growth needed
+    /// three audible underruns to answer, and a grown target was never re-banked (growth raises
+    /// a threshold; only a re-prime deepens the ring), so the depth rode the knife edge. Now
+    /// near-misses grow the target before the first click, a failed shrink probe is undone at
+    /// once and backs the sync loop off, and a hollow ring cashes the whole refill on the click
+    /// it already paid. What remains is the clock-skew re-anchor — a slightly slow host
+    /// genuinely starves the ring every few minutes, and only rate adaptation (which no client
+    /// has) could remove that — so the bound is "a handful over ten minutes", not zero.
+    #[test]
+    fn sync_pressure_on_a_bunching_link_converges_instead_of_clicking_forever() {
+        // 25 ms gaps every 300 ms, a slightly slow host, ten minutes, sync permanently asking
+        // for a 5 ms ring.
+        let s = simulate_bunching(
+            JitterTuning::COREAUDIO,
+            Some(per_ms(2) * 5),
+            600_000,
+            25,
+            300,
+            -50,
+        );
+        assert!(
+            s.audible_tail <= 4,
+            "the tug-of-war must converge to the skew floor: {s:?}"
+        );
+        assert!(
+            s.audible <= 12,
+            "learning the link may cost a handful of audible events, not a stream of them: {s:?}"
+        );
+    }
+
+    /// The same link without sync pressure — the plain adaptive-growth behaviour — must land in
+    /// the same place: sync steering may not add a persistent audible cost over not steering.
+    #[test]
+    fn a_bunching_link_without_sync_stays_clean_after_growing() {
+        let s = simulate_bunching(JitterTuning::COREAUDIO, None, 600_000, 25, 300, -50);
+        assert!(s.audible_tail <= 4, "{s:?}");
+        assert!(s.audible <= 12, "{s:?}");
     }
 }
