@@ -79,6 +79,13 @@ public final class SessionAudio {
     /// session's activate.
     private static let sessionQueue = DispatchQueue(label: "io.unom.punktfunk.audio.session")
     #endif
+    #if os(iOS)
+    /// Live only for a `.playAndRecord` session: the token for the route-change observer that
+    /// keeps the BUILT-IN output on the speaker rather than the earpiece (see
+    /// `steerBuiltInOutputToSpeaker`). A `.playback` session already prefers the speaker and
+    /// never needs steering, so the mic-off path installs nothing. Guarded by `stateLock`.
+    private var routeObserver: NSObjectProtocol?
+    #endif
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -89,6 +96,11 @@ public final class SessionAudio {
     /// Engine teardown still belongs to stop().
     deinit {
         flag.stop()
+        #if os(iOS)
+        // The observer only holds self weakly, so we can be deinited with it still registered;
+        // drop the token here too rather than leaking it when an owner skips stop().
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        #endif
     }
 
     /// Start playback (and, if enabled+authorized, the mic uplink). Empty UIDs = system default
@@ -138,11 +150,29 @@ public final class SessionAudio {
         do {
             #if os(iOS)
             if micEnabled {
-                // .defaultToSpeaker: .playAndRecord otherwise routes to the iPhone EARPIECE; only
-                // affects the built-in route (headphones/BT still win).
+                // NO .defaultToSpeaker here, deliberately. It reads like "prefer the speaker over
+                // the earpiece", and the comment that used to sit here claimed headphones and
+                // Bluetooth still won. That is true of WIRED headphones and false of Bluetooth —
+                // a cable is the one way to test this and see the right answer. It is an
+                // OVERRIDE, and it outranks an A2DP route: with it set, every Bluetooth headset
+                // lost the stream to the phone's own speaker. That is the 0.25 field report ("no
+                // audio over Bluetooth ... plays through speakers if Mic input is enabled") — mic
+                // and echo cancellation both default to ON, so this branch is the DEFAULT path
+                // and every Bluetooth listener hit it; turning the mic off was the accidental
+                // workaround, because that lands on `.playback` below, which routes to A2DP
+                // happily.
+                //
+                // The earpiece problem it was reaching for is real, so it is solved after
+                // activation instead, against the route we were ACTUALLY given —
+                // see `steerBuiltInOutputToSpeaker`.
+                //
+                // `.allowBluetoothA2DP` alone, also deliberately: adding `.allowBluetooth` would
+                // make a headset's MIC usable, but it buys that by dragging the whole route onto
+                // HFP/SCO and collapsing game audio to narrowband. High-quality A2DP output plus
+                // the built-in mic is the better trade for a game-streaming client.
                 try session.setCategory(
                     .playAndRecord, mode: .default,
-                    options: [.allowBluetoothA2DP, .defaultToSpeaker])
+                    options: [.allowBluetoothA2DP])
                 // Uplink latency: ask for 5 ms IO quanta at the wire rate (the default ~10-23 ms
                 // quantum is most of the mic path's burst latency). Best-effort — the hardware
                 // has the final word (a Bluetooth route will ignore both), and whatever quantum
@@ -156,9 +186,63 @@ public final class SessionAudio {
             try session.setCategory(.playback, mode: .default)
             #endif
             try session.setActive(true)
+            #if os(iOS)
+            // Only the `.playAndRecord` session can land on the earpiece, and only it accepts an
+            // output override — so the mic-off (`.playback`) path deliberately does neither.
+            if micEnabled {
+                steerBuiltInOutputToSpeaker(session)
+                installRouteObserver()
+            }
+            #endif
         } catch {
             log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
         }
+    }
+    #endif
+
+    #if os(iOS)
+    /// `.playAndRecord` parks the BUILT-IN output on the earpiece — right for a phone call,
+    /// useless for a game. Move it to the speaker, but ONLY when the route we were actually given
+    /// is the receiver: anything external (Bluetooth, wired, CarPlay, AirPlay) is left strictly
+    /// alone. That "look first" is the whole difference between this and the `.defaultToSpeaker`
+    /// option it replaced, which forced the speaker unconditionally and so beat Bluetooth.
+    ///
+    /// Idempotent and cheap, so the route observer can simply call it again.
+    private func steerBuiltInOutputToSpeaker(_ session: AVAudioSession) {
+        // An override already in force shows up as `.builtInSpeaker`, not `.builtInReceiver`, so
+        // re-running this never fights its own previous result.
+        guard session.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver })
+        else { return }
+        do {
+            try session.overrideOutputAudioPort(.speaker)
+        } catch {
+            log.warning("could not move audio off the earpiece: \(error.localizedDescription)")
+        }
+    }
+
+    /// Routes change under a live session: a headset connects mid-stream, or disconnects and hands
+    /// the stream back to the built-in output. iOS drops an output override whenever the route
+    /// changes — which is what lets a newly-connected headset win — so the earpiece steer is a
+    /// property of the CURRENT route and has to be re-applied per route. Without this, dropping
+    /// Bluetooth mid-stream would land the game on the earpiece.
+    private func installRouteObserver() {
+        let observer = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil
+        ) { [weak self] _ in
+            // Arrives on whatever thread AVFoundation posts it from, and the session API blocks
+            // on the audio server — so do the work on the shared session queue, like every
+            // other call into it.
+            SessionAudio.sessionQueue.async {
+                guard let self, !self.flag.isStopped else { return }
+                self.steerBuiltInOutputToSpeaker(AVAudioSession.sharedInstance())
+            }
+        }
+        stateLock.lock()
+        let stale = routeObserver
+        routeObserver = observer
+        stateLock.unlock()
+        if let stale { NotificationCenter.default.removeObserver(stale) }
     }
     #endif
 
@@ -249,7 +333,16 @@ public final class SessionAudio {
         combinedEngine = nil
         let wasDraining = drainStarted
         drainStarted = false
+        #if os(iOS)
+        let route = routeObserver
+        routeObserver = nil
+        #endif
         stateLock.unlock()
+        #if os(iOS)
+        // Before the deactivate below, so a route change during teardown can't re-steer a session
+        // we are in the middle of releasing.
+        if let route { NotificationCenter.default.removeObserver(route) }
+        #endif
         if let capture {
             capture.inputNode.removeTap(onBus: 0)
             capture.stop()
