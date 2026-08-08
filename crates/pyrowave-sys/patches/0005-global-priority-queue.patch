@@ -17,7 +17,38 @@ VK_ERROR_NOT_PERMITTED_KHR so a refused class NEVER regresses the encoder. Gated
 NOTE: on an RTX 4090 / Windows / WDDM this did not reduce the spikes (the graphics-vs-compute
 preemption granularity is the wall) — kept because it is correct, harmless (graceful fallback), and
 may help other GPUs/drivers. Reduce the encode's GPU cost (4:2:0/8-bit) or use H.265 for a
-GPU-saturated game.
+GPU-saturated game. **That measurement is Windows/WDDM and does NOT transfer to Linux** — a
+different driver stack with a different preemption model.
+
+MEASURED ON LINUX/NVIDIA 2026-08-08, and it comes out the OTHER WAY: the elevated queue DOES cut
+the tail. RTX 5070 Ti (driver 610.57.04), GRID 2 benchmark loop saturating the GPU at 54-87 %,
+PyroWave 1080p, same binary in both arms (the only difference is CAP_SYS_NICE, i.e. whether the
+class is granted at all), steady-state windows of 30 frames:
+
+  arm                       p50        p99        worst frame
+  default priority (refused) ~2.6 ms   ~6.4 ms    9.5 ms
+  REALTIME granted           ~3.2 ms   ~4.4 ms    5.4 ms      (repeat: p50 ~3.35, p99 ~4.8)
+
+So on this stack the priority class buys a materially tighter TAIL — p99 down ~30 %, worst frame
+roughly halved — at the cost of ~0.6 ms on the median. For a streaming encoder that is the right
+side of the trade: the tail is what shows up as a visible hitch. Do NOT delete this patch on the
+strength of the RTX 4090/WDDM result above; the two stacks disagree.
+
+Caveats, so the number is not over-read: the arms were not interleaved and the background game
+load drifted between them, capture was frame-starved (~2.5 fps) so this measures encode latency
+under contention rather than a full-rate stream, and it is two granted runs against one refused
+run. The direction was consistent across all 25 measurement windows.
+
+NOTE 2 — WHERE THIS PATCH IS ACTUALLY LIVE. It is gated `if (!inherit_info)`, and only the WINDOWS
+path leaves `inherit_info` null: `crates/pf-encode/src/enc/windows/pyrowave.rs` calls
+`pyrowave_create_device_by_compat`, so Granite builds the device itself and this block runs.
+**On LINUX it has never done anything.** `crates/pf-encode/src/enc/linux/pyrowave.rs::open_inner`
+passes its own instance/device create-infos into `pyrowave_device_create_info`, Granite's
+`MyDeviceFactory::get_existing_create_info()` returns them, `create_device` takes the inherit
+branch, and the whole block above is skipped. The Linux request is therefore wired natively in
+**`crates/pf-encode/src/enc/linux/pyrowave.rs`** (search `queue_priority_candidates`), which
+implements the SAME env grammar and the SAME downgrade ladder so one knob means one thing on both
+platforms. If you change the grammar here, change it there in the same commit.
 
 diff --git a/crates/pyrowave-sys/vendor/pyrowave/Granite/vulkan/context.cpp b/crates/pyrowave-sys/vendor/pyrowave/Granite/vulkan/context.cpp
 index 5257fc33..479eeded 100644

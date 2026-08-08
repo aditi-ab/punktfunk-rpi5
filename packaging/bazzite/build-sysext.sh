@@ -130,6 +130,31 @@ SYSEXT_VERSION_ID=$PF_VR
 EXTENSION_RELOAD_MANAGER=1
 EOF
 
+# CAP_SYS_NICE on the host binary — the GPU-scheduling grant. PyroWave encodes on the GPU shader
+# cores a game saturates, and the driver gates the elevated global-priority Vulkan queue that fixes
+# it on this capability (measured 2026-08-08 on an RTX 5070 Ti: refused without it, granted REALTIME
+# with it; RADV the same). Narrow — scheduling priority only, no filesystem/network privilege, not
+# setuid.
+#
+# It has to be applied HERE, not in the merge hook: a merged sysext's /usr is a read-only squashfs,
+# so nothing can setcap it afterwards. And it cannot ride in from the RPM either — the spec declares
+# it with %caps, but rpm stores capabilities in its own header and `rpm2cpio | cpio` carries only
+# the payload, so the staged file arrives with no capability at all. mksquashfs DOES record
+# security.capability (only security.selinux is excluded below), so a setcap on the staging tree is
+# what ends up in the image.
+#
+# Needs CAP_SETFCAP, i.e. root (or fakeroot) — a plain-user CI build cannot do it. That is not fatal:
+# the image just ships as it does today and the encode runs at default GPU priority, so warn and
+# carry on rather than fail a release build over a performance lever.
+if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
+  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-host" 2>/dev/null; then
+    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-host (GPU-priority lever active)"
+  else
+    echo "WARNING: could not setcap CAP_SYS_NICE (need root/CAP_SETFCAP) — the image will ship" >&2
+    echo "         without it and PyroWave will encode at default GPU priority." >&2
+  fi
+fi
+
 # SELinux labels as pseudo-xattrs (see header). matchpathcon resolves each target path against
 # the targeted policy's file_contexts; <<none>> means "no specific entry" — skip those (the
 # handful of matches all resolve to real contexts for our payload).

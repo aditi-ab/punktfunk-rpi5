@@ -70,6 +70,13 @@ struct UserData {
     linear_nv12_failed: bool,
     /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
     dbg_log_n: u64,
+    /// PW4 step 1: the producer-fence wait distribution, measured on this (the PipeWire loop)
+    /// thread. Per-session, like the fall-through tally.
+    fence_wait: FenceWaitStats,
+    /// Raw-passthrough frames that silently fell through to the CPU de-pad path, by reason — see
+    /// [`PassthroughFallbacks`]. Per-session: a fresh `UserData` is built per pipeline, so a
+    /// compositor that starts serving dmabufs again after a rebuild gets a fresh log budget.
+    passthrough_fallbacks: PassthroughFallbacks,
     /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
     cursor: CursorState,
     /// `Some((w, h))` while the producer's negotiated size is a sacrificial birth mode and a
@@ -239,6 +246,290 @@ impl NegotiationPlan {
     }
 }
 
+/// Which capture arm a negotiated pipeline actually resolved to.
+///
+/// The 2026-08-08 PyroWave triage had to reconstruct this from four files, because no single line
+/// ever states it: the arm is the product of a policy, a latch, an importer that may or may not
+/// have constructed, and a modifier list. A degraded host and a healthy one logged the same
+/// thing. [`resolved_capture_arm`] plus the one INFO line at pipeline build is the whole fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CaptureArm {
+    /// Raw dmabufs handed straight to the encoder, which imports them itself — libva (VAAPI) or
+    /// the PyroWave encoder's own Vulkan device. No host pixel touch.
+    DmabufPassthrough,
+    /// dmabufs imported to CUDA device buffers by the EGL→CUDA worker, for NVENC. No host pixel
+    /// touch either, but a different failure surface (the worker, the modifier negotiation).
+    CudaImport,
+    /// CPU frames: an mmap de-pad of every frame, then whatever CSC + upload the encoder needs.
+    /// The slow path — always a downgrade when the consumer could have taken a dmabuf.
+    Cpu,
+}
+
+impl CaptureArm {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            CaptureArm::DmabufPassthrough => "dmabuf-passthrough",
+            CaptureArm::CudaImport => "cuda-import",
+            CaptureArm::Cpu => "cpu",
+        }
+    }
+}
+
+/// Resolve the arm this pipeline ended up on. **Pure** — `have_importer` and `want_dmabuf` are the
+/// two runtime facts `negotiation_plan` cannot know (whether the importer constructed, and what
+/// modifier list that yielded); everything else is already in the plan.
+pub(super) fn resolved_capture_arm(
+    plan: &NegotiationPlan,
+    have_importer: bool,
+    want_dmabuf: bool,
+) -> CaptureArm {
+    if !want_dmabuf {
+        // No dmabuf offer at all: SHM/CPU frames, whatever the plan wanted.
+        CaptureArm::Cpu
+    } else if plan.vaapi_passthrough {
+        CaptureArm::DmabufPassthrough
+    } else if have_importer {
+        CaptureArm::CudaImport
+    } else {
+        // Unreachable via `want_dmabuf` (it requires `have_importer || vaapi_passthrough`), but
+        // stated rather than `unreachable!()`: a logging helper must never be the thing that
+        // panics a capture thread.
+        CaptureArm::Cpu
+    }
+}
+
+/// Who consumes the captured frames — the fact that decides whether a CPU arm is a *downgrade*
+/// worth warning about, and what to call it in the log.
+///
+/// Derived from the resolved [`ZeroCopyPolicy`](crate::ZeroCopyPolicy), **not** from the encoder
+/// pref: `pyrowave_session` is per-session (the negotiated codec), so a PyroWave session on an
+/// otherwise-NVENC host reads as PyroWave here. Naming the pref instead is exactly how a PyroWave
+/// session's CPU downgrade came to be reported as an NVENC one — or, on an NVIDIA host, not
+/// reported at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConsumerKind {
+    /// This session encodes PyroWave: the wavelet encoder's own Vulkan device imports dmabufs on
+    /// any vendor, so a CPU arm costs it the passthrough it was designed around.
+    PyroWave,
+    /// The VAAPI backend (AMD/Intel): libva imports the dmabuf and CSCs on the GPU.
+    Vaapi,
+    /// NVENC, fed by the EGL→CUDA importer.
+    Nvenc,
+    /// The software encoder — CPU frames are its native input, so a CPU arm is no downgrade.
+    Software,
+}
+
+impl ConsumerKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ConsumerKind::PyroWave => "pyrowave",
+            ConsumerKind::Vaapi => "vaapi",
+            ConsumerKind::Nvenc => "nvenc",
+            ConsumerKind::Software => "software",
+        }
+    }
+
+    /// Whether landing on [`CaptureArm::Cpu`] is a performance downgrade for this consumer (i.e.
+    /// worth a `warn!`). True for every GPU consumer; false for the software encoder, which wants
+    /// CPU frames anyway.
+    pub(super) fn cpu_is_downgrade(self) -> bool {
+        !matches!(self, ConsumerKind::Software)
+    }
+}
+
+/// Classify the frames' consumer. **Pure.** `pyrowave_session` wins over `backend_is_vaapi`
+/// because it is the per-session truth and the pref is host-global (a PyroWave session also flips
+/// `backend_is_vaapi` on, via `linux_zero_copy_is_vaapi`'s `Pyrowave` arm — so testing vaapi first
+/// would swallow every PyroWave session).
+pub(super) fn consumer_kind(
+    pyrowave_session: bool,
+    backend_is_vaapi: bool,
+    backend_is_gpu: bool,
+) -> ConsumerKind {
+    if pyrowave_session {
+        ConsumerKind::PyroWave
+    } else if !backend_is_gpu {
+        ConsumerKind::Software
+    } else if backend_is_vaapi {
+        ConsumerKind::Vaapi
+    } else {
+        ConsumerKind::Nvenc
+    }
+}
+
+/// Why a frame on the raw-dmabuf passthrough could not be handed to the encoder and fell through
+/// to the CPU de-pad path instead.
+///
+/// Each variant is a *different* diagnosis with a different fix, and all four were silent: the
+/// passthrough block simply fell out of its `if` and the frame took the slow path, so a session
+/// that had negotiated zero-copy could pay CPU costs on every frame while logging a healthy
+/// "advertising DMA-BUF modifiers" line at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassthroughFallback {
+    /// No format negotiated yet — transient, and expected around a renegotiation.
+    NoFormat,
+    /// The producer delivered an SHM/MemFd buffer for this frame, not a dmabuf.
+    NotDmabuf,
+    /// The negotiated pixel format has no DRM fourcc, so it cannot be described to the encoder.
+    NoFourcc,
+    /// `F_DUPFD_CLOEXEC` failed — the fd could not be duplicated to outlive the buffer recycle
+    /// (an fd-limit symptom, not a graphics one).
+    DupFailed,
+}
+
+impl PassthroughFallback {
+    fn bit(self) -> u8 {
+        match self {
+            PassthroughFallback::NoFormat => 1 << 0,
+            PassthroughFallback::NotDmabuf => 1 << 1,
+            PassthroughFallback::NoFourcc => 1 << 2,
+            PassthroughFallback::DupFailed => 1 << 3,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            PassthroughFallback::NoFormat => "no format negotiated yet",
+            PassthroughFallback::NotDmabuf => "the producer delivered an SHM/MemFd buffer",
+            PassthroughFallback::NoFourcc => "the negotiated format has no DRM fourcc",
+            PassthroughFallback::DupFailed => "F_DUPFD_CLOEXEC failed on the dmabuf fd",
+        }
+    }
+
+    /// What actually happens to the frame. Three of the four reasons downgrade it to the CPU
+    /// de-pad path; `NoFormat` does not — the CPU path needs `ud.format` too and returns without
+    /// de-padding, so that frame is DROPPED. Worth the distinction: "slower" and "gone" are
+    /// different faults, and a diagnostic that conflates them is the thing PW2 exists to remove.
+    pub(super) fn falls_back_to_cpu(self) -> bool {
+        !matches!(self, PassthroughFallback::NoFormat)
+    }
+
+    /// What to do about it — the half a log line is useless without.
+    pub(super) fn hint(self) -> &'static str {
+        match self {
+            PassthroughFallback::NoFormat => {
+                "harmless if it stops: the first buffers can arrive before param_changed"
+            }
+            PassthroughFallback::NotDmabuf => {
+                "the compositor accepted the dmabuf offer and is serving memory anyway — check \
+                 PUNKTFUNK_FORCE_SHM and the compositor's allocator"
+            }
+            PassthroughFallback::NoFourcc => {
+                "a capture format the encoder path cannot describe — file it, the negotiation \
+                 should not have accepted it"
+            }
+            PassthroughFallback::DupFailed => "out of file descriptors — raise the host's NOFILE",
+        }
+    }
+}
+
+/// Upper bounds (µs) of the fence-wait histogram's buckets; the last bucket is everything above.
+///
+/// Deliberately coarse and log-ish. The question this instrument exists to answer is not "what is
+/// the wait, to the microsecond" but "**is the tail ~0, or is it milliseconds?**" — the first
+/// answer retires PW4 as a comment correction, the second justifies moving the wait off the
+/// PipeWire loop thread. Bucket edges are placed so those two worlds cannot be confused: anything
+/// at or below 100 µs is noise, anything past 1 ms is a real stall on a 60 Hz budget of 16.6 ms.
+const FENCE_WAIT_BUCKETS_US: [u64; 6] = [100, 500, 1_000, 2_000, 5_000, 10_000];
+
+/// PW4 step 1: the distribution of the producer's implicit-fence wait, measured **on the PipeWire
+/// loop thread**, which is exactly where it is expensive — that thread is the compositor's
+/// consumer, so time spent blocked here delays buffer recycling for the NEXT frame.
+///
+/// PW4 is pre-registered to be **abandoned on evidence**: if the p99 sits in the first bucket the
+/// wait is already ~free and the package becomes a comment correction. Shipping the instrument
+/// before the change is the whole point — the alternative is moving load-bearing synchronisation
+/// off a thread on a hunch.
+///
+/// One caveat the reader needs: measure this AFTER the priority levers land. The win case for
+/// moving the wait is a loaded GPU, which is the same scenario PW1 targets, so a measurement taken
+/// before PW1 would hand PW4 credit for PW1's problem.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct FenceWaitStats {
+    samples: u64,
+    total_us: u64,
+    max_us: u64,
+    /// One more than the bucket bounds: the overflow bucket.
+    buckets: [u64; FENCE_WAIT_BUCKETS_US.len() + 1],
+    /// Outcome split — a `NoFence` majority means the wait is structurally free on this producer
+    /// (nothing to wait for), which is a different finding from "the wait is short".
+    signaled: u64,
+    no_fence: u64,
+    timed_out: u64,
+    failed: u64,
+}
+
+impl FenceWaitStats {
+    /// Record one wait. `bucket_of` is inlined here rather than exposed: the histogram is only
+    /// ever read through [`summary`](Self::summary).
+    pub(super) fn record(&mut self, us: u64) {
+        self.samples += 1;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+        let idx = FENCE_WAIT_BUCKETS_US
+            .iter()
+            .position(|&b| us <= b)
+            .unwrap_or(FENCE_WAIT_BUCKETS_US.len());
+        self.buckets[idx] += 1;
+    }
+
+    /// The bucket the `q`-quantile falls in, as its upper bound in µs — `None` for the overflow
+    /// bucket (i.e. "worse than the last edge"). Counting up to the quantile rather than
+    /// interpolating keeps this honest about what a histogram can actually say.
+    pub(super) fn quantile_bucket_us(&self, q: f64) -> Option<Option<u64>> {
+        if self.samples == 0 {
+            return None;
+        }
+        // The index of the sample at `q`, 0-based, so q=1.0 picks the last sample.
+        let target = ((self.samples as f64) * q).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (i, &count) in self.buckets.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return Some(FENCE_WAIT_BUCKETS_US.get(i).copied());
+            }
+        }
+        Some(None)
+    }
+
+    pub(super) fn mean_us(&self) -> u64 {
+        self.total_us.checked_div(self.samples).unwrap_or(0)
+    }
+
+    /// Whether enough has been seen for the p99 to mean anything. 100 frames is under two seconds
+    /// at 60 fps and is the point where one outlier stops dominating the answer.
+    pub(super) fn is_meaningful(&self) -> bool {
+        self.samples >= 100
+    }
+}
+
+/// Per-session tally of raw-passthrough frames that fell through to the CPU path, with a one-line
+/// budget per distinct reason.
+///
+/// Rate-limiting is what makes this shippable: `.process` runs per frame, so an unconditional log
+/// would flood at the capture rate. Per *reason* rather than per session, because the four reasons
+/// diagnose different faults and a transient `NoFormat` at open must not spend the budget a
+/// persistent `NotDmabuf` needs.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PassthroughFallbacks {
+    frames: u64,
+    logged: u8,
+}
+
+impl PassthroughFallbacks {
+    /// Record one fall-through. Returns `Some(frames_so_far)` the FIRST time each distinct reason
+    /// is seen this session — the caller logs then and only then, so at most four lines per
+    /// session regardless of frame rate.
+    pub(super) fn note(&mut self, reason: PassthroughFallback) -> Option<u64> {
+        self.frames += 1;
+        let bit = reason.bit();
+        (self.logged & bit == 0).then(|| {
+            self.logged |= bit;
+            self.frames
+        })
+    }
+}
+
 /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
 /// the stream is poisoned for rebuild. A tiled import failure must NEVER fall through to the
 /// CPU mmap path — de-padding tiled bytes as linear produces a scrambled image — so after a
@@ -345,9 +636,34 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     // the buffer's implicit fence and wait the producer's render before sampling —
     // closing the stale/old-frame race on NVIDIA. No-op for shm buffers or drivers that
     // attach no fence. Covers both the GPU import and the CPU mmap read below.
+    //
+    // MEASURED 2026-08-08 (Wave-2 PW4, which proposed moving this off the loop thread and was
+    // pre-registered to be abandoned if the wait was already free — it is):
+    //   gamescope + NVIDIA (RTX 5070 Ti)   outcome=NoFence
+    //   Mutter    + NVIDIA (RTX 5070 Ti)   outcome=NoFence
+    //   gamescope + RADV   (Deck VANGOGH)  300 samples, ALL NoFence, mean 23us, max 48us,
+    //                                      p50 and p99 both in the <=100us bucket
+    //   KWin      + RADV   (Deck desktop)  no implicit fence either
+    // That is EVERY compositor × vendor combination this fleet has, and not one of them attaches an
+    // implicit fence — so this is one ioctl and a return, not a block: there is nothing to wait on,
+    // and moving it to the consumer side buys nothing. The 100 ms budget stays as a guard for a
+    // producer that DOES fence, which is a real thing even if nothing here does it. The histogram
+    // below is how to re-check if that ever changes: run with PUNKTFUNK_PERF=1 and read the p99
+    // bucket.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        match pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100) {
+        // PW4 step 1: time the wait. Two `Instant::now()` per frame on a path that is already
+        // making a syscall — and this is the measurement that decides whether PW4 ships at all.
+        let t0 = std::time::Instant::now();
+        let waited = pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100);
+        ud.fence_wait.record(t0.elapsed().as_micros() as u64);
+        match waited {
             Ok(outcome) => {
+                use pf_zerocopy::dmabuf_fence::WaitOutcome;
+                match outcome {
+                    WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
+                    WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
+                    WaitOutcome::TimedOut => ud.fence_wait.timed_out += 1,
+                }
                 static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
                 if F1.swap(false, Ordering::Relaxed) {
                     tracing::info!(
@@ -360,6 +676,7 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
                 }
             }
             Err(e) => {
+                ud.fence_wait.failed += 1;
                 static F2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
                 if F2.swap(false, Ordering::Relaxed) {
                     tracing::warn!(
@@ -370,106 +687,161 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
                 }
             }
         }
+        // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — the same gate and cadence the
+        // encode backends use for their submit splits, so a perf run reads as one instrument.
+        if pf_host_config::config().perf
+            && ud.fence_wait.is_meaningful()
+            && ud.fence_wait.samples % 300 == 0
+        {
+            let q = |p: f64| match ud.fence_wait.quantile_bucket_us(p) {
+                Some(Some(us)) => format!("<={us}us"),
+                Some(None) => format!(
+                    ">{}us",
+                    FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
+                ),
+                None => "n/a".to_string(),
+            };
+            tracing::info!(
+                samples = ud.fence_wait.samples,
+                mean_us = ud.fence_wait.mean_us(),
+                max_us = ud.fence_wait.max_us,
+                p50 = %q(0.50),
+                p99 = %q(0.99),
+                signaled = ud.fence_wait.signaled,
+                no_fence = ud.fence_wait.no_fence,
+                timed_out = ud.fence_wait.timed_out,
+                failed = ud.fence_wait.failed,
+                "dmabuf implicit-fence wait on the PipeWire loop thread (PW4: a p99 in the first \
+                 bucket means this wait is already free and moving it off-thread buys nothing)"
+            );
+        }
     }
 
     // Raw DMA-BUF passthrough: packed RGB is imported for GPU CSC; producer-native NV12 can
     // be consumed by the Vulkan Video encoder without another color conversion.
+    //
+    // The block below either publishes a dmabuf and RETURNS, or breaks with the reason it could
+    // not — so every non-success exit is named and counted instead of silently falling out of
+    // three nested `if`s into the CPU path, which is how a session that had negotiated zero-copy
+    // could pay a full CPU pixel touch per frame while logging nothing but a healthy open.
     if ud.vaapi_passthrough {
-        if let Some(fmt) = ud.format {
-            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-                if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
-                    let chunk = datas[0].chunk();
-                    let offset = chunk.offset();
-                    let stride = chunk.stride().max(0) as u32;
-                    // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
-                    // object; plane 1's chunk carries the REAL UV offset/stride (compositors
-                    // may align the Y plane before UV). Pass it through instead of assuming
-                    // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
-                    // by inode, not fd number; a genuinely two-BO frame cannot travel through
-                    // the single-fd import — drop it with a diagnosis instead of streaming
-                    // garbage chroma.
-                    let plane1 =
-                        if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
-                            // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
-                            // owned by the live PipeWire buffer for this callback, and `fstat`
-                            // only writes the out-param structs, whose fields are read only after
-                            // the `== 0` success checks.
-                            let same_bo = unsafe {
-                                let mut s0: libc::stat = std::mem::zeroed();
-                                let mut s1: libc::stat = std::mem::zeroed();
-                                libc::fstat(datas[0].fd() as i32, &mut s0) == 0
-                                    && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
-                                    && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
-                            };
-                            if !same_bo {
-                                warn_once(
-                                    "NV12 planes live in different buffer objects — frames \
-                                 dropped (single-fd import only)",
-                                );
-                                return;
-                            }
-                            let c1 = datas[1].chunk();
-                            Some((c1.offset(), c1.stride().max(0) as u32))
-                        } else {
-                            None
-                        };
-                    // dup the fd so it survives the SPA buffer recycle — the encode thread
-                    // imports it. Content stability across the brief import/encode window relies
-                    // on the compositor's buffer-pool depth, like any zero-copy capture.
-                    // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
-                    // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
-                    // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
-                    // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
-                    let dup =
-                        unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
-                    if dup >= 0 {
-                        let pts_ns = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
-                        ud.publish(CapturedFrame {
-                            width: w as u32,
-                            height: h as u32,
-                            pts_ns,
-                            format: fmt,
-                            payload: FramePayload::Dmabuf(DmabufFrame {
-                                // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
-                                // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
-                                // ownership and closes it exactly once on drop — no alias, no
-                                // double-close.
-                                fd: unsafe { OwnedFd::from_raw_fd(dup) },
-                                fourcc,
-                                modifier: ud.modifier,
-                                offset,
-                                stride,
-                                plane1,
-                            }),
-                            // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
-                            // embeds its pointer in the produced pixels, so native NV12 has none.
-                            cursor: ud.cursor.overlay(),
-                        });
-                        static ONCE: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(true);
-                        if ONCE.swap(false, Ordering::Relaxed) {
-                            tracing::info!(
-                                w,
-                                h,
-                                modifier = ud.modifier,
-                                fourcc = format_args!("{:#010x}", fourcc),
-                                source = if fmt == PixelFormat::Nv12 {
-                                    "producer-native NV12"
-                                } else {
-                                    "packed RGB (encoder GPU CSC)"
-                                },
-                                "zero-copy: handing the raw DMA-BUF to the encoder"
-                            );
-                        }
-                        return;
-                    }
-                }
+        let reason = 'passthrough: {
+            let Some(fmt) = ud.format else {
+                break 'passthrough PassthroughFallback::NoFormat;
+            };
+            if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
+                break 'passthrough PassthroughFallback::NotDmabuf;
             }
+            let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
+                break 'passthrough PassthroughFallback::NoFourcc;
+            };
+            let chunk = datas[0].chunk();
+            let offset = chunk.offset();
+            let stride = chunk.stride().max(0) as u32;
+            // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
+            // object; plane 1's chunk carries the REAL UV offset/stride (compositors
+            // may align the Y plane before UV). Pass it through instead of assuming
+            // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
+            // by inode, not fd number; a genuinely two-BO frame cannot travel through
+            // the single-fd import — drop it with a diagnosis instead of streaming
+            // garbage chroma.
+            let plane1 = if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
+                // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
+                // owned by the live PipeWire buffer for this callback, and `fstat`
+                // only writes the out-param structs, whose fields are read only after
+                // the `== 0` success checks.
+                let same_bo = unsafe {
+                    let mut s0: libc::stat = std::mem::zeroed();
+                    let mut s1: libc::stat = std::mem::zeroed();
+                    libc::fstat(datas[0].fd() as i32, &mut s0) == 0
+                        && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
+                        && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
+                };
+                if !same_bo {
+                    warn_once(
+                        "NV12 planes live in different buffer objects — frames \
+                                 dropped (single-fd import only)",
+                    );
+                    // Not a fall-through: this frame is DROPPED, not downgraded (de-padding it as
+                    // linear would stream scrambled chroma), so it is not counted below.
+                    return;
+                }
+                let c1 = datas[1].chunk();
+                Some((c1.offset(), c1.stride().max(0) as u32))
+            } else {
+                None
+            };
+            // dup the fd so it survives the SPA buffer recycle — the encode thread
+            // imports it. Content stability across the brief import/encode window relies
+            // on the compositor's buffer-pool depth, like any zero-copy capture.
+            // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
+            // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
+            // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
+            // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
+            let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                break 'passthrough PassthroughFallback::DupFailed;
+            }
+            let pts_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            ud.publish(CapturedFrame {
+                width: w as u32,
+                height: h as u32,
+                pts_ns,
+                format: fmt,
+                payload: FramePayload::Dmabuf(DmabufFrame {
+                    // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
+                    // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
+                    // ownership and closes it exactly once on drop — no alias, no
+                    // double-close.
+                    fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                    fourcc,
+                    modifier: ud.modifier,
+                    offset,
+                    stride,
+                    plane1,
+                }),
+                // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
+                // embeds its pointer in the produced pixels, so native NV12 has none.
+                cursor: ud.cursor.overlay(),
+            });
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if ONCE.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    w,
+                    h,
+                    modifier = ud.modifier,
+                    fourcc = format_args!("{:#010x}", fourcc),
+                    source = if fmt == PixelFormat::Nv12 {
+                        "producer-native NV12"
+                    } else {
+                        "packed RGB (encoder GPU CSC)"
+                    },
+                    "zero-copy: handing the raw DMA-BUF to the encoder"
+                );
+            }
+            return;
+        };
+        // The passthrough declined this frame. Say so ONCE per distinct reason (`.process` runs
+        // per frame — see `PassthroughFallbacks`), carrying the running count so a persistent
+        // downgrade is distinguishable from a one-frame hiccup at renegotiation.
+        if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
+            tracing::warn!(
+                frames,
+                "zero-copy raw-dmabuf passthrough did not take this frame: {} — {} ({})",
+                reason.as_str(),
+                if reason.falls_back_to_cpu() {
+                    "it falls back to the CPU capture path, costing a full-resolution mmap \
+                     de-pad plus the encoder's own upload on every such frame"
+                } else {
+                    "the frame is DROPPED — the CPU de-pad path needs the negotiated format \
+                     too, so nothing streams while this persists"
+                },
+                reason.hint()
+            );
         }
-        // Not a dmabuf (or unmappable format) — fall through to the CPU de-pad path.
     }
 
     // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
@@ -912,6 +1284,31 @@ pub fn pipewire_thread(
         want_dmabuf && !vaapi_passthrough && !want_hdr,
         Ordering::Relaxed,
     );
+    // The ONE line that says which arm this session actually got, and who consumes it. Everything
+    // below explains a particular arm; nothing below states the answer. Reconstructing it from the
+    // detail lines cost the 2026-08-08 PyroWave triage four files, and on the one arm that matters
+    // most — a PyroWave session downgraded to CPU on an NVIDIA host — there was no detail line to
+    // reconstruct it from at all (see the final `else if` of this chain).
+    let consumer = consumer_kind(
+        policy.pyrowave_session,
+        backend_is_vaapi,
+        policy.backend_is_gpu,
+    );
+    let arm = resolved_capture_arm(&plan, importer.is_some(), want_dmabuf);
+    tracing::info!(
+        capture_arm = arm.as_str(),
+        consumer = consumer.as_str(),
+        modifier_count = modifiers.len(),
+        // PW3(c): the latch state belongs on the same line as the arm. A `cpu` arm has two very
+        // different explanations — "this host was never going to do dmabuf" and "something failed
+        // earlier and we are still living with the verdict" — and only the second is a bug worth
+        // chasing. Reading it here also means the retry/clear behaviour is observable rather than
+        // inferred.
+        raw_dmabuf_latch = pf_zerocopy::raw_dmabuf_latch_state(),
+        "capture pipeline resolved: {} → {}",
+        arm.as_str(),
+        consumer.as_str()
+    );
     if force_shm {
         tracing::info!(
             "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
@@ -942,19 +1339,34 @@ pub fn pipewire_thread(
             sample = ?&modifiers[..modifiers.len().min(6)],
             "zero-copy: advertising EGL-importable dmabuf modifiers"
         );
-    } else if backend_is_vaapi && policy.backend_is_gpu {
+    } else if consumer.cpu_is_downgrade() {
         // Reached only when no dmabuf is advertised at all (every arm above rules out a
-        // zero-copy path), so this genuinely IS the CPU capture path: a VAAPI session then pays
-        // three full-frame CPU touches (mmap de-pad + swscale RGB→NV12 + surface upload) —
+        // zero-copy path), so this genuinely IS the CPU capture path: the consumer then pays
+        // full-frame CPU touches (mmap de-pad + whatever CSC/upload it needs) —
         // make the silent fallback visible.
         // The `raw_dmabuf_latched` arm above catches the latched downgrade, so by here zero-copy
         // is off at the source: the env var, or the session's own output format.
+        //
+        // The gate used to be `backend_is_vaapi && backend_is_gpu`, which is why a PyroWave
+        // session's CPU downgrade was invisible on an NVIDIA/auto host: `backend_is_vaapi` reads
+        // the host-global encoder pref, so a per-session PyroWave negotiation there is `false` and
+        // fell out of the chain logging NOTHING. `consumer_kind` asks the per-session question
+        // instead, and excludes only the software encoder (which wants CPU frames).
         tracing::warn!(
-            "VAAPI encode with the CPU capture path (per-frame de-pad + swscale CSC + \
-             upload) — zero-copy is off for this capture ({}); clear PUNKTFUNK_ZEROCOPY to \
-             restore the dmabuf default",
+            consumer = consumer.as_str(),
+            "{} encode with the CPU capture path (per-frame de-pad + CSC + upload) — \
+             zero-copy is off for this capture ({}); set PUNKTFUNK_ZEROCOPY=1 to restore the \
+             dmabuf default",
+            consumer.as_str(),
             if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
                 "PUNKTFUNK_ZEROCOPY is set falsy"
+            } else if want_hdr && !policy.hdr_cuda_ok {
+                // Reachable and NOT the output format's doing: `build_importer` drops an HDR
+                // capture whose encoder cannot take a packed 10-bit CUDA payload (libav's HDR
+                // route swscales into a P010 hardware frame). Naming the output format here
+                // would send the reader hunting the wrong knob.
+                "this HDR session's encoder cannot ingest a 10-bit CUDA payload, so the capture \
+                 stays on CPU frames"
             } else {
                 "this session's output format asked for CPU frames"
             }
@@ -986,6 +1398,8 @@ pub fn pipewire_thread(
         yuv444: want_444,
         linear_nv12_failed: false,
         dbg_log_n: 0,
+        fence_wait: FenceWaitStats::default(),
+        passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(cursor_id0_hides),
         expect_dims: if expect_exact_dims {
             preferred.map(|(w, h, _)| (w, h))
@@ -1706,6 +2120,228 @@ mod tests {
             assert!(!p.vaapi_passthrough);
             assert!(!p.prefer_native_nv12);
             assert!(!p.want_dmabuf(false, &[0]));
+        }
+    }
+
+    // ---- PW2: capture-arm observability (pure halves) -------------------------------------
+    //
+    // Env-var reads race under a shared test process, so these assert against the pure functions
+    // the logging sites call — the same rule `negotiation_plan_invariants` follows.
+
+    use super::{
+        consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, FenceWaitStats,
+        PassthroughFallback, PassthroughFallbacks, FENCE_WAIT_BUCKETS_US,
+    };
+
+    /// A PyroWave session is PyroWave even though it also flips `backend_is_vaapi` on (the
+    /// `linux_zero_copy_is_vaapi` `Pyrowave` arm). Getting this precedence backwards is the exact
+    /// shape of the bug PW2 fixes: the session gets reported as somebody else's backend.
+    #[test]
+    fn pyrowave_outranks_the_host_global_backend_pref() {
+        assert_eq!(consumer_kind(true, true, true), ConsumerKind::PyroWave);
+        // ...and on an NVIDIA/auto host, where `backend_is_vaapi` is false, it is still PyroWave —
+        // the case that previously logged nothing at all.
+        assert_eq!(consumer_kind(true, false, true), ConsumerKind::PyroWave);
+    }
+
+    /// The non-PyroWave consumers, and the one that must NOT warn on a CPU arm.
+    #[test]
+    fn consumer_kinds_and_which_ones_a_cpu_arm_degrades() {
+        assert_eq!(consumer_kind(false, true, true), ConsumerKind::Vaapi);
+        assert_eq!(consumer_kind(false, false, true), ConsumerKind::Nvenc);
+        // No GPU backend ⇒ the software encoder, whose native input IS CPU frames.
+        assert_eq!(consumer_kind(false, false, false), ConsumerKind::Software);
+        assert!(ConsumerKind::PyroWave.cpu_is_downgrade());
+        assert!(ConsumerKind::Vaapi.cpu_is_downgrade());
+        assert!(ConsumerKind::Nvenc.cpu_is_downgrade());
+        assert!(!ConsumerKind::Software.cpu_is_downgrade());
+    }
+
+    /// The arm is a function of the plan plus the two runtime facts. Pinned against every plan the
+    /// resolver can produce, so the headline line can never claim an arm the session did not take.
+    #[test]
+    fn resolved_arm_matches_the_plan_that_produced_it() {
+        // PyroWave/VAAPI raw passthrough.
+        let p = negotiation_plan(NegotiationInputs {
+            pyrowave_session: true,
+            ..nvenc()
+        });
+        assert!(p.vaapi_passthrough);
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[0])),
+            CaptureArm::DmabufPassthrough
+        );
+        // NVENC via the EGL→CUDA importer.
+        let p = negotiation_plan(nvenc());
+        assert!(p.build_importer);
+        assert_eq!(
+            resolved_capture_arm(&p, true, p.want_dmabuf(true, &[0])),
+            CaptureArm::CudaImport
+        );
+        // The importer was meant to be built but did not construct (no driver): CPU, not a
+        // cuda-import the session never got.
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[0])),
+            CaptureArm::Cpu
+        );
+        // An empty modifier list is a CPU arm even under a live passthrough plan.
+        let p = negotiation_plan(NegotiationInputs {
+            pyrowave_session: true,
+            ..nvenc()
+        });
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[])),
+            CaptureArm::Cpu
+        );
+        // Forced SHM: CPU regardless of everything else.
+        let p = negotiation_plan(NegotiationInputs {
+            force_shm: true,
+            ..nvenc()
+        });
+        assert_eq!(
+            resolved_capture_arm(&p, true, p.want_dmabuf(true, &[0])),
+            CaptureArm::Cpu
+        );
+    }
+
+    /// The rate limiter: ONE line per distinct reason per session, counting every fall-through.
+    /// `.process` runs per frame, so an off-by-one here is a log flood at the capture rate.
+    #[test]
+    fn fallback_log_budget_is_one_line_per_reason() {
+        let mut f = PassthroughFallbacks::default();
+        // First of a reason logs, and reports the running total (not a per-reason count).
+        assert_eq!(f.note(PassthroughFallback::NotDmabuf), Some(1));
+        // Repeats of the SAME reason never log again, but are still counted.
+        for _ in 0..1_000 {
+            assert_eq!(f.note(PassthroughFallback::NotDmabuf), None);
+        }
+        // A DIFFERENT reason is a different diagnosis and gets its own line, carrying the
+        // now-large total — which is what distinguishes a persistent downgrade from a hiccup.
+        assert_eq!(f.note(PassthroughFallback::DupFailed), Some(1002));
+        assert_eq!(f.note(PassthroughFallback::DupFailed), None);
+        // All four reasons fit the budget independently; the tally counts every frame.
+        assert_eq!(f.note(PassthroughFallback::NoFormat), Some(1004));
+        assert_eq!(f.note(PassthroughFallback::NoFourcc), Some(1005));
+        // Budget spent: every reason has logged once, so nothing logs again however long the
+        // session runs.
+        for r in [
+            PassthroughFallback::NoFormat,
+            PassthroughFallback::NotDmabuf,
+            PassthroughFallback::NoFourcc,
+            PassthroughFallback::DupFailed,
+        ] {
+            assert_eq!(f.note(r), None);
+        }
+    }
+
+    /// Every reason is distinguishable (a shared bit would silence one of them) and carries an
+    /// actionable hint — a reason with no fix is a line the reader cannot use.
+    #[test]
+    fn every_fallback_reason_is_distinct_and_actionable() {
+        let all = [
+            PassthroughFallback::NoFormat,
+            PassthroughFallback::NotDmabuf,
+            PassthroughFallback::NoFourcc,
+            PassthroughFallback::DupFailed,
+        ];
+        let mut f = PassthroughFallbacks::default();
+        for r in all {
+            assert!(
+                f.note(r).is_some(),
+                "{r:?} shares a bit with an earlier reason"
+            );
+            assert!(!r.as_str().is_empty());
+            assert!(!r.hint().is_empty());
+        }
+        // Only `NoFormat` drops the frame; the other three downgrade it. The log line picks its
+        // consequence clause off this, so an inverted answer would print the opposite of the truth.
+        assert!(!PassthroughFallback::NoFormat.falls_back_to_cpu());
+        assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
+        assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
+        assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
+    }
+
+    // ---- PW4 step 1: the fence-wait histogram ------------------------------------------------
+    //
+    // This instrument decides whether PW4 ships, so its arithmetic has to be right: a p99 that
+    // reads one bucket low would retire a package that was worth doing, and one that reads high
+    // would justify moving load-bearing synchronisation off a thread for nothing.
+
+    /// An empty histogram must say "no answer", not "zero" — those are different claims, and the
+    /// second one would look like a decisive p99 ≈ 0 result.
+    #[test]
+    fn an_empty_histogram_has_no_quantile() {
+        let s = FenceWaitStats::default();
+        assert_eq!(s.quantile_bucket_us(0.99), None);
+        assert_eq!(s.mean_us(), 0);
+        assert!(!s.is_meaningful(), "it must not be trusted yet either");
+    }
+
+    /// The all-fast case — the one that RETIRES PW4. Every sample in the first bucket must put the
+    /// p99 there too.
+    #[test]
+    fn an_all_fast_distribution_puts_p99_in_the_first_bucket() {
+        let mut s = FenceWaitStats::default();
+        for _ in 0..1000 {
+            s.record(3);
+        }
+        assert_eq!(
+            s.quantile_bucket_us(0.50),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0]))
+        );
+        assert_eq!(
+            s.quantile_bucket_us(0.99),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0]))
+        );
+        assert_eq!(s.mean_us(), 3);
+    }
+
+    /// The case PW4 exists for: a fast median with a heavy tail. The p50 must stay low AND the p99
+    /// must find the tail — a histogram that smeared them together could not tell the two worlds
+    /// apart, which is the entire decision.
+    #[test]
+    fn a_heavy_tail_moves_p99_without_moving_p50() {
+        let mut s = FenceWaitStats::default();
+        for _ in 0..980 {
+            s.record(10); // fast majority
+        }
+        for _ in 0..20 {
+            s.record(6_000); // 2 % of frames stall milliseconds
+        }
+        assert_eq!(
+            s.quantile_bucket_us(0.50),
+            Some(Some(FENCE_WAIT_BUCKETS_US[0])),
+            "the median is still free"
+        );
+        assert_eq!(
+            s.quantile_bucket_us(0.99),
+            Some(Some(10_000)),
+            "...but the p99 must land in the 5-10ms bucket, not with the median"
+        );
+        assert_eq!(s.max_us, 6_000);
+    }
+
+    /// Anything past the last edge reports as overflow rather than being clamped into the last
+    /// bucket — "worse than 10 ms" is a distinct finding and must not read as "10 ms".
+    #[test]
+    fn waits_past_the_last_edge_report_as_overflow() {
+        let mut s = FenceWaitStats::default();
+        s.record(99_000);
+        assert_eq!(s.quantile_bucket_us(0.99), Some(None));
+    }
+
+    /// Bucket edges are inclusive upper bounds, so a sample exactly ON an edge belongs to that
+    /// bucket and not the next one up.
+    #[test]
+    fn bucket_edges_are_inclusive() {
+        for (i, &edge) in FENCE_WAIT_BUCKETS_US.iter().enumerate() {
+            let mut s = FenceWaitStats::default();
+            s.record(edge);
+            assert_eq!(
+                s.quantile_bucket_us(1.0),
+                Some(Some(edge)),
+                "a sample of exactly {edge}us belongs in bucket {i}"
+            );
         }
     }
 }

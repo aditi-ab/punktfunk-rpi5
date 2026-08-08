@@ -114,9 +114,21 @@ pub fn run(opts: Options) -> Result<()> {
                     refresh_hz: opts.fps,
                 })
                 .context("create virtual output")?;
+            // `resolve` is the shared GameStream/spike constructor and hard-codes `pyrowave: false`
+            // (GameStream never negotiates it). The spike DOES know its codec, and on Linux that
+            // flag is what puts the capture on the raw-dmabuf passthrough
+            // (`ZeroCopyPolicy::pyrowave_session`, set from the same comparison in
+            // `session_plan::output_format`). Left false, `--codec pyrowave` encoded PyroWave off a
+            // capture negotiated for somebody else, and the only way to exercise the real path was
+            // the host-global `PUNKTFUNK_ENCODER=pyrowave` lever — which ALSO flips
+            // `backend_is_vaapi`, so it cannot reproduce a per-session PyroWave negotiation on an
+            // auto/NVENC host at all. That is precisely the configuration PW2 exists for.
+            let mut want =
+                capture::OutputFormat::resolve(false, crate::encode::resolved_backend_is_gpu());
+            want.pyrowave = opts.codec == Codec::PyroWave;
             capture::capture_virtual_output(
                 vout,
-                capture::OutputFormat::resolve(false, crate::encode::resolved_backend_is_gpu()),
+                want,
                 crate::session_plan::CaptureBackend::resolve(),
                 compositor == crate::vdisplay::Compositor::Kwin,
             )

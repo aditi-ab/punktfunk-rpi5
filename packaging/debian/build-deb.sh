@@ -294,6 +294,16 @@ if [ "$1" = "configure" ]; then
     # primitive that must not ride on the group users are told to join for gamepads
     # (security-review 2026-08-05 M-4).
     getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
+    # CAP_SYS_NICE — the GPU-scheduling grant. PyroWave encodes on the shader cores a game
+    # saturates, and the driver gates the elevated global-priority Vulkan queue that fixes it on
+    # this capability: measured 2026-08-08 on an RTX 5070 Ti, WITHOUT it every priority class is
+    # refused and WITH it the encoder is granted REALTIME first try (RADV behaves the same).
+    # Without this line the knob exists and does nothing. Narrow: it permits raising scheduling
+    # priority only — no filesystem, network or user-switching privilege, and no setuid. Note a
+    # capability-carrying binary is AT_SECURE, so the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
+    # it and core dumps are suppressed by default. Best-effort: a box without libcap, or a
+    # filesystem that cannot store capabilities, just runs at default priority as before.
+    setcap 'cap_sys_nice=ep' /usr/bin/punktfunk-host 2>/dev/null || true
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true

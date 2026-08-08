@@ -321,6 +321,15 @@ struct DeviceHold {
     instance_ci: Box<vk::InstanceCreateInfo<'static>>,
     _queue_prio: Box<[f32; 1]>,
     _queue_ci: Box<[vk::DeviceQueueCreateInfo<'static>; 1]>,
+    /// The elevated global-priority request chained into `_queue_ci[0].p_next`
+    /// (`PYROWAVE_QUEUE_PRIORITY`, see `queue_priority_candidates`). A `Box` for the same
+    /// move-stability reason as its siblings: `pyrowave_create_device` RETAINS `device_ci` for
+    /// the device's lifetime and Granite reads the chain back through
+    /// `get_existing_create_info()`, so this must stay put and — critically — must describe the
+    /// device that actually got created. The create ladder below is therefore required to write
+    /// its FINAL state back here (null the `p_next` if the no-priority attempt is the one that
+    /// succeeded); a chain the device was not created with is a lie Granite would believe.
+    _queue_gp: Box<[vk::DeviceQueueGlobalPriorityCreateInfoKHR<'static>; 1]>,
     // A plain Vec (not Box<[_; N]> like its siblings): Phase 8 pushes queue_family_foreign
     // conditionally. The heap buffer as_ptr() feeds device_ci is move-stable like the Boxes.
     _dev_exts: Vec<*const c_char>,
@@ -328,6 +337,60 @@ struct DeviceHold {
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
+}
+
+/// Percentile of a sorted sample slice, by nearest-rank. **Pure.** Used for the `PUNKTFUNK_PERF`
+/// encode split: a p99 is the whole point here (the game-load spike this codec suffers is a TAIL
+/// event — the mean barely moves while individual frames go 2 ms → 18 ms), so a mean-only readout
+/// would report "fine" through exactly the failure the priority lever exists to fix.
+fn pct(sorted: &[u32], q: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() as f64) * q).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// The global-priority classes to try, in order, for `PYROWAVE_QUEUE_PRIORITY`.
+///
+/// **Pure, and character-identical to the vendored C patch's grammar**
+/// (`patches/0005-global-priority-queue.patch`, `context.cpp` ~2136-2152): unset → `realtime`;
+/// ASCII-lowercased; `off` → no candidates at all; `high` → `[HIGH]`; anything else, including
+/// junk → `[REALTIME, HIGH]`. Keeping the two grammars identical is the whole point — the same
+/// env var drives the Windows path (where the patch is live, because Granite builds its own
+/// device there) and this Linux path (where the patch is inert, because we pass our own
+/// create-infos and Granite takes its `inherit_info` branch). One knob that meant two different
+/// things per platform is exactly the documentation trap this wiring exists to close.
+///
+/// Note `off` is the ONLY spelling that disables it; `0` is not, because the C side does not
+/// accept `0` either. Do not "improve" that here without changing the patch in the same commit.
+fn queue_priority_candidates(raw: Option<&str>) -> Vec<vk::QueueGlobalPriorityKHR> {
+    let want = raw.map(|s| s.to_ascii_lowercase());
+    match want.as_deref() {
+        Some("off") => Vec::new(),
+        Some("high") => vec![vk::QueueGlobalPriorityKHR::HIGH],
+        _ => vec![
+            vk::QueueGlobalPriorityKHR::REALTIME,
+            vk::QueueGlobalPriorityKHR::HIGH,
+        ],
+    }
+}
+
+/// Whether a `create_device` error means "this priority class was refused" — i.e. walk the ladder
+/// down rather than failing the encoder open.
+///
+/// `ERROR_NOT_PERMITTED_KHR` is the specified answer and the only one the C patch handles.
+/// `ERROR_INITIALIZATION_FAILED` is here because the in-tree precedent that already ships this
+/// ladder on Linux — pf-zerocopy's VkBridge — accepts it too, and because the failure mode this
+/// guards against is severe and asymmetric: a PyroWave open is reached only by a NEGOTIATED
+/// PyroWave session, so a hard error here is a dead stream, not a fallback to another encoder.
+/// Treating one extra driver-specific refusal as a downgrade costs nothing; treating it as fatal
+/// costs the session.
+fn priority_refused(e: vk::Result) -> bool {
+    matches!(
+        e,
+        vk::Result::ERROR_NOT_PERMITTED_KHR | vk::Result::ERROR_INITIALIZATION_FAILED
+    )
 }
 
 pub struct PyroWaveEncoder {
@@ -398,6 +461,13 @@ pub struct PyroWaveEncoder {
     chroma444: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
+    /// `PUNKTFUNK_PERF`: the synchronous encode's own duration, which is the quantity the
+    /// GPU-priority work is about — patch 0005's header records it going ~2 ms → 15-18 ms at
+    /// 95 % game load. Every other backend (VAAPI, direct NVENC) already logs a submit split;
+    /// this one did not, so the one encoder whose cost the priority lever exists to protect was
+    /// the one you could not measure. Reservoir of recent samples, summarised on a slow cadence.
+    perf_us: Vec<u32>,
+    perf_logged_at: Option<std::time::Instant>,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary and pad every codec
     /// packet to it, so each wire shard carries whole self-delimiting packets. `None` =
     /// one packet per AU (the dense MVP shape).
@@ -420,6 +490,43 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 impl PyroWaveEncoder {
+    /// `PUNKTFUNK_PERF`: record one synchronous-encode duration and summarise on a slow cadence.
+    ///
+    /// Whole-`submit` timing on purpose: for this backend that IS the encode — `encode_frame`
+    /// records CSC+encode, submits, waits the fence and packetizes, all inline (which is also
+    /// why the loop's period folds to `interval + encode`, the thing PW5 exists to unfold).
+    fn note_encode_us(&mut self, us: u32) {
+        if !pf_host_config::config().perf {
+            return;
+        }
+        self.perf_us.push(us);
+        let now = std::time::Instant::now();
+        let since = self.perf_logged_at.map(|t| now.duration_since(t));
+        // Every 2 s, matching the other backends' submit-split cadence, and never before there
+        // are enough samples for a p99 to mean anything.
+        if self.perf_us.len() < 30 || since.is_some_and(|d| d.as_secs() < 2) {
+            if self.perf_logged_at.is_none() {
+                self.perf_logged_at = Some(now);
+            }
+            return;
+        }
+        self.perf_logged_at = Some(now);
+        let mut s = std::mem::take(&mut self.perf_us);
+        s.sort_unstable();
+        let n = s.len() as u64;
+        let mean = s.iter().map(|&v| u64::from(v)).sum::<u64>() / n.max(1);
+        tracing::info!(
+            frames = n,
+            mean_us = mean,
+            p50_us = pct(&s, 0.50),
+            p99_us = pct(&s, 0.99),
+            max_us = *s.last().unwrap_or(&0),
+            "pyrowave encode (synchronous: CSC + encode + fence wait + packetize). Under a \
+             GPU-bound game this is the number the global-priority queue exists to protect — \
+             watch p99, not the mean"
+        );
+    }
+
     pub fn open(
         width: u32,
         height: u32,
@@ -467,6 +574,7 @@ impl PyroWaveEncoder {
             instance_ci: Box::new(vk::InstanceCreateInfo::default()),
             _queue_prio: Box::new([1.0f32]),
             _queue_ci: Box::new([vk::DeviceQueueCreateInfo::default()]),
+            _queue_gp: Box::new([vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()]),
             _dev_exts: vec![
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
@@ -487,8 +595,14 @@ impl PyroWaveEncoder {
         // error arm. From the device on, a partially-constructed `Self` (below) makes the
         // existing `Drop` the sole unwind path — these used to be a dozen `?`s that each leaked
         // everything created before them.
-        // SAFETY: plain physical-device queries on the live instance just created, and a
-        // `create_device` whose create-infos are pinned in `hold` for the call's duration.
+        // SAFETY: plain physical-device queries on the live instance just created, and
+        // `create_device` calls whose create-infos are pinned in `hold` for each call's duration.
+        // The global-priority ladder (WP14 step 4) may call `create_device` several times; every
+        // attempt reads the SAME pinned `hold`, and the only thing that varies between attempts is
+        // `hold._queue_gp[0].global_priority` (a plain enum field) and, for the final attempt,
+        // `hold._queue_ci[0].p_next` being nulled. Both live in `Box`es owned by `hold`, so the
+        // pointers `device_ci` holds stay valid across the retries; a failed `create_device` does
+        // not consume or invalidate its create-info, so re-passing it is sound.
         let selected = (|| unsafe {
             // The SAME selector `capture_modifiers` uses, so the two can never disagree about
             // the device (see `select_physical_device` — including why the selection itself is
@@ -585,18 +699,117 @@ impl PyroWaveEncoder {
                 );
                 vk::QUEUE_FAMILY_EXTERNAL
             };
+            // VK_KHR_global_priority (WP14 step 4): PyroWave encodes on the SAME shader cores a
+            // game saturates, and `encode_gpu_synchronous` measurably collapses under that load
+            // (patch 0005's header: ~2 ms → 15-18 ms at 95 % game load on an RTX 4090). An
+            // elevated global-priority queue is the actual compute-PREEMPTION lever — unlike a
+            // process-priority raise, which only orders submission. The vendored patch requests
+            // it, but it is gated `if (!inherit_info)` and Linux passes its OWN create-infos, so
+            // Granite takes the inherit branch and the patch has never done anything here. This
+            // is the Linux half. Must be pushed BEFORE the count/as_ptr wiring below, exactly
+            // like queue_family_foreign above.
+            let gp_candidates =
+                queue_priority_candidates(std::env::var("PYROWAVE_QUEUE_PRIORITY").ok().as_deref());
+            // Enable whichever alias the driver advertises (KHR = the promoted name), mirroring
+            // pf-zerocopy's VkBridge probe so the two can never disagree about the spelling.
+            let gp_ext =
+                if crate::vk_util::ext_advertised(&dev_ext_props, vk::KHR_GLOBAL_PRIORITY_NAME) {
+                    Some(vk::KHR_GLOBAL_PRIORITY_NAME)
+                } else if crate::vk_util::ext_advertised(
+                    &dev_ext_props,
+                    vk::EXT_GLOBAL_PRIORITY_NAME,
+                ) {
+                    Some(vk::EXT_GLOBAL_PRIORITY_NAME)
+                } else {
+                    None
+                };
+            let gp = gp_ext.filter(|_| !gp_candidates.is_empty());
+            if let Some(name) = gp {
+                hold._dev_exts.push(name.as_ptr());
+            }
+
             hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
             hold._queue_ci[0].queue_count = 1;
             hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
+            if gp.is_some() {
+                hold._queue_ci[0].p_next = &*hold._queue_gp as *const _ as *const std::ffi::c_void;
+            }
             hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
             hold.device_ci.queue_create_info_count = 1;
             hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
             hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
             hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
 
-            let device = instance
-                .create_device(pd, &hold.device_ci, None)
-                .context("create device")?;
+            // The downgrade ladder, mirroring the C patch: try each class in turn, step down only
+            // on a REFUSAL, and if every class is refused create with no global priority at all.
+            // A refused class must NEVER fail the open — that graceful property is the entire
+            // reason patch 0005 was kept despite its negative RTX/WDDM measurement, and it matters
+            // more here: this path is reached only by a negotiated PyroWave session, so a hard
+            // error is a dead stream rather than a fallback to another encoder.
+            let mut chosen = None;
+            let mut device = None;
+            for want in &gp_candidates {
+                if gp.is_none() {
+                    break;
+                }
+                hold._queue_gp[0].global_priority = *want;
+                match instance.create_device(pd, &hold.device_ci, None) {
+                    Ok(d) => {
+                        chosen = Some(*want);
+                        device = Some(d);
+                        break;
+                    }
+                    Err(e) if priority_refused(e) => {
+                        tracing::debug!(
+                            priority = ?want,
+                            error = ?e,
+                            "pyrowave: global queue priority not permitted — downgrading"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(e).context("create device");
+                    }
+                }
+            }
+            let device = match device {
+                Some(d) => {
+                    tracing::info!(
+                        priority = ?chosen,
+                        ext = ?gp,
+                        "pyrowave: elevated global queue priority (the encode dispatch preempts a \
+                         GPU-bound game where the driver honors it)"
+                    );
+                    d
+                }
+                None => {
+                    // Either nothing was requested (`off`, or no extension), or every class was
+                    // refused. EITHER WAY the retained create-info must now describe a device
+                    // created WITHOUT a priority chain — `pyrowave_create_device` keeps
+                    // `device_ci` for the device's lifetime and Granite reads it back through
+                    // `get_existing_create_info()`. Leaving `p_next` pointing at the
+                    // global-priority struct here would hand Granite a chain the device was not
+                    // created with. (The extension itself stays enabled and that is correct: it
+                    // IS enabled on the device, it just carries no request.)
+                    hold._queue_ci[0].p_next = std::ptr::null();
+                    if !gp_candidates.is_empty() && gp.is_some() {
+                        // MEASURED on .21 (RTX 5070 Ti, NVIDIA 610.43.02, 2026-08-08), and it is
+                        // not a vendor quirk: an unprivileged host is refused EVERY class, and the
+                        // same binary with `cap_sys_nice+ep` is granted REALTIME on the first
+                        // attempt. So this arm is the normal state of a packaged host today, the
+                        // lever is inert until the capability ships, and the message has to say
+                        // which capability rather than leave an operator guessing.
+                        tracing::warn!(
+                            "pyrowave: every global queue priority class was refused — encoding \
+                             at default priority. The GPU-preemption lever is INERT without \
+                             CAP_SYS_NICE on the host binary (measured on both NVIDIA and RADV); \
+                             PYROWAVE_QUEUE_PRIORITY=off silences this"
+                        );
+                    }
+                    instance
+                        .create_device(pd, &hold.device_ci, None)
+                        .context("create device")?
+                }
+            };
             Ok((pd, family, device, foreign_qfi))
         })();
         let (pd, family, device, foreign_qfi) = match selected {
@@ -662,6 +875,8 @@ impl PyroWaveEncoder {
             fps,
             chroma444,
             frame_budget: budget_for(bitrate, fps),
+            perf_us: Vec::new(),
+            perf_logged_at: None,
             wire_chunk: None,
             wire_budget: crate::pyrowave_wire::WireBudget::new(),
             bitstream: Vec::new(),
@@ -1519,6 +1734,9 @@ impl PyroWaveEncoder {
 
 impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
+        // `PUNKTFUNK_PERF` encode split (kept above the SAFETY comment so that comment stays
+        // attached to the block it proves — the crate denies undocumented unsafe blocks).
+        let t0 = std::time::Instant::now();
         // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
         // struct owns and waits its own fence before touching results. Command-buffer state on
         // failure is `encode_frame`'s own business now: its record-and-submit closure resets the
@@ -1527,7 +1745,9 @@ impl Encoder for PyroWaveEncoder {
         // VUID-vkResetCommandBuffer-commandBuffer-00045; the blanket reset that used to live
         // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
         // before anything touches `cmd` again.
-        unsafe { self.encode_frame(frame) }
+        let r = unsafe { self.encode_frame(frame) };
+        self.note_encode_us(t0.elapsed().as_micros() as u32);
+        r
     }
 
     fn caps(&self) -> EncoderCaps {
@@ -2261,5 +2481,82 @@ mod tests {
         dump("ref-dense444-y.bin", &y);
         dump("ref-dense444-cb.bin", &cb);
         dump("ref-dense444-cr.bin", &cr);
+    }
+
+    // ---- WP14 step 4: the global-priority grammar --------------------------------------------
+    //
+    // The device-create ladder itself has NO unit test and cannot have one — it needs a real
+    // Vulkan device. Its coverage is clippy plus the on-glass log line. What IS testable, and what
+    // actually drifts, is the grammar: it must stay character-identical to the vendored C patch,
+    // because the SAME env var drives the Windows path (where the patch is live) and this one.
+    // These are device-free by construction — that is why `queue_priority_candidates` takes the
+    // raw string instead of reading the environment itself (env-var tests race).
+
+    /// Unset means `realtime`, which means "try REALTIME, then fall back to HIGH" — the ladder,
+    /// not a single class. Windows parity: the C patch defaults the same way.
+    #[test]
+    fn unset_requests_the_realtime_ladder() {
+        assert_eq!(
+            queue_priority_candidates(None),
+            vec![
+                vk::QueueGlobalPriorityKHR::REALTIME,
+                vk::QueueGlobalPriorityKHR::HIGH
+            ]
+        );
+    }
+
+    /// `off` is the ONLY spelling that disables it, and it is case-insensitive because the C patch
+    /// lowercases first. Note `0` is deliberately NOT off — the C side does not accept it either,
+    /// and two grammars for one variable is the trap this wiring closes.
+    #[test]
+    fn only_off_disables_and_it_is_case_insensitive() {
+        assert!(queue_priority_candidates(Some("off")).is_empty());
+        assert!(queue_priority_candidates(Some("OFF")).is_empty());
+        assert!(queue_priority_candidates(Some("Off")).is_empty());
+        assert!(!queue_priority_candidates(Some("0")).is_empty());
+    }
+
+    /// `high` asks for HIGH ONLY — it must not silently try REALTIME first, or the knob would be
+    /// unable to express "elevated, but not realtime" (the thing an operator reaches for after a
+    /// compositor-jank report).
+    #[test]
+    fn high_asks_for_high_alone() {
+        assert_eq!(
+            queue_priority_candidates(Some("high")),
+            vec![vk::QueueGlobalPriorityKHR::HIGH]
+        );
+        assert_eq!(
+            queue_priority_candidates(Some("HIGH")),
+            vec![vk::QueueGlobalPriorityKHR::HIGH]
+        );
+    }
+
+    /// Junk falls back to the default ladder rather than to "off": an unparseable value must never
+    /// silently disable a performance lever the operator was trying to tune.
+    #[test]
+    fn junk_falls_back_to_the_default_ladder() {
+        for raw in ["", "realtime", "REALTIME", "yes", "1", "medium", "  high"] {
+            assert!(
+                !queue_priority_candidates(Some(raw)).is_empty(),
+                "{raw:?} must not disable the priority request"
+            );
+        }
+        // ...and specifically the full ladder, not HIGH alone. `"  high"` is in the list above on
+        // purpose: the C patch does NOT trim, so neither do we — a space-padded value is junk to
+        // both, and the two must agree even in how they are wrong.
+        assert_eq!(queue_priority_candidates(Some("  high")).len(), 2);
+    }
+
+    /// A refused class must walk the ladder down, never fail the open. `NOT_PERMITTED` is the
+    /// specified refusal; `INITIALIZATION_FAILED` is accepted too, matching pf-zerocopy's shipped
+    /// VkBridge ladder. Anything else is a real error and must propagate — a driver that is out of
+    /// memory should not be silently retried at a lower priority and reported as a success.
+    #[test]
+    fn only_refusals_walk_the_ladder_down() {
+        assert!(priority_refused(vk::Result::ERROR_NOT_PERMITTED_KHR));
+        assert!(priority_refused(vk::Result::ERROR_INITIALIZATION_FAILED));
+        assert!(!priority_refused(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+        assert!(!priority_refused(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
+        assert!(!priority_refused(vk::Result::SUCCESS));
     }
 }

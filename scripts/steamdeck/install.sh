@@ -344,6 +344,25 @@ if [ "$SUDO_OK" = 1 ]; then
         warn "(everything else works; the pad arrives as a generic Xbox 360 controller). By hand:"
         warn "  sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
     fi
+    # CAP_SYS_NICE on the host binary — the GPU-scheduling grant, and the Deck is the box that
+    # needs it most: a Van Gogh APU shares one small GPU between the game and PyroWave's encode
+    # dispatch. The driver gates the elevated global-priority Vulkan queue on this capability
+    # (measured 2026-08-08 on an RTX 5070 Ti: refused without it, granted REALTIME with it; RADV
+    # behaves the same), so without this the knob exists and does nothing.
+    #
+    # The binary lives under $HOME, not /usr — so unlike the /etc drop-ins above this survives a
+    # SteamOS A/B update on its own and needs no atomic-keep entry. It DOES need re-applying after
+    # every rebuild, because a fresh binary is a new inode; re-running this installer does that.
+    #
+    # Narrow (scheduling priority only, no filesystem/network privilege, not setuid) and
+    # best-effort — a failure just means the encode runs at default priority as it does today.
+    if [ -x "$BIN" ]; then
+        if sudo setcap 'cap_sys_nice=ep' "$BIN" 2>/dev/null; then
+            ok "granted CAP_SYS_NICE (PyroWave encode can outrank a GPU-bound game)"
+        else
+            warn "could not grant CAP_SYS_NICE to $BIN — PyroWave encode stays at default GPU priority"
+        fi
+    fi
     # SteamOS A/B updates rebuild /etc and DROP everything not on Valve's keep list — verified
     # live: an OS update stripped the udev rule + vhci autoload + UDP sysctl (gamepads silently
     # degrade to Xbox 360, buffers back to 208 KB). The sanctioned fix is a preserve drop-in in
