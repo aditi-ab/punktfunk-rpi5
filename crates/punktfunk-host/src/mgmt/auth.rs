@@ -51,6 +51,18 @@ impl AuthLane {
     pub(crate) fn may_set_privileged_fields(self) -> bool {
         matches!(self, AuthLane::Admin)
     }
+
+    /// Whether this is the operator's own lane — the console, as opposed to a paired client or a
+    /// plugin.
+    ///
+    /// Same arm as [`may_set_privileged_fields`](Self::may_set_privileged_fields) today, and
+    /// deliberately a separate question: that one asks "may this caller cause command execution",
+    /// this one asks "is this caller the person curating the library". A read-only view the operator
+    /// alone should see (their hidden titles) is not a privilege escalation, and collapsing the two
+    /// would leave whichever one changes first silently answering for the other.
+    pub(crate) fn is_operator(self) -> bool {
+        matches!(self, AuthLane::Admin)
+    }
 }
 
 /// Auth gate on the `/api/v1` routes: a paired client cert (mTLS, from anywhere) or the bearer token

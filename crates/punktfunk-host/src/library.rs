@@ -29,6 +29,7 @@ mod epic;
 mod gog;
 #[cfg(target_os = "linux")]
 mod heroic;
+mod hidden;
 mod launch;
 #[cfg(target_os = "linux")]
 mod lutris;
@@ -46,6 +47,7 @@ pub use epic::*;
 pub use gog::*;
 #[cfg(target_os = "linux")]
 pub use heroic::*;
+pub use hidden::*;
 pub use launch::*;
 #[cfg(target_os = "linux")]
 pub use lutris::*;
@@ -195,6 +197,32 @@ pub struct GameEntry {
     pub meta: GameMeta,
 }
 
+/// A library entry plus the operator's own view of it — today, whether they hid it.
+///
+/// A separate type rather than a field on [`GameEntry`] for two reasons. It keeps the visibility
+/// answer out of the providers entirely: a store parser has no opinion on what the operator hid, and
+/// adding `hidden: false` to all eight construction sites would imply it does. More importantly it
+/// makes the lane rule a TYPE guarantee instead of a discipline — `GET /library` answers
+/// `Vec<GameEntry>` on every lane but the operator's, so a hidden entry cannot leak to a paired
+/// client by someone forgetting a filter; there is no field there to leak.
+///
+/// `flatten` keeps the wire shape identical to a plain entry with one extra key, so the console
+/// parses one model either way.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct OperatorGameEntry {
+    #[serde(flatten)]
+    pub entry: GameEntry,
+    /// The operator hid this title ([`set_entry_hidden`]) — omitted when false, so the shape only
+    /// grows for entries that actually are hidden.
+    #[serde(skip_serializing_if = "is_not_hidden")]
+    pub hidden: bool,
+}
+
+/// `skip_serializing_if` predicate for [`OperatorGameEntry::hidden`] — `&bool` as serde requires.
+fn is_not_hidden(hidden: &bool) -> bool {
+    !*hidden
+}
+
 /// A store that contributes titles to the library. The trait is the extension point for future
 /// launchers; today only [`SteamProvider`] implements it.
 pub trait LibraryProvider {
@@ -268,7 +296,39 @@ impl ArtKind {
 ///   Removing the plugin releases the claim and the built-in comes straight back.
 ///
 /// The user-curated custom store is not a source and always contributes.
+///
+/// A **third** gate rides on top of these two: the operator's per-entry hides (`hidden.rs`). It is
+/// applied here rather than at each call site so a hidden title is gone from every surface by
+/// construction — the grid, native clients, `/applist`, and launch resolution — exactly as a
+/// disabled source's titles are. [`all_games_for_operator`] is the single deliberate exception.
 pub fn all_games() -> Vec<GameEntry> {
+    let hidden = hidden_ids();
+    let mut games = collect_games();
+    games.retain(|g| !hidden.contains(&g.id));
+    games
+}
+
+/// The library **including** the operator's hidden titles, each flagged.
+///
+/// The console's list is the only caller, and only on the operator's own lane (`GET /library`
+/// branches on it): a hidden entry has to be visible SOMEWHERE or it could never be brought back.
+/// Everything else — every paired client, the GameStream app list, launch resolution — goes through
+/// [`all_games`] and never sees them.
+pub fn all_games_for_operator() -> Vec<OperatorGameEntry> {
+    let hidden = hidden_ids();
+    collect_games()
+        .into_iter()
+        .map(|entry| OperatorGameEntry {
+            hidden: hidden.contains(&entry.id),
+            entry,
+        })
+        .collect()
+}
+
+/// Merge every enabled source + the custom entries, sorted by title — with no visibility gate of its
+/// own. Split out so the two public views above cannot drift: they differ only in what they do with
+/// the hidden set, never in what they collect.
+fn collect_games() -> Vec<GameEntry> {
     let off = disabled_scanners();
     let claimed = claimed_stores();
     // A built-in scanner runs when the operator hasn't disabled it AND no plugin has claimed its
@@ -313,4 +373,91 @@ pub fn all_games() -> Vec<GameEntry> {
     );
     games.sort_by_key(|g| g.title.to_lowercase());
     games
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, title: &str) -> GameEntry {
+        GameEntry {
+            id: id.into(),
+            store: id.split_once(':').map_or("custom", |(s, _)| s).into(),
+            title: title.into(),
+            art: Artwork::default(),
+            role: GameRole::default(),
+            launch: None,
+            provider: None,
+            detect: DetectSpec::default(),
+            meta: GameMeta::default(),
+        }
+    }
+
+    /// The console codes against this shape, so pin it: the operator view must be a normal entry
+    /// with ONE extra key, and that key must vanish when the title is visible.
+    ///
+    /// The skip matters beyond tidiness — it is what keeps this response byte-identical to the old
+    /// one for a library with nothing hidden, so shipping the feature cannot change what an existing
+    /// console renders until someone actually hides something.
+    #[test]
+    fn operator_entry_flattens_and_omits_hidden_when_false() {
+        let visible = OperatorGameEntry {
+            entry: entry("steam:70", "Half-Life"),
+            hidden: false,
+        };
+        let v = serde_json::to_value(&visible).expect("serializes");
+        assert_eq!(v["id"], "steam:70", "the entry's fields stay at top level");
+        assert_eq!(v["title"], "Half-Life");
+        assert!(
+            v.get("hidden").is_none(),
+            "a visible entry must not carry the key at all: {v}"
+        );
+
+        let hidden = OperatorGameEntry {
+            entry: entry("steam:70", "Half-Life"),
+            hidden: true,
+        };
+        let v = serde_json::to_value(&hidden).expect("serializes");
+        assert_eq!(v["hidden"], true);
+        assert_eq!(v["id"], "steam:70", "flatten still applies when hidden");
+    }
+
+    /// `all_games` and `all_games_for_operator` must agree on WHICH entries exist and differ only in
+    /// visibility — they share `collect_games` for exactly that reason. This pins the shared-source
+    /// property the same way the art test pins write/read symmetry: both views of an id-set built
+    /// from one collector, so a future edit that inlines one of them is caught.
+    #[test]
+    fn hidden_filter_is_the_only_difference_between_the_two_views() {
+        let games = vec![
+            entry("steam:70", "Half-Life"),
+            entry("lutris:4", "Syndicate"),
+            entry("custom:abc", "Chrono Trigger"),
+        ];
+        let hidden: HashSet<String> = ["lutris:4".to_string()].into_iter().collect();
+
+        let operator: Vec<OperatorGameEntry> = games
+            .iter()
+            .cloned()
+            .map(|entry| OperatorGameEntry {
+                hidden: hidden.contains(&entry.id),
+                entry,
+            })
+            .collect();
+        let played: Vec<GameEntry> = games
+            .into_iter()
+            .filter(|g| !hidden.contains(&g.id))
+            .collect();
+
+        assert_eq!(operator.len(), 3, "the operator sees every title");
+        assert_eq!(played.len(), 2, "a player does not see the hidden one");
+        assert!(
+            !played.iter().any(|g| g.id == "lutris:4"),
+            "the hidden id must be absent, not merely flagged"
+        );
+        assert_eq!(
+            operator.iter().filter(|r| r.hidden).count(),
+            1,
+            "exactly the hidden one is flagged"
+        );
+    }
 }

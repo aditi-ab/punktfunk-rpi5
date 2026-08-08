@@ -14,33 +14,42 @@ use axum::Extension;
 /// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
 /// authority alone. Route reachability and field authority are separate questions.
 ///
-/// `Some(response)` is the refusal to return; `None` means the payload may proceed. Deliberately
-/// not `Result<(), Response>`: the "error" here IS the response the handler sends, so there is no
-/// error value to propagate, and a 128-byte `Response` in an `Err` variant is what
+/// `Some((reason, response))` is the refusal to return; `None` means the payload may proceed.
+/// Deliberately not `Result<(), Response>`: the "error" here IS the response the handler sends, so
+/// there is no error value to propagate, and a 128-byte `Response` in an `Err` variant is what
 /// `clippy::result_large_err` objects to.
+///
+/// `reason` is the caller's log line. It exists because these are TWO different refusals — an
+/// operator-privileged field (403) and an unservable art path (400) — and logging both as "carries
+/// a field this lane may not set" sent the Lutris/Steam `file://` art rejection looking like an
+/// auth problem. The plugin only ever sees `HostRequestError`, so this log line is the sole
+/// diagnosis surface for whoever has to explain why a scanner syncs nothing.
 fn check_entry_fields(
     lane: AuthLane,
     art: &crate::library::Artwork,
     launch: Option<&crate::library::LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
-) -> Option<Response> {
+) -> Option<(String, Response)> {
     if !lane.may_set_privileged_fields() {
         if let Some(field) = crate::library::privileged_field(launch, prep) {
-            return Some(api_error(
-                StatusCode::FORBIDDEN,
-                &format!(
-                    "`{field}` is executed as the host user and may only be set with the \
-                     operator's admin token — a plugin may publish entries with any host-resolved \
-                     launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
-                     heroic, playnite) \
-                     instead"
+            return Some((
+                format!("payload carries `{field}`, which this lane may not set"),
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "`{field}` is executed as the host user and may only be set with the \
+                         operator's admin token — a plugin may publish entries with any host-resolved \
+                         launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
+                         heroic, playnite) \
+                         instead"
+                    ),
                 ),
             ));
         }
     }
     crate::library::validate_art_paths(art)
         .err()
-        .map(|e| api_error(StatusCode::BAD_REQUEST, &e))
+        .map(|e| (e.clone(), api_error(StatusCode::BAD_REQUEST, &e)))
 }
 
 #[derive(Deserialize)]
@@ -58,6 +67,10 @@ pub(crate) struct LibraryQuery {
 /// fetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the
 /// entries a given external provider owns; `?platform=` to one platform (case-insensitive —
 /// installed-store titles are `PC`, custom/provider entries carry whatever was authored).
+///
+/// **The operator's own lane additionally sees the titles they have HIDDEN**, each carrying
+/// `hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The
+/// console needs them to offer "un-hide", and it is the only surface that does.
 #[utoipa::path(
     get,
     path = "/library",
@@ -68,26 +81,28 @@ pub(crate) struct LibraryQuery {
         ("platform" = Option<String>, Query, description = "Only entries on this platform (case-insensitive, e.g. `PS2`)"),
     ),
     responses(
-        (status = OK, description = "Unified library across all stores", body = [crate::library::GameEntry]),
+        (status = OK, description = "Unified library across all stores (the operator's lane also gets hidden entries, flagged)", body = [crate::library::OperatorGameEntry]),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
 pub(crate) async fn get_library(
     Extension(lane): Extension<AuthLane>,
     Query(q): Query<LibraryQuery>,
-) -> Json<Vec<crate::library::GameEntry>> {
+) -> Response {
+    // The operator's list is a DIFFERENT TYPE, not the same one with a flag set — which is what
+    // makes "a hidden title never reaches a paired client" structural rather than a filter someone
+    // has to remember. The redaction below is skipped here because this arm is the operator's own
+    // token: the command line being redacted is the one they typed.
+    if lane.is_operator() {
+        let mut rows = crate::library::all_games_for_operator();
+        rows.retain(|r| matches_query(&r.entry, &q));
+        for r in &mut rows {
+            crate::library::proxy_local_art(&r.entry.id, &mut r.entry.art);
+        }
+        return Json(rows).into_response();
+    }
     let mut games = crate::library::all_games();
-    if let Some(provider) = q.provider.filter(|p| !p.is_empty()) {
-        games.retain(|g| g.provider.as_deref() == Some(provider.as_str()));
-    }
-    if let Some(platform) = q.platform.filter(|p| !p.is_empty()) {
-        games.retain(|g| {
-            g.meta
-                .platform
-                .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case(&platform))
-        });
-    }
+    games.retain(|g| matches_query(g, &q));
     // Rewrite provider entries' local-file art into host art-proxy URLs so a client fetches covers
     // from the host (a provider like Playnite stores on-host paths; the payload stays tiny at any
     // library size, and the client never sees an unreachable `C:\…`).
@@ -103,16 +118,97 @@ pub(crate) async fn get_library(
     // a client picks a title by ID and the host resolves the recipe itself (`resolve_launch`),
     // which is the invariant that stops a client injecting a command in the first place. The
     // `kind` stays, so "this is launchable, and how" still renders.
-    if !lane.may_set_privileged_fields() {
-        for g in &mut games {
-            if let Some(l) = g.launch.as_mut() {
-                if l.kind == "command" {
-                    l.value.clear();
-                }
+    //
+    // Unconditional now: the operator's lane returned above, so reaching here IS "some lane but
+    // theirs". Leaving the old `if !lane.may_set_privileged_fields()` would read as though an
+    // unredacted path still existed here, and would quietly stop redacting if that early return
+    // ever moved.
+    for g in &mut games {
+        if let Some(l) = g.launch.as_mut() {
+            if l.kind == "command" {
+                l.value.clear();
             }
         }
     }
-    Json(games)
+    Json(games).into_response()
+}
+
+/// The `?provider=` / `?platform=` narrowing, shared by both lane arms so they cannot drift.
+fn matches_query(g: &crate::library::GameEntry, q: &LibraryQuery) -> bool {
+    if let Some(provider) = q.provider.as_deref().filter(|p| !p.is_empty()) {
+        if g.provider.as_deref() != Some(provider) {
+            return false;
+        }
+    }
+    if let Some(platform) = q.platform.as_deref().filter(|p| !p.is_empty()) {
+        if !g
+            .meta
+            .platform
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(platform))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Request body for `setLibraryEntryHidden`.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct HiddenToggle {
+    /// Whether this title should be hidden from every play surface.
+    hidden: bool,
+}
+
+/// What `setLibraryEntryHidden` echoes back.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct HiddenState {
+    /// The entry id the call addressed.
+    id: String,
+    /// Its visibility after the call.
+    hidden: bool,
+}
+
+/// Hide or un-hide one library title
+///
+/// Curation, not access control: a hidden title disappears from every play surface — the console
+/// grid on a client, native clients, the GameStream app list, and launch resolution — while nothing
+/// is deleted and un-hiding restores it immediately. The operator's own console still lists it
+/// (flagged `hidden`) so it can be brought back.
+///
+/// Keyed by the entry's stable `<store>:<external_id>` id, which survives re-scans and reconciles by
+/// construction (D2). The id is **not** validated against the current library on purpose: a title
+/// can be legitimately absent at this moment (launcher closed, plugin mid-sync, drive unmounted),
+/// and refusing the operator's choice in that window would be worse than storing an id that
+/// currently matches nothing. Emits `library.changed` (source = the store) only on a real change.
+#[utoipa::path(
+    put,
+    path = "/library/hidden/{id}",
+    tag = "library",
+    operation_id = "setLibraryEntryHidden",
+    params(("id" = String, Path, description = "The library entry id (e.g. `steam:70`)")),
+    request_body = HiddenToggle,
+    responses(
+        (status = OK, description = "Stored; the entry's visibility after the call", body = HiddenState),
+        (status = BAD_REQUEST, description = "Empty entry id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_entry_hidden(
+    Path(id): Path<String>,
+    ApiJson(toggle): ApiJson<HiddenToggle>,
+) -> Response {
+    if id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "entry id must not be empty");
+    }
+    match crate::library::set_entry_hidden(&id, toggle.hidden) {
+        Ok(hidden) => {
+            tracing::info!(entry = %id, hidden, "management API: library entry visibility set");
+            Json(HiddenState { id, hidden }).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// Request body for `setLibraryScanner`.
@@ -205,7 +301,9 @@ pub(crate) async fn create_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some((_, denied)) =
+        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
+    {
         return denied;
     }
     match crate::library::add_custom(input) {
@@ -238,7 +336,9 @@ pub(crate) async fn update_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some((_, denied)) =
+        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
+    {
         return denied;
     }
     use crate::library::MutateOutcome;
@@ -364,11 +464,14 @@ pub(crate) async fn reconcile_provider_entries(
     // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
     // one privileged field anywhere in it is one command execution.
     for (i, e) in inputs.iter().enumerate() {
-        if let Some(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
+        if let Some((reason, denied)) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep)
+        {
             tracing::warn!(
                 provider,
                 index = i,
-                "library reconcile refused: payload carries a field this lane may not set"
+                title = %e.title,
+                reason = %reason,
+                "library reconcile refused"
             );
             return denied;
         }

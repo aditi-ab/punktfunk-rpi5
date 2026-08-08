@@ -1,6 +1,6 @@
-import { Pencil, Trash2 } from "lucide-react";
+import { Eye, EyeOff, Pencil, Trash2 } from "lucide-react";
 import { type FC, useState } from "react";
-import type { GameEntry } from "@/api/gen/model/gameEntry";
+import type { OperatorGameEntry } from "@/api/gen/model/operatorGameEntry";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -23,23 +23,33 @@ function storeLabel(store: string): string {
 }
 
 export interface GameCardProps {
-	game: GameEntry;
+	game: OperatorGameEntry;
 	onEdit: () => void;
 	onDelete: () => void;
 	deleting: boolean;
+	/** Hide this title from every play surface, or bring it back. */
+	onToggleHidden: () => void;
+	/** This card's hide/un-hide is in flight — only this one disables. */
+	hiding: boolean;
 }
 
 /**
  * A poster tile. The cover prefers the 2:3 portrait capsule; on a load error it
  * falls back to the wide header, then to a text placeholder. Custom entries get
- * edit/delete affordances.
+ * edit/delete affordances; every entry can be hidden.
  */
 export const GameCard: FC<GameCardProps> = ({
 	game,
 	onEdit,
 	onDelete,
 	deleting,
+	onToggleHidden,
+	hiding,
 }) => {
+	// Hiding is available for EVERY store, unlike edit/delete: the titles most worth hiding are the
+	// ones the operator cannot edit — a launcher's own scanned entries, a Proton tool, a demo. The
+	// host keys the setting by the entry id and never needs to own the entry.
+	const hidden = game.hidden === true;
 	// Editable only if the operator actually owns this entry. A custom-store entry SYNCED by a
 	// provider plugin also has `store === "custom"`, but the host refuses to hand-edit or delete it
 	// (409 CONFLICT, "owned by provider … — update it through its reconcile"), so offering the
@@ -57,16 +67,23 @@ export const GameCard: FC<GameCardProps> = ({
 	return (
 		<Card className="group relative overflow-hidden">
 			<div className="relative aspect-[2/3] bg-muted">
+				{/* Dim the ARTWORK only — never the badges or the buttons layered over it. A hidden
+				    card is the sole place the title can be brought back, so its controls have to stay
+				    at full contrast while the poster reads as "not in play". */}
 				{src ? (
 					<img
 						src={src}
 						alt={game.title}
 						loading="lazy"
-						className="size-full object-cover"
+						className={`size-full object-cover${hidden ? " opacity-30" : ""}`}
 						onError={() => setFailed((prev) => ({ ...prev, [src]: true }))}
 					/>
 				) : (
-					<div className="flex size-full items-center justify-center p-3 text-center text-sm font-medium text-muted-foreground">
+					<div
+						className={`flex size-full items-center justify-center p-3 text-center text-sm font-medium text-muted-foreground${
+							hidden ? " opacity-30" : ""
+						}`}
+					>
 						{game.title}
 					</div>
 				)}
@@ -91,30 +108,67 @@ export const GameCard: FC<GameCardProps> = ({
 							{m.library_owned_by({ provider: game.provider })}
 						</Badge>
 					)}
+					{/* Says WHY this poster is faded. Without it a dimmed tile reads as a broken cover
+					    or a still-loading image rather than a deliberate setting. */}
+					{hidden && (
+						<Badge
+							variant="secondary"
+							className="bg-background/90 backdrop-blur"
+						>
+							{m.library_hidden_badge()}
+						</Badge>
+					)}
 				</div>
-				{isCustom && (
-					<div className="absolute right-2 top-2 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-						<Button
-							variant="secondary"
-							size="icon"
-							className="size-7 bg-background/80 backdrop-blur"
-							aria-label={m.library_edit()}
-							onClick={onEdit}
-						>
-							<Pencil className="size-3.5" />
-						</Button>
-						<Button
-							variant="secondary"
-							size="icon"
-							className="size-7 bg-background/80 backdrop-blur"
-							aria-label={m.library_delete()}
-							disabled={deleting}
-							onClick={onDelete}
-						>
-							<Trash2 className="size-3.5 text-destructive" />
-						</Button>
-					</div>
-				)}
+				{/* A hidden card keeps its controls VISIBLE rather than hover-revealed. Hover-to-reveal
+				    is fine for an ordinary tile, but the un-hide button is the only way out of the
+				    hidden state — requiring a hover to discover it would strand anyone on a touch
+				    screen, which is exactly where the console's pointer work landed. */}
+				<div
+					className={`absolute right-2 top-2 flex gap-1 transition-opacity focus-within:opacity-100 group-hover:opacity-100${
+						hidden ? "" : " opacity-0"
+					}`}
+				>
+					<Button
+						variant="secondary"
+						size="icon"
+						className="size-7 bg-background/80 backdrop-blur"
+						aria-label={
+							hidden ? m.library_unhide_action() : m.library_hide_action()
+						}
+						aria-pressed={hidden}
+						disabled={hiding}
+						onClick={onToggleHidden}
+					>
+						{hidden ? (
+							<Eye className="size-3.5" />
+						) : (
+							<EyeOff className="size-3.5" />
+						)}
+					</Button>
+					{isCustom && (
+						<>
+							<Button
+								variant="secondary"
+								size="icon"
+								className="size-7 bg-background/80 backdrop-blur"
+								aria-label={m.library_edit()}
+								onClick={onEdit}
+							>
+								<Pencil className="size-3.5" />
+							</Button>
+							<Button
+								variant="secondary"
+								size="icon"
+								className="size-7 bg-background/80 backdrop-blur"
+								aria-label={m.library_delete()}
+								disabled={deleting}
+								onClick={onDelete}
+							>
+								<Trash2 className="size-3.5 text-destructive" />
+							</Button>
+						</>
+					)}
+				</div>
 			</div>
 			<div
 				className="truncate px-card pb-card pt-4 text-sm font-medium"

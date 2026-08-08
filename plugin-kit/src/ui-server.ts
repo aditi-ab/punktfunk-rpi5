@@ -7,7 +7,11 @@ import { Effect, FileSystem, Layer, Path, Schema, type Scope } from "effect";
 import { Etag, HttpPlatform, HttpRouter } from "effect/unstable/http";
 import type { ConfigService } from "./config.js";
 import { UiServeError } from "./errors.js";
-import { HostClient, PluginInfo } from "./host-client.js";
+import {
+	HostClient,
+	type HostClientService,
+	PluginInfo,
+} from "./host-client.js";
 
 /**
  * Everything `HttpApiBuilder.layer` needs beyond the router, satisfied from effect core —
@@ -192,7 +196,7 @@ export const serveUi = (
 			return handler(req);
 		};
 
-		return yield* Effect.acquireRelease(
+		const handle = yield* Effect.acquireRelease(
 			Effect.tryPromise({
 				try: () =>
 					servePluginUi(host.facade, {
@@ -212,4 +216,54 @@ export const serveUi = (
 			}),
 			(handle) => Effect.promise(() => handle.close()).pipe(Effect.ignore),
 		);
+
+		yield* verifyCategoryLanded(opts.category, info.name, host);
+		return handle;
 	});
+
+/**
+ * Read our own directory entry back and warn if the requested `category` is not on it.
+ *
+ * `category` travels through the UNTYPED `pf.request` seam precisely so an older host ignores it
+ * instead of rejecting the registration — which means dropping it is SILENT by design, at three
+ * different layers (an old host, an old runner-resolved SDK, a typo). On 2026-08-08 the middle one
+ * happened: `@punktfunk/host@0.1.2` was published before it forwarded the field, so every installed
+ * library scanner registered without a category. The visible result was Lutris and Heroic sitting in
+ * the console nav — which they explicitly opt out of — and their settings unreachable, because the
+ * Library section's Game sources surface lists exactly the plugins whose category IS `library`.
+ * Nothing logged anything.
+ *
+ * So this asks the host what it actually recorded. Same spirit as the store-claim degradation
+ * warning in `defineLibraryPlugin`: turn a silent no-op into one line that names the fix. Purely
+ * advisory — a failed read, or a host too old to report the field, must never keep a working plugin
+ * from starting.
+ */
+const verifyCategoryLanded = (
+	category: string | undefined,
+	id: string,
+	host: { readonly request: HostClientService["request"] },
+): Effect.Effect<void> => {
+	if (category === undefined) return Effect.void;
+	return host.request("GET", "/plugins").pipe(
+		Effect.flatMap((body) => {
+			const mine = (Array.isArray(body) ? body : []).find(
+				(p): p is { id: string; category?: string } =>
+					typeof p === "object" &&
+					p !== null &&
+					(p as { id?: unknown }).id === id,
+			);
+			// Not finding ourselves is not evidence of anything: the lease is registered
+			// best-effort, so a host that was momentarily away simply has not listed us yet.
+			if (!mine || mine.category === category) return Effect.void;
+			return Effect.logWarning(
+				`registered without category "${category}" (the host reports ` +
+					`${mine.category === undefined ? "none" : `"${mine.category}"`}). ` +
+					`This plugin will appear in the console's sidebar instead of its intended ` +
+					`section. The usual cause is an @punktfunk/host older than 0.1.3, which drops ` +
+					`the field before registering — update it, or the host, to resolve it.`,
+			);
+		}),
+		// Advisory only: never let a diagnostic take down the plugin it is diagnosing.
+		Effect.ignore,
+	);
+};
