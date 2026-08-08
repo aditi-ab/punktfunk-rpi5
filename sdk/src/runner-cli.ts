@@ -23,7 +23,12 @@
 // package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
 import { installLogShipper } from "./log-ship.js";
-import { addPlugins, listInstalled, removePlugins } from "./plugins.js";
+import {
+	addPlugins,
+	listInstalled,
+	reconcileSharedSdk,
+	removePlugins,
+} from "./plugins.js";
 import { discoverUnits, runner } from "./runner.js";
 
 const arg = (flag: string): string | undefined => {
@@ -165,6 +170,13 @@ const keepAlive = setInterval(() => {}, 2 ** 31 - 1);
 // to write into the host's log. Must be installed before the runner starts — the lines that explain
 // a plugin failing to load are the first ones out.
 const shipper = installLogShipper();
+
+// Before any plugin loads: make the tree's shared SDK the one this runner was built from. A host
+// upgrade is the only moment that can deliver an SDK fix to already-installed plugins, and this is
+// that moment — see `reconcileSharedSdk`. Deliberately AFTER the log shipper so the operator can
+// read what it did from the console's Logs page, and BEFORE `runner()` so plugins import the
+// refreshed copy rather than the one they were started with.
+reconcileSharedSdk(options.pluginsDir);
 
 const fiber = Effect.runFork(runner(options));
 let stopping = false;

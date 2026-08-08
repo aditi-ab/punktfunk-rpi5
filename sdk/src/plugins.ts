@@ -6,6 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { configDir } from "./config.js";
+import { SDK_VERSION } from "./version.js";
 
 /** The `@punktfunk` package registry (Gitea's npm registry for the `unom` org). */
 export const REGISTRY = "https://git.unom.io/api/packages/unom/npm/";
@@ -184,6 +185,109 @@ const runBun = (action: "add" | "remove", pkgs: string[], opts: PkgOpts): void =
 	});
 	if (!res.success) {
 		throw new Error(`bun ${action} exited ${res.exitCode ?? "?"} — see output above`);
+	}
+};
+
+/** The SDK version installed in a plugins tree, or undefined if it isn't installed at all. */
+export const installedSdkVersion = (
+	dir = pluginsDirDefault(),
+): string | undefined => {
+	try {
+		const manifest = path.join(
+			dir,
+			"node_modules",
+			"@punktfunk",
+			"host",
+			"package.json",
+		);
+		const v = (
+			JSON.parse(fs.readFileSync(manifest, "utf8")) as { version?: string }
+		).version;
+		return typeof v === "string" ? v : undefined;
+	} catch {
+		return undefined;
+	}
+};
+
+/**
+ * Bring the plugins tree's `@punktfunk/host` up to the version THIS runner was built from.
+ *
+ * **Why this exists.** The SDK is the seam every plugin registers through, but each plugin resolves
+ * it from the plugins tree, and `bun.lock` pins it to an exact version with an integrity hash. No
+ * user-facing flow re-resolves that pin: installing a plugin, reinstalling it, even updating it to a
+ * newer release all leave the SDK where it is, because the plugin's `^0.1.x` range is already
+ * satisfied. Measured on 2026-08-08 — publishing `@punktfunk/host@0.1.3` (the release that lets a
+ * library scanner register `category`, so it stays out of the console nav) reached **no existing
+ * install**, and the only thing that moved it was deleting the lockfile by hand over ssh. Shipping a
+ * fix that needs an ssh session is not shipping a fix.
+ *
+ * The runner is the right owner: it is bundled from this same `sdk/` at the host's release commit
+ * (`packaging/arch/PKGBUILD` builds `src/runner-cli.ts` into the punktfunk-scripting package), so
+ * `SDK_VERSION` is by construction the SDK that matches the host now on disk. A host upgrade then
+ * carries the SDK with it and nobody touches a runner.
+ *
+ * **Why the whole lockfile.** A targeted `bun add @punktfunk/host@<v>` at the root does NOT work
+ * while plugins still declare the SDK in their own `dependencies` (they do, though none import it):
+ * bun honours their locked resolution and gives each plugin a private nested copy, which then
+ * SHADOWS the root — measured, 5 nested copies. A lockless resolve hoists one copy for everyone,
+ * also measured. Once the plugins drop that spurious dependency this can become the targeted form.
+ *
+ * Safety: the plugins' own versions are pinned exactly in the root `package.json`, so a re-resolve
+ * cannot move them; only shared transitive deps float within their declared ranges. The lockfile is
+ * backed up first and restored if the install fails, and any failure is logged and swallowed — a
+ * dependency refresh must never stop the plugins that are already working from loading.
+ */
+export const reconcileSharedSdk = (
+	dir = pluginsDirDefault(),
+	log: (line: string) => void = (l) => console.log(l),
+): void => {
+	const have = installedSdkVersion(dir);
+	// Nothing installed = no plugins yet; the first `bun add` resolves the current SDK on its own.
+	if (have === undefined || have === SDK_VERSION) return;
+
+	const lock = path.join(dir, "bun.lock");
+	const backup = `${lock}.pf-bak`;
+	log(
+		`[plugins] @punktfunk/host ${have} installed, this host ships ${SDK_VERSION} — refreshing`,
+	);
+	let restore = false;
+	try {
+		if (fs.existsSync(lock)) {
+			fs.copyFileSync(lock, backup);
+			fs.rmSync(lock);
+			restore = true;
+		}
+		const res = Bun.spawnSync([process.execPath, "install", "--ignore-scripts"], {
+			cwd: dir,
+			stdio: ["inherit", "inherit", "inherit"],
+		});
+		if (!res.success) {
+			throw new Error(`bun install exited ${res.exitCode ?? "?"}`);
+		}
+		const now = installedSdkVersion(dir);
+		if (now !== SDK_VERSION) {
+			// The install "succeeded" and still did not deliver the version — better to sit on the
+			// known-good tree than to keep a half-resolved one.
+			throw new Error(`still ${now ?? "absent"} after install`);
+		}
+		restore = false;
+		if (fs.existsSync(backup)) fs.rmSync(backup);
+		log(`[plugins] @punktfunk/host is now ${SDK_VERSION}`);
+	} catch (e) {
+		log(
+			`[plugins] WARNING: could not refresh @punktfunk/host (${
+				e instanceof Error ? e.message : e
+			}) — plugins keep running against ${have}`,
+		);
+		if (restore && fs.existsSync(backup)) {
+			try {
+				fs.copyFileSync(backup, lock);
+				fs.rmSync(backup);
+			} catch {
+				// The backup is still on disk under its own name; say so rather than pretend.
+				log(`[plugins] the previous lockfile is at ${backup}`);
+			}
+		}
 	}
 };
 
