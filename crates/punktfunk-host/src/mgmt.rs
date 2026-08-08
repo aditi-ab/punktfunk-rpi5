@@ -47,6 +47,14 @@ mod store;
 mod tests;
 mod update;
 
+/// Lets `library::plugin_launch`'s tests put a stub plugin in the registry (test-only).
+#[cfg(test)]
+pub(crate) use plugins::register_ui_for_test;
+/// The launch path asks a library plugin what to run for its own entries, and needs the loopback
+/// credential this process already holds for it. Re-exported (rather than opening the whole
+/// `plugins` module crate-wide) so these two are the ONLY things `mgmt` lends to the library side.
+pub(crate) use plugins::ui_credential;
+
 /// Default management port — adjacent to the GameStream block (47984…48010), and the same
 /// number Sunshine users already associate with "the config UI".
 pub const DEFAULT_PORT: u16 = 47990;

@@ -1,7 +1,7 @@
 // What a kit error says when something interpolates it — which is the whole diagnosis surface a
 // plugin operator gets, because `sync-engine`'s failure path logs `${e.cause}` and nothing else.
 import { describe, expect, test } from "bun:test";
-import { HostRequestError } from "../src/errors.js";
+import { HostRequestError, SyncError } from "../src/errors.js";
 
 describe("HostRequestError", () => {
 	// Regression for 2026-08-08: this printed the bare tag, so `plugin:lutris sync (startup)
@@ -60,5 +60,38 @@ describe("HostRequestError", () => {
 		expect(err._tag).toBe("HostRequestError");
 		expect(err.method).toBe("DELETE");
 		expect(err.path).toBe("/library/provider/heroic");
+	});
+});
+
+describe("SyncError", () => {
+	// Regression for 2026-08-08 (rom-manager): the host refused every ROM reconcile with a 403 that
+	// named the offending field AND the fix, `HostRequestError` carried that sentence faithfully —
+	// and then this class dropped it, because the default string form is the bare tag. The plugin
+	// rendered `String(e)` into its API error, so the operator's entire diagnosis was the word
+	// "SyncError" (and, after the undecodable 500, "Decode error"). The chain must survive.
+	test("carries the nested host explanation, not the bare tag", () => {
+		const err = new SyncError({
+			reason: "manual",
+			cause: new HostRequestError({
+				method: "PUT",
+				path: "/library/provider/rom-manager",
+				cause: {
+					error:
+						'`launch.kind = "command"` is executed as the host user and may only be set with the operator\'s admin token',
+				},
+			}),
+		});
+
+		expect(`${err}`).toContain("manual");
+		expect(`${err}`).toContain("/library/provider/rom-manager");
+		expect(`${err}`).toContain("launch.kind");
+		expect(`${err}`).not.toBe("SyncError");
+		expect(`${err}`).not.toContain("[object Object]");
+	});
+
+	test("keeps its tag and fields for catchTag narrowing", () => {
+		const err = new SyncError({ reason: "startup", cause: "boom" });
+		expect(err._tag).toBe("SyncError");
+		expect(err.reason).toBe("startup");
 	});
 });

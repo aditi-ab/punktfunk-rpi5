@@ -1507,11 +1507,17 @@ async fn serve_session(
     // launcher's on-disk metadata, and the data plane needs three things out of it — what to run, what
     // to call the title, and how to recognize its process once a launcher has handed off
     // (design/session-game-lifetime.md §4).
-    let launch_target =
-        hello
-            .launch
-            .as_deref()
-            .and_then(|id| match crate::library::resolve_launch(id) {
+    //
+    // On a blocking thread: a `plugin`-kind entry resolves by asking the plugin that owns it over
+    // loopback (`library::ask_plugin_launch`), and this is an async context.
+    let launch_target = match hello.launch.as_deref() {
+        None => None,
+        Some(id) => {
+            let owned = id.to_string();
+            match tokio::task::spawn_blocking(move || crate::library::resolve_launch(&owned))
+                .await
+                .context("resolve the session's library launch")?
+            {
                 Some(t) => {
                     tracing::info!(
                         launch_id = id,
@@ -1528,7 +1534,9 @@ async fn serve_session(
                     );
                     None
                 }
-            });
+            }
+        }
+    };
     #[cfg(target_os = "windows")]
     let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]

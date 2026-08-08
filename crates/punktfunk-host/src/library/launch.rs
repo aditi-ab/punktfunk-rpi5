@@ -52,7 +52,9 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     {
         // Linux runs the command itself, so a title without one has nothing to launch — same answer
         // (and same warning path) as before this resolution existed.
-        let command = entry.launch.as_ref().and_then(command_for)?;
+        let command = plugin_recipe(&entry)
+            .map(|l| l.command)
+            .or_else(|| entry.launch.as_ref().and_then(command_for))?;
         Some(LaunchTarget {
             game,
             launcher: entry.role == GameRole::Launcher,
@@ -74,8 +76,65 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     }
 }
 
+/// The recipe for a `plugin`-kind entry, asked of the plugin that owns it. `None` for every other
+/// kind (without doing any I/O), so both per-OS resolvers can simply try this first.
+///
+/// This lives beside [`resolve_launch`] / [`launch_title`] rather than inside `command_for` /
+/// `windows_launch_for` because it needs the entry's **`provider`** — and that field is the whole
+/// authorization story. `provider` is stamped by the host from the reconcile URL
+/// (`PUT /library/provider/{provider}`), never taken from the payload, so it is what decides which
+/// plugin gets asked. A plugin that plants an entry under someone else's provider only causes that
+/// *other* plugin to be asked about a key it never published — which is a 404, not a launch.
+///
+/// **Blocking**: see [`ask_plugin_launch`]. `resolve_launch`'s async callers hop through
+/// `spawn_blocking`; the handshake probe uses [`launch_is_resolvable`], which never asks.
+fn plugin_recipe(entry: &GameEntry) -> Option<PluginLaunch> {
+    let spec = entry.launch.as_ref()?;
+    if spec.kind != "plugin" {
+        return None;
+    }
+    let Some(provider) = entry.provider.as_deref() else {
+        // Only a provider reconcile can author this kind, so this is unreachable short of a
+        // hand-edited library.json — say so rather than silently doing nothing.
+        tracing::warn!(
+            id = %entry.id,
+            "plugin launch: entry carries no provider, so no plugin can answer for it"
+        );
+        return None;
+    };
+    ask_plugin_launch(provider, &spec.value)
+}
+
+/// Whether `id` will actually launch something — **without asking a plugin**.
+///
+/// The handshake needs this one bit to decide dedicated-session routing, and it runs on the async
+/// path, so it must not make a blocking call out to a plugin. For a `plugin`-kind entry the cheap
+/// answer is "a live plugin is registered under its provider, and the key is well formed"; if that
+/// plugin later refuses the ask, the launch fails the same way any unresolvable entry does and the
+/// player is left on the session.
+#[cfg(not(windows))]
+pub fn launch_is_resolvable(id: &str) -> bool {
+    let Some(entry) = all_games().into_iter().find(|g| g.id == id) else {
+        return false;
+    };
+    let Some(spec) = entry.launch.as_ref() else {
+        return false;
+    };
+    if spec.kind == "plugin" {
+        return valid_plugin_entry_key(&spec.value)
+            && entry
+                .provider
+                .as_deref()
+                .is_some_and(|p| crate::mgmt::ui_credential(p).is_some());
+    }
+    command_for(spec).is_some()
+}
+
 /// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
 /// [`resolve_launch`], split out so the appid-validation can be tested without a Steam install).
+///
+/// The `plugin` kind is deliberately absent: its answer comes from another process, so it is
+/// resolved by [`plugin_recipe`] before this is reached.
 ///
 /// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits).
 /// - `command` → the stored command verbatim. This string comes from the host's own custom store
@@ -126,17 +185,24 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 /// desktop and grabs foreground.
 #[cfg(windows)]
 pub fn launch_title(id: &str) -> Result<()> {
-    let spec = all_games()
+    let entry = all_games()
         .into_iter()
         .find(|g| g.id == id)
-        .and_then(|g| g.launch)
+        .filter(|g| g.launch.is_some())
         .ok_or_else(|| anyhow::anyhow!("no launchable library entry '{id}'"))?;
-    let (cmdline, workdir) = windows_launch_for(&spec).ok_or_else(|| {
-        anyhow::anyhow!(
-            "library entry '{id}' has no Windows launch recipe (kind '{}')",
-            spec.kind
-        )
-    })?;
+    let spec = entry.launch.clone().expect("filtered to Some above");
+    // A `plugin` entry's recipe comes from the plugin that owns it, and arrives in the same
+    // (command line, working dir) shape this path already spawns. `windows_launch_for` has no arm
+    // for the kind, so a failed ask falls through to the "no recipe" error below.
+    let (cmdline, workdir) = plugin_recipe(&entry)
+        .map(|l| (l.command, l.cwd))
+        .or_else(|| windows_launch_for(&spec))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "library entry '{id}' has no Windows launch recipe (kind '{}')",
+                spec.kind
+            )
+        })?;
     let pid = crate::interactive::spawn_in_active_session(&cmdline, workdir.as_deref())
         .with_context(|| format!("launch '{id}' in the interactive session"))?;
     tracing::info!(launch_id = id, %cmdline, pid, "launched library title in the interactive session");
@@ -148,6 +214,9 @@ pub fn launch_title(id: &str) -> Result<()> {
 ///
 /// CreateProcessAsUserW does NO shell or protocol resolution, so the URI/flags are handed to a
 /// concrete EXE as plain arguments — a (host-derived) URI string can never reach a command interpreter.
+///
+/// The `plugin` kind is deliberately absent: its answer comes from another process, so it is
+/// resolved by [`plugin_recipe`] before this is reached.
 #[cfg(windows)]
 fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::PathBuf>)> {
     match spec.kind.as_str() {

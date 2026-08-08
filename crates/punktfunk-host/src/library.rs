@@ -33,6 +33,7 @@ mod hidden;
 mod launch;
 #[cfg(target_os = "linux")]
 mod lutris;
+mod plugin_launch;
 mod scanners;
 mod steam;
 #[cfg(windows)]
@@ -51,6 +52,7 @@ pub use hidden::*;
 pub use launch::*;
 #[cfg(target_os = "linux")]
 pub use lutris::*;
+pub use plugin_launch::*;
 pub use scanners::*;
 pub use steam::*;
 #[cfg(windows)]

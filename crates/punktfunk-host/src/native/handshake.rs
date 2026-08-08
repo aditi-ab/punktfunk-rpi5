@@ -270,13 +270,15 @@ pub(super) async fn negotiate(
             // id must fall back to normal auto routing, not a blank "sleep infinity" gamescope
             // (review #9). (dedicated is Linux-only, and only there does `resolve_launch` carry a
             // command — on Windows the concrete process is resolved at launch time instead.)
+            // `launch_is_resolvable`, not a full `resolve_launch`: a `plugin`-kind entry's command
+            // is fetched from the owning plugin over loopback, and this runs on the async path. The
+            // cheap check answers the only question asked here (does this tile launch anything?)
+            // without a blocking call — see `library::launch_is_resolvable`.
             #[cfg(not(target_os = "windows"))]
             let has_resolvable_launch = hello
                 .launch
                 .as_deref()
-                .and_then(crate::library::resolve_launch)
-                .and_then(|t| t.command)
-                .is_some();
+                .is_some_and(crate::library::launch_is_resolvable);
             #[cfg(target_os = "windows")]
             let has_resolvable_launch = false;
             let dedicated = crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);

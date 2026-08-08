@@ -80,4 +80,18 @@ export class UiServeError extends Data.TaggedError("UiServeError")<{
 export class SyncError extends Data.TaggedError("SyncError")<{
 	readonly reason: string;
 	readonly cause: unknown;
-}> {}
+}> {
+	/**
+	 * Same load-bearing getter as {@link HostRequestError}, and for the same reason one step further
+	 * out: without it `String(e)` is the bare tag `SyncError`, so a plugin that renders its sync
+	 * failure into an API error or a toast shows the operator a word instead of the refusal.
+	 *
+	 * That is how a rom-manager sync refused with a fully explanatory 403 reached its own UI as
+	 * "Decode error" and nothing else — the reason existed at every layer and was dropped at this
+	 * one. `describeCause` unwraps a nested `HostRequestError` through its own message getter, so
+	 * the host's sentence survives the whole way to the surface.
+	 */
+	override get message(): string {
+		return `sync (${this.reason}) failed: ${describeCause(this.cause)}`;
+	}
+}
