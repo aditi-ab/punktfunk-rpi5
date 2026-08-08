@@ -58,16 +58,20 @@ sudo rm -f /etc/apt/sources.list.d/punktfunk.list /etc/apt/keyrings/punktfunk.as
 sudo apt update
 ```
 
-**Left behind:** `~/.config/punktfunk`, and the empty `punktfunk-update` system group the package
-created for [one-click updates](/docs/updating). Clear them with:
+**Left behind:** `~/.config/punktfunk`, and the two system groups the package created — the empty
+`punktfunk-update` for [one-click updates](/docs/updating), and `punktfunk` for the virtual Steam
+Deck pad's usbip nodes. Clear them with:
 
 ```sh
 rm -rf ~/.config/punktfunk
 sudo groupdel punktfunk-update
+sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk
 ```
 
 Your `input` group membership is harmless to keep (it is a stock Ubuntu group). Drop it with
-`sudo gpasswd -d "$USER" input` if you'd rather not have it. If you opened the firewall, close it
+`sudo gpasswd -d "$USER" input` if you'd rather not have it. The `punktfunk` group above is worth
+dropping rather than keeping: it can present arbitrary emulated USB hardware, and with the host
+gone nothing uses it. If you opened the firewall, close it
 again: `sudo ufw delete allow punktfunk-native` (and `punktfunk-gamestream` / `punktfunk-web` if you
 allowed those too).
 
@@ -80,9 +84,12 @@ sudo dnf remove punktfunk punktfunk-web punktfunk-client punktfunk-scripting
 sudo rm -f /etc/yum.repos.d/punktfunk.repo
 ```
 
-**Left behind:** `~/.config/punktfunk`, the `punktfunk-update` group, and the signing key dnf
+**Left behind:** `~/.config/punktfunk`, the `punktfunk-update` and `punktfunk` groups, and the
+signing key dnf
 imported into the rpm keyring when it first installed a Punktfunk package. Clear the first two with
-`rm -rf ~/.config/punktfunk` and `sudo groupdel punktfunk-update`. The key is harmless to leave — on
+`rm -rf ~/.config/punktfunk` and `sudo groupdel punktfunk-update`; drop `punktfunk` too
+(`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`) — it can present arbitrary
+emulated USB hardware and nothing uses it once the host is gone. The key is harmless to leave — on
 its own it only marks packages from our registry as trusted, and nothing fetches them once the repo
 file is gone.
 
@@ -127,6 +134,7 @@ Three things it created outside `/usr` stay behind:
 ```sh
 sudo rm -f /etc/modules-load.d/punktfunk.conf /etc/udev/rules.d/60-punktfunk.rules
 sudo groupdel punktfunk-update
+sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk
 ```
 
 And your config, if you want it gone: `rm -rf ~/.config/punktfunk`. See
@@ -150,8 +158,10 @@ repo's signing key from pacman's keyring:
 sudo pacman-key --delete E0CA04465C99C936E0B0C6510A317015A34DDD69
 ```
 
-**Left behind:** `~/.config/punktfunk` and the `punktfunk-update` group —
-`rm -rf ~/.config/punktfunk` and `sudo groupdel punktfunk-update` clear them. On CachyOS, close the
+**Left behind:** `~/.config/punktfunk` and the `punktfunk-update` and `punktfunk` groups —
+`rm -rf ~/.config/punktfunk`, `sudo groupdel punktfunk-update`, and
+`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk` clear them. Drop that last one
+rather than keeping it: it can present arbitrary emulated USB hardware. On CachyOS, close the
 ufw rules you opened: `sudo ufw delete allow punktfunk-native`.
 
 ### SteamOS / Steam Deck host (on-device build)
@@ -172,8 +182,10 @@ atomic-update keep list is what carries those files through every SteamOS update
 stay on the device indefinitely.
 
 **Left behind:** `~/.config/punktfunk` (`rm -rf ~/.config/punktfunk` for a clean slate), your
-`input` group membership, and — if the installer seeded it because you had none — the KDE
-RemoteDesktop portal grant at `~/.local/share/flatpak/db/kde-authorized`.
+`input` and `punktfunk` group memberships, and — if the installer seeded it because you had none —
+the KDE RemoteDesktop portal grant at `~/.local/share/flatpak/db/kde-authorized`. Drop the second
+group once the host is gone — it can present arbitrary emulated USB hardware and nothing else on a
+Deck uses it: `sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`.
 
 ### NixOS
 
@@ -184,9 +196,9 @@ There is nothing to uninstall imperatively — remove what you declared:
    input.
 3. Rebuild: `sudo nixos-rebuild switch`.
 
-The unit, udev rules, sysctl tuning, firewall ports and `input` group membership all disappear with
-the generation. The store paths stay until you garbage-collect, and `~/.config/punktfunk` — which
-the module never managed — stays regardless.
+The unit, udev rules, sysctl tuning, firewall ports and the `input` / `punktfunk` group memberships
+all disappear with the generation. The store paths stay until you garbage-collect, and
+`~/.config/punktfunk` — which the module never managed — stays regardless.
 
 ## Windows host
 

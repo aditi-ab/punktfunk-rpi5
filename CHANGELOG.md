@@ -79,6 +79,20 @@ capability rode on `input`, which every gamepad guide tells users to join — bu
 arbitrary USB hardware. Operators must `usermod -aG punktfunk "$USER"` and re-login or the pad stops
 attaching. Ordinary virtual gamepads are unaffected.
 
+> **Known issue in 0.25.0, fixed after it.** Four of the six install paths shipped
+> `60-punktfunk.rules` — whose `RUN+=` does `chgrp punktfunk` on the vhci `attach`/`detach` nodes —
+> without ever creating the group, so the `chgrp` failed, the nodes stayed root-only, and the pad
+> silently never attached. The `usermod` above also fails outright on those boxes with *group
+> 'punktfunk' does not exist*. Affected: **Arch/CachyOS upgraded** rather than freshly installed
+> (`post_upgrade` called only `_ensure_update_group`), the **NixOS module** (no
+> `users.groups.punktfunk`), the **Bazzite sysext** (a group is host state and cannot ride an
+> image), and **Steam Deck source installs** (`scripts/steamdeck/install.sh`/`update.sh` handled
+> only `input`). The deb and rpm scriptlets were correct throughout — they run one `%post`/`postinst`
+> on install and upgrade alike. All four now create the group, and the two that know which user
+> runs the host (the Deck scripts and the NixOS module's `host.users`) add that user to it as well.
+> Workaround on an unpatched box:
+> `sudo groupadd --system punktfunk`, then the `usermod`, then re-login.
+
 **3. Plugins may no longer set `launch.command` or the pre-launch command.** Both run through a
 shell and are now operator-token only; a plugin that sets them is refused. Third-party plugins that
 populated them need updating — use the `launcher_ui` / `xbox` launch kinds instead.

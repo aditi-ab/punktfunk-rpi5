@@ -167,6 +167,13 @@ post_merge() {
   # The (empty) opt-in group for web-console-triggered updates (the sysext ships the pf-update
   # helper + unit + polkit rule in its /usr; the group can't ride an image) — nobody is auto-added.
   getent group punktfunk-update >/dev/null 2>&1 || groupadd --system punktfunk-update 2>/dev/null || :
+  # 'punktfunk' owns the vhci attach/detach nodes the rule we just mirrored into /etc chgrp's to.
+  # A group cannot ride an image either (/etc/group is host state), and the deb/rpm scriptlets that
+  # would normally create it never run on an image-based install — so without this the chgrp fails,
+  # attach/detach stay root-only and the virtual Steam Deck pad never attaches. Deliberately NOT
+  # 'input': writing 'attach' materialises an arbitrary emulated USB device (review 2026-08-05 M-4),
+  # so it stays a group users join on purpose — see `ujust add-user-to-input-group` for the other one.
+  getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
   modprobe vhci-hcd 2>/dev/null || :
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
   # the input-group ownership even when the module's original add event predated the reloaded rule.

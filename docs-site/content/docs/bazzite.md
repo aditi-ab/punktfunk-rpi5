@@ -126,6 +126,18 @@ ujust add-user-to-input-group
 Then **log out and back in**. (A controller that's "detected but does nothing" is almost always this
 permission, not a client problem.)
 
+Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro), also join
+`punktfunk` — `usermod` is fine here, because unlike `input` this group is ours and the sysext
+creates it on merge:
+
+```sh
+sudo usermod -aG punktfunk "$USER"   # then log out and back in
+```
+
+It is a separate group on purpose: it gates the usbip `attach` file, which can materialise
+arbitrary emulated USB hardware, so it is not folded into the group everyone is told to join for
+gamepads. Skip it and the pad arrives as an ordinary Xbox 360 controller instead.
+
 ## Configure
 
 The RPM ships a Bazzite-tuned config you can copy as your starting point:

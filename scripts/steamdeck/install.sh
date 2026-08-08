@@ -23,6 +23,13 @@ ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  !!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# Create a system group if it is missing (needs sudo). Idempotent, and mirrors what the
+# deb/rpm/arch scriptlets do — a udev rule that chgrp's to a group nobody created fails silently.
+ensure_group() {
+    getent group "$1" >/dev/null 2>&1 && return 0
+    sudo groupadd --system "$1" 2>/dev/null || return 1
+    ok "created the '$1' system group"
+}
 
 # --- options ---------------------------------------------------------------
 SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
@@ -252,8 +259,21 @@ EOF
     )
     chmod 600 "$CONFIG/web.env"
     ok "wrote web.env (generated login password)"
-else
-    [ "$WITH_WEB" = 1 ] && ok "web.env exists (login password unchanged)"
+elif [ "$WITH_WEB" = 1 ] && [ -f "$CONFIG/web.env" ]; then
+    # THE belt the comment above promises. It used to live inside the create-only branch, so it
+    # only ever ran on files that had just been written 0600 anyway — every install that predates
+    # the L-19 fix still has its console password and session secret on disk at the Deck's ambient
+    # umask (0644, world-readable). Tighten it here, and say so out loud: a chmod does not un-leak
+    # a secret that was already readable by every local account, so the password needs rotating.
+    if find "$CONFIG/web.env" -maxdepth 0 -perm /0077 2>/dev/null | grep -q .; then
+        chmod 600 "$CONFIG/web.env"
+        warn "web.env was group/world-readable — an older install wrote it at the default umask."
+        warn "Tightened to 0600, but that does NOT un-expose the password it already leaked to every"
+        warn "local account. Rotate it: edit PUNKTFUNK_UI_PASSWORD in $CONFIG/web.env, then"
+        warn "  systemctl --user restart punktfunk-web"
+    else
+        ok "web.env exists (login password unchanged, mode already 0600)"
+    fi
 fi
 
 # --- 3b. HDR gamescope (punktfunk-gamescope, best-effort) ------------------
@@ -264,8 +284,8 @@ fi
 # host.env only while the binary provably runs on SteamOS.
 PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" bash "$SRC/scripts/steamdeck/build-gamescope.sh"
 
-# --- 4. system tuning (needs sudo: UDP buffers + gamepad udev rule + vhci-hcd + input group) --------
-log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group)"
+# --- 4. system tuning (needs sudo: UDP buffers + udev rule + vhci-hcd + input/punktfunk groups) -----
+log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input/punktfunk groups)"
 # sudo was acquired up front in preflight (SUDO_OK) so this never stalls behind the long build; a
 # skip here (no password / no TTY) was already reported loudly there.
 if [ "$SUDO_OK" = 1 ]; then
@@ -293,6 +313,34 @@ if [ "$SUDO_OK" = 1 ]; then
         NEED_RELOGIN=1
         warn "added $USER to the 'input' group (applies on next login)"
     fi
+    # The 'punktfunk' group owns the usbip vhci attach/detach nodes (see 60-punktfunk.rules).
+    # Deliberately NOT 'input': writing 'attach' hands the kernel a caller-supplied socket fd and
+    # materialises an arbitrary emulated USB device — a root-only primitive that must not ride on
+    # the group every gamepad guide tells you to join (security-review 2026-08-05 M-4).
+    #
+    # The deb/rpm/arch scriptlets groupadd this; NOTHING on the Deck path did. So the rule we just
+    # installed ran `chgrp punktfunk` against a group that did not exist, the chgrp failed, the
+    # attach/detach files stayed root-only, and the native Steam Deck pad never attached — with no
+    # error anywhere the user would look. Create it and join it here: unlike a general-purpose
+    # host, running THIS script IS the statement "make my Deck a host with native pad passthrough".
+    # `if ensure_group` (not `ensure_group || true`): a failed groupadd must not fall through to a
+    # usermod against a group that does not exist, which under `set -e` would kill the installer
+    # here — after the long build and before the services are installed.
+    if ensure_group punktfunk; then
+        if id -nG "$USER" | grep -qw punktfunk; then
+            ok "already in the 'punktfunk' group (usbip vhci access)"
+        else
+            sudo usermod -aG punktfunk "$USER"
+            NEED_RELOGIN=1
+            warn "added $USER to the 'punktfunk' group — the native Steam Deck pad needs it. That group"
+            warn "can emulate arbitrary USB devices; drop it with 'sudo gpasswd -d $USER punktfunk' if"
+            warn "you would rather stream without the native pad."
+        fi
+    else
+        warn "could not create the 'punktfunk' group — the native Steam Deck pad will not attach"
+        warn "(everything else works; the pad arrives as a generic Xbox 360 controller). By hand:"
+        warn "  sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
+    fi
     # SteamOS A/B updates rebuild /etc and DROP everything not on Valve's keep list — verified
     # live: an OS update stripped the udev rule + vhci autoload + UDP sysctl (gamepads silently
     # degrade to Xbox 360, buffers back to 208 KB). The sanctioned fix is a preserve drop-in in
@@ -303,15 +351,18 @@ if [ "$SUDO_OK" = 1 ]; then
     fi
 else
     warn "no usable sudo — SKIPPED system tuning. Gamepad passthrough + clean streaming need root (udev"
-    warn "rule, 'input' group, vhci-hcd, UDP buffers) — there is no user-space way to do these."
+    warn "rule, 'input' + 'punktfunk' groups, vhci-hcd, UDP buffers) — there is no user-space way to do these."
     warn "A stock SteamOS 'deck' account has NO password, so sudo can't work until you set one:"
     warn "  passwd            # set a sudo password once, then re-run this script"
     warn "Or apply it by hand (then reboot):"
     warn "  sudo install -m644 $SRC/scripts/60-punktfunk.rules /etc/udev/rules.d/ &&"
     warn "  sudo install -m644 $SRC/scripts/punktfunk-modules.conf /etc/modules-load.d/punktfunk.conf &&"
-    warn "  sudo usermod -aG input $USER &&"
+    warn "  sudo groupadd --system punktfunk;"
+    warn "  sudo usermod -aG input,punktfunk $USER &&"
     warn "  printf 'net.core.wmem_max=33554432\\nnet.core.rmem_max=33554432\\n' | sudo tee /etc/sysctl.d/99-punktfunk-net.conf &&"
     warn "  sudo sysctl --system && sudo udevadm control --reload-rules && sudo udevadm trigger"
+    warn "('punktfunk' owns the usbip vhci nodes the native Steam Deck pad attaches through — without"
+    warn " it the pad silently never appears. Omit it if you do not want that pad.)"
 fi
 
 # --- 5. systemd user services ---------------------------------------------

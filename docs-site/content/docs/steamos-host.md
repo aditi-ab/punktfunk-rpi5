@@ -74,8 +74,9 @@ It is idempotent — safe to re-run. In one pass it:
    [plugin store](/docs/plugins) works out of the box — the runner service itself stays opt-in),
 3. writes config to `~/.config/punktfunk/` (a generated web-console login password),
 4. raises the UDP socket buffers to 32 MB, installs the gamepad udev rule + the `vhci-hcd` autoload
-   and adds you to the `input` group (virtual gamepads / **native Steam Deck controller passthrough**),
-   seeds the KDE RemoteDesktop grant for Desktop-mode input, and **registers all of it on SteamOS's
+   and adds you to the `input` group (virtual gamepads) **and the `punktfunk` group** (the usbip
+   nodes **native Steam Deck controller passthrough** attaches through — creating that group if it
+   does not exist yet), seeds the KDE RemoteDesktop grant for Desktop-mode input, and **registers all of it on SteamOS's
    atomic-update keep list** so OS updates carry it over — the installer asks for your `sudo`
    password **first, before the long build**, so you can authorise once and walk away,
 5. installs + starts the `punktfunk-host` and `punktfunk-web` **systemd user services** (with linger,
@@ -102,7 +103,8 @@ When it finishes it prints the web-console URL and how to pair.
 > surface at all.
 
 > **First install — reboot once before streaming.** KWin only authorizes Desktop-mode screen capture
-> on a fresh session, and the new `input` group (native Steam Deck controller passthrough) only takes
+> on a fresh session, and the new `input` and `punktfunk` groups (native Steam Deck controller
+> passthrough) only take
 > effect on a new login — so after the **first** install, **reboot the Deck** (a re-run that changes
 > nothing doesn't need it). Streaming **Game Mode** with a generic Xbox pad works right away; **Desktop
 > capture and the native Steam Deck controller need the reboot.** If a client connects and every
@@ -126,6 +128,13 @@ On a trusted home LAN you can instead install with `--open` and skip pairing ent
 The installer generates a random console login password (printed at the end of step 2) and writes it
 to `~/.config/punktfunk/web.env`. To read it back or set your own, see
 [The Web Console](/docs/web-console#login-password).
+
+> **Installed before 0.25.0? Rotate that password once.** Older versions of the script created
+> `web.env` at the account's default umask, so the console password and session secret sat on disk
+> world-readable — any local account could read them. Re-running `install.sh` or `update.sh` now
+> tightens the file to `0600` and tells you it did, but a chmod cannot un-leak a secret that was
+> already readable. Change `PUNKTFUNK_UI_PASSWORD` in `~/.config/punktfunk/web.env`, then
+> `systemctl --user restart punktfunk-web`.
 
 ## 4. Verify
 
@@ -177,8 +186,11 @@ bash ~/punktfunk/scripts/steamdeck/update.sh --pull
 ```
 
 Drop `--pull` if you rsync source in yourself. `update.sh` also retrofits anything a newer installer
-adds — the plugin runner, the HDR gamescope, the atomic-update keep list, the rebuild check — onto an
-older install.
+adds — the plugin runner, the HDR gamescope, the atomic-update keep list, the rebuild check, the
+`punktfunk` group, and the `0600`/`0700` permissions on `~/.config/punktfunk` — onto an older
+install. You do **not** need to run the group or firewall commands from the release notes by hand on
+a Deck: the group is the script's job, and stock SteamOS runs no firewall for the port note to apply
+to. Rotating the console password after a pre-0.25.0 install is the one thing still on you (above).
 
 > **This install follows the canary channel.** An on-device source build tracks `main`, not stable
 > `vX.Y.Z` releases, so the console offers you the newest `main` build. See
@@ -247,7 +259,9 @@ rm -rf ~/.config/punktfunk
 And the installer may have seeded a KDE RemoteDesktop portal grant at
 `~/.local/share/flatpak/db/kde-authorized` (only if you had none); remove that file if nothing
 else on the device relies on it. Your `input` group membership is harmless to keep — drop it with
-`sudo gpasswd -d "$USER" input` if you'd rather not.
+`sudo gpasswd -d "$USER" input` if you'd rather not. The `punktfunk` group is worth actually
+dropping once the host is gone, because it can present emulated USB hardware and nothing else uses
+it: `sudo gpasswd -d "$USER" punktfunk`.
 
 See [Uninstalling](/docs/uninstall) for the other install methods and what each one leaves behind.
 
@@ -258,9 +272,14 @@ See [Uninstalling](/docs/uninstall) for the other install methods and what each 
 - **Keep the device awake.** On handhelds, Game Mode auto-suspends on idle, which drops the host off
   the network mid stream — disable auto-suspend (Settings → Power) for a headless host.
 - **Native Steam Deck controller passthrough** presents the client's pad as a real Steam Deck
-  controller (paddles, trackpads, gyro) via a virtual USB device — that needs the `input` group and the
+  controller (paddles, trackpads, gyro) via a virtual USB device — that needs the `input` **and
+  `punktfunk`** groups and the
   `vhci-hcd` module live, so it only works **after the first-install reboot** above; until then the pad
-  degrades to a generic Xbox 360 controller (still fully playable). If you're streaming *to* another
+  degrades to a generic Xbox 360 controller (still fully playable). The second group is separate on
+  purpose: it can present arbitrary emulated USB hardware, which is why it is not folded into the
+  `input` group every gamepad guide tells you to join. Check both with `id -nG`, and check the nodes
+  themselves with `ls -l /sys/devices/platform/vhci_hcd.0/attach` — group `punktfunk`, mode `0660`.
+  If you're streaming *to* another
   Steam Deck, also set Steam Input to **Off** for Punktfunk on that Deck — see
   [Stream to a Steam Deck](/docs/steam-deck).
 - **It survives OS updates — automatically.** SteamOS A/B updates rebuild `/etc` and can move
