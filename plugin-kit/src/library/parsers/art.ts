@@ -36,7 +36,10 @@ export const fileUrl = (p: string): string => {
  * re-hashed; newer ones serve from an unpredictable per-asset-hash path, where this 404s and the
  * client falls through to its next candidate. That degradation is intentional and pre-existing.
  */
-export const steamCdnUrl = (appid: number, kind: ArtKind): string | undefined => {
+export const steamCdnUrl = (
+	appid: number,
+	kind: ArtKind,
+): string | undefined => {
 	// A non-Steam shortcut's appid has the high bit set and is never a real store appid — the CDN
 	// would only 404, so don't emit a URL that is guaranteed to fail.
 	if ((appid & 0x8000_0000) !== 0) return undefined;
@@ -81,7 +84,12 @@ export const findLocalArtFile = (
 	}
 	// Older Steam wrote the files directly under `librarycache/` with the appid in the name.
 	for (const name of localFilenames(kind)) {
-		const flat = path.join(root, "appcache", "librarycache", `${appid}_${name}`);
+		const flat = path.join(
+			root,
+			"appcache",
+			"librarycache",
+			`${appid}_${name}`,
+		);
 		if (isFile(flat)) return flat;
 	}
 	return undefined;

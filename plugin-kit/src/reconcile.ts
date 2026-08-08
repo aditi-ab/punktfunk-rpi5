@@ -39,7 +39,9 @@ export interface ProviderClientService {
 	 * Remove every entry this provider owns **and release its store claim** (the explicit-uninstall
 	 * path). Releasing is what brings the host's built-in scanner back.
 	 */
-	readonly remove: (providerId: string) => Effect.Effect<void, HostRequestError>;
+	readonly remove: (
+		providerId: string,
+	) => Effect.Effect<void, HostRequestError>;
 }
 
 export class ProviderClient extends Context.Service<

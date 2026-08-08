@@ -45,9 +45,7 @@ describe("spike 2: client prefix through the console proxy", () => {
 		const captured: Array<string> = [];
 		class Api extends AtomHttpApi.Service<Api>()("SpikeApiPrepend", {
 			api,
-			httpClient: Layer.succeed(HttpClient.HttpClient)(
-				captureClient(captured),
-			),
+			httpClient: Layer.succeed(HttpClient.HttpClient)(captureClient(captured)),
 			transformClient: HttpClient.mapRequest(
 				HttpClientRequest.prependUrl(PREFIX),
 			),
@@ -66,9 +64,7 @@ describe("spike 2: client prefix through the console proxy", () => {
 		const captured: Array<string> = [];
 		class Api extends AtomHttpApi.Service<Api>()("SpikeApiBaseUrl", {
 			api,
-			httpClient: Layer.succeed(HttpClient.HttpClient)(
-				captureClient(captured),
-			),
+			httpClient: Layer.succeed(HttpClient.HttpClient)(captureClient(captured)),
 			baseUrl: PREFIX,
 		}) {}
 

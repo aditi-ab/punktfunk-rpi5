@@ -79,6 +79,13 @@ struct AVD3D11VADeviceContext {
     lock: *mut c_void,           // void (*)(void*)
     unlock: *mut c_void,         // void (*)(void*)
     lock_ctx: *mut c_void,
+    // DELIBERATELY TRUNCATED: FFmpeg >=8 appends `UINT BindFlags; UINT MiscFlags;` here, FFmpeg 7.1
+    // does not, and we build against both (Windows links the BtbN n7.1 tree, Linux the distro's 8 or
+    // 9). Mirroring only the common prefix is what makes one definition correct for all three —
+    // libav owns the allocation (av_hwdevice_ctx_alloc sizes it), and we only ever WRITE `device` at
+    // offset 0, so a short mirror can never read or write past what libav allocated. Adding the two
+    // flags to match 8/9 would silently mis-describe the 7.1 build we actually ship on Windows.
+    // The per-pool AVD3D11VAFramesContext.BindFlags below — which we DO set — exists in all three.
 }
 
 /// `AVD3D11VAFramesContext` (libavutil/hwcontext_d3d11va.h) — mirrored. `BindFlags`/`MiscFlags`
@@ -95,10 +102,17 @@ struct AVD3D11VAFramesContext {
 // Hand-written mirrors of libav's `AVD3D11VADeviceContext` / `AVD3D11VAFramesContext`
 // (hwcontext_d3d11va.h) — `ffmpeg-sys-next` binds neither, and we WRITE `device` / `bind_flags`
 // through them, so a wrong offset is silent corruption of libav's context rather than a compile
-// error. ⚠ These two structs are duplicated in the other crate that talks to the same libav
-// contexts (pf-encode's `ffmpeg_win.rs` and pf-client-core's `video_d3d11.rs`); they must agree
-// with libav AND with each other, and these assertions are what makes a drift in either a build
-// failure instead of a runtime mystery.
+// error.
+//
+// ⚠ KNOW WHAT THESE ASSERTIONS DO AND DO NOT BUY YOU. They pin OUR layout, not libav's, so they
+// turn an accidental edit to the structs above into a build failure — but nothing here reads
+// hwcontext_d3d11va.h, so a field libav inserts upstream still sails straight through, and a green
+// build is not evidence. Both layouts were therefore re-checked BY HAND against FFmpeg 7.1, 8.1.2
+// and 9.0 during the 8 -> 9 bump (2026-08-08): `AVD3D11VAFramesContext` is byte-identical in all
+// three, and `AVD3D11VADeviceContext` gained two trailing UINTs in 8 that 7.1 lacks — which is
+// exactly why the struct above stops at the common prefix. Re-check by hand on the next FFmpeg
+// major. (An older note here claimed these were duplicated in pf-client-core's `video_d3d11.rs`;
+// that copy went away with the client's FFmpeg in M10, so this is now the only definition.)
 const _: () = {
     use std::mem::{offset_of, size_of};
     type P = *mut c_void;

@@ -274,14 +274,41 @@ fn pw_thread(
                     chunk.clear();
                     let _ = ud.recycle.try_send(chunk);
                 }
+                // The graph asks for `requested` frames this cycle (one quantum, after
+                // rate-matching); the mapped buffer is sized for the WORST case — PipeWire's
+                // `quantum-limit`, 8192 frames ≈ 170 ms — not for this cycle. Filling to
+                // capacity queued ~170 ms per buffer downstream of the ring and, worse, taught
+                // the jitter policy that the device drains 170 ms per callback, which lifted
+                // the underrun floor (`want` + one frame) above any depth the A/V sync loop is
+                // allowed to ask for: audio sat a stable ~270 ms late and, by the continuity
+                // rule, sync was FORBIDDEN from draining it. Capacity is only the ceiling;
+                // `requested == 0` (no adapter suggestion) falls back to it.
+                let requested = usize::try_from(buffer.requested()).unwrap_or(0);
                 let stride = 4 * ud.channels; // F32LE interleaved
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
                 }
                 let data = &mut datas[0];
-                let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
+                let max_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
+                let want_frames = if requested > 0 {
+                    requested.min(max_frames)
+                } else {
+                    max_frames
+                };
                 let want = want_frames * ud.channels;
+                // Once per stream, in the shape of the host's per-capture-open quantum log:
+                // whether the graph's request or the buffer ceiling is sizing our writes is
+                // exactly what an on-glass latency report needs to say.
+                if ud.callbacks == 0 {
+                    tracing::info!(
+                        requested_frames = requested,
+                        capacity_frames = max_frames,
+                        write_frames = want_frames,
+                        write_ms = want_frames / 48,
+                        "audio playback quantum"
+                    );
+                }
 
                 // A/V sync: take whatever depth the decode thread's sync loop last asked for, and
                 // publish where the ring actually is so it can measure the result. The policy

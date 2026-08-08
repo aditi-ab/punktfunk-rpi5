@@ -6,12 +6,13 @@
 // appending launcher entries, serving `__config` so the console renders settings without the plugin
 // shipping an SPA, registering under `category: "library"` so it stays out of the nav, and the
 // standard CLI verbs.
-import type { PluginDef } from "@punktfunk/host";
+
 import * as fs from "node:fs";
-import { Duration, Effect, Layer, Schema, Stream } from "effect";
+import type { PluginDef } from "@punktfunk/host";
+import { Duration, Effect, type Schema, Stream } from "effect";
 import { type CliCommand, runPluginCli } from "../cli.js";
 import { type ConfigService, makeConfigService } from "../config.js";
-import { HostClient, PluginInfo } from "../host-client.js";
+import { HostClient, type PluginInfo } from "../host-client.js";
 import { ProviderClient, type ProviderClientService } from "../reconcile.js";
 import { definePluginKit, type PluginKitDef } from "../runtime.js";
 import { makeSyncEngine } from "../sync-engine.js";
@@ -103,8 +104,11 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 	const debounce = def.debounce ?? Duration.seconds(3);
 
 	/** The config service, built fresh wherever it is needed (it only requires `PluginInfo`). */
-	const config: Effect.Effect<ConfigService<S>, never, PluginInfo> =
-		makeConfigService({ schema: def.configSchema });
+	const config: Effect.Effect<
+		ConfigService<S>,
+		never,
+		PluginInfo
+	> = makeConfigService({ schema: def.configSchema });
 
 	/** Scan + launcher entries, in the order they should reach the host. */
 	const computeEntries = (
@@ -234,7 +238,8 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 				}),
 		},
 		scan: {
-			summary: "scan and print what WOULD be synced (--preview for the JSON entries)",
+			summary:
+				"scan and print what WOULD be synced (--preview for the JSON entries)",
 			// Also offline: the point is to debug a scanner against real launcher files without
 			// touching the host's library.
 			offline: true,
@@ -289,9 +294,9 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 					}
 					const baseline = yield* Effect.try({
 						try: () =>
-							JSON.parse(fs.readFileSync(compare as string, "utf8")) as ReturnType<
-								typeof fromHostEntry
-							>[],
+							JSON.parse(
+								fs.readFileSync(compare as string, "utf8"),
+							) as ReturnType<typeof fromHostEntry>[],
 						catch: (cause) => new Error(`cannot read ${compare}: ${cause}`),
 					});
 					const cfg = yield* (yield* config).load;
@@ -307,7 +312,8 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 				}),
 		},
 		uninstall: {
-			summary: "remove this source's games from the host and release its store claim",
+			summary:
+				"remove this source's games from the host and release its store claim",
 			run: () =>
 				Effect.gen(function* () {
 					const provider = yield* ProviderClient;

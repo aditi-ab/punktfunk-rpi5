@@ -2,12 +2,14 @@
 // matching the format the scripting runner journals (and what the previous hand-rolled
 // plugin loggers emitted), so kit-based plugins read consistently in
 // `journalctl --user -u punktfunk-scripting`.
-import { Cause, Layer, Logger } from "effect";
+import { Cause, type Layer, Logger } from "effect";
 
 const render = (message: unknown): string => {
 	if (typeof message === "string") return message;
 	if (Array.isArray(message)) return message.map(render).join(" ");
-	return typeof message === "object" ? JSON.stringify(message) : String(message);
+	return typeof message === "object"
+		? JSON.stringify(message)
+		: String(message);
 };
 
 /** Replace the default logger with the runner-journal format. */

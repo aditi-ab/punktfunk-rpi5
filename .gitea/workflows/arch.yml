@@ -173,6 +173,31 @@ jobs:
             makepkg -f -d --holdver
           ls -lh "$GITHUB_WORKSPACE/dist"
 
+      # The host must ship a VERSIONED libav soname dep, and nothing else in this pipeline proves
+      # it. packaging/arch/PKGBUILD lists bare `libavcodec.so` etc. and relies on makepkg rewriting
+      # each into `libavcodec.so=<soname>-<arch>` from the built binary's DT_NEEDED; if that
+      # rewrite ever stops happening — Arch dropping the soname `provides`, someone "tidying" the
+      # entries out of `depends`, a makepkg change — the dep silently degrades to an unversioned
+      # name that ANY ffmpeg satisfies. That is precisely the 2026-08-08 state in which `pacman
+      # -Syu` walked every Arch/CachyOS install across the FFmpeg 8 -> 9 soname bump and left the
+      # host unable to start (exit 127 before main(), restart loop). The failure is invisible in a
+      # green build and only shows up as a bricked box weeks later, so assert it here.
+      - name: Assert the host pins the FFmpeg soname
+        run: |
+          PKG="$(ls "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst | head -1)"
+          DEPS="$(bsdtar -xOf "$PKG" .PKGINFO | sed -n 's/^depend = //p')"
+          echo "$DEPS" | sed 's/^/  depend = /'
+          for lib in libavcodec libavutil; do
+            echo "$DEPS" | grep -qE "^$lib\.so=[0-9]+-[0-9]+$" || {
+              echo "::error::punktfunk-host declares no VERSIONED $lib.so dependency."
+              echo "::error::makepkg did not expand the bare soname from DT_NEEDED, so pacman can"
+              echo "::error::upgrade FFmpeg across a soname break and brick the install."
+              echo "::error::See the depends comment in packaging/arch/PKGBUILD."
+              exit 1
+            }
+          done
+          echo "OK: $(echo "$DEPS" | grep -E '^libav|^libsw' | tr '\n' ' ')"
+
       # The optional HDR gamescope companion (packaging/gamescope) — a separate pkgbase with a
       # completely different dependency set, published into the same repo so `pacman -S
       # punktfunk-gamescope` is all an Arch/SteamOS box needs for 10-bit BT.2020 PQ.

@@ -40,7 +40,10 @@ const readCStr = (buf: Uint8Array, c: Cursor): string | undefined => {
 /** Read a little-endian int32, advancing 4 bytes. `undefined` if fewer than 4 remain. */
 const readI32 = (buf: Uint8Array, c: Cursor): number | undefined => {
 	if (c.pos + 4 > buf.length) return undefined;
-	const v = new DataView(buf.buffer, buf.byteOffset + c.pos, 4).getInt32(0, true);
+	const v = new DataView(buf.buffer, buf.byteOffset + c.pos, 4).getInt32(
+		0,
+		true,
+	);
 	c.pos += 4;
 	return v;
 };
@@ -134,7 +137,7 @@ export const crc32 = (data: Uint8Array): number => {
 			crc = (crc >>> 1) ^ (0xedb8_8320 & mask);
 		}
 	}
-	return (~crc) >>> 0;
+	return ~crc >>> 0;
 };
 
 /**

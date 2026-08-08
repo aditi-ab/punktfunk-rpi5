@@ -45,6 +45,17 @@ if (Test-Path $rustup) {
 # signed DLLs in users' installs. The pins below were captured 2026-07-10 from the then-current
 # n7.1 lgpl-shared build. When BtbN re-rolls `latest`, this fetch FAILS CLOSED (hash mismatch) —
 # that is intentional: re-download, re-verify the new archive, and update the two pins here.
+#
+# STILL n7.1 AFTER THE 2026-08-08 ffmpeg-next 8 -> 9 BUMP, on purpose. A crate major is a CEILING,
+# not a target (ffmpeg-sys-next 9 spans libavcodec 56..63), so 7.1 keeps compiling; and Windows has
+# no exposure to the soname break that forced the bump, because these DLLs are BUNDLED into the
+# signed installer/MSIX rather than resolved from a system that can upgrade underneath them. BtbN
+# publishes no FFmpeg 9 build at all right now (`latest` carries n7.1 and n8.1 only), so matching
+# Arch is not even available. Moving this pin would swap the DLLs inside a code-signed installer and
+# re-qualify AMF/QSV encode on real Intel/AMD hardware, which is its own change with its own on-glass
+# pass — not a side effect of a Cargo bump. ⚠ One consequence to keep in mind while it stays here:
+# 7.1's `AVD3D11VADeviceContext` is two UINTs shorter than 8/9's, which is why the mirror in
+# crates/pf-encode/src/enc/windows/ffmpeg_win.rs deliberately stops at the common prefix.
 #   Refresh a pin:  (Get-FileHash .\ffmpeg-<tag>.zip -Algorithm SHA256).Hash
 function Get-BtbnFfmpeg {
   param([string]$Dir, [string]$ZipTag, [string]$Sha)   # ZipTag: 'win64' (x64); BtbN also publishes 'winarm64'

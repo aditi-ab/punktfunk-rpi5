@@ -5,23 +5,24 @@
 // and launches nothing. Where a Rust test exists, its assertions are carried over verbatim — the
 // per-plugin parity harness (design M5) then checks the whole pipeline against a live host, but
 // these catch a drift long before that.
-import { describe, expect, test } from "bun:test";
+
 import { Database } from "bun:sqlite";
+import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
 	confinedJoin,
 	crc32,
+	fileUrl,
 	findGridArtFile,
 	findLocalArtFile,
-	fileUrl,
 	gridFilenames,
 	isSteamTool,
-	withReadOnlyDb,
 	openReadOnly,
 	parseAppManifest,
 	parseRegQuery,
+	parseRegSubKeys,
 	parseShortcuts,
 	readTextCapped,
 	shortcutAppId,
@@ -29,6 +30,7 @@ import {
 	steamCdnUrl,
 	vdfPaths,
 	vdfValue,
+	withReadOnlyDb,
 } from "../src/library/parsers/index.js";
 
 const tmp = (name: string): string => {
@@ -85,7 +87,9 @@ describe("text VDF / ACF", () => {
 	});
 
 	test("isSteamTool keeps runtimes out of a game library", () => {
-		expect(isSteamTool(228980, "Steamworks Common Redistributables")).toBe(true);
+		expect(isSteamTool(228980, "Steamworks Common Redistributables")).toBe(
+			true,
+		);
 		expect(isSteamTool(1628350, "Steam Linux Runtime 3.0 (sniper)")).toBe(true);
 		expect(isSteamTool(999, "Proton 9.0")).toBe(true);
 		expect(isSteamTool(999, "SteamVR")).toBe(true);
@@ -109,7 +113,12 @@ describe("binary shortcuts.vdf", () => {
 			parts.push(0);
 		};
 		const i32 = (v: number) => {
-			parts.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff);
+			parts.push(
+				v & 0xff,
+				(v >>> 8) & 0xff,
+				(v >>> 16) & 0xff,
+				(v >>> 24) & 0xff,
+			);
 		};
 		parts.push(0x00);
 		cstr("shortcuts");
@@ -205,9 +214,13 @@ describe("path confinement", () => {
 			path.join(base, "bin", "game.exe"),
 		);
 		// The three shapes a crafted goggame-*.info would use to point elsewhere.
-		expect(confinedJoin(base, "../../windows/system32/cmd.exe")).toBeUndefined();
+		expect(
+			confinedJoin(base, "../../windows/system32/cmd.exe"),
+		).toBeUndefined();
 		expect(confinedJoin(base, "/etc/passwd")).toBeUndefined();
-		expect(confinedJoin(base, "C:\\Windows\\system32\\cmd.exe")).toBeUndefined();
+		expect(
+			confinedJoin(base, "C:\\Windows\\system32\\cmd.exe"),
+		).toBeUndefined();
 		expect(confinedJoin(base, "")).toBeUndefined();
 	});
 });
@@ -237,8 +250,14 @@ describe("art locations", () => {
 
 	test("grid filenames follow Steam's per-kind naming", () => {
 		expect(gridFilenames(570, "portrait")).toEqual(["570p.png", "570p.jpg"]);
-		expect(gridFilenames(570, "hero")).toEqual(["570_hero.png", "570_hero.jpg"]);
-		expect(gridFilenames(570, "logo")).toEqual(["570_logo.png", "570_logo.jpg"]);
+		expect(gridFilenames(570, "hero")).toEqual([
+			"570_hero.png",
+			"570_hero.jpg",
+		]);
+		expect(gridFilenames(570, "logo")).toEqual([
+			"570_logo.png",
+			"570_logo.jpg",
+		]);
 		expect(gridFilenames(570, "header")).toEqual(["570.png", "570.jpg"]);
 	});
 
@@ -307,8 +326,12 @@ describe("openReadOnly", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-kit-sqlite-"));
 		const file = path.join(dir, "pga.db");
 		const seed = new Database(file);
-		seed.run("CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, installed INT)");
-		seed.run("INSERT INTO games (id, name, installed) VALUES (1, 'Ubisoft Connect', 1)");
+		seed.run(
+			"CREATE TABLE games (id INTEGER PRIMARY KEY, name TEXT, installed INT)",
+		);
+		seed.run(
+			"INSERT INTO games (id, name, installed) VALUES (1, 'Ubisoft Connect', 1)",
+		);
 		seed.close();
 		try {
 			return use(file);
@@ -321,9 +344,9 @@ describe("openReadOnly", () => {
 		withDb((file) => {
 			const db = openReadOnly(file);
 			expect(db).toBeDefined();
-			expect(db?.query("SELECT id, name FROM games WHERE installed = 1")).toEqual([
-				{ id: 1, name: "Ubisoft Connect" },
-			]);
+			expect(
+				db?.query("SELECT id, name FROM games WHERE installed = 1"),
+			).toEqual([{ id: 1, name: "Ubisoft Connect" }]);
 			db?.close();
 		});
 	});
@@ -337,7 +360,9 @@ describe("openReadOnly", () => {
 		seed.run("INSERT INTO games (id) VALUES (7)");
 		seed.close();
 		try {
-			expect(openReadOnly(file)?.query("SELECT id FROM games")).toEqual([{ id: 7 }]);
+			expect(openReadOnly(file)?.query("SELECT id FROM games")).toEqual([
+				{ id: 7 },
+			]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -345,16 +370,20 @@ describe("openReadOnly", () => {
 
 	test("withReadOnlyDb reads, then closes", () => {
 		withDb((file) => {
-			expect(withReadOnlyDb(file, (h) => h.query("SELECT name FROM games"))).toEqual([
-				{ name: "Ubisoft Connect" },
-			]);
+			expect(
+				withReadOnlyDb(file, (h) => h.query("SELECT name FROM games")),
+			).toEqual([{ name: "Ubisoft Connect" }]);
 		});
 	});
 
 	// The "not installed" contract — an absent file is `undefined`, never a throw.
 	test("absent file is undefined, not an error", () => {
-		expect(openReadOnly(path.join(os.tmpdir(), "pf-kit-nope", "pga.db"))).toBeUndefined();
-		expect(withReadOnlyDb(path.join(os.tmpdir(), "pf-kit-nope", "pga.db"), () => 1)).toBeUndefined();
+		expect(
+			openReadOnly(path.join(os.tmpdir(), "pf-kit-nope", "pga.db")),
+		).toBeUndefined();
+		expect(
+			withReadOnlyDb(path.join(os.tmpdir(), "pf-kit-nope", "pga.db"), () => 1),
+		).toBeUndefined();
 	});
 
 	// Schema drift degrades to no rows rather than taking the plugin down.
@@ -364,5 +393,70 @@ describe("openReadOnly", () => {
 			expect(db?.query("SELECT missing_column FROM games")).toEqual([]);
 			db?.close();
 		});
+	});
+});
+
+// Subkey enumeration, against the output reg.exe ACTUALLY prints.
+//
+// This had no coverage and was broken end to end: it matched lines against the abbreviated
+// `HKLM\…` prefix it was handed, but reg.exe echoes `HKEY_LOCAL_MACHINE\…`. Nothing ever matched,
+// so it returned [] on every machine, and the GOG plugin — its only consumer — reported "no games
+// installed" rather than failing. Caught on hardware by the parity gate: the host's built-in
+// scanner found IRON NEST, the plugin found nothing.
+//
+// The fixture is the verbatim output from .173 (a blank line, then one subkey row).
+describe("parseRegSubKeys", () => {
+	const KEY = "HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games";
+
+	test("returns subkey NAMES from real reg.exe output", () => {
+		const stdout = [
+			"",
+			"HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\GOG.com\\Games\\2013434102",
+			"",
+		].join("\r\n");
+		// The name is the GOG product id, and the consumer composes `${KEY}\\${name}`.
+		expect(parseRegSubKeys(stdout, KEY)).toEqual(["2013434102"]);
+	});
+
+	test("several subkeys, in order", () => {
+		const base = "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\GOG.com\\Games";
+		const stdout = ["", `${base}\\1207658930`, `${base}\\2013434102`].join(
+			"\r\n",
+		);
+		expect(parseRegSubKeys(stdout, KEY)).toEqual(["1207658930", "2013434102"]);
+	});
+
+	// reg.exe /s output nests deeper; only immediate children are subkeys of this key.
+	test("ignores grandchildren", () => {
+		const base = "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\GOG.com\\Games";
+		const stdout = [
+			"",
+			`${base}\\2013434102`,
+			`${base}\\2013434102\\tasks`,
+		].join("\r\n");
+		expect(parseRegSubKeys(stdout, KEY)).toEqual(["2013434102"]);
+	});
+
+	// The queried key itself is echoed as a header when it has values; it is not its own subkey.
+	test("does not return the queried key itself", () => {
+		const stdout = [
+			"",
+			"HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\GOG.com\\Games",
+			"",
+		].join("\r\n");
+		expect(parseRegSubKeys(stdout, KEY)).toEqual([]);
+	});
+
+	test("case-insensitive on the hive and path", () => {
+		const stdout =
+			"hkey_local_machine\\software\\wow6432node\\gog.com\\games\\42";
+		expect(parseRegSubKeys(stdout, KEY)).toEqual(["42"]);
+	});
+
+	test("no subkeys is empty, not a throw", () => {
+		expect(parseRegSubKeys("", KEY)).toEqual([]);
+		expect(
+			parseRegSubKeys("ERROR: The system was unable to find...", KEY),
+		).toEqual([]);
 	});
 });

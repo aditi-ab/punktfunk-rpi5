@@ -13,7 +13,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import {
-	Cause,
 	type Duration,
 	Effect,
 	Exit,
@@ -40,7 +39,11 @@ export interface LastSync {
 }
 
 export type SyncOutcome<Report> =
-	| { readonly _tag: "Applied"; readonly report: Report; readonly count: number }
+	| {
+			readonly _tag: "Applied";
+			readonly report: Report;
+			readonly count: number;
+	  }
 	| { readonly _tag: "Unchanged"; readonly report: Report }
 	| { readonly _tag: "AlreadyRunning" };
 
@@ -278,8 +281,6 @@ export const makeSyncEngine = <
 			status,
 			changes: Stream.fromPubSub(hub),
 			start: safeSync("startup").pipe(Effect.andThen(startLoops)),
-			reconfigure: startLoops.pipe(
-				Effect.andThen(safeSync("config-change")),
-			),
+			reconfigure: startLoops.pipe(Effect.andThen(safeSync("config-change"))),
 		} satisfies SyncEngine<Report>;
 	});

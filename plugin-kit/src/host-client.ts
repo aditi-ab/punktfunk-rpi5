@@ -21,14 +21,13 @@ export interface HostClientService {
 	readonly facade: Punktfunk;
 }
 
-export class HostClient extends Context.Service<HostClient, HostClientService>()(
-	"@punktfunk/plugin-kit/HostClient",
-) {}
+export class HostClient extends Context.Service<
+	HostClient,
+	HostClientService
+>()("@punktfunk/plugin-kit/HostClient") {}
 
 /** Wrap the facade the runner hands to `main` (or `connect()` in the CLI/dev paths). */
-export const hostClientFromFacade = (
-	pf: Punktfunk,
-): Layer.Layer<HostClient> =>
+export const hostClientFromFacade = (pf: Punktfunk): Layer.Layer<HostClient> =>
 	Layer.succeed(HostClient)({
 		request: (method, path, body) =>
 			Effect.tryPromise({
@@ -44,9 +43,10 @@ export interface PluginInfoService {
 	readonly version?: string;
 }
 
-export class PluginInfo extends Context.Service<PluginInfo, PluginInfoService>()(
-	"@punktfunk/plugin-kit/PluginInfo",
-) {}
+export class PluginInfo extends Context.Service<
+	PluginInfo,
+	PluginInfoService
+>()("@punktfunk/plugin-kit/PluginInfo") {}
 
 export const pluginInfoLayer = (
 	info: PluginInfoService,

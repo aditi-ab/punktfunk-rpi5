@@ -55,9 +55,10 @@ const databaseCandidates = (): string[] => {
 };
 
 const findDatabase = (cfg: { databasePath?: string }): string | undefined =>
-	[...(cfg.databasePath ? [cfg.databasePath] : []), ...databaseCandidates()].find(
-		isFile,
-	);
+	[
+		...(cfg.databasePath ? [cfg.databasePath] : []),
+		...databaseCandidates(),
+	].find(isFile);
 
 /**
  * `<kind>/<slug>.jpg` across the current, legacy-cache and Flatpak Lutris roots.

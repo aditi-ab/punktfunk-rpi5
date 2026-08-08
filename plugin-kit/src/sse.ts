@@ -2,7 +2,7 @@
 // beta.99), so the status feed is a raw HttpRouter route beside the HttpApi contract —
 // same wire shape the first-generation plugins used (`event: <name>` frames + comment
 // pings), which is already proven through the console's reverse proxy.
-import { Effect, Layer, Schedule, Stream } from "effect";
+import { Effect, type Layer, Schedule, Stream } from "effect";
 import { HttpRouter, HttpServerResponse } from "effect/unstable/http";
 
 const encoder = new TextEncoder();

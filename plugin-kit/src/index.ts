@@ -1,5 +1,18 @@
 // @punktfunk/plugin-kit — Effect-based framework for punktfunk plugins.
+
+export { type CacheStore, makeCacheStore } from "./cache-store.js";
+export { type CliCommand, runPluginCli } from "./cli.js";
+export { type ConfigService, makeConfigService } from "./config.js";
 export * from "./errors.js";
+export {
+	HostClient,
+	type HostClientService,
+	hostClientFromFacade,
+	PluginInfo,
+	type PluginInfoService,
+	pluginInfoLayer,
+} from "./host-client.js";
+export { loggingLayer } from "./logging.js";
 export {
 	atomicWriteFile,
 	ensureStateDir,
@@ -7,17 +20,6 @@ export {
 	pluginStateDir,
 	statePath,
 } from "./paths.js";
-export {
-	HostClient,
-	hostClientFromFacade,
-	type HostClientService,
-	PluginInfo,
-	pluginInfoLayer,
-	type PluginInfoService,
-} from "./host-client.js";
-export { loggingLayer } from "./logging.js";
-export { type ConfigService, makeConfigService } from "./config.js";
-export { type CacheStore, makeCacheStore } from "./cache-store.js";
 export {
 	Artwork,
 	DetectHint,
@@ -33,6 +35,7 @@ export {
 	type PluginKitDef,
 	runPluginKitDirect,
 } from "./runtime.js";
+export { type SseRouteOptions, sseRoute } from "./sse.js";
 export {
 	type LastSync,
 	makeSyncEngine,
@@ -47,9 +50,7 @@ export {
 	deriveConfigJsonSchema,
 	httpApiEnv,
 	makeConfigHandler,
-	serveUi,
 	type ServeUiConfig,
 	type ServeUiOptions,
+	serveUi,
 } from "./ui-server.js";
-export { sseRoute, type SseRouteOptions } from "./sse.js";
-export { type CliCommand, runPluginCli } from "./cli.js";

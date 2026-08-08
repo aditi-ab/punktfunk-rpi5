@@ -66,6 +66,13 @@ jobs:
           test -f node_modules/@punktfunk/host/package.json
           test -f node_modules/@punktfunk/host/dist/index.d.ts
 
+      # The kit had no biome config and no lint step, while every plugin repo that consumes it does
+      # — so its source drifted (unused imports, formatting) with nothing to catch it. Now gated
+      # here, on the same config and pinned biome version the plugins use.
+      - name: Lint & format
+        working-directory: plugin-kit
+        run: bun run check
+
       - name: Typecheck
         working-directory: plugin-kit
         run: bun run typecheck
