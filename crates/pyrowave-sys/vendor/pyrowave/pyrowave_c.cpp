@@ -1196,6 +1196,17 @@ pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_packet *packets, s
 	return PYROWAVE_SUCCESS;
 }
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0007-encoder-sequence-override.patch), not upstream.
+pyrowave_result
+pyrowave_encoder_set_next_sequence(pyrowave_encoder encoder, uint32_t sequence)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!encoder)
+		return PYROWAVE_ERROR_GENERIC;
+	encoder->encoder.set_next_sequence(sequence);
+	return PYROWAVE_SUCCESS;
+}
+
 void pyrowave_encoder_destroy(pyrowave_encoder encoder)
 {
 	auto *device = encoder->device;
