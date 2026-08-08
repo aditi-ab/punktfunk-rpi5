@@ -27,6 +27,7 @@ mod heads;
 mod splash;
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
+    gamescope_can_composite_external_overlay, gamescope_can_offer_refresh_rates,
     gamescope_node_present, poll_managed_node, wait_for_node,
 };
 pub(crate) use discovery::{
@@ -1153,22 +1154,112 @@ fn gamescope_argvs() -> Vec<Vec<String>> {
 /// also the final filter that separates a compositor from anything else [`gamescope_argvs`] let by.
 fn current_gamescope_output_size() -> Option<(u32, u32)> {
     gamescope_argvs().into_iter().find_map(|args| {
-        let flag = |names: &[&str]| -> Option<u32> {
-            args.iter().enumerate().find_map(|(i, a)| {
-                names
-                    .contains(&a.as_str())
-                    .then(|| args.get(i + 1).and_then(|v| v.parse().ok()))
-                    .flatten()
-            })
-        };
         match (
-            flag(&["-W", "--output-width"]),
-            flag(&["-H", "--output-height"]),
+            argv_u32(&args, &["-W", "--output-width"]),
+            argv_u32(&args, &["-H", "--output-height"]),
         ) {
             (Some(w), Some(h)) => Some((w, h)),
             _ => None,
         }
     })
+}
+
+/// The numeric value following the first of `names` present in `argv`. Pure + unit-tested — it is
+/// the shared reader behind both the output-size probe above and the mode verification below.
+fn argv_u32(argv: &[String], names: &[&str]) -> Option<u32> {
+    argv.iter().enumerate().find_map(|(i, a)| {
+        names
+            .contains(&a.as_str())
+            .then(|| argv.get(i + 1).and_then(|v| v.parse().ok()))
+            .flatten()
+    })
+}
+
+/// Did the MODE we asked an indirectly-spawned session for actually reach its gamescope?
+///
+/// [`verify_managed_spawn_flags`] answers the same question for the capability flags and REFUSES
+/// the session when they are missing, because the retry then resolves a different (correct) plan.
+/// The mode has no such recovery: relaunching would hand the session the exact same environment and
+/// lose it the same way, so refusing would only loop. It is not silent either, though — and it used
+/// to be, in the way that costs the most:
+///
+/// `--nested-refresh` is the ONLY refresh a headless gamescope has. `CHeadlessBackend::Init`
+/// assigns `g_nOutputRefresh = g_nNestedRefresh`, defaulting to **60 Hz** when the flag is absent,
+/// and that one number is what the session composites at, what `vblankmanager` paces to, and what
+/// Steam and every game are told the display runs at. It reaches a `gamescope-session-plus` only
+/// through the `GAMESCOPE_BIN` wrapper — which the session script is free to lose (a `sessions.d`
+/// file sourced with `set -a` can reassign `GAMESCOPE_BIN`; one that sets `GAMESCOPECMD` outright
+/// skips the whole builder). When that happened the stream still ran, still looked right, and still
+/// showed the client's own fps counter at the negotiated rate — because the encode loop repeats the
+/// held frame — while the game underneath was capped to 60. Field report 2026-08-08.
+///
+/// So: warn, name the numbers, and carry on. Same "any running gamescope carrying it" rule as the
+/// flag check, and the same silence when `/proc` cannot be read.
+fn warn_if_mode_lost(mode: Mode, want_hz: u32) {
+    let argvs = gamescope_argvs();
+    let lost = mode_mismatch(mode.width, mode.height, want_hz, &argvs);
+    if lost.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        lost = %lost.join(", "),
+        "gamescope: the session did not start at the mode we asked for — the session script \
+         dropped GAMESCOPE_BIN / SCREEN_WIDTH / SCREEN_HEIGHT. A headless gamescope reports \
+         `--nested-refresh` as its ONE refresh rate (60 Hz when the flag never arrives), so games \
+         and Steam will believe the display runs at that rate however fast the stream is. Install \
+         punktfunk-gamescope, or check /etc/gamescope-session-plus/sessions.d/ for a file that \
+         overrides GAMESCOPE_BIN or sets GAMESCOPECMD"
+    );
+}
+
+/// Which parts of the requested mode no running gamescope was started with, as human-readable
+/// `asked=…, got=…` fragments. Empty when it matches — or when there is nothing to compare against,
+/// which is the same fail-open rule [`missing_flags`] has and for the same reason. Pure +
+/// unit-tested.
+fn mode_mismatch(want_w: u32, want_h: u32, want_hz: u32, argvs: &[Vec<String>]) -> Vec<String> {
+    if argvs.is_empty() {
+        return Vec::new();
+    }
+    let mut lost = Vec::new();
+    let sizes: Vec<(u32, u32)> = argvs
+        .iter()
+        .filter_map(|a| {
+            Some((
+                argv_u32(a, &["-W", "--output-width"])?,
+                argv_u32(a, &["-H", "--output-height"])?,
+            ))
+        })
+        .collect();
+    // No gamescope carries an output size at all → we cannot tell ours apart from a nested one;
+    // stay quiet rather than warn on every box that runs a second gamescope.
+    if !sizes.is_empty() && !sizes.contains(&(want_w, want_h)) {
+        lost.push(format!(
+            "resolution asked={want_w}x{want_h}, got={}",
+            sizes
+                .iter()
+                .map(|(w, h)| format!("{w}x{h}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    let rates: Vec<u32> = argvs
+        .iter()
+        .filter_map(|a| argv_u32(a, &["-r", "--nested-refresh"]))
+        .collect();
+    if !rates.contains(&want_hz) {
+        lost.push(match rates.as_slice() {
+            // The flag is absent everywhere — the exact shape that silently yields 60 Hz.
+            [] => format!(
+                "refresh asked={want_hz}Hz, got=no --nested-refresh at all (gamescope defaults to \
+                 60Hz headless)"
+            ),
+            got => format!(
+                "refresh asked={want_hz}Hz, got={}Hz",
+                got.iter().map(u32::to_string).collect::<Vec<_>>().join("/")
+            ),
+        });
+    }
+    lost
 }
 
 /// Did the flags we passed an INDIRECTLY-spawned session actually reach its gamescope?
@@ -2337,12 +2428,29 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
     let wrapper = write_gamescope_bin_wrapper()?;
     stop_session(unit_name); // clear any stale unit + relay so a relaunch is clean
     let hz = mode.refresh_hz.max(1);
-    // The two rates are deliberately different when the frame limiter is set. CUSTOM_REFRESH_RATES
-    // generates the mode the session ADVERTISES, which must stay the client's — that is what makes
-    // games see the real refresh instead of the box's EDID. PF_HZ becomes `--nested-refresh`, the
-    // rate the game is clamped to, and is the only one the limiter touches. Identical when it's
-    // unset, which is the default.
+    // ONE rate reaches gamescope, and it is `--nested-refresh` (via the wrapper's `PF_HZ`). On the
+    // headless backend that flag IS the output refresh — `CHeadlessBackend::Init` assigns
+    // `g_nOutputRefresh = g_nNestedRefresh` — so it is simultaneously the rate the session
+    // composites at, the rate `vblankmanager` paces to, and the rate Steam and every game are told
+    // the display runs at. When the frame limiter (`PUNKTFUNK_MAX_FPS`) is set they all drop
+    // together; that is the trade the knob is, and it is off by default.
+    //
+    // `CUSTOM_REFRESH_RATES` below does NOT do this, whatever its name suggests: it is the *set* of
+    // rates the session may offer, and `gamescope-session-plus` gates it on the binary having
+    // `--custom-refresh-rates`, which no upstream gamescope has ever had. On a stock gamescope it
+    // is inert (it was a silent no-op for years); on our `+pfhdr3` build it is what puts more than
+    // one entry in Steam's refresh menu. Either way it cannot fix a wrong `--nested-refresh`.
     let game = game_hz(mode.refresh_hz);
+    // The advertised SET, which always contains the rate we actually run at.
+    let offered = {
+        let mut r = pf_host_config::config().gamescope_refresh_rates.clone();
+        if !r.contains(&hz) {
+            r.push(hz);
+        }
+        r.sort_unstable();
+        r.dedup();
+        r.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+    };
     let start_unit = || -> Result<()> {
         let status = Command::new("systemd-run")
             .args(["--user", "--collect", &format!("--unit={unit_name}")])
@@ -2366,7 +2474,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             ))
             .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
             .arg("--setenv=DRM_MODE=cvt")
-            .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
+            .arg(format!("--setenv=CUSTOM_REFRESH_RATES={offered}"))
             .arg("--")
             .arg(SESSION_PLUS_BIN)
             .arg(client)
@@ -2394,6 +2502,9 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
                 stop_session(unit_name);
                 return Err(e);
             }
+            // Loud, but not fatal — see [`warn_if_mode_lost`] for why this one warns where the
+            // capability flags above refuse.
+            warn_if_mode_lost(mode, game);
             return Ok(id);
         }
         if Instant::now() >= deadline {
@@ -2526,7 +2637,15 @@ fn add_bare_gamescope_args(
     if grab_cursor {
         command.arg("--force-grab-cursor");
     }
-    for arg in hdr_args(hdr).into_iter().chain(cursor_args()) {
+    // `-r` above is what this headless session will REPORT as its refresh (the headless backend
+    // assigns `g_nOutputRefresh = g_nNestedRefresh`), so it is already correct here. This adds the
+    // rest of the SET the in-session UI may offer — the bare spawn passes it directly, with none of
+    // the session-script indirection the managed path has to route it through.
+    for arg in hdr_args(hdr)
+        .into_iter()
+        .chain(cursor_args())
+        .chain(refresh_rate_args(hz))
+    {
         command.arg(arg);
     }
     command.args(["--xwayland-count", "1", "--"]);
@@ -2571,11 +2690,48 @@ fn hdr_args(hdr: bool) -> Vec<String> {
 /// host-side (it costs the host a full-frame pass, and on the zero-CSC encode source it cannot be
 /// done at all). Empty on a stock gamescope, which is exactly the old behaviour.
 fn cursor_args() -> Vec<String> {
+    let mut args = Vec::new();
     if gamescope_can_composite_cursor() {
-        vec!["--pipewire-composite-cursor".to_string()]
-    } else {
-        Vec::new()
+        args.push("--pipewire-composite-cursor".to_string());
     }
+    // The external overlay (mangoapp — the Deck UI's fps/frametime readout, patch level 4+). Unlike
+    // the cursor there is no host-side fallback: the host cannot reconstruct another process's
+    // overlay window, so without this the layer is simply absent from every gamescope stream.
+    if gamescope_can_composite_external_overlay() {
+        args.push("--pipewire-composite-external-overlay".to_string());
+    }
+    args
+}
+
+/// `--custom-refresh-rates <list>` when the resolved gamescope has it (patch level 3+): the rates a
+/// HEADLESS session may offer its clients.
+///
+/// Without it a headless connector advertises exactly one rate, so Steam's in-session display
+/// settings show a single entry and a game reads the display as that one number. `session_hz` is
+/// always in the list — it is the mode the session actually runs at, and an advertised set that
+/// excluded it would be a lie in the other direction.
+///
+/// The operator can widen the set (`PUNKTFUNK_GAMESCOPE_REFRESH_RATES=60,90,120`) so the in-session
+/// UI offers real choices; unset, we advertise the one rate we run at, which is what the client
+/// asked for.
+fn refresh_rate_args(session_hz: u32) -> Vec<String> {
+    if !gamescope_can_offer_refresh_rates() {
+        return Vec::new();
+    }
+    let mut rates = pf_host_config::config().gamescope_refresh_rates.clone();
+    if !rates.contains(&session_hz) {
+        rates.push(session_hz);
+    }
+    rates.sort_unstable();
+    rates.dedup();
+    vec![
+        "--custom-refresh-rates".to_string(),
+        rates
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    ]
 }
 
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
@@ -2717,7 +2873,7 @@ mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
         display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
-        is_steam_launch, missing_flags, nested_wrapper_script, sentinel_advanced,
+        is_steam_launch, missing_flags, mode_mismatch, nested_wrapper_script, sentinel_advanced,
         shape_dedicated_command,
     };
 
@@ -2947,6 +3103,63 @@ mod tests {
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-gamescope.service"
         ));
         assert!(!cgroup_is_punktfunk_owned(""));
+    }
+
+    /// The silent-60Hz guard. A headless gamescope reports `--nested-refresh` as its ONE refresh
+    /// rate and falls back to 60 Hz when the flag never arrives, so a session that lost the
+    /// `GAMESCOPE_BIN` wrapper streams at the client's rate while telling every game it is 60 —
+    /// the exact shape of the 2026-08-08 field report, and invisible without this.
+    #[test]
+    fn mode_mismatch_names_what_the_session_actually_got() {
+        let argv = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
+
+        // The good case: our own managed spawn, carrying everything we asked for.
+        let ok = vec![argv(
+            "/usr/bin/gamescope --backend headless -W 1920 -H 1080 --nested-refresh 120 --steam",
+        )];
+        assert!(mode_mismatch(1920, 1080, 120, &ok).is_empty());
+
+        // THE field case: the wrapper was dropped, so there is no `--nested-refresh` anywhere and
+        // gamescope silently ran its 60 Hz default. Size still landed (SCREEN_WIDTH survived).
+        let lost = vec![argv(
+            "/usr/bin/gamescope --backend headless -W 1920 -H 1080 --steam",
+        )];
+        let got = mode_mismatch(1920, 1080, 120, &lost);
+        assert_eq!(got.len(), 1, "only the refresh is wrong: {got:?}");
+        assert!(got[0].contains("asked=120Hz"), "{got:?}");
+        assert!(got[0].contains("no --nested-refresh at all"), "{got:?}");
+
+        // A wrong rate is reported with the number it actually got, not just "missing".
+        let wrong = vec![argv("gamescope -W 1920 -H 1080 --nested-refresh 60")];
+        let got = mode_mismatch(1920, 1080, 120, &wrong);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("got=60Hz"), "{got:?}");
+
+        // Resolution lost too (SCREEN_WIDTH/HEIGHT dropped as well) — both are named.
+        let both = vec![argv("gamescope -W 1280 -H 720")];
+        assert_eq!(mode_mismatch(1920, 1080, 120, &both).len(), 2);
+
+        // Fail OPEN, exactly like `missing_flags`: nothing to compare against says nothing. A box
+        // with a second gamescope that carries no output size must not produce a false alarm.
+        assert!(mode_mismatch(1920, 1080, 120, &[]).is_empty());
+
+        // ANY running gamescope carrying the mode satisfies it — a Deck commonly runs a nested one
+        // beside the session, and demanding that every gamescope match would reject a good session.
+        let two = vec![
+            argv("gamescope -W 1280 -H 800 --nested-refresh 60"),
+            argv("gamescope -W 1920 -H 1080 --nested-refresh 120"),
+        ];
+        assert!(mode_mismatch(1920, 1080, 120, &two).is_empty());
+
+        // The long spellings are read too.
+        let long = vec![argv(
+            "gamescope --output-width 1920 --output-height 1080 --nested-refresh 120",
+        )];
+        assert!(mode_mismatch(1920, 1080, 120, &long).is_empty());
+
+        // A flag with no value after it must not panic or read past the end.
+        let truncated = vec![argv("gamescope -W 1920 -H 1080 --nested-refresh")];
+        assert_eq!(mode_mismatch(1920, 1080, 120, &truncated).len(), 1);
     }
 
     /// The silent-cursor guard: a managed session that ignored `GAMESCOPE_BIN` / the PATH shim runs

@@ -449,6 +449,34 @@ pub(crate) fn gamescope_can_composite_cursor() -> bool {
     gamescope_patch_level() >= 2 && !flags_lost()
 }
 
+/// Does the resolved gamescope let us hand a headless session the list of refresh rates it may
+/// offer (`--custom-refresh-rates`)?
+///
+/// Below this level a headless gamescope advertises **one** rate — whatever `--nested-refresh`
+/// resolved to, or its own 60 Hz default — and no resolution list at all, because its connector
+/// returns empty spans from `GetModes()`/`GetValidDynamicRefreshRates()` and reports an INTERNAL
+/// screen (which makes `update_mode_atoms` delete the mode-list atom outright). So on a stock
+/// gamescope, Steam's in-session display settings show exactly one refresh rate and no
+/// resolutions, and games read the display as 60 Hz whatever the client negotiated.
+///
+/// `gamescope-session-plus` has probed for this flag for years (`CUSTOM_REFRESH_RATES` is gated on
+/// `gamescope --help` mentioning it) — upstream simply never had it, so the env var it plumbs was
+/// a no-op everywhere.
+pub(crate) fn gamescope_can_offer_refresh_rates() -> bool {
+    gamescope_patch_level() >= 3 && !flags_lost()
+}
+
+/// Can the resolved gamescope paint the EXTERNAL OVERLAY — mangoapp, the Deck-UI fps/frametime
+/// readout — into its PipeWire node (`--pipewire-composite-external-overlay`)?
+///
+/// `paint_pipewire` has never referenced that layer on any upstream version, so a client whose
+/// only view of the session is the node sees the overlay it just enabled simply not appear.
+/// Unlike the cursor there is no host-side substitute: the host cannot reconstruct someone else's
+/// overlay window.
+pub(crate) fn gamescope_can_composite_external_overlay() -> bool {
+    gamescope_patch_level() >= 4 && !flags_lost()
+}
+
 /// Has a spawn been observed where our flags did NOT reach the gamescope process?
 ///
 /// The binary probe above answers "can it", which is all the bare spawn needs — there we build
