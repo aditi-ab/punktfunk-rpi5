@@ -420,10 +420,29 @@ jobs:
           # A rebuild bumps pkgrel, so its FILENAMES differ from the ones already attached, and
           # upsert_asset only replaces by name — the superseded set would survive untouched.
           # Drop every pacman asset (and .sha256 sidecar) this upload did not just write.
+          #
+          # ⚠⚠ THIS MUST LIVE IN THE WORKFLOW, NOT IN scripts/ci/gitea-release.sh. The sourced
+          # script comes from the CHECKED-OUT TREE, which on a release rebuild is the OLD TAG —
+          # so it can only ever offer the helpers that existed when that tag was cut. A helper
+          # added for this feature is therefore guaranteed ABSENT in the one code path that
+          # calls it: the first attempt failed with `prune_release_assets: command not found`
+          # after publishing perfectly. Only the workflow file itself is taken from the ref you
+          # dispatch. Same reason a packaging fix made after a tag does NOT reach a rebuild of
+          # that tag — the PKGBUILD is the tag's too.
           if [ -n "${RELEASE_TAG:-}" ]; then
             KEEP="$(cd dist && printf '%s ' *.pkg.tar.zst)"
             # An UNMATCHED glob would come through literally and match nothing in the keep set —
-            # i.e. "delete every pacman asset on the release". Empty out instead; prune refuses.
+            # i.e. "delete every pacman asset on the release". Skip entirely instead.
             case "$KEEP" in *'*'*) KEEP="" ;; esac
-            prune_release_assets "$RID" .pkg.tar.zst "$KEEP"
+            API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+            if [ -n "$KEEP" ]; then
+              curl -fsS "$API/releases/$RID/assets" -H "Authorization: token $GITEA_TOKEN" \
+                | python3 -c "import json,sys;k=set(sys.argv[1].split());k|={n+'.sha256' for n in k};print('\n'.join('%s %s'%(a['id'],a['name']) for a in json.load(sys.stdin) if a.get('name','').endswith(('.pkg.tar.zst','.pkg.tar.zst.sha256')) and a['name'] not in k))" "$KEEP" \
+                | while read -r id name; do
+                    [ -n "$id" ] || continue
+                    echo "dropping superseded release asset: $name"
+                    curl -fsS -o /dev/null -X DELETE "$API/releases/$RID/assets/$id" \
+                      -H "Authorization: token $GITEA_TOKEN" || true
+                  done
+            fi
           fi
