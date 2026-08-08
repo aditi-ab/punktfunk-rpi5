@@ -906,6 +906,7 @@ struct ContentView: View {
     private var shortcutHintText: String {
         "Hold the remote's Back button — or L1+R1+Start+Select on a controller — to disconnect"
         + " · Touch surface moves the pointer · press clicks · Play/Pause right-clicks"
+        + " · Hold Play/Pause, or Select+X on a controller, for statistics"
     }
     private static let shortcutHintFont: CGFloat = 22 // read from the couch
     #endif

@@ -34,10 +34,26 @@ public final class SiriRemotePointer {
     private var heldButtons: Set<UInt32> = []
     /// When Back/Menu went down; a release after `disconnectHold` fires the exit.
     private var menuDownAt: Date?
+    /// Counts a held Play/Pause down to `statsHold`; nil when the button is up or already
+    /// resolved. See `playPauseChanged`.
+    private var playPauseTimer: Timer?
+    /// The held Play/Pause has already been spent on a stats cycle, so its release must not also
+    /// right-click.
+    private var statsHoldFired = false
+    /// Trails a delivered right-click tap by `tapPress` to release it — see `deliverRightClick`.
+    private var rightReleaseTimer: Timer?
 
     /// Hold Back/Menu at least this long (then release) to end the session. Shorter than the
     /// controller chord's 1.5 s — the remote has no way to trip this during gameplay.
     private static let disconnectHold: TimeInterval = 1.0
+    /// Hold Play/Pause this long to cycle the stats overlay instead of right-clicking. It is the
+    /// remote's only spare button, and on an Apple TV with no controller in the room this is the
+    /// ONLY route to the numbers (⌃⌥⇧S wants a keyboard, the three-finger tap a touchscreen).
+    /// Shorter than `disconnectHold`: nothing destructive rides on it.
+    private static let statsHold: TimeInterval = 0.5
+    /// pf-client-core's `TAP_PRESS`, borrowed for the deferred right-click: its release trails
+    /// the press by this much, so the two transitions can't fold into nothing downstream.
+    private static let tapPress: TimeInterval = 0.05
     /// A full edge-to-edge swipe moves the host cursor about this many pixels. The surface is
     /// small; two comfortable swipes should cross a 1080p desktop.
     private static let pointerScale: Float = 1100
@@ -95,6 +111,9 @@ public final class SiriRemotePointer {
             old.buttonX.pressedChangedHandler = nil
             old.buttonMenu.pressedChangedHandler = nil
         }
+        // Timers first, then the lift: a tap whose release is still owed is held state, so
+        // `releaseHeld` below is what sends its button-up.
+        cancelPlayPause()
         releaseHeld()
         lastTouch = nil
         menuDownAt = nil
@@ -109,12 +128,13 @@ public final class SiriRemotePointer {
         micro.dpad.valueChangedHandler = { [weak self] _, x, y in
             MainActor.assumeIsolated { self?.touchMoved(x: x, y: y) }
         }
-        // Surface click = left button; Play/Pause = right (the remote's only spare face button).
+        // Surface click = left button; Play/Pause = right (the remote's only spare face button),
+        // or — held — the stats-overlay cycle. See `playPauseChanged`.
         micro.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
             MainActor.assumeIsolated { self?.setButton(1, down: pressed) }
         }
         micro.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
-            MainActor.assumeIsolated { self?.setButton(3, down: pressed) }
+            MainActor.assumeIsolated { self?.playPauseChanged(pressed: pressed) }
         }
         micro.buttonMenu.pressedChangedHandler = { [weak self] _, _, pressed in
             MainActor.assumeIsolated { self?.menuChanged(pressed: pressed) }
@@ -147,6 +167,76 @@ public final class SiriRemotePointer {
     private func setButton(_ button: UInt32, down: Bool) {
         if down { heldButtons.insert(button) } else { heldButtons.remove(button) }
         connection.send(.mouseButton(button, down: down))
+    }
+
+    /// Play/Pause: a TAP right-clicks, a HOLD (`statsHold`) cycles the stats overlay instead.
+    ///
+    /// The right button is therefore DEFERRED until the press resolves, rather than going down on
+    /// contact: once the host has seen a button-down there is no taking it back, and a right
+    /// button held for half a second is a context menu on every desktop this streams. The shape
+    /// is the hold-Select gesture's (`GamepadCapture.gestureFiltered`) — suppress, then deliver a
+    /// tap on release or the gesture past the threshold — so the two behave alike.
+    private func playPauseChanged(pressed: Bool) {
+        if pressed {
+            statsHoldFired = false
+            let timer = Timer(timeInterval: Self.statsHold, repeats: false) { [weak self] _ in
+                Task { @MainActor in self?.statsHoldElapsed() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            playPauseTimer?.invalidate()
+            playPauseTimer = timer
+            return
+        }
+        playPauseTimer?.invalidate()
+        playPauseTimer = nil
+        // The hold already spent this press on a cycle — its release clicks nothing.
+        guard !statsHoldFired else {
+            statsHoldFired = false
+            return
+        }
+        deliverRightClick()
+    }
+
+    /// The threshold passed with Play/Pause still down → cycle the overlay and consume the press.
+    /// Writes the shared `statsVerbosity` default every reader observes through @AppStorage — the
+    /// same cycle as ⌃⌥⇧S, the three-finger tap and the controller's Select + X.
+    private func statsHoldElapsed() {
+        playPauseTimer = nil
+        statsHoldFired = true
+        StatsVerbosity.cycle()
+    }
+
+    /// A Play/Pause tap, delivered now that it resolved as one: the right button down, its
+    /// release `tapPress` behind so the pair can't collapse into nothing downstream.
+    private func deliverRightClick() {
+        // A previous tap's owed release goes out FIRST — two taps inside `tapPress` would
+        // otherwise send the host two downs in a row (the rule GamepadCapture's held-back Select
+        // tap follows for the same reason).
+        finishRightClick()
+        setButton(3, down: true)
+        let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.finishRightClick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        rightReleaseTimer = timer
+    }
+
+    /// Release a tap's right button if one is still owed; nothing otherwise.
+    private func finishRightClick() {
+        guard rightReleaseTimer != nil else { return }
+        rightReleaseTimer?.invalidate()
+        rightReleaseTimer = nil
+        setButton(3, down: false)
+    }
+
+    /// Drop any in-flight Play/Pause state (unbind / stop). Timers only — a right button already
+    /// sent down is held state, and `releaseHeld` is what lifts it.
+    private func cancelPlayPause() {
+        playPauseTimer?.invalidate()
+        playPauseTimer = nil
+        rightReleaseTimer?.invalidate()
+        rightReleaseTimer = nil
+        statsHoldFired = false
     }
 
     private func menuChanged(pressed: Bool) {

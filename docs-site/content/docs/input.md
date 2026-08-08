@@ -77,7 +77,9 @@ to one readable line.
 - **Apple TV** has no keyboard path, and a short press of the Siri Remote's Back button deliberately
   does nothing — so a controller's B button can't end your session by accident. To leave, **hold
   Back for about a second and let go**. During a session the remote's touch surface drives the host
-  cursor, a press is a left click, and Play/Pause is a right click.
+  cursor, a press is a left click, and Play/Pause is a right click — **hold Play/Pause** instead and
+  it cycles the [stats overlay](/docs/stats). With a controller in hand, **Select + X** does the
+  same on every Apple client.
 
 ### Leaving with a controller
 
@@ -98,6 +100,19 @@ The chord is read off the pads a client forwards, so turning
 there the client stops opening the controller at all, which is the point of the setting. Use
 **Ctrl+Alt+Shift+D** or the client's own UI to leave instead. The Apple and Android apps keep
 watching for the chord either way.
+
+### Statistics with a controller
+
+The **Apple** apps reserve a second chord: **Select + X**, which cycles the
+[stats overlay](/docs/stats) one level each time you complete it. It is for the moment your hands
+are on a controller and the usual routes aren't — no keyboard for **⌃⌥⇧S**, no free screen for the
+three-finger tap — and on **Apple TV** it is the only way there with a pad. X is deliberately none
+of the four leave-chord buttons, so reaching for one chord never trips the other. Both buttons
+still reach the game; only the overlay changes locally.
+
+On the **Siri Remote**, **hold Play/Pause** for about half a second instead. A quick tap of that
+button is still a right click — the click is simply sent when you let go, so the hold has
+something to be.
 
 ### The guide button (Xbox / PS / Steam) and Quick Access
 
