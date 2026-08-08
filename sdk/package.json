@@ -34,7 +34,7 @@
 		"registry": "https://git.unom.io/api/packages/unom/npm/"
 	},
 	"scripts": {
-		"prepare": "bun2nix -o bun.nix",
+		"prepare": "if command -v bun2nix >/dev/null 2>&1; then bun2nix -o bun.nix; fi",
 		"gen": "openapigen --spec ../api/openapi.json --name Punktfunk --format httpclient > src/gen/punktfunk.ts",
 		"typecheck": "tsc --noEmit",
 		"build": "tsc -p tsconfig.build.json",
