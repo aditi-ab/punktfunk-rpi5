@@ -46,4 +46,9 @@ upstream:
     realtime) so the wavelet encode can preempt a GPU-bound game on the shared shader cores. A
     create loop downgrades on NOT_PERMITTED so a refused class never regresses the encoder. Did
     not overcome the graphics-vs-compute preemption wall on an RTX 4090 (kept: correct + harmless,
-    may help other HW/drivers).
+    may help other HW/drivers) — that measurement is Windows/WDDM and does not transfer to Linux.
+    GATED ON !inherit_info, so it is LIVE ONLY ON THE WINDOWS PATH (pyrowave_create_device_by_compat,
+    where Granite builds its own device). Linux passes its own create-infos and takes the inherit
+    branch, so this patch is inert there; the Linux request lives natively in
+    crates/pf-encode/src/enc/linux/pyrowave.rs (queue_priority_candidates), with the same grammar
+    and the same downgrade ladder. Change one, change both.

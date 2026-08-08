@@ -17,7 +17,20 @@ VK_ERROR_NOT_PERMITTED_KHR so a refused class NEVER regresses the encoder. Gated
 NOTE: on an RTX 4090 / Windows / WDDM this did not reduce the spikes (the graphics-vs-compute
 preemption granularity is the wall) — kept because it is correct, harmless (graceful fallback), and
 may help other GPUs/drivers. Reduce the encode's GPU cost (4:2:0/8-bit) or use H.265 for a
-GPU-saturated game.
+GPU-saturated game. **That measurement is Windows/WDDM and does NOT transfer to Linux** — a
+different driver stack with a different preemption model; treat Linux as unmeasured until its own
+A/B exists.
+
+NOTE 2 — WHERE THIS PATCH IS ACTUALLY LIVE. It is gated `if (!inherit_info)`, and only the WINDOWS
+path leaves `inherit_info` null: `crates/pf-encode/src/enc/windows/pyrowave.rs` calls
+`pyrowave_create_device_by_compat`, so Granite builds the device itself and this block runs.
+**On LINUX it has never done anything.** `crates/pf-encode/src/enc/linux/pyrowave.rs::open_inner`
+passes its own instance/device create-infos into `pyrowave_device_create_info`, Granite's
+`MyDeviceFactory::get_existing_create_info()` returns them, `create_device` takes the inherit
+branch, and the whole block above is skipped. The Linux request is therefore wired natively in
+**`crates/pf-encode/src/enc/linux/pyrowave.rs`** (search `queue_priority_candidates`), which
+implements the SAME env grammar and the SAME downgrade ladder so one knob means one thing on both
+platforms. If you change the grammar here, change it there in the same commit.
 
 diff --git a/crates/pyrowave-sys/vendor/pyrowave/Granite/vulkan/context.cpp b/crates/pyrowave-sys/vendor/pyrowave/Granite/vulkan/context.cpp
 index 5257fc33..479eeded 100644
