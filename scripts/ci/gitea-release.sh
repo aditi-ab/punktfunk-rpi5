@@ -38,6 +38,18 @@ for a in json.load(sys.stdin):
         print(a.get("id",""));break' "$1" 2>/dev/null
 }
 _urlencode() { python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+# _json_stale_asset_ids SUFFIX KEEP_NAMES  (assets JSON on stdin) -> "<id> <name>" lines
+#   The assets matching SUFFIX (or its .sha256 sidecar) that are NOT in the whitespace-separated
+#   KEEP_NAMES. See prune_release_assets.
+_json_stale_asset_ids() {
+  python3 -c 'import json,sys
+suffix, keep = sys.argv[1], set(sys.argv[2].split())
+keep |= {n + ".sha256" for n in keep}
+for a in json.load(sys.stdin):
+    n = a.get("name", "")
+    if n.endswith((suffix, suffix + ".sha256")) and n not in keep:
+        print(a.get("id", ""), n)' "$1" "$2" 2>/dev/null
+}
 
 # _release_notes_path TAG
 #   Print the path of the in-repo release notes for TAG (docs/releases/<TAG>.md) IFF it exists,
@@ -163,6 +175,33 @@ upsert_asset() {
   sums="$(mktemp)"
   printf '%s  %s\n' "$(_sha256 "$file")" "$name" > "$sums"
   if _put_asset "$rid" "$sums" "$name.sha256"; then rm -f "$sums"; else rm -f "$sums"; return 1; fi
+}
+
+# prune_release_assets RELEASE_ID SUFFIX KEEP_NAMES
+#   Delete every asset of the release whose name ends in SUFFIX (or SUFFIX.sha256) and is not one
+#   of KEEP_NAMES (whitespace-separated).
+#
+#   WHY: upsert_asset replaces an asset BY NAME, which is idempotent only while the filename is
+#   stable. A REBUILD of an already-published release is exactly the case where it is not — a
+#   distro moved under the release, the artifact is rebuilt at a higher pkgrel, and
+#   `punktfunk-host-0.25.0-2-x86_64.pkg.tar.zst` collides with nothing, so the -1 build stays
+#   attached. A superseded package on a release page is not clutter; it is a live download of the
+#   very build the rebuild exists to replace. Scoped by SUFFIX because a release object is shared
+#   by ~8 packaging workflows running concurrently — each leg may only ever prune names it owns.
+prune_release_assets() {
+  local rid="${1:?release id}" suffix="${2:?suffix}" keep="${3:-}"
+  local api
+  # An empty keep list means "delete every asset matching SUFFIX", which is never what a caller
+  # wants and is exactly what a mis-expanded glob looks like. Refuse rather than clear a release.
+  [ -n "$keep" ] || { echo "gitea-release: prune_release_assets got an empty keep list — refusing" >&2; return 0; }
+  api="$(_gitea_api)"
+  curl -fsS "$api/releases/$rid/assets" -H "Authorization: token ${GITEA_TOKEN:?}" \
+    | _json_stale_asset_ids "$suffix" "$keep" \
+    | while read -r id name; do
+        echo "gitea-release: dropping superseded asset '$name'"
+        curl -fsS -o /dev/null -X DELETE "$api/releases/$rid/assets/$id" \
+          -H "Authorization: token ${GITEA_TOKEN:?}" || true
+      done
 }
 
 # apply_release_notes RELEASE_ID TAG

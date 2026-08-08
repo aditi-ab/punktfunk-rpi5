@@ -437,6 +437,24 @@ refuses the upgrade instead of bricking the install. All seven libs are listed e
 `--as-needed` currently drops two: an unlinked soname is left bare by makepkg and satisfied by any
 ffmpeg, so listing it costs nothing and a future link picks up the bound automatically.
 
+🛑 **The v0.25.0 Arch packages shipped with that bound pointing at the WRONG FFmpeg — install
+`punktfunk-host 0.25.0-2` or newer.** The soname fix and the FFmpeg-9 build landed as one merge;
+the release tag was pushed four minutes later, while the CI builder image was still being
+rebuilt. arch.yml deliberately runs no `-Syu` ("the image's snapshot IS the build environment"),
+so the release was linked against FFmpeg 8 and published `libavcodec.so=62-64` — a bound no
+up-to-date Arch box can satisfy. It fails *safely* (pacman refuses; nothing bricks), but it fails
+**loudly and broadly**: pacman prepares one transaction, so an unsatisfiable dependency of ours
+stopped affected users' entire `pacman -Syu`. `0.25.0-2` is the identical source rebuilt against
+FFmpeg 9. Only Arch was exposed — every other format derives its dependency from the ELF at build
+time and could not disagree with itself this way.
+
+Two guards now stand where only a convention did. arch.yml compares the builder's libav
+`provides` against the live repos before building and `-Syu`s itself if they differ; and no
+package is published until a **pristine-`--dbpath`** `pacman -U --print` resolves it, which asks
+"would a real, up-to-date Arch box install this?" instead of "does the builder happen to satisfy
+it?" — the distinction that let this ship. Keeping `ci/arch-ci.Dockerfile` current is still the
+cheap path; the guards are the backstop.
+
 ### Linux playback filled the buffer ceiling
 
 The PipeWire playback callback sized its writes from the mapped buffer's **capacity** — PipeWire's

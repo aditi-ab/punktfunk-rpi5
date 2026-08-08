@@ -19,6 +19,16 @@
 # 63-64), so it would simply refuse to install rather than start. Re-keying this image is the step
 # that makes the ffmpeg-9 bump actually reach the package — a Cargo.toml bump alone does nothing
 # here. Whenever Arch moves to an FFmpeg major, bump the date in the same commit.
+#
+# ⚠ AND KNOW WHY THAT WAS NOT ENOUGH: bumping this date only helps once docker.yml has actually
+# republished the image, and nothing sequences the two workflows. v0.25.0 was tagged four minutes
+# after the ffmpeg-9 merge, so the release build still pulled the FFmpeg-8 `:latest` and published
+# a punktfunk-host that no up-to-date Arch box could install — which blocks the user's ENTIRE
+# `pacman -Syu`, not just our package. arch.yml therefore no longer trusts this image on that one
+# axis: it compares the builder's libav sonames against the repos before building (and `-Syu`s
+# itself if they differ), and refuses to publish anything a pristine-db `pacman -U --print` says
+# is unsatisfiable. This file staying current is still the CHEAP path — those guards are the
+# backstop, not the plan.
 FROM docker.io/library/archlinux:base-devel
 
 # One transaction: the main build/runtime deps (first list) + the gamescope companion's

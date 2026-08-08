@@ -56,8 +56,38 @@ sudo pacman -Sy punktfunk-web         # optional browser management console
 packages against the key you just trusted. Arch is rolling, so the packages are built against
 current Arch sonames — keep the box itself updated too.)
 
+Step 2 **appends**, so running it twice leaves two `[punktfunk]` blocks and every later pacman
+run opens with `error: could not register 'punktfunk' database (database already registered)`.
+It is harmless — pacman ignores the duplicate and carries on — but to silence it, delete the
+extra block from `/etc/pacman.conf`.
+
 Then the same first-run steps as a source build (printed by the install scriptlet): `input`
 group, `host.env`, `systemctl --user enable --now punktfunk-host` — see the next section.
+
+### If pacman says `unable to satisfy dependency 'libavcodec.so=…'`
+
+```
+:: unable to satisfy dependency 'libavcodec.so=62-64' required by punktfunk-host
+```
+
+`punktfunk-host` links FFmpeg, so it depends on the exact libav sonames it was built against —
+FFmpeg 8 provides `libavcodec.so=62`, FFmpeg 9 provides `libavcodec.so=63`. This message means the
+package on offer was built against a *different* FFmpeg major than your box has. Because pacman
+prepares the whole transaction at once, it stops your entire `pacman -Syu`, not just this package.
+
+The bound is deliberate. Without it the upgrade succeeds and leaves a host binary that cannot
+start at all — exit 127 before `main()`, in a systemd restart loop, with nothing in its own log
+to explain it (`ldd /usr/bin/punktfunk-host | grep 'not found'` is the one-line diagnosis).
+
+1. `sudo pacman -Syyu` — a forced db refresh, in case the matching build is already published.
+   Compare `pacman -Si punktfunk-host` against your `pacman -Q ffmpeg`.
+2. Still refused? Then we published a build made against the wrong FFmpeg — please report it. The
+   repair arrives as a higher **pkgrel** of the same version (`0.25.0-2`), so a later `-Syu`
+   picks it up with nothing to undo.
+3. To let the rest of the system upgrade in the meantime: `sudo pacman -Syu --ignore punktfunk-host`.
+   If pacman still refuses (your *installed* copy is the one carrying the bound), remove it with
+   `sudo pacman -Rdd punktfunk-host`, upgrade, and install it again once the rebuild lands. Either
+   way the host stays down until then — that is the soname break itself, not a second fault.
 
 ## Build from source — Arch Linux (mutable)
 
