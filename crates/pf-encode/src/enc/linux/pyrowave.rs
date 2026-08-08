@@ -504,6 +504,9 @@ struct InFlight {
     /// one packet and the encode would bail with "unexpected packet count" on a frame that was
     /// perfectly fine.
     cap: usize,
+    /// The wire sequence value stamped into this frame's block headers, so the AU can be checked
+    /// against what we asked for — see the self-check in `wait_and_packetize`.
+    seq: u8,
     /// The datagram alignment this frame was encoded for; `set_wire_chunking` can likewise land
     /// mid-flight, and a frame packetized at a boundary it was not rate-controlled for would ship
     /// with the wrong `chunk_aligned` flag.
@@ -529,7 +532,30 @@ pub struct PyroWaveEncoder {
 
     // --- pyrowave (borrows our device; destroyed before it) ---
     pw_dev: pw::pyrowave_device,
-    pw_enc: pw::pyrowave_encoder,
+    /// ONE `pyrowave_encoder` per [`Slot`] (PW5 stage 5), alternated.
+    ///
+    /// The object CANNOT hold two frames in flight — not "probably not", structurally not.
+    /// `Encoder::Impl` owns one each of `wavelet_img_high_res`, `bucket_buffer`, `meta_buffer`,
+    /// `block_stat_buffer`, `payload_data` and `quant_buffer`, and `Impl::encode` OPENS by
+    /// discarding them: an image barrier with `VK_IMAGE_LAYOUT_UNDEFINED` as the old layout (a
+    /// written promise that nothing else is reading it) plus three `fill_buffer` clears. Two
+    /// encodes recorded into two command buffers and submitted to the same queue have NO execution
+    /// dependency in Vulkan — submission order orders the start, not the completion — so N+1's DWT
+    /// would overwrite the bands and zero the RDO buckets while N's block packing still reads them.
+    ///
+    /// So overlap means two handles on one device, and within a handle the encodes stay strictly
+    /// serialized (a slot's next frame is only recorded after that slot's previous one was
+    /// retired), which keeps patch 0004's scratch-pool invariant intact without touching it.
+    pw_encs: Vec<pw::pyrowave_encoder>,
+    /// The wire sequence counter, kept HERE rather than in the encoder objects.
+    ///
+    /// ⚠ pyrowave's own `sequence_count` is PER-ENCODER, so two alternating handles each count
+    /// 1,2,3… independently and the wire sees 1,1,2,2,3,3…. The decoder restarts a frame only when
+    /// the value CHANGES (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so a
+    /// repeat reads as MORE BLOCKS OF THE SAME FRAME: `clear()` never runs and every second frame
+    /// is silently swallowed, on every client. `patches/0007-encoder-sequence-override.patch`
+    /// exposes a setter so this single counter is stamped regardless of which handle encodes.
+    wire_seq: u32,
 
     // --- CSC pipeline + sampler: SHARED by every slot (immutable once built, read-only in
     //     recording, so no overlap hazard). The per-frame resources live in `slots`. ---
@@ -947,7 +973,7 @@ impl PyroWaveEncoder {
         // Construct `Self` NOW, every not-yet-created resource at its null value, and assign
         // into it as resources come up. Any `?` from here drops `me`, and the existing `Drop`
         // tears down exactly the prefix that exists: it `device_wait_idle()`s first, null-guards
-        // `pw_enc` (`pyrowave_encoder_destroy` dereferences before deleting),
+        // `pw_encs` (`pyrowave_encoder_destroy` dereferences before deleting),
         // `pyrowave_device_destroy(null)` is a plain `delete nullptr` (pyrowave_c.cpp) and
         // every `vkDestroy*`/`vkFree*` of a VK_NULL_HANDLE is the spec-defined no-op. One
         // teardown path serves both the error unwind and the normal drop, so an open-path leak
@@ -963,7 +989,8 @@ impl PyroWaveEncoder {
             mem_props,
             _hold: hold,
             pw_dev: std::ptr::null_mut(),
-            pw_enc: std::ptr::null_mut(),
+            pw_encs: vec![std::ptr::null_mut(); SLOTS],
+            wire_seq: 0,
             csc_pipe: vk::Pipeline::null(),
             csc_layout: vk::PipelineLayout::null(),
             csc_dsl: vk::DescriptorSetLayout::null(),
@@ -1042,10 +1069,12 @@ impl PyroWaveEncoder {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
         };
-        pw_check(
-            pw::pyrowave_encoder_create(&einfo, &mut me.pw_enc),
-            "encoder_create",
-        )?;
+        for i in 0..SLOTS {
+            pw_check(
+                pw::pyrowave_encoder_create(&einfo, &mut me.pw_encs[i]),
+                "encoder_create",
+            )?;
+        }
 
         // ---- CSC planes: full-res R8 luma + RG8 chroma (half-res for 4:2:0, full-res for
         //      4:4:4), storage-written by the CSC and sampled directly by pyrowave (R/G view
@@ -1527,7 +1556,7 @@ impl PyroWaveEncoder {
         // a session error and never resubmit, but a null here would be a use-after-free inside
         // pyrowave rather than a clean error — so fail loudly instead of relying on that.
         anyhow::ensure!(
-            !self.pw_enc.is_null(),
+            self.pw_encs.iter().all(|e| !e.is_null()),
             "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
         );
         let dev = self.device.clone();
@@ -1581,6 +1610,7 @@ impl PyroWaveEncoder {
         // y/uv images, cursor image and CPU staging (PW5 stage 4). `submit` guaranteed it is free
         // by draining to `max_inflight - 1` before calling here.
         let slot = self.next_slot;
+        let seq = self.wire_seq;
         let cmd = self.slots[slot].cmd;
         let fence = self.slots[slot].fence;
         let record_and_submit = (|| -> Result<()> {
@@ -1811,8 +1841,20 @@ impl PyroWaveEncoder {
                 self.pw_dev,
                 cmd.as_raw() as usize as pw::VkCommandBuffer,
             );
+            // ⚠ THE LANDMINE (PW5 stage 5). Stamp OUR monotonic counter before the encode, or
+            // the two alternating handles emit 1,1,2,2,3,3… and the decoder reads each repeat as
+            // more blocks of the same frame — half the frames silently swallowed, on every client.
+            // Needs `patches/0007-encoder-sequence-override.patch`; the round-trip test
+            // `wire_sequence_increments_across_alternating_handles` is what keeps it honest.
+            pw_check(
+                pw::pyrowave_encoder_set_next_sequence(
+                    self.pw_encs[slot],
+                    seq & pw::PYROWAVE_SEQUENCE_MASK,
+                ),
+                "set_next_sequence",
+            )?;
             let enc_res = pw::pyrowave_encoder_encode_gpu_synchronous(
-                self.pw_enc,
+                self.pw_encs[slot],
                 std::ptr::null(),
                 std::ptr::null(),
                 &buffers,
@@ -1840,8 +1882,13 @@ impl PyroWaveEncoder {
         // Submitted: from here the GPU may be executing, and NOTHING may touch `cmd`, the y/uv
         // images or `csc_set` until this entry is retired by `wait_and_packetize`.
         self.next_slot = (slot + 1) % SLOTS;
+        // Advance only on SUCCESS: a frame that never reached the wire must not burn a sequence
+        // value (a gap reads as a restart, which is right for a DROPPED frame and wrong for one
+        // that was never emitted at all).
+        self.wire_seq = self.wire_seq.wrapping_add(1);
         self.inflight.push_back(InFlight {
             slot,
+            seq: (seq & pw::PYROWAVE_SEQUENCE_MASK) as u8,
             pts_ns: frame.pts_ns,
             cap: self.frame_budget + BS_SLACK,
             wire_chunk: self.wire_chunk,
@@ -1884,7 +1931,7 @@ impl PyroWaveEncoder {
         let boundary = crate::pyrowave_wire::packet_boundary(fr.wire_chunk, cap);
         let mut n: usize = 0;
         pw_check(
-            pw::pyrowave_encoder_compute_num_packets(self.pw_enc, boundary, &mut n),
+            pw::pyrowave_encoder_compute_num_packets(self.pw_encs[fr.slot], boundary, &mut n),
             "compute_num_packets",
         )?;
         if n == 0 || (fr.wire_chunk.is_none() && n != 1) {
@@ -1894,7 +1941,7 @@ impl PyroWaveEncoder {
         let mut out_n: usize = 0;
         pw_check(
             pw::pyrowave_encoder_packetize(
-                self.pw_enc,
+                self.pw_encs[fr.slot],
                 packets.as_mut_ptr(),
                 boundary,
                 &mut out_n,
@@ -1909,6 +1956,27 @@ impl PyroWaveEncoder {
         // blacks. (Linux capture has no HDR path, so this side never stamps BT.2020/PQ.)
         if let Some(p) = packets.first() {
             crate::pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, false);
+            // Self-check on the ONE thing a dropped vendored patch would break silently. Without
+            // `0007-encoder-sequence-override.patch` the two handles count independently, the wire
+            // reads 1,1,2,2,3,3..., and every client's decoder folds each repeated value into the
+            // previous frame — half the frames gone, no error anywhere. A re-vendor that loses the
+            // patch would not fail to build; it would fail on glass, subtly. Two byte reads per
+            // frame to make that loud instead. Once per process: if it is wrong it is wrong for
+            // every frame.
+            if crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset) != Some(fr.seq) {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        expected = fr.seq,
+                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset),
+                        "pyrowave: the wire sequence counter is NOT what we stamped — \
+                         patches/0007-encoder-sequence-override.patch is missing or ineffective. \
+                         With two alternating encoder handles this silently halves the frame rate \
+                         on every client"
+                    );
+                }
+            }
         }
         // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
         // single packet, or the datagram-aligned windowed AU (§4.4).
@@ -2032,13 +2100,6 @@ impl Encoder for PyroWaveEncoder {
         // object being swapped.
         unsafe {
             self.device.device_wait_idle().ok();
-            pw::pyrowave_encoder_destroy(self.pw_enc);
-            // Publish the null IMMEDIATELY: the create below is fallible, and its failure path
-            // must not leave a freed pointer in the field. `pyrowave_encoder_destroy` is a plain
-            // `delete` (pyrowave_c.cpp) with no null check, so `Drop` running on a stale handle
-            // is a double free — the exact shape this reset hits when the rebuild fails because
-            // the device is already lost, which is the state that made the watchdog fire.
-            self.pw_enc = std::ptr::null_mut();
             let einfo = pw::pyrowave_encoder_create_info {
                 device: self.pw_dev,
                 width: self.width as i32,
@@ -2049,17 +2110,32 @@ impl Encoder for PyroWaveEncoder {
                     pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
                 },
             };
-            let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
-            let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
-            if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
-                tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
-                // `pw_enc` stays null — `Drop` and `submit_frame` both guard on it. The queued
-                // AUs are forfeit either way (the caller turns a false reset into a session
-                // error), so drop them rather than shipping output from a dead encoder.
-                self.pending.clear();
-                return false;
+            for i in 0..SLOTS {
+                pw::pyrowave_encoder_destroy(self.pw_encs[i]);
+                // Publish the null IMMEDIATELY: the create below is fallible, and its failure path
+                // must not leave a freed pointer in the field. `pyrowave_encoder_destroy` is a
+                // plain `delete` (pyrowave_c.cpp) with no null check, so `Drop` running on a stale
+                // handle is a double free — the exact shape this reset hits when the rebuild fails
+                // because the device is already lost, which is the state that made the watchdog
+                // fire.
+                self.pw_encs[i] = std::ptr::null_mut();
+                let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
+                let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
+                if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
+                    tracing::error!(result = ?r, slot = i, "pyrowave: encoder rebuild failed");
+                    // This handle stays null — `Drop` and `submit_frame` both guard on it. The
+                    // queued AUs are forfeit either way (the caller turns a false reset into a
+                    // session error), so drop them rather than shipping output from a dead
+                    // encoder.
+                    self.pending.clear();
+                    return false;
+                }
+                self.pw_encs[i] = enc;
             }
-            self.pw_enc = enc;
+            // Fresh handles start their own counters at 0, but the CLIENT's `last_seq` does not
+            // reset — so keep counting from where the stream was. A rebuild loses frames, and a
+            // gap is exactly what tells the decoder to restart.
+            self.next_slot = 0;
         }
         self.pending.clear();
         true
@@ -2108,13 +2184,15 @@ impl Drop for PyroWaveEncoder {
         // up, so on a failed open this runs against a partial prefix. That is sound because
         // `pyrowave_device_destroy(null)` is a bare `delete nullptr` (pyrowave_c.cpp — safe
         // no-op) and every `vkDestroy*`/`vkFree*` of VK_NULL_HANDLE is the spec-defined no-op;
-        // `pw_enc` is the one null-UNSAFE destroy and carries its own guard below.
+        // `pw_encs` are the null-UNSAFE destroys and carry their own guard below.
         unsafe {
             self.device.device_wait_idle().ok();
             // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
             // is not null-safe.
-            if !self.pw_enc.is_null() {
-                pw::pyrowave_encoder_destroy(self.pw_enc);
+            for &e in &self.pw_encs {
+                if !e.is_null() {
+                    pw::pyrowave_encoder_destroy(e);
+                }
             }
             pw::pyrowave_device_destroy(self.pw_dev);
             for (_, _, i, m, v) in self.import_cache.drain(..) {
@@ -2843,5 +2921,134 @@ mod tests {
         assert!(!priority_refused(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         assert!(!priority_refused(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
         assert!(!priority_refused(vk::Result::SUCCESS));
+    }
+
+    // ---- PW5 stage 5: the alternating-handle sequence gate ------------------------------------
+
+    /// **THE gate for the second encoder handle.** Two `pyrowave_encoder` objects each keep their
+    /// OWN 3-bit `sequence_count`, so alternating them emits `1,1,2,2,3,3…` on the wire. The
+    /// decoder restarts a frame only when the value CHANGES
+    /// (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so every repeat reads as
+    /// "more blocks of the same frame": `clear()` never runs and the second frame of each pair is
+    /// silently swallowed. Half frame rate, occasional mixed-frame blocks, no error anywhere — a
+    /// failure that passes a smoke test, on every client.
+    ///
+    /// `patches/0007-encoder-sequence-override.patch` exists solely to make that impossible, and
+    /// this test is what proves it, three ways over 20 frames (well past the 3-bit wrap at 8):
+    ///
+    /// 1. the wire counter advances by exactly +1 mod 8 per AU, read straight out of the block
+    ///    header the decoder reads;
+    /// 2. ONE persistent decoder — `last_seq` carried across every push, exactly as a client's is —
+    ///    reports ready for every single AU, so nothing is swallowed;
+    /// 3. consecutive decoded pictures DIFFER. Content moves every frame (`test_card` reseeded per
+    ///    frame; flat fills are the documented false-green trap here), so a swallowed frame would
+    ///    show up as a repeat, and this catches it even if 1 and 2 somehow both passed.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn wire_sequence_increments_across_alternating_handles() {
+        const FRAMES: u32 = 20;
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open");
+        // This gate is meaningless with a single encoder handle.
+        const { assert!(SLOTS >= 2) };
+
+        let mut aus: Vec<Vec<u8>> = Vec::new();
+        for i in 0..FRAMES {
+            // Content MOVES every frame — a repeated picture is the symptom being hunted, and a
+            // static card would hide it. ODD seeds only: `test_card` starts its LCG at `seed | 1`,
+            // so 2 and 3 produce a byte-identical card and consecutive even/odd seeds would fake
+            // the very repeat this test looks for (it did, on the first run).
+            enc.submit(&test_card(w, h, 2 * i + 1)).expect("submit");
+            let au = enc.poll().expect("poll").expect("one AU per frame");
+            aus.push(au.data);
+        }
+
+        // (1) the wire counter, read from the header the decoder parses.
+        let seqs: Vec<u8> = aus
+            .iter()
+            .map(|au| {
+                crate::pyrowave_wire::wire_sequence(au, 0).expect("AU carries a block header")
+            })
+            .collect();
+        for (i, pair) in seqs.windows(2).enumerate() {
+            assert_eq!(
+                pair[1],
+                (pair[0] + 1) & 7,
+                "frame {} -> {}: wire sequence went {} -> {} (all: {seqs:?}). Two encoder handles \
+                 each counting alone produce repeats, which the decoder reads as more blocks of \
+                 the same frame — check that patch 0007 is applied and set_next_sequence is called",
+                i,
+                i + 1,
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // (2) + (3) ONE decoder for the whole run — a fresh decoder per AU would reset `last_seq`
+        // and hide the exact bug this exists to catch.
+        // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+        unsafe {
+            let mut dev: pw::pyrowave_device = std::ptr::null_mut();
+            assert_eq!(
+                pw::pyrowave_create_default_device(&mut dev),
+                pw::pyrowave_result_PYROWAVE_SUCCESS
+            );
+            let dinfo = pw::pyrowave_decoder_create_info {
+                device: dev,
+                width: w as i32,
+                height: h as i32,
+                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+                fragment_path: false,
+            };
+            let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
+            assert_eq!(
+                pw::pyrowave_decoder_create(&dinfo, &mut dec),
+                pw::pyrowave_result_PYROWAVE_SUCCESS
+            );
+            let mut last_y: Option<Vec<u8>> = None;
+            for (i, au) in aus.iter().enumerate() {
+                assert_eq!(
+                    pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
+                    pw::pyrowave_result_PYROWAVE_SUCCESS,
+                    "frame {i} was rejected by the decoder"
+                );
+                assert!(
+                    pw::pyrowave_decoder_decode_is_ready(dec, false),
+                    "frame {i} never became decodable — the decoder is still accumulating it into \
+                     the PREVIOUS frame, which is exactly the repeated-sequence failure"
+                );
+                let mut y = vec![0u8; (w * h) as usize];
+                let mut cb = vec![0u8; (w * h / 4) as usize];
+                let mut cr = vec![0u8; (w * h / 4) as usize];
+                let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
+                buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+                buf.width = w as i32;
+                buf.height = h as i32;
+                buf.data = [
+                    y.as_mut_ptr() as *mut _,
+                    cb.as_mut_ptr() as *mut _,
+                    cr.as_mut_ptr() as *mut _,
+                ];
+                buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+                buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
+                assert_eq!(
+                    pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
+                    pw::pyrowave_result_PYROWAVE_SUCCESS,
+                    "frame {i} failed to decode"
+                );
+                if let Some(prev) = &last_y {
+                    assert_ne!(
+                        prev,
+                        &y,
+                        "frame {i} decoded to the SAME picture as frame {} — a swallowed frame",
+                        i - 1
+                    );
+                }
+                last_y = Some(y);
+            }
+            pw::pyrowave_decoder_destroy(dec);
+            pw::pyrowave_device_destroy(dev);
+        }
     }
 }

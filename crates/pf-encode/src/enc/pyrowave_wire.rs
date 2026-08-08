@@ -53,6 +53,24 @@ pub(crate) fn stamp_color_bits(bitstream: &mut [u8], seq_offset: usize, bt2020_p
     }
 }
 
+/// Read the 3-bit wire sequence counter out of a pyrowave block header.
+///
+/// Every block header is `{ u16 ballot; u16 payload_words:12, sequence:3, extended:1; u32 ... }`
+/// (`pyrowave_common.hpp`, `static_assert(sizeof == 8)`), so the counter is bits 12..14 of the
+/// little-endian half-word at `packet_offset + 2` — the same word `stamp_color_bits` reaches into
+/// from the other end.
+///
+/// This field is the entire frame-boundary signal on the wire: the decoder restarts a frame only
+/// when the value CHANGES (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so a
+/// repeated value is read as more blocks of the same frame. That is why PW5's alternating encoder
+/// handles need `pyrowave_encoder_set_next_sequence`, and why a test asserts this reader sees
+/// +1 mod 8 across the pair.
+pub(crate) fn wire_sequence(bitstream: &[u8], packet_offset: usize) -> Option<u8> {
+    let lo = *bitstream.get(packet_offset + 2)?;
+    let hi = *bitstream.get(packet_offset + 3)?;
+    Some(((u16::from_le_bytes([lo, hi]) >> 12) & 0x7) as u8)
+}
+
 /// The wavelet block space's total 32x32-block count for a mode — the exact counting walk of
 /// upstream `WaveletBuffers::init_block_meta` (also ported to the Apple `WaveletLayout`, whose
 /// golden tests pin it against real host AUs). Needed because the vendored RDO pass packs the

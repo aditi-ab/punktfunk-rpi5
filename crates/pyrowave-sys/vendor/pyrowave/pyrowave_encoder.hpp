@@ -37,6 +37,12 @@ public:
 	bool init(Vulkan::Device *device, int width, int height, ChromaSubsampling chroma);
 	bool encode(Vulkan::CommandBuffer &cmd, const ViewBuffers &views, const BitstreamBuffers &buffers);
 
+	// PUNKTFUNK: override the 3-bit wire sequence counter the NEXT encode will stamp.
+	// The counter is per-Encoder, so alternating two encoder objects to overlap frames emits
+	// 1,1,2,2,3,3... and the decoder reads a repeated value as "more blocks of the same frame".
+	// See crates/pyrowave-sys/patches/0007-encoder-sequence-override.patch.
+	void set_next_sequence(uint32_t sequence);
+
 	// Debug hackery
 	const Vulkan::ImageView &get_wavelet_band(int component, int level);
 	bool encode_pre_transformed(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
