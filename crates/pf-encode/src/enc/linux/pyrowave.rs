@@ -396,8 +396,102 @@ fn priority_refused(e: vk::Result) -> bool {
 /// One frame recorded and queue-submitted, whose fence has not been waited and whose bitstream has
 /// therefore not been packetized yet. PW5 stage 3: this is what the `submit`/`poll` split created —
 /// before it, no such state could exist because `submit` did the whole thing inline.
+/// How many independent per-frame resource sets the encoder allocates.
+///
+/// PW5 stage 4. Two, because Granite caps the overlap at two anyway: the pyrowave device defaults
+/// to `init_frame_contexts(2)` and `next_frame_context()` — called at the top of every
+/// `encode_gpu_synchronous` — waits the context it rotates into, so "frame N may not begin
+/// recording until N-2 completed" is enforced below us. A third slot would buy nothing without a
+/// vendored `init_frame_contexts(3)`, which is not exposed.
+///
+/// **Allocated is not the same as used.** `max_inflight` decides how many are live at once and is
+/// still 1 here; this stage is pure capacity so the depth change that follows is a one-line
+/// behaviour change rather than a simultaneous re-plumbing.
+const SLOTS: usize = 2;
+
+/// Everything ONE in-flight frame needs exclusively.
+///
+/// PW5 stage 4 exists because the analysis found six single-slot resources beyond the y/uv images
+/// the plan named, and every one of them is a correctness problem under overlap — not a
+/// performance one:
+///
+/// * `csc_set` was ONE descriptor set rewritten every frame by `bind_rgb`. Updating a descriptor
+///   set still bound by a PENDING command buffer is a spec violation
+///   (VUID-vkUpdateDescriptorSets-None-03047), and the kind that produces a wrong picture rather
+///   than a validation error on most drivers.
+/// * `y_img`/`uv_img` — the CSC of N+1 storage-writes exactly the images pyrowave is still
+///   sampling for N. The old barrier comment ("the previous frame's encode already completed under
+///   our synchronous fence") was load-bearing and said so.
+/// * `cursor_img`/`cursor_stage` — the struct comment said it plainly: *"Single (not ring) because
+///   PyroWave encodes one frame synchronously — no in-flight overlap to race."* A new cursor
+///   bitmap's host write + copy races N's sampled read.
+/// * `cmd` + `fence` — you cannot record into a PENDING command buffer at all.
+/// * `cpu_img`/`cpu_stage` (software capture / tests) — the host writes staging while N's copy is
+///   still pending.
+///
+/// `bitstream` and `import_cache` are deliberately NOT here. `bitstream` is only touched during
+/// packetize, i.e. only on the poll side, one frame at a time. `import_cache` retains the
+/// `VkImage`/`VkDeviceMemory` per dmabuf inode, so dropping a `CapturedFrame` (and its dup'd fd)
+/// while the GPU still reads it is not a use-after-free — do not "optimise" that retention away.
+struct Slot {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    csc_set: vk::DescriptorSet,
+    y_img: vk::Image,
+    y_mem: vk::DeviceMemory,
+    y_view: vk::ImageView,
+    uv_img: vk::Image,
+    uv_mem: vk::DeviceMemory,
+    uv_view: vk::ImageView,
+    cursor_img: vk::Image,
+    cursor_mem: vk::DeviceMemory,
+    cursor_view: vk::ImageView,
+    cursor_stage: vk::Buffer,
+    cursor_stage_mem: vk::DeviceMemory,
+    /// Per-slot: each slot's cursor image is its own, so a bitmap change is uploaded once per slot
+    /// (`SLOTS` small uploads instead of one) rather than once globally, which would leave the
+    /// other slot showing the previous pointer.
+    cursor_serial: u64,
+    cursor_ready: bool,
+    /// CPU-input staging (software capture / smoke tests), lazily (re)created on format change.
+    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
+    cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+}
+
+impl Slot {
+    /// All-null, matching `open_inner`'s "construct then fill" unwind discipline: every
+    /// `vkDestroy*`/`vkFree*` of `VK_NULL_HANDLE` is the spec-defined no-op, so `Drop` running on a
+    /// partially-built slot is sound.
+    fn null() -> Self {
+        Self {
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            csc_set: vk::DescriptorSet::null(),
+            y_img: vk::Image::null(),
+            y_mem: vk::DeviceMemory::null(),
+            y_view: vk::ImageView::null(),
+            uv_img: vk::Image::null(),
+            uv_mem: vk::DeviceMemory::null(),
+            uv_view: vk::ImageView::null(),
+            cursor_img: vk::Image::null(),
+            cursor_mem: vk::DeviceMemory::null(),
+            cursor_view: vk::ImageView::null(),
+            cursor_stage: vk::Buffer::null(),
+            cursor_stage_mem: vk::DeviceMemory::null(),
+            cursor_serial: u64::MAX,
+            cursor_ready: false,
+            cpu_img: None,
+            cpu_stage: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InFlight {
+    /// Which [`Slot`] this frame's command buffer, fence, descriptor set and images belong to.
+    /// Carried per-frame rather than recomputed so `wait_and_packetize` cannot wait the wrong
+    /// fence — the failure that would look like corruption, not like an error.
+    slot: usize,
     /// The capture timestamp this frame's AU must carry. Held here rather than re-read from the
     /// `CapturedFrame` because the frame is the CALLER's and is gone by the time we packetize.
     pts_ns: u64,
@@ -437,52 +531,39 @@ pub struct PyroWaveEncoder {
     pw_dev: pw::pyrowave_device,
     pw_enc: pw::pyrowave_encoder,
 
-    // --- CSC + planes (single slot: encode is synchronous per frame) ---
+    // --- CSC pipeline + sampler: SHARED by every slot (immutable once built, read-only in
+    //     recording, so no overlap hazard). The per-frame resources live in `slots`. ---
     csc_pipe: vk::Pipeline,
     csc_layout: vk::PipelineLayout,
     csc_dsl: vk::DescriptorSetLayout,
     csc_pool: vk::DescriptorPool,
-    csc_set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    y_img: vk::Image,
-    y_mem: vk::DeviceMemory,
-    y_view: vk::ImageView,
-    uv_img: vk::Image,
-    uv_mem: vk::DeviceMemory,
-    uv_view: vk::ImageView,
-
-    // Cursor overlay (cursor-as-metadata): a fixed CURSOR_MAX² RGBA8 sampled image (bound at binding
-    // 3) + host staging, re-uploaded only when the bitmap changes (`cursor_serial`). Single (not
-    // ring) because PyroWave encodes one frame synchronously — no in-flight overlap to race.
-    cursor_img: vk::Image,
-    cursor_mem: vk::DeviceMemory,
-    cursor_view: vk::ImageView,
-    cursor_stage: vk::Buffer,
-    cursor_stage_mem: vk::DeviceMemory,
-    cursor_serial: u64,
-    cursor_ready: bool,
 
     // Per-buffer dmabuf-import cache keyed by (st_dev, st_ino) — mirrors `vulkan_video.rs`.
+    // NOT per-slot: it retains the VkImage/VkDeviceMemory per inode, which is exactly what makes
+    // it safe for two slots to sample the same imported buffer.
     import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
-    // CPU-input staging (software capture / smoke tests), lazily (re)created on format change.
-    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
-    cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
     /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
+    /// Not per-slot: it is consumed synchronously inside `submit_frame` (copied into staging
+    /// before the call returns), so no GPU work ever reads it.
     cpu_expand: Vec<u8>,
 
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    /// The `SLOTS` independent per-frame resource sets — see [`Slot`] for why each member is in
+    /// there and why `bitstream`/`import_cache` are not.
+    slots: Vec<Slot>,
+    /// Which slot the NEXT submit records into; advances modulo `SLOTS` per submitted frame.
+    next_slot: usize,
     /// Frames recorded and queue-submitted whose fence has not been waited yet — i.e. exactly the
     /// work that may still be executing on the GPU. `reset()` keys its bounded wait on this being
     /// non-empty: a never-submitted fence would otherwise read as "wedged" (fences start
     /// unsignaled). At today's depth of 1 this holds at most one entry.
     inflight: VecDeque<InFlight>,
-    /// How many frames may be submitted-but-not-polled at once. **1 today, and the only value the
-    /// resources below can support** — `cmd`, `fence`, `csc_set` and the y/uv images are one each,
-    /// so a second concurrent frame would record into a PENDING command buffer and storage-write
-    /// the images pyrowave is still sampling. PW5 stages 4-6 raise this; until then the split
-    /// exists so the fence wait is on the POLL side, where every other backend already has it.
+    /// How many frames may be submitted-but-not-polled at once. **Still 1**, even though stage 4
+    /// allocated `SLOTS` resource sets: raising it is stage 6's job and needs the second pyrowave
+    /// encoder handle (stage 5) first — pyrowave's own `Encoder` object structurally cannot hold
+    /// two frames (single wavelet/scratch buffers, and `Impl::encode` opens by discarding them
+    /// with an UNDEFINED old layout). Never exceeds `SLOTS`.
     max_inflight: usize,
 
     // --- state ---
@@ -887,30 +968,14 @@ impl PyroWaveEncoder {
             csc_layout: vk::PipelineLayout::null(),
             csc_dsl: vk::DescriptorSetLayout::null(),
             csc_pool: vk::DescriptorPool::null(),
-            csc_set: vk::DescriptorSet::null(),
             sampler: vk::Sampler::null(),
-            y_img: vk::Image::null(),
-            y_mem: vk::DeviceMemory::null(),
-            y_view: vk::ImageView::null(),
-            uv_img: vk::Image::null(),
-            uv_mem: vk::DeviceMemory::null(),
-            uv_view: vk::ImageView::null(),
-            cursor_img: vk::Image::null(),
-            cursor_mem: vk::DeviceMemory::null(),
-            cursor_view: vk::ImageView::null(),
-            cursor_stage: vk::Buffer::null(),
-            cursor_stage_mem: vk::DeviceMemory::null(),
-            cursor_serial: u64::MAX,
-            cursor_ready: false,
             import_cache: Vec::new(),
-            cpu_img: None,
-            cpu_stage: None,
             cpu_expand: Vec::new(),
             cmd_pool: vk::CommandPool::null(),
-            cmd: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
+            slots: (0..SLOTS).map(|_| Slot::null()).collect(),
+            next_slot: 0,
             inflight: VecDeque::new(),
-            // PW5: depth 1. Stages 4-6 raise it; the per-slot resources above cannot support 2.
+            // PW5: depth 1 still. Stage 4 allocates the capacity; stage 6 spends it.
             max_inflight: 1,
             width: w,
             height: h,
@@ -987,28 +1052,6 @@ impl PyroWaveEncoder {
         //      swizzles synthesize Cb/Cr) ----
         let device = me.device.clone(); // cheap fn-table clone; lets `me.*` assignments interleave
         let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
-        let (y_img, y_mem, y_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8_UNORM,
-            w,
-            h,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-        )?;
-        me.y_img = y_img;
-        me.y_mem = y_mem;
-        me.y_view = y_view;
-        let (uv_img, uv_mem, uv_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8G8_UNORM,
-            cw,
-            ch,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-        )?;
-        me.uv_img = uv_img;
-        me.uv_mem = uv_mem;
-        me.uv_view = uv_view;
 
         // ---- CSC compute pipeline (same shader + layout as vulkan_video.rs) ----
         me.sampler = device.create_sampler(
@@ -1073,91 +1116,140 @@ impl PyroWaveEncoder {
         device.destroy_shader_module(shader, None);
         me.csc_pipe = pipe_res.map_err(|(_, e)| e)?[0];
 
+        // Pool sized for ALL slots: 2 combined-image-samplers (binding 0 RGB + binding 3 cursor)
+        // and 2 storage images (Y, UV) per set.
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                // binding 0 (RGB) + binding 3 (cursor).
-                .descriptor_count(2),
+                .descriptor_count(2 * SLOTS as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(2),
+                .descriptor_count(2 * SLOTS as u32),
         ];
         me.csc_pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
+                .max_sets(SLOTS as u32)
                 .pool_sizes(&pool_sizes),
             None,
         )?;
-        me.csc_set = device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(me.csc_pool)
-                .set_layouts(&dsls),
-        )?[0];
-        // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (bound at binding 3).
-        let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8G8B8A8_UNORM,
-            CURSOR_MAX,
-            CURSOR_MAX,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-        )?;
-        me.cursor_img = cursor_img;
-        me.cursor_mem = cursor_mem;
-        me.cursor_view = cursor_view;
-        let (cursor_stage, cursor_stage_mem) = make_host_buffer(
-            &device,
-            &me.mem_props,
-            (CURSOR_MAX * CURSOR_MAX * 4) as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
-        me.cursor_stage = cursor_stage;
-        me.cursor_stage_mem = cursor_stage_mem;
-        // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the encoder's life.
-        let yi = [vk::DescriptorImageInfo::default()
-            .image_view(me.y_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let uvi = [vk::DescriptorImageInfo::default()
-            .image_view(me.uv_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let curi = [vk::DescriptorImageInfo::default()
-            .sampler(me.sampler)
-            .image_view(me.cursor_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        device.update_descriptor_sets(
-            &[
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&yi),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&uvi),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(3)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&curi),
-            ],
-            &[],
-        );
-
         me.cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
-        me.cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(me.cmd_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        me.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+
+        // ---- the per-frame resource sets (PW5 stage 4) ----
+        // Each iteration builds ONE complete `Slot` and assigns as it goes, so a failure part-way
+        // leaves the earlier slots fully formed and the rest null — which `Drop` handles, since
+        // every `vkDestroy*` of VK_NULL_HANDLE is the spec-defined no-op.
+        for i in 0..SLOTS {
+            let (y_img, y_mem, y_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8_UNORM,
+                w,
+                h,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            me.slots[i].y_img = y_img;
+            me.slots[i].y_mem = y_mem;
+            me.slots[i].y_view = y_view;
+            let (uv_img, uv_mem, uv_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8G8_UNORM,
+                cw,
+                ch,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            me.slots[i].uv_img = uv_img;
+            me.slots[i].uv_mem = uv_mem;
+            me.slots[i].uv_view = uv_view;
+            // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (binding 3).
+            let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8G8B8A8_UNORM,
+                CURSOR_MAX,
+                CURSOR_MAX,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            )?;
+            me.slots[i].cursor_img = cursor_img;
+            me.slots[i].cursor_mem = cursor_mem;
+            me.slots[i].cursor_view = cursor_view;
+            let (cursor_stage, cursor_stage_mem) = make_host_buffer(
+                &device,
+                &me.mem_props,
+                (CURSOR_MAX * CURSOR_MAX * 4) as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+            me.slots[i].cursor_stage = cursor_stage;
+            me.slots[i].cursor_stage_mem = cursor_stage_mem;
+            let csc_set = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(me.csc_pool)
+                    .set_layouts(&dsls),
+            )?[0];
+            me.slots[i].csc_set = csc_set;
+            // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the slot's
+            // life; only binding 0 (the frame's RGB view) is rewritten per frame, by `bind_rgb`,
+            // and THAT is why each slot needs its own set — see `Slot`.
+            let yi = [vk::DescriptorImageInfo::default()
+                .image_view(y_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let uvi = [vk::DescriptorImageInfo::default()
+                .image_view(uv_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let curi = [vk::DescriptorImageInfo::default()
+                .sampler(me.sampler)
+                .image_view(cursor_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&yi),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&uvi),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(3)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&curi),
+                ],
+                &[],
+            );
+            me.slots[i].cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(me.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            me.slots[i].fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        }
+
+        // What the extra slot actually COST, measured from the driver's own requirements rather
+        // than estimated from the dimensions — the plan's estimate is not evidence, and on an iGPU
+        // at 4K/4:4:4 this is the number that decides whether the capacity is affordable. The
+        // per-frame CPU staging is excluded because it is allocated lazily and only on the
+        // software-capture path.
+        let slot_bytes: u64 = [
+            me.slots[0].y_img,
+            me.slots[0].uv_img,
+            me.slots[0].cursor_img,
+        ]
+        .iter()
+        .map(|&i| device.get_image_memory_requirements(i).size)
+        .sum::<u64>()
+            + device
+                .get_buffer_memory_requirements(me.slots[0].cursor_stage)
+                .size;
 
         let props = me.instance.get_physical_device_properties(pd);
         tracing::info!(
@@ -1165,21 +1257,29 @@ impl PyroWaveEncoder {
             mode = %format!("{w}x{h}@{fps}"),
             budget_kib = me.frame_budget / 1024,
             chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
+            slots = SLOTS,
+            slot_kib = slot_bytes / 1024,
+            slots_kib = slot_bytes * SLOTS as u64 / 1024,
             "PyroWave encoder open (intra-only wavelet, BT.709 limited)"
         );
 
         Ok(me)
     }
 
-    /// Point CSC binding 0 at this frame's RGB view.
-    unsafe fn bind_rgb(&self, rgb_view: vk::ImageView) {
+    /// Point slot `slot`'s CSC binding 0 at this frame's RGB view.
+    ///
+    /// ⚠ This is the `vkUpdateDescriptorSets` the analysis flagged: writing a set that is still
+    /// bound by a PENDING command buffer violates VUID-vkUpdateDescriptorSets-None-03047. It is
+    /// safe because the set belongs to the slot we are about to record into, and that slot's
+    /// previous frame was retired before `submit` chose it.
+    unsafe fn bind_rgb(&self, slot: usize, rgb_view: vk::ImageView) {
         let ii = [vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(rgb_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         self.device.update_descriptor_sets(
             &[vk::WriteDescriptorSet::default()
-                .dst_set(self.csc_set)
+                .dst_set(self.slots[slot].csc_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&ii)],
@@ -1190,13 +1290,22 @@ impl PyroWaveEncoder {
     /// Cursor-as-metadata: bring the cursor image up to date for this frame and return the shader
     /// push constant `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend).
     /// Records the small upload (only when the bitmap `serial` changed) + layout transition into
-    /// `cmd`, ahead of the CSC dispatch that samples binding 3. Encode is synchronous, so the single
-    /// shared image never races a prior frame; the first use transitions it to SHADER_READ_ONLY.
-    unsafe fn prep_cursor(&mut self, cursor: Option<&pf_frame::CursorOverlay>) -> Result<[i32; 4]> {
+    /// slot `slot`'s command buffer, ahead of the CSC dispatch that samples binding 3.
+    ///
+    /// PER SLOT since PW5 stage 4 — image, staging buffer and `cursor_serial` all. The old comment
+    /// said it outright: a single shared image was only safe because there was no in-flight
+    /// overlap to race. The cost of per-slot is that a changed bitmap uploads once per slot.
+    unsafe fn prep_cursor(
+        &mut self,
+        slot: usize,
+        cursor: Option<&pf_frame::CursorOverlay>,
+    ) -> Result<[i32; 4]> {
         let dev = self.device.clone();
-        let cmd = self.cmd;
-        let img = self.cursor_img;
-        let ready = self.cursor_ready;
+        let cmd = self.slots[slot].cmd;
+        let img = self.slots[slot].cursor_img;
+        let stage = self.slots[slot].cursor_stage;
+        let stage_mem = self.slots[slot].cursor_stage_mem;
+        let ready = self.slots[slot].cursor_ready;
         let barrier = |old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ss)
@@ -1214,20 +1323,16 @@ impl PyroWaveEncoder {
             Some(c) if !c.rgba.is_empty() => {
                 let cw = c.w.min(CURSOR_MAX);
                 let ch = c.h.min(CURSOR_MAX);
-                if self.cursor_serial != c.serial {
+                if self.slots[slot].cursor_serial != c.serial {
                     let bytes = (cw as usize) * (ch as usize) * 4;
-                    let ptr = dev.map_memory(
-                        self.cursor_stage_mem,
-                        0,
-                        bytes as u64,
-                        vk::MemoryMapFlags::empty(),
-                    )?;
+                    let ptr =
+                        dev.map_memory(stage_mem, 0, bytes as u64, vk::MemoryMapFlags::empty())?;
                     std::ptr::copy_nonoverlapping(
                         c.rgba.as_ptr(),
                         ptr as *mut u8,
                         bytes.min(c.rgba.len()),
                     );
-                    dev.unmap_memory(self.cursor_stage_mem);
+                    dev.unmap_memory(stage_mem);
                     let old = if ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -1246,7 +1351,7 @@ impl PyroWaveEncoder {
                     );
                     dev.cmd_copy_buffer_to_image(
                         cmd,
-                        self.cursor_stage,
+                        stage,
                         img,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[vk::BufferImageCopy::default()
@@ -1272,8 +1377,8 @@ impl PyroWaveEncoder {
                             vk::AccessFlags2::SHADER_READ,
                         )]),
                     );
-                    self.cursor_serial = c.serial;
-                    self.cursor_ready = true;
+                    self.slots[slot].cursor_serial = c.serial;
+                    self.slots[slot].cursor_ready = true;
                 }
                 Ok([c.x, c.y, cw as i32, ch as i32])
             }
@@ -1290,7 +1395,7 @@ impl PyroWaveEncoder {
                             vk::AccessFlags2::SHADER_READ,
                         )]),
                     );
-                    self.cursor_ready = true;
+                    self.slots[slot].cursor_ready = true;
                 }
                 Ok([0, 0, 0, 0])
             }
@@ -1347,12 +1452,20 @@ impl PyroWaveEncoder {
     }
 
     /// CPU RGB staging (software capture / smoke tests) — mirrors `vulkan_video.rs::ensure_cpu_rgb`.
-    unsafe fn ensure_cpu_rgb(&mut self, fmt: vk::Format, bytes: &[u8]) -> Result<vk::ImageView> {
+    ///
+    /// PER SLOT since PW5 stage 4: the host writes this staging buffer, so writing it while a
+    /// previous frame's buffer-to-image copy is still pending would race that copy.
+    unsafe fn ensure_cpu_rgb(
+        &mut self,
+        slot: usize,
+        fmt: vk::Format,
+        bytes: &[u8],
+    ) -> Result<vk::ImageView> {
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
         let need = (w * h * 4) as u64;
-        if self.cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
-            if let Some((i, m, v, _)) = self.cpu_img.take() {
+        if self.slots[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
+            if let Some((i, m, v, _)) = self.slots[slot].cpu_img.take() {
                 dev.destroy_image_view(v, None);
                 dev.destroy_image(i, None);
                 dev.free_memory(m, None);
@@ -1365,10 +1478,14 @@ impl PyroWaveEncoder {
                 h,
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             )?;
-            self.cpu_img = Some((i, m, v, fmt));
+            self.slots[slot].cpu_img = Some((i, m, v, fmt));
         }
-        if self.cpu_stage.map(|(_, _, s)| s < need).unwrap_or(true) {
-            if let Some((b, m, _)) = self.cpu_stage.take() {
+        if self.slots[slot]
+            .cpu_stage
+            .map(|(_, _, s)| s < need)
+            .unwrap_or(true)
+        {
+            if let Some((b, m, _)) = self.slots[slot].cpu_stage.take() {
                 dev.destroy_buffer(b, None);
                 dev.free_memory(m, None);
             }
@@ -1378,14 +1495,14 @@ impl PyroWaveEncoder {
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.cpu_stage = Some((buf, mem, need));
+            self.slots[slot].cpu_stage = Some((buf, mem, need));
         }
-        let (_, m, _) = self.cpu_stage.unwrap();
+        let (_, m, _) = self.slots[slot].cpu_stage.unwrap();
         let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
         let n = bytes.len().min(need as usize);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
         dev.unmap_memory(m);
-        Ok(self.cpu_img.unwrap().2)
+        Ok(self.slots[slot].cpu_img.unwrap().2)
     }
 
     /// The per-frame budget handed to pyrowave rate control: `frame_budget`, deflated by the
@@ -1460,16 +1577,22 @@ impl PyroWaveEncoder {
         // which the next `begin` may implicitly reset.
         // Resolved before the closure (which borrows `self` mutably for the recording calls).
         let rate_budget = self.rate_budget();
+        // THE slot this frame owns for its whole life — command buffer, fence, descriptor set,
+        // y/uv images, cursor image and CPU staging (PW5 stage 4). `submit` guaranteed it is free
+        // by draining to `max_inflight - 1` before calling here.
+        let slot = self.next_slot;
+        let cmd = self.slots[slot].cmd;
+        let fence = self.slots[slot].fence;
         let record_and_submit = (|| -> Result<()> {
             dev.begin_command_buffer(
-                self.cmd,
+                cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
             // Cursor-as-metadata: refresh the cursor image (only when the bitmap changed) + get the
             // shader push constant. Recorded into `self.cmd` before the CSC dispatch samples binding 3.
-            let cursor_pc = self.prep_cursor(frame.cursor.as_ref())?;
+            let cursor_pc = self.prep_cursor(slot, frame.cursor.as_ref())?;
 
             // ---- ingest RGB (same barrier discipline as vulkan_video.rs) ----
             let rgb_view = match &frame.payload {
@@ -1496,7 +1619,7 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
                     );
                     view
@@ -1509,13 +1632,13 @@ impl PyroWaveEncoder {
                         normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
                     let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
                     let view = match fmt {
-                        Ok(f) => self.ensure_cpu_rgb(f, norm_bytes),
+                        Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes),
                         Err(e) => Err(e),
                     };
                     self.cpu_expand = scratch;
                     let view = view?;
-                    let (img, ..) = self.cpu_img.unwrap();
-                    let (stage, ..) = self.cpu_stage.unwrap();
+                    let (img, ..) = self.slots[slot].cpu_img.unwrap();
+                    let (stage, ..) = self.slots[slot].cpu_stage.unwrap();
                     let to_dst = vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
@@ -1526,11 +1649,11 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
                     );
                     dev.cmd_copy_buffer_to_image(
-                        self.cmd,
+                        cmd,
                         stage,
                         img,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1556,18 +1679,19 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
                     );
                     view
                 }
                 _ => bail!("pyrowave: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
             };
-            self.bind_rgb(rgb_view);
+            self.bind_rgb(slot, rgb_view);
 
-            // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — the previous
-            // frame's encode already completed under our synchronous fence, which is also the
-            // "execution barrier before writing to images" pyrowave's contract asks for).
+            // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — this SLOT's
+            // previous frame was retired before `submit` chose it, which is also the "execution
+            // barrier before writing to images" pyrowave's contract asks for).
+            let (y_img, uv_img) = (self.slots[slot].y_img, self.slots[slot].uv_img);
             let to_general = |img| {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -1580,17 +1704,17 @@ impl PyroWaveEncoder {
                     .subresource_range(color_range(0))
             };
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[to_general(self.y_img), to_general(self.uv_img)]),
+                    .image_memory_barriers(&[to_general(y_img), to_general(uv_img)]),
             );
-            dev.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
             dev.cmd_bind_descriptor_sets(
-                self.cmd,
+                cmd,
                 vk::PipelineBindPoint::COMPUTE,
                 self.csc_layout,
                 0,
-                &[self.csc_set],
+                &[self.slots[slot].csc_set],
                 &[],
             );
             let mut pc_bytes = [0u8; 16];
@@ -1598,7 +1722,7 @@ impl PyroWaveEncoder {
                 pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
             }
             dev.cmd_push_constants(
-                self.cmd,
+                cmd,
                 self.csc_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
@@ -1606,9 +1730,9 @@ impl PyroWaveEncoder {
             );
             // 4:2:0: one invocation per 2x2 luma block (per chroma sample); 4:4:4: per pixel.
             if self.chroma444 {
-                dev.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+                dev.cmd_dispatch(cmd, w.div_ceil(8), h.div_ceil(8), 1);
             } else {
-                dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+                dev.cmd_dispatch(cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
             }
 
             // CSC storage writes -> pyrowave's sampled reads (images stay GENERAL — the layout
@@ -1625,9 +1749,9 @@ impl PyroWaveEncoder {
                     .subresource_range(color_range(0))
             };
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[to_sampled(self.y_img), to_sampled(self.uv_img)]),
+                    .image_memory_barriers(&[to_sampled(y_img), to_sampled(uv_img)]),
             );
 
             // ---- pyrowave encode, recorded into OUR command buffer ----
@@ -1654,7 +1778,7 @@ impl PyroWaveEncoder {
             let buffers = pw::pyrowave_gpu_buffers {
                 planes: [
                     plane(
-                        self.y_img,
+                        y_img,
                         w,
                         h,
                         r8,
@@ -1665,14 +1789,14 @@ impl PyroWaveEncoder {
                     // The view extent is the chroma IMAGE's own mip0 extent (it's a separate
                     // image, not a planar aspect): half-res for 4:2:0, full-res for 4:4:4.
                     plane(
-                        self.uv_img,
+                        uv_img,
                         if self.chroma444 { w } else { w / 2 },
                         if self.chroma444 { h } else { h / 2 },
                         rg8,
                         pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
                     ),
                     plane(
-                        self.uv_img,
+                        uv_img,
                         if self.chroma444 { w } else { w / 2 },
                         if self.chroma444 { h } else { h / 2 },
                         rg8,
@@ -1685,7 +1809,7 @@ impl PyroWaveEncoder {
             };
             pw::pyrowave_device_set_command_buffer(
                 self.pw_dev,
-                self.cmd.as_raw() as usize as pw::VkCommandBuffer,
+                cmd.as_raw() as usize as pw::VkCommandBuffer,
             );
             let enc_res = pw::pyrowave_encoder_encode_gpu_synchronous(
                 self.pw_enc,
@@ -1697,25 +1821,27 @@ impl PyroWaveEncoder {
             pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
             pw_check(enc_res, "encode_gpu_synchronous")?;
 
-            dev.end_command_buffer(self.cmd)?;
-            dev.reset_fences(&[self.fence])?;
-            let cmds = [self.cmd];
+            dev.end_command_buffer(cmd)?;
+            dev.reset_fences(&[fence])?;
+            let cmds = [cmd];
             dev.queue_submit(
                 self.queue,
                 &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                self.fence,
+                fence,
             )?;
             Ok(())
         })();
         if let Err(e) = record_and_submit {
             // SAFETY: on every closure error arm the buffer is RECORDING/INVALID/EXECUTABLE —
             // never PENDING (nothing was enqueued) — and the pool allows the reset.
-            let _ = dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            let _ = dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
             return Err(e);
         }
         // Submitted: from here the GPU may be executing, and NOTHING may touch `cmd`, the y/uv
         // images or `csc_set` until this entry is retired by `wait_and_packetize`.
+        self.next_slot = (slot + 1) % SLOTS;
         self.inflight.push_back(InFlight {
+            slot,
             pts_ns: frame.pts_ns,
             cap: self.frame_budget + BS_SLACK,
             wire_chunk: self.wire_chunk,
@@ -1736,7 +1862,7 @@ impl PyroWaveEncoder {
             return Ok(());
         };
         let dev = self.device.clone();
-        dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
+        dev.wait_for_fences(&[self.slots[fr.slot].fence], true, 5_000_000_000)
             .context("pyrowave encode fence")?;
         // Waited and signaled: the command buffer is INVALID (one-time submit), which the next
         // `begin` may implicitly reset, and the GPU is done with this frame's resources.
@@ -1832,11 +1958,11 @@ impl Encoder for PyroWaveEncoder {
         // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
         // before anything touches `cmd` again.
         unsafe {
-            // Make room before recording. At `max_inflight == 1` this retires the previous frame,
-            // which is what makes the single `cmd`/`fence`/`csc_set`/y/uv set safe to reuse — the
-            // whole depth-1 invariant, stated in one place. The host loop polls after every submit
-            // so this is normally a no-op; it is here for callers that do not (the `spike`
-            // subcommand, the hardware smoke tests).
+            // Make room before recording. This is THE invariant that makes the slot
+            // `submit_frame` is about to pick provably free: at most `max_inflight - 1` frames may
+            // still be in flight, and `max_inflight <= SLOTS`, so the slot `next_slot` points at
+            // was retired. The host loop polls after every submit so this is normally a no-op; it
+            // is here for callers that do not (the `spike` subcommand, the hardware smoke tests).
             self.drain_to(self.max_inflight.saturating_sub(1))?;
             self.submit_frame(frame, t0)
         }
@@ -1880,13 +2006,16 @@ impl Encoder for PyroWaveEncoder {
         // report "no in-place rebuild" and let the session surface a real error (`Drop`'s
         // unbounded idle covers teardown, where blocking on the kernel is acceptable).
         if !self.inflight.is_empty() {
-            // SAFETY: waiting this encoder's own fence under `&mut self`.
-            if unsafe {
-                self.device
-                    .wait_for_fences(&[self.fence], true, 5_000_000_000)
-            }
-            .is_err()
-            {
+            // Every in-flight frame's fence, not just the oldest — at depth > 1 there may be
+            // several, and destroying the pyrowave encoder while ANY of them still executes is a
+            // use-after-free.
+            let fences: Vec<vk::Fence> = self
+                .inflight
+                .iter()
+                .map(|f| self.slots[f.slot].fence)
+                .collect();
+            // SAFETY: waiting this encoder's own fences under `&mut self`.
+            if unsafe { self.device.wait_for_fences(&fences, true, 5_000_000_000) }.is_err() {
                 tracing::error!(
                     "pyrowave: in-flight encode did not complete within the reset budget — GPU \
                      or driver wedged; in-place rebuild abandoned"
@@ -1993,16 +2122,32 @@ impl Drop for PyroWaveEncoder {
                 self.device.destroy_image(i, None);
                 self.device.free_memory(m, None);
             }
-            if let Some((i, m, v, _)) = self.cpu_img.take() {
-                self.device.destroy_image_view(v, None);
-                self.device.destroy_image(i, None);
-                self.device.free_memory(m, None);
+            // Every slot, in the same all-null-tolerant way (a failed open leaves a partial
+            // prefix built and the rest null; `vkDestroy*(VK_NULL_HANDLE)` is a spec no-op).
+            for sl in std::mem::take(&mut self.slots) {
+                if let Some((i, m, v, _)) = sl.cpu_img {
+                    self.device.destroy_image_view(v, None);
+                    self.device.destroy_image(i, None);
+                    self.device.free_memory(m, None);
+                }
+                if let Some((b, m, _)) = sl.cpu_stage {
+                    self.device.destroy_buffer(b, None);
+                    self.device.free_memory(m, None);
+                }
+                self.device.destroy_fence(sl.fence, None);
+                self.device.destroy_image_view(sl.y_view, None);
+                self.device.destroy_image(sl.y_img, None);
+                self.device.free_memory(sl.y_mem, None);
+                self.device.destroy_image_view(sl.uv_view, None);
+                self.device.destroy_image(sl.uv_img, None);
+                self.device.free_memory(sl.uv_mem, None);
+                self.device.destroy_image_view(sl.cursor_view, None);
+                self.device.destroy_image(sl.cursor_img, None);
+                self.device.free_memory(sl.cursor_mem, None);
+                self.device.destroy_buffer(sl.cursor_stage, None);
+                self.device.free_memory(sl.cursor_stage_mem, None);
             }
-            if let Some((b, m, _)) = self.cpu_stage.take() {
-                self.device.destroy_buffer(b, None);
-                self.device.free_memory(m, None);
-            }
-            self.device.destroy_fence(self.fence, None);
+            // Command buffers and descriptor sets are freed with their pools.
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_descriptor_pool(self.csc_pool, None);
             self.device.destroy_pipeline(self.csc_pipe, None);
@@ -2010,17 +2155,6 @@ impl Drop for PyroWaveEncoder {
             self.device
                 .destroy_descriptor_set_layout(self.csc_dsl, None);
             self.device.destroy_sampler(self.sampler, None);
-            self.device.destroy_image_view(self.y_view, None);
-            self.device.destroy_image(self.y_img, None);
-            self.device.free_memory(self.y_mem, None);
-            self.device.destroy_image_view(self.uv_view, None);
-            self.device.destroy_image(self.uv_img, None);
-            self.device.free_memory(self.uv_mem, None);
-            self.device.destroy_image_view(self.cursor_view, None);
-            self.device.destroy_image(self.cursor_img, None);
-            self.device.free_memory(self.cursor_mem, None);
-            self.device.destroy_buffer(self.cursor_stage, None);
-            self.device.free_memory(self.cursor_stage_mem, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -2310,6 +2444,52 @@ mod tests {
                      vs expected (Y {ye:.1}, Cb {cbe:.1}, Cr {cre:.1})"
                 );
             }
+        }
+    }
+
+    /// PW5 stage 4: what the extra per-frame resource set actually COSTS in VRAM, at the modes
+    /// that decide whether it is affordable. Reported from the driver's own memory requirements,
+    /// not estimated from the dimensions — the plan's ~25-35 MB estimate is a guess, and on an
+    /// iGPU at 4K/4:4:4 the real number is the one that matters.
+    ///
+    /// Prints rather than asserts a threshold: a hard limit here would be a guess about every
+    /// future GPU. What it DOES assert is that a slot is not free and not absurd, so a refactor
+    /// that accidentally allocated per-slot copies of something large fails visibly.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn slot_vram_cost_is_reported() {
+        for (w, h, chroma, name) in [
+            (1920u32, 1080u32, crate::ChromaFormat::Yuv420, "1080p 4:2:0"),
+            (3840, 2160, crate::ChromaFormat::Yuv420, "4K 4:2:0"),
+            (3840, 2160, crate::ChromaFormat::Yuv444, "4K 4:4:4"),
+        ] {
+            let enc = PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma).expect("open");
+            // SAFETY: plain memory-requirement queries on images this encoder owns.
+            let per_slot: u64 = unsafe {
+                [
+                    enc.slots[0].y_img,
+                    enc.slots[0].uv_img,
+                    enc.slots[0].cursor_img,
+                ]
+                .iter()
+                .map(|&i| enc.device.get_image_memory_requirements(i).size)
+                .sum::<u64>()
+                    + enc
+                        .device
+                        .get_buffer_memory_requirements(enc.slots[0].cursor_stage)
+                        .size
+            };
+            eprintln!(
+                "{name}: {} KiB per slot, {SLOTS} slots = {} KiB total",
+                per_slot / 1024,
+                per_slot * SLOTS as u64 / 1024
+            );
+            assert!(per_slot > 0, "{name}: a slot must own real memory");
+            assert!(
+                per_slot < 512 * 1024 * 1024,
+                "{name}: {per_slot} bytes per slot — something large became per-slot that should \
+                 not have (bitstream? import cache?)"
+            );
         }
     }
 
