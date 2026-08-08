@@ -16,6 +16,7 @@ The patches here add the missing half, and nothing else. See
 | `0003-headless-advertise-the-virtual-display-s-mode-and-re.patch` | Give `CHeadlessConnector` a real `GetModes()` + `GetValidDynamicRefreshRates()` from the resolved `-W`/`-H`/`-r`, report `GAMESCOPE_SCREEN_TYPE_EXTERNAL` so `update_mode_atoms` publishes the list, and add `--custom-refresh-rates` | **Yes** — a headless session that cannot report its own mode is a plain bug |
 | `0004-pipewire-optionally-composite-the-external-overlay-i.patch` | `--pipewire-composite-external-overlay` (off by default): paint the external overlay layer (mangoapp — the fps/stats readout) into the capture stream | **Yes** — same shape as the cursor patch, same argument |
 | `0005-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the functional patches above land upstream |
+| `0006-punktfunk-never-destroy-the-Vulkan-device-or-output-.patch` | Give `g_device` and `g_output` storage that is never destroyed, so their destructors cannot call a Vulkan driver glibc has already unloaded at `exit()` | **Yes** — a plain static-destruction-order bug, not punktfunk-specific |
 
 ### Why the headless patch matters
 
@@ -58,6 +59,12 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr4` | …and `--pipewire-composite-external-overlay` |
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
+
+A patch that only fixes a crash does **not** bump it: `0006` (the exit-time Vulkan teardown fix)
+changes nothing the host probes for, so the level stays `+pfhdr4` and the rebuild ships as a
+`pkgrel` bump instead — exactly the split the PKGBUILD's own comment describes. Bumping the level
+for a bugfix would be worse than useless: it would advertise a capability tier that does not exist
+and strand hosts that gate on it.
 
 ⚠️ The two indirect spawn modes (the `GAMESCOPE_BIN` wrapper for gamescope-session-plus, and the
 SteamOS PATH shim) pass these flags through `PF_HDR_ARGS`, so they share one dependency: if the

@@ -1,0 +1,125 @@
+From 509fb928c7dc3307372629ca692f4c895c4fe984 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Sat, 8 Aug 2026 19:17:25 +0200
+Subject: [PATCH] punktfunk: never destroy the Vulkan device or output at exit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every gamescope session punktfunk spawns ended in SIGSEGV. It happened after
+the compositor had already done its work — "Primary child shut down!", then a
+coredump — so the stream itself looked fine and the crash only showed up as a
+steady drip of coredumps and a non-zero exit from the spawn.
+
+The cause is static destruction order, not anything gamescope does wrong at
+runtime. `g_device` (CVulkanDevice) and `g_output` (VulkanOutput_t) were plain
+globals, so glibc ran their destructors from `__run_exit_handlers` once main()
+returned. Those destructors call back into the driver:
+
+  ~CVulkanCmdBuffer -> m_device->vk.FreeCommandBuffers(...)
+  ~CVulkanTexture   -> vk.Destroy*(...)
+
+but the Vulkan ICD has already been torn down and unloaded by that point, so
+each call jumps through a function pointer into an unmapped page. The faulting
+address equals the instruction pointer, which is the signature of exactly that:
+
+  #0  0x00007fe8fd1d1070 in ?? ()
+  #1  CVulkanCmdBuffer::~CVulkanCmdBuffer   at rendervulkan.cpp:1543
+  #9  std::vector<unique_ptr<CVulkanCmdBuffer>>::~vector  (g_device+1792)
+  #10 CVulkanDevice::~CVulkanDevice         at rendervulkan.hpp:768
+  #11 __run_exit_handlers / exit()
+
+On NVIDIA it is 100% reproducible:
+`gamescope --backend headless -W 1280 -H 720 -r 60 --xwayland-count 1 -- true`
+exits 139 every time, and cleanly with this patch (5/5, plus 2/2 at the real
+session's 2752x2064@120 --steam).
+
+Nothing needs freeing at that point. The process is exiting; the kernel
+reclaims the device, its command buffers and every GPU allocation. So give both
+objects storage that is constructed exactly as before but never destroyed — a
+union member is destroyed only if the union's destructor says so, and ours
+deliberately does not. `g_device` and `g_output` keep their names and types
+(now references bound at constant-initialisation time), so no use site changes.
+
+Both are needed: pinning only the device relocated the fault into
+~VulkanOutput_t, which is why this is a shared helper and not a one-off.
+---
+ src/rendervulkan.cpp | 35 +++++++++++++++++++++++++++++++++--
+ src/rendervulkan.hpp |  4 ++--
+ 2 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index 5c2dd11..8cd5ca2 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -118,7 +118,37 @@ static VkResult vulkan_load_module()
+ 	return s_result;
+ }
+ 
+-VulkanOutput_t g_output;
++// punktfunk: globals that own GPU objects must OUTLIVE static destruction.
++//
++// gamescope kept its Vulkan device and output as plain globals, so glibc ran their destructors
++// from `__run_exit_handlers` after main() returned. Those destructors call back into the driver
++// (~CVulkanCmdBuffer -> vk.FreeCommandBuffers, ~CVulkanTexture -> vk.Destroy*), but by then the
++// Vulkan ICD has already been torn down and unloaded, so the call jumps through a function
++// pointer into an unmapped page: SIGSEGV at exactly the address it tried to execute. On NVIDIA it
++// is 100% reproducible -- `gamescope --backend headless ... -- true` dies with exit 139 EVERY
++// time -- so every punktfunk gamescope session ended in a coredump.
++//
++// Nothing needs freeing at that point: the process is exiting and the kernel reclaims the device,
++// its command buffers and every GPU allocation. So give these objects storage that is constructed
++// exactly as before but NEVER destroyed. A union member is only destroyed if the union says so,
++// and ours deliberately does not.
++//
++// Fixing only one of them just moves the crash to the next global (verified: pinning the device
++// relocated the fault into ~VulkanOutput_t), which is why this is a shared helper rather than a
++// one-off.
++namespace
++{
++	template <typename T>
++	union CNoDestroy
++	{
++		T value;
++		CNoDestroy() : value() {}
++		~CNoDestroy() {} // deliberately does NOT destroy `value`
++	};
++}
++
++namespace { CNoDestroy<VulkanOutput_t> g_outputHolder; }
++VulkanOutput_t &g_output = g_outputHolder.value;
+ 
+ uint32_t g_uCompositeDebug = 0u;
+ gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
+@@ -1943,7 +1973,8 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
+ 									0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
+ }
+ 
+-CVulkanDevice g_device;
++namespace { CNoDestroy<CVulkanDevice> g_deviceHolder; }
++CVulkanDevice &g_device = g_deviceHolder.value;
+ 
+ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
+ {
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index b6749d4..a9335c4 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -564,7 +564,7 @@ enum ShaderType {
+ 	SHADER_TYPE_COUNT
+ };
+ 
+-extern VulkanOutput_t g_output;
++extern VulkanOutput_t &g_output;
+ 
+ struct SamplerState
+ {
+@@ -1007,4 +1007,4 @@ void vulkan_wait_idle();
+ // Whether the driver implements VK_EXT_physical_device_drm
+ bool vulkan_has_drm_props();
+ 
+-extern CVulkanDevice g_device;
++extern CVulkanDevice &g_device;
+-- 
+2.55.0
+
