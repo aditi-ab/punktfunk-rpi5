@@ -27,7 +27,28 @@ TARGET_DIR="$SRC/target-steamos"
 WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
 if [ "${1:-}" = "--pull" ]; then
-    if [ -d "$SRC/.git" ]; then log "git pull"; git -C "$SRC" pull --ff-only; ok "pulled"; else die "$SRC is not a git checkout — rsync new source then run without --pull"; fi
+    [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
+    # web/bun.nix and sdk/bun.nix are GENERATED (bun2nix, a pure function of the matching bun.lock —
+    # packaging/nix/README.md) yet COMMITTED, because the Nix build fetches node_modules only from
+    # them. Until the --ignore-scripts fix below, web's `bun install` here ran its `postinstall`
+    # (`bun2nix -o bun.nix`) and rewrote that tracked file on every single update. That is invisible
+    # while the committed file is in sync — but main carried a STALE web/bun.nix from 1db8f763 to
+    # b79d90b4, so any Deck updated in that window had the file rewritten to the *correct* content
+    # and has been sitting dirty ever since. The next `git pull --ff-only` that touches it then dies
+    # with "Your local changes to the following files would be overwritten by merge", and the update
+    # stops before a single service is restarted.
+    #
+    # Restore ONLY these two derived paths. Not a blanket `git reset --hard`: $SRC is the operator's
+    # own checkout (they may have patched a source file, or be carrying a cherry-pick), and silently
+    # deleting that to save an update is a far worse trade than one legible error. Discarding these
+    # two is provably lossless — regenerating them from the lockfiles is exactly what bun2nix does.
+    git -C "$SRC" checkout -- web/bun.nix sdk/bun.nix 2>/dev/null || true
+    log "git pull"
+    git -C "$SRC" pull --ff-only \
+        || die "git pull --ff-only failed in $SRC. If it named locally-modified files, this checkout
+  has local changes: review them with 'git -C $SRC status', then commit or stash them (or discard
+  one with 'git -C $SRC checkout -- <file>') and re-run. Nothing was rebuilt or restarted."
+    ok "pulled"
 fi
 
 log "Rebuilding host (release)"
@@ -36,7 +57,14 @@ distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.cargo/bin:\$PATH
 ok "host rebuilt"
 if [ "$WEB" = 1 ]; then
     log "Rebuilding web console"
-    distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.bun/bin:\$PATH; cd '$SRC/web' && bun install --frozen-lockfile && bun run build"
+    # --ignore-scripts, then `bun run codegen` explicitly: web has TWO install lifecycle scripts and
+    # we want exactly one of them. `prepare` (= codegen: orval + paraglide + the i18n check) is
+    # REQUIRED — src/api/gen, src/paraglide and src/routeTree.gen.ts are gitignored, and `prebuild`
+    # only re-runs orval, so dropping codegen leaves the build without its i18n messages. But
+    # `postinstall` (`bun2nix -o bun.nix`) writes a COMMITTED file, and an updater must never dirty
+    # the tree it just pulled into — that is what broke `--pull` above. The SDK install below has
+    # always passed --ignore-scripts, which is why only web/bun.nix ever went dirty.
+    distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.bun/bin:\$PATH; cd '$SRC/web' && bun install --frozen-lockfile --ignore-scripts && bun run codegen && bun run build"
     ok "web rebuilt"
 fi
 
