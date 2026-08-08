@@ -73,6 +73,10 @@ struct UserData {
     /// PW4 step 1: the producer-fence wait distribution, measured on this (the PipeWire loop)
     /// thread. Per-session, like the fall-through tally.
     fence_wait: FenceWaitStats,
+    /// PW5 step 1: the negotiated buffer-pool depth, counted from `add_buffer`/`remove_buffer`.
+    /// See [`PoolCensus`] — this is the number that decides whether a deeper encode pipeline is
+    /// safe, and until now nobody had it.
+    pool: PoolCensus,
     /// Raw-passthrough frames that silently fell through to the CPU de-pad path, by reason — see
     /// [`PassthroughFallbacks`]. Per-session: a fresh `UserData` is built per pipeline, so a
     /// compositor that starts serving dmabufs again after a rebuild gets a fresh log budget.
@@ -500,6 +504,51 @@ impl FenceWaitStats {
     /// at 60 fps and is the point where one outlier stops dominating the answer.
     pub(super) fn is_meaningful(&self) -> bool {
         self.samples >= 100
+    }
+}
+
+/// PW5 stage 1: how many buffers the producer actually allocated for this stream.
+///
+/// **Nothing in this codebase had ever counted them.** The zero-copy path dups the dmabuf fd and
+/// publishes the frame while the SPA buffer is handed straight back to the producer at `.process`
+/// return — so the only thing keeping capture untorn is that the producer round-robins a pool
+/// deeper than our import+encode window. That depth was an unmeasured assumption; this makes it a
+/// logged number, on every producer, before anything is built on it.
+///
+/// `live` is maintained by the `add_buffer`/`remove_buffer` stream callbacks, which PipeWire fires
+/// on the loop thread as the pool is allocated (and again, remove-then-add, on a renegotiation that
+/// replaces it). There is no "pool complete" event, so the count is published from `.process`: by
+/// the time the first buffer is dequeued the allocation has finished.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PoolCensus {
+    /// Buffers currently in the pool (adds minus removes).
+    live: u32,
+    /// Deepest `live` seen this session — the number a depth decision must key on, since a
+    /// renegotiation can transiently shrink the pool to zero.
+    high_water: u32,
+    /// The `live` value already logged, so a stable pool logs exactly one line per distinct depth
+    /// (a renegotiation that changes the depth is worth a second line; 240 frames a second of the
+    /// same number is not).
+    logged: Option<u32>,
+}
+
+impl PoolCensus {
+    fn add(&mut self) {
+        self.live += 1;
+        self.high_water = self.high_water.max(self.live);
+    }
+
+    fn remove(&mut self) {
+        self.live = self.live.saturating_sub(1);
+    }
+
+    /// Called from `.process`, once per buffer. Returns `Some(live)` the first time each distinct
+    /// depth is seen — the caller logs then and only then.
+    fn note_frame(&mut self) -> Option<u32> {
+        (self.logged != Some(self.live)).then(|| {
+            self.logged = Some(self.live);
+            self.live
+        })
     }
 }
 
@@ -1397,6 +1446,7 @@ pub fn pipewire_thread(
         linear_nv12_failed: false,
         dbg_log_n: 0,
         fence_wait: FenceWaitStats::default(),
+        pool: PoolCensus::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(cursor_id0_hides),
         expect_dims: if expect_exact_dims {
@@ -1495,6 +1545,11 @@ pub fn pipewire_thread(
                 }
             }
         })
+        // PW5 stage 1 — the pool census. PipeWire fires these on the loop thread as it allocates
+        // (and, on a renegotiation, frees then re-allocates) the stream's buffers. Counting only:
+        // the buffer pointer is not touched, so no lifetime question arises here.
+        .add_buffer(|_stream, ud, _buf| ud.pool.add())
+        .remove_buffer(|_stream, ud, _buf| ud.pool.remove())
         .process(|stream, ud| {
             // Latest-frame-only (OBS pattern): Mutter delivers buffers in bursts and recycles its
             // pool; an older queued buffer carries a STALE frame. Drain all queued buffers, requeue
@@ -1522,6 +1577,25 @@ pub fn pipewire_thread(
                 unsafe { stream.queue_raw_buffer(newest) };
                 newest = next;
                 drained += 1;
+            }
+            // PW5 stage 1: publish the depth the producer actually negotiated, once per distinct
+            // value. MEASURED, not requested: `build_dmabuf_buffers` asks for a range and the
+            // producer picks — this line is the only place the picked number is visible.
+            //
+            // Why it matters beyond curiosity: `stream.queue_raw_buffer(newest)` at the end of this
+            // callback hands the buffer back while the encode thread may still be importing and
+            // reading its dmabuf, so content stability rests entirely on the producer not cycling
+            // back to this buffer before we are done with it. That window is `pool_depth` buffer
+            // periods wide. A pool of 2 has essentially none.
+            if let Some(depth) = ud.pool.note_frame() {
+                tracing::info!(
+                    pool_depth = depth,
+                    high_water = ud.pool.high_water,
+                    drained,
+                    "pipewire buffer pool negotiated — this is the producer's ACTUAL count \
+                     (add_buffer/remove_buffer), the window in which a buffer we handed back may \
+                     be rewritten while the encoder still reads it"
+                );
             }
             // Sacrificial-mode gate (kwin.rs `create`): until the producer renegotiates to the
             // expected dims, every buffer — frame AND cursor meta, whose positions are in the
@@ -2128,7 +2202,7 @@ mod tests {
 
     use super::{
         consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, FenceWaitStats,
-        PassthroughFallback, PassthroughFallbacks, FENCE_WAIT_BUCKETS_US,
+        PassthroughFallback, PassthroughFallbacks, PoolCensus, FENCE_WAIT_BUCKETS_US,
     };
 
     /// A PyroWave session is PyroWave even though it also flips `backend_is_vaapi` on (the
@@ -2341,5 +2415,50 @@ mod tests {
                 "a sample of exactly {edge}us belongs in bucket {i}"
             );
         }
+    }
+
+    /// PW5 stage 1: a stable pool logs ONE line, not one per frame. `.process` runs at the capture
+    /// rate — an unconditional log here would be 240 lines a second of the same number.
+    #[test]
+    fn a_stable_pool_is_logged_once() {
+        let mut p = PoolCensus::default();
+        for _ in 0..8 {
+            p.add();
+        }
+        assert_eq!(p.note_frame(), Some(8));
+        for _ in 0..100 {
+            assert_eq!(p.note_frame(), None, "the same depth must not re-log");
+        }
+    }
+
+    /// A renegotiation frees the pool and re-allocates it. The LIVE count therefore dips (and the
+    /// new depth is worth a second line), but `high_water` — the number a pipeline-depth decision
+    /// keys on — must not follow the dip down.
+    #[test]
+    fn a_renegotiated_pool_relogs_but_the_high_water_holds() {
+        let mut p = PoolCensus::default();
+        for _ in 0..8 {
+            p.add();
+        }
+        assert_eq!(p.note_frame(), Some(8));
+        for _ in 0..8 {
+            p.remove();
+        }
+        for _ in 0..4 {
+            p.add();
+        }
+        assert_eq!(p.note_frame(), Some(4), "a changed depth is worth a line");
+        assert_eq!(p.high_water, 8, "the deepest pool seen this session");
+    }
+
+    /// `remove_buffer` without a matching `add_buffer` must not wrap the count to `u32::MAX` —
+    /// a depth gate reading that would happily pipeline against a pool of zero.
+    #[test]
+    fn unmatched_removes_saturate_at_zero() {
+        let mut p = PoolCensus::default();
+        p.remove();
+        p.remove();
+        assert_eq!(p.note_frame(), Some(0));
+        assert_eq!(p.high_water, 0);
     }
 }
