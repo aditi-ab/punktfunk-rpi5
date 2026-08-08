@@ -112,6 +112,24 @@ public final class GamepadCapture {
     static let escapeChordElements = [
         GCInputLeftShoulder, GCInputRightShoulder, GCInputButtonMenu, GCInputButtonOptions,
     ]
+    /// The stats-overlay chord: Select + X, one tier per completion (off → compact → normal →
+    /// detailed → off). It exists because a controller in both hands has no other way to the
+    /// numbers — the ⌃⌥⇧S combo needs a keyboard and the three-finger tap needs a free screen —
+    /// and on tvOS there is no other way AT ALL, which is what this fixes.
+    ///
+    /// Built like Android's mic chord (`GamepadRouter.MIC_CHORD`, Select + Y) and deliberately
+    /// not overlapping `escapeChord`: X is none of its four buttons, so no way of reaching the
+    /// exit chord passes through this one on the way, and vice versa. Select is a menu button
+    /// rather than a twitch action, which keeps the pair out of real play. Y is left free so the
+    /// mic chord can be ported onto it later without moving this one.
+    static let statsChord: UInt32 = GamepadWire.back | GamepadWire.x
+    /// `statsChord`'s elements by GameController alias — same mirror-the-mask rule (and same
+    /// invisible failure) as `escapeChordElements`; the same test pins both.
+    static let statsChordElements = [GCInputButtonOptions, GCInputButtonX]
+    /// Every element some chord reads — what a NON-forwarding slot claims (see `openSlot`). The
+    /// escape chord's four plus the stats chord's X; Select is shared, so it appears once.
+    static let chordElements: [String] =
+        escapeChordElements + statsChordElements.filter { !escapeChordElements.contains($0) }
     /// pf-client-core's `DISCONNECT_HOLD` — the same 1.5 s on every client.
     private static let disconnectHold: TimeInterval = 1.5
     /// pf-client-core's `GUIDE_HOLD`: hold Select alone this long → the HOST's guide goes
@@ -288,14 +306,15 @@ public final class GamepadCapture {
         // the PS button must open the host's Steam overlay. Restored to .enabled on close.
         //
         // With forwarding OFF none of that applies — no press reaches the host, so taking the
-        // user's screenshot gesture away buys nothing. NARROWED, not skipped: the escape chord
-        // is still read off this slot, and on tvOS it is the only controller way out of a
-        // stream, so the chord's own four elements keep their claim. (Menu especially: leave
-        // its gesture attached on tvOS and the press is the system's — the chord would never
-        // complete and the session would have no controller exit at all.)
+        // user's screenshot gesture away buys nothing. NARROWED, not skipped: the CHORDS are
+        // still read off this slot — on tvOS the escape chord is the only controller way out of
+        // a stream, and the stats chord the only way to the overlay — so their own elements keep
+        // their claim. (Menu especially: leave its gesture attached on tvOS and the press is the
+        // system's — the chord would never complete and the session would have no controller
+        // exit at all.)
         let claimed = forwarding
             ? Array(c.physicalInputProfile.elements.values)
-            : Self.escapeChordElements.compactMap { c.physicalInputProfile.elements[$0] }
+            : Self.chordElements.compactMap { c.physicalInputProfile.elements[$0] }
         for element in claimed {
             element.preferredSystemGestureState = .disabled
         }
@@ -437,10 +456,24 @@ public final class GamepadCapture {
         let newButtons = raw | (slot.buttons & GamepadWire.guide)
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
+            let was = slot.buttons
             for bit in GamepadWire.allButtons where changed & bit != 0 {
                 wire?.send(.gamepadButton(bit, down: newButtons & bit != 0, pad: slot.pad))
             }
             slot.buttons = newButtons
+            // The stats chord, edge-triggered on the press that COMPLETES it: one cycle per
+            // chord rather than one per press, since a third button pressed on top finds the
+            // mask already complete and can't re-fire it. Read off the wire mask like the escape
+            // chord, which means a Select the hold-Select gesture has turned into a guide is not
+            // in it — a guide hold can't cycle the overlay on its way past. The buttons still
+            // forward (the chord is a local overlay change, not an input the host must not see).
+            if was & Self.statsChord != Self.statsChord,
+               newButtons & Self.statsChord == Self.statsChord {
+                // Straight to the shared tier default, like TouchMouse's three-finger tap: every
+                // reader (the HUD, the Settings pickers, the live session) observes it through
+                // @AppStorage, so no wiring back to the app is needed.
+                StatsVerbosity.cycle()
+            }
         }
         let newAxes: [Int32] = [
             Int32(g.leftThumbstick.xAxis.value * 32767),

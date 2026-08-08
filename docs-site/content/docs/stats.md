@@ -45,6 +45,13 @@ in-stream:
 | Linux · Windows · Steam Deck | **Ctrl+Alt+Shift+S** |
 | macOS / iPad (pointer or trackpad) | **⌃⌥⇧S** or a **three-finger tap** |
 | Android · iPhone | a **three-finger tap** |
+| Apple TV | **hold Play/Pause** on the Siri Remote |
+| Any Apple client, controller in hand | **Select + X** |
+
+**Select + X** is there for the times your hands are on a controller and the other routes aren't:
+no keyboard for the combo, no free screen for the tap. On an **Apple TV** it is the only one of
+the two you can reach with a game controller, and holding **Play/Pause** is the equivalent on the
+Siri Remote — a *tap* on that button still right-clicks, only the hold cycles the overlay.
 
 **Ctrl+Alt+Shift+S** is one of a small set of shortcuts a stream reserves; the others — release
 captured input, switch mouse mode, disconnect, mute the microphone — are in

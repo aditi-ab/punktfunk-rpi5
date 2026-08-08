@@ -5,8 +5,9 @@ import XCTest
 
 /// The escape chord's mask and its GameController alias list have to describe the same four
 /// buttons. `GamepadCapture.openSlot` claims the system gesture of every element while forwarding
-/// is on, but only of `escapeChordElements` while it is off — so if the alias list ever stops
-/// covering the mask, the missing button's press stays the system's and the chord never completes.
+/// is on, but only of `chordElements` — `escapeChordElements` plus the stats chord's — while it is
+/// off, so if this alias list ever stops covering the mask, the missing button's press stays the
+/// system's and the chord never completes. (`GamepadStatsChordTests` pins the claim list itself.)
 ///
 /// That matters most on tvOS, where this chord is the only controller way out of a stream: the
 /// symptom is a session nobody can leave with the pad in their hands, and nothing logs or crashes.
