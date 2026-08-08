@@ -1148,7 +1148,12 @@ async fn serve_session(
     // path verdict (WARN + learned clamp for the next session on a constrained path; clears
     // a stale clamp on a healthy one) — and, with the driver above, heal or grow THIS
     // session mid-stream. Bounded ~10 s task unless a jumbo grow leaves it as revert guard.
-    wire_mtu::spawn_watch(conn.clone(), welcome.shard_payload as usize, shard_reneg);
+    wire_mtu::spawn_watch(
+        conn.clone(),
+        welcome.shard_payload as usize,
+        hello.max_shard_payload,
+        shard_reneg,
+    );
     // Negotiated cursor forwarding: the HOST_CAP_CURSOR bit the Welcome advertised, read back
     // rather than recomputed (`handshake::cursor_forward` computed it once, with the encoder
     // blend-capability gate — re-running it here could drift, and would re-probe).
