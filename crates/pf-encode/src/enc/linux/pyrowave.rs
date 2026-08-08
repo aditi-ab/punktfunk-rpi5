@@ -339,6 +339,18 @@ struct DeviceHold {
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
 }
 
+/// Percentile of a sorted sample slice, by nearest-rank. **Pure.** Used for the `PUNKTFUNK_PERF`
+/// encode split: a p99 is the whole point here (the game-load spike this codec suffers is a TAIL
+/// event — the mean barely moves while individual frames go 2 ms → 18 ms), so a mean-only readout
+/// would report "fine" through exactly the failure the priority lever exists to fix.
+fn pct(sorted: &[u32], q: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() as f64) * q).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
 /// The global-priority classes to try, in order, for `PYROWAVE_QUEUE_PRIORITY`.
 ///
 /// **Pure, and character-identical to the vendored C patch's grammar**
@@ -449,6 +461,13 @@ pub struct PyroWaveEncoder {
     chroma444: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
+    /// `PUNKTFUNK_PERF`: the synchronous encode's own duration, which is the quantity the
+    /// GPU-priority work is about — patch 0005's header records it going ~2 ms → 15-18 ms at
+    /// 95 % game load. Every other backend (VAAPI, direct NVENC) already logs a submit split;
+    /// this one did not, so the one encoder whose cost the priority lever exists to protect was
+    /// the one you could not measure. Reservoir of recent samples, summarised on a slow cadence.
+    perf_us: Vec<u32>,
+    perf_logged_at: Option<std::time::Instant>,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary and pad every codec
     /// packet to it, so each wire shard carries whole self-delimiting packets. `None` =
     /// one packet per AU (the dense MVP shape).
@@ -471,6 +490,43 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 impl PyroWaveEncoder {
+    /// `PUNKTFUNK_PERF`: record one synchronous-encode duration and summarise on a slow cadence.
+    ///
+    /// Whole-`submit` timing on purpose: for this backend that IS the encode — `encode_frame`
+    /// records CSC+encode, submits, waits the fence and packetizes, all inline (which is also
+    /// why the loop's period folds to `interval + encode`, the thing PW5 exists to unfold).
+    fn note_encode_us(&mut self, us: u32) {
+        if !pf_host_config::config().perf {
+            return;
+        }
+        self.perf_us.push(us);
+        let now = std::time::Instant::now();
+        let since = self.perf_logged_at.map(|t| now.duration_since(t));
+        // Every 2 s, matching the other backends' submit-split cadence, and never before there
+        // are enough samples for a p99 to mean anything.
+        if self.perf_us.len() < 30 || since.is_some_and(|d| d.as_secs() < 2) {
+            if self.perf_logged_at.is_none() {
+                self.perf_logged_at = Some(now);
+            }
+            return;
+        }
+        self.perf_logged_at = Some(now);
+        let mut s = std::mem::take(&mut self.perf_us);
+        s.sort_unstable();
+        let n = s.len() as u64;
+        let mean = s.iter().map(|&v| u64::from(v)).sum::<u64>() / n.max(1);
+        tracing::info!(
+            frames = n,
+            mean_us = mean,
+            p50_us = pct(&s, 0.50),
+            p99_us = pct(&s, 0.99),
+            max_us = *s.last().unwrap_or(&0),
+            "pyrowave encode (synchronous: CSC + encode + fence wait + packetize). Under a \
+             GPU-bound game this is the number the global-priority queue exists to protect — \
+             watch p99, not the mean"
+        );
+    }
+
     pub fn open(
         width: u32,
         height: u32,
@@ -819,6 +875,8 @@ impl PyroWaveEncoder {
             fps,
             chroma444,
             frame_budget: budget_for(bitrate, fps),
+            perf_us: Vec::new(),
+            perf_logged_at: None,
             wire_chunk: None,
             wire_budget: crate::pyrowave_wire::WireBudget::new(),
             bitstream: Vec::new(),
@@ -1676,6 +1734,9 @@ impl PyroWaveEncoder {
 
 impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
+        // `PUNKTFUNK_PERF` encode split (kept above the SAFETY comment so that comment stays
+        // attached to the block it proves — the crate denies undocumented unsafe blocks).
+        let t0 = std::time::Instant::now();
         // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
         // struct owns and waits its own fence before touching results. Command-buffer state on
         // failure is `encode_frame`'s own business now: its record-and-submit closure resets the
@@ -1684,7 +1745,9 @@ impl Encoder for PyroWaveEncoder {
         // VUID-vkResetCommandBuffer-commandBuffer-00045; the blanket reset that used to live
         // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
         // before anything touches `cmd` again.
-        unsafe { self.encode_frame(frame) }
+        let r = unsafe { self.encode_frame(frame) };
+        self.note_encode_us(t0.elapsed().as_micros() as u32);
+        r
     }
 
     fn caps(&self) -> EncoderCaps {
