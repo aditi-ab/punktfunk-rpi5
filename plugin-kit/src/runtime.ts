@@ -12,10 +12,10 @@
 // plugin fiber (running scoped finalizers: UI deregistration, watcher close, cache flush)
 // and bounds the whole teardown with `shutdownGraceMs` so `main` always resolves.
 import {
+	connect,
 	definePlugin,
 	type PluginDef,
 	type Punktfunk,
-	connect,
 } from "@punktfunk/host";
 import {
 	Cause,
@@ -24,7 +24,7 @@ import {
 	Fiber,
 	Layer,
 	ManagedRuntime,
-	Scope,
+	type Scope,
 } from "effect";
 import {
 	type HostClient,

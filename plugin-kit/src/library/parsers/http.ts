@@ -6,8 +6,9 @@
 // SSRF pivot from a process running on the operator's box (`http://169.254.169.254/…`, an internal
 // service). The host learned this in the 2026-07-17 security review; a plugin fetching the same
 // class of URL inherits the same rule. A rare legitimately-redirecting CDN just yields no art.
-import { HostRequestError } from "../../errors.js";
+
 import { Effect } from "effect";
+import { HostRequestError } from "../../errors.js";
 
 export interface FetchLimits {
 	/** Hard cap on the response body. Default 8 MiB — a cover never approaches it. */

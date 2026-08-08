@@ -3,7 +3,7 @@
 // register/renew/deregister through Scope. Validated end-to-end by the phase-0 spike:
 // core-only env layers, no platform package, SPA fallthrough preserved.
 import { type PluginUiHandle, servePluginUi } from "@punktfunk/host";
-import { Effect, FileSystem, Layer, Path, Schema, Scope } from "effect";
+import { Effect, FileSystem, Layer, Path, Schema, type Scope } from "effect";
 import { Etag, HttpPlatform, HttpRouter } from "effect/unstable/http";
 import type { ConfigService } from "./config.js";
 import { UiServeError } from "./errors.js";
@@ -176,7 +176,9 @@ export const serveUi = (
 			Effect.promise(() => dispose()).pipe(Effect.ignore),
 		);
 
-		const serveConfig = opts.config ? makeConfigHandler(opts.config) : undefined;
+		const serveConfig = opts.config
+			? makeConfigHandler(opts.config)
+			: undefined;
 
 		const fetch = async (req: Request): Promise<Response | undefined> => {
 			const url = new URL(req.url);
@@ -203,9 +205,7 @@ export const serveUi = (
 						...(opts.staticDir !== undefined
 							? { staticDir: opts.staticDir }
 							: {}),
-						...(opts.category !== undefined
-							? { category: opts.category }
-							: {}),
+						...(opts.category !== undefined ? { category: opts.category } : {}),
 						fetch,
 					}),
 				catch: (cause) => new UiServeError({ cause }),

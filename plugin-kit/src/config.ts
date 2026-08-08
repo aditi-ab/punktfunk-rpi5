@@ -16,8 +16,8 @@ import {
 	ConfigPermissionError,
 	type ConfigWriteError,
 } from "./errors.js";
-import { atomicWriteFile, ensureStateDir, statePath } from "./paths.js";
 import { PluginInfo } from "./host-client.js";
+import { atomicWriteFile, ensureStateDir, statePath } from "./paths.js";
 
 export interface ConfigService<S extends Schema.Top> {
 	/** Decode the raw file with Schema defaults applied. Missing file → all defaults. */
@@ -36,10 +36,7 @@ export interface ConfigService<S extends Schema.Top> {
 	 */
 	readonly saveRaw: (
 		raw: unknown,
-	) => Effect.Effect<
-		S["Type"],
-		ConfigParseError | ConfigWriteError
-	>;
+	) => Effect.Effect<S["Type"], ConfigParseError | ConfigWriteError>;
 	/** Emits the decoded config after every successful `saveRaw`. */
 	readonly changes: Stream.Stream<S["Type"]>;
 	/** Absolute path of the config file (status views). */
@@ -95,9 +92,7 @@ export const makeConfigService = <S extends Schema.Top>(opts: {
 		const file = statePath(info.name, opts.fileName ?? "config.json");
 		const hub = yield* PubSub.unbounded<S["Type"]>();
 
-		const decode = (
-			raw: unknown,
-		): Effect.Effect<S["Type"], ConfigParseError> =>
+		const decode = (raw: unknown): Effect.Effect<S["Type"], ConfigParseError> =>
 			Schema.decodeUnknownEffect(opts.schema)(raw).pipe(
 				Effect.mapError(
 					(e) => new ConfigParseError({ path: file, issue: String(e) }),

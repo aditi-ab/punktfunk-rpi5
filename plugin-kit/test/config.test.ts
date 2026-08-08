@@ -71,10 +71,7 @@ describe("ConfigService", () => {
 	test("saveRaw persists the RAW shape verbatim (no defaults baked in)", async () => {
 		await withService((svc) => svc.saveRaw({ roots: ["/roms"] }));
 		const onDisk = JSON.parse(
-			fs.readFileSync(
-				path.join(pluginStateDir(PLUGIN), "config.json"),
-				"utf8",
-			),
+			fs.readFileSync(path.join(pluginStateDir(PLUGIN), "config.json"), "utf8"),
 		);
 		expect(onDisk).toEqual({ roots: ["/roms"] }); // no sync block materialized
 		const loaded = await withService((svc) => svc.load);

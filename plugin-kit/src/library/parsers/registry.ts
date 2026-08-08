@@ -59,17 +59,46 @@ export const regQueryValue = (key: string, name: string): string | undefined =>
 	regQueryValues(key).find((v) => v.name.toLowerCase() === name.toLowerCase())
 		?.data;
 
-/** The immediate SUBKEY paths under one HKLM key (GOG lists one subkey per installed game). */
+/**
+ * `reg.exe` always echoes the FULL hive name in its output rows, never the abbreviation it was
+ * given: query `HKLM\SOFTWARE\…` and every line comes back `HKEY_LOCAL_MACHINE\SOFTWARE\…`.
+ */
+const HKLM_FULL = "HKEY_LOCAL_MACHINE\\";
+
+/**
+ * Parse `reg.exe query <key>` output into the immediate subkey NAMES under `key`.
+ *
+ * Exported for tests, like {@link parseRegQuery}, and for the same reason — this is a text format
+ * that quietly breaks, and it did: the previous version matched output lines against the
+ * abbreviated `HKLM\…` prefix it was handed, while reg.exe prints `HKEY_LOCAL_MACHINE\…`. Nothing
+ * ever matched, so it returned `[]` on every machine, forever, and the one plugin that uses it
+ * (GOG) reported "no games installed" instead of failing. See the regSubKeys tests.
+ *
+ * Returns NAMES, not paths: the sole consumer composes `${key}\\${name}`, and a GOG subkey name IS
+ * the product id that becomes the entry's `external_id`.
+ */
+export const parseRegSubKeys = (stdout: string, key: string): string[] => {
+	const full = key.toUpperCase().startsWith(HKLM)
+		? HKLM_FULL + key.slice(HKLM.length)
+		: key;
+	const prefix = `${full.toLowerCase()}\\`;
+	return (
+		stdout
+			.split(/\r?\n/)
+			.map((l) => l.trim())
+			.filter((l) => l.toLowerCase().startsWith(prefix))
+			.map((l) => l.slice(full.length + 1))
+			// Immediate children only — a deeper path still starts with the prefix.
+			.filter((name) => name !== "" && !name.includes("\\"))
+	);
+};
+
+/** The immediate SUBKEY NAMES under one HKLM key (GOG lists one subkey per installed game). */
 export const regSubKeys = (key: string): string[] => {
 	if (!validRegKey(key)) return [];
 	const out = run(["query", key]);
 	if (out === undefined) return [];
-	const prefix = `${key.toLowerCase()}\\`;
-	return out
-		.split(/\r?\n/)
-		.map((l) => l.trim())
-		.filter((l) => l.toLowerCase().startsWith(prefix))
-		.filter((l) => !l.slice(key.length + 1).includes("\\"));
+	return parseRegSubKeys(out, key);
 };
 
 /**

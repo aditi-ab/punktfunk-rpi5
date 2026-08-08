@@ -32,13 +32,13 @@ export {
 } from "./http.js";
 export {
 	parseRegQuery,
+	parseRegSubKeys,
+	type RegValue,
 	regQueryValue,
 	regQueryValues,
 	regSubKeys,
-	type RegValue,
 	validRegKey,
 } from "./registry.js";
-export { openReadOnly, type ReadOnlyDb, withReadOnlyDb } from "./sqlite.js";
 export {
 	crc32,
 	parseShortcuts,
@@ -46,6 +46,7 @@ export {
 	shortcutAppId,
 	shortcutGameId,
 } from "./shortcuts.js";
+export { openReadOnly, type ReadOnlyDb, withReadOnlyDb } from "./sqlite.js";
 export {
 	steamLibraryDirs,
 	steamRoots,

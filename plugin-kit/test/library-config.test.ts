@@ -25,7 +25,10 @@ const ScannerConfig = Schema.Struct({
 		}),
 	),
 	root: Schema.optionalKey(
-		Schema.String.annotate({ title: "Launcher root", description: "Absolute path." }),
+		Schema.String.annotate({
+			title: "Launcher root",
+			description: "Absolute path.",
+		}),
 	),
 	extraRoots: Schema.Array(Schema.String)
 		.annotate({ title: "Extra roots" })
@@ -36,7 +39,10 @@ const ScannerConfig = Schema.Struct({
 			),
 		),
 	launchers: Schema.Struct({
-		bigpicture: Schema.Boolean.annotate({ title: "Big Picture", default: true }),
+		bigpicture: Schema.Boolean.annotate({
+			title: "Big Picture",
+			default: true,
+		}),
 		desktop: Schema.Boolean.annotate({ title: "Desktop", default: false }),
 	}).pipe(
 		Schema.withDecodingDefaultKey(
@@ -80,7 +86,10 @@ describe("S2 — JSON Schema derivation for __config", () => {
 		// A nested object stays nested — the form renders a fieldset, not a JSON blob.
 		expect(p.launchers).toMatchObject({
 			type: "object",
-			properties: { bigpicture: { type: "boolean" }, desktop: { type: "boolean" } },
+			properties: {
+				bigpicture: { type: "boolean" },
+				desktop: { type: "boolean" },
+			},
 		});
 		// A literal union derives a clean enum — prefer it over a union of strings.
 		expect(p.artSource).toMatchObject({
@@ -92,7 +101,9 @@ describe("S2 — JSON Schema derivation for __config", () => {
 	test("annotations pass through — they are the ONLY source of labels and defaults", () => {
 		const p = props();
 		expect(p.enabled.title).toBe("Enable scanning");
-		expect(p.enabled.description).toBe("Whether this source contributes titles.");
+		expect(p.enabled.description).toBe(
+			"Whether this source contributes titles.",
+		);
 		// The derivation does NOT infer `default` from withDecodingDefaultKey, so an un-annotated
 		// field shows the form no placeholder at all. Annotate every field.
 		expect(p.enabled.default).toBe(true);
@@ -120,13 +131,13 @@ describe("S2 — JSON Schema derivation for __config", () => {
 		expect(props().pollMinutes).toMatchObject({ type: "integer" });
 		// The trap, pinned: Schema.Number's ENCODED form admits "NaN"/"Infinity"/"-Infinity", so it
 		// derives a four-way anyOf that no number input can render. Use Finite or Int.
-		const bad = deriveConfigJsonSchema(
-			Schema.Struct({ n: Schema.Number }),
-		) as { schema: { properties: { n: { anyOf?: unknown[] } } } };
+		const bad = deriveConfigJsonSchema(Schema.Struct({ n: Schema.Number })) as {
+			schema: { properties: { n: { anyOf?: unknown[] } } };
+		};
 		expect(Array.isArray(bad.schema.properties.n.anyOf)).toBe(true);
-		const ok = deriveConfigJsonSchema(
-			Schema.Struct({ n: Schema.Finite }),
-		) as { schema: { properties: { n: { type?: string } } } };
+		const ok = deriveConfigJsonSchema(Schema.Struct({ n: Schema.Finite })) as {
+			schema: { properties: { n: { type?: string } } };
+		};
 		expect(ok.schema.properties.n.type).toBe("number");
 	});
 
@@ -141,7 +152,10 @@ describe("S2 — JSON Schema derivation for __config", () => {
 
 describe("__config wire contract", () => {
 	const withService = async <A>(
-		use: (handler: (req: Request) => Promise<Response>, file: string) => Promise<A>,
+		use: (
+			handler: (req: Request) => Promise<Response>,
+			file: string,
+		) => Promise<A>,
 	): Promise<A> => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-kit-cfg-"));
 		const prev = process.env.PUNKTFUNK_CONFIG_DIR;
@@ -150,7 +164,9 @@ describe("__config wire contract", () => {
 			const service = await Effect.runPromise(
 				makeConfigService({ schema: ScannerConfig }).pipe(
 					Effect.provide(
-						Layer.mergeAll(pluginInfoLayer({ name: "steam", version: "0.1.0" })),
+						Layer.mergeAll(
+							pluginInfoLayer({ name: "steam", version: "0.1.0" }),
+						),
 					),
 				),
 			);

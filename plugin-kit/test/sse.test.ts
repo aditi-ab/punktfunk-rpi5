@@ -18,13 +18,9 @@ describe("sseRoute", () => {
 			Layer.provide(routes, httpApiEnv),
 		);
 		try {
-			const res = await handler(
-				new Request("http://127.0.0.1/api/events"),
-			);
+			const res = await handler(new Request("http://127.0.0.1/api/events"));
 			expect(res.status).toBe(200);
-			expect(res.headers.get("content-type")).toContain(
-				"text/event-stream",
-			);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
 			const text = await res.text();
 			expect(text).toContain('event: status\ndata: {"tick":0}\n\n');
 			expect(text).toContain('event: status\ndata: {"tick":2}\n\n');

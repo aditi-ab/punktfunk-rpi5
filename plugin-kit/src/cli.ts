@@ -5,13 +5,13 @@
 // ManagedRuntime + layer graph as the plugin entry, so commands reuse the exact services.
 import { connect, type Punktfunk } from "@punktfunk/host";
 import { Effect, Layer, ManagedRuntime } from "effect";
+import { HostRequestError } from "./errors.js";
 import {
 	type HostClient,
 	hostClientFromFacade,
 	type PluginInfo,
 	pluginInfoLayer,
 } from "./host-client.js";
-import { HostRequestError } from "./errors.js";
 import { loggingLayer } from "./logging.js";
 import type { PluginKitDef } from "./runtime.js";
 
@@ -62,9 +62,7 @@ export const runPluginCli = async <E, R>(opts: {
 		process.exit(name === undefined || name === "help" ? 0 : 2);
 	}
 
-	const pf = command.offline
-		? offlineFacade(opts.def.name)
-		: await connect();
+	const pf = command.offline ? offlineFacade(opts.def.name) : await connect();
 	const base = Layer.mergeAll(
 		hostClientFromFacade(pf),
 		pluginInfoLayer({ name: opts.def.name, version: opts.def.version }),
@@ -82,9 +80,7 @@ export const runPluginCli = async <E, R>(opts: {
 		process.exitCode ??= 0;
 	} catch (e) {
 		const hint =
-			e instanceof HostRequestError
-				? " (is the Punktfunk host running?)"
-				: "";
+			e instanceof HostRequestError ? " (is the Punktfunk host running?)" : "";
 		console.error(`${opts.def.name}: ${name} failed: ${e}${hint}`);
 		process.exitCode = 1;
 	} finally {

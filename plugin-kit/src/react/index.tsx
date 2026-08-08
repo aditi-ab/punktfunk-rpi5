@@ -7,9 +7,10 @@
 // route init must read the last pathname segment — the hash is only a standalone-tab
 // fallback. Navigation posts `pf-ui:navigate` so the console mirrors the route into its
 // own URL (replace: true; the iframe src stays pinned — no reload loop).
-import { useEffect, useState, type ReactNode } from "react";
+
 import { Option, Schema } from "effect";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { type ReactNode, useEffect, useState } from "react";
 
 /** `/plugin-ui/<id>` when served through the console proxy, "" in dev/standalone. */
 export const resolvePluginBase = (): string => {
@@ -110,9 +111,7 @@ export interface ResultGateProps<A, E> {
  * The one loading/error/success convention for plugin pages. Keeps showing the last
  * value while a refresh is in flight (no skeleton flash on invalidation).
  */
-export const ResultGate = <A, E>(
-	props: ResultGateProps<A, E>,
-): ReactNode => {
+export const ResultGate = <A, E>(props: ResultGateProps<A, E>): ReactNode => {
 	const { result } = props;
 	if (AsyncResult.isSuccess(result)) return props.children(result.value);
 	if (AsyncResult.isFailure(result)) {
