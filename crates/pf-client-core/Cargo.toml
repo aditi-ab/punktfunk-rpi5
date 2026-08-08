@@ -118,7 +118,11 @@ rand = "0.9"
 # need the hidapi driver). Linux links the system SDL3; Windows builds it from source
 # (no system SDL3 there — same choice as clients/windows).
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire = "0.9"
+# `v0_3_49` for `Buffer::requested` — the graph's per-cycle frame ask, without which the
+# playback callback can only size writes from the buffer CEILING (quantum-limit, ~170 ms).
+# Pure cfg gate; needs libpipewire ≥ 0.3.49 (2022-03) at runtime, which every ship target
+# (SteamOS, flatpak runtimes, Arch, Ubuntu ≥ 22.10) clears.
+pipewire = { version = "0.9", features = ["v0_3_49"] }
 sdl3 = { version = "0.18", features = ["hidapi"] }
 # Native VAAPI decode (M6 of the native-decode program): the hand-declared libva buffer
 # layouts, the profile/format/surface decisions, the AuPlan → picparams/IQ/slice
