@@ -393,6 +393,32 @@ fn priority_refused(e: vk::Result) -> bool {
     )
 }
 
+/// One frame recorded and queue-submitted, whose fence has not been waited and whose bitstream has
+/// therefore not been packetized yet. PW5 stage 3: this is what the `submit`/`poll` split created —
+/// before it, no such state could exist because `submit` did the whole thing inline.
+#[derive(Clone, Copy)]
+struct InFlight {
+    /// The capture timestamp this frame's AU must carry. Held here rather than re-read from the
+    /// `CapturedFrame` because the frame is the CALLER's and is gone by the time we packetize.
+    pts_ns: u64,
+    /// The bitstream buffer size this frame was ENCODED against (`frame_budget + BS_SLACK`), and
+    /// the packetize boundary in dense mode.
+    ///
+    /// Snapshotted at submit rather than re-read at poll because the split opened a window that
+    /// did not exist before: `reconfigure_bitrate` can land between the two, and in dense mode the
+    /// boundary IS this number — a shrunk budget would make `compute_num_packets` return more than
+    /// one packet and the encode would bail with "unexpected packet count" on a frame that was
+    /// perfectly fine.
+    cap: usize,
+    /// The datagram alignment this frame was encoded for; `set_wire_chunking` can likewise land
+    /// mid-flight, and a frame packetized at a boundary it was not rate-controlled for would ship
+    /// with the wrong `chunk_aligned` flag.
+    wire_chunk: Option<usize>,
+    /// `PUNKTFUNK_PERF`: when `submit` started. The summary keeps measuring submit→AU (what
+    /// `92326312` measured, so stage 0's baseline stays comparable), not just the wait half.
+    t0: std::time::Instant,
+}
+
 pub struct PyroWaveEncoder {
     // --- vulkan core (owned; private to this encoder) ---
     _entry: ash::Entry,
@@ -447,10 +473,17 @@ pub struct PyroWaveEncoder {
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
-    /// True between a successful `queue_submit` and its successful fence wait — i.e. exactly when
-    /// GPU work may still be executing. `reset()` keys its bounded wait on this: a never-submitted
-    /// fence would otherwise read as "wedged" (fences start unsignaled).
-    gpu_pending: bool,
+    /// Frames recorded and queue-submitted whose fence has not been waited yet — i.e. exactly the
+    /// work that may still be executing on the GPU. `reset()` keys its bounded wait on this being
+    /// non-empty: a never-submitted fence would otherwise read as "wedged" (fences start
+    /// unsignaled). At today's depth of 1 this holds at most one entry.
+    inflight: VecDeque<InFlight>,
+    /// How many frames may be submitted-but-not-polled at once. **1 today, and the only value the
+    /// resources below can support** — `cmd`, `fence`, `csc_set` and the y/uv images are one each,
+    /// so a second concurrent frame would record into a PENDING command buffer and storage-write
+    /// the images pyrowave is still sampling. PW5 stages 4-6 raise this; until then the split
+    /// exists so the fence wait is on the POLL side, where every other backend already has it.
+    max_inflight: usize,
 
     // --- state ---
     width: u32,
@@ -490,11 +523,17 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 impl PyroWaveEncoder {
-    /// `PUNKTFUNK_PERF`: record one synchronous-encode duration and summarise on a slow cadence.
+    /// `PUNKTFUNK_PERF`: record one encode duration and summarise on a slow cadence.
     ///
-    /// Whole-`submit` timing on purpose: for this backend that IS the encode — `encode_frame`
-    /// records CSC+encode, submits, waits the fence and packetizes, all inline (which is also
-    /// why the loop's period folds to `interval + encode`, the thing PW5 exists to unfold).
+    /// **submit→AU on purpose**, and unchanged by PW5 stage 3's `submit`/`poll` split: the sample
+    /// is stamped when `submit` starts and taken when the AU becomes readable, so it still covers
+    /// CSC + encode + fence wait + packetize and stays directly comparable to the pre-split
+    /// baseline (`92326312`). What the split changed is WHERE the wait sits — the host loop's own
+    /// `submit_us` now excludes it, which is the shape every other backend already had.
+    ///
+    /// ⚠ At a depth greater than 1 this number legitimately grows by roughly one loop period,
+    /// because frame N's AU is not retrieved until after N+1 has been submitted. That is real
+    /// added latency, not an instrumentation artefact — see PW5's escalation gate.
     fn note_encode_us(&mut self, us: u32) {
         if !pf_host_config::config().perf {
             return;
@@ -521,9 +560,10 @@ impl PyroWaveEncoder {
             p50_us = pct(&s, 0.50),
             p99_us = pct(&s, 0.99),
             max_us = *s.last().unwrap_or(&0),
-            "pyrowave encode (synchronous: CSC + encode + fence wait + packetize). Under a \
+            depth = self.max_inflight,
+            "pyrowave encode, submit->AU (CSC + encode + fence wait + packetize). Under a \
              GPU-bound game this is the number the global-priority queue exists to protect — \
-             watch p99, not the mean"
+             watch p99, not the mean. At depth > 1 it includes one loop period of pipelining"
         );
     }
 
@@ -869,7 +909,9 @@ impl PyroWaveEncoder {
             cmd_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
-            gpu_pending: false,
+            inflight: VecDeque::new(),
+            // PW5: depth 1. Stages 4-6 raise it; the per-slot resources above cannot support 2.
+            max_inflight: 1,
             width: w,
             height: h,
             fps,
@@ -1356,9 +1398,14 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// One frame, synchronously: ingest → CSC → pyrowave encode (recorded into our command
-    /// buffer) → submit + fence wait (sub-ms) → packetize into an `EncodedFrame`.
-    unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
+    /// The SUBMIT half of one frame (PW5 stage 3): ingest → CSC → pyrowave encode, recorded into
+    /// our command buffer → queue-submit → **return**. The fence wait and packetize moved to
+    /// [`wait_and_packetize`](Self::wait_and_packetize), which is where every other backend in
+    /// this crate has always had them.
+    ///
+    /// On success exactly one [`InFlight`] is pushed. On failure nothing is pushed and the command
+    /// buffer has been reset (see the error-arm note inside) — the caller may submit again.
+    unsafe fn submit_frame(&mut self, frame: &CapturedFrame, t0: std::time::Instant) -> Result<()> {
         // A failed `reset()` leaves the encoder destroyed and null. Callers today turn that into
         // a session error and never resubmit, but a null here would be a use-after-free inside
         // pyrowave rather than a clean error — so fail loudly instead of relying on that.
@@ -1666,10 +1713,34 @@ impl PyroWaveEncoder {
             let _ = dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
             return Err(e);
         }
-        self.gpu_pending = true;
+        // Submitted: from here the GPU may be executing, and NOTHING may touch `cmd`, the y/uv
+        // images or `csc_set` until this entry is retired by `wait_and_packetize`.
+        self.inflight.push_back(InFlight {
+            pts_ns: frame.pts_ns,
+            cap: self.frame_budget + BS_SLACK,
+            wire_chunk: self.wire_chunk,
+            t0,
+        });
+        Ok(())
+    }
+
+    /// The POLL half of one frame (PW5 stage 3): wait the oldest in-flight frame's fence, then
+    /// packetize its bitstream into an `EncodedFrame` on `pending`.
+    ///
+    /// ⚠ The fence wait's failure path deliberately does NOT reset the command buffer: a timeout
+    /// leaves it PENDING, where a reset violates VUID-vkResetCommandBuffer-commandBuffer-00045.
+    /// The in-flight entry is likewise NOT popped on that failure — it is what tells `reset()`
+    /// there is still live GPU work to re-wait before the encoder object may be destroyed.
+    unsafe fn wait_and_packetize(&mut self) -> Result<()> {
+        let Some(fr) = self.inflight.front().copied() else {
+            return Ok(());
+        };
+        let dev = self.device.clone();
         dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
             .context("pyrowave encode fence")?;
-        self.gpu_pending = false;
+        // Waited and signaled: the command buffer is INVALID (one-time submit), which the next
+        // `begin` may implicitly reset, and the GPU is done with this frame's resources.
+        self.inflight.pop_front();
 
         // ---- packetize ----
         // Dense (default): boundary = whole buffer → the AU is exactly one pyrowave packet.
@@ -1678,16 +1749,19 @@ impl PyroWaveEncoder {
         // self-delimiting packets — the client windows its parse and a lost shard costs
         // only those blocks. Padding cost is small: the packetizer fills close to the
         // boundary by design.
-        let cap = self.frame_budget + BS_SLACK;
+        // `fr.cap`/`fr.wire_chunk`, NOT the live fields: `reconfigure_bitrate` and
+        // `set_wire_chunking` may have landed since this frame was submitted, and packetizing at a
+        // boundary the frame was not rate-controlled for is a spurious failure.
+        let cap = fr.cap;
         self.bitstream.resize(cap, 0);
         // Chunked mode reserves the 4-byte window prefix from the packetize boundary (shared helper).
-        let boundary = crate::pyrowave_wire::packet_boundary(self.wire_chunk, cap);
+        let boundary = crate::pyrowave_wire::packet_boundary(fr.wire_chunk, cap);
         let mut n: usize = 0;
         pw_check(
             pw::pyrowave_encoder_compute_num_packets(self.pw_enc, boundary, &mut n),
             "compute_num_packets",
         )?;
-        if n == 0 || (self.wire_chunk.is_none() && n != 1) {
+        if n == 0 || (fr.wire_chunk.is_none() && n != 1) {
             bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
         }
         let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
@@ -1713,21 +1787,34 @@ impl PyroWaveEncoder {
         // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
         // single packet, or the datagram-aligned windowed AU (§4.4).
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
-        let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
-        if self.wire_chunk.is_some() {
+        let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk);
+        if fr.wire_chunk.is_some() {
             let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
             self.wire_budget.observe(raw, au.len());
         }
         self.frame_count += 1;
         self.pending.push_back(EncodedFrame {
             data: au,
-            pts_ns: frame.pts_ns,
+            pts_ns: fr.pts_ns,
             // Every frame is independently decodable — SOF/keyframe on each AU is the codec's
             // whole recovery story (plan §1.2).
             keyframe: true,
             recovery_anchor: false,
-            chunk_aligned: self.wire_chunk.is_some(),
+            chunk_aligned: fr.wire_chunk.is_some(),
         });
+        // submit→AU, the same quantity `92326312` measured before the split, so stage 0's
+        // baseline stays comparable. Stamped here rather than in `submit` because that is where
+        // the AU now becomes readable.
+        self.note_encode_us(fr.t0.elapsed().as_micros() as u32);
+        Ok(())
+    }
+
+    /// Retire in-flight frames until at most `keep` remain. Used by `submit` (make room before
+    /// recording) and by `flush`/`poll` (drain).
+    unsafe fn drain_to(&mut self, keep: usize) -> Result<()> {
+        while self.inflight.len() > keep {
+            self.wait_and_packetize()?;
+        }
         Ok(())
     }
 }
@@ -1737,17 +1824,22 @@ impl Encoder for PyroWaveEncoder {
         // `PUNKTFUNK_PERF` encode split (kept above the SAFETY comment so that comment stays
         // attached to the block it proves — the crate denies undocumented unsafe blocks).
         let t0 = std::time::Instant::now();
-        // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
-        // struct owns and waits its own fence before touching results. Command-buffer state on
-        // failure is `encode_frame`'s own business now: its record-and-submit closure resets the
-        // buffer on every pre-submit failure, and its post-submit failures (fence timeout —
-        // buffer possibly PENDING) deliberately do NOT reset, because that violates
+        // SAFETY: single-threaded encoder; both halves work on handles this struct owns.
+        // Command-buffer state on failure is `submit_frame`'s own business: its record-and-submit
+        // closure resets the buffer on every pre-submit failure, and the fence wait's failure
+        // (buffer possibly PENDING) deliberately does NOT reset, because that violates
         // VUID-vkResetCommandBuffer-commandBuffer-00045; the blanket reset that used to live
         // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
         // before anything touches `cmd` again.
-        let r = unsafe { self.encode_frame(frame) };
-        self.note_encode_us(t0.elapsed().as_micros() as u32);
-        r
+        unsafe {
+            // Make room before recording. At `max_inflight == 1` this retires the previous frame,
+            // which is what makes the single `cmd`/`fence`/`csc_set`/y/uv set safe to reuse — the
+            // whole depth-1 invariant, stated in one place. The host loop polls after every submit
+            // so this is normally a no-op; it is here for callers that do not (the `spike`
+            // subcommand, the hardware smoke tests).
+            self.drain_to(self.max_inflight.saturating_sub(1))?;
+            self.submit_frame(frame, t0)
+        }
     }
 
     fn caps(&self) -> EncoderCaps {
@@ -1764,6 +1856,14 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        // PW5 stage 3: THIS is where the fence wait now lives. `submit` returns as soon as the
+        // work is queued; the AU only exists once the fence signals and the bitstream is
+        // packetized, so poll completes the oldest in-flight frame before answering.
+        if self.pending.is_empty() && !self.inflight.is_empty() {
+            // SAFETY: single-threaded encoder, waiting its own fence and reading its own
+            // bitstream; the failure path leaves the entry in flight for `reset()` to re-wait.
+            unsafe { self.wait_and_packetize()? };
+        }
         Ok(self.pending.pop_front())
     }
 
@@ -1771,15 +1871,15 @@ impl Encoder for PyroWaveEncoder {
         // Cheap in-place rebuild: recreate only the pyrowave encoder object — there is no
         // rate-control history or reference state worth preserving (plan §4.3).
         //
-        // Bounded wait first: the only work possibly still executing is the one submitted frame
-        // whose synchronous fence wait timed out (`gpu_pending`). Re-wait it under the same 5 s
-        // cap as `encode_frame` — an untimed `device_wait_idle` here would park the recovery
-        // thread on the exact device it suspects is wedged, until the kernel's GPU reset, if
-        // ever. If the fence still won't signal, destroying the pyrowave encoder under live GPU
-        // work would be a use-after-free, so report "no in-place rebuild" and let the session
-        // surface a real error (`Drop`'s unbounded idle covers teardown, where blocking on the
-        // kernel is acceptable).
-        if self.gpu_pending {
+        // Bounded wait first: the only work possibly still executing is a submitted frame whose
+        // fence wait has not succeeded yet (`inflight` non-empty — either never polled, or polled
+        // and timed out). Re-wait it under the same 5 s cap as `wait_and_packetize` — an untimed
+        // `device_wait_idle` here would park the recovery thread on the exact device it suspects
+        // is wedged, until the kernel's GPU reset, if ever. If the fence still won't signal,
+        // destroying the pyrowave encoder under live GPU work would be a use-after-free, so
+        // report "no in-place rebuild" and let the session surface a real error (`Drop`'s
+        // unbounded idle covers teardown, where blocking on the kernel is acceptable).
+        if !self.inflight.is_empty() {
             // SAFETY: waiting this encoder's own fence under `&mut self`.
             if unsafe {
                 self.device
@@ -1794,7 +1894,9 @@ impl Encoder for PyroWaveEncoder {
                 self.pending.clear();
                 return false;
             }
-            self.gpu_pending = false;
+            // The submitted frames are forfeit (their bitstream lives in the encoder object about
+            // to be destroyed), but the GPU is provably done with them.
+            self.inflight.clear();
         }
         // SAFETY: the device is idle for this encoder's work (the fence wait above, or no submit
         // outstanding) — this sweep-up is instant — and the pyrowave device outlives the encoder
@@ -1822,7 +1924,7 @@ impl Encoder for PyroWaveEncoder {
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
             if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
                 tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
-                // `pw_enc` stays null — `Drop` and `encode_frame` both guard on it. The queued
+                // `pw_enc` stays null — `Drop` and `submit_frame` both guard on it. The queued
                 // AUs are forfeit either way (the caller turns a false reset into a session
                 // error), so drop them rather than shipping output from a dead encoder.
                 self.pending.clear();
@@ -1860,8 +1962,11 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Synchronous per-frame encode: nothing buffered beyond `pending`.
-        Ok(())
+        // Since PW5 stage 3 there IS something buffered beyond `pending`: a submitted frame whose
+        // fence has not been waited. Retire it so the caller's `poll`-until-`None` drain
+        // (the trait's contract) actually returns every AU. Bounded by the same 5 s fence cap.
+        // SAFETY: single-threaded encoder, waiting its own fence.
+        unsafe { self.drain_to(0) }
     }
 }
 
