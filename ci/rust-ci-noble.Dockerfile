@@ -45,6 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Sourced from the official FFmpeg GitHub mirror by release tag, NOT ffmpeg.org: the CI build network
 # can't reach ffmpeg.org (curl times out) but reaches github.com fine. The `nX.Y` tag pins the version
 # (n8.0 -> libavcodec 62); bump it to move FFmpeg. Immutable-tag clone, so no separate checksum needed.
+#
+# STAYING ON 8.0 THROUGH THE 2026-08-08 FFmpeg-9 BUMP IS DELIBERATE. `ffmpeg-next` moved to 9, but a
+# crate major is a CEILING (ffmpeg-sys-next 9 spans libavcodec 56..63), so an 8.0 tree still compiles
+# — and this .deb is the one package with NO exposure to the soname break that motivated the bump: it
+# BUNDLES these libs into /usr/lib/punktfunk-host behind an rpath and strips the libav* sonames from
+# its Depends, so nothing the user's apt does can move them underneath it. Bumping this tag would
+# re-qualify the encode stack for every Ubuntu user and buy none of them anything, so it is its own
+# change — and it drags NVHDR_TAG and the soname assertion below along with it.
 ARG FFMPEG_TAG=n8.0
 # nv-codec-headers must MATCH the FFmpeg version: its `master` is NVENC SDK 13, which renamed
 # NV_ENC_CLOCK_TIMESTAMP_SET.countingType -> countingTypeLSB and won't compile against FFmpeg 8.0's

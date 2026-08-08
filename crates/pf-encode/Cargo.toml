@@ -35,8 +35,12 @@ pf-capture = { path = "../pf-capture" }
 openh264 = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# libavcodec (NVENC libav + VAAPI backends). `ffmpeg-sys-next` auto-detects the FFmpeg version.
-ffmpeg-next = "8"
+# libavcodec (NVENC libav + VAAPI backends). `ffmpeg-sys-next` auto-detects the FFmpeg version, so
+# this pin tracks the crate's own major (which shadows FFmpeg's): 9 = FFmpeg 9 (libavcodec 63,
+# libavutil 61). Arch shipped FFmpeg 9 on 2026-08-08 and every soname moved with it; the packaged
+# host must be BUILT against the FFmpeg it will run on, and packaging/arch/PKGBUILD now derives a
+# soname dep from that link so pacman can no longer walk an install across the break.
+ffmpeg-next = "9"
 libc = "0.2"
 # Vulkan bindings for the raw Vulkan-Video encode + PyroWave compute backends (feature-gated below;
 # the dep stays unconditional to mirror the host's Linux target — unused-but-declared is harmless).
@@ -53,7 +57,7 @@ pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 # NVENC (direct SDK, D3D11 input) + the shared D3D11/DXGI vocabulary via pf-frame.
 nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
 # AMD (AMF) + Intel (QSV) hardware encode via libavcodec (behind `amf-qsv`; link-imports FFmpeg).
-ffmpeg-next = { version = "8", optional = true }
+ffmpeg-next = { version = "9", optional = true }
 # `libnvidia-encode`/`nvEncodeAPI64.dll` resolved at runtime; the NVENC status→cause table dlopen.
 libloading = "0.8"
 # Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.

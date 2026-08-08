@@ -13,7 +13,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # toolchain + bindgen; nodejs runs the JS actions (checkout/cache); unzip is for the bun installer
     build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs unzip \
-    # ffmpeg-next 8 (system FFmpeg 8 / libavcodec 62 on 26.04)
+    # ffmpeg-next 9, built against whatever libav* 26.04 ships (FFmpeg 8 / libavcodec 62 today).
+    # The crate major is a CEILING — ffmpeg-sys-next 9 spans libavcodec 56..63 — so this image does
+    # not need to move in lockstep with Arch's FFmpeg 9; it just links what the distro has.
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
     libavdevice-dev \
     # capture / audio / display stacks (+xkbcommon for the wlr input backend)
