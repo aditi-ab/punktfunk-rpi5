@@ -350,8 +350,21 @@ fn sniff_image_type(bytes: &[u8]) -> Option<&'static str> {
 /// write-time half of the art confinement — [`validate_art_paths`] refuses to persist a value this
 /// rejects, so an out-of-root path never reaches the catalog in the first place, and
 /// [`local_art_bytes`] re-checks at read time so an entry written before this existed is still safe.
+///
+/// A `file://` value is decoded to a plain path FIRST, exactly as [`local_art_bytes`] does. Both
+/// halves of the confinement must judge the *same* string or they disagree: `Path::new` on a raw
+/// `file:///home/u/c.jpg` yields a RELATIVE path whose first component is `file:`, which
+/// canonicalizes against the cwd, fails, and reads as "outside every root". That is not a
+/// conservative failure — it rejected every `file://` cover the plugin kit emits (`fileUrl`, the
+/// documented way for a library plugin to publish local art), so the Lutris and Steam scanners
+/// could not reconcile a single entry while the read path would have served those same files
+/// happily.
 pub fn art_path_is_servable(value: &str) -> bool {
-    let p = Path::new(value);
+    // Idempotent for the already-decoded caller: the decoded form no longer carries the prefix,
+    // so `local_art_bytes` passing its own output back through here is a no-op, not a second
+    // percent-decode of a path that legitimately contains `%`.
+    let value = file_url_to_path(value);
+    let p = Path::new(&*value);
     let ext_ok = p
         .extension()
         .and_then(|e| e.to_str())
@@ -699,11 +712,23 @@ mod tests {
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
 
+    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` is process-global while cargo runs tests as threads, so the
+    /// tests that repoint it must not overlap — one clearing the variable mid-flight makes the
+    /// other's temp root stop being a root, which fails as a confinement bug that isn't there.
+    /// Poisoning is recovered rather than propagated: a panic in one test should report ITS
+    /// failure, not cascade into an unrelated `PoisonError`.
+    static ART_ROOTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_art_roots() -> std::sync::MutexGuard<'static, ()> {
+        ART_ROOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The art proxy reads bytes in the HOST process (LocalSystem on Windows) from a path the
     /// plugin lane can write — so what it will and will not read IS the security boundary
     /// (2026-08-05 review H-2). Confinement, extension, and content are all load-bearing.
     #[test]
     fn local_art_bytes_is_confined_and_image_only() {
+        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-test-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("pf-art-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -835,6 +860,79 @@ mod tests {
             err.starts_with("art.hero"),
             "the error names the field: {err}"
         );
+    }
+
+    /// The write gate and the read gate must judge the SAME string.
+    ///
+    /// Regression for 2026-08-08: `validate_art_paths` handed the raw value to `Path::new`, so a
+    /// `file:///…` cover became a *relative* path starting with a `file:` component, canonicalized
+    /// against the cwd, failed, and was refused as "outside every art root" — while
+    /// `local_art_bytes` decoded the very same value and served the file. Every Lutris and Steam
+    /// entry carrying local art was rejected with a 400 the plugin could only report as
+    /// `HostRequestError`, so neither scanner could sync a single game. Asserting servable and
+    /// readable together is the point: either alone passes with the bug present.
+    #[test]
+    fn file_url_art_is_accepted_at_write_time_exactly_as_at_read_time() {
+        let _guard = lock_art_roots();
+        let dir = std::env::temp_dir().join(format!("pf-art-wr-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("pf-art-wr-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir);
+
+        let cover = dir.join("cover.png");
+        std::fs::write(&cover, PNG).unwrap();
+
+        // What the kit's `fileUrl` actually emits for a Lutris/Steam cover.
+        let url = file_url(&cover);
+        assert!(
+            is_local_art_path(&url),
+            "a file:// value is local art, so the confinement applies to it"
+        );
+        assert!(
+            art_path_is_servable(&url),
+            "write time must accept the file:// form of a servable cover"
+        );
+        assert!(
+            validate_art_paths(&Artwork {
+                portrait: Some(url.clone()),
+                header: Some(url),
+                ..Default::default()
+            })
+            .is_ok(),
+            "a real Lutris-shaped payload must reconcile"
+        );
+
+        // A percent-encoded name (the reason the decode exists at all) survives the round trip.
+        let spaced = dir.join("My Cover.png");
+        std::fs::write(&spaced, PNG).unwrap();
+        let spaced_url = file_url(&spaced).replace(' ', "%20");
+        assert!(
+            art_path_is_servable(&spaced_url),
+            "percent-encoded names must decode before the containment test: {spaced_url}"
+        );
+        assert!(local_art_bytes(&spaced_url).is_some(), "read time agrees");
+
+        // Loosening the write gate must not loosen the confinement: outside the root is still
+        // refused in file:// clothing, which is what the raw-string bug was accidentally doing.
+        let elsewhere = outside.join("cover.png");
+        std::fs::write(&elsewhere, PNG).unwrap();
+        assert!(
+            !art_path_is_servable(&file_url(&elsewhere)),
+            "file:// must not escape the art roots at write time either"
+        );
+        assert!(
+            validate_art_paths(&Artwork {
+                portrait: Some(file_url(&elsewhere)),
+                ..Default::default()
+            })
+            .is_err(),
+            "an out-of-root file:// cover is still refused"
+        );
+
+        std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

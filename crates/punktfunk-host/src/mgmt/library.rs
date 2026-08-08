@@ -14,33 +14,42 @@ use axum::Extension;
 /// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
 /// authority alone. Route reachability and field authority are separate questions.
 ///
-/// `Some(response)` is the refusal to return; `None` means the payload may proceed. Deliberately
-/// not `Result<(), Response>`: the "error" here IS the response the handler sends, so there is no
-/// error value to propagate, and a 128-byte `Response` in an `Err` variant is what
+/// `Some((reason, response))` is the refusal to return; `None` means the payload may proceed.
+/// Deliberately not `Result<(), Response>`: the "error" here IS the response the handler sends, so
+/// there is no error value to propagate, and a 128-byte `Response` in an `Err` variant is what
 /// `clippy::result_large_err` objects to.
+///
+/// `reason` is the caller's log line. It exists because these are TWO different refusals — an
+/// operator-privileged field (403) and an unservable art path (400) — and logging both as "carries
+/// a field this lane may not set" sent the Lutris/Steam `file://` art rejection looking like an
+/// auth problem. The plugin only ever sees `HostRequestError`, so this log line is the sole
+/// diagnosis surface for whoever has to explain why a scanner syncs nothing.
 fn check_entry_fields(
     lane: AuthLane,
     art: &crate::library::Artwork,
     launch: Option<&crate::library::LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
-) -> Option<Response> {
+) -> Option<(String, Response)> {
     if !lane.may_set_privileged_fields() {
         if let Some(field) = crate::library::privileged_field(launch, prep) {
-            return Some(api_error(
-                StatusCode::FORBIDDEN,
-                &format!(
-                    "`{field}` is executed as the host user and may only be set with the \
-                     operator's admin token — a plugin may publish entries with any host-resolved \
-                     launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
-                     heroic, playnite) \
-                     instead"
+            return Some((
+                format!("payload carries `{field}`, which this lane may not set"),
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "`{field}` is executed as the host user and may only be set with the \
+                         operator's admin token — a plugin may publish entries with any host-resolved \
+                         launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
+                         heroic, playnite) \
+                         instead"
+                    ),
                 ),
             ));
         }
     }
     crate::library::validate_art_paths(art)
         .err()
-        .map(|e| api_error(StatusCode::BAD_REQUEST, &e))
+        .map(|e| (e.clone(), api_error(StatusCode::BAD_REQUEST, &e)))
 }
 
 #[derive(Deserialize)]
@@ -205,7 +214,9 @@ pub(crate) async fn create_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some((_, denied)) =
+        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
+    {
         return denied;
     }
     match crate::library::add_custom(input) {
@@ -238,7 +249,9 @@ pub(crate) async fn update_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some(denied) = check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep) {
+    if let Some((_, denied)) =
+        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
+    {
         return denied;
     }
     use crate::library::MutateOutcome;
@@ -364,11 +377,14 @@ pub(crate) async fn reconcile_provider_entries(
     // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
     // one privileged field anywhere in it is one command execution.
     for (i, e) in inputs.iter().enumerate() {
-        if let Some(denied) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep) {
+        if let Some((reason, denied)) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep)
+        {
             tracing::warn!(
                 provider,
                 index = i,
-                "library reconcile refused: payload carries a field this lane may not set"
+                title = %e.title,
+                reason = %reason,
+                "library reconcile refused"
             );
             return denied;
         }

@@ -3,12 +3,46 @@
 // Schema-based errors with status annotations.
 import { Data } from "effect";
 
-/** A management-API call through the pf facade failed. */
+/**
+ * A management-API call through the pf facade failed.
+ *
+ * The `message` getter is load-bearing, not decoration. `Data.TaggedError`'s default string form is
+ * the bare tag, and the sync engine logs `sync (${reason}) failed: ${e.cause}` — so a host that
+ * refused a reconcile with a perfectly clear 400 surfaced in the plugin log as exactly
+ * `sync (startup) failed: HostRequestError`, with the method, the path and the host's own
+ * explanation all discarded. Diagnosing the 2026-08-08 Lutris/Steam art rejection meant reading the
+ * HOST's journal instead, because the plugin's own log could not distinguish a validation refusal
+ * from the host being down.
+ */
 export class HostRequestError extends Data.TaggedError("HostRequestError")<{
 	readonly method: string;
 	readonly path: string;
 	readonly cause: unknown;
-}> {}
+}> {
+	override get message(): string {
+		return `${this.method} ${this.path} failed: ${describeCause(this.cause)}`;
+	}
+}
+
+/**
+ * Render whatever `pf.request` rejected with into one line.
+ *
+ * An `Error` stringifies usefully already; a plain object (the host's `{error: "…"}` body, which is
+ * what a rejected reconcile actually carries) stringifies to `[object Object]`, which is how the
+ * useful half of the message got lost. JSON is the fallback so a body-shaped cause survives, and a
+ * cycle or a BigInt degrades to `String(cause)` rather than throwing inside error formatting.
+ */
+const describeCause = (cause: unknown): string => {
+	if (cause instanceof Error) return cause.message;
+	if (typeof cause === "object" && cause !== null) {
+		try {
+			return JSON.stringify(cause);
+		} catch {
+			return String(cause);
+		}
+	}
+	return String(cause);
+};
 
 /** config.json exists but does not parse/decode. */
 export class ConfigParseError extends Data.TaggedError("ConfigParseError")<{
