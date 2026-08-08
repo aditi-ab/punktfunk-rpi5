@@ -1,6 +1,6 @@
 // SyncEngine semantics: fingerprint skip, single-flight coalescing, status feed.
 import { describe, expect, test } from "bun:test";
-import { Duration, Effect, Fiber, Ref, Scope, Stream } from "effect";
+import { Duration, Effect, Fiber, Ref, type Scope, Stream } from "effect";
 import {
 	type LastSync,
 	makeSyncEngine,
@@ -19,33 +19,31 @@ const harness = (opts?: {
 		const applied = yield* Ref.make(0);
 		const last = yield* Ref.make<LastSync | undefined>(undefined);
 		const entries = opts?.entries ?? (() => ["a", "b"]);
-		const engine = yield* makeSyncEngine<Report, ReadonlyArray<string>, never>(
-			{
-				compute: () =>
-					Effect.suspend(() => {
-						const e = entries();
-						return Effect.succeed({
-							entries: e,
-							report: { included: e.length },
-						});
-					}).pipe(
-						opts?.computeDelayMs
-							? Effect.delay(Duration.millis(opts.computeDelayMs))
-							: (x) => x,
-					),
-				apply: () => Ref.update(applied, (n) => n + 1),
-				lastSync: {
-					get: Ref.get(last),
-					set: (l) => Ref.set(last, l),
-				},
-				settings: Effect.succeed({
-					pollInterval: Duration.minutes(60),
-					watch: false,
-					debounce: Duration.millis(10),
-					watchDirs: [],
-				}),
+		const engine = yield* makeSyncEngine<Report, ReadonlyArray<string>, never>({
+			compute: () =>
+				Effect.suspend(() => {
+					const e = entries();
+					return Effect.succeed({
+						entries: e,
+						report: { included: e.length },
+					});
+				}).pipe(
+					opts?.computeDelayMs
+						? Effect.delay(Duration.millis(opts.computeDelayMs))
+						: (x) => x,
+				),
+			apply: () => Ref.update(applied, (n) => n + 1),
+			lastSync: {
+				get: Ref.get(last),
+				set: (l) => Ref.set(last, l),
 			},
-		);
+			settings: Effect.succeed({
+				pollInterval: Duration.minutes(60),
+				watch: false,
+				debounce: Duration.millis(10),
+				watchDirs: [],
+			}),
+		});
 		return { engine, applied, last };
 	});
 

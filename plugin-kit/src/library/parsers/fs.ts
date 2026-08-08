@@ -101,7 +101,7 @@ export const confinedJoin = (base: string, rel: string): string | undefined => {
 	// Normalize separators so a Windows-shaped relative path is checked on any platform (a plugin
 	// may parse a Windows manifest while its tests run on Linux).
 	const parts = rel.split(/[\\/]/);
-	if (parts[0] === "" ) return undefined; // rooted
+	if (parts[0] === "") return undefined; // rooted
 	if (/^[A-Za-z]:$/.test(parts[0])) return undefined; // drive prefix
 	if (parts.some((p) => p === "..")) return undefined; // traversal
 	const joined = path.join(base, ...parts.filter((p) => p !== "" && p !== "."));

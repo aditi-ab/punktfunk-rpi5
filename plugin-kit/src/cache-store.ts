@@ -4,8 +4,8 @@
 import * as fs from "node:fs";
 import { Effect, Ref, Schema } from "effect";
 import type { ConfigWriteError } from "./errors.js";
-import { atomicWriteFile, ensureStateDir, statePath } from "./paths.js";
 import { PluginInfo } from "./host-client.js";
+import { atomicWriteFile, ensureStateDir, statePath } from "./paths.js";
 
 export interface CacheStore<S extends Schema.Top> {
 	readonly get: Effect.Effect<S["Type"]>;
@@ -44,20 +44,14 @@ export const makeCacheStore = <S extends Schema.Top>(opts: {
 
 		const persist = (value: S["Type"]) =>
 			ensureStateDir(info.name).pipe(
-				Effect.flatMap(() =>
-					atomicWriteFile(file, JSON.stringify(value)),
-				),
+				Effect.flatMap(() => atomicWriteFile(file, JSON.stringify(value))),
 			);
 
 		const modify = <A>(f: (current: S["Type"]) => readonly [A, S["Type"]]) =>
 			Ref.modify(ref, (current) => {
 				const [a, next] = f(current);
 				return [[a, next] as const, next] as const;
-			}).pipe(
-				Effect.flatMap(([a, next]) =>
-					persist(next).pipe(Effect.as(a)),
-				),
-			);
+			}).pipe(Effect.flatMap(([a, next]) => persist(next).pipe(Effect.as(a))));
 
 		return {
 			get: Ref.get(ref),

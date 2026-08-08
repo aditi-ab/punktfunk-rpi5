@@ -40,7 +40,8 @@ const pluginEntry = (over: Partial<ProviderEntry> = {}): ProviderEntry =>
 		art: {
 			portrait: "file:///home/u/.steam/appcache/librarycache/440/a/p.jpg",
 			hero: "https://cdn.cloudflare.steamstatic.com/steam/apps/440/library_hero.jpg",
-			header: "https://cdn.cloudflare.steamstatic.com/steam/apps/440/header.jpg",
+			header:
+				"https://cdn.cloudflare.steamstatic.com/steam/apps/440/header.jpg",
 		},
 		platform: "PC",
 		...over,

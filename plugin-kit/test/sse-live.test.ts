@@ -44,7 +44,9 @@ describe("sseRoute (live, PubSub-backed)", () => {
 			const { handler, dispose } = HttpRouter.toWebHandler(
 				Layer.provide(routes, httpApiEnv),
 			);
-			const res = yield* Effect.promise(() => handler(new Request("http://127.0.0.1/api/events")));
+			const res = yield* Effect.promise(() =>
+				handler(new Request("http://127.0.0.1/api/events")),
+			);
 			expect(res.status).toBe(200);
 			// Publish only once the response is open — the real engine's pattern.
 			setTimeout(() => {
@@ -68,7 +70,9 @@ describe("sseRoute (live, PubSub-backed)", () => {
 			const { handler, dispose } = HttpRouter.toWebHandler(
 				Layer.provide(routes, httpApiEnv),
 			);
-			const res = yield* Effect.promise(() => handler(new Request("http://127.0.0.1/api/events")));
+			const res = yield* Effect.promise(() =>
+				handler(new Request("http://127.0.0.1/api/events")),
+			);
 			const body = yield* Effect.promise(() => readSome(res, 4000));
 			yield* Effect.promise(() => dispose());
 			return body;

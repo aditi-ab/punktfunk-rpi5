@@ -9,6 +9,8 @@
 //   3. The real servePluginUi server (loopback, per-boot bearer secret, __health) proxies
 //      into the HttpApi handler end-to-end.
 import { describe, expect, test } from "bun:test";
+import type { Punktfunk } from "@punktfunk/host";
+import { servePluginUi } from "@punktfunk/host";
 import { Effect, Layer, Schema } from "effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -19,8 +21,6 @@ import {
 	HttpApiEndpoint,
 	HttpApiGroup,
 } from "effect/unstable/httpapi";
-import { servePluginUi } from "@punktfunk/host";
-import type { Punktfunk } from "@punktfunk/host";
 
 const Pong = Schema.Struct({ ok: Schema.Boolean, source: Schema.String });
 const EchoIn = Schema.Struct({ msg: Schema.String });
@@ -90,8 +90,11 @@ describe("spike 1: HttpApi via toWebHandler on Bun", () => {
 
 	test("end-to-end behind servePluginUi (loopback + bearer secret)", async () => {
 		const { handler, dispose } = HttpRouter.toWebHandler(appLayer);
-		const registrations: Array<{ method: string; path: string; body: unknown }> =
-			[];
+		const registrations: Array<{
+			method: string;
+			path: string;
+			body: unknown;
+		}> = [];
 		// servePluginUi only touches pf.request — a recording stub is a faithful host.
 		const pf = {
 			request: async (method: string, path: string, body?: unknown) => {
@@ -116,15 +119,18 @@ describe("spike 1: HttpApi via toWebHandler on Bun", () => {
 				(r) => r.method === "PUT" && r.path === "/plugins/spike",
 			);
 			expect(reg).toBeDefined();
-			const secret = (reg?.body as { ui: { secret: string } }).ui.secret;
+			// Not `reg?.body`: the optional chain undoes the assertion above — if `reg` were
+			// undefined the `.ui` access would throw a TypeError instead of failing this test
+			// readably. The `expect` is what guarantees it, so assert it to the type system too.
+			if (!reg) throw new Error("registration not found");
+			const secret = (reg.body as { ui: { secret: string } }).ui.secret;
 			expect(secret.length).toBeGreaterThanOrEqual(16);
 			const auth = { authorization: `Bearer ${secret}` };
 
 			// Health endpoint is served by servePluginUi itself.
-			const health = await fetch(
-				`http://127.0.0.1:${ui.port}/__health`,
-				{ headers: auth },
-			);
+			const health = await fetch(`http://127.0.0.1:${ui.port}/__health`, {
+				headers: auth,
+			});
 			expect(health.status).toBe(200);
 
 			// HttpApi endpoint through the real server.
