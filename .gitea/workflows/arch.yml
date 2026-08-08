@@ -48,7 +48,26 @@ on:
     # `punktfunk-canary` pacman repo as X.Y.Z-0.<run#> (sorts below the eventual X.Y.Z-1),
     # tags to `punktfunk` — separate repos, so neither channel can shadow the other.
     tags: ['v*']
+  # REBUILDING A PUBLISHED RELEASE, because on a rolling distro the ground moves under one.
+  # Arch went FFmpeg 8 -> 9 (every libav soname +1) four minutes before v0.25.0 was tagged, so
+  # the release's punktfunk-host was linked in a builder image that still had 8 and shipped
+  # `libavcodec.so=62-64`. No up-to-date Arch box can satisfy that — and pacman prepares the
+  # whole transaction at once, so it did not merely block our package, it blocked those users'
+  # entire `pacman -Syu`. The repair is a rebuild of the SAME upstream version at a HIGHER
+  # pkgrel; nothing else reaches a box that already has the broken build recorded in its db.
+  # The workflow file at the tag can never carry inputs added after it was tagged, so dispatch
+  # this from `main`: it checks the tag's SOURCE out, publishes to the STABLE repo, and
+  # replaces the release-page assets. Same lever for any future "the distro moved" rebuild.
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Rebuild this published release (e.g. v0.25.0) into the stable `punktfunk` repo. Empty = ordinary canary build of the dispatched ref.'
+        required: false
+        default: ''
+      pkgrel:
+        description: 'pkgrel for that rebuild — MUST be above the published one (2, 3, …); a same-pkgrel republish is invisible to pacman. Ignored without release_tag.'
+        required: false
+        default: '2'
 
 env:
   REGISTRY: git.unom.io
@@ -94,7 +113,52 @@ jobs:
           }
           bun --version
 
+      # THE BUILDER'S FFmpeg IS PART OF THE PACKAGE CONTRACT, not merely a build detail.
+      # packaging/arch/PKGBUILD binds punktfunk-host to the exact libav sonames it linked
+      # (`libavcodec.so=63-64` …), so a builder one FFmpeg major behind Arch emits a package
+      # that NOBODY can install — and takes the user's whole `pacman -Syu` down with it, since
+      # pacman prepares the transaction as a unit. That is exactly how v0.25.0 shipped: PR #108
+      # re-keyed this image for FFmpeg 9, the release tag fired four minutes later, and the job
+      # still got the FFmpeg-8 `:latest`. The image is a cache and is allowed to lag — but never
+      # on this one axis. So heal it in-job and shout, instead of building a dead package.
+      # (Runs BEFORE checkout: a stale image should be repaired before anything depends on it.)
+      - name: FFmpeg soname parity with today's Arch (heals a stale builder image)
+        run: |
+          export LC_ALL=C   # `Provides` is a localized field name
+          # Piped (never a TTY here) pacman prints each field on ONE line, unwrapped.
+          sonames() { sed -n 's/^Provides *: *//p' | tr ' ' '\n' | grep -E '^lib(av|sw)[a-z]*\.so=' | sort | tr '\n' ' '; }
+          # A SEPARATE --dbpath: this refreshes only a throwaway view of the repos, so the
+          # container's own db never enters the partial-upgrade state a bare `pacman -Sy` leaves.
+          mkdir -p /tmp/pf-archsync
+          if ! pacman -Sy --dbpath /tmp/pf-archsync --logfile /dev/null >/dev/null 2>&1; then
+            echo "::warning::could not refresh the Arch db — skipping the FFmpeg parity check"
+            exit 0
+          fi
+          HAVE="$(pacman -Qi ffmpeg | sonames)"
+          WANT="$(pacman -Si --dbpath /tmp/pf-archsync ffmpeg | sonames)"
+          echo "builder ffmpeg $(pacman -Q ffmpeg | cut -d' ' -f2): $HAVE"
+          echo "arch    ffmpeg $(pacman -Si --dbpath /tmp/pf-archsync ffmpeg | sed -n 's/^Version *: *//p'): $WANT"
+          if [ "$HAVE" = "$WANT" ]; then
+            echo "OK: the builder links the FFmpeg every up-to-date Arch box already has"
+            exit 0
+          fi
+          echo "::warning::arch-ci is stale ACROSS AN FFMPEG SONAME BUMP — upgrading it for this run."
+          echo "::warning::Bump the 'refreshed:' date in ci/arch-ci.Dockerfile so the IMAGE carries it."
+          pacman -Syu --noconfirm || true
+          HAVE="$(pacman -Qi ffmpeg | sonames)"
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::builder still links $HAVE while Arch ships $WANT."
+            echo "::error::Building on would publish a package no Arch box can install."
+            exit 1
+          fi
+          echo "healed: builder now links $HAVE"
+
       - uses: actions/checkout@v4
+        with:
+          # A dispatched release rebuild takes its WORKFLOW from the ref you dispatch (the only
+          # way it can carry inputs the tag predates) and its SOURCE from the tag. Empty string
+          # = checkout's own default, i.e. the triggering ref, for every other trigger.
+          ref: ${{ github.event.inputs.release_tag }}
 
       # Cache cargo's git dir too, not just the registry: the workspace includes
       # clients/windows, whose windows-reactor/windows deps are git-pinned — cargo must CLONE
@@ -127,12 +191,30 @@ jobs:
         # Keep the leading `0.` — it is what sorts a canary BELOW the eventual `X.Y.Z-1` stable
         # release. (A pkgrel is digits+dots only, so `0.` is the only prefix available; raising
         # it to `1.` would sort canaries ABOVE the release and is not an option.)
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          REBUILD_PKGREL: ${{ github.event.inputs.pkgrel }}
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of latest stable)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1";                       REPO=punktfunk ;;
-            *)            V="$PF_BASE";  R="0.$(printf '%08d' "$GITHUB_RUN_NUMBER")";  REPO=punktfunk-canary ;;
-          esac
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            # Dispatched rebuild of a published release (see the workflow_dispatch note at the
+            # top): same upstream version, higher pkgrel, straight into the stable repo.
+            # ⚠ Keep that pkgrel SINGLE-DIGIT. Gitea's Arch registry picks the version its .db
+            # advertises by STRING order (the same trap the canary zero-padding below exists for),
+            # so "0.25.0-10" sorts BELOW "0.25.0-2" and the rebuild would never be advertised.
+            V="${RELEASE_TAG#v}"
+            R="${REBUILD_PKGREL:-2}"
+            REPO=punktfunk
+            case "$R" in
+              ''|*[!0-9.]*) echo "::error::pkgrel '$R' is not digits+dots"; exit 1 ;;
+              1) echo "::error::pkgrel 1 is the published build — a rebuild MUST go up (2, 3, …)"; exit 1 ;;
+            esac
+          else
+            case "$GITHUB_REF" in
+              refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1";                       REPO=punktfunk ;;
+              *)            V="$PF_BASE";  R="0.$(printf '%08d' "$GITHUB_RUN_NUMBER")";  REPO=punktfunk-canary ;;
+            esac
+          fi
           echo "PF_PKGVER=$V" >> "$GITHUB_ENV"
           echo "PF_PKGREL=$R" >> "$GITHUB_ENV"
           echo "REPO=$REPO" >> "$GITHUB_ENV"
@@ -235,6 +317,63 @@ jobs:
             rm -rf dist-gamescope   # never cache a failed build (an empty path is not saved)
           fi
 
+      # THE GATE THIS PIPELINE WAS MISSING. The soname assert above proves the libav dep is
+      # VERSIONED; it cannot prove the version is one that EXISTS. v0.25.0 passed it and still
+      # shipped `libavcodec.so=62-64` to a world that had moved to 63 — every affected user got
+      # "unable to satisfy dependency … required by punktfunk-host", and because pacman prepares
+      # one transaction, their whole system upgrade stopped there. So ask the only question that
+      # matters before publishing: would a real, up-to-date Arch box install this?
+      #
+      # An empty --dbpath is what makes the answer honest. It means "nothing is installed", so
+      # pacman must satisfy every dependency FROM THE REPOS exactly as a user's box does. Checking
+      # against the builder's own installed set instead would let a stale ffmpeg satisfy the stale
+      # bound and hide the break completely — the very illusion that shipped v0.25.0. `--print`
+      # resolves and prints; it downloads nothing and installs nothing. Verified against the real
+      # broken artifact on an ffmpeg-9 box: it reproduces the user-visible failure verbatim.
+      - name: Assert every package installs on an up-to-date Arch box
+        run: |
+          export LC_ALL=C
+          mkdir -p /tmp/pf-instcheck
+          if ! pacman -Sy --dbpath /tmp/pf-instcheck --logfile /dev/null >/dev/null 2>&1; then
+            echo "::error::could not sync the Arch db — cannot prove these packages install"
+            exit 1
+          fi
+          check() {   # check FILE -> 0 installable, 1 not (reason on stdout)
+            pacman -U --print --noconfirm --dbpath /tmp/pf-instcheck --logfile /dev/null "$1" 2>&1
+          }
+          ls dist/*.pkg.tar.zst >/dev/null 2>&1 || { echo "::error::nothing in dist/ to check"; exit 1; }
+          rc=0
+          for pkg in dist/*.pkg.tar.zst; do
+            if out="$(check "$pkg")"; then
+              echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
+            else
+              rc=1
+              echo "::error::$(basename "$pkg") CANNOT be installed on an up-to-date Arch box:"
+              echo "$out" | sed 's/^/    /'
+            fi
+          done
+          # gamescope stays best-effort, exactly as its build step is: a companion that cannot
+          # install is dropped from the upload with a warning, never a reason to withhold the
+          # packages this workflow exists to publish. (It is also the one package that can be
+          # restored from a cache older than the current Arch snapshot.)
+          for pkg in dist-gamescope/*.pkg.tar.zst; do
+            [ -e "$pkg" ] || continue
+            if out="$(check "$pkg")"; then
+              echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
+            else
+              echo "::warning::$(basename "$pkg") is not installable on current Arch — NOT publishing it"
+              echo "$out" | sed 's/^/    /'
+              rm -f "$pkg"
+            fi
+          done
+          if [ "$rc" != 0 ]; then
+            echo "::error::refusing to publish: pacman would reject this on a current box, and a"
+            echo "::error::rejected dependency blocks the user's ENTIRE upgrade, not just punktfunk."
+            echo "::error::Usual cause: the arch-ci builder image lags Arch across a soname bump —"
+            echo "::error::bump 'refreshed:' in ci/arch-ci.Dockerfile, let docker.yml republish it, re-run."
+            exit 1
+          fi
+
       # NOTE deliberately NO sysext image is built or published here: a prebuilt HOST binary on
       # SteamOS breaks on the next A/B soname bump (and /var — where sysexts live — is
       # per-partition-set), which is the standing packaging verdict behind the on-device
@@ -262,14 +401,29 @@ jobs:
           done
           echo "published to $OWNER/arch/$REPO"
 
-      # On a real release, also attach the packages to the unified Gitea Release.
-      - name: Attach packages to the Gitea release (stable tags only)
-        if: startsWith(gitea.ref, 'refs/tags/v')
+      # On a real release, also attach the packages to the unified Gitea Release. A dispatched
+      # rebuild attaches to that SAME release object: the release page is a distribution surface
+      # too, and leaving the superseded .pkg.tar.zst sitting on it is one click away from handing
+      # someone the exact break the rebuild exists to fix.
+      - name: Attach packages to the Gitea release (stable tags + release rebuilds)
+        if: startsWith(gitea.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           . scripts/ci/gitea-release.sh
-          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          TAG="${RELEASE_TAG:-$GITHUB_REF_NAME}"
+          RID=$(ensure_release "$TAG" "$TAG" auto)
           for pkg in dist/*.pkg.tar.zst; do
             upsert_asset "$RID" "$pkg"
           done
+          # A rebuild bumps pkgrel, so its FILENAMES differ from the ones already attached, and
+          # upsert_asset only replaces by name — the superseded set would survive untouched.
+          # Drop every pacman asset (and .sha256 sidecar) this upload did not just write.
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            KEEP="$(cd dist && printf '%s ' *.pkg.tar.zst)"
+            # An UNMATCHED glob would come through literally and match nothing in the keep set —
+            # i.e. "delete every pacman asset on the release". Empty out instead; prune refuses.
+            case "$KEEP" in *'*'*) KEEP="" ;; esac
+            prune_release_assets "$RID" .pkg.tar.zst "$KEEP"
+          fi
