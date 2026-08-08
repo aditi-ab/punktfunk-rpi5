@@ -47,7 +47,11 @@ options=('!lto' '!debug')
 
 # All build deps for both packages (Arch runtime packages ship their own headers, so these cover
 # build + link). aws-lc/ring need clang+cmake; nasm is for asm. ffmpeg stays because the HOST's
-# encoder links libav* — the CLIENT dropped it in M10 and decodes natively. No vulkan-headers:
+# encoder links libav* — the CLIENT dropped it in M10 and decodes natively. `ffmpeg` is
+# deliberately UNVERSIONED here: ffmpeg-sys-next auto-detects the installed FFmpeg, so the package
+# builds against whatever the builder ships, and the RUNTIME bound follows automatically from the
+# soname deps makepkg derives from the linked binary (see package_punktfunk-host's depends). Pinning
+# a version at build time would just have to be re-edited on every FFmpeg major. No vulkan-headers:
 # nothing in the workspace compiles against the system Vulkan headers any more (pyrowave-sys builds
 # against its own vendored copy, and both binaries reach Vulkan through ash, which dlopens it).
 makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
@@ -135,8 +139,33 @@ package_punktfunk-host() {
   # opens a Pulse socket itself, so pipewire-pulse is an OPTdepend, not a depend: it exists
   # for the GAMES, which commonly emit through the PulseAudio API. Hard-depending on it made
   # the package uninstallable next to real `pulseaudio`, which serves those games just as well.
+  # ⚠ The libav* entries below are SONAME deps, not package names, and they are load-bearing.
+  # pacman is the only one of our packaging formats that does NOT derive dependencies from ELF
+  # DT_NEEDED (rpm auto-generates `libavcodec.so.62()(64bit)`; dpkg-shlibdeps emits `libavcodec62`;
+  # nix pins the closure). So a bare `depends=('ffmpeg')` let `pacman -Syu` walk the host across an
+  # FFmpeg soname bump with no warning and no conflict — which is exactly what FFmpeg 8 -> 9
+  # (2026-08-08, ffmpeg 2:9.0-5: libavutil .60->.61, libavcodec .62->.63, libavfilter .11->.12,
+  # libavdevice .62->.63, libswscale .9->.10) did to every Arch/CachyOS user: the dynamic loader
+  # cannot start the binary at all, so it is exit 127 *before* main() in a systemd restart loop,
+  # with nothing in the host's own log to explain it (`ldd /usr/bin/punktfunk-host | grep "not found"`
+  # is the one-line diagnosis). Arch's ffmpeg declares the matching
+  # `provides=(libavcodec.so=63-64 libavutil.so=61-64 ...)`, and makepkg rewrites each bare
+  # `libfoo.so` listed here into `libfoo.so=<soname>-<arch>` by reading the built binary's
+  # DT_NEEDED — so the bound tracks whatever FFmpeg the builder linked against, with nothing to
+  # hand-maintain across the next bump. pacman then REFUSES the ffmpeg upgrade instead of bricking
+  # the install, and the canary rebuilt on an ffmpeg-9 image installs cleanly on an ffmpeg-9 box.
+  # A hand-written `ffmpeg<2:9` would have to be edited (and would go stale) on every bump; this
+  # does not. NOT bundling FFmpeg the way the .deb does (BUNDLE_FFMPEG=1): that exists because
+  # Ubuntu 24.04 LTS is frozen on FFmpeg 6.1 and can never satisfy the dep, whereas rolling Arch
+  # always ships a current FFmpeg — and vendoring a second copy of a system library is against
+  # Arch packaging doctrine (and would not survive AUR review).
+  # All seven are listed even though --as-needed currently drops libavformat/libswresample from the
+  # link: an unlinked soname is left bare by makepkg and is satisfied by any ffmpeg, so listing it
+  # costs nothing, while a future link picking one up gets the version bound automatically.
   depends=('ffmpeg' 'pipewire' 'wireplumber' 'opus' 'libei'
-           'mesa' 'libglvnd' 'libxkbcommon' 'wayland')
+           'mesa' 'libglvnd' 'libxkbcommon' 'wayland'
+           'libavcodec.so' 'libavutil.so' 'libavfilter.so' 'libavdevice.so'
+           'libavformat.so' 'libswscale.so' 'libswresample.so')
   optdepends=('pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
               'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
               'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'

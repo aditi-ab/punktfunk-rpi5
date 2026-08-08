@@ -1,6 +1,10 @@
 //! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg — `ffmpeg-sys-next` auto-detects the
-//! installed version, so this builds against FFmpeg 7.x/libavcodec 61 *or* 8.x/libavcodec 62;
-//! validated live on Ubuntu 26.04 (FFmpeg 8) and Bazzite F43 (FFmpeg 7.1)).
+//! installed version and emits a per-version cfg, so one source tree spans FFmpeg 7.x/libavcodec 61,
+//! 8.x/62 and 9.x/63; validated live on Ubuntu 26.04 (FFmpeg 8), Bazzite F43 (7.1) and CachyOS
+//! (FFmpeg 9). The `ffmpeg-next` MAJOR is a ceiling, not a target: 8.x refused anything past
+//! libavcodec 62, which is why Arch's FFmpeg 9 needed the crate bump and not just a rebuild.
+//! What a given package links is decided by the BUILDER's FFmpeg, so the soname bound that keeps an
+//! install honest is generated at package time — see packaging/arch/PKGBUILD.
 //!
 //! Input is a packed RGB/BGR CPU frame; `*_nvenc` accepts `rgb0`/`bgr0`/`rgba`/`bgra`
 //! directly and does the RGB→YUV conversion on the GPU, so the host stays off the
