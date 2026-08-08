@@ -636,6 +636,18 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     // the buffer's implicit fence and wait the producer's render before sampling —
     // closing the stale/old-frame race on NVIDIA. No-op for shm buffers or drivers that
     // attach no fence. Covers both the GPU import and the CPU mmap read below.
+    //
+    // MEASURED 2026-08-08 (Wave-2 PW4, which proposed moving this off the loop thread and was
+    // pre-registered to be abandoned if the wait was already free — it is):
+    //   gamescope + NVIDIA (RTX 5070 Ti)   outcome=NoFence
+    //   Mutter    + NVIDIA (RTX 5070 Ti)   outcome=NoFence
+    //   gamescope + RADV   (Deck VANGOGH)  300 samples, ALL NoFence, mean 23us, max 48us,
+    //                                      p50 and p99 both in the <=100us bucket
+    // Every producer tested attaches NO implicit fence, so this is one ioctl and a return, not a
+    // block: there is nothing to wait on and moving it to the consumer side buys nothing. The
+    // 100 ms budget is a guard for a producer that DOES fence, not a cost we pay today.
+    // KWin/AMD is the one combination still unmeasured. The histogram below is how to re-check:
+    // run with PUNKTFUNK_PERF=1 and read the p99 bucket.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
         // PW4 step 1: time the wait. Two `Instant::now()` per frame on a path that is already
         // making a syscall — and this is the measurement that decides whether PW4 ships at all.
