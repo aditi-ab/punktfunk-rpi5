@@ -229,7 +229,10 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         }
         // Slice-progressive delivery (the embedder's opt-in): AU prefixes hand up as
         // `Frame::part` pieces while the tail is still on the wire. Never on PyroWave — its
-        // all-intra frame channel drains newest-wins, which assumes whole AUs.
+        // all-intra frame channel drains newest-wins per QUEUE ENTRY, so parts of one AU read as
+        // separate AUs and the drain shreds the AU it is mid-way through (`FrameChannel::pop`
+        // spells out the mechanism and what a fix would take). Unrelated to the host's streamed-AU
+        // wire (`VIDEO_CAP_STREAMED_AU`), which still completes one whole `Frame` per AU.
         if args.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
             session.set_deliver_frame_parts(true);
         }
