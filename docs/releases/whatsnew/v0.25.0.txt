@@ -1,0 +1,6 @@
+• New: a USB DualSense can play the host's fine-grained haptics through the pad itself. Needs a Windows host with Steam.
+• Sound that drifts behind the picture now catches itself up instead of staying late all session.
+• New: a safe-area resolution keeps the picture clear of the notch and rounded corners.
+• Rumble no longer dies for the rest of the session after one glitch.
+• Automatic bitrate stops overshooting what your device can really decode.
+• Hold Select to reach the host's Guide menu.
