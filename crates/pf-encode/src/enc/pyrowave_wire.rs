@@ -65,6 +65,14 @@ pub(crate) fn stamp_color_bits(bitstream: &mut [u8], seq_offset: usize, bt2020_p
 /// repeated value is read as more blocks of the same frame. That is why PW5's alternating encoder
 /// handles need `pyrowave_encoder_set_next_sequence`, and why a test asserts this reader sees
 /// +1 mod 8 across the pair.
+///
+/// Its only caller is the Linux backend — alternating encoder handles are a Linux-side concern, and
+/// the Windows backend drives pyrowave's compat device with a single handle. The rest of this module
+/// really is shared (`packet_boundary` and `stamp_color_bits` have callers on both), so the exemption
+/// is scoped to this one item rather than the file: `dead_code` stays live on Linux, where the caller
+/// lives and where its disappearing would be a real finding. Windows builds with `-D warnings`, so
+/// without this the host and tray clippy legs fail to compile the lib at all.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn wire_sequence(bitstream: &[u8], packet_offset: usize) -> Option<u8> {
     let lo = *bitstream.get(packet_offset + 2)?;
     let hi = *bitstream.get(packet_offset + 3)?;
