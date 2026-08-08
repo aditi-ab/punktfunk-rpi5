@@ -1,0 +1,3 @@
+• New: an OLED colour scheme whose dark half is truly black, not dark grey.
+• The controller interface can now stay on screen when no controller is attached, instead of only appearing while one is plugged in.
+• Sound catches jitter before you can hear it. The buffer learns from the near-misses nobody notices rather than waiting for three audible dropouts, so a busy Wi-Fi network clicks far less.

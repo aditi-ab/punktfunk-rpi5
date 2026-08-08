@@ -12,6 +12,412 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.26.0
+
+47 commits since v0.25.0.
+
+### Versions
+
+| | v0.25.0 | v0.26.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 17 | **17** | unchanged — no symbol added, removed or changed |
+| Workspace crate dirs | 26 | **26** | unchanged (40 workspace members) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3) |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.24.0 | **0.25.0** | tracks API edits, lags one release by convention |
+| gamescope patch level (`+pfhdrN`) | 2 | **4** | 3 patches → 6; `pkgrel` 1 → 2 |
+| `@punktfunk/host` (SDK) | 0.1.2 | **0.1.4** | |
+| `@punktfunk/plugin-kit` | 0.3.2 | **0.4.0** | the `plugin` launch kind |
+
+`crates/pf-driver-proto` is byte-for-byte identical to v0.25.0 and to v0.24.0 — if you ship the
+virtual-display driver or the gamepad channel, the last two releases have not touched you.
+
+### ⚠ Breaking changes
+
+**None.** This is a fixes release. Every embedder, packager and plugin that works against v0.25.0
+works against v0.26.0 unchanged. Two behaviour changes are worth knowing about anyway, because both
+make a client advertise *less* than it used to — see **Capability advertisement** below.
+
+### Capability advertisement
+
+- **`VIDEO_CAP_444` is now probed, not asserted.** It rode the "Full chroma" setting alone. That was
+  safe while a software HEVC decoder sat underneath it; M8 removed one (there is no permissively
+  licensed HEVC CPU decoder, so `software_decodable_codecs()` is `H264|AV1`). The host grants 4:4:4
+  on HEVC **only** and answers the resolved chroma in the `Welcome` *before* the client builds a
+  decoder — so on a device with no 4:4:4 decode the toggle did not cost crispness, it cost the whole
+  codec: the Vulkan rung refuses the shape at construction, VAAPI refuses it too, there is no CPU
+  rung, and the session reconnects on H.264. No AMD silicon has HEVC 4:4:4 decode, so every Steam
+  Deck with that switch on lost HEVC. Per-profile and default-off, which is why it read as
+  intermittent.
+
+  Now gated on `hevc_444_hardware_decodable`, which asks the driver through the same code the rung
+  uses at construction (`VkH265Decoder::probe_stream_support`). **Both depths are required**, not
+  either: with HDR the host may resolve 4:4:4 10-bit, and a device offering `YUV444_8` but not
+  `YUV444_10` lands in the same hole. Answering from the Vulkan rung alone is exact rather than
+  approximate — it is the only rung in this build that implements 4:4:4 at all
+  (`pf_vaadec::profile_for` errors on `chroma_format_idc 3`, pf-dxvadec refuses anything but 4:2:0,
+  the CPU rung is 8-bit 4:2:0).
+
+  ⚠ Deliberately **not** extended to `VIDEO_CAP_10BIT`/HDR: all three rungs implement 10-bit 4:2:0,
+  so a Vulkan-only probe there would withdraw HDR from boxes whose VAAPI/DXVA rung decodes it
+  perfectly — a regression against a case never observed.
+
+  The bit arithmetic moved into `video::video_caps_for` so the part that was wrong is testable
+  without a GPU, a host or a `Hello`; the test is verified non-vacuous against the planted defect.
+
+### Host and client environment variables
+
+Four new, one clarified. Verified new by `git grep` at the v0.25.0 tag, not assumed —
+`PUNKTFUNK_JUMBO`, `PUNKTFUNK_WIRE_MTU`, `PUNKTFUNK_STREAMED_AU`, `PUNKTFUNK_LIBRARY_ART_ROOTS`,
+`PUNKTFUNK_RECOVER_SESSION_CMD`, `PUNKTFUNK_GAMESCOPE_SDR_NITS`, `PUNKTFUNK_MAX_FPS` and
+`PUNKTFUNK_ON_CONNECT_CMD` all already existed.
+
+- **`PUNKTFUNK_OVERLAY_MASK`** *(new, client)* — controls the Steam-overlay input mask below.
+- **`PUNKTFUNK_PYROWAVE_CHUNK_KIB`** *(new)* and **`PUNKTFUNK_PYROWAVE_STREAMED_AU`** *(new)* —
+  PyroWave AU chunking and the streamed-AU path.
+- **`PYROWAVE_QUEUE_PRIORITY`** *(existed, but was inert on Linux — see below)* — grammar: unset →
+  realtime, ASCII-lowercased, `off` alone disables, `high` asks for HIGH only, junk falls back to
+  the ladder rather than to off. ⚠ **One env var must not mean two things on two platforms**, so
+  the Rust grammar is unit-tested against the C patch's, including where both are deliberately
+  un-clever (neither trims).
+- **`PUNKTFUNK_GAMESCOPE_REFRESH_RATES=60,90,120`** *(new)* — widens the set a gamescope session
+  offers in Steam's in-session display settings. The rate the session actually runs at is always
+  included, so it can only add options; junk entries are skipped rather than failing the host.
+  Requires gamescope patch level 3+.
+- **`PUNKTFUNK_COMPOSITOR`** *(behaviour clarified, not changed)* — documented as "which backend to
+  drive", it also silently discarded `game_session=dedicated`: `resolve_compositor` gated the
+  dedicated route on `!overridden` and logged nothing either way. The pin still wins — it is the
+  operator's explicit knob — but it now says so and names itself. Two further holes closed with it:
+  the pin put its backend into `available()` unconditionally *and* skipped `apply_session_env`'s
+  `XDG_CURRENT_DESKTOP` scrub, so `pick_compositor` could never return `None` — the one call site of
+  `try_recover_session()`, which left `PUNKTFUNK_RECOVER_SESSION_CMD` unreachable behind that arm.
+  Liveness is now read on both paths. `needs_live_session()` exempts gamescope, which stands up its
+  own session, so pinning it on a headless box stays supported.
+
+### Client settings keys
+
+All additive; an older client ignores what it does not know, and a newer value can never trap an
+older client.
+
+- **`gamepad_ui_mode`** — `"connected"` (default, and exactly what the previous lone Bool meant) or
+  `"always"`. Splits *whether* the controller UI is offered from *when* it appears.
+  `GamepadUIEnvironment.isActive` takes the mode with **no default argument** on purpose: a call
+  site that forgot it would silently strand everyone who chose Always. An unrecognized value waits
+  for a controller.
+- **`ui_palette`** gains `oled` at **index 1**, directly after the brand default — keeping
+  `PALETTES[0]` the unknown-id fallback and the dark-to-pale cycling order intact. Hand-mirrored in
+  three languages (`pf-console-ui`'s `library.rs`, `GamepadPalette.swift`, `GamepadPalette.kt`); each
+  port carries an `oled_is_actually_black` test that measures the claim (mean cell luminance 0.019
+  against Violet's 0.254) rather than restating the table.
+- **`library-hidden.json`** — per-title hide list, mirroring how `library-scanners.json` holds
+  disabled sources. Deliberately **not** stored on the entry: a scanner's and a plugin's titles are
+  rebuilt from scratch on every scan and reconcile, so a flag written onto one would be erased
+  minutes later. Applied in `all_games`, the single funnel every play surface already goes through
+  (client grid, native clients, the GameStream app list, launch resolution).
+
+### gamescope patches
+
+Three → six, and the marker patch moves last so the banner is stamped after the capabilities it
+advertises.
+
+- **0003 — headless: advertise the virtual display's mode and refresh rates.** `CHeadlessConnector`
+  returned empty spans from `GetModes()` and `GetValidDynamicRefreshRates()` and reported
+  `GAMESCOPE_SCREEN_TYPE_INTERNAL`, so `update_mode_atoms` **deleted** the mode-list atom and
+  wlserver fell through to a one-entry refresh list built from `g_nOutputRefresh` — which, with
+  `--nested-refresh` absent, is `Init()`'s 60 Hz default. That is why a 1920x1080@120 client saw
+  "gamescope only shows 60hz" and Overwatch capped itself to 60 while the stream ran at 120. Now
+  populates both from the resolved mode, reports `EXTERNAL`, and adds `--custom-refresh-rates`.
+  gamescope-session-plus has probed for that flag for years; upstream never had it, so the
+  `CUSTOM_REFRESH_RATES` env it plumbs was a no-op everywhere.
+- **0004 — pipewire: optionally composite the external overlay into the capture stream.** That layer
+  is mangoapp. `paint_pipewire` has never referenced it on any version. Behind
+  `--pipewire-composite-external-overlay`, off by default.
+- **0006 — never destroy the Vulkan device or output.** `g_device` (`CVulkanDevice`) and `g_output`
+  (`VulkanOutput_t`) were plain globals, so glibc ran their destructors from `__run_exit_handlers`
+  once `main()` returned — calling back into an ICD that had already been torn down and unloaded.
+  Faulting address equalling the instruction pointer is the signature. Reproducible with
+  `gamescope --backend headless -W 1280 -H 720 -r 60 --xwayland-count 1 -- true` (exit 139, every
+  time). Both globals get storage constructed exactly as before but never destroyed; pinning only
+  the device relocated the fault into `~VulkanOutput_t`, hence a shared `CNoDestroy<T>`.
+
+  ⚠ **`+pfhdrN` deliberately does not move for 0006.** The marker is a capability tier the host
+  probes via `gamescope_patch_level()` *before* it spawns; this patch adds no capability, so bumping
+  it would advertise a tier that does not exist. Ships as a `pkgrel` bump instead.
+
+⚠ gamescope CI legs are best-effort — a broken patch is a **missing package**, not a red run.
+
+### Virtual-display handle ownership (Windows)
+
+The control-device sharing contract was "bare `HANDLE` copies, never closed for the process
+lifetime": retired handles were kept alive because pinger/linger threads and capture closures held
+raw copies whose soundness depended on no-close. An open control handle is exactly what vetoes the
+PnP disable — and can wedge the `pnputil` restart — that wake-from-sleep recovery leans on, so every
+post-wake adapter reload came back REFUSED. `reset-pf-vdisplay.ps1` stops the whole host service
+precisely to get those handles closed; the in-process recovery could not.
+
+Ownership is now `Arc` all the way out: `ensure_device` / `device_handle` / `control_device_handle`
+hand out `Arc<OwnedHandle>` clones, every consumer holds its clone across its IOCTLs (ending the
+`isize` smuggling — `Arc<OwnedHandle>` is `Send + Sync`), and retiring drops only the manager's
+reference. `DeviceSlot::retired` is gone.
+
+⚠ **Nothing may store a bare control `HANDLE` again.** The whole fix is that the handle closes when
+the last in-flight user drains.
+
+### Presenter — points are not pixels
+
+`SDL_GetDesktopDisplayMode` reports a mode in **screen coordinates** and hands the pixels-per-point
+ratio back separately as `pixel_density`; `m.w`/`m.h` were read raw. KDE advertises a 2560x1600 panel
+at 150 % as 1707x1067 points with a density of ~1.4997, `render_scale::apply` even-floors both odd
+axes, and 1706x1066 went on the wire. Multiplying by the density recovers 2560x1600 to the pixel.
+
+⚠ Inert on X11 and Windows: SDL never sets a density there and `SDL_video.c` normalizes the unset
+0.0 to 1.0. **This bug needed a compositor doing fractional scaling.**
+
+Second, independent defect: the SDL window was created without `HIGH_PIXEL_DENSITY`, so the Wayland
+surface stayed at buffer scale 1 and the swapchain was built at 1707x1067 for KWin to upscale. That
+one also silently shrank "Match window", which asks the host for `size_in_pixels()`.
+
+### Apple audio session
+
+`micEnabled` and `echoCancel` both default to `true`, so the **default** iOS session is
+`.playAndRecord` — and that branch set `.defaultToSpeaker`. That option is an output **override**,
+not a preference, and it outranks an A2DP route. ⚠ **Wired headphones beat it, Bluetooth does not**,
+so testing with a cable returns the wrong answer — which is what the comment sitting on it asserted.
+
+Now solved against the route actually given: after activation, if the current output is
+`.builtInReceiver`, override to speaker; anything external (Bluetooth, wired, CarPlay, AirPlay) is
+left strictly alone. The override is a property of the current route — iOS drops it on every route
+change, which is what lets a newly-connected headset win — so it is re-applied per route via an
+observer, registered only for `.playAndRecord`, removed in `stop()` before deactivate, `deinit` as
+backstop. Without it, dropping Bluetooth mid-stream lands on the earpiece.
+
+⚠ Deliberately **not** adding `.allowBluetooth`: it would make a headset's mic usable but drag the
+whole route onto HFP/SCO and collapse game audio to narrowband.
+
+### Audio jitter policy
+
+`JitterPolicy` (`punktfunk-core/src/audio.rs`, used by Linux/Windows/Android) and its mirror in
+Swift `AudioRing`. The policy learned exclusively from audible failures on both sides: growth needed
+**three** audible underruns; the A/V sync loop re-tested a shallower ring every five quiet seconds
+and paid an audible starvation event every time it was wrong, forever; and a grown target was never
+re-banked (growth raises a threshold — only a re-prime deepens the ring), so a bunching link rode
+the knife edge with the "grown" target sitting inert.
+
+Three mechanisms: **near-miss** (a read served with less than one protocol frame left over is the
+same evidence as an underrun, heard by no one — grows one step per window, *before* the click);
+**shrink probes** (every shrink armed for 5 s, undone on the spot if answered by an underrun or
+near-miss, with a doubling backoff 60 s → 8 min on a failed sync-driven shrink; a surviving probe
+resets it); **hollow re-prime** (an underrun while the depth *average* runs more than a step below
+target re-primes immediately — the average, not the instant, separates a hollow ring from one late
+packet, and it is seeded on prime so a fresh ring is never spuriously hollow).
+
+Measured on a ten-minute simulation of the Wi-Fi power-save pattern (25 ms gaps / 300 ms, −50 ppm
+skew): **~2000 audible events → 9.**
+
+### Plugins, SDK and the runner
+
+- **`category` never shipped.** The console correctly keeps `category: "library"` plugins out of the
+  nav; the host reported no category for them at all. `defineLibraryPlugin` sets it and
+  `sdk/src/ui.ts` forwards it — what shipped did not: `@punktfunk/host` was bumped to 0.1.2 on
+  2026-07-20 and `category` landed 2026-08-05 without a bump, so the registry's 0.1.2 is the
+  pre-category build. ⚠ **Inert until published.** `serveUi` now reads its own directory entry back
+  and warns once when a requested category did not land.
+- **Local art sync failed on a `file://` disagreement.** `local_art_bytes` decodes a `file://` value
+  before testing containment; `validate_art_paths` handed the raw value to `Path::new`. Same defect
+  produced both the unreachable settings and `sync (startup) failed: HostRequestError`.
+- **The runner now carries SDK updates.** The copy each installed plugin runs was pinned at install
+  time, so an SDK fix could never reach it.
+- **`bun publish` runs `prepare`, and `prepare` needs bun2nix** — the SDK could not be published at
+  all. Also fixed: a corrupt committed `bun.lock` in plugin-kit.
+- **Decky client update.** `flatpak remote-info punktfunk-origin io.unom.Punktfunk` names no branch;
+  the remote publishes `stable` **and** `canary`, so the ref is ambiguous and flatpak refuses it —
+  ⚠ one branch being *installed* does not disambiguate, the ambiguity is on the remote. The call
+  failed on every box, every time, and returned `available=False`, which the panel rendered as good
+  news. Every query now names the ref in full via `_flatpak_ref()` (no subprocess), carrying the
+  **scope** too, so a system-wide install is no longer invisible to a check that hardcoded `--user`.
+  A check that cannot run now reports `client_error`.
+
+### Packaging
+
+- **The `punktfunk` group is created everywhere the udev rule needs it.** `60-punktfunk.rules`
+  chgrp's the usbip vhci attach/detach nodes to a dedicated group (security review 2026-08-05 M-4:
+  writing `attach` materialises an arbitrary emulated USB device, so it must not ride on `input`).
+  **Four of six install paths shipped that rule in 0.25.0 without creating the group** — chgrp
+  failed, nodes stayed `root:root 0644`, the virtual Deck pad silently never attached, and
+  `usermod -aG punktfunk` failed outright. Fixed in arch `post_upgrade()` (only `post_install` was
+  correct, so every box that reached 0.25.0 by `pacman -Syu` missed it), nix (`users.groups.punktfunk`
+  did not exist), the bazzite sysext (a group is host state and cannot ride an image), and the Steam
+  Deck scripts. deb and rpm were correct throughout.
+- **`punktfunk-gamescope` now builds for RPM and apt**, not Arch only.
+- **Arch release-rebuild prune** called a helper that cannot exist in a release rebuild. Together
+  with the FFmpeg 9 repackage this closes the 0.25.0-1 → 0.25.0-2 episode in the pipeline rather
+  than by hand.
+- **Steam Deck `update.sh` / `install.sh`.** The web step ran `bun install --frozen-lockfile` with
+  no `--ignore-scripts`, so web's `postinstall` (`bun2nix -o bun.nix`) rewrote a **tracked** file on
+  every update; the SDK step below it had always passed `--ignore-scripts`, and that asymmetry is
+  the whole bug. Now `--ignore-scripts` plus an explicit `bun run codegen` — provably equivalent,
+  since web's `prepare` is literally `"bun run codegen"` and `src/api/gen`, `src/paraglide` and
+  `src/routeTree.gen.ts` are gitignored. `--pull` restores `web/bun.nix` and `sdk/bun.nix` before
+  pulling, which is lossless by construction. ⚠ Deliberately **not** `git reset --hard`: `$SRC`
+  defaults to the operator's own checkout. Also: `web.env` secret hygiene — `chmod 600` sat inside
+  the create-only branch, so an install set up once and only updated since kept it world-readable.
+  ⚠ `packaging/debian/build-web-deb.sh`, `packaging/arch/PKGBUILD` and `packaging/rpm/punktfunk.spec`
+  still lack `--ignore-scripts` for web — harmless (throwaway build trees), left as follow-up.
+
+### Triage tooling
+
+**`--probe-decode` described a different device from the one that streams.** The RADV
+video-decode opt-in sat *after* the `--list-adapters` / `--probe-decode` / `--list-audio` / `--pair`
+early exits, so the triage tool never had it. Measured on a Deck, same binary back to back: bare
+`--probe-decode` printed "vulkan video decode: no", "driver decode ops: none (0x0)", "no queue
+family advertises VIDEO_DECODE"; with `RADV_PERFTEST=video_decode` in the environment, "YES" and
+"H.264, H.265, AV1, VP9". ⚠ **Any Deck triage that consulted it reached the opposite of the truth.**
+Hoisted to the top of `run`, ahead of every early exit.
+
+### PyroWave on Linux — Wave 2
+
+The program's own measurement, from patch 0005's header: `encode_gpu_synchronous` goes from ~2 ms
+to **15–18 ms at 95 % game load**, with the stream frame rate collapsing. PyroWave encodes on the
+same shader cores a game saturates; NVENC is immune because it has its own ASIC.
+
+- **PW1 — the GPU-priority lever had never fired on Linux.** The vendored patch requests an elevated
+  global-priority queue, gated `if (!inherit_info)` — and **only Windows leaves `inherit_info` null**
+  (`pyrowave_create_device_by_compat`, where Granite builds the device itself). Linux passes its own
+  create-infos, Granite's `get_existing_create_info()` hands them back, `create_device` takes the
+  inherit branch, and the whole block is skipped. Now wired natively in `open_inner`'s `DeviceHold`,
+  ladder REALTIME → HIGH → no-priority, stepping only on refusal; a refused class can never fail the
+  open. The extension probe reuses the `dev_ext_props` already fetched for `queue_family_foreign` and
+  takes KHR or the EXT alias — the same spelling pf-zerocopy probes, so the two cannot disagree.
+  ⭐ **Needs `CAP_SYS_NICE`**, which the packaging now grants; without it the lever does nothing.
+- **PW5 — two encoder handles.** `Encoder::Impl` owns exactly one each of `wavelet_img_high_res`,
+  `bucket_buffer`, `meta_buffer`, `block_stat_buffer`, `payload_data`, `quant_buffer`, and
+  `Impl::encode` *opens* by discarding them (an image barrier with `VK_IMAGE_LAYOUT_UNDEFINED` as the
+  old layout, plus three `fill_buffer` clears). Two encodes submitted to one queue have **no**
+  execution dependency in Vulkan — submission order orders the start, not the completion — so N+1's
+  DWT would overwrite N's wavelet bands while N's block packing still reads them. Content-dependent
+  and silent. Overlap therefore means two handles alternated, one per slot. ⚠⚠ **The landmine:**
+  `sequence_count` also lives on `Impl`, and it is the **3-bit** counter stamped into every block
+  header. Two handles each counting 1,2,3… put 1,1,2,2,3,3… on the wire, and the decoder restarts a
+  frame only when the value *changes* — so a repeat reads as more blocks of the same frame. Depth is
+  **still 1**; the handles alternate with one in flight.
+- **PW3 — the fence wait moved out of submit.** PyroWave was the one backend waiting its fence inside
+  `submit`.
+- **PW7a — the jumbo leg was dead code.** quinn caps a peer's MTU-discovery search at
+  `min(MtuDiscoveryConfig::upper_bound, the other side's advertised max_udp_payload_size)`, and
+  `EndpointConfig::max_udp_payload_size` **defaults to 1472**. Nothing in the repo had ever touched
+  `EndpointConfig`, so raising the host's probe ceiling could never make discovery settle above 1472
+  — and the shipped mid-session grow's `settled >= sealed_datagram_bytes(target)` gate was
+  unreachable on **every path that has ever existed**. Two smaller contributors fixed with it: the
+  watcher stopped sampling the moment `settled >= 1472`, discarding the very climb the proof needs;
+  and a session sealed above the 1500-byte default was never checked against the path at all.
+
+  The advertisement is raised on the **client** endpoint under the same `jumbo_wire_mtu()` opt-in,
+  because it is not free: quinn sizes its endpoint receive buffer
+  `max_udp_payload_size × max_receive_segments × BATCH_SIZE` — on a GRO-capable Linux/Android client
+  that is ~2.9 MiB at the default and **~18 MiB at jumbo** (47 KiB → 288 KiB on Apple/Windows).
+  PyroWave is the codec that most wants this: it can never be re-keyed mid-stream (its client parses
+  chunk-aligned AUs in windows of the `Welcome` value, read once over the C ABI), so it should
+  *start* at the big shard. At an 8908-byte shard that is ~6× fewer datagrams per frame — **~49k → ~8k
+  pps at 550 Mb/s**.
+
+### Zero-copy capture
+
+- **The dmabuf latch conflated two causes with different lifetimes.** One `AtomicBool` served both
+  "the encoder repeatedly failed to import what this compositor allocates" (unrecoverable, a driver
+  fact) and "the dmabuf-only capture offer never negotiated" (which can just mean the compositor was
+  mid-restart). Sharing it made the second as permanent as the first: **one timeout, and every later
+  session on that host captured CPU frames until the process restarted** — including sessions against
+  a different compositor and a different node that had never failed at anything, with nothing said.
+  Now a `RawDmabufLatch` owning both: import failures stay sticky (unchanged 3-consecutive threshold);
+  negotiation timeouts get a retry budget of **2** — deliberately small, since each failure costs a
+  ~10 s stall the user pays in dead air; a capture that negotiates credits the budget back; and both
+  are keyed to a capture identity (node id + portal bit).
+- **The zero-copy path never asked for buffer headroom.** `build_dmabuf_buffers` set
+  `SPA_PARAM_BUFFERS_dataType` and stopped — no `SPA_PARAM_BUFFERS_buffers` at all, so the pool depth
+  every zero-copy safety argument rests on was entirely the producer's choice and we never expressed
+  a preference. Now asks for 8 (min 2, max 16) as a **Choice Range, deliberately not a fixed count**:
+  SPA intersects consumer and producer params, so a fixed 8 against a producer that can only afford 4
+  empties the intersection and the link stalls in "negotiating" with no error anywhere — ⚠ the exact
+  trap that once cost this codebase the entire Linux cursor channel, when a 256² cursor-meta max
+  failed to intersect Mutter's fixed 384². 8 buffers is ~133 ms of pool at 60 Hz and ~33 ms at 240 Hz;
+  16 is a ceiling, not a request (a 4K 4:4:4 buffer is ~25 MB).
+- **A PyroWave session could drop to CPU capture and log nothing.** The CPU-fallback warning was gated
+  on `backend_is_vaapi`, which reads the **host-global** encoder pref — but a PyroWave session is
+  negotiated **per session**, so on an NVIDIA/auto host that gate is false and the session fell out of
+  every arm of the negotiation log chain while paying a full-resolution CPU pixel touch every frame.
+  A degraded host and a healthy one produced identical logs. Now asks the per-session question
+  (`consumer_kind`), widened to every GPU consumer and excluding only the software encoder, whose
+  native input *is* CPU frames. ⚠ `pyrowave_session` must outrank `backend_is_vaapi`, because a
+  PyroWave pref flips `backend_is_vaapi` on too.
+
+### Steam-overlay input masking (Steam Deck)
+
+On a Deck in Gaming Mode the Steam menu and the QAM are driven by the **same physical controller** the
+client forwards, so opening either moved the game on the host as well — a second, invisible player.
+Steam Input masks a normal game here; it cannot mask us, because masking happens on Steam Input's
+virtual pad and we deliberately forward the **real** one (the virtual pad has no gyro, trackpads or
+paddles).
+
+⚠ **SDL's own gate cannot fire on a Deck.** SDL drops presses while a process has windows but no
+keyboard focus, and it is on by default — but gamescope resolves focus per Xwayland ctx and the client
+sits alone in its own, so the Steam overlay (which lives in the root ctx) never takes our X focus and
+no `FocusOut` is ever generated. Measured on glass: with the QAM open, X input focus inside the
+client's ctx stayed on its window for the whole 4 s while `GAMESCOPE_FOCUSED_APP` flipped to 769
+(Steam) and `GAMESCOPE_FOCUSED_APP_GFX` stayed on the app. **That pair of atoms is the signal.**
+
+⚠ `overlay_focus` watches them on the gamescope **root** ctx, which is *not* our own `$DISPLAY` under
+`--xwayland-count 2` — hence the socket-directory walk and the flatpak filesystem line.
+
+⚠⚠ Masking is deliberately **not** `set_forwarding`: that closes the slot and sends `GamepadRemove`,
+so the game would see a controller **unplug** every time somebody opened the QAM. Every slot stays
+open and only transitions stop, after flushing what the host believes is held (so a stick deflected at
+overlay-open stops steering instead of freezing at its last value). On the way back, held buttons are
+**adopted rather than replayed** — the A that picked a QAM row must not fire in the game as it closes
+— while axes *are* re-sent, since a stick has no press to ghost and SDL only speaks on change.
+
+### The `plugin` launch kind
+
+The 2026-08-05 review made `launch.kind = "command"` operator-only, and a reconcile refuses on the
+**first** offending entry — so rom-manager, whose every ROM is `<emulator> <args> <rom>`, stopped
+putting anything in the library at all. Playnite hit the same wall and was rescued with a typed kind
+the host resolves itself; there is no fixed scheme for "whichever emulator the operator configured,
+with the core and flags they chose", so that trick does not generalise.
+
+The entry now carries an **opaque key and nothing executable**, and the host asks the owning plugin
+what to run at launch time, over the loopback UI port and per-boot secret it already registered.
+⭐ **A stolen plugin token stops being command execution:** planting an entry is not enough, because
+the live plugin answers 404 for a key it never published. Nothing executable is persisted or served to
+a client, and an emulator that moved is picked up on the next launch rather than leaving a dead tile
+(same reasoning as `xbox` resolving its AUMID at launch time).
+
+⚠ **The host still spawns it**, because only the host can put the process where the stream can see it:
+on Linux that is either gamescope's own argv or a spawn carrying the session's compositor env, and the
+returned child is what session-game-lifetime tracks to know the game exited. A plugin spawning the
+emulator itself would land it outside both.
+
+### Verification status
+
+| | |
+|---|---|
+| gamescope 0006 | 6/6 exit 0 on a release build at the real spawn shape (`2752x2064@120 --steam --xwayland-count 1`); distro control SIGSEGVs |
+| Decky client update | on the Deck against the real install — pre-fix `available=False remote=''`, post-fix `available=True remote=ca010668` |
+| `--probe-decode` | on a Deck, same binary back to back, with and without the RADV opt-in |
+| Apple audio | builds on arm64-apple-ios17.0 (the triple that compiles the `#if os(iOS)` blocks — a plain `swift build` is macOS and skips them), arm64-apple-tvos17.0, macOS; 257 Swift tests |
+| Audio jitter | 10-minute Wi-Fi power-save simulation, ~2000 → 9 audible events |
+| 4:4:4 gate | test verified non-vacuous against the planted original defect |
+| Steam Deck scripts | `bash -n` + shellcheck 0.11.0 clean at `-S warning`; exec bits preserved |
+| Steam-overlay masking | on glass on a Deck — atom flip and X-focus non-flip both measured over a 4 s QAM open |
+| PyroWave depth 2 | exercised on real hardware **without shipping depth 2** (dedicated test, shipped depth stays 1) |
+| PW6 streamed AU | the trap is real, and at 2 % loss it costs exactly nothing |
+
+⏳ **Owed on glass:** iPhone + Bluetooth listen, Apple TV stats overlay, MacBook audio listen, the
+Deck HEVC/4:4:4 retest, a Windows wake-from-sleep cycle, and the PyroWave-under-game-load A/B on a
+Linux host with `CAP_SYS_NICE` actually granted — the number this whole wave is aimed at.
+
+---
+
 ## v0.25.0
 
 407 commits since v0.24.0.
