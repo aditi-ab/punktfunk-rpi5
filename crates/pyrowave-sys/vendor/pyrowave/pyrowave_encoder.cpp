@@ -1230,6 +1230,14 @@ bool Encoder::encode(CommandBuffer &cmd, const ViewBuffers &views, const Bitstre
 	return impl->encode(cmd, views, buffers);
 }
 
+// PUNKTFUNK: see the declaration in pyrowave_encoder.hpp. Impl::encode PRE-increments
+// (sequence_count = (sequence_count + 1) & mask before stamping), so store one less than the value
+// the caller wants stamped — the setter's contract is about the next ENCODE, not the next store.
+void Encoder::set_next_sequence(uint32_t sequence)
+{
+	impl->sequence_count = (sequence - 1) & SequenceCountMask;
+}
+
 const Vulkan::ImageView &Encoder::get_wavelet_band(int component, int level)
 {
 	return *impl->component_layer_views[component][level];

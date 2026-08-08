@@ -168,6 +168,10 @@ pub struct PortalCapturer {
     /// downgrade ([`pf_zerocopy::note_raw_dmabuf_negotiation_failed`]) so the pipeline rebuild
     /// retries on the CPU offer instead of failing identically forever.
     vaapi_dmabuf: bool,
+    /// PW3: this capture's dmabuf offer has been confirmed to negotiate (a frame arrived), so the
+    /// negotiation retry budget has already been credited back. One-shot — the credit is per
+    /// capture, not per frame.
+    negotiation_confirmed: bool,
     /// This capture ran the HDR (10-bit PQ/BT.2020 dmabuf) offer — see [`Self::open`]'s
     /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the
     /// process-wide SDR downgrade) and by [`hdr_meta`](Capturer::hdr_meta).
@@ -412,6 +416,7 @@ impl PwHandles {
             signals: self.signals,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
+            negotiation_confirmed: false,
             hdr_offer: self.hdr_offer,
             hdr_source,
             node_id,
@@ -468,6 +473,13 @@ fn spawn_pipewire(
     } else {
         want_hdr
     };
+    // PW3: tell the raw-dmabuf latch which capture this is BEFORE reading its verdict below. A
+    // different node id is a different question — a fresh virtual output, a compositor restart,
+    // the Bazzite Gaming↔Desktop switch — and inheriting "dmabuf does not work here" from an
+    // unrelated capture is how one transient timeout used to cost a host CPU capture until it was
+    // restarted. The portal bit is in the key because a portal-fd capture and a virtual-output
+    // capture with the same node number are genuinely different sources.
+    pf_zerocopy::note_raw_dmabuf_capture(u64::from(node_id) | (u64::from(fd.is_some()) << 32));
     // THE negotiation decision, resolved once here and handed to the thread — no mirror (L3/F1).
     // Every environment/latch read the decision depends on happens at this single point.
     let plan = pipewire::negotiation_plan(pipewire::NegotiationInputs {
@@ -705,6 +717,7 @@ impl PortalCapturer {
             // The slot before the wakeup: a publish that coalesced its edge (or landed while we were
             // not waiting) is still visible here.
             if let Some(f) = self.take_frame() {
+                self.note_negotiation_confirmed();
                 return Ok(f);
             }
             let slice = Duration::from_millis(500)
@@ -726,6 +739,16 @@ impl PortalCapturer {
     /// Take the mailbox's frame, if the producer has published one since the last take.
     fn take_frame(&self) -> Option<CapturedFrame> {
         self.slot.lock().ok().and_then(|mut s| s.take())
+    }
+
+    /// PW3: a frame arrived, so this capture's dmabuf-only offer DID negotiate — credit the
+    /// negotiation retry budget back. Only meaningful for a capture that actually made that offer,
+    /// and only once per capture (the budget counts consecutive failed BUILDS, not frames).
+    fn note_negotiation_confirmed(&mut self) {
+        if self.vaapi_dmabuf && !self.negotiation_confirmed {
+            self.negotiation_confirmed = true;
+            pf_zerocopy::note_raw_dmabuf_negotiation_ok();
+        }
     }
 
     /// The [`frame_within`](Self::frame_within) budget expired (or the thread ended) — turn it

@@ -193,12 +193,29 @@ impl SessionPlan {
                 // Surface the trade loudly: this is the single biggest per-frame cost a 4:4:4
                 // session adds (full-res CPU readback + swscale RGB→YUV444P every frame), and
                 // it looks like an unexplained fps ceiling if you don't know it happened.
-                tracing::warn!(
-                    "4:4:4 session on the NVENC path without PUNKTFUNK_ZEROCOPY: zero-copy GPU \
-                     capture DISABLED — every frame is CPU RGB + swscale RGB→YUV444P; expect a \
-                     lower fps ceiling than 4:2:0 at this mode (set PUNKTFUNK_ZEROCOPY=1 for the \
-                     GPU 4:4:4 convert)"
-                );
+                //
+                // Name the SESSION's codec, not the backend the gate is named after. The gate
+                // keys on `linux_zero_copy_is_vaapi()`, which reads the host-global encoder pref
+                // — so a per-session PyroWave negotiation on an NVENC/auto host lands here and
+                // was told it was "on the NVENC path", which is false in every particular: the
+                // wavelet encoder never touches NVENC, never swscales to YUV444P, and what it
+                // actually loses is the raw-dmabuf passthrough its whole design assumes.
+                if self.codec == crate::encode::Codec::PyroWave {
+                    tracing::warn!(
+                        "4:4:4 PyroWave session with PUNKTFUNK_ZEROCOPY off: zero-copy GPU \
+                         capture DISABLED — the wavelet encoder loses its raw-dmabuf passthrough \
+                         and every frame becomes a full-resolution CPU readback plus an upload \
+                         into its own Vulkan device; expect a materially lower fps ceiling (set \
+                         PUNKTFUNK_ZEROCOPY=1 to restore the passthrough)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "4:4:4 session on the NVENC path without PUNKTFUNK_ZEROCOPY: zero-copy \
+                         GPU capture DISABLED — every frame is CPU RGB + swscale RGB→YUV444P; \
+                         expect a lower fps ceiling than 4:2:0 at this mode (set \
+                         PUNKTFUNK_ZEROCOPY=1 for the GPU 4:4:4 convert)"
+                    );
+                }
             }
             gpu && !force_cpu_for_nvenc_444
         };

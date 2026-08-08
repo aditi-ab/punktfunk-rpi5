@@ -205,6 +205,36 @@ the host.
 If the host answers, it's up. If not, check `journalctl --user -u punktfunk-host` on the host — on
 a Windows host, run `punktfunk-host service status` from an elevated prompt on the machine itself.
 
+## GPU scheduling priority
+
+The Linux packages give the host binary one Linux capability, `CAP_SYS_NICE`, and it is worth
+knowing why it is there and how to take it away.
+
+The [PyroWave](/docs/pyrowave) codec encodes on the same GPU shader cores your game is using, so a
+demanding game can crowd it out and the stream's frame rate drops with it. The fix is to ask the
+driver to schedule the encode ahead of the game, and every driver we tested gates that request on
+this capability: without it the request is simply refused and nothing changes. The other codecs use
+a separate video engine on the GPU and are unaffected either way.
+
+`CAP_SYS_NICE` lets a process raise its own scheduling priority. It grants no access to files,
+the network or other users' processes, and it is **not** the same as running as root — the host
+still runs as you, under your user session.
+
+To check, or to take it away:
+
+```sh
+getcap /usr/bin/punktfunk-host          # shows cap_sys_nice=ep when granted
+sudo setcap -r /usr/bin/punktfunk-host  # remove it; streaming still works
+```
+
+Removing it costs you nothing unless you stream PyroWave, and you can also just set
+`PYROWAVE_QUEUE_PRIORITY=off` to stop the host asking. Note that a package update replaces the
+binary and re-applies the capability.
+
+Two side effects, if you are debugging the host: a binary carrying a capability is treated as
+security-sensitive by the dynamic loader, so `LD_LIBRARY_PATH` and `LD_PRELOAD` are ignored for it,
+and it does not write core dumps by default.
+
 ## Stopping and removing
 
 After a Linux package update the user service keeps running the old binary until it's restarted, and

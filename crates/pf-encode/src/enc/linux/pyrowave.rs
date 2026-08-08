@@ -321,6 +321,15 @@ struct DeviceHold {
     instance_ci: Box<vk::InstanceCreateInfo<'static>>,
     _queue_prio: Box<[f32; 1]>,
     _queue_ci: Box<[vk::DeviceQueueCreateInfo<'static>; 1]>,
+    /// The elevated global-priority request chained into `_queue_ci[0].p_next`
+    /// (`PYROWAVE_QUEUE_PRIORITY`, see `queue_priority_candidates`). A `Box` for the same
+    /// move-stability reason as its siblings: `pyrowave_create_device` RETAINS `device_ci` for
+    /// the device's lifetime and Granite reads the chain back through
+    /// `get_existing_create_info()`, so this must stay put and — critically — must describe the
+    /// device that actually got created. The create ladder below is therefore required to write
+    /// its FINAL state back here (null the `p_next` if the no-priority attempt is the one that
+    /// succeeded); a chain the device was not created with is a lie Granite would believe.
+    _queue_gp: Box<[vk::DeviceQueueGlobalPriorityCreateInfoKHR<'static>; 1]>,
     // A plain Vec (not Box<[_; N]> like its siblings): Phase 8 pushes queue_family_foreign
     // conditionally. The heap buffer as_ptr() feeds device_ci is move-stable like the Boxes.
     _dev_exts: Vec<*const c_char>,
@@ -328,6 +337,183 @@ struct DeviceHold {
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
+}
+
+/// Percentile of a sorted sample slice, by nearest-rank. **Pure.** Used for the `PUNKTFUNK_PERF`
+/// encode split: a p99 is the whole point here (the game-load spike this codec suffers is a TAIL
+/// event — the mean barely moves while individual frames go 2 ms → 18 ms), so a mean-only readout
+/// would report "fine" through exactly the failure the priority lever exists to fix.
+fn pct(sorted: &[u32], q: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() as f64) * q).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// The global-priority classes to try, in order, for `PYROWAVE_QUEUE_PRIORITY`.
+///
+/// **Pure, and character-identical to the vendored C patch's grammar**
+/// (`patches/0005-global-priority-queue.patch`, `context.cpp` ~2136-2152): unset → `realtime`;
+/// ASCII-lowercased; `off` → no candidates at all; `high` → `[HIGH]`; anything else, including
+/// junk → `[REALTIME, HIGH]`. Keeping the two grammars identical is the whole point — the same
+/// env var drives the Windows path (where the patch is live, because Granite builds its own
+/// device there) and this Linux path (where the patch is inert, because we pass our own
+/// create-infos and Granite takes its `inherit_info` branch). One knob that meant two different
+/// things per platform is exactly the documentation trap this wiring exists to close.
+///
+/// Note `off` is the ONLY spelling that disables it; `0` is not, because the C side does not
+/// accept `0` either. Do not "improve" that here without changing the patch in the same commit.
+fn queue_priority_candidates(raw: Option<&str>) -> Vec<vk::QueueGlobalPriorityKHR> {
+    let want = raw.map(|s| s.to_ascii_lowercase());
+    match want.as_deref() {
+        Some("off") => Vec::new(),
+        Some("high") => vec![vk::QueueGlobalPriorityKHR::HIGH],
+        _ => vec![
+            vk::QueueGlobalPriorityKHR::REALTIME,
+            vk::QueueGlobalPriorityKHR::HIGH,
+        ],
+    }
+}
+
+/// Whether a `create_device` error means "this priority class was refused" — i.e. walk the ladder
+/// down rather than failing the encoder open.
+///
+/// `ERROR_NOT_PERMITTED_KHR` is the specified answer and the only one the C patch handles.
+/// `ERROR_INITIALIZATION_FAILED` is here because the in-tree precedent that already ships this
+/// ladder on Linux — pf-zerocopy's VkBridge — accepts it too, and because the failure mode this
+/// guards against is severe and asymmetric: a PyroWave open is reached only by a NEGOTIATED
+/// PyroWave session, so a hard error here is a dead stream, not a fallback to another encoder.
+/// Treating one extra driver-specific refusal as a downgrade costs nothing; treating it as fatal
+/// costs the session.
+fn priority_refused(e: vk::Result) -> bool {
+    matches!(
+        e,
+        vk::Result::ERROR_NOT_PERMITTED_KHR | vk::Result::ERROR_INITIALIZATION_FAILED
+    )
+}
+
+/// One frame recorded and queue-submitted, whose fence has not been waited and whose bitstream has
+/// therefore not been packetized yet. PW5 stage 3: this is what the `submit`/`poll` split created —
+/// before it, no such state could exist because `submit` did the whole thing inline.
+/// How many independent per-frame resource sets the encoder allocates.
+///
+/// PW5 stage 4. Two, because Granite caps the overlap at two anyway: the pyrowave device defaults
+/// to `init_frame_contexts(2)` and `next_frame_context()` — called at the top of every
+/// `encode_gpu_synchronous` — waits the context it rotates into, so "frame N may not begin
+/// recording until N-2 completed" is enforced below us. A third slot would buy nothing without a
+/// vendored `init_frame_contexts(3)`, which is not exposed.
+///
+/// **Allocated is not the same as used.** `max_inflight` decides how many are live at once and is
+/// still 1 here; this stage is pure capacity so the depth change that follows is a one-line
+/// behaviour change rather than a simultaneous re-plumbing.
+const SLOTS: usize = 2;
+
+/// Everything ONE in-flight frame needs exclusively.
+///
+/// PW5 stage 4 exists because the analysis found six single-slot resources beyond the y/uv images
+/// the plan named, and every one of them is a correctness problem under overlap — not a
+/// performance one:
+///
+/// * `csc_set` was ONE descriptor set rewritten every frame by `bind_rgb`. Updating a descriptor
+///   set still bound by a PENDING command buffer is a spec violation
+///   (VUID-vkUpdateDescriptorSets-None-03047), and the kind that produces a wrong picture rather
+///   than a validation error on most drivers.
+/// * `y_img`/`uv_img` — the CSC of N+1 storage-writes exactly the images pyrowave is still
+///   sampling for N. The old barrier comment ("the previous frame's encode already completed under
+///   our synchronous fence") was load-bearing and said so.
+/// * `cursor_img`/`cursor_stage` — the struct comment said it plainly: *"Single (not ring) because
+///   PyroWave encodes one frame synchronously — no in-flight overlap to race."* A new cursor
+///   bitmap's host write + copy races N's sampled read.
+/// * `cmd` + `fence` — you cannot record into a PENDING command buffer at all.
+/// * `cpu_img`/`cpu_stage` (software capture / tests) — the host writes staging while N's copy is
+///   still pending.
+///
+/// `bitstream` and `import_cache` are deliberately NOT here. `bitstream` is only touched during
+/// packetize, i.e. only on the poll side, one frame at a time. `import_cache` retains the
+/// `VkImage`/`VkDeviceMemory` per dmabuf inode, so dropping a `CapturedFrame` (and its dup'd fd)
+/// while the GPU still reads it is not a use-after-free — do not "optimise" that retention away.
+struct Slot {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    csc_set: vk::DescriptorSet,
+    y_img: vk::Image,
+    y_mem: vk::DeviceMemory,
+    y_view: vk::ImageView,
+    uv_img: vk::Image,
+    uv_mem: vk::DeviceMemory,
+    uv_view: vk::ImageView,
+    cursor_img: vk::Image,
+    cursor_mem: vk::DeviceMemory,
+    cursor_view: vk::ImageView,
+    cursor_stage: vk::Buffer,
+    cursor_stage_mem: vk::DeviceMemory,
+    /// Per-slot: each slot's cursor image is its own, so a bitmap change is uploaded once per slot
+    /// (`SLOTS` small uploads instead of one) rather than once globally, which would leave the
+    /// other slot showing the previous pointer.
+    cursor_serial: u64,
+    cursor_ready: bool,
+    /// CPU-input staging (software capture / smoke tests), lazily (re)created on format change.
+    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
+    cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+}
+
+impl Slot {
+    /// All-null, matching `open_inner`'s "construct then fill" unwind discipline: every
+    /// `vkDestroy*`/`vkFree*` of `VK_NULL_HANDLE` is the spec-defined no-op, so `Drop` running on a
+    /// partially-built slot is sound.
+    fn null() -> Self {
+        Self {
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            csc_set: vk::DescriptorSet::null(),
+            y_img: vk::Image::null(),
+            y_mem: vk::DeviceMemory::null(),
+            y_view: vk::ImageView::null(),
+            uv_img: vk::Image::null(),
+            uv_mem: vk::DeviceMemory::null(),
+            uv_view: vk::ImageView::null(),
+            cursor_img: vk::Image::null(),
+            cursor_mem: vk::DeviceMemory::null(),
+            cursor_view: vk::ImageView::null(),
+            cursor_stage: vk::Buffer::null(),
+            cursor_stage_mem: vk::DeviceMemory::null(),
+            cursor_serial: u64::MAX,
+            cursor_ready: false,
+            cpu_img: None,
+            cpu_stage: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InFlight {
+    /// Which [`Slot`] this frame's command buffer, fence, descriptor set and images belong to.
+    /// Carried per-frame rather than recomputed so `wait_and_packetize` cannot wait the wrong
+    /// fence — the failure that would look like corruption, not like an error.
+    slot: usize,
+    /// The capture timestamp this frame's AU must carry. Held here rather than re-read from the
+    /// `CapturedFrame` because the frame is the CALLER's and is gone by the time we packetize.
+    pts_ns: u64,
+    /// The bitstream buffer size this frame was ENCODED against (`frame_budget + BS_SLACK`), and
+    /// the packetize boundary in dense mode.
+    ///
+    /// Snapshotted at submit rather than re-read at poll because the split opened a window that
+    /// did not exist before: `reconfigure_bitrate` can land between the two, and in dense mode the
+    /// boundary IS this number — a shrunk budget would make `compute_num_packets` return more than
+    /// one packet and the encode would bail with "unexpected packet count" on a frame that was
+    /// perfectly fine.
+    cap: usize,
+    /// The wire sequence value stamped into this frame's block headers, so the AU can be checked
+    /// against what we asked for — see the self-check in `wait_and_packetize`.
+    seq: u8,
+    /// The datagram alignment this frame was encoded for; `set_wire_chunking` can likewise land
+    /// mid-flight, and a frame packetized at a boundary it was not rate-controlled for would ship
+    /// with the wrong `chunk_aligned` flag.
+    wire_chunk: Option<usize>,
+    /// `PUNKTFUNK_PERF`: when `submit` started. The summary keeps measuring submit→AU (what
+    /// `92326312` measured, so stage 0's baseline stays comparable), not just the wait half.
+    t0: std::time::Instant,
 }
 
 pub struct PyroWaveEncoder {
@@ -346,48 +532,65 @@ pub struct PyroWaveEncoder {
 
     // --- pyrowave (borrows our device; destroyed before it) ---
     pw_dev: pw::pyrowave_device,
-    pw_enc: pw::pyrowave_encoder,
+    /// ONE `pyrowave_encoder` per [`Slot`] (PW5 stage 5), alternated.
+    ///
+    /// The object CANNOT hold two frames in flight — not "probably not", structurally not.
+    /// `Encoder::Impl` owns one each of `wavelet_img_high_res`, `bucket_buffer`, `meta_buffer`,
+    /// `block_stat_buffer`, `payload_data` and `quant_buffer`, and `Impl::encode` OPENS by
+    /// discarding them: an image barrier with `VK_IMAGE_LAYOUT_UNDEFINED` as the old layout (a
+    /// written promise that nothing else is reading it) plus three `fill_buffer` clears. Two
+    /// encodes recorded into two command buffers and submitted to the same queue have NO execution
+    /// dependency in Vulkan — submission order orders the start, not the completion — so N+1's DWT
+    /// would overwrite the bands and zero the RDO buckets while N's block packing still reads them.
+    ///
+    /// So overlap means two handles on one device, and within a handle the encodes stay strictly
+    /// serialized (a slot's next frame is only recorded after that slot's previous one was
+    /// retired), which keeps patch 0004's scratch-pool invariant intact without touching it.
+    pw_encs: Vec<pw::pyrowave_encoder>,
+    /// The wire sequence counter, kept HERE rather than in the encoder objects.
+    ///
+    /// ⚠ pyrowave's own `sequence_count` is PER-ENCODER, so two alternating handles each count
+    /// 1,2,3… independently and the wire sees 1,1,2,2,3,3…. The decoder restarts a frame only when
+    /// the value CHANGES (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so a
+    /// repeat reads as MORE BLOCKS OF THE SAME FRAME: `clear()` never runs and every second frame
+    /// is silently swallowed, on every client. `patches/0007-encoder-sequence-override.patch`
+    /// exposes a setter so this single counter is stamped regardless of which handle encodes.
+    wire_seq: u32,
 
-    // --- CSC + planes (single slot: encode is synchronous per frame) ---
+    // --- CSC pipeline + sampler: SHARED by every slot (immutable once built, read-only in
+    //     recording, so no overlap hazard). The per-frame resources live in `slots`. ---
     csc_pipe: vk::Pipeline,
     csc_layout: vk::PipelineLayout,
     csc_dsl: vk::DescriptorSetLayout,
     csc_pool: vk::DescriptorPool,
-    csc_set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    y_img: vk::Image,
-    y_mem: vk::DeviceMemory,
-    y_view: vk::ImageView,
-    uv_img: vk::Image,
-    uv_mem: vk::DeviceMemory,
-    uv_view: vk::ImageView,
-
-    // Cursor overlay (cursor-as-metadata): a fixed CURSOR_MAX² RGBA8 sampled image (bound at binding
-    // 3) + host staging, re-uploaded only when the bitmap changes (`cursor_serial`). Single (not
-    // ring) because PyroWave encodes one frame synchronously — no in-flight overlap to race.
-    cursor_img: vk::Image,
-    cursor_mem: vk::DeviceMemory,
-    cursor_view: vk::ImageView,
-    cursor_stage: vk::Buffer,
-    cursor_stage_mem: vk::DeviceMemory,
-    cursor_serial: u64,
-    cursor_ready: bool,
 
     // Per-buffer dmabuf-import cache keyed by (st_dev, st_ino) — mirrors `vulkan_video.rs`.
+    // NOT per-slot: it retains the VkImage/VkDeviceMemory per inode, which is exactly what makes
+    // it safe for two slots to sample the same imported buffer.
     import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
-    // CPU-input staging (software capture / smoke tests), lazily (re)created on format change.
-    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
-    cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
     /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
+    /// Not per-slot: it is consumed synchronously inside `submit_frame` (copied into staging
+    /// before the call returns), so no GPU work ever reads it.
     cpu_expand: Vec<u8>,
 
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
-    /// True between a successful `queue_submit` and its successful fence wait — i.e. exactly when
-    /// GPU work may still be executing. `reset()` keys its bounded wait on this: a never-submitted
-    /// fence would otherwise read as "wedged" (fences start unsignaled).
-    gpu_pending: bool,
+    /// The `SLOTS` independent per-frame resource sets — see [`Slot`] for why each member is in
+    /// there and why `bitstream`/`import_cache` are not.
+    slots: Vec<Slot>,
+    /// Which slot the NEXT submit records into; advances modulo `SLOTS` per submitted frame.
+    next_slot: usize,
+    /// Frames recorded and queue-submitted whose fence has not been waited yet — i.e. exactly the
+    /// work that may still be executing on the GPU. `reset()` keys its bounded wait on this being
+    /// non-empty: a never-submitted fence would otherwise read as "wedged" (fences start
+    /// unsignaled). At today's depth of 1 this holds at most one entry.
+    inflight: VecDeque<InFlight>,
+    /// How many frames may be submitted-but-not-polled at once. **Still 1**, even though stage 4
+    /// allocated `SLOTS` resource sets: raising it is stage 6's job and needs the second pyrowave
+    /// encoder handle (stage 5) first — pyrowave's own `Encoder` object structurally cannot hold
+    /// two frames (single wavelet/scratch buffers, and `Impl::encode` opens by discarding them
+    /// with an UNDEFINED old layout). Never exceeds `SLOTS`.
+    max_inflight: usize,
 
     // --- state ---
     width: u32,
@@ -398,6 +601,13 @@ pub struct PyroWaveEncoder {
     chroma444: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
+    /// `PUNKTFUNK_PERF`: the synchronous encode's own duration, which is the quantity the
+    /// GPU-priority work is about — patch 0005's header records it going ~2 ms → 15-18 ms at
+    /// 95 % game load. Every other backend (VAAPI, direct NVENC) already logs a submit split;
+    /// this one did not, so the one encoder whose cost the priority lever exists to protect was
+    /// the one you could not measure. Reservoir of recent samples, summarised on a slow cadence.
+    perf_us: Vec<u32>,
+    perf_logged_at: Option<std::time::Instant>,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary and pad every codec
     /// packet to it, so each wire shard carries whole self-delimiting packets. `None` =
     /// one packet per AU (the dense MVP shape).
@@ -407,6 +617,11 @@ pub struct PyroWaveEncoder {
     wire_budget: crate::pyrowave_wire::WireBudget,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
+    /// The AU currently being handed out in streamed chunks (PW6 — `Some` strictly between a
+    /// `first` chunk and its `last`). See [`crate::pyrowave_wire::AuChunker`]: this backend's
+    /// encode is synchronous, so the AU is COMPLETE before the first chunk leaves — the split is
+    /// for the send side, never an encode/send overlap.
+    chunker: Option<crate::pyrowave_wire::AuChunker>,
     frame_count: u64,
 }
 
@@ -420,6 +635,50 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 impl PyroWaveEncoder {
+    /// `PUNKTFUNK_PERF`: record one encode duration and summarise on a slow cadence.
+    ///
+    /// **submit→AU on purpose**, and unchanged by PW5 stage 3's `submit`/`poll` split: the sample
+    /// is stamped when `submit` starts and taken when the AU becomes readable, so it still covers
+    /// CSC + encode + fence wait + packetize and stays directly comparable to the pre-split
+    /// baseline (`92326312`). What the split changed is WHERE the wait sits — the host loop's own
+    /// `submit_us` now excludes it, which is the shape every other backend already had.
+    ///
+    /// ⚠ At a depth greater than 1 this number legitimately grows by roughly one loop period,
+    /// because frame N's AU is not retrieved until after N+1 has been submitted. That is real
+    /// added latency, not an instrumentation artefact — see PW5's escalation gate.
+    fn note_encode_us(&mut self, us: u32) {
+        if !pf_host_config::config().perf {
+            return;
+        }
+        self.perf_us.push(us);
+        let now = std::time::Instant::now();
+        let since = self.perf_logged_at.map(|t| now.duration_since(t));
+        // Every 2 s, matching the other backends' submit-split cadence, and never before there
+        // are enough samples for a p99 to mean anything.
+        if self.perf_us.len() < 30 || since.is_some_and(|d| d.as_secs() < 2) {
+            if self.perf_logged_at.is_none() {
+                self.perf_logged_at = Some(now);
+            }
+            return;
+        }
+        self.perf_logged_at = Some(now);
+        let mut s = std::mem::take(&mut self.perf_us);
+        s.sort_unstable();
+        let n = s.len() as u64;
+        let mean = s.iter().map(|&v| u64::from(v)).sum::<u64>() / n.max(1);
+        tracing::info!(
+            frames = n,
+            mean_us = mean,
+            p50_us = pct(&s, 0.50),
+            p99_us = pct(&s, 0.99),
+            max_us = *s.last().unwrap_or(&0),
+            depth = self.max_inflight,
+            "pyrowave encode, submit->AU (CSC + encode + fence wait + packetize). Under a \
+             GPU-bound game this is the number the global-priority queue exists to protect — \
+             watch p99, not the mean. At depth > 1 it includes one loop period of pipelining"
+        );
+    }
+
     pub fn open(
         width: u32,
         height: u32,
@@ -467,6 +726,7 @@ impl PyroWaveEncoder {
             instance_ci: Box::new(vk::InstanceCreateInfo::default()),
             _queue_prio: Box::new([1.0f32]),
             _queue_ci: Box::new([vk::DeviceQueueCreateInfo::default()]),
+            _queue_gp: Box::new([vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()]),
             _dev_exts: vec![
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
@@ -487,8 +747,14 @@ impl PyroWaveEncoder {
         // error arm. From the device on, a partially-constructed `Self` (below) makes the
         // existing `Drop` the sole unwind path — these used to be a dozen `?`s that each leaked
         // everything created before them.
-        // SAFETY: plain physical-device queries on the live instance just created, and a
-        // `create_device` whose create-infos are pinned in `hold` for the call's duration.
+        // SAFETY: plain physical-device queries on the live instance just created, and
+        // `create_device` calls whose create-infos are pinned in `hold` for each call's duration.
+        // The global-priority ladder (WP14 step 4) may call `create_device` several times; every
+        // attempt reads the SAME pinned `hold`, and the only thing that varies between attempts is
+        // `hold._queue_gp[0].global_priority` (a plain enum field) and, for the final attempt,
+        // `hold._queue_ci[0].p_next` being nulled. Both live in `Box`es owned by `hold`, so the
+        // pointers `device_ci` holds stay valid across the retries; a failed `create_device` does
+        // not consume or invalidate its create-info, so re-passing it is sound.
         let selected = (|| unsafe {
             // The SAME selector `capture_modifiers` uses, so the two can never disagree about
             // the device (see `select_physical_device` — including why the selection itself is
@@ -585,18 +851,117 @@ impl PyroWaveEncoder {
                 );
                 vk::QUEUE_FAMILY_EXTERNAL
             };
+            // VK_KHR_global_priority (WP14 step 4): PyroWave encodes on the SAME shader cores a
+            // game saturates, and `encode_gpu_synchronous` measurably collapses under that load
+            // (patch 0005's header: ~2 ms → 15-18 ms at 95 % game load on an RTX 4090). An
+            // elevated global-priority queue is the actual compute-PREEMPTION lever — unlike a
+            // process-priority raise, which only orders submission. The vendored patch requests
+            // it, but it is gated `if (!inherit_info)` and Linux passes its OWN create-infos, so
+            // Granite takes the inherit branch and the patch has never done anything here. This
+            // is the Linux half. Must be pushed BEFORE the count/as_ptr wiring below, exactly
+            // like queue_family_foreign above.
+            let gp_candidates =
+                queue_priority_candidates(std::env::var("PYROWAVE_QUEUE_PRIORITY").ok().as_deref());
+            // Enable whichever alias the driver advertises (KHR = the promoted name), mirroring
+            // pf-zerocopy's VkBridge probe so the two can never disagree about the spelling.
+            let gp_ext =
+                if crate::vk_util::ext_advertised(&dev_ext_props, vk::KHR_GLOBAL_PRIORITY_NAME) {
+                    Some(vk::KHR_GLOBAL_PRIORITY_NAME)
+                } else if crate::vk_util::ext_advertised(
+                    &dev_ext_props,
+                    vk::EXT_GLOBAL_PRIORITY_NAME,
+                ) {
+                    Some(vk::EXT_GLOBAL_PRIORITY_NAME)
+                } else {
+                    None
+                };
+            let gp = gp_ext.filter(|_| !gp_candidates.is_empty());
+            if let Some(name) = gp {
+                hold._dev_exts.push(name.as_ptr());
+            }
+
             hold._queue_ci[0] = vk::DeviceQueueCreateInfo::default().queue_family_index(family);
             hold._queue_ci[0].queue_count = 1;
             hold._queue_ci[0].p_queue_priorities = hold._queue_prio.as_ptr();
+            if gp.is_some() {
+                hold._queue_ci[0].p_next = &*hold._queue_gp as *const _ as *const std::ffi::c_void;
+            }
             hold.device_ci.p_next = &*hold._feat2 as *const _ as *const std::ffi::c_void;
             hold.device_ci.queue_create_info_count = 1;
             hold.device_ci.p_queue_create_infos = hold._queue_ci.as_ptr();
             hold.device_ci.enabled_extension_count = hold._dev_exts.len() as u32;
             hold.device_ci.pp_enabled_extension_names = hold._dev_exts.as_ptr();
 
-            let device = instance
-                .create_device(pd, &hold.device_ci, None)
-                .context("create device")?;
+            // The downgrade ladder, mirroring the C patch: try each class in turn, step down only
+            // on a REFUSAL, and if every class is refused create with no global priority at all.
+            // A refused class must NEVER fail the open — that graceful property is the entire
+            // reason patch 0005 was kept despite its negative RTX/WDDM measurement, and it matters
+            // more here: this path is reached only by a negotiated PyroWave session, so a hard
+            // error is a dead stream rather than a fallback to another encoder.
+            let mut chosen = None;
+            let mut device = None;
+            for want in &gp_candidates {
+                if gp.is_none() {
+                    break;
+                }
+                hold._queue_gp[0].global_priority = *want;
+                match instance.create_device(pd, &hold.device_ci, None) {
+                    Ok(d) => {
+                        chosen = Some(*want);
+                        device = Some(d);
+                        break;
+                    }
+                    Err(e) if priority_refused(e) => {
+                        tracing::debug!(
+                            priority = ?want,
+                            error = ?e,
+                            "pyrowave: global queue priority not permitted — downgrading"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(e).context("create device");
+                    }
+                }
+            }
+            let device = match device {
+                Some(d) => {
+                    tracing::info!(
+                        priority = ?chosen,
+                        ext = ?gp,
+                        "pyrowave: elevated global queue priority (the encode dispatch preempts a \
+                         GPU-bound game where the driver honors it)"
+                    );
+                    d
+                }
+                None => {
+                    // Either nothing was requested (`off`, or no extension), or every class was
+                    // refused. EITHER WAY the retained create-info must now describe a device
+                    // created WITHOUT a priority chain — `pyrowave_create_device` keeps
+                    // `device_ci` for the device's lifetime and Granite reads it back through
+                    // `get_existing_create_info()`. Leaving `p_next` pointing at the
+                    // global-priority struct here would hand Granite a chain the device was not
+                    // created with. (The extension itself stays enabled and that is correct: it
+                    // IS enabled on the device, it just carries no request.)
+                    hold._queue_ci[0].p_next = std::ptr::null();
+                    if !gp_candidates.is_empty() && gp.is_some() {
+                        // MEASURED on .21 (RTX 5070 Ti, NVIDIA 610.43.02, 2026-08-08), and it is
+                        // not a vendor quirk: an unprivileged host is refused EVERY class, and the
+                        // same binary with `cap_sys_nice+ep` is granted REALTIME on the first
+                        // attempt. So this arm is the normal state of a packaged host today, the
+                        // lever is inert until the capability ships, and the message has to say
+                        // which capability rather than leave an operator guessing.
+                        tracing::warn!(
+                            "pyrowave: every global queue priority class was refused — encoding \
+                             at default priority. The GPU-preemption lever is INERT without \
+                             CAP_SYS_NICE on the host binary (measured on both NVIDIA and RADV); \
+                             PYROWAVE_QUEUE_PRIORITY=off silences this"
+                        );
+                    }
+                    instance
+                        .create_device(pd, &hold.device_ci, None)
+                        .context("create device")?
+                }
+            };
             Ok((pd, family, device, foreign_qfi))
         })();
         let (pd, family, device, foreign_qfi) = match selected {
@@ -613,7 +978,7 @@ impl PyroWaveEncoder {
         // Construct `Self` NOW, every not-yet-created resource at its null value, and assign
         // into it as resources come up. Any `?` from here drops `me`, and the existing `Drop`
         // tears down exactly the prefix that exists: it `device_wait_idle()`s first, null-guards
-        // `pw_enc` (`pyrowave_encoder_destroy` dereferences before deleting),
+        // `pw_encs` (`pyrowave_encoder_destroy` dereferences before deleting),
         // `pyrowave_device_destroy(null)` is a plain `delete nullptr` (pyrowave_c.cpp) and
         // every `vkDestroy*`/`vkFree*` of a VK_NULL_HANDLE is the spec-defined no-op. One
         // teardown path serves both the error unwind and the normal drop, so an open-path leak
@@ -629,43 +994,33 @@ impl PyroWaveEncoder {
             mem_props,
             _hold: hold,
             pw_dev: std::ptr::null_mut(),
-            pw_enc: std::ptr::null_mut(),
+            pw_encs: vec![std::ptr::null_mut(); SLOTS],
+            wire_seq: 0,
             csc_pipe: vk::Pipeline::null(),
             csc_layout: vk::PipelineLayout::null(),
             csc_dsl: vk::DescriptorSetLayout::null(),
             csc_pool: vk::DescriptorPool::null(),
-            csc_set: vk::DescriptorSet::null(),
             sampler: vk::Sampler::null(),
-            y_img: vk::Image::null(),
-            y_mem: vk::DeviceMemory::null(),
-            y_view: vk::ImageView::null(),
-            uv_img: vk::Image::null(),
-            uv_mem: vk::DeviceMemory::null(),
-            uv_view: vk::ImageView::null(),
-            cursor_img: vk::Image::null(),
-            cursor_mem: vk::DeviceMemory::null(),
-            cursor_view: vk::ImageView::null(),
-            cursor_stage: vk::Buffer::null(),
-            cursor_stage_mem: vk::DeviceMemory::null(),
-            cursor_serial: u64::MAX,
-            cursor_ready: false,
             import_cache: Vec::new(),
-            cpu_img: None,
-            cpu_stage: None,
             cpu_expand: Vec::new(),
             cmd_pool: vk::CommandPool::null(),
-            cmd: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
-            gpu_pending: false,
+            slots: (0..SLOTS).map(|_| Slot::null()).collect(),
+            next_slot: 0,
+            inflight: VecDeque::new(),
+            // PW5: depth 1 still. Stage 4 allocates the capacity; stage 6 spends it.
+            max_inflight: 1,
             width: w,
             height: h,
             fps,
             chroma444,
             frame_budget: budget_for(bitrate, fps),
+            perf_us: Vec::new(),
+            perf_logged_at: None,
             wire_chunk: None,
             wire_budget: crate::pyrowave_wire::WireBudget::new(),
             bitstream: Vec::new(),
             pending: VecDeque::new(),
+            chunker: None,
             frame_count: 0,
         };
 
@@ -720,38 +1075,18 @@ impl PyroWaveEncoder {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
         };
-        pw_check(
-            pw::pyrowave_encoder_create(&einfo, &mut me.pw_enc),
-            "encoder_create",
-        )?;
+        for i in 0..SLOTS {
+            pw_check(
+                pw::pyrowave_encoder_create(&einfo, &mut me.pw_encs[i]),
+                "encoder_create",
+            )?;
+        }
 
         // ---- CSC planes: full-res R8 luma + RG8 chroma (half-res for 4:2:0, full-res for
         //      4:4:4), storage-written by the CSC and sampled directly by pyrowave (R/G view
         //      swizzles synthesize Cb/Cr) ----
         let device = me.device.clone(); // cheap fn-table clone; lets `me.*` assignments interleave
         let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
-        let (y_img, y_mem, y_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8_UNORM,
-            w,
-            h,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-        )?;
-        me.y_img = y_img;
-        me.y_mem = y_mem;
-        me.y_view = y_view;
-        let (uv_img, uv_mem, uv_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8G8_UNORM,
-            cw,
-            ch,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-        )?;
-        me.uv_img = uv_img;
-        me.uv_mem = uv_mem;
-        me.uv_view = uv_view;
 
         // ---- CSC compute pipeline (same shader + layout as vulkan_video.rs) ----
         me.sampler = device.create_sampler(
@@ -816,91 +1151,140 @@ impl PyroWaveEncoder {
         device.destroy_shader_module(shader, None);
         me.csc_pipe = pipe_res.map_err(|(_, e)| e)?[0];
 
+        // Pool sized for ALL slots: 2 combined-image-samplers (binding 0 RGB + binding 3 cursor)
+        // and 2 storage images (Y, UV) per set.
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                // binding 0 (RGB) + binding 3 (cursor).
-                .descriptor_count(2),
+                .descriptor_count(2 * SLOTS as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(2),
+                .descriptor_count(2 * SLOTS as u32),
         ];
         me.csc_pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
+                .max_sets(SLOTS as u32)
                 .pool_sizes(&pool_sizes),
             None,
         )?;
-        me.csc_set = device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(me.csc_pool)
-                .set_layouts(&dsls),
-        )?[0];
-        // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (bound at binding 3).
-        let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
-            &device,
-            &me.mem_props,
-            vk::Format::R8G8B8A8_UNORM,
-            CURSOR_MAX,
-            CURSOR_MAX,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-        )?;
-        me.cursor_img = cursor_img;
-        me.cursor_mem = cursor_mem;
-        me.cursor_view = cursor_view;
-        let (cursor_stage, cursor_stage_mem) = make_host_buffer(
-            &device,
-            &me.mem_props,
-            (CURSOR_MAX * CURSOR_MAX * 4) as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
-        me.cursor_stage = cursor_stage;
-        me.cursor_stage_mem = cursor_stage_mem;
-        // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the encoder's life.
-        let yi = [vk::DescriptorImageInfo::default()
-            .image_view(me.y_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let uvi = [vk::DescriptorImageInfo::default()
-            .image_view(me.uv_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let curi = [vk::DescriptorImageInfo::default()
-            .sampler(me.sampler)
-            .image_view(me.cursor_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        device.update_descriptor_sets(
-            &[
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&yi),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&uvi),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(me.csc_set)
-                    .dst_binding(3)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&curi),
-            ],
-            &[],
-        );
-
         me.cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
-        me.cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(me.cmd_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        me.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+
+        // ---- the per-frame resource sets (PW5 stage 4) ----
+        // Each iteration builds ONE complete `Slot` and assigns as it goes, so a failure part-way
+        // leaves the earlier slots fully formed and the rest null — which `Drop` handles, since
+        // every `vkDestroy*` of VK_NULL_HANDLE is the spec-defined no-op.
+        for i in 0..SLOTS {
+            let (y_img, y_mem, y_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8_UNORM,
+                w,
+                h,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            me.slots[i].y_img = y_img;
+            me.slots[i].y_mem = y_mem;
+            me.slots[i].y_view = y_view;
+            let (uv_img, uv_mem, uv_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8G8_UNORM,
+                cw,
+                ch,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            me.slots[i].uv_img = uv_img;
+            me.slots[i].uv_mem = uv_mem;
+            me.slots[i].uv_view = uv_view;
+            // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (binding 3).
+            let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
+                &device,
+                &me.mem_props,
+                vk::Format::R8G8B8A8_UNORM,
+                CURSOR_MAX,
+                CURSOR_MAX,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            )?;
+            me.slots[i].cursor_img = cursor_img;
+            me.slots[i].cursor_mem = cursor_mem;
+            me.slots[i].cursor_view = cursor_view;
+            let (cursor_stage, cursor_stage_mem) = make_host_buffer(
+                &device,
+                &me.mem_props,
+                (CURSOR_MAX * CURSOR_MAX * 4) as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+            me.slots[i].cursor_stage = cursor_stage;
+            me.slots[i].cursor_stage_mem = cursor_stage_mem;
+            let csc_set = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(me.csc_pool)
+                    .set_layouts(&dsls),
+            )?[0];
+            me.slots[i].csc_set = csc_set;
+            // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the slot's
+            // life; only binding 0 (the frame's RGB view) is rewritten per frame, by `bind_rgb`,
+            // and THAT is why each slot needs its own set — see `Slot`.
+            let yi = [vk::DescriptorImageInfo::default()
+                .image_view(y_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let uvi = [vk::DescriptorImageInfo::default()
+                .image_view(uv_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let curi = [vk::DescriptorImageInfo::default()
+                .sampler(me.sampler)
+                .image_view(cursor_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&yi),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&uvi),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(csc_set)
+                        .dst_binding(3)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&curi),
+                ],
+                &[],
+            );
+            me.slots[i].cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(me.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            me.slots[i].fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        }
+
+        // What the extra slot actually COST, measured from the driver's own requirements rather
+        // than estimated from the dimensions — the plan's estimate is not evidence, and on an iGPU
+        // at 4K/4:4:4 this is the number that decides whether the capacity is affordable. The
+        // per-frame CPU staging is excluded because it is allocated lazily and only on the
+        // software-capture path.
+        let slot_bytes: u64 = [
+            me.slots[0].y_img,
+            me.slots[0].uv_img,
+            me.slots[0].cursor_img,
+        ]
+        .iter()
+        .map(|&i| device.get_image_memory_requirements(i).size)
+        .sum::<u64>()
+            + device
+                .get_buffer_memory_requirements(me.slots[0].cursor_stage)
+                .size;
 
         let props = me.instance.get_physical_device_properties(pd);
         tracing::info!(
@@ -908,21 +1292,29 @@ impl PyroWaveEncoder {
             mode = %format!("{w}x{h}@{fps}"),
             budget_kib = me.frame_budget / 1024,
             chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
+            slots = SLOTS,
+            slot_kib = slot_bytes / 1024,
+            slots_kib = slot_bytes * SLOTS as u64 / 1024,
             "PyroWave encoder open (intra-only wavelet, BT.709 limited)"
         );
 
         Ok(me)
     }
 
-    /// Point CSC binding 0 at this frame's RGB view.
-    unsafe fn bind_rgb(&self, rgb_view: vk::ImageView) {
+    /// Point slot `slot`'s CSC binding 0 at this frame's RGB view.
+    ///
+    /// ⚠ This is the `vkUpdateDescriptorSets` the analysis flagged: writing a set that is still
+    /// bound by a PENDING command buffer violates VUID-vkUpdateDescriptorSets-None-03047. It is
+    /// safe because the set belongs to the slot we are about to record into, and that slot's
+    /// previous frame was retired before `submit` chose it.
+    unsafe fn bind_rgb(&self, slot: usize, rgb_view: vk::ImageView) {
         let ii = [vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(rgb_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         self.device.update_descriptor_sets(
             &[vk::WriteDescriptorSet::default()
-                .dst_set(self.csc_set)
+                .dst_set(self.slots[slot].csc_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&ii)],
@@ -933,13 +1325,22 @@ impl PyroWaveEncoder {
     /// Cursor-as-metadata: bring the cursor image up to date for this frame and return the shader
     /// push constant `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend).
     /// Records the small upload (only when the bitmap `serial` changed) + layout transition into
-    /// `cmd`, ahead of the CSC dispatch that samples binding 3. Encode is synchronous, so the single
-    /// shared image never races a prior frame; the first use transitions it to SHADER_READ_ONLY.
-    unsafe fn prep_cursor(&mut self, cursor: Option<&pf_frame::CursorOverlay>) -> Result<[i32; 4]> {
+    /// slot `slot`'s command buffer, ahead of the CSC dispatch that samples binding 3.
+    ///
+    /// PER SLOT since PW5 stage 4 — image, staging buffer and `cursor_serial` all. The old comment
+    /// said it outright: a single shared image was only safe because there was no in-flight
+    /// overlap to race. The cost of per-slot is that a changed bitmap uploads once per slot.
+    unsafe fn prep_cursor(
+        &mut self,
+        slot: usize,
+        cursor: Option<&pf_frame::CursorOverlay>,
+    ) -> Result<[i32; 4]> {
         let dev = self.device.clone();
-        let cmd = self.cmd;
-        let img = self.cursor_img;
-        let ready = self.cursor_ready;
+        let cmd = self.slots[slot].cmd;
+        let img = self.slots[slot].cursor_img;
+        let stage = self.slots[slot].cursor_stage;
+        let stage_mem = self.slots[slot].cursor_stage_mem;
+        let ready = self.slots[slot].cursor_ready;
         let barrier = |old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ss)
@@ -957,20 +1358,16 @@ impl PyroWaveEncoder {
             Some(c) if !c.rgba.is_empty() => {
                 let cw = c.w.min(CURSOR_MAX);
                 let ch = c.h.min(CURSOR_MAX);
-                if self.cursor_serial != c.serial {
+                if self.slots[slot].cursor_serial != c.serial {
                     let bytes = (cw as usize) * (ch as usize) * 4;
-                    let ptr = dev.map_memory(
-                        self.cursor_stage_mem,
-                        0,
-                        bytes as u64,
-                        vk::MemoryMapFlags::empty(),
-                    )?;
+                    let ptr =
+                        dev.map_memory(stage_mem, 0, bytes as u64, vk::MemoryMapFlags::empty())?;
                     std::ptr::copy_nonoverlapping(
                         c.rgba.as_ptr(),
                         ptr as *mut u8,
                         bytes.min(c.rgba.len()),
                     );
-                    dev.unmap_memory(self.cursor_stage_mem);
+                    dev.unmap_memory(stage_mem);
                     let old = if ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -989,7 +1386,7 @@ impl PyroWaveEncoder {
                     );
                     dev.cmd_copy_buffer_to_image(
                         cmd,
-                        self.cursor_stage,
+                        stage,
                         img,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[vk::BufferImageCopy::default()
@@ -1015,8 +1412,8 @@ impl PyroWaveEncoder {
                             vk::AccessFlags2::SHADER_READ,
                         )]),
                     );
-                    self.cursor_serial = c.serial;
-                    self.cursor_ready = true;
+                    self.slots[slot].cursor_serial = c.serial;
+                    self.slots[slot].cursor_ready = true;
                 }
                 Ok([c.x, c.y, cw as i32, ch as i32])
             }
@@ -1033,7 +1430,7 @@ impl PyroWaveEncoder {
                             vk::AccessFlags2::SHADER_READ,
                         )]),
                     );
-                    self.cursor_ready = true;
+                    self.slots[slot].cursor_ready = true;
                 }
                 Ok([0, 0, 0, 0])
             }
@@ -1090,12 +1487,20 @@ impl PyroWaveEncoder {
     }
 
     /// CPU RGB staging (software capture / smoke tests) — mirrors `vulkan_video.rs::ensure_cpu_rgb`.
-    unsafe fn ensure_cpu_rgb(&mut self, fmt: vk::Format, bytes: &[u8]) -> Result<vk::ImageView> {
+    ///
+    /// PER SLOT since PW5 stage 4: the host writes this staging buffer, so writing it while a
+    /// previous frame's buffer-to-image copy is still pending would race that copy.
+    unsafe fn ensure_cpu_rgb(
+        &mut self,
+        slot: usize,
+        fmt: vk::Format,
+        bytes: &[u8],
+    ) -> Result<vk::ImageView> {
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
         let need = (w * h * 4) as u64;
-        if self.cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
-            if let Some((i, m, v, _)) = self.cpu_img.take() {
+        if self.slots[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
+            if let Some((i, m, v, _)) = self.slots[slot].cpu_img.take() {
                 dev.destroy_image_view(v, None);
                 dev.destroy_image(i, None);
                 dev.free_memory(m, None);
@@ -1108,10 +1513,14 @@ impl PyroWaveEncoder {
                 h,
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             )?;
-            self.cpu_img = Some((i, m, v, fmt));
+            self.slots[slot].cpu_img = Some((i, m, v, fmt));
         }
-        if self.cpu_stage.map(|(_, _, s)| s < need).unwrap_or(true) {
-            if let Some((b, m, _)) = self.cpu_stage.take() {
+        if self.slots[slot]
+            .cpu_stage
+            .map(|(_, _, s)| s < need)
+            .unwrap_or(true)
+        {
+            if let Some((b, m, _)) = self.slots[slot].cpu_stage.take() {
                 dev.destroy_buffer(b, None);
                 dev.free_memory(m, None);
             }
@@ -1121,14 +1530,14 @@ impl PyroWaveEncoder {
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.cpu_stage = Some((buf, mem, need));
+            self.slots[slot].cpu_stage = Some((buf, mem, need));
         }
-        let (_, m, _) = self.cpu_stage.unwrap();
+        let (_, m, _) = self.slots[slot].cpu_stage.unwrap();
         let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
         let n = bytes.len().min(need as usize);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
         dev.unmap_memory(m);
-        Ok(self.cpu_img.unwrap().2)
+        Ok(self.slots[slot].cpu_img.unwrap().2)
     }
 
     /// The per-frame budget handed to pyrowave rate control: `frame_budget`, deflated by the
@@ -1141,14 +1550,19 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// One frame, synchronously: ingest → CSC → pyrowave encode (recorded into our command
-    /// buffer) → submit + fence wait (sub-ms) → packetize into an `EncodedFrame`.
-    unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
+    /// The SUBMIT half of one frame (PW5 stage 3): ingest → CSC → pyrowave encode, recorded into
+    /// our command buffer → queue-submit → **return**. The fence wait and packetize moved to
+    /// [`wait_and_packetize`](Self::wait_and_packetize), which is where every other backend in
+    /// this crate has always had them.
+    ///
+    /// On success exactly one [`InFlight`] is pushed. On failure nothing is pushed and the command
+    /// buffer has been reset (see the error-arm note inside) — the caller may submit again.
+    unsafe fn submit_frame(&mut self, frame: &CapturedFrame, t0: std::time::Instant) -> Result<()> {
         // A failed `reset()` leaves the encoder destroyed and null. Callers today turn that into
         // a session error and never resubmit, but a null here would be a use-after-free inside
         // pyrowave rather than a clean error — so fail loudly instead of relying on that.
         anyhow::ensure!(
-            !self.pw_enc.is_null(),
+            self.pw_encs.iter().all(|e| !e.is_null()),
             "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
         );
         let dev = self.device.clone();
@@ -1198,16 +1612,23 @@ impl PyroWaveEncoder {
         // which the next `begin` may implicitly reset.
         // Resolved before the closure (which borrows `self` mutably for the recording calls).
         let rate_budget = self.rate_budget();
+        // THE slot this frame owns for its whole life — command buffer, fence, descriptor set,
+        // y/uv images, cursor image and CPU staging (PW5 stage 4). `submit` guaranteed it is free
+        // by draining to `max_inflight - 1` before calling here.
+        let slot = self.next_slot;
+        let seq = self.wire_seq;
+        let cmd = self.slots[slot].cmd;
+        let fence = self.slots[slot].fence;
         let record_and_submit = (|| -> Result<()> {
             dev.begin_command_buffer(
-                self.cmd,
+                cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
             // Cursor-as-metadata: refresh the cursor image (only when the bitmap changed) + get the
             // shader push constant. Recorded into `self.cmd` before the CSC dispatch samples binding 3.
-            let cursor_pc = self.prep_cursor(frame.cursor.as_ref())?;
+            let cursor_pc = self.prep_cursor(slot, frame.cursor.as_ref())?;
 
             // ---- ingest RGB (same barrier discipline as vulkan_video.rs) ----
             let rgb_view = match &frame.payload {
@@ -1234,7 +1655,7 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
                     );
                     view
@@ -1247,13 +1668,13 @@ impl PyroWaveEncoder {
                         normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
                     let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
                     let view = match fmt {
-                        Ok(f) => self.ensure_cpu_rgb(f, norm_bytes),
+                        Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes),
                         Err(e) => Err(e),
                     };
                     self.cpu_expand = scratch;
                     let view = view?;
-                    let (img, ..) = self.cpu_img.unwrap();
-                    let (stage, ..) = self.cpu_stage.unwrap();
+                    let (img, ..) = self.slots[slot].cpu_img.unwrap();
+                    let (stage, ..) = self.slots[slot].cpu_stage.unwrap();
                     let to_dst = vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
@@ -1264,11 +1685,11 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
                     );
                     dev.cmd_copy_buffer_to_image(
-                        self.cmd,
+                        cmd,
                         stage,
                         img,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1294,18 +1715,19 @@ impl PyroWaveEncoder {
                         .image(img)
                         .subresource_range(color_range(0));
                     dev.cmd_pipeline_barrier2(
-                        self.cmd,
+                        cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
                     );
                     view
                 }
                 _ => bail!("pyrowave: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
             };
-            self.bind_rgb(rgb_view);
+            self.bind_rgb(slot, rgb_view);
 
-            // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — the previous
-            // frame's encode already completed under our synchronous fence, which is also the
-            // "execution barrier before writing to images" pyrowave's contract asks for).
+            // y/uv -> GENERAL for the CSC's storage writes (discard prior contents — this SLOT's
+            // previous frame was retired before `submit` chose it, which is also the "execution
+            // barrier before writing to images" pyrowave's contract asks for).
+            let (y_img, uv_img) = (self.slots[slot].y_img, self.slots[slot].uv_img);
             let to_general = |img| {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -1318,17 +1740,17 @@ impl PyroWaveEncoder {
                     .subresource_range(color_range(0))
             };
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[to_general(self.y_img), to_general(self.uv_img)]),
+                    .image_memory_barriers(&[to_general(y_img), to_general(uv_img)]),
             );
-            dev.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
             dev.cmd_bind_descriptor_sets(
-                self.cmd,
+                cmd,
                 vk::PipelineBindPoint::COMPUTE,
                 self.csc_layout,
                 0,
-                &[self.csc_set],
+                &[self.slots[slot].csc_set],
                 &[],
             );
             let mut pc_bytes = [0u8; 16];
@@ -1336,7 +1758,7 @@ impl PyroWaveEncoder {
                 pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
             }
             dev.cmd_push_constants(
-                self.cmd,
+                cmd,
                 self.csc_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
@@ -1344,9 +1766,9 @@ impl PyroWaveEncoder {
             );
             // 4:2:0: one invocation per 2x2 luma block (per chroma sample); 4:4:4: per pixel.
             if self.chroma444 {
-                dev.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+                dev.cmd_dispatch(cmd, w.div_ceil(8), h.div_ceil(8), 1);
             } else {
-                dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+                dev.cmd_dispatch(cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
             }
 
             // CSC storage writes -> pyrowave's sampled reads (images stay GENERAL — the layout
@@ -1363,9 +1785,9 @@ impl PyroWaveEncoder {
                     .subresource_range(color_range(0))
             };
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[to_sampled(self.y_img), to_sampled(self.uv_img)]),
+                    .image_memory_barriers(&[to_sampled(y_img), to_sampled(uv_img)]),
             );
 
             // ---- pyrowave encode, recorded into OUR command buffer ----
@@ -1392,7 +1814,7 @@ impl PyroWaveEncoder {
             let buffers = pw::pyrowave_gpu_buffers {
                 planes: [
                     plane(
-                        self.y_img,
+                        y_img,
                         w,
                         h,
                         r8,
@@ -1403,14 +1825,14 @@ impl PyroWaveEncoder {
                     // The view extent is the chroma IMAGE's own mip0 extent (it's a separate
                     // image, not a planar aspect): half-res for 4:2:0, full-res for 4:4:4.
                     plane(
-                        self.uv_img,
+                        uv_img,
                         if self.chroma444 { w } else { w / 2 },
                         if self.chroma444 { h } else { h / 2 },
                         rg8,
                         pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
                     ),
                     plane(
-                        self.uv_img,
+                        uv_img,
                         if self.chroma444 { w } else { w / 2 },
                         if self.chroma444 { h } else { h / 2 },
                         rg8,
@@ -1423,10 +1845,22 @@ impl PyroWaveEncoder {
             };
             pw::pyrowave_device_set_command_buffer(
                 self.pw_dev,
-                self.cmd.as_raw() as usize as pw::VkCommandBuffer,
+                cmd.as_raw() as usize as pw::VkCommandBuffer,
             );
+            // ⚠ THE LANDMINE (PW5 stage 5). Stamp OUR monotonic counter before the encode, or
+            // the two alternating handles emit 1,1,2,2,3,3… and the decoder reads each repeat as
+            // more blocks of the same frame — half the frames silently swallowed, on every client.
+            // Needs `patches/0007-encoder-sequence-override.patch`; the round-trip test
+            // `wire_sequence_increments_across_alternating_handles` is what keeps it honest.
+            pw_check(
+                pw::pyrowave_encoder_set_next_sequence(
+                    self.pw_encs[slot],
+                    seq & pw::PYROWAVE_SEQUENCE_MASK,
+                ),
+                "set_next_sequence",
+            )?;
             let enc_res = pw::pyrowave_encoder_encode_gpu_synchronous(
-                self.pw_enc,
+                self.pw_encs[slot],
                 std::ptr::null(),
                 std::ptr::null(),
                 &buffers,
@@ -1435,26 +1869,57 @@ impl PyroWaveEncoder {
             pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
             pw_check(enc_res, "encode_gpu_synchronous")?;
 
-            dev.end_command_buffer(self.cmd)?;
-            dev.reset_fences(&[self.fence])?;
-            let cmds = [self.cmd];
+            dev.end_command_buffer(cmd)?;
+            dev.reset_fences(&[fence])?;
+            let cmds = [cmd];
             dev.queue_submit(
                 self.queue,
                 &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                self.fence,
+                fence,
             )?;
             Ok(())
         })();
         if let Err(e) = record_and_submit {
             // SAFETY: on every closure error arm the buffer is RECORDING/INVALID/EXECUTABLE —
             // never PENDING (nothing was enqueued) — and the pool allows the reset.
-            let _ = dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            let _ = dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
             return Err(e);
         }
-        self.gpu_pending = true;
-        dev.wait_for_fences(&[self.fence], true, 5_000_000_000)
+        // Submitted: from here the GPU may be executing, and NOTHING may touch `cmd`, the y/uv
+        // images or `csc_set` until this entry is retired by `wait_and_packetize`.
+        self.next_slot = (slot + 1) % SLOTS;
+        // Advance only on SUCCESS: a frame that never reached the wire must not burn a sequence
+        // value (a gap reads as a restart, which is right for a DROPPED frame and wrong for one
+        // that was never emitted at all).
+        self.wire_seq = self.wire_seq.wrapping_add(1);
+        self.inflight.push_back(InFlight {
+            slot,
+            seq: (seq & pw::PYROWAVE_SEQUENCE_MASK) as u8,
+            pts_ns: frame.pts_ns,
+            cap: self.frame_budget + BS_SLACK,
+            wire_chunk: self.wire_chunk,
+            t0,
+        });
+        Ok(())
+    }
+
+    /// The POLL half of one frame (PW5 stage 3): wait the oldest in-flight frame's fence, then
+    /// packetize its bitstream into an `EncodedFrame` on `pending`.
+    ///
+    /// ⚠ The fence wait's failure path deliberately does NOT reset the command buffer: a timeout
+    /// leaves it PENDING, where a reset violates VUID-vkResetCommandBuffer-commandBuffer-00045.
+    /// The in-flight entry is likewise NOT popped on that failure — it is what tells `reset()`
+    /// there is still live GPU work to re-wait before the encoder object may be destroyed.
+    unsafe fn wait_and_packetize(&mut self) -> Result<()> {
+        let Some(fr) = self.inflight.front().copied() else {
+            return Ok(());
+        };
+        let dev = self.device.clone();
+        dev.wait_for_fences(&[self.slots[fr.slot].fence], true, 5_000_000_000)
             .context("pyrowave encode fence")?;
-        self.gpu_pending = false;
+        // Waited and signaled: the command buffer is INVALID (one-time submit), which the next
+        // `begin` may implicitly reset, and the GPU is done with this frame's resources.
+        self.inflight.pop_front();
 
         // ---- packetize ----
         // Dense (default): boundary = whole buffer → the AU is exactly one pyrowave packet.
@@ -1463,23 +1928,26 @@ impl PyroWaveEncoder {
         // self-delimiting packets — the client windows its parse and a lost shard costs
         // only those blocks. Padding cost is small: the packetizer fills close to the
         // boundary by design.
-        let cap = self.frame_budget + BS_SLACK;
+        // `fr.cap`/`fr.wire_chunk`, NOT the live fields: `reconfigure_bitrate` and
+        // `set_wire_chunking` may have landed since this frame was submitted, and packetizing at a
+        // boundary the frame was not rate-controlled for is a spurious failure.
+        let cap = fr.cap;
         self.bitstream.resize(cap, 0);
         // Chunked mode reserves the 4-byte window prefix from the packetize boundary (shared helper).
-        let boundary = crate::pyrowave_wire::packet_boundary(self.wire_chunk, cap);
+        let boundary = crate::pyrowave_wire::packet_boundary(fr.wire_chunk, cap);
         let mut n: usize = 0;
         pw_check(
-            pw::pyrowave_encoder_compute_num_packets(self.pw_enc, boundary, &mut n),
+            pw::pyrowave_encoder_compute_num_packets(self.pw_encs[fr.slot], boundary, &mut n),
             "compute_num_packets",
         )?;
-        if n == 0 || (self.wire_chunk.is_none() && n != 1) {
+        if n == 0 || (fr.wire_chunk.is_none() && n != 1) {
             bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
         }
         let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
         let mut out_n: usize = 0;
         pw_check(
             pw::pyrowave_encoder_packetize(
-                self.pw_enc,
+                self.pw_encs[fr.slot],
                 packets.as_mut_ptr(),
                 boundary,
                 &mut out_n,
@@ -1494,40 +1962,84 @@ impl PyroWaveEncoder {
         // blacks. (Linux capture has no HDR path, so this side never stamps BT.2020/PQ.)
         if let Some(p) = packets.first() {
             crate::pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, false);
+            // Self-check on the ONE thing a dropped vendored patch would break silently. Without
+            // `0007-encoder-sequence-override.patch` the two handles count independently, the wire
+            // reads 1,1,2,2,3,3..., and every client's decoder folds each repeated value into the
+            // previous frame — half the frames gone, no error anywhere. A re-vendor that loses the
+            // patch would not fail to build; it would fail on glass, subtly. Two byte reads per
+            // frame to make that loud instead. Once per process: if it is wrong it is wrong for
+            // every frame.
+            if crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset) != Some(fr.seq) {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        expected = fr.seq,
+                        got = ?crate::pyrowave_wire::wire_sequence(&self.bitstream, p.offset),
+                        "pyrowave: the wire sequence counter is NOT what we stamped — \
+                         patches/0007-encoder-sequence-override.patch is missing or ineffective. \
+                         With two alternating encoder handles this silently halves the frame rate \
+                         on every client"
+                    );
+                }
+            }
         }
         // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
         // single packet, or the datagram-aligned windowed AU (§4.4).
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
-        let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
-        if self.wire_chunk.is_some() {
+        let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk);
+        if fr.wire_chunk.is_some() {
             let raw: usize = pkts.iter().map(|&(_, s)| s).sum();
             self.wire_budget.observe(raw, au.len());
         }
         self.frame_count += 1;
         self.pending.push_back(EncodedFrame {
             data: au,
-            pts_ns: frame.pts_ns,
+            pts_ns: fr.pts_ns,
             // Every frame is independently decodable — SOF/keyframe on each AU is the codec's
             // whole recovery story (plan §1.2).
             keyframe: true,
             recovery_anchor: false,
-            chunk_aligned: self.wire_chunk.is_some(),
+            chunk_aligned: fr.wire_chunk.is_some(),
         });
+        // submit→AU, the same quantity `92326312` measured before the split, so stage 0's
+        // baseline stays comparable. Stamped here rather than in `submit` because that is where
+        // the AU now becomes readable.
+        self.note_encode_us(fr.t0.elapsed().as_micros() as u32);
+        Ok(())
+    }
+
+    /// Retire in-flight frames until at most `keep` remain. Used by `submit` (make room before
+    /// recording) and by `flush`/`poll` (drain).
+    unsafe fn drain_to(&mut self, keep: usize) -> Result<()> {
+        while self.inflight.len() > keep {
+            self.wait_and_packetize()?;
+        }
         Ok(())
     }
 }
 
 impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
-        // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
-        // struct owns and waits its own fence before touching results. Command-buffer state on
-        // failure is `encode_frame`'s own business now: its record-and-submit closure resets the
-        // buffer on every pre-submit failure, and its post-submit failures (fence timeout —
-        // buffer possibly PENDING) deliberately do NOT reset, because that violates
+        // `PUNKTFUNK_PERF` encode split (kept above the SAFETY comment so that comment stays
+        // attached to the block it proves — the crate denies undocumented unsafe blocks).
+        let t0 = std::time::Instant::now();
+        // SAFETY: single-threaded encoder; both halves work on handles this struct owns.
+        // Command-buffer state on failure is `submit_frame`'s own business: its record-and-submit
+        // closure resets the buffer on every pre-submit failure, and the fence wait's failure
+        // (buffer possibly PENDING) deliberately does NOT reset, because that violates
         // VUID-vkResetCommandBuffer-commandBuffer-00045; the blanket reset that used to live
         // here fired on exactly that path. Recovery (`reset()`/`Drop`) waits the device idle
         // before anything touches `cmd` again.
-        unsafe { self.encode_frame(frame) }
+        unsafe {
+            // Make room before recording. This is THE invariant that makes the slot
+            // `submit_frame` is about to pick provably free: at most `max_inflight - 1` frames may
+            // still be in flight, and `max_inflight <= SLOTS`, so the slot `next_slot` points at
+            // was retired. The host loop polls after every submit so this is normally a no-op; it
+            // is here for callers that do not (the `spike` subcommand, the hardware smoke tests).
+            self.drain_to(self.max_inflight.saturating_sub(1))?;
+            self.submit_frame(frame, t0)
+        }
     }
 
     fn caps(&self) -> EncoderCaps {
@@ -1544,29 +2056,84 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        // Trait contract (PW6): each AU is drained through ONE method. Erroring beats
+        // double-emitting the bytes the chunk cursor already handed out (which would reach the
+        // wire twice, under the same frame index, and fail the receiver's retro-validation).
+        // Checked BEFORE the fence wait below: if a chunk cursor is open this call is a caller
+        // bug, and completing more work first would only widen the damage.
+        if self.chunker.is_some() {
+            bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
+        }
+        // PW5 stage 3: THIS is where the fence wait now lives. `submit` returns as soon as the
+        // work is queued; the AU only exists once the fence signals and the bitstream is
+        // packetized, so poll completes the oldest in-flight frame before answering.
+        if self.pending.is_empty() && !self.inflight.is_empty() {
+            // SAFETY: single-threaded encoder, waiting its own fence and reading its own
+            // bitstream; the failure path leaves the entry in flight for `reset()` to re-wait.
+            unsafe { self.wait_and_packetize()? };
+        }
         Ok(self.pending.pop_front())
     }
 
+    // --- streamed AU (PW6) — see `pyrowave_wire::AuChunker` for what this does and does NOT buy.
+    fn supports_chunked_poll(&self) -> bool {
+        crate::pyrowave_wire::stream_chunk_step(self.wire_chunk).is_some()
+    }
+
+    fn poll_chunk(&mut self) -> Result<Option<crate::AuChunk>> {
+        // Finish the AU already in flight before opening the next one — the host's `handle_chunk`
+        // keys begin/finish off `first`/`last` and cannot interleave two AUs.
+        if let Some(c) = self.chunker.as_mut() {
+            if let Some(chunk) = c.next() {
+                return Ok(Some(chunk));
+            }
+            self.chunker = None;
+        }
+        let Some(f) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+        // No blocking wait here (the trait allows one): `submit` already ran the whole encode
+        // synchronously, so an AU in `pending` is complete by construction.
+        match crate::pyrowave_wire::stream_chunk_step(self.wire_chunk) {
+            Some(step) => Ok(self
+                .chunker
+                .insert(crate::pyrowave_wire::AuChunker::new(f, step))
+                .next()),
+            // Unarmed / dense: the trait's own default shape, so a host that polls chunks anyway
+            // still gets whole AUs.
+            None => Ok(Some(crate::AuChunk::whole(f))),
+        }
+    }
+
     fn reset(&mut self) -> bool {
+        // A rebuild forfeits every in-flight frame — including an AU only half-handed-out through
+        // `poll_chunk`. Dropping the cursor here (ahead of every `pending.clear()` arm below) is
+        // what keeps the next `poll_chunk` from splicing the tail of a dead AU onto a fresh one;
+        // the host sees a `first` without the previous `last`, logs "streamed AU abandoned
+        // mid-flight" and lets the client age that frame out.
+        self.chunker = None;
         // Cheap in-place rebuild: recreate only the pyrowave encoder object — there is no
         // rate-control history or reference state worth preserving (plan §4.3).
         //
-        // Bounded wait first: the only work possibly still executing is the one submitted frame
-        // whose synchronous fence wait timed out (`gpu_pending`). Re-wait it under the same 5 s
-        // cap as `encode_frame` — an untimed `device_wait_idle` here would park the recovery
-        // thread on the exact device it suspects is wedged, until the kernel's GPU reset, if
-        // ever. If the fence still won't signal, destroying the pyrowave encoder under live GPU
-        // work would be a use-after-free, so report "no in-place rebuild" and let the session
-        // surface a real error (`Drop`'s unbounded idle covers teardown, where blocking on the
-        // kernel is acceptable).
-        if self.gpu_pending {
-            // SAFETY: waiting this encoder's own fence under `&mut self`.
-            if unsafe {
-                self.device
-                    .wait_for_fences(&[self.fence], true, 5_000_000_000)
-            }
-            .is_err()
-            {
+        // Bounded wait first: the only work possibly still executing is a submitted frame whose
+        // fence wait has not succeeded yet (`inflight` non-empty — either never polled, or polled
+        // and timed out). Re-wait it under the same 5 s cap as `wait_and_packetize` — an untimed
+        // `device_wait_idle` here would park the recovery thread on the exact device it suspects
+        // is wedged, until the kernel's GPU reset, if ever. If the fence still won't signal,
+        // destroying the pyrowave encoder under live GPU work would be a use-after-free, so
+        // report "no in-place rebuild" and let the session surface a real error (`Drop`'s
+        // unbounded idle covers teardown, where blocking on the kernel is acceptable).
+        if !self.inflight.is_empty() {
+            // Every in-flight frame's fence, not just the oldest — at depth > 1 there may be
+            // several, and destroying the pyrowave encoder while ANY of them still executes is a
+            // use-after-free.
+            let fences: Vec<vk::Fence> = self
+                .inflight
+                .iter()
+                .map(|f| self.slots[f.slot].fence)
+                .collect();
+            // SAFETY: waiting this encoder's own fences under `&mut self`.
+            if unsafe { self.device.wait_for_fences(&fences, true, 5_000_000_000) }.is_err() {
                 tracing::error!(
                     "pyrowave: in-flight encode did not complete within the reset budget — GPU \
                      or driver wedged; in-place rebuild abandoned"
@@ -1574,20 +2141,15 @@ impl Encoder for PyroWaveEncoder {
                 self.pending.clear();
                 return false;
             }
-            self.gpu_pending = false;
+            // The submitted frames are forfeit (their bitstream lives in the encoder object about
+            // to be destroyed), but the GPU is provably done with them.
+            self.inflight.clear();
         }
         // SAFETY: the device is idle for this encoder's work (the fence wait above, or no submit
         // outstanding) — this sweep-up is instant — and the pyrowave device outlives the encoder
         // object being swapped.
         unsafe {
             self.device.device_wait_idle().ok();
-            pw::pyrowave_encoder_destroy(self.pw_enc);
-            // Publish the null IMMEDIATELY: the create below is fallible, and its failure path
-            // must not leave a freed pointer in the field. `pyrowave_encoder_destroy` is a plain
-            // `delete` (pyrowave_c.cpp) with no null check, so `Drop` running on a stale handle
-            // is a double free — the exact shape this reset hits when the rebuild fails because
-            // the device is already lost, which is the state that made the watchdog fire.
-            self.pw_enc = std::ptr::null_mut();
             let einfo = pw::pyrowave_encoder_create_info {
                 device: self.pw_dev,
                 width: self.width as i32,
@@ -1598,17 +2160,32 @@ impl Encoder for PyroWaveEncoder {
                     pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
                 },
             };
-            let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
-            let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
-            if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
-                tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
-                // `pw_enc` stays null — `Drop` and `encode_frame` both guard on it. The queued
-                // AUs are forfeit either way (the caller turns a false reset into a session
-                // error), so drop them rather than shipping output from a dead encoder.
-                self.pending.clear();
-                return false;
+            for i in 0..SLOTS {
+                pw::pyrowave_encoder_destroy(self.pw_encs[i]);
+                // Publish the null IMMEDIATELY: the create below is fallible, and its failure path
+                // must not leave a freed pointer in the field. `pyrowave_encoder_destroy` is a
+                // plain `delete` (pyrowave_c.cpp) with no null check, so `Drop` running on a stale
+                // handle is a double free — the exact shape this reset hits when the rebuild fails
+                // because the device is already lost, which is the state that made the watchdog
+                // fire.
+                self.pw_encs[i] = std::ptr::null_mut();
+                let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
+                let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
+                if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
+                    tracing::error!(result = ?r, slot = i, "pyrowave: encoder rebuild failed");
+                    // This handle stays null — `Drop` and `submit_frame` both guard on it. The
+                    // queued AUs are forfeit either way (the caller turns a false reset into a
+                    // session error), so drop them rather than shipping output from a dead
+                    // encoder.
+                    self.pending.clear();
+                    return false;
+                }
+                self.pw_encs[i] = enc;
             }
-            self.pw_enc = enc;
+            // Fresh handles start their own counters at 0, but the CLIENT's `last_seq` does not
+            // reset — so keep counting from where the stream was. A rebuild loses frames, and a
+            // gap is exactly what tells the decoder to restart.
+            self.next_slot = 0;
         }
         self.pending.clear();
         true
@@ -1640,8 +2217,11 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Synchronous per-frame encode: nothing buffered beyond `pending`.
-        Ok(())
+        // Since PW5 stage 3 there IS something buffered beyond `pending`: a submitted frame whose
+        // fence has not been waited. Retire it so the caller's `poll`-until-`None` drain
+        // (the trait's contract) actually returns every AU. Bounded by the same 5 s fence cap.
+        // SAFETY: single-threaded encoder, waiting its own fence.
+        unsafe { self.drain_to(0) }
     }
 }
 
@@ -1654,13 +2234,15 @@ impl Drop for PyroWaveEncoder {
         // up, so on a failed open this runs against a partial prefix. That is sound because
         // `pyrowave_device_destroy(null)` is a bare `delete nullptr` (pyrowave_c.cpp — safe
         // no-op) and every `vkDestroy*`/`vkFree*` of VK_NULL_HANDLE is the spec-defined no-op;
-        // `pw_enc` is the one null-UNSAFE destroy and carries its own guard below.
+        // `pw_encs` are the null-UNSAFE destroys and carry their own guard below.
         unsafe {
             self.device.device_wait_idle().ok();
             // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
             // is not null-safe.
-            if !self.pw_enc.is_null() {
-                pw::pyrowave_encoder_destroy(self.pw_enc);
+            for &e in &self.pw_encs {
+                if !e.is_null() {
+                    pw::pyrowave_encoder_destroy(e);
+                }
             }
             pw::pyrowave_device_destroy(self.pw_dev);
             for (_, _, i, m, v) in self.import_cache.drain(..) {
@@ -1668,16 +2250,32 @@ impl Drop for PyroWaveEncoder {
                 self.device.destroy_image(i, None);
                 self.device.free_memory(m, None);
             }
-            if let Some((i, m, v, _)) = self.cpu_img.take() {
-                self.device.destroy_image_view(v, None);
-                self.device.destroy_image(i, None);
-                self.device.free_memory(m, None);
+            // Every slot, in the same all-null-tolerant way (a failed open leaves a partial
+            // prefix built and the rest null; `vkDestroy*(VK_NULL_HANDLE)` is a spec no-op).
+            for sl in std::mem::take(&mut self.slots) {
+                if let Some((i, m, v, _)) = sl.cpu_img {
+                    self.device.destroy_image_view(v, None);
+                    self.device.destroy_image(i, None);
+                    self.device.free_memory(m, None);
+                }
+                if let Some((b, m, _)) = sl.cpu_stage {
+                    self.device.destroy_buffer(b, None);
+                    self.device.free_memory(m, None);
+                }
+                self.device.destroy_fence(sl.fence, None);
+                self.device.destroy_image_view(sl.y_view, None);
+                self.device.destroy_image(sl.y_img, None);
+                self.device.free_memory(sl.y_mem, None);
+                self.device.destroy_image_view(sl.uv_view, None);
+                self.device.destroy_image(sl.uv_img, None);
+                self.device.free_memory(sl.uv_mem, None);
+                self.device.destroy_image_view(sl.cursor_view, None);
+                self.device.destroy_image(sl.cursor_img, None);
+                self.device.free_memory(sl.cursor_mem, None);
+                self.device.destroy_buffer(sl.cursor_stage, None);
+                self.device.free_memory(sl.cursor_stage_mem, None);
             }
-            if let Some((b, m, _)) = self.cpu_stage.take() {
-                self.device.destroy_buffer(b, None);
-                self.device.free_memory(m, None);
-            }
-            self.device.destroy_fence(self.fence, None);
+            // Command buffers and descriptor sets are freed with their pools.
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_descriptor_pool(self.csc_pool, None);
             self.device.destroy_pipeline(self.csc_pipe, None);
@@ -1685,17 +2283,6 @@ impl Drop for PyroWaveEncoder {
             self.device
                 .destroy_descriptor_set_layout(self.csc_dsl, None);
             self.device.destroy_sampler(self.sampler, None);
-            self.device.destroy_image_view(self.y_view, None);
-            self.device.destroy_image(self.y_img, None);
-            self.device.free_memory(self.y_mem, None);
-            self.device.destroy_image_view(self.uv_view, None);
-            self.device.destroy_image(self.uv_img, None);
-            self.device.free_memory(self.uv_mem, None);
-            self.device.destroy_image_view(self.cursor_view, None);
-            self.device.destroy_image(self.cursor_img, None);
-            self.device.free_memory(self.cursor_mem, None);
-            self.device.destroy_buffer(self.cursor_stage, None);
-            self.device.free_memory(self.cursor_stage_mem, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1988,6 +2575,52 @@ mod tests {
         }
     }
 
+    /// PW5 stage 4: what the extra per-frame resource set actually COSTS in VRAM, at the modes
+    /// that decide whether it is affordable. Reported from the driver's own memory requirements,
+    /// not estimated from the dimensions — the plan's ~25-35 MB estimate is a guess, and on an
+    /// iGPU at 4K/4:4:4 the real number is the one that matters.
+    ///
+    /// Prints rather than asserts a threshold: a hard limit here would be a guess about every
+    /// future GPU. What it DOES assert is that a slot is not free and not absurd, so a refactor
+    /// that accidentally allocated per-slot copies of something large fails visibly.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn slot_vram_cost_is_reported() {
+        for (w, h, chroma, name) in [
+            (1920u32, 1080u32, crate::ChromaFormat::Yuv420, "1080p 4:2:0"),
+            (3840, 2160, crate::ChromaFormat::Yuv420, "4K 4:2:0"),
+            (3840, 2160, crate::ChromaFormat::Yuv444, "4K 4:4:4"),
+        ] {
+            let enc = PyroWaveEncoder::open(w, h, 60, 40_000_000, chroma).expect("open");
+            // SAFETY: plain memory-requirement queries on images this encoder owns.
+            let per_slot: u64 = unsafe {
+                [
+                    enc.slots[0].y_img,
+                    enc.slots[0].uv_img,
+                    enc.slots[0].cursor_img,
+                ]
+                .iter()
+                .map(|&i| enc.device.get_image_memory_requirements(i).size)
+                .sum::<u64>()
+                    + enc
+                        .device
+                        .get_buffer_memory_requirements(enc.slots[0].cursor_stage)
+                        .size
+            };
+            eprintln!(
+                "{name}: {} KiB per slot, {SLOTS} slots = {} KiB total",
+                per_slot / 1024,
+                per_slot * SLOTS as u64 / 1024
+            );
+            assert!(per_slot > 0, "{name}: a slot must own real memory");
+            assert!(
+                per_slot < 512 * 1024 * 1024,
+                "{name}: {per_slot} bytes per slot — something large became per-slot that should \
+                 not have (bitstream? import cache?)"
+            );
+        }
+    }
+
     /// WP4.5: a frame that is not the session's mode must be REFUSED, not encoded. PyroWave
     /// applies no alignment, so a mismatch can only be a stale frame from a renegotiated mode —
     /// and the failure is silent without this check (`rgb2yuv.comp` clamps its fetches and the CPU
@@ -2261,5 +2894,559 @@ mod tests {
         dump("ref-dense444-y.bin", &y);
         dump("ref-dense444-cb.bin", &cb);
         dump("ref-dense444-cr.bin", &cr);
+    }
+
+    // ---- WP14 step 4: the global-priority grammar --------------------------------------------
+    //
+    // The device-create ladder itself has NO unit test and cannot have one — it needs a real
+    // Vulkan device. Its coverage is clippy plus the on-glass log line. What IS testable, and what
+    // actually drifts, is the grammar: it must stay character-identical to the vendored C patch,
+    // because the SAME env var drives the Windows path (where the patch is live) and this one.
+    // These are device-free by construction — that is why `queue_priority_candidates` takes the
+    // raw string instead of reading the environment itself (env-var tests race).
+
+    /// Unset means `realtime`, which means "try REALTIME, then fall back to HIGH" — the ladder,
+    /// not a single class. Windows parity: the C patch defaults the same way.
+    #[test]
+    fn unset_requests_the_realtime_ladder() {
+        assert_eq!(
+            queue_priority_candidates(None),
+            vec![
+                vk::QueueGlobalPriorityKHR::REALTIME,
+                vk::QueueGlobalPriorityKHR::HIGH
+            ]
+        );
+    }
+
+    /// `off` is the ONLY spelling that disables it, and it is case-insensitive because the C patch
+    /// lowercases first. Note `0` is deliberately NOT off — the C side does not accept it either,
+    /// and two grammars for one variable is the trap this wiring closes.
+    #[test]
+    fn only_off_disables_and_it_is_case_insensitive() {
+        assert!(queue_priority_candidates(Some("off")).is_empty());
+        assert!(queue_priority_candidates(Some("OFF")).is_empty());
+        assert!(queue_priority_candidates(Some("Off")).is_empty());
+        assert!(!queue_priority_candidates(Some("0")).is_empty());
+    }
+
+    /// `high` asks for HIGH ONLY — it must not silently try REALTIME first, or the knob would be
+    /// unable to express "elevated, but not realtime" (the thing an operator reaches for after a
+    /// compositor-jank report).
+    #[test]
+    fn high_asks_for_high_alone() {
+        assert_eq!(
+            queue_priority_candidates(Some("high")),
+            vec![vk::QueueGlobalPriorityKHR::HIGH]
+        );
+        assert_eq!(
+            queue_priority_candidates(Some("HIGH")),
+            vec![vk::QueueGlobalPriorityKHR::HIGH]
+        );
+    }
+
+    /// Junk falls back to the default ladder rather than to "off": an unparseable value must never
+    /// silently disable a performance lever the operator was trying to tune.
+    #[test]
+    fn junk_falls_back_to_the_default_ladder() {
+        for raw in ["", "realtime", "REALTIME", "yes", "1", "medium", "  high"] {
+            assert!(
+                !queue_priority_candidates(Some(raw)).is_empty(),
+                "{raw:?} must not disable the priority request"
+            );
+        }
+        // ...and specifically the full ladder, not HIGH alone. `"  high"` is in the list above on
+        // purpose: the C patch does NOT trim, so neither do we — a space-padded value is junk to
+        // both, and the two must agree even in how they are wrong.
+        assert_eq!(queue_priority_candidates(Some("  high")).len(), 2);
+    }
+
+    /// A refused class must walk the ladder down, never fail the open. `NOT_PERMITTED` is the
+    /// specified refusal; `INITIALIZATION_FAILED` is accepted too, matching pf-zerocopy's shipped
+    /// VkBridge ladder. Anything else is a real error and must propagate — a driver that is out of
+    /// memory should not be silently retried at a lower priority and reported as a success.
+    #[test]
+    fn only_refusals_walk_the_ladder_down() {
+        assert!(priority_refused(vk::Result::ERROR_NOT_PERMITTED_KHR));
+        assert!(priority_refused(vk::Result::ERROR_INITIALIZATION_FAILED));
+        assert!(!priority_refused(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+        assert!(!priority_refused(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
+        assert!(!priority_refused(vk::Result::SUCCESS));
+    }
+
+    // ---- PW6: the streamed-AU cut, on real GPU output ----------------------------------------
+    // Appended at module END per the wave plan's ownership rule.
+
+    /// Walk a windowed AU back into the flat codec-packet stream — the clients' parse
+    /// (`video_pyrowave.rs::push_window`, Apple's `MetalWaveletDecoder`), so upstream's decoder
+    /// sees exactly what a real client would feed it.
+    fn walk_windows(au: &[u8], window: usize) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut frag: Vec<u8> = Vec::new();
+        for win in au.chunks(window) {
+            let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+            let kind = u16::from_le_bytes([win[2], win[3]]);
+            let body = &win[4..4 + used];
+            match kind {
+                0 => stream.extend_from_slice(body),
+                1 => frag = body.to_vec(),
+                2 => frag.extend_from_slice(body),
+                3 => {
+                    frag.extend_from_slice(body);
+                    stream.extend_from_slice(&frag);
+                    frag.clear();
+                }
+                k => panic!("unknown window kind {k}"),
+            }
+        }
+        stream
+    }
+
+    /// Luma PSNR (dB) of a decoded Y plane against the BT.709 limited-range luma of the source
+    /// BGRA — the same math `rgb2yuv.comp` runs on the GPU. Luma only: chroma is subsampled on
+    /// the 4:2:0 path, and luma is where wavelet quantisation shows.
+    fn luma_psnr(src_bgra: &[u8], decoded_y: &[u8]) -> f64 {
+        assert_eq!(src_bgra.len(), decoded_y.len() * 4);
+        let mut sse = 0.0f64;
+        for (px, &got) in src_bgra.chunks_exact(4).zip(decoded_y) {
+            let (b, g, r) = (px[0] as f64, px[1] as f64, px[2] as f64);
+            let want = 16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b;
+            let d = want - got as f64;
+            sse += d * d;
+        }
+        let mse = sse / decoded_y.len() as f64;
+        if mse <= f64::EPSILON {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
+
+    /// PW6 on-glass: with `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` armed, a real GPU encode of a BUSY
+    /// test card must come out of `poll_chunk` in several window-aligned pieces that concatenate
+    /// to a decodable AU — and the picture must survive, verified by PSNR against the CSC's own
+    /// BT.709 math rather than by "it ran".
+    ///
+    /// Flat fills are useless here (they false-greened the Windows bring-up): a solid colour
+    /// reassembles convincingly even when whole subbands are missing. The busy card puts energy
+    /// in every subband, so a cut that lost or reordered a window shows up as a PSNR collapse.
+    ///
+    /// `#[ignore]`d: needs a real Vulkan 1.3 GPU.
+    ///   cargo test -p pf-encode --features pyrowave --no-run
+    ///   PUNKTFUNK_PYROWAVE_STREAMED_AU=1 <bin> --ignored --nocapture pyrowave_streamed_chunks
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn pyrowave_streamed_chunks_reassemble_and_keep_the_picture() {
+        const WINDOW: usize = 1408;
+        // 1280x720 at 60 Mb/s ≈ 125 KB/AU — comfortably several 256 KiB-target chunks' worth of
+        // windows at the default step once the step is clamped to the AU, and big enough that the
+        // AU spans many windows.
+        let (w, h) = (1280u32, 720u32);
+        let mut enc = PyroWaveEncoder::open(w, h, 60, 200_000_000, crate::ChromaFormat::Yuv420)
+            .expect("open pyrowave encoder");
+        enc.set_wire_chunking(WINDOW);
+
+        assert!(
+            enc.supports_chunked_poll(),
+            "PUNKTFUNK_PYROWAVE_STREAMED_AU=1 must be set in the ENVIRONMENT of this test binary \
+             — without it PW6 is off by design and there is nothing to verify"
+        );
+
+        for seed in [7u32, 11, 13] {
+            let frame = test_card(w, h, seed);
+            let FramePayload::Cpu(ref src) = frame.payload else {
+                panic!("test card is a CPU frame")
+            };
+            let src = src.clone();
+            enc.submit(&frame).expect("submit");
+
+            // Drain the AU through the chunked poll, exactly as the native pump does.
+            let mut au = Vec::new();
+            let (mut chunks, mut firsts, mut lasts) = (0u32, 0u32, 0u32);
+            loop {
+                let c = enc
+                    .poll_chunk()
+                    .expect("poll_chunk")
+                    .expect("an AU is in flight");
+                assert!(c.chunk_aligned, "wire chunking is on");
+                assert!(c.keyframe, "every pyrowave AU is a keyframe");
+                assert_eq!(
+                    c.data.len() % WINDOW,
+                    0,
+                    "every chunk is a whole number of windows — a cut inside a window would \
+                     split the 4-byte framing prefix from its body"
+                );
+                chunks += 1;
+                firsts += u32::from(c.first);
+                lasts += u32::from(c.last);
+                au.extend_from_slice(&c.data);
+                if c.last {
+                    break;
+                }
+            }
+            assert_eq!(firsts, 1, "exactly one opening chunk");
+            assert_eq!(lasts, 1, "exactly one closing chunk");
+            assert!(
+                chunks > 1,
+                "seed {seed}: the AU came out in ONE piece ({} B) — the cut never engaged, so \
+                 this run proves nothing about PW6",
+                au.len()
+            );
+            assert_eq!(au.len() % WINDOW, 0, "the AU is a whole number of windows");
+
+            // A second `poll_chunk` must report the AU is done, not dribble more bytes.
+            assert!(
+                enc.poll_chunk().expect("poll_chunk after last").is_none(),
+                "no AU is in flight once `last` was handed out"
+            );
+
+            // The picture: window-walk (the client's parse) → upstream's own decoder → PSNR.
+            let stream = walk_windows(&au, WINDOW);
+            // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+            let (y, _cb, _cr) = unsafe { decode_planes(w, h, &stream) };
+            let psnr = luma_psnr(&src, &y);
+            eprintln!(
+                "seed {seed}: {chunks} chunks, {} B AU ({} windows), luma PSNR {psnr:.2} dB",
+                au.len(),
+                au.len() / WINDOW
+            );
+            assert!(
+                psnr > 30.0,
+                "seed {seed}: luma PSNR {psnr:.2} dB — the streamed reassembly lost or reordered \
+                 picture data (a flat-fill test would NOT have caught this)"
+            );
+        }
+    }
+
+    // ---- PW5 stage 5: the alternating-handle sequence gate ------------------------------------
+
+    /// **THE gate for the second encoder handle.** Two `pyrowave_encoder` objects each keep their
+    /// OWN 3-bit `sequence_count`, so alternating them emits `1,1,2,2,3,3…` on the wire. The
+    /// decoder restarts a frame only when the value CHANGES
+    /// (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so every repeat reads as
+    /// "more blocks of the same frame": `clear()` never runs and the second frame of each pair is
+    /// silently swallowed. Half frame rate, occasional mixed-frame blocks, no error anywhere — a
+    /// failure that passes a smoke test, on every client.
+    ///
+    /// `patches/0007-encoder-sequence-override.patch` exists solely to make that impossible, and
+    /// this test is what proves it, three ways over 20 frames (well past the 3-bit wrap at 8):
+    ///
+    /// 1. the wire counter advances by exactly +1 mod 8 per AU, read straight out of the block
+    ///    header the decoder reads;
+    /// 2. ONE persistent decoder — `last_seq` carried across every push, exactly as a client's is —
+    ///    reports ready for every single AU, so nothing is swallowed;
+    /// 3. consecutive decoded pictures DIFFER. Content moves every frame (`test_card` reseeded per
+    ///    frame; flat fills are the documented false-green trap here), so a swallowed frame would
+    ///    show up as a repeat, and this catches it even if 1 and 2 somehow both passed.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn wire_sequence_increments_across_alternating_handles() {
+        const FRAMES: u32 = 20;
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open");
+        // This gate is meaningless with a single encoder handle.
+        const { assert!(SLOTS >= 2) };
+
+        let mut aus: Vec<Vec<u8>> = Vec::new();
+        for i in 0..FRAMES {
+            // Content MOVES every frame — a repeated picture is the symptom being hunted, and a
+            // static card would hide it. ODD seeds only: `test_card` starts its LCG at `seed | 1`,
+            // so 2 and 3 produce a byte-identical card and consecutive even/odd seeds would fake
+            // the very repeat this test looks for (it did, on the first run).
+            enc.submit(&test_card(w, h, 2 * i + 1)).expect("submit");
+            let au = enc.poll().expect("poll").expect("one AU per frame");
+            aus.push(au.data);
+        }
+
+        // (1) the wire counter, read from the header the decoder parses.
+        let seqs: Vec<u8> = aus
+            .iter()
+            .map(|au| {
+                crate::pyrowave_wire::wire_sequence(au, 0).expect("AU carries a block header")
+            })
+            .collect();
+        for (i, pair) in seqs.windows(2).enumerate() {
+            assert_eq!(
+                pair[1],
+                (pair[0] + 1) & 7,
+                "frame {} -> {}: wire sequence went {} -> {} (all: {seqs:?}). Two encoder handles \
+                 each counting alone produce repeats, which the decoder reads as more blocks of \
+                 the same frame — check that patch 0007 is applied and set_next_sequence is called",
+                i,
+                i + 1,
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // (2) + (3) ONE decoder for the whole run — a fresh decoder per AU would reset `last_seq`
+        // and hide the exact bug this exists to catch.
+        // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+        unsafe {
+            let mut dev: pw::pyrowave_device = std::ptr::null_mut();
+            assert_eq!(
+                pw::pyrowave_create_default_device(&mut dev),
+                pw::pyrowave_result_PYROWAVE_SUCCESS
+            );
+            let dinfo = pw::pyrowave_decoder_create_info {
+                device: dev,
+                width: w as i32,
+                height: h as i32,
+                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+                fragment_path: false,
+            };
+            let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
+            assert_eq!(
+                pw::pyrowave_decoder_create(&dinfo, &mut dec),
+                pw::pyrowave_result_PYROWAVE_SUCCESS
+            );
+            let mut last_y: Option<Vec<u8>> = None;
+            for (i, au) in aus.iter().enumerate() {
+                assert_eq!(
+                    pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
+                    pw::pyrowave_result_PYROWAVE_SUCCESS,
+                    "frame {i} was rejected by the decoder"
+                );
+                assert!(
+                    pw::pyrowave_decoder_decode_is_ready(dec, false),
+                    "frame {i} never became decodable — the decoder is still accumulating it into \
+                     the PREVIOUS frame, which is exactly the repeated-sequence failure"
+                );
+                let mut y = vec![0u8; (w * h) as usize];
+                let mut cb = vec![0u8; (w * h / 4) as usize];
+                let mut cr = vec![0u8; (w * h / 4) as usize];
+                let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
+                buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+                buf.width = w as i32;
+                buf.height = h as i32;
+                buf.data = [
+                    y.as_mut_ptr() as *mut _,
+                    cb.as_mut_ptr() as *mut _,
+                    cr.as_mut_ptr() as *mut _,
+                ];
+                buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+                buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
+                assert_eq!(
+                    pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
+                    pw::pyrowave_result_PYROWAVE_SUCCESS,
+                    "frame {i} failed to decode"
+                );
+                if let Some(prev) = &last_y {
+                    assert_ne!(
+                        prev,
+                        &y,
+                        "frame {i} decoded to the SAME picture as frame {} — a swallowed frame",
+                        i - 1
+                    );
+                }
+                last_y = Some(y);
+            }
+            pw::pyrowave_decoder_destroy(dec);
+            pw::pyrowave_device_destroy(dev);
+        }
+    }
+
+    /// Decode a whole AU stream through ONE decoder (a client's `last_seq` is not reset per frame)
+    /// and return each frame's luma plane.
+    ///
+    /// # Safety
+    /// Test-only FFI into the vendored decoder with locally-owned buffers.
+    unsafe fn decode_stream_luma(w: u32, h: u32, aus: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut dev: pw::pyrowave_device = std::ptr::null_mut();
+        assert_eq!(
+            pw::pyrowave_create_default_device(&mut dev),
+            pw::pyrowave_result_PYROWAVE_SUCCESS
+        );
+        let dinfo = pw::pyrowave_decoder_create_info {
+            device: dev,
+            width: w as i32,
+            height: h as i32,
+            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            fragment_path: false,
+        };
+        let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
+        assert_eq!(
+            pw::pyrowave_decoder_create(&dinfo, &mut dec),
+            pw::pyrowave_result_PYROWAVE_SUCCESS
+        );
+        let mut out = Vec::with_capacity(aus.len());
+        for (i, au) in aus.iter().enumerate() {
+            assert_eq!(
+                pw::pyrowave_decoder_push_packet(dec, au.as_ptr() as *const _, au.len()),
+                pw::pyrowave_result_PYROWAVE_SUCCESS,
+                "frame {i} rejected"
+            );
+            assert!(
+                pw::pyrowave_decoder_decode_is_ready(dec, false),
+                "frame {i} never became decodable"
+            );
+            let mut y = vec![0u8; (w * h) as usize];
+            let mut cb = vec![0u8; (w * h / 4) as usize];
+            let mut cr = vec![0u8; (w * h / 4) as usize];
+            let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
+            buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+            buf.width = w as i32;
+            buf.height = h as i32;
+            buf.data = [
+                y.as_mut_ptr() as *mut _,
+                cb.as_mut_ptr() as *mut _,
+                cr.as_mut_ptr() as *mut _,
+            ];
+            buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+            buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
+            assert_eq!(
+                pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
+                pw::pyrowave_result_PYROWAVE_SUCCESS,
+                "frame {i} failed to decode"
+            );
+            out.push(y);
+        }
+        pw::pyrowave_decoder_destroy(dec);
+        pw::pyrowave_device_destroy(dev);
+        out
+    }
+
+    /// PSNR (dB) between two equal-sized 8-bit planes; `f64::INFINITY` when identical.
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mse = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = x as f64 - y as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / a.len() as f64;
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        }
+    }
+
+    /// **PW5 stage 6's ENCODER-side gate.** Two frames genuinely in flight at once must produce the
+    /// same pictures, in the same order, as the synchronous depth-1 path.
+    ///
+    /// This is the half of the depth-2 risk that lives in THIS crate: the slot resources
+    /// (`cmd`/`fence`/`csc_set`/y/uv/cursor) and the alternating encoder handles. Ground truth is
+    /// the encoder's OWN depth-1 output over the same frames, which is the honest reference —
+    /// pyrowave's raw AU bytes are not reproducible run-to-run (see the stage-3 commit), but its
+    /// DECODED planes are.
+    ///
+    /// Content moves every frame. Flat fills are the documented false-green trap here: a torn frame
+    /// assembled from two halves of a static card is invisible, and a gray fill once green-lit a
+    /// broken import.
+    ///
+    /// ⚠ WHAT THIS DOES **NOT** COVER, and no in-tree test can: the CAPTURE side. `.process`
+    /// requeues the SPA buffer to the compositor at callback return while the encode thread still
+    /// holds only a dup of its fd, so a second frame in flight widens the window in which the
+    /// producer may overwrite a buffer we are still reading by a full frame period. That needs a
+    /// live compositor, a real client and a long moving-content session — the on-glass tear-hunt
+    /// PW5 stage 6 is gated on. This test passing is necessary, not sufficient.
+    ///
+    /// Drives the backend at depth 2 by setting `max_inflight` directly rather than through a
+    /// shipped knob: the shipped value is 1 and this must not change that.
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn overlapping_two_frames_reproduces_the_synchronous_picture() {
+        const FRAMES: u32 = 16;
+        let (w, h) = (256u32, 256u32);
+        // Odd seeds: `test_card` starts its LCG at `seed | 1`, so 2 and 3 build the same card.
+        let cards: Vec<CapturedFrame> = (0..FRAMES).map(|i| test_card(w, h, 2 * i + 1)).collect();
+        let open = || {
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open")
+        };
+
+        // --- reference: strictly synchronous, one frame at a time ---
+        let mut enc = open();
+        let sync: Vec<Vec<u8>> = cards
+            .iter()
+            .map(|c| {
+                enc.submit(c).expect("sync submit");
+                assert_eq!(
+                    enc.inflight.len(),
+                    1,
+                    "submit must leave exactly one in flight"
+                );
+                enc.poll()
+                    .expect("sync poll")
+                    .expect("one AU per frame")
+                    .data
+            })
+            .collect();
+        drop(enc);
+
+        // --- overlapped: submit N+1 before polling N ---
+        let mut enc = open();
+        enc.max_inflight = SLOTS;
+        let mut overlapped: Vec<Vec<u8>> = Vec::new();
+        let mut saw_two_in_flight = false;
+        for c in &cards {
+            enc.submit(c).expect("overlapped submit");
+            saw_two_in_flight |= enc.inflight.len() == 2;
+            if enc.inflight.len() >= SLOTS {
+                overlapped.push(
+                    enc.poll()
+                        .expect("overlapped poll")
+                        .expect("an AU once the pipeline is full")
+                        .data,
+                );
+            }
+        }
+        enc.flush().expect("flush drains the tail");
+        while let Some(au) = enc.poll().expect("tail poll") {
+            overlapped.push(au.data);
+        }
+        drop(enc);
+        assert!(
+            saw_two_in_flight,
+            "two frames were never actually in flight — this test proved nothing"
+        );
+        assert_eq!(
+            overlapped.len(),
+            sync.len(),
+            "the overlapped run emitted a different number of AUs — a frame was lost"
+        );
+
+        // --- decode both streams and compare, frame by frame ---
+        // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+        let (sy, oy) = unsafe {
+            (
+                decode_stream_luma(w, h, &sync),
+                decode_stream_luma(w, h, &overlapped),
+            )
+        };
+        let mut worst = f64::INFINITY;
+        for i in 0..sy.len() {
+            let p = psnr(&sy[i], &oy[i]);
+            worst = worst.min(p);
+            // 45 dB is far above "looks the same" — a torn frame stitched from two moving cards
+            // lands in the teens. Not an equality assert only because the wavelet RDO is not
+            // bit-reproducible; the printed worst-case is the number to read.
+            assert!(
+                p > 45.0,
+                "frame {i}: overlapped decode is {p:.1} dB from the synchronous one — the pipelined \
+                 path changed the picture"
+            );
+            // The discriminator that PSNR alone can miss: a frame delivered ONE POSITION OFF still
+            // scores well against a similar neighbour. It must match its OWN reference best.
+            if i > 0 {
+                let prev = psnr(&sy[i - 1], &oy[i]);
+                assert!(
+                    p > prev,
+                    "frame {i} matches the PREVIOUS reference better ({prev:.1} dB) than its own \
+                     ({p:.1} dB) — the pipeline is off by one"
+                );
+            }
+        }
+        eprintln!(
+            "depth-2 vs depth-1 over {} frames: worst-case PSNR {}",
+            sy.len(),
+            if worst.is_infinite() {
+                "identical (inf)".to_string()
+            } else {
+                format!("{worst:.1} dB")
+            }
+        );
     }
 }

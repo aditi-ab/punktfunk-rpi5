@@ -356,6 +356,26 @@ in
         allowedUDPPorts = nativeUDP ++ optionals cfg.host.gamestream gamestreamUDP;
       };
 
+      # CAP_SYS_NICE — the GPU-scheduling grant. PyroWave encodes on the GPU shader cores a game
+      # saturates; the elevated global-priority Vulkan queue that fixes it is gated on this
+      # capability (measured 2026-08-08, RTX 5070 Ti: without it EVERY priority class is refused,
+      # with it the encoder gets REALTIME on the first attempt; RADV behaves the same).
+      #
+      # NixOS cannot `setcap` a store path — it is read-only and shared — so this goes through
+      # `security.wrappers`, which builds a small setcap'd wrapper in /run/wrappers/bin. The unit's
+      # ExecStart points at the wrapper below; everything else about the host is unchanged.
+      #
+      # Narrow: CAP_SYS_NICE permits raising scheduling priority only — no filesystem, network or
+      # user-switching privilege, and the wrapper is capability-based, NOT setuid. Two side effects
+      # to know: the wrapped binary is AT_SECURE (the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
+      # it) and core dumps are suppressed by default.
+      security.wrappers.punktfunk-host = {
+        source = "${cfg.host.package}/bin/punktfunk-host";
+        capabilities = "cap_sys_nice=ep";
+        owner = "root";
+        group = "root";
+      };
+
       systemd.user.services.punktfunk-host = {
         description = "punktfunk GameStream + punktfunk/1 streaming host";
         documentation = [ "https://git.unom.io/unom/punktfunk" ];
@@ -374,8 +394,12 @@ in
         # PUNKTFUNK_GAMESCOPE_BIN so an operator's own override of that env still wins.
         ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
         serviceConfig = {
+          # Through the wrapper (see `security.wrappers.punktfunk-host` above), NOT the store path
+          # directly — the store path carries no capability and the GPU-priority lever would be
+          # inert. `config.security.wrapperDir` rather than a hard-coded /run/wrappers/bin so an
+          # operator who has moved it is still correct.
           ExecStart =
-            "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
+            "${config.security.wrapperDir}/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
           Restart = "on-failure";
           RestartSec = 2;
           EnvironmentFile =

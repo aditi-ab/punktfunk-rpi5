@@ -82,6 +82,49 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     Arc::new(t)
 }
 
+/// Endpoint config for the CLIENT endpoint — the half of the jumbo opt-in that lives on the
+/// receiving side, and without which the whole jumbo leg is unreachable.
+///
+/// `EndpointConfig::max_udp_payload_size` is the QUIC transport parameter this endpoint
+/// advertises: "the largest UDP payload I accept". quinn defaults it to **1472** (a 1500-byte
+/// Ethernet MTU), and a peer's MTU-discovery search is upper-bounded by
+/// `min(MtuDiscoveryConfig::upper_bound, the value the OTHER side advertised)`
+/// (`quinn_proto::connection::mtud::SearchState::new`). So raising the host's probe ceiling
+/// alone — which is all [`stream_transport_idle`] did — can never make a host's discovery
+/// settle above 1472: the *client's* default advertisement caps it, and the host's
+/// settled-at-jumbo proof (`native/wire_mtu.rs`, both the mid-session grow and the
+/// session-start one) could never fire. This raises the advertisement to the sealed jumbo
+/// datagram size so the proof is obtainable at all.
+///
+/// Gated on the SAME operator opt-in as the probe ceiling ([`crate::config::jumbo_wire_mtu`],
+/// i.e. `PUNKTFUNK_JUMBO=1` / `PUNKTFUNK_WIRE_MTU` > 1500) because it is not free: quinn sizes
+/// its endpoint receive buffer as `max_udp_payload_size × max_receive_segments × BATCH_SIZE`,
+/// which on a GRO-capable Linux/Android client is 64 × 32 segments — ~2.9 MiB at the 1472
+/// default, ~18 MiB at jumbo. A jumbo LAN is a deliberate deployment; every other client keeps
+/// today's buffer to the byte. Without the opt-in this returns the stock config, so the
+/// advertisement, the wire, and the memory are all unchanged.
+fn endpoint_config() -> quinn::EndpointConfig {
+    let mut cfg = quinn::EndpointConfig::default();
+    if let Some(mtu) = crate::config::jumbo_wire_mtu() {
+        // Derived exactly like the probe ceiling above (IPv4 overhead — a v6 peer's sealed
+        // target is smaller, so this covers it), and clamped into quinn's accepted range.
+        let shard = crate::config::jumbo_shard_payload_for(
+            mtu,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        );
+        let accept = crate::config::sealed_datagram_bytes(shard).clamp(1200, 65_527) as u16;
+        if cfg.max_udp_payload_size(accept).is_ok() {
+            tracing::info!(
+                max_udp_payload_size = accept,
+                wire_mtu = mtu,
+                "jumbo opt-in: this endpoint advertises a jumbo QUIC receive ceiling, so the \
+                 peer's MTU discovery can prove a jumbo path (it is capped by this value)"
+            );
+        }
+    }
+    cfg
+}
+
 /// Server endpoint with a fresh self-signed certificate (tests/dev — production hosts
 /// persist an identity and use [`server_with_identity`] so clients can pin it).
 pub fn server(addr: std::net::SocketAddr) -> anyhow_result::Result<quinn::Endpoint> {
@@ -238,7 +281,15 @@ pub fn client_pinned_with_identity(
             .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
         client_cfg.transport_config(stream_transport()); // keep-alive — see stream_transport
-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+
+        // `Endpoint::client` hardcodes `EndpointConfig::default()`, whose 1472-byte
+        // `max_udp_payload_size` caps the HOST's MTU discovery (see `endpoint_config`), so the
+        // endpoint is built by hand to carry the jumbo opt-in. Same bind as before
+        // (`0.0.0.0:0`, v4 — no dual-stack flag to reproduce) and the same default runtime.
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow_result::Error::msg("no async runtime found".into()))?;
+        let mut ep = quinn::Endpoint::new(endpoint_config(), None, socket, runtime)?;
         ep.set_default_client_config(client_cfg);
         Ok(ep)
     })();
@@ -347,5 +398,81 @@ mod tests {
         // startup through the `expect`. Both extremes must construct.
         let _ = super::stream_transport_idle(std::time::Duration::MAX);
         let _ = super::stream_transport_idle(std::time::Duration::ZERO);
+    }
+
+    /// Where a connection's MTU discovery is allowed to climb to, measured rather than argued
+    /// (PW7a). Loopback's own MTU is 64 KiB, so the ONLY thing that can stop the search here is
+    /// configuration — which makes this a clean instrument for the two ceilings:
+    ///
+    /// * **leg A** — server opted in, client NOT: the search stalls at the client's default
+    ///   `max_udp_payload_size` advertisement (1472) no matter how high the server's probe
+    ///   ceiling is. This is why the shipped jumbo grow could never fire: `wire_mtu.rs` waits
+    ///   for a settle at the sealed jumbo size and the peer's transport parameter forbids it.
+    /// * **leg B** — both opted in: the search reaches the sealed jumbo datagram, and the
+    ///   elapsed time is what the `Welcome`'s bounded proof-wait has to cover.
+    ///
+    /// `#[ignore]`d: it sets process-wide env (each endpoint reads the opt-in at construction,
+    /// which is exactly how the two legs are built) and spends seconds of wall clock.
+    /// Run it alone: `cargo test -p punktfunk-core --features quic mtu_discovery -- --ignored
+    /// --nocapture --test-threads=1`.
+    #[tokio::test]
+    #[ignore = "measurement: sets process env and takes ~15 s of wall clock"]
+    async fn mtu_discovery_climbs_only_as_high_as_the_peer_advertises() {
+        async fn climb(server_jumbo: bool, client_jumbo: bool) -> (u16, u128) {
+            let set = |on: bool| {
+                if on {
+                    std::env::set_var("PUNKTFUNK_JUMBO", "1");
+                } else {
+                    std::env::remove_var("PUNKTFUNK_JUMBO");
+                }
+            };
+            set(server_jumbo);
+            let server = endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = server.local_addr().unwrap();
+            set(client_jumbo);
+            let client = endpoint::client_insecure().unwrap();
+            set(false);
+            let accept = tokio::spawn(async move {
+                let incoming = server.accept().await.expect("incoming");
+                let conn = incoming.await.expect("host side connects");
+                (server, conn)
+            });
+            let client_conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
+            let (_server_ep, host_conn) = accept.await.unwrap();
+            // A stream write gives the driver something to transmit, which is what starts the
+            // search (probes ride `poll_transmit`); after that each probe's ack drives the next.
+            let mut s = host_conn.open_uni().await.unwrap();
+            s.write_all(b"go").await.unwrap();
+            let want = crate::config::sealed_datagram_bytes(crate::config::jumbo_shard_payload_for(
+                9000,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            )) as u16;
+            let t0 = std::time::Instant::now();
+            let mut mtu = host_conn.stats().path.current_mtu;
+            while t0.elapsed() < std::time::Duration::from_secs(6) && mtu < want {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                mtu = host_conn.stats().path.current_mtu;
+            }
+            let elapsed = t0.elapsed().as_millis();
+            drop(client_conn);
+            drop(client);
+            (mtu, elapsed)
+        }
+
+        let (capped, _) = climb(true, false).await;
+        println!("leg A (server opted in, client not): settled at {capped} B UDP payload");
+        assert_eq!(
+            capped, 1472,
+            "a peer that advertises the stock max_udp_payload_size caps the search at 1472 — \
+             the whole point of raising it on the client endpoint"
+        );
+
+        let (grown, ms) = climb(true, true).await;
+        println!("leg B (both opted in): reached {grown} B UDP payload in {ms} ms");
+        assert!(
+            grown >= 8972,
+            "both sides opted in, loopback MTU is 64 KiB — discovery should reach the sealed \
+             jumbo datagram, got {grown}"
+        );
     }
 }

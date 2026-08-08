@@ -288,16 +288,57 @@ pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
     })
 }
 
-/// Build a Buffers param requesting dmabuf-only buffers.
+/// PW5 stage 2: the buffer-pool depth we ASK for on the zero-copy path, as a Choice range.
+///
+/// The zero-copy path hands the SPA buffer back to the producer at `.process` return, while the
+/// encode thread still holds a dup of its dmabuf fd and has not yet imported, let alone read, the
+/// contents. Nothing bounds that window — see the `queue_raw_buffer` comment in `pipewire.rs` — so
+/// the only thing that keeps capture untorn is the producer round-robining a pool deeper than our
+/// import+encode latency. Until PW5 stage 1 nobody had ever counted what that pool was; we never
+/// even asked for a size (`build_dmabuf_buffers` set `dataType` and nothing else).
+///
+/// A **range**, deliberately, not a fixed count: SPA intersects the consumer's and producer's
+/// Buffers params, so a fixed 8 against a producer that can only afford 4 empties the intersection
+/// and the link silently stalls in "negotiating" — the exact failure mode the cursor-meta `size`
+/// property already cost this codebase once (see `build_cursor_meta_param`). With a range the
+/// producer clamps into it and negotiation still succeeds.
+///
+/// The numbers: `min` stays at 2 so nothing that works today stops working; `default` 8 is ~133 ms
+/// of buffer at 60 Hz and ~33 ms at 240 Hz, comfortably past the ~3-4 ms capture→fence latency
+/// measured in PW3/PW4 even with a second frame in flight; `max` 16 is a ceiling, not a request
+/// (a 4K 4:4:4 buffer is ~25 MB, so 16 is ~400 MB of compositor allocation and worth capping).
+/// **What the producer actually picks is logged by the stage-1 census — trust that line, not
+/// these constants.**
+const POOL_MIN: i32 = 2;
+const POOL_DEFAULT: i32 = 8;
+const POOL_MAX: i32 = 16;
+
+/// Build a Buffers param requesting dmabuf-only buffers, with pool headroom (see [`POOL_DEFAULT`]).
 pub(super) fn build_dmabuf_buffers() -> Result<Vec<u8>> {
     serialize_pod(pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
         id: pw::spa::param::ParamType::Buffers.as_raw(),
-        properties: vec![pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
-            flags: pw::spa::pod::PropertyFlags::empty(),
-            value: pw::spa::pod::Value::Int(1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
-        }],
+        properties: vec![
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Int(1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+            },
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                    pw::spa::utils::Choice(
+                        pw::spa::utils::ChoiceFlags::empty(),
+                        pw::spa::utils::ChoiceEnum::Range {
+                            default: POOL_DEFAULT,
+                            min: POOL_MIN,
+                            max: POOL_MAX,
+                        },
+                    ),
+                )),
+            },
+        ],
     })
 }
 
@@ -511,5 +552,48 @@ mod tests {
             super::pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,
             "libspa renumbered spa_video_transfer_function — update the hardcoded PQ id"
         );
+    }
+
+    /// PW5 stage 2: the pool request must be a **Choice Range**, never a fixed Int.
+    ///
+    /// This is the whole safety argument for asking at all: SPA intersects the two sides' Buffers
+    /// params, so a fixed count a producer cannot afford empties the intersection and the link
+    /// stalls in "negotiating" with no error anywhere — the same trap that cost this codebase the
+    /// entire Linux cursor channel once (see `build_cursor_meta_param`). Asserting the pod shape
+    /// is what keeps a later "simplify" from turning the range back into a number.
+    #[test]
+    fn the_dmabuf_pool_request_is_a_range_not_a_fixed_count() {
+        let pod = build_dmabuf_buffers().unwrap();
+        let key = spa::sys::SPA_PARAM_BUFFERS_buffers.to_ne_bytes();
+        let at = pod
+            .windows(4)
+            .position(|w| w == key)
+            .expect("the dmabuf Buffers pod must carry a buffers count");
+        let word = |off: usize| u32::from_ne_bytes(pod[off..off + 4].try_into().unwrap());
+        // Property = { key, flags, value_pod }; value_pod = { size, type, body }. A Choice body
+        // is { type: u32, flags: u32, child_size: u32, child_type: u32, values… }.
+        assert_eq!(
+            word(at + 12),
+            spa::sys::SPA_TYPE_Choice,
+            "the buffers count must be a Choice, not a bare Int — a fixed count can fail \
+             negotiation outright"
+        );
+        assert_eq!(
+            word(at + 16),
+            spa::sys::SPA_CHOICE_Range,
+            "the Choice must be a Range (default, min, max)"
+        );
+        assert_eq!(word(at + 24), 4, "Choice child pods are 4-byte Ints");
+        assert_eq!(word(at + 28), spa::sys::SPA_TYPE_Int, "…of type Int");
+        let vals: Vec<i32> = (0..3)
+            .map(|i| i32::from_ne_bytes(pod[at + 32 + i * 4..at + 36 + i * 4].try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            vals,
+            vec![POOL_DEFAULT, POOL_MIN, POOL_MAX],
+            "Range values are serialized default-first"
+        );
+        // The minimum must not exceed what producers already serve, or the ask becomes a demand.
+        const { assert!(POOL_MIN <= 2) };
     }
 }

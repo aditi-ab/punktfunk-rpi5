@@ -148,7 +148,6 @@ pub(super) async fn negotiate(
     Option<crate::vdisplay::GamescopeRoute>,
     Option<super::stream::PrepHandle>,
 )> {
-    let peer = conn.remote_address();
     let mut hello = Hello::decode(first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
     if hello.abi_version != punktfunk_core::WIRE_VERSION {
         close_rejected(
@@ -497,6 +496,11 @@ pub(super) async fn negotiate(
     let (data_sock, direct) = bind_data_socket(data_port)?;
     let udp_port = data_sock.local_addr()?.port();
 
+    // The session's video geometry (see the `shard_payload` field below). Resolved before the
+    // Welcome struct because a path a previous session proved jumbo is given a bounded moment
+    // to re-prove itself live on THIS connection — the awaited part of `negotiated_shard_payload`.
+    let shard_payload = wire_mtu::negotiated_shard_payload(conn, hello.max_shard_payload).await;
+
     let mut key = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key);
     // Fresh per-session salt alongside the fresh key. GCM nonce uniqueness only *requires* one
@@ -548,14 +552,15 @@ pub(super) async fn negotiate(
         // hardcoded 1452 overshot the v4 ceiling (its math forgot the header/crypto ride
         // inside the UDP payload) and silently IP-fragmented EVERY video datagram, doubling
         // per-datagram loss on Wi-Fi — the "100 Mbps badly fails on the phone" root cause.
-        // Negotiated, so the client follows. Jumbo (≈8900) is a future negotiated bump (needs
-        // MAX_DATAGRAM_BYTES raised + end-to-end 9000 MTU).
-        // Resolution order (wire_mtu.rs): `PUNKTFUNK_WIRE_MTU` operator override, then a path
-        // budget learned from a prior session whose QUIC MTU discovery settled below the
-        // video-datagram ceiling (the "VPN on the host blackholes every video packet" field
-        // shape — small flows pass, the stream is an endless black screen), then this family
-        // default. Healthy paths take the default branch and are byte-identical to before.
-        shard_payload: wire_mtu::negotiated_shard_payload(peer.ip()) as u16,
+        // Negotiated, so the client follows.
+        // Resolution order (wire_mtu.rs): a JUMBO start (≈8900) on a path a previous session
+        // proved AND this connection has just re-proved live, then the `PUNKTFUNK_WIRE_MTU`
+        // operator override, then a path budget learned from a prior session whose QUIC MTU
+        // discovery settled below the video-datagram ceiling (the "VPN on the host blackholes
+        // every video packet" field shape — small flows pass, the stream is an endless black
+        // screen), then this family default. Healthy paths take the default branch and are
+        // byte-identical to before.
+        shard_payload: shard_payload as u16,
         encrypt: true,
         key,
         salt,

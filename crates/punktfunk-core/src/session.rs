@@ -677,8 +677,21 @@ impl Session {
     /// [`Frame::part`]` = Some` while the rest is still on the wire, instead of one whole-AU
     /// delivery (the slice-progressive decode path — [`crate::packet::USER_FLAG_SLICE_STREAM`]).
     /// With it on, EVERY video frame delivery carries `part: Some` (a frame with no early
-    /// parts arrives as the degenerate `{offset: 0, first, last}` whole). Do not combine with
-    /// an all-intra (PyroWave) stream: its newest-wins draining assumes whole AUs.
+    /// parts arrives as the degenerate `{offset: 0, first, last}` whole).
+    ///
+    /// **Do not combine with an all-intra (PyroWave) stream**, and the reason is sharper than
+    /// "newest-wins draining assumes whole AUs" (2026-08-08, PW6): the drain
+    /// (`client::frame_channel::FrameChannel::pop`) counts QUEUE ENTRIES and takes one entry to be
+    /// one AU. With parts on, a single AU pushes K entries, so `len > 1` stops meaning "the consumer
+    /// is behind" — the drain fires mid-AU, returns the newest entry (a SUFFIX) and clears that
+    /// same AU's prefixes. For PyroWave that is unrecoverable rather than lossy: the sequence
+    /// header lives in window 0 of every AU, so every frame would arrive headerless. Making the
+    /// two composable means teaching the drain to skip whole superseded AUs (never to split one)
+    /// — see the PW6 section of `design/linux-host-performance-wave2-pyrowave.md`.
+    ///
+    /// Note this is a DIFFERENT axis from the host's streamed-AU wire
+    /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]): a streamed AU still completes as ONE `Frame`
+    /// here, so it is unaffected by any of the above.
     pub fn set_deliver_frame_parts(&mut self, on: bool) {
         self.reassembler.set_deliver_parts(on);
     }

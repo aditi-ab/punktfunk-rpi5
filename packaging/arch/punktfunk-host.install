@@ -12,9 +12,33 @@ _ensure_punktfunk_group() {
   getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || true
 }
 
+# CAP_SYS_NICE on the host binary — the GPU-scheduling grant.
+#
+# WHY: PyroWave encodes on the GPU's shader cores, so a GPU-bound game starves it (measured: the
+# encode dispatch goes from ~2 ms to 15-18 ms at 95 % game load). The fix is an elevated
+# global-priority Vulkan queue, which the driver gates on CAP_SYS_NICE — measured 2026-08-08 on an
+# RTX 5070 Ti: WITHOUT the capability every priority class is refused, WITH it the encoder is
+# granted REALTIME on the first attempt. RADV is the same. Without this line the knob exists and
+# does nothing. Same capability, same mechanism, as our gamescope package sets on its own binary.
+#
+# NARROW: CAP_SYS_NICE only permits raising scheduling priority (nice/ioprio/affinity/RT class). It
+# grants no filesystem, network or user-switching privilege, and it is NOT setuid.
+#
+# TWO CONSEQUENCES worth knowing before you debug something odd on this host:
+#  * a file capability makes the process AT_SECURE, so the dynamic loader IGNORES LD_LIBRARY_PATH
+#    and LD_PRELOAD for it. A library-path shim that used to work will silently stop.
+#  * core dumps are suppressed for capability-carrying binaries by default (fs.suid_dumpable).
+#
+# Never fails the install: a box without libcap, or a filesystem that cannot store capabilities
+# (some overlay/NFS setups), just runs at default priority exactly as before.
+_grant_sched_capability() {
+  setcap 'cap_sys_nice=ep' usr/bin/punktfunk-host 2>/dev/null || true
+}
+
 post_install() {
   _ensure_update_group
   _ensure_punktfunk_group
+  _grant_sched_capability
   udevadm control --reload-rules 2>/dev/null || true
   udevadm trigger --subsystem-match=misc 2>/dev/null || true
   # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
@@ -73,6 +97,8 @@ post_upgrade() {
   # root-only, and the virtual Steam Deck pad silently unable to attach. groupadd is idempotent, so
   # this is a no-op on boxes that installed fresh.
   _ensure_punktfunk_group
+  # A replaced binary is a NEW inode — file capabilities do not survive the upgrade, so re-grant.
+  _grant_sched_capability
   udevadm control --reload-rules 2>/dev/null || true
   sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
   _warn_stale_firewall_ports

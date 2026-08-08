@@ -477,7 +477,15 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %files
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md packaging/README.md
-%{_bindir}/punktfunk-host
+# CAP_SYS_NICE — the GPU-scheduling grant, declared the RPM-native way so rpm applies it at
+# install, restores it on upgrade, and VERIFIES it (a plain %post setcap does none of those).
+# PyroWave encodes on the shader cores a game saturates; the elevated global-priority Vulkan queue
+# that fixes it is gated on this capability. Measured 2026-08-08 on an RTX 5070 Ti: without it
+# every priority class is refused, with it the encoder gets REALTIME first try (RADV the same).
+# Narrow — scheduling priority only, no filesystem/network/user-switching privilege, not setuid.
+# Consequences: the binary becomes AT_SECURE, so the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
+# it, and core dumps are suppressed by default.
+%caps(cap_sys_nice=ep) %{_bindir}/punktfunk-host
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %dir %{_libexecdir}/punktfunk

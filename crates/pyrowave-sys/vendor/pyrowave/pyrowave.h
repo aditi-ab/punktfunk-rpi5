@@ -476,6 +476,19 @@ PYROWAVE_PUBLIC_API pyrowave_result
 pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_packet *packets, size_t packet_boundary,
                            size_t *out_packets, void *bitstream, size_t size);
 
+// PUNKTFUNK LOCAL EXTENSION (patches/0007-encoder-sequence-override.patch), not upstream.
+// The wire sequence counter is 3 bits (PyroWave::SequenceCountMask, pyrowave_common.hpp);
+// exported here so callers mask with the codec's own value instead of a copied literal.
+#define PYROWAVE_SEQUENCE_MASK 0x7u
+
+// Overrides the 3-bit wire sequence counter the NEXT encode will stamp into every block header.
+// The counter lives on the encoder object, so a caller that alternates TWO encoders to overlap
+// frames emits 1,1,2,2,3,3... and the decoder — which restarts a frame only when the value
+// CHANGES — reads the repeat as more blocks of the same frame and silently swallows every second
+// frame. Stamp a single monotonic counter across the handles with this. Value is masked to 3 bits.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_set_next_sequence(pyrowave_encoder encoder, uint32_t sequence);
+
 // Implementation ensures GPU is idle before destroying objects.
 PYROWAVE_PUBLIC_API void
 pyrowave_encoder_destroy(pyrowave_encoder encoder);

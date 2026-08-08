@@ -128,6 +128,11 @@ pub struct PyroWaveEncoder {
     wire_budget: pyrowave_wire::WireBudget,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
+    /// The AU currently being handed out in streamed chunks (PW6 — `Some` strictly between a
+    /// `first` chunk and its `last`). See [`pyrowave_wire::AuChunker`]: this backend's encode is
+    /// synchronous, so the AU is COMPLETE before the first chunk leaves — the split is for the
+    /// send side, never an encode/send overlap.
+    chunker: Option<pyrowave_wire::AuChunker>,
 }
 
 // SAFETY: used only from the single encode thread; the pyrowave handles are owned and only touched
@@ -255,6 +260,7 @@ impl PyroWaveEncoder {
                 wire_budget: pyrowave_wire::WireBudget::new(),
                 bitstream: Vec::new(),
                 pending: VecDeque::new(),
+                chunker: None,
             })
         }
     }
@@ -676,10 +682,55 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        // Trait contract: each AU is drained through ONE method. Erroring beats double-emitting
+        // the bytes the chunk cursor already handed out (which would reach the wire twice, under
+        // the same frame index, and fail the receiver's retro-validation).
+        if self.chunker.is_some() {
+            bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
+        }
         Ok(self.pending.pop_front())
     }
 
+    // --- streamed AU (PW6) — see `pyrowave_wire::AuChunker` for what this does and does NOT buy.
+    // Byte-identical to the Linux twin BY CONSTRUCTION: all of the cutting lives in the shared
+    // helper, which compiles and unit-tests on every platform. This file cannot be compiled from
+    // a Linux/macOS dev box, so anything written here directly would ship unverified.
+    fn supports_chunked_poll(&self) -> bool {
+        pyrowave_wire::stream_chunk_step(self.wire_chunk).is_some()
+    }
+
+    fn poll_chunk(&mut self) -> Result<Option<crate::AuChunk>> {
+        // Finish the AU already in flight before opening the next one — the host's `handle_chunk`
+        // keys begin/finish off `first`/`last` and cannot interleave two AUs.
+        if let Some(c) = self.chunker.as_mut() {
+            if let Some(chunk) = c.next() {
+                return Ok(Some(chunk));
+            }
+            self.chunker = None;
+        }
+        let Some(f) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+        // No blocking wait here (the trait allows one): `submit` already ran the whole encode
+        // synchronously, so an AU in `pending` is complete by construction.
+        match pyrowave_wire::stream_chunk_step(self.wire_chunk) {
+            Some(step) => Ok(self
+                .chunker
+                .insert(pyrowave_wire::AuChunker::new(f, step))
+                .next()),
+            // Unarmed / dense: the trait's own default shape, so a host that polls chunks anyway
+            // still gets whole AUs.
+            None => Ok(Some(crate::AuChunk::whole(f))),
+        }
+    }
+
     fn reset(&mut self) -> bool {
+        // A rebuild forfeits every in-flight frame — including an AU only half-handed-out through
+        // `poll_chunk`. Dropping the cursor here (ahead of every `pending.clear()` arm below) is
+        // what keeps the next `poll_chunk` from splicing the tail of a dead AU onto a fresh one;
+        // the host sees a `first` without the previous `last`, logs "streamed AU abandoned
+        // mid-flight" and lets the client age that frame out.
+        self.chunker = None;
         // Cheap in-place rebuild: recreate only the pyrowave encoder object (no rate-control /
         // reference state to preserve). The device, imported textures and fence survive.
         // SAFETY: encode is synchronous (no work in flight); the device outlives the swapped encoder.

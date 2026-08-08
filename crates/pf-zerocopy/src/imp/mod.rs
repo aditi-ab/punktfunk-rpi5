@@ -19,7 +19,7 @@ pub mod vkslot;
 pub mod vulkan;
 pub mod worker;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
@@ -261,56 +261,223 @@ pub fn gpu_import_disabled() -> bool {
 /// operator found `PUNKTFUNK_ZEROCOPY=0` by hand. The host already knows how to encode that
 /// machine — capture just has to stop handing it dmabufs. Latching here is what makes the next
 /// session negotiate CPU frames on its own.
-static RAW_DMABUF_FAILURE_STREAK: AtomicU32 = AtomicU32::new(0);
-static RAW_DMABUF_DISABLED: AtomicBool = AtomicBool::new(false);
 /// Below the encoder's own rebuild budget, so the latch is set before the session it doomed ends.
 const RAW_DMABUF_FAILURE_LATCH: u32 = 3;
 
-/// Record an encoder-side raw-dmabuf import failure. Latches the process-wide disable after
-/// `RAW_DMABUF_FAILURE_LATCH` consecutive failures.
+/// Consecutive capture rebuilds whose dmabuf-only offer never negotiated before the passthrough is
+/// latched off. **2 = one retry**, deliberately: each failed negotiation costs a ~10 s stall, so a
+/// larger budget is paid by the user in dead air. One retry is enough to survive a compositor
+/// caught mid-restart, which is the transient this exists for; a compositor that genuinely never
+/// accepts keeps the same capture identity, so its streak accumulates and it latches on the second
+/// try — one extra stall versus the old behaviour, once per host lifetime.
+const RAW_DMABUF_NEGOTIATION_LATCH: u32 = 2;
+
+/// The raw-dmabuf passthrough's off-switch — **two causes with two different lifetimes**, which is
+/// the whole point of this type.
+///
+/// They used to share one `AtomicBool`, so the cheap recoverable cause (a negotiation that timed
+/// out, possibly because the compositor was mid-restart) was as permanent as the expensive
+/// unrecoverable one (an encoder that cannot import what this compositor allocates). Once either
+/// fired, EVERY later session on the host captured CPU frames until the process was restarted —
+/// including sessions against a completely different compositor and node, which had never failed
+/// at anything.
+///
+/// * **Import failures stay sticky.** A driver that will not take what the compositor allocates
+///   refuses identically on every retry, and the encode-stall recovery above cannot tell that from
+///   a transient — it rebuilt the same failing encoder five times and then ended the session, on
+///   every connection, forever. That is what this latch was born to stop, and it must keep
+///   stopping it.
+/// * **Negotiation timeouts get a retry budget** ([`RAW_DMABUF_NEGOTIATION_LATCH`]).
+/// * **Both are keyed to a capture identity.** A new node id — a fresh virtual output, the
+///   Bazzite Gaming↔Desktop switch, a compositor restart — is a genuinely different question, so
+///   it earns a fresh dmabuf attempt instead of inheriting a verdict about something else.
+///
+/// Atomics rather than a lock because [`note_import_ok`](Self::note_import_ok) is on the per-frame
+/// import path; everything else here runs at pipeline build or on failure.
+#[derive(Debug)]
+pub struct RawDmabufLatch {
+    import_streak: AtomicU32,
+    import_latched: AtomicBool,
+    negotiation_streak: AtomicU32,
+    negotiation_latched: AtomicBool,
+    /// The capture identity the counters above describe. `u64::MAX` = nothing observed yet (a real
+    /// identity is a node id, so it can never collide with the sentinel).
+    identity: AtomicU64,
+}
+
+/// Nothing observed yet — distinct from any real capture identity.
+const NO_IDENTITY: u64 = u64::MAX;
+
+impl RawDmabufLatch {
+    pub const fn new() -> Self {
+        RawDmabufLatch {
+            import_streak: AtomicU32::new(0),
+            import_latched: AtomicBool::new(false),
+            negotiation_streak: AtomicU32::new(0),
+            negotiation_latched: AtomicBool::new(false),
+            identity: AtomicU64::new(NO_IDENTITY),
+        }
+    }
+
+    /// Whether the raw-dmabuf passthrough is currently off, for either cause.
+    pub fn disabled(&self) -> bool {
+        self.import_latched.load(Ordering::Relaxed)
+            || self.negotiation_latched.load(Ordering::Relaxed)
+    }
+
+    /// Tell the latch which capture is about to be built. A DIFFERENT capture from the one the
+    /// current verdict was formed against clears every counter and both latches, so the new
+    /// pipeline earns a fresh dmabuf attempt.
+    ///
+    /// Returns `true` only when that clear actually **re-armed something** — i.e. the identity
+    /// changed *and* a latch was set. Deliberately not "the identity changed": every session on a
+    /// fresh virtual output changes it, and a caller that logged on that would print a re-arm line
+    /// on every healthy session open, which is noise. `true` means "this capture would have been
+    /// forced to CPU by an earlier capture's verdict, and no longer is".
+    ///
+    /// Call this BEFORE reading [`disabled`](Self::disabled) for a negotiation decision, or the
+    /// decision is made against the previous capture's verdict.
+    pub fn observe_capture(&self, identity: u64) -> bool {
+        if self.identity.swap(identity, Ordering::Relaxed) == identity {
+            return false;
+        }
+        let was_latched = self.disabled();
+        self.import_streak.store(0, Ordering::Relaxed);
+        self.import_latched.store(false, Ordering::Relaxed);
+        self.negotiation_streak.store(0, Ordering::Relaxed);
+        self.negotiation_latched.store(false, Ordering::Relaxed);
+        was_latched
+    }
+
+    /// Record an encoder-side raw-dmabuf import failure. Returns `true` if this failure is the one
+    /// that latched the passthrough off.
+    pub fn note_import_failure(&self) -> Option<u32> {
+        let streak = self.import_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        (streak >= RAW_DMABUF_FAILURE_LATCH && !self.import_latched.swap(true, Ordering::Relaxed))
+            .then_some(streak)
+    }
+
+    /// Record a raw dmabuf that imported and encoded — resets the failure streak. The per-frame
+    /// hot path, hence a single relaxed store.
+    ///
+    /// Deliberately does NOT clear `import_latched`: once the latch fires, capture has already
+    /// moved to CPU frames, so there are no more dmabuf imports to succeed. Only a new capture
+    /// identity clears it.
+    pub fn note_import_ok(&self) {
+        self.import_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a capture rebuild whose dmabuf-only offer never negotiated. Returns `Some(streak)`
+    /// if this is the failure that latched the passthrough off, `None` while retries remain.
+    pub fn note_negotiation_timeout(&self) -> Option<u32> {
+        let streak = self.negotiation_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        (streak >= RAW_DMABUF_NEGOTIATION_LATCH
+            && !self.negotiation_latched.swap(true, Ordering::Relaxed))
+        .then_some(streak)
+    }
+
+    /// Record a capture whose dmabuf offer DID negotiate — the retry budget is per consecutive
+    /// run of failures, so a success spends none of it.
+    pub fn note_negotiation_ok(&self) {
+        self.negotiation_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Diagnostic for the session-open line: which cause (if any) currently holds it off.
+    pub fn state(&self) -> &'static str {
+        match (
+            self.import_latched.load(Ordering::Relaxed),
+            self.negotiation_latched.load(Ordering::Relaxed),
+        ) {
+            (true, true) => "latched: encoder-import + negotiation",
+            (true, false) => "latched: encoder-import failures",
+            (false, true) => "latched: negotiation timeouts",
+            (false, false) => "live",
+        }
+    }
+}
+
+impl Default for RawDmabufLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static RAW_DMABUF: RawDmabufLatch = RawDmabufLatch::new();
+
+/// Record an encoder-side raw-dmabuf import failure. Latches the passthrough off after
+/// `RAW_DMABUF_FAILURE_LATCH` consecutive failures, until the capture identity changes.
 pub fn note_raw_dmabuf_import_failure(reason: &str) {
-    let streak = RAW_DMABUF_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-    if streak >= RAW_DMABUF_FAILURE_LATCH && !RAW_DMABUF_DISABLED.swap(true, Ordering::Relaxed) {
+    if let Some(streak) = RAW_DMABUF.note_import_failure() {
         tracing::error!(
             streak,
             reason,
-            "zero-copy raw-dmabuf passthrough disabled for this host process: the encoder failed \
-             to import the compositor's dmabuf {streak} times in a row — captures fall back to the \
-             CPU path (slower, but this host could not stream at all otherwise)"
+            "zero-copy raw-dmabuf passthrough disabled: the encoder failed to import the \
+             compositor's dmabuf {streak} times in a row — captures fall back to the CPU path \
+             (slower, but this host could not stream at all otherwise). A new capture (different \
+             node / compositor) clears this."
         );
     }
 }
 
 /// Record a raw dmabuf that imported and encoded — resets the failure streak.
 pub fn note_raw_dmabuf_import_ok() {
-    RAW_DMABUF_FAILURE_STREAK.store(0, Ordering::Relaxed);
+    RAW_DMABUF.note_import_ok();
 }
 
 /// Latch the raw-dmabuf passthrough off because its dmabuf-only *offer never negotiated* — the
-/// CAPTURE-side counterpart to [`note_raw_dmabuf_import_failure`]'s encoder-side streak. One
-/// timeout is conclusive for this offer (a compositor that cannot allocate the requested
-/// LINEAR/modifier BGRx dmabuf refuses it identically on every retry), so there is no streak to
-/// count: the next capture skips the passthrough and negotiates SHM/CPU instead of re-running the
-/// same 10 s timeout on every reconnect.
+/// CAPTURE-side counterpart to [`note_raw_dmabuf_import_failure`]'s encoder-side streak.
+///
+/// Unlike the import streak this gets a retry budget: the offer can time out because the
+/// compositor was mid-restart rather than because it will never accept, and the old behaviour
+/// (one timeout = CPU capture for the rest of the host's life, for every compositor and every
+/// node) turned a transient into a permanent downgrade nobody could see.
 ///
 /// Scoped deliberately. This used to be `note_vaapi_dmabuf_failed`, which fed [`enabled`] and so
-/// disabled ALL zero-copy host-wide — see [`enabled`]. `RAW_DMABUF_DISABLED` gates only the
-/// raw-passthrough decision, so the EGL→CUDA importer that a later NVENC session builds is
-/// untouched.
+/// disabled ALL zero-copy host-wide — see [`enabled`]. It gates only the raw-passthrough decision,
+/// so the EGL→CUDA importer that a later NVENC session builds is untouched.
 pub fn note_raw_dmabuf_negotiation_failed() {
-    if !RAW_DMABUF_DISABLED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "zero-copy raw-dmabuf passthrough disabled for this host process: the compositor never \
-             accepted the dmabuf-only capture offer, so later captures negotiate the CPU path \
-             instead of repeating that timeout (the EGL→CUDA import path is NOT affected)"
-        );
+    match RAW_DMABUF.note_negotiation_timeout() {
+        Some(streak) => tracing::warn!(
+            streak,
+            "zero-copy raw-dmabuf passthrough disabled: the compositor did not accept the \
+             dmabuf-only capture offer {streak} builds in a row, so later captures negotiate the \
+             CPU path instead of repeating that timeout (the EGL→CUDA import path is NOT \
+             affected). A new capture (different node / compositor) clears this."
+        ),
+        None => tracing::warn!(
+            "the compositor did not accept the dmabuf-only capture offer — retrying dmabuf on the \
+             next capture build before giving up on it"
+        ),
     }
 }
 
-/// True once repeated encoder import failures latched the raw-dmabuf passthrough off (see
-/// [`note_raw_dmabuf_import_failure`]).
+/// Record a capture whose dmabuf offer negotiated — spends none of the retry budget.
+pub fn note_raw_dmabuf_negotiation_ok() {
+    RAW_DMABUF.note_negotiation_ok();
+}
+
+/// Tell the latch which capture is about to be built, so a verdict formed against a DIFFERENT
+/// compositor/node is not inherited. Returns `true` if a latch was cleared by the change.
+pub fn note_raw_dmabuf_capture(identity: u64) -> bool {
+    let cleared = RAW_DMABUF.observe_capture(identity);
+    if cleared {
+        tracing::info!(
+            identity,
+            "zero-copy raw-dmabuf passthrough re-armed: this is a different capture from the one \
+             that failed, so it gets a fresh dmabuf attempt"
+        );
+    }
+    cleared
+}
+
+/// True while either cause holds the raw-dmabuf passthrough off (see [`RawDmabufLatch`]).
 pub fn raw_dmabuf_import_disabled() -> bool {
-    RAW_DMABUF_DISABLED.load(Ordering::Relaxed)
+    RAW_DMABUF.disabled()
+}
+
+/// Which cause holds the passthrough off, for the session-open diagnostic line.
+pub fn raw_dmabuf_latch_state() -> &'static str {
+    RAW_DMABUF.state()
 }
 
 /// The EGL→CUDA twin of the raw-passthrough negotiation latch: the capture advertised the GPU
@@ -563,5 +730,132 @@ mod tests {
         );
         note_gpu_import_death(); // third consecutive death
         assert!(gpu_import_disabled());
+    }
+
+    // ---- PW3: the raw-dmabuf latch's two lifetimes ------------------------------------------
+    //
+    // Against a LOCAL `RawDmabufLatch`, never the process-wide static: these assertions are about
+    // the state machine, and sharing one global across a test binary's threads is how a latch test
+    // becomes order-dependent.
+
+    /// The expensive cause stays sticky. A driver that cannot import what this compositor
+    /// allocates refuses identically every time, and the encode-stall recovery cannot tell that
+    /// from a transient — this latch is what stops it rebuilding the same doomed encoder forever.
+    #[test]
+    fn import_failures_latch_and_stay_latched() {
+        let l = RawDmabufLatch::new();
+        assert!(!l.disabled());
+        assert_eq!(l.note_import_failure(), None); // 1
+        assert_eq!(l.note_import_failure(), None); // 2
+        assert!(!l.disabled(), "must not latch before the streak completes");
+        assert_eq!(l.note_import_failure(), Some(3));
+        assert!(l.disabled());
+        // Only the FIRST crossing reports, so the error line cannot repeat per frame.
+        assert_eq!(l.note_import_failure(), None);
+        // A success resets the streak but must NOT unlatch: once capture moved to CPU frames there
+        // are no more dmabuf imports, so an "ok" here would be about something else entirely.
+        l.note_import_ok();
+        assert!(l.disabled());
+    }
+
+    /// A run of failures broken by a success spends none of the budget — the streak is
+    /// consecutive-only, which is what makes an occasional failure survivable.
+    #[test]
+    fn a_success_breaks_the_import_streak() {
+        let l = RawDmabufLatch::new();
+        l.note_import_failure();
+        l.note_import_failure();
+        l.note_import_ok();
+        assert_eq!(l.note_import_failure(), None, "streak restarted at 1");
+        assert_eq!(l.note_import_failure(), None);
+        assert!(!l.disabled());
+        assert_eq!(l.note_import_failure(), Some(3));
+    }
+
+    /// The cheap cause gets a retry. This is the behaviour change PW3 exists for: one timeout used
+    /// to mean CPU capture for the rest of the host's life, on every compositor and every node.
+    #[test]
+    fn a_negotiation_timeout_is_retried_before_it_latches() {
+        let l = RawDmabufLatch::new();
+        assert_eq!(l.note_negotiation_timeout(), None, "first one retries");
+        assert!(
+            !l.disabled(),
+            "the next capture build must still be allowed to try dmabuf"
+        );
+        assert_eq!(l.note_negotiation_timeout(), Some(2));
+        assert!(l.disabled());
+        assert_eq!(l.note_negotiation_timeout(), None, "reports once");
+    }
+
+    /// A capture that negotiates credits the budget back, so a compositor that fails once and then
+    /// works never accumulates its way to a latch across an evening of reconnects.
+    #[test]
+    fn a_negotiated_capture_credits_the_retry_budget() {
+        let l = RawDmabufLatch::new();
+        for _ in 0..10 {
+            assert_eq!(l.note_negotiation_timeout(), None);
+            l.note_negotiation_ok();
+        }
+        assert!(!l.disabled());
+    }
+
+    /// A different capture is a different question. New node id (fresh virtual output, compositor
+    /// restart, the Bazzite Gaming↔Desktop switch) clears BOTH causes — the same capture does not.
+    #[test]
+    fn a_new_capture_identity_clears_the_latch_and_the_same_one_does_not() {
+        let l = RawDmabufLatch::new();
+        // Nothing is latched yet, so observing a new capture re-arms NOTHING — that is what the
+        // return value means, and it is why a healthy session open logs no re-arm line.
+        assert!(
+            !l.observe_capture(7),
+            "nothing was latched, nothing re-armed"
+        );
+        assert!(!l.observe_capture(7), "same capture, no clear");
+        for _ in 0..RAW_DMABUF_FAILURE_LATCH {
+            l.note_import_failure();
+        }
+        assert!(l.disabled());
+        assert!(
+            !l.observe_capture(7),
+            "the SAME capture must keep its verdict — this is the 10s-stall hazard the latch exists for"
+        );
+        assert!(l.disabled());
+        assert!(l.observe_capture(9), "a different node re-arms it");
+        assert!(!l.disabled());
+        // ...and the streaks reset with it, so the fresh attempt gets a full budget.
+        assert_eq!(l.note_import_failure(), None);
+    }
+
+    /// The negotiation latch is keyed the same way — a compositor restart must not inherit the
+    /// previous one's timeout verdict.
+    #[test]
+    fn a_new_capture_identity_clears_the_negotiation_latch_too() {
+        let l = RawDmabufLatch::new();
+        l.observe_capture(1);
+        l.note_negotiation_timeout();
+        l.note_negotiation_timeout();
+        assert!(l.disabled());
+        assert!(l.observe_capture(2));
+        assert!(!l.disabled());
+    }
+
+    /// The session-open line has to name WHICH cause holds it off — "cpu because nothing here
+    /// does dmabuf" and "cpu because something failed earlier" are different bugs.
+    #[test]
+    fn latch_state_names_the_cause() {
+        let l = RawDmabufLatch::new();
+        assert_eq!(l.state(), "live");
+        l.note_negotiation_timeout();
+        l.note_negotiation_timeout();
+        assert_eq!(l.state(), "latched: negotiation timeouts");
+        let l = RawDmabufLatch::new();
+        for _ in 0..RAW_DMABUF_FAILURE_LATCH {
+            l.note_import_failure();
+        }
+        assert_eq!(l.state(), "latched: encoder-import failures");
+        for _ in 0..RAW_DMABUF_NEGOTIATION_LATCH {
+            l.note_negotiation_timeout();
+        }
+        assert_eq!(l.state(), "latched: encoder-import + negotiation");
     }
 }

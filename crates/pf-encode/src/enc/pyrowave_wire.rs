@@ -53,6 +53,24 @@ pub(crate) fn stamp_color_bits(bitstream: &mut [u8], seq_offset: usize, bt2020_p
     }
 }
 
+/// Read the 3-bit wire sequence counter out of a pyrowave block header.
+///
+/// Every block header is `{ u16 ballot; u16 payload_words:12, sequence:3, extended:1; u32 ... }`
+/// (`pyrowave_common.hpp`, `static_assert(sizeof == 8)`), so the counter is bits 12..14 of the
+/// little-endian half-word at `packet_offset + 2` — the same word `stamp_color_bits` reaches into
+/// from the other end.
+///
+/// This field is the entire frame-boundary signal on the wire: the decoder restarts a frame only
+/// when the value CHANGES (`diff = (hdr.sequence - last_seq) & 0x7; restart = diff != 0`), so a
+/// repeated value is read as more blocks of the same frame. That is why PW5's alternating encoder
+/// handles need `pyrowave_encoder_set_next_sequence`, and why a test asserts this reader sees
+/// +1 mod 8 across the pair.
+pub(crate) fn wire_sequence(bitstream: &[u8], packet_offset: usize) -> Option<u8> {
+    let lo = *bitstream.get(packet_offset + 2)?;
+    let hi = *bitstream.get(packet_offset + 3)?;
+    Some(((u16::from_le_bytes([lo, hi]) >> 12) & 0x7) as u8)
+}
+
 /// The wavelet block space's total 32x32-block count for a mode — the exact counting walk of
 /// upstream `WaveletBuffers::init_block_meta` (also ported to the Apple `WaveletLayout`, whose
 /// golden tests pin it against real host AUs). Needed because the vendored RDO pass packs the
@@ -199,6 +217,193 @@ pub(crate) fn build_au(
     }
     close(&mut au, &mut open, chunk);
     au
+}
+
+// ---------------------------------------------------------------------------
+// Streamed-AU chunk cutting (PW6 — latency plan §T3.4, wave-2 plan PW6)
+// ---------------------------------------------------------------------------
+
+/// Default per-chunk target — ~3–4 chunks for a 400 Mb/s 60 fps AU (~833 KB). Deliberately coarse,
+/// because the SEALER, not this size, sets how early bytes actually leave:
+///
+/// * Toward a plain `VIDEO_CAP_STREAMED_AU` client, `Packetizer::push_streamed` flushes only when
+///   its pending buffer exceeds one FEC block — `fec.max_data_per_block × shard_payload`, which is
+///   200 × 1408 = 281 600 B on the shipped 1500-MTU IPv4 geometry. Anything smaller than that is
+///   simply buffered. (256 KiB sits just under one block, so the first flush lands on the SECOND
+///   chunk; the win is intact either way — the whole-AU path seals all ~3 blocks before its first
+///   datagram may leave.) Only a client that ALSO negotiated `VIDEO_CAP_MULTI_SLICE` gets the
+///   finer `MIN_STREAM_BLOCK_SHARDS` floor (16 shards ≈ 22 KB), where the chunk size does set the
+///   flush granularity directly. pf-encode is not told the session's FEC geometry, so this is a
+///   fixed byte target rather than a block-derived one.
+/// * Chunks are not free: the send thread paces each sealed batch on its own
+///   (`stream.rs::pace_sealed`), and every call grants a fresh `max(bytes/4, 128 KiB)` microburst
+///   allowance. Cutting an AU into dozens of chunks therefore erodes the pacing this host does to
+///   stop line-rate bursts from overrunning the NIC — the failure mode the pacer exists for.
+const STREAM_CHUNK_TARGET_BYTES: usize = 256 * 1024;
+/// Clamp on the `PUNKTFUNK_PYROWAVE_CHUNK_KIB` override (see [`stream_chunk_step`]).
+const STREAM_CHUNK_MIN_KIB: usize = 4;
+const STREAM_CHUNK_MAX_KIB: usize = 8192;
+
+/// Whether streamed-AU output is armed for this host process.
+///
+/// **Default OFF, and deliberately so.** The streamed wire shape costs one PyroWave-specific
+/// regression that has not been measured: an UNPINNED streamed frame (its final block never
+/// arrived, so `frame_bytes` is still the 0 sentinel) is excluded from partial delivery
+/// (`reassemble.rs`, 2026-07 security-review finding 10) — where today's whole-AU path hands the
+/// consumer a usable blurred partial, a streamed frame that loses its final block delivers
+/// NOTHING. PyroWave clients opt into partial delivery unconditionally
+/// (`client/pump/handshake.rs`), so this is a live behaviour change for every one of them. The
+/// netem loss-harness leg (2 % on `lo`, FEC pinned off — the Phase-4 recipe) comparing
+/// partial-delivery rates streamed vs whole-AU is the prerequisite for flipping the default;
+/// until it has run, `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` is how you get it.
+///
+/// The client's `VIDEO_CAP_STREAMED_AU` and the host's `PUNKTFUNK_STREAMED_AU` remain the outer
+/// gates (`stream.rs`) — this only decides whether the ENCODER offers chunks at all.
+fn stream_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Latched once: `supports_chunked_poll` is re-queried per AU, and a knob that could change
+    // mid-session would flip the wire shape under an open `StreamedAu`.
+    *ARMED.get_or_init(|| {
+        matches!(
+            std::env::var("PUNKTFUNK_PYROWAVE_STREAMED_AU").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+/// Bytes per streamed chunk, rounded DOWN to a whole number of `window`-sized windows (never
+/// below one). The rounding is the whole point — see [`AuChunker`].
+fn chunk_step(window: usize, target: usize) -> usize {
+    (target / window.max(1)).max(1) * window.max(1)
+}
+
+/// The streamed-AU chunk size for a backend whose wire chunking is `wire_chunk`, or `None` when
+/// this session must stay on the whole-AU path — which is the answer whenever the feature is not
+/// armed ([`stream_armed`]) or the encoder is in DENSE mode.
+///
+/// Dense mode is excluded on purpose: there the AU is ONE atomic pyrowave packet with no window
+/// framing, so a cut is neither shard-aligned nor a framing boundary. Every real PyroWave session
+/// runs datagram-aligned (`stream.rs` sets `plan.wire_chunk = Some(session.shard_payload())`), so
+/// nothing is lost — but the invariant this file promises stays true instead of nearly true.
+///
+/// `PUNKTFUNK_PYROWAVE_CHUNK_KIB` overrides the target (clamped to
+/// [`STREAM_CHUNK_MIN_KIB`]..=[`STREAM_CHUNK_MAX_KIB`]); garbage falls back to the default.
+pub(crate) fn stream_chunk_step(wire_chunk: Option<usize>) -> Option<usize> {
+    let window = wire_chunk.filter(|&w| w > 0)?;
+    if !stream_armed() {
+        return None;
+    }
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target = *TARGET.get_or_init(|| {
+        std::env::var("PUNKTFUNK_PYROWAVE_CHUNK_KIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|k| (STREAM_CHUNK_MIN_KIB..=STREAM_CHUNK_MAX_KIB).contains(k))
+            .map(|k| k * 1024)
+            .unwrap_or(STREAM_CHUNK_TARGET_BYTES)
+    });
+    Some(chunk_step(window, target))
+}
+
+/// Hands a **finished** datagram-aligned AU out in window-aligned pieces for the streamed-AU wire
+/// ([`crate::Encoder::poll_chunk`], `punktfunk_core::quic::VIDEO_CAP_STREAMED_AU`). Shared by both
+/// pyrowave backends so the cut rule cannot drift between Linux and Windows — the Windows backend
+/// cannot even be compiled from a Linux/macOS dev box, so logic written into it directly ships
+/// unverified.
+///
+/// ## What this does NOT buy (read before quoting PW6 as a latency win)
+///
+/// pyrowave's `encode_frame` is **synchronous**: `submit` returns only once the whole AU sits in
+/// `pending`, so by the time the host can poll a chunk the encode is over. `poll_chunk` is
+/// therefore NOT "emit slices as the encoder produces them" — it is "hand the finished AU out in
+/// pieces so the wire work pipelines with itself". Concretely, what moves:
+///
+/// * whole-AU path: `Session::seal_frame_at` FEC-protects, packetizes and AEAD-seals the ENTIRE
+///   ~830 KB AU before its first datagram may leave the socket;
+/// * streamed path: each FEC block seals and paces as it completes, so the first byte reaches the
+///   wire after one block's seal, and the remaining seal work overlaps its own transmission.
+///
+/// There is NO encode/send overlap here — unlike the H.26x sub-frame slice path, where chunks
+/// genuinely appear while the encoder is still working. PW6 and PW5 (encode overlap) are
+/// independent packages, not sequential ones.
+///
+/// It also does **not** give the client decode-while-arriving: the reassembler completes a
+/// streamed AU exactly like a whole one (`reassemble.rs` — `block_count != 0 && blocks_ok ==
+/// block_count`) and hands up ONE `Frame`. Client-side prefix decode is the separate
+/// `Session::set_deliver_frame_parts` opt-in, which PyroWave's newest-wins frame channel cannot
+/// take — see the PW6 section of `design/linux-host-performance-wave2-pyrowave.md`.
+///
+/// ## The cut rule
+///
+/// A chunk is a whole number of `chunk`-sized WINDOWS. [`build_au`] gives every window exactly ONE
+/// `kind` in its 4-byte prefix (`WIN_PACKED` or one link of a `WIN_FRAG_*` chain), so a cut inside
+/// a window would split a unit the clients parse atomically. Whole windows are `shard_payload`
+/// multiples by construction, which is what makes the sealer's sentinel block bases shard-aligned
+/// for free (plan §4.4) — the streamed path's placement contract.
+pub(crate) struct AuChunker {
+    au: Vec<u8>,
+    /// Bytes already handed out.
+    cursor: usize,
+    /// Bytes per chunk — a whole number of windows ([`chunk_step`]).
+    step: usize,
+    pts_ns: u64,
+    keyframe: bool,
+    recovery_anchor: bool,
+    chunk_aligned: bool,
+    /// Set once anything has been emitted, so the degenerate EMPTY AU still owes exactly one
+    /// chunk and not an infinite stream of them.
+    emitted: bool,
+}
+
+impl AuChunker {
+    pub(crate) fn new(frame: crate::EncodedFrame, step: usize) -> AuChunker {
+        AuChunker {
+            au: frame.data,
+            cursor: 0,
+            step: step.max(1),
+            pts_ns: frame.pts_ns,
+            keyframe: frame.keyframe,
+            recovery_anchor: frame.recovery_anchor,
+            chunk_aligned: frame.chunk_aligned,
+            emitted: false,
+        }
+    }
+
+    /// The next piece, or `None` once the AU is spent. The pieces concatenate to exactly the bytes
+    /// [`crate::Encoder::poll`] would have returned; `first` opens the wire frame and `last` closes
+    /// it (the host's `handle_chunk` keys its `begin`/`finish` off precisely those two).
+    pub(crate) fn next(&mut self) -> Option<crate::AuChunk> {
+        if self.cursor >= self.au.len() {
+            // A zero-byte AU is not reachable through `build_au` (it always emits at least one
+            // window), but the host would leak its open `StreamedAu` if a chunked poll returned
+            // nothing at all — so the degenerate case still owes one self-closing chunk.
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            return Some(self.chunk(Vec::new(), true, true));
+        }
+        let first = self.cursor == 0;
+        let end = (self.cursor + self.step).min(self.au.len());
+        let data = self.au[self.cursor..end].to_vec();
+        self.cursor = end;
+        self.emitted = true;
+        Some(self.chunk(data, first, end == self.au.len()))
+    }
+
+    /// AU-level metadata rides every chunk (the `AuChunk` contract only makes it authoritative on
+    /// `first`, but a truthful copy on each one costs nothing and keeps a mid-AU log honest).
+    fn chunk(&self, data: Vec<u8>, first: bool, last: bool) -> crate::AuChunk {
+        crate::AuChunk {
+            data,
+            pts_ns: self.pts_ns,
+            keyframe: self.keyframe,
+            recovery_anchor: self.recovery_anchor,
+            chunk_aligned: self.chunk_aligned,
+            first,
+            last,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +566,120 @@ mod tests {
         // chroma_siting (0x80) stays CENTER.
         stamp_color_bits(&mut bs, 0, true);
         assert_eq!(bs[7], 0x78);
+    }
+
+    // --- streamed-AU chunk cutting (PW6) ------------------------------------
+    // Appended at module END per the wave plan's ownership rule.
+
+    fn frame(data: Vec<u8>) -> crate::EncodedFrame {
+        crate::EncodedFrame {
+            data,
+            pts_ns: 1_234_567,
+            keyframe: true,
+            recovery_anchor: false,
+            chunk_aligned: true,
+        }
+    }
+
+    /// Drain a chunker into `(concatenated bytes, per-chunk lengths, first flags, last flags)`.
+    fn drain(mut c: AuChunker) -> (Vec<u8>, Vec<usize>, Vec<bool>, Vec<bool>) {
+        let (mut bytes, mut lens, mut firsts, mut lasts) = (Vec::new(), Vec::new(), vec![], vec![]);
+        while let Some(ch) = c.next() {
+            lens.push(ch.data.len());
+            firsts.push(ch.first);
+            lasts.push(ch.last);
+            bytes.extend_from_slice(&ch.data);
+            assert_eq!(ch.pts_ns, 1_234_567, "AU metadata rides every chunk");
+            assert!(ch.keyframe && ch.chunk_aligned && !ch.recovery_anchor);
+        }
+        (bytes, lens, firsts, lasts)
+    }
+
+    /// The invariant PW6 rests on: chunks concatenate to EXACTLY the AU, every cut lands on a
+    /// whole-window boundary (so no window's single `kind` is split across two wire frames), and
+    /// the reassembled stream still walks back to the same codec packets. A cut inside a window
+    /// would hand the client a 4-byte prefix whose body arrives in a different chunk — the
+    /// framing is one-kind-per-window, so there is no way to express that.
+    #[test]
+    fn stream_chunks_tile_the_au_on_window_boundaries() {
+        let bs: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let packets = [(0, 20), (20, 300), (320, 55), (375, 900), (1275, 40)];
+        let chunk = 64;
+        let au = build_au(&packets, &bs, Some(chunk));
+        assert!(au.len() / chunk > 4, "need several windows to cut between");
+        let step = chunk_step(chunk, 3 * chunk);
+        assert_eq!(step, 3 * chunk);
+        let (bytes, lens, firsts, lasts) = drain(AuChunker::new(frame(au.clone()), step));
+        assert_eq!(bytes, au, "chunks concatenate to exactly the AU");
+        assert!(
+            lens.iter().all(|l| l % chunk == 0),
+            "every chunk is a whole number of windows: {lens:?}"
+        );
+        assert!(
+            lens[..lens.len() - 1].iter().all(|&l| l == step),
+            "only the tail chunk may be short: {lens:?}"
+        );
+        assert_eq!(
+            firsts,
+            (0..lens.len()).map(|i| i == 0).collect::<Vec<_>>(),
+            "exactly one opening chunk"
+        );
+        assert_eq!(
+            lasts,
+            (0..lens.len())
+                .map(|i| i + 1 == lens.len())
+                .collect::<Vec<_>>(),
+            "exactly one closing chunk"
+        );
+        // And the client's parse is unchanged by the cutting.
+        let mut expect = Vec::new();
+        for &(o, s) in &packets {
+            expect.extend_from_slice(&bs[o..o + s]);
+        }
+        assert_eq!(walk(&bytes, chunk), expect);
+    }
+
+    /// The step always rounds DOWN to whole windows and never to zero — a target below one window
+    /// degenerates to one window per chunk rather than an empty chunk (which would spin forever).
+    #[test]
+    fn chunk_step_rounds_down_to_whole_windows() {
+        // 262144 / 1408 = 186.2 → 186 whole windows (261 888 B), never the 262 144 asked for.
+        assert_eq!(chunk_step(1408, 256 * 1024), 186 * 1408);
+        assert_eq!(chunk_step(1408, 1408), 1408);
+        assert_eq!(chunk_step(1408, 1407), 1408); // below one window → one window
+        assert_eq!(chunk_step(1408, 0), 1408);
+        assert_eq!(chunk_step(0, 4096), 4096); // defensive: never divides by zero
+    }
+
+    /// An AU that fits one chunk is a single `first && last` piece — the shape the host's
+    /// `handle_chunk` turns into begin+finish on one message, and byte-identical on the wire to
+    /// what the whole-AU path would have sealed.
+    #[test]
+    fn single_chunk_au_opens_and_closes_itself() {
+        let au = vec![7u8; 512];
+        let (bytes, lens, firsts, lasts) = drain(AuChunker::new(frame(au.clone()), 4096));
+        assert_eq!(bytes, au);
+        assert_eq!(lens, vec![512]);
+        assert_eq!(firsts, vec![true]);
+        assert_eq!(lasts, vec![true]);
+    }
+
+    /// The degenerate empty AU still owes exactly ONE self-closing chunk: a chunked poll that
+    /// returned nothing would leave the host's `StreamedAu` open forever (its `begin` fires on
+    /// `first`, its `finish` on `last`).
+    #[test]
+    fn empty_au_still_emits_one_self_closing_chunk() {
+        let mut c = AuChunker::new(frame(Vec::new()), 4096);
+        let ch = c.next().expect("one chunk");
+        assert!(ch.first && ch.last && ch.data.is_empty());
+        assert!(c.next().is_none(), "and never a second one");
+    }
+
+    /// Dense (non-windowed) AUs never stream: there is no window framing to cut on, so a chunk
+    /// boundary would be neither shard-aligned nor a parse boundary.
+    #[test]
+    fn dense_mode_never_streams() {
+        assert!(stream_chunk_step(None).is_none());
+        assert!(stream_chunk_step(Some(0)).is_none());
     }
 }
