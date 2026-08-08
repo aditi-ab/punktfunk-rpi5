@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
-Date: Tue, 28 Jul 2026 15:42:01 +0200
+Date: Sat, 8 Aug 2026 13:17:37 +0000
 Subject: [PATCH] punktfunk: stamp the version banner with +pfhdrN
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -8,25 +8,27 @@ Content-Transfer-Encoding: 8bit
 
 punktfunk decides a session's shape before the virtual display exists — the
 bit depth in the Welcome (irrevocable; a PQ stream on an 8-bit encoder is a
-hard error), and whether it must composite the cursor host-side before the
-encoder is even opened. Both answers therefore have to be static properties of
-the resolved binary rather than something negotiated later.
+hard error), whether it must composite the cursor host-side before the encoder
+is even opened, and which flags the spawn has to carry. All of those have to be
+static properties of the resolved binary rather than something negotiated later.
 
-The number is a monotonic patch-set revision, so one probe answers both:
+The number is a monotonic patch-set revision, so one probe answers all of them:
   +pfhdr1  10-bit BT.2020/PQ capture formats
   +pfhdr2  …and --pipewire-composite-cursor
+  +pfhdr3  …and the headless connector advertises its mode + --custom-refresh-rates
+  +pfhdr4  …and --pipewire-composite-external-overlay
 
 NOT for upstream: drop this once the functional patches land there and plain
 version floors answer the same questions.
 ---
- src/meson.build | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ src/meson.build | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/src/meson.build b/src/meson.build
-index 662f752..af48d01 100644
+index 662f752..12fd38a 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -177,7 +177,12 @@ compiler_version = cc.version()
+@@ -177,7 +177,14 @@ compiler_version = cc.version()
  
  vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
  vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
@@ -36,7 +38,9 @@ index 662f752..af48d01 100644
 +# punktfunk/1 Welcome is irrevocable). The number is a monotonic PATCH-SET revision:
 +#   +pfhdr1 — 10-bit BT.2020/PQ capture formats on the PipeWire node
 +#   +pfhdr2 — …and `--pipewire-composite-cursor`
-+version_tag = vcs_tag + '+pfhdr2' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr3 — …and the headless connector advertises its mode + `--custom-refresh-rates`
++#   +pfhdr4 — …and `--pipewire-composite-external-overlay`
++version_tag = vcs_tag + '+pfhdr4' + ' (' + compiler_name + ' ' + compiler_version + ')'
  
  gamescope_version_conf = configuration_data()
  gamescope_version_conf.set('VCS_TAG', version_tag)

@@ -63,7 +63,7 @@ unwrapped.overrideAttrs (old: {
     );
 
   # nixpkgs builds from a `fetchFromGitHub` src, so there is no `.git` for `git describe` and the
-  # banner would read `+pfhdr2 (gcc …)` with no version at all — which the host's diagnostic
+  # banner would read `+pfhdrN (gcc …)` with no version at all — which the host's diagnostic
   # version gate then misreads (it takes the first X.Y.Z triple it finds, i.e. the compiler's).
   # Substituting the real version in keeps `--version` honest AND keeps our marker.
   postPatch = (old.postPatch or "") + ''

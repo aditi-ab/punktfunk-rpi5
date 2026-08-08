@@ -13,7 +13,21 @@ The patches here add the missing half, and nothing else. See
 |---|---|---|
 | `0001-pipewire-offer-10-bit-BT.2020-PQ-capture-formats-HDR.patch` | Offer SPA `xRGB_210LE`/`xBGR_210LE` with MANDATORY SMPTE ST.2084 + BT.2020 props, map them to `DRM_FORMAT_XRGB2101010`/`XBGR2101010`, and composite them with `g_ScreenshotColorMgmtLutsHDR` + `EOTF_PQ` | **Yes** — offered against [gamescope#2126](https://github.com/ValveSoftware/gamescope/issues/2126) |
 | `0002-pipewire-optionally-composite-the-cursor-into-the-ca.patch` | `--pipewire-composite-cursor` (off by default): paint the pointer into the capture stream, using the same `MouseCursor::paint` call the scanout composite uses | **Yes** — independently useful to any consumer with no cursor of its own |
-| `0003-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the two above land upstream |
+| `0003-headless-advertise-the-virtual-display-s-mode-and-re.patch` | Give `CHeadlessConnector` a real `GetModes()` + `GetValidDynamicRefreshRates()` from the resolved `-W`/`-H`/`-r`, report `GAMESCOPE_SCREEN_TYPE_EXTERNAL` so `update_mode_atoms` publishes the list, and add `--custom-refresh-rates` | **Yes** — a headless session that cannot report its own mode is a plain bug |
+| `0004-pipewire-optionally-composite-the-external-overlay-i.patch` | `--pipewire-composite-external-overlay` (off by default): paint the external overlay layer (mangoapp — the fps/stats readout) into the capture stream | **Yes** — same shape as the cursor patch, same argument |
+| `0005-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the functional patches above land upstream |
+
+### Why the headless patch matters
+
+A headless gamescope is how a streaming host gives a game a display: the caller passes the
+client's exact mode and expects the session to run at it. It *does* — but it never told anyone.
+`CHeadlessConnector` returned an empty span from both `GetModes()` and
+`GetValidDynamicRefreshRates()` and reported `GAMESCOPE_SCREEN_TYPE_INTERNAL`, so
+`update_mode_atoms()` **deleted** `GAMESCOPE_DISPLAY_MODE_LIST_EXTERNAL` (no resolution list) and
+`wlserver_send_gamescope_control()` fell through to a **one-entry** refresh list built from
+`g_nOutputRefresh` (no refresh list). With `-r` absent that entry is `Init()`'s 60 Hz default, so a
+client on a 120 Hz panel was told its display was 60 Hz — and games capped themselves to it. Field
+report 2026-08-08: "gamescope only shows 60hz and there's no other option".
 
 ### Why the cursor patch matters more than it looks
 
@@ -40,6 +54,8 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 |---|---|
 | `+pfhdr1` | 10-bit BT.2020/PQ capture formats |
 | `+pfhdr2` | …and `--pipewire-composite-cursor` |
+| `+pfhdr3` | …and the headless connector advertises its mode + `--custom-refresh-rates` |
+| `+pfhdr4` | …and `--pipewire-composite-external-overlay` |
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
 
@@ -142,7 +158,7 @@ Note what is NOT in that table: the `.deb`. Debian/Ubuntu boxes build it by hand
 ## Verifying the patch on a box (P0 exit)
 
 ```sh
-punktfunk-gamescope --version                    # must contain +pfhdr2
+punktfunk-gamescope --version                    # must contain +pfhdr4
 punktfunk-gamescope --backend headless -W 1920 -H 1080 -r 60 \
     --hdr-enabled --hdr-debug-force-support --pipewire-composite-cursor -- vkcube &
 pw-dump | grep -A40 '"gamescope"'                # node offers xRGB_210LE / xBGR_210LE
