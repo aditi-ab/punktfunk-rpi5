@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.24.0"
+    "version": "0.25.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -997,7 +997,7 @@
           "library"
         ],
         "summary": "List the game library",
-        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns; `?platform=` to one platform (case-insensitive —\ninstalled-store titles are `PC`, custom/provider entries carry whatever was authored).",
+        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns; `?platform=` to one platform (case-insensitive —\ninstalled-store titles are `PC`, custom/provider entries carry whatever was authored).\n\n**The operator's own lane additionally sees the titles they have HIDDEN**, each carrying\n`hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The\nconsole needs them to offer \"un-hide\", and it is the only surface that does.",
         "operationId": "getLibrary",
         "parameters": [
           {
@@ -1021,13 +1021,13 @@
         ],
         "responses": {
           "200": {
-            "description": "Unified library across all stores",
+            "description": "Unified library across all stores (the operator's lane also gets hidden entries, flagged)",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/GameEntry"
+                    "$ref": "#/components/schemas/OperatorGameEntry"
                   }
                 }
               }
@@ -1290,6 +1290,79 @@
           },
           "500": {
             "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/hidden/{id}": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Hide or un-hide one library title",
+        "description": "Curation, not access control: a hidden title disappears from every play surface — the console\ngrid on a client, native clients, the GameStream app list, and launch resolution — while nothing\nis deleted and un-hiding restores it immediately. The operator's own console still lists it\n(flagged `hidden`) so it can be brought back.\n\nKeyed by the entry's stable `<store>:<external_id>` id, which survives re-scans and reconciles by\nconstruction (D2). The id is **not** validated against the current library on purpose: a title\ncan be legitimately absent at this moment (launcher closed, plugin mid-sync, drive unmounted),\nand refusing the operator's choice in that window would be worse than storing an id that\ncurrently matches nothing. Emits `library.changed` (source = the store) only on a real change.",
+        "operationId": "setLibraryEntryHidden",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The library entry id (e.g. `steam:70`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HiddenToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; the entry's visibility after the call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HiddenState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty entry id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the settings",
             "content": {
               "application/json": {
                 "schema": {
@@ -5553,6 +5626,37 @@
           }
         }
       },
+      "HiddenState": {
+        "type": "object",
+        "description": "What `setLibraryEntryHidden` echoes back.",
+        "required": [
+          "id",
+          "hidden"
+        ],
+        "properties": {
+          "hidden": {
+            "type": "boolean",
+            "description": "Its visibility after the call."
+          },
+          "id": {
+            "type": "string",
+            "description": "The entry id the call addressed."
+          }
+        }
+      },
+      "HiddenToggle": {
+        "type": "object",
+        "description": "Request body for `setLibraryEntryHidden`.",
+        "required": [
+          "hidden"
+        ],
+        "properties": {
+          "hidden": {
+            "type": "boolean",
+            "description": "Whether this title should be hidden from every play surface."
+          }
+        }
+      },
       "HookEntry": {
         "type": "object",
         "description": "One hook: fire `run` and/or `webhook` when an event matching `on` (+ `filter`) occurs.",
@@ -6338,6 +6442,23 @@
             "example": "1234"
           }
         }
+      },
+      "OperatorGameEntry": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameEntry"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "hidden": {
+                "type": "boolean",
+                "description": "The operator hid this title ([`set_entry_hidden`]) — omitted when false, so the shape only\ngrows for entries that actually are hidden."
+              }
+            }
+          }
+        ],
+        "description": "A library entry plus the operator's own view of it — today, whether they hid it.\n\nA separate type rather than a field on [`GameEntry`] for two reasons. It keeps the visibility\nanswer out of the providers entirely: a store parser has no opinion on what the operator hid, and\nadding `hidden: false` to all eight construction sites would imply it does. More importantly it\nmakes the lane rule a TYPE guarantee instead of a discipline — `GET /library` answers\n`Vec<GameEntry>` on every lane but the operator's, so a hidden entry cannot leak to a paired\nclient by someone forgetting a filter; there is no field there to leak.\n\n`flatten` keeps the wire shape identical to a plain entry with one extra key, so the console\nparses one model either way."
       },
       "PairedClient": {
         "type": "object",

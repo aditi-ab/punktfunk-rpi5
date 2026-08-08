@@ -1198,6 +1198,10 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/library/art/{id}/{kind}", true, true),
         ("GET", "/api/v1/library/scanners", true, false),
         ("PUT", "/api/v1/library/scanners/{id}", true, false),
+        // Hiding a title is the OPERATOR curating their own library: a plugin has no business
+        // deciding what the operator sees, and a paired client must not be able to hide a game on
+        // the host it is streaming from. Neither lane, unlike the scanner toggle above.
+        ("PUT", "/api/v1/library/hidden/{id}", false, false),
         ("POST", "/api/v1/library/custom", true, false),
         ("PUT", "/api/v1/library/custom/{id}", true, false),
         ("DELETE", "/api/v1/library/custom/{id}", true, false),
@@ -2046,6 +2050,40 @@ async fn library_scanner_list_and_unknown_toggle() {
         StatusCode::NOT_FOUND,
         "unknown scanner id must 404: {json}"
     );
+}
+
+/// A library id is `<store>:<external_id>`, so the hide route's path segment CONTAINS A COLON —
+/// and for Heroic (`heroic:legendary:<hash>`) it contains two.
+///
+/// This is the one thing about the endpoint that could be silently wrong: if the router did not
+/// match, or split on the colon, the console's hide button would 404 against an id the host itself
+/// produced. Asserting "not 404" is the whole point, so the body is deliberately INVALID — that
+/// stops at the JSON layer with a 4xx and never reaches the handler, which would otherwise write
+/// `library-hidden.json` into the developer's real config dir (the same reason the toggle test
+/// above only exercises its rejection path).
+#[tokio::test]
+async fn hide_route_matches_ids_containing_colons() {
+    let app = test_app(test_state(), None);
+    let put = |id: &str| {
+        axum::http::Request::put(format!("/api/v1/library/hidden/{id}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            // Not a `HiddenToggle` — rejected before the handler runs.
+            .body(Body::from(serde_json::json!({"nope": 1}).to_string()))
+            .unwrap()
+    };
+
+    for id in ["steam:70", "custom:abc", "heroic:legendary:fc0b13b7"] {
+        let (s, json) = send(&app, put(id)).await;
+        assert_ne!(
+            s,
+            StatusCode::NOT_FOUND,
+            "`{id}` must ROUTE — a colon is a legal path character and every library id has one: {json}"
+        );
+        assert!(
+            s.is_client_error(),
+            "a body that is not a HiddenToggle must be refused, not accepted: {s} {json}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------ library providers

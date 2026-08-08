@@ -45,6 +45,8 @@ export const Populated: Story = {
 			onEdit={noop}
 			onDelete={noop}
 			deletingId={null}
+			onToggleHidden={noop}
+			hidingId={null}
 		/>
 	),
 };
@@ -70,6 +72,29 @@ export const WithLaunchers: Story = {
 			onEdit={noop}
 			onDelete={noop}
 			deletingId={null}
+			onToggleHidden={noop}
+			hidingId={null}
+		/>
+	),
+};
+
+/**
+ * A hidden title, as only the operator's console ever sees it — every other surface has it filtered
+ * out upstream. The poster dims but the badge and the un-hide button stay at full contrast, because
+ * this card is the only route back.
+ */
+export const WithHidden: Story = {
+	render: () => (
+		<LibraryGrid
+			library={{
+				data: library.map((g, i) => (i === 1 ? { ...g, hidden: true } : g)),
+				...idle,
+			}}
+			onEdit={noop}
+			onDelete={noop}
+			deletingId={null}
+			onToggleHidden={noop}
+			hidingId={null}
 		/>
 	),
 };
@@ -81,6 +106,8 @@ export const Empty: Story = {
 			onEdit={noop}
 			onDelete={noop}
 			deletingId={null}
+			onToggleHidden={noop}
+			hidingId={null}
 		/>
 	),
 };
