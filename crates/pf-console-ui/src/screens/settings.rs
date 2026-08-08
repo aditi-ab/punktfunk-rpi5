@@ -258,16 +258,32 @@ impl SettingsScreen {
         }
     }
 
-    /// The rows of the CURRENT tab. Profiles is built from the catalog: one row per
-    /// profile, or the explainer placeholder while there are none.
-    fn row_ids(&self) -> Vec<RowId> {
+    /// The rows of the CURRENT tab, minus any whose setting has nothing to act on (see
+    /// [`row_applies`]). Profiles is built from the catalog: one row per profile, or the
+    /// explainer placeholder while there are none.
+    fn row_ids(&self, ctx: &Ctx) -> Vec<RowId> {
         if self.tab != PROFILES_TAB {
-            return TABS[self.tab].1.to_vec();
+            return TABS[self.tab]
+                .1
+                .iter()
+                .copied()
+                .filter(|id| row_applies(*id, ctx.settings))
+                .collect();
         }
         if self.profiles.is_empty() {
             vec![RowId::NoProfiles]
         } else {
             (0..self.profiles.len()).map(RowId::Profile).collect()
+        }
+    }
+
+    /// Pull the cursor back onto the list. Every tab but Profiles used to be a fixed length,
+    /// so this only mattered on entry ([`show_tab`]); the smoothness buffer's row now comes
+    /// and goes, and another writer (a desktop shell, a session's match-window persist) can
+    /// take it away between frames while this screen is open.
+    fn clamp_cursor(&mut self, len: usize) {
+        if self.list.cursor >= len {
+            self.list.jump_to(len.saturating_sub(1));
         }
     }
 
@@ -278,21 +294,22 @@ impl SettingsScreen {
 
     /// L1/R1 (and Tab/PgUp/PgDn) — move one tab, wrapping (the strip is a ring, like A's
     /// value cycle), keeping each tab's own cursor.
-    fn switch_tab(&mut self, delta: i32) -> Option<MenuPulse> {
+    fn switch_tab(&mut self, delta: i32, ctx: &Ctx) -> Option<MenuPulse> {
         let n = TABS.len() as i32;
-        self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize)
+        self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize, ctx)
     }
 
     /// Show `tab`, parking the cursor the outgoing tab was on. Also the pointer's path in:
     /// a press on a pill names a tab outright rather than a direction to step in.
-    fn show_tab(&mut self, tab: usize) -> Option<MenuPulse> {
+    fn show_tab(&mut self, tab: usize, ctx: &Ctx) -> Option<MenuPulse> {
         if tab >= TABS.len() {
             return None;
         }
         self.tab_cursors[self.tab] = self.list.cursor;
         self.tab = tab;
-        // Clamp the remembered cursor: the Profiles tab's length follows the catalog.
-        let len = self.row_ids().len();
+        // Clamp the remembered cursor: the Profiles tab's length follows the catalog, and
+        // Video's follows whether the smoothness buffer is offered.
+        let len = self.row_ids(ctx).len();
         self.list
             .jump_to(self.tab_cursors[self.tab].min(len.saturating_sub(1)));
         Some(MenuPulse::Move)
@@ -302,10 +319,11 @@ impl SettingsScreen {
     /// there is never meant for a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if let Some(tab) = self.strip.pointer(p) {
-            self.show_tab(tab);
+            self.show_tab(tab, ctx);
             return true;
         }
-        let ids = self.row_ids();
+        let ids = self.row_ids(ctx);
+        self.clamp_cursor(ids.len());
         let (msg, pulse) = self.list.pointer(p, ids.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -325,11 +343,12 @@ impl SettingsScreen {
                 fx.pop();
                 return None;
             }
-            MenuEvent::JumpBack => return self.switch_tab(-1),
-            MenuEvent::JumpForward => return self.switch_tab(1),
+            MenuEvent::JumpBack => return self.switch_tab(-1, ctx),
+            MenuEvent::JumpForward => return self.switch_tab(1, ctx),
             _ => {}
         }
-        let ids = self.row_ids();
+        let ids = self.row_ids(ctx);
+        self.clamp_cursor(ids.len());
         let (msg, pulse) = self.list.menu(ev, ids.len());
         self.apply_row(msg, pulse, &ids, ctx, fx)
     }
@@ -344,8 +363,14 @@ impl SettingsScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
+        // A cursor with no row under it can only mean the list shrank between the clamp above
+        // and here, which nothing does today — but indexing on the assumption would turn that
+        // into a panic in a shipping console rather than a dropped keypress.
+        let Some(&focused) = ids.get(self.list.cursor) else {
+            return pulse;
+        };
         // The Profiles rows navigate instead of editing the settings file.
-        match ids[self.list.cursor] {
+        match focused {
             RowId::Profile(i) => {
                 return match msg {
                     ListMsg::Activate => {
@@ -378,7 +403,7 @@ impl SettingsScreen {
         }
         match msg {
             ListMsg::Adjust(delta) => {
-                let changed = adjust(ids[self.list.cursor], delta, false, ctx);
+                let changed = adjust(focused, delta, false, ctx);
                 if changed {
                     ctx.settings.save();
                     Some(MenuPulse::Move)
@@ -388,7 +413,7 @@ impl SettingsScreen {
             }
             ListMsg::Activate => {
                 // A cycles forward WRAPPING, so every option is reachable one-handed.
-                if adjust(ids[self.list.cursor], 1, true, ctx) {
+                if adjust(focused, 1, true, ctx) {
                     ctx.settings.save();
                 }
                 pulse
@@ -397,8 +422,8 @@ impl SettingsScreen {
         }
     }
 
-    pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
-        let ids = self.row_ids();
+    pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
+        let ids = self.row_ids(ctx);
         // The shoulders always change section, so that hint leads on every row.
         let mut hints = vec![Hint::new(HintKey::Shoulders, "Section")];
         hints.extend(match ids.get(self.list.cursor) {
@@ -445,7 +470,8 @@ impl SettingsScreen {
             rect.right,
             rect.bottom - detail_h as f32,
         );
-        let ids = self.row_ids();
+        let ids = self.row_ids(ctx);
+        self.clamp_cursor(ids.len());
         let rows: Vec<RowSpec> = ids
             .iter()
             .map(|id| row_spec(*id, ctx, &self.profiles))
@@ -463,6 +489,24 @@ impl SettingsScreen {
             f64::from(rect.bottom) - detail_h + 6.0 * k,
             f64::from(rect.width()) * 0.8,
         );
+    }
+}
+
+/// Whether a row is OFFERED at all, as opposed to offered-but-inert.
+///
+/// The two are a real distinction. Echo cancellation and the pad rows follow a switch the user
+/// can see a line or two above them, so dimming them shows the relationship — dropping them
+/// would just make settings appear and disappear as the switch flips. The smoothness buffer is
+/// different: it is not a sub-setting of a switch, it is a knob on ONE of two intents, and
+/// under Lowest latency it names a quantity that doesn't exist. Every other settings surface —
+/// the GTK and WinUI shells, the Apple touch/tvOS screens, the Android touch screen — hides it
+/// there. This screen was the lone exception because its row list was fixed; it is rebuilt from
+/// this filter each frame now, and the row it drops sits directly BELOW the row that drops it,
+/// so the cursor is never under anything that moves.
+fn row_applies(id: RowId, s: &pf_client_core::trust::Settings) -> bool {
+    match id {
+        RowId::SmoothBuffer => s.present_priority == "smooth",
+        _ => true,
     }
 }
 
@@ -497,18 +541,17 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         _ => {}
     }
     let s = &ctx.settings;
-    // Several rows follow another: echo cancellation only means anything while the mic
-    // streams, the pad rows only while any controller is forwarded at all, and the
-    // smoothness buffer only while that intent is chosen. All go dim and inert otherwise
-    // — the same relationship the desktop shells draw by greying a row out (they hide the
-    // buffer row entirely; a fixed row list can't, and a row that vanished mid-list would
-    // move everything under the cursor).
+    // Two rows follow a switch a line or two above them: echo cancellation only means
+    // anything while the mic streams, and the pad rows only while any controller is
+    // forwarded at all. Both go dim and inert otherwise — the same relationship the desktop
+    // shells draw by greying a row out, and dimming (not dropping) is what shows the
+    // relationship. The smoothness buffer used to be listed here too; it is dropped from the
+    // list instead now — see [`row_applies`] for why that one is different.
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
         RowId::Pad | RowId::PadType | RowId::SystemButtons | RowId::GuideGesture => {
             s.gamepad_forwarding
         }
-        RowId::SmoothBuffer => s.present_priority == "smooth",
         _ => true,
     };
     let (header, label, value): (Option<&'static str>, &str, String) = match id {
@@ -848,7 +891,10 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, PRESENT_PRIORITIES.len(), delta, wrap)
                 .map(|i| s.present_priority = PRESENT_PRIORITIES[i].0.to_string())
         }
-        // Inert unless smoothness is chosen — a boundary thud, matching the dimmed row.
+        // Under Lowest latency the row isn't offered at all ([`row_applies`]), so this branch
+        // is only reachable if another writer flipped the intent between the frame that built
+        // the list and the keypress that lands here — a boundary thud, not a stored value
+        // nothing will read.
         RowId::SmoothBuffer => {
             if s.present_priority == "smooth" {
                 let cur = SMOOTH_BUFFERS
@@ -1093,9 +1139,6 @@ mod tests {
         fake_home();
         let mut s = SettingsScreen::with_profiles(Vec::new());
         rendered(&mut s);
-        // Row 0 of the leading tab is Resolution, whose first step is Native → Match
-        // window: one field, one unambiguous effect to assert on.
-        assert_eq!(s.row_ids()[0], RowId::Resolution);
         let first = s.list.row_rect(0).expect("the list drew its rows");
         let (mut settings, pads) = ctx_parts();
         settings.save(); // seat the fake HOME's file — `apply_row` rebases on it
@@ -1109,6 +1152,9 @@ mod tests {
             device_name: "t",
             t: 0.0,
         };
+        // Row 0 of the leading tab is Resolution, whose first step is Native → Match
+        // window: one field, one unambiguous effect to assert on.
+        assert_eq!(s.row_ids(&ctx)[0], RowId::Resolution);
         let mut fx = Outbox::default();
         assert!(!ctx.settings.match_window);
         assert!(s.pointer(press(first), &mut ctx, &mut fx));
@@ -1232,13 +1278,12 @@ mod tests {
         assert!(ctx.settings.echo_cancel);
     }
 
-    /// The smoothness buffer follows the presentation intent, exactly as echo cancellation
-    /// follows the mic: dimmed and inert under Lowest latency (where holding frames means
-    /// nothing), live under Smoothness. The desktop shells hide the row instead; a fixed
-    /// row list dims it, because a row vanishing mid-list would shift everything under the
-    /// cursor.
+    /// The smoothness buffer is OFFERED only under Smoothness — under Lowest latency it names
+    /// a quantity that doesn't exist, so the row is gone from the Video tab rather than sitting
+    /// there dimmed. This is what the GTK and WinUI shells and the Apple/Android screens have
+    /// always done; this screen was the exception until its row list stopped being fixed.
     #[test]
-    fn smoothness_buffer_follows_the_intent() {
+    fn smoothness_buffer_is_offered_only_under_smoothness() {
         let (mut settings, pads) = ctx_parts();
         assert_eq!(settings.present_priority, "latency", "the shipped default");
         let library = crate::library::LibraryShared::default();
@@ -1251,24 +1296,93 @@ mod tests {
             device_name: "t",
             t: 0.0,
         };
-        assert!(!row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        s.tab = TABS
+            .iter()
+            .position(|(name, _)| *name == "Video")
+            .expect("the Video tab");
+
+        let video = s.row_ids(&ctx);
+        assert!(
+            !video.contains(&RowId::SmoothBuffer),
+            "latency hides the buffer row: {video:?}"
+        );
+        assert!(video.contains(&RowId::PresentPriority), "the intent stays");
+        // Even reached out of band it writes nothing — the list it came from is a frame old.
         assert!(
             !adjust(RowId::SmoothBuffer, 1, false, &mut ctx),
             "latency intent = thud"
         );
         assert_eq!(ctx.settings.smooth_buffer, 0, "and nothing was written");
 
-        // Stepping the intent to Smoothness brings the buffer row to life.
+        // Stepping the intent to Smoothness brings the row into the list, directly under it.
         assert!(adjust(RowId::PresentPriority, 1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "smooth");
-        assert!(row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
+        let video = s.row_ids(&ctx);
+        let intent = video
+            .iter()
+            .position(|id| *id == RowId::PresentPriority)
+            .expect("the intent row");
+        assert_eq!(
+            video.get(intent + 1),
+            Some(&RowId::SmoothBuffer),
+            "the row that comes and goes sits BELOW the row that decides it, so the cursor \
+             never has anything move out from under it"
+        );
         assert!(adjust(RowId::SmoothBuffer, 1, false, &mut ctx));
         assert_eq!(ctx.settings.smooth_buffer, 1);
 
-        // The intent wraps back and the row goes inert again.
+        // The intent wraps back and the row leaves again — with the cursor parked on the
+        // intent row, which is where a user who just stepped it necessarily is.
+        s.list.cursor = intent;
         assert!(adjust(RowId::PresentPriority, -1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "latency");
-        assert!(!row_spec(RowId::SmoothBuffer, &ctx, &[]).enabled);
+        let video = s.row_ids(&ctx);
+        assert!(!video.contains(&RowId::SmoothBuffer));
+        assert_eq!(
+            video.get(s.list.cursor),
+            Some(&RowId::PresentPriority),
+            "the cursor is still on the row the user was stepping"
+        );
+    }
+
+    /// A cursor parked past the end of a list that shrank underneath it is pulled back rather
+    /// than indexed with — the console must not panic because another writer changed the
+    /// presentation intent while its settings screen was open.
+    #[test]
+    fn a_shrinking_list_pulls_the_cursor_back() {
+        // `apply_row` rebases on the FILE before acting, so this has to be seated — and
+        // seated with the SHRUNKEN list's intent, which is the state being tested.
+        fake_home();
+        let (mut settings, pads) = ctx_parts();
+        settings.present_priority = "latency".into();
+        settings.save();
+        settings.present_priority = "smooth".into();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        s.tab = TABS
+            .iter()
+            .position(|(name, _)| *name == "Video")
+            .expect("the Video tab");
+        // Park on the last row while the buffer row is still there…
+        s.list.cursor = s.row_ids(&ctx).len() - 1;
+        let parked = s.list.cursor;
+        // …then take it away behind the screen's back, as a desktop shell would.
+        ctx.settings.present_priority = "latency".into();
+        let mut fx = Outbox::default();
+        let pulse = s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        assert!(pulse.is_some(), "the press was routed, not dropped");
+        assert!(s.list.cursor < parked, "the cursor came back onto the list");
+        assert!(fx.nav.is_none());
     }
 
     #[test]
@@ -1392,7 +1506,7 @@ mod tests {
             ("p2".into(), "Game".into()),
         ]);
         s.tab = PROFILES_TAB;
-        let ids = s.row_ids();
+        let ids = s.row_ids(&ctx);
         assert_eq!(ids, vec![RowId::Profile(0), RowId::Profile(1)]);
 
         let spec = row_spec(RowId::Profile(0), &ctx, &s.profiles);
@@ -1438,7 +1552,7 @@ mod tests {
         };
         let mut s = SettingsScreen::with_profiles(Vec::new());
         s.tab = PROFILES_TAB;
-        let ids = s.row_ids();
+        let ids = s.row_ids(&ctx);
         assert_eq!(ids, vec![RowId::NoProfiles]);
         let spec = row_spec(RowId::NoProfiles, &ctx, &s.profiles);
         assert!(!spec.enabled);

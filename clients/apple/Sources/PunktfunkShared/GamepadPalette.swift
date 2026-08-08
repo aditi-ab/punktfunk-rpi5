@@ -65,13 +65,25 @@ public struct GamepadPalette: Identifiable, Equatable, Sendable {
         SIMD3(0.22, 0.38, 0.86), SIMD3(0.53, 0.47, 0.96),
     ]
 
-    /// The twelve shipped palettes: the brand default, five more dark fields, then six pale
+    /// The thirteen shipped palettes: the brand default, six more dark fields, then six pale
     /// ones. Cycling order runs dark → light, so stepping the row walks the whole range one way.
     public static let all: [GamepadPalette] = [
         // --- dark fields (white ink) ---
         GamepadPalette(
             id: "violet", name: "Violet", stops: [],
             ground: SIMD3(0.075, 0.060, 0.160), accent: SIMD3(0.525, 0.471, 0.961), light: false),
+        GamepadPalette(
+            // For OLED and AMOLED panels, where a black pixel is a pixel switched off — no glow,
+            // no power. The first two stops are literally (0,0,0), so the shaded half of the
+            // field is genuinely off rather than "very dark grey", and the ground is pure black
+            // too: the calm mix on the form screens lifts toward nothing. What is left is a
+            // faint indigo→violet ember in the bright corner. The accent stays the brand violet
+            // — focus has to be findable on black.
+            id: "oled", name: "OLED",
+            stops: [SIMD3(0.000, 0.000, 0.000), SIMD3(0.000, 0.000, 0.000),
+                    SIMD3(0.010, 0.020, 0.100), SIMD3(0.045, 0.016, 0.115),
+                    SIMD3(0.120, 0.024, 0.130)],
+            ground: SIMD3(0, 0, 0), accent: SIMD3(0.525, 0.471, 0.961), light: false),
         GamepadPalette(
             // Deep indigo climbing through violet into a hot magenta.
             id: "nebula", name: "Nebula",

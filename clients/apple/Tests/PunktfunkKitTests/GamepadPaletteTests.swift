@@ -46,12 +46,29 @@ final class GamepadPaletteTests: XCTestCase {
     func testTableMatchesTheOtherClients() {
         XCTAssertEqual(
             GamepadPalette.all.map(\.id),
-            ["violet", "nebula", "abyss", "ember", "moss", "graphite",
+            ["violet", "oled", "nebula", "abyss", "ember", "moss", "graphite",
              "holo", "sunset", "bloom", "dawn", "mint", "opal"])
         // Dark fields lead, pale ones follow, so stepping the row walks one direction.
         let firstLight = GamepadPalette.all.firstIndex { $0.light }
-        XCTAssertEqual(firstLight, 6)
-        XCTAssertTrue(GamepadPalette.all.dropFirst(6).allSatisfy(\.light))
+        XCTAssertEqual(firstLight, 7)
+        XCTAssertTrue(GamepadPalette.all.dropFirst(7).allSatisfy(\.light))
+    }
+
+    /// OLED is the one palette whose selling point is measurable: it has to be genuinely black,
+    /// not merely the darkest of the dark fields.
+    func testOLEDIsActuallyBlack() {
+        let oled = GamepadPalette.named("oled")
+        XCTAssertEqual(oled.ground, SIMD3(0, 0, 0), "the calm lift must be nothing")
+        let cells = oled.meshColors
+        XCTAssertGreaterThanOrEqual(
+            cells.filter { luma($0) == 0 }.count, 3,
+            "the shaded corner has to be switched off, not dimmed")
+        let mean = cells.map(luma).reduce(0, +) / Double(cells.count)
+        let darkestOther = GamepadPalette.all
+            .filter { $0.id != "oled" }
+            .map { p in p.meshColors.map(luma).reduce(0, +) / Double(p.meshColors.count) }
+            .min() ?? 0
+        XCTAssertLessThan(mean, darkestOther / 2, "oled is barely darker than \(darkestOther)")
     }
 
     /// A palette must read as SEVERAL hues, not one hue at several brightnesses — that was

@@ -75,6 +75,13 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
+    /// When the switch above takes over — read (and shown) only while it is on.
+    @AppStorage(DefaultsKey.gamepadUIMode) var gamepadUIMode =
+        GamepadUIEnvironment.modeWhenConnected
+    /// The gamepad UI's background palette. Edited here on tvOS only (see `tvBody`) — every other
+    /// platform reaches it through the gamepad settings screen, which an Apple TV without a
+    /// controller cannot open.
+    @AppStorage(DefaultsKey.uiPalette) var uiPalette = "violet"
     @AppStorage(DefaultsKey.autoWake) var autoWakeEnabled = true
     @AppStorage(DefaultsKey.backgroundKeepAlive) var backgroundKeepAlive = false
     @AppStorage(DefaultsKey.backgroundTimeoutMinutes) var backgroundTimeoutMinutes = 10
@@ -488,6 +495,22 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Gamepad-optimized browsing",
                     options: [("On", "on"), ("Off", "off")], selection: gamepadUIEnabledTag)
+                // Hidden while the switch above is off — see the touch settings' identical gate.
+                if gamepadUIEnabled {
+                    TVSelectionRow(
+                        title: "Show it",
+                        options: SettingsOptions.gamepadUIModes, selection: $gamepadUIMode)
+                    // The Apple TV's ONLY route to the shared `ui_palette`. Everywhere else the
+                    // Background row lives on the gamepad settings screen, which is reached from
+                    // the gamepad launcher — and on tvOS that launcher needs an extended-profile
+                    // controller, so an Apple TV driven by the Siri Remote alone could not reach
+                    // the palettes at all. It belongs beside "Show it" because both describe the
+                    // same interface: this row is what that interface looks like once it is up.
+                    TVSelectionRow(
+                        title: "Background",
+                        options: GamepadPalette.all.map { (label: $0.name, tag: $0.id) },
+                        selection: $uiPalette)
+                }
                 tvCaption(Self.controllersFooter)
                 NavigationLink("About") { AboutView() }
                     .padding(.top, 8)

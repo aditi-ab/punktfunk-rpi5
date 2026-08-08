@@ -96,11 +96,12 @@ those hiccups out, at that buffer's worth of added delay. Linux and Windows apps
 home; the Apple and Android apps have carried the same setting for a while, and it is stored
 under the same name, so a [profile](/docs/profiles-and-links) means the same thing on every device.
 
-**Smoothness buffer** — *default: Automatic (two frames).* Only shown under **Smoothness**. How
-many frames are held back before showing. Each frame absorbs roughly one screen refresh of network
-hiccup and costs one refresh of delay — so on a 120 Hz screen, two frames is about 17 ms of extra
-delay bought against 17 ms of jitter. If you never see stutter, you don't need this. Wherever
-**Prioritize** is offered, and greyed out until you pick Smoothness.
+**Smoothness buffer** — *default: Automatic (two frames).* How many frames are held back before
+showing. Each frame absorbs roughly one screen refresh of network hiccup and costs one refresh of
+delay — so on a 120 Hz screen, two frames is about 17 ms of extra delay bought against 17 ms of
+jitter. If you never see stutter, you don't need this. The row appears wherever **Prioritize** is
+offered, and only once you have picked **Smoothness** — under Lowest latency there are no held
+frames for it to count, so it isn't shown at all.
 
 **V-Sync** — *default: on.* Tear-free presentation. Turning it off asks the GPU to show each frame
 the instant it's ready instead of waiting for the screen's next refresh: the lowest delay a display
@@ -263,6 +264,43 @@ when you return to the host list. The console home carries the row for the deskt
 shares the store — a Gaming-Mode launch is fullscreen whatever it says. iPhone, iPad, Apple TV
 and Android have no equivalent.
 
+## Interface
+
+These change how the client itself looks and behaves. None of them touches a stream, so none of them
+can live in a [profile](/docs/profiles-and-links) — they are decisions about the device in front of
+you.
+
+**Gamepad-optimized browsing** — *default: on.* Swaps the touch or desktop home for the
+controller-optimized one: the host carousel, larger focus targets, a swipeable cover browser, and
+settings you can step with a thumbstick. The Apple and Android apps have this switch. Turn it off to
+stay in the touch interface even with a pad in your hands. On Linux, Windows and the Steam Deck the
+controller-optimized home is a separate entry point rather than a switch, so there is nothing to
+turn off. An Android TV is always in this mode — its remote is the only input it has.
+
+**Show it** — *default: With a controller.* Only shown while the switch above is on, and it decides
+*when* that switch takes effect. **With a controller** is the long-standing behaviour: the
+controller-optimized home appears as a pad connects and the touch interface returns when the last one
+disconnects. **Always** keeps the controller-optimized home either way — for a phone or tablet that
+lives docked to a TV, where the pad isn't always awake but the couch layout is always the one you
+want. Apple and Android. (An Android TV is in that mode regardless, so the choice changes nothing
+there.)
+
+**Background** — *default: Violet.* The colour family the controller-optimized home's living backdrop
+drifts through. Thirteen of them: seven dark fields — **Violet**, **OLED**, **Nebula**, **Abyss**,
+**Ember**, **Moss**, **Graphite** — then six pale ones, **Holo**, **Sunset**, **Bloom**, **Dawn**,
+**Mint** and **Opal**, which flip the whole interface to dark text on a light field. The backdrop
+recolours as you step the row, so pick by looking. **OLED** is the one with a practical point rather
+than a decorative one: it is true black — most of the frame is pixels switched off, which on an OLED
+or AMOLED panel means no glow and no power drawn, with only a faint violet ember left in one corner.
+Stored under the same name on every client, so a phone, a Deck and a desktop set to Mint all look
+alike. Appearance only — nothing about a stream depends on it.
+
+The row lives in the controller-optimized settings themselves — the screen you reach with **X** from
+the controller-optimized home — on every platform that has one, which includes the Steam Deck and the
+Linux and Windows console home. The Apple TV is the exception: it carries **Background** in its
+ordinary Settings instead, next to **Show it**, because its controller-optimized home needs a real
+controller to open and the palettes would otherwise be unreachable from the Siri Remote.
+
 ## Overlay
 
 **Statistics overlay** — *default: Normal.* Four tiers — Off, Compact, Normal, Detailed — each a
@@ -292,6 +330,10 @@ stay global and **cannot be put in a settings profile**:
   profile forwards.
 - **Auto-wake on connect** and **Show game library** — decisions about this device and this network,
   not about how a given host is streamed.
+- Everything under **Interface** — **Gamepad-optimized browsing**, **Show it** and **Background**.
+  How this client looks and which layout it wears has nothing to do with how a host streams to it,
+  so binding them to a host would only make the same device change appearance depending on what it
+  connected to.
 
 One switch you might expect here isn't in Settings at all: **Share clipboard** lives in a saved
 host's own edit sheet, because handing a machine your clipboard is a decision about that one host —

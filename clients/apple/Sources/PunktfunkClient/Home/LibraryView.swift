@@ -32,9 +32,12 @@ struct LibraryView: View {
     // setting off) every platform keeps the plain-grid presentation of this same view.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    @AppStorage(DefaultsKey.gamepadUIMode) private var gamepadUIMode =
+        GamepadUIEnvironment.modeWhenConnected
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
-            gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
+            gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled,
+            mode: gamepadUIMode)
     }
     #endif
 
@@ -77,6 +80,16 @@ struct LibraryView: View {
                     LibraryBackCatcher(active: controllerActive) { (onClose ?? { dismiss() })() }
                 }
             }
+            #endif
+            #if os(iOS) || os(macOS) || os(tvOS)
+            // Published HERE, not just inside the coverflow, because the coverflow is only one of
+            // four things this view renders: the loading spinner, the error state and the empty
+            // state sit above it, as do the navigation title and toolbar. On iOS those are wrapped
+            // by GamepadLibraryScreen, which inks the whole thing; tvOS and macOS present this view
+            // directly in a NavigationStack, so under a pale palette every one of them kept the
+            // system's own (dark, on an Apple TV) chrome over a light field. Off when the gamepad
+            // UI isn't drawing — the plain grid belongs to the system background.
+            .gamepadPaletteInk(gamepadUIActive)
             #endif
     }
 

@@ -99,6 +99,10 @@ struct ContentView: View {
     // with no (extended) controller attached tvOS falls back to HomeView as before.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    /// When the switch above takes over — "connected" (default) or "always". See
+    /// `GamepadUIEnvironment`.
+    @AppStorage(DefaultsKey.gamepadUIMode) private var gamepadUIMode =
+        GamepadUIEnvironment.modeWhenConnected
     /// Auto-wake on connect (Settings → General). On (default): a dial to an offline saved host
     /// fires Wake-on-LAN up front and falls into the "Waking…" wait if the dial fails. Off: connects
     /// go straight through with no wake. The explicit "Wake Host" action is unaffected either way.
@@ -113,7 +117,8 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
-            gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
+            gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled,
+            mode: gamepadUIMode)
     }
 
     // The body is split in two — `driven` (the screen plus its lifecycle drivers and sheets) and

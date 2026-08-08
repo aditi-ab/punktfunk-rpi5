@@ -176,16 +176,23 @@ public enum DefaultsKey {
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
     public static let hudPlacement = "punktfunk.hudPlacement"
     /// iOS/iPadOS/macOS: switch the host list, settings and game library to a controller-friendly
-    /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library)
-    /// whenever a gamepad is connected. On by default; see `GamepadUIEnvironment.isActive`.
+    /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library).
+    /// On by default; WHEN it takes over is `gamepadUIMode`. See `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
+    /// When `gamepadUIEnabled` actually takes over: `"connected"` (the default — only while a
+    /// usable controller is attached, the behaviour this switch has always had) or `"always"`,
+    /// for someone who prefers the console layout with no pad in reach (a TV-connected iPad, a
+    /// Mac driven from the couch). Read only while `gamepadUIEnabled` is on, which is why the
+    /// settings rows hide it when the switch is off. Anything unrecognized reads as
+    /// `"connected"`. A device preference, never part of a stream profile.
+    public static let gamepadUIMode = "punktfunk.gamepadUIMode"
     /// Which colour family the gamepad UI's living backdrop drifts through — a
-    /// `GamepadPalette` id ("violet" = the brand default, then "tide"/"forest"/"ember"/
-    /// "rose"/"graphite"). The cross-client `ui_palette` key: the desktop console and the
-    /// Android client carry the same table under the same names. Presentation only, so it is
-    /// a device preference and never part of a stream profile. An unknown value reads as the
-    /// default rather than failing — a newer client may have shipped a palette this build
-    /// doesn't know.
+    /// `GamepadPalette` id ("violet" = the brand default, then "oled"/"nebula"/"abyss"/"ember"/
+    /// "moss"/"graphite", then the pale ones). The cross-client `ui_palette` key: the desktop
+    /// console and the Android client carry the same table under the same names. Presentation
+    /// only, so it is a device preference and never part of a stream profile. An unknown value
+    /// reads as the default rather than failing — a newer client may have shipped a palette this
+    /// build doesn't know.
     public static let uiPalette = "punktfunk.uiPalette"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where

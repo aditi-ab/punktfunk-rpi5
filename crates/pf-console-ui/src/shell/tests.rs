@@ -329,7 +329,7 @@ fn dump_console_screens() {
     for _ in 0..5 {
         s.handle_menu(MenuEvent::JumpForward);
     }
-    for id in ["violet", "ember", "abyss", "holo", "sunset", "mint"] {
+    for id in ["violet", "oled", "ember", "abyss", "holo", "sunset", "mint"] {
         s.settings.ui_palette = id.to_string();
         dump(&mut s, 40, 8, &format!("03-settings-{id}"), true);
     }

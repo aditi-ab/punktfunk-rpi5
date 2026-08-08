@@ -95,24 +95,19 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     private var materialWash: Color { ink.glass(ink.isLight ? 0.55 : 0.40) }
 
     func body(content: Content) -> some View {
+        // The scheme goes on the WHOLE modified view, not just the fill inside `.background {}`.
+        // Scoped to the fill it frosts the material correctly and stops there, so a system colour
+        // in the row's own content (a `.secondary` label, a `.bordered` button) still resolved
+        // against the device appearance — which is how the pale palettes came out light-on-light
+        // on tvOS, whose appearance is always Dark. The 26 branch had it right all along; the
+        // tvOS and pre-26 branches were the odd ones out.
         #if os(tvOS)
         // ALWAYS the material fallback on tvOS: the gamepad settings list is 15+ of these
         // surfaces, and live Liquid Glass per row made the whole screen visibly laggy on the
         // Apple TV's GPU (same class of call GlassProminentButton already makes — glass fights
         // the 10-foot platform). The wash and tint ride overlays — two flat fills, no GPU cost.
-        content.background {
-            shape.fill(.ultraThinMaterial)
-                .environment(\.colorScheme, scheme)
-                .overlay { shape.fill(materialWash) }
-                .overlay {
-                    if let tint { shape.fill(tint) }
-                }
-        }
-        #else
-        if #available(iOS 26, macOS 26, *) {
-            content.glassEffect(glass, in: shape).environment(\.colorScheme, scheme)
-        } else {
-            content.background {
+        content
+            .background {
                 shape.fill(.ultraThinMaterial)
                     .environment(\.colorScheme, scheme)
                     .overlay { shape.fill(materialWash) }
@@ -120,6 +115,21 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
                         if let tint { shape.fill(tint) }
                     }
             }
+            .environment(\.colorScheme, scheme)
+        #else
+        if #available(iOS 26, macOS 26, *) {
+            content.glassEffect(glass, in: shape).environment(\.colorScheme, scheme)
+        } else {
+            content
+                .background {
+                    shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, scheme)
+                        .overlay { shape.fill(materialWash) }
+                        .overlay {
+                            if let tint { shape.fill(tint) }
+                        }
+                }
+                .environment(\.colorScheme, scheme)
         }
         #endif
     }
@@ -173,11 +183,14 @@ private struct ConsoleGlassBackground<S: Shape>: ViewModifier {
                     in: shape)
                 .environment(\.colorScheme, scheme)
         } else {
-            content.background {
-                shape.fill(.regularMaterial)
-                    .environment(\.colorScheme, scheme)
-                    .overlay { shape.fill(ink.glass(ink.isLight ? 0.55 : 0.40)) }
-            }
+            // Same hoist as ConsoleGlass: the content needs the scheme too, not only the frost.
+            content
+                .background {
+                    shape.fill(.regularMaterial)
+                        .environment(\.colorScheme, scheme)
+                        .overlay { shape.fill(ink.glass(ink.isLight ? 0.55 : 0.40)) }
+                }
+                .environment(\.colorScheme, scheme)
         }
     }
 }
