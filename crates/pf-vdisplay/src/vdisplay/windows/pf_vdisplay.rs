@@ -1106,10 +1106,12 @@ const BRIEF_RETRY: Duration = Duration::from_secs(3);
 /// them rather than N interleaved ones — each of which tears down the stack the others are waiting
 /// on. The second caller through typically finds the interface already up and returns at once.
 ///
-/// Taken ONLY by [`ensure_available`], which holds no manager lock, and released before the retire
-/// hook below takes the manager's `device` mutex. That is what keeps the lock order one-way:
-/// [`VdisplayDriver::open`] runs *inside* that same `device` mutex, so if it could also take this
-/// lock the two orders would invert and deadlock. It cannot — it never reloads.
+/// Taken ONLY by [`ensure_available`], which holds no manager lock. The lock order is one-way —
+/// `RECOVERY` → `device`: the recovery's handle-release hooks (`invalidate_cached_device`, which
+/// drops the manager's reference so the control handle can CLOSE before the PnP cycle) take the
+/// `device` mutex while this is held. It must stay one-way: [`VdisplayDriver::open`] runs *inside*
+/// that same `device` mutex, so if it could also take this lock the two orders would invert and
+/// deadlock. It cannot — it never reloads.
 static RECOVERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [`is_available`], with self-heal — and with PATIENCE, which is the part that matters after a
@@ -1125,10 +1127,11 @@ pub fn ensure_available() -> Result<()> {
         let _serialize = RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
         wait_for_interface(NOT_READY_GRACE, true)
     };
-    // OUTSIDE the recovery lock, by the ordering contract on `RECOVERY`. A reload tore the driver
-    // stack down and back up, so any control handle a previous session cached is dead by
-    // construction — retire it while we know that for certain, rather than leaving the next session
-    // to discover it by having an IOCTL fail. No-op before any backend opened the device.
+    // A reload tore the driver stack down and back up, so any control handle cached MEANWHILE (a
+    // racing open during the arrival window) is dead by construction — retire it while we know
+    // that for certain, rather than leaving the next session to discover it by having an IOCTL
+    // fail. Usually a no-op now: the recovery path already released the manager's reference
+    // before the reload (the handle-drain that lets the PnP cycle proceed at all).
     if reloaded {
         super::manager::invalidate_cached_device(
             "the pf-vdisplay adapter was reloaded (hostless-zombie recovery)",
@@ -1175,12 +1178,33 @@ fn wait_for_interface(not_ready_grace: Duration, reload: bool) -> (Result<OwnedH
         // Track how long we have seen NOTHING. Reset by any sighting, so a device that flickers
         // between absent and not-ready is treated as the transition it is.
         if probe.is_absent() {
+            if absent_since.is_none() && reload {
+                // First absent sighting on the recovery path: drop the manager's reference to the
+                // (dead) control device NOW, so the ABSENT_SETTLE below doubles as the drain window
+                // for every outstanding `Arc` clone — the handle then actually CLOSES before the
+                // reload runs. An open control handle is exactly what vetoes the PnP disable (and
+                // can wedge the pnputil restart) that the reload leans on; reset-pf-vdisplay.ps1
+                // stops the whole host service to get the same release (field 2026-08-08: every
+                // reload on a woken box came back REFUSED `Generic failure`). Gated on `reload`:
+                // the BRIEF_RETRY caller runs inside the manager's `device` mutex, where taking it
+                // again would deadlock — and that caller never reloads anyway.
+                super::manager::invalidate_cached_device(
+                    "control interface absent — releasing the host's own device handle ahead of a \
+                     possible adapter reload",
+                );
+            }
             absent_since.get_or_insert_with(Instant::now);
         } else {
             absent_since = None;
         }
         let absent_long_enough = absent_since.is_some_and(|t| t.elapsed() >= ABSENT_SETTLE);
         if reload && !reloaded && (absent_long_enough || Instant::now() >= deadline) {
+            // The not-ready path reaches here without the absent-sighting release above — drop the
+            // manager's reference now for the same reason (idempotent: a second call is a no-op).
+            super::manager::invalidate_cached_device(
+                "adapter reload imminent — releasing the host's own device handle (open handles \
+                 veto the PnP cycle)",
+            );
             match reload_vdisplay_adapter() {
                 // No devnode at all — waiting cannot conjure a driver. Fail immediately rather than
                 // burning the arrival window on a box that simply does not have it installed.
