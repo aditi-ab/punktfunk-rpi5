@@ -100,14 +100,27 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
 /// `reset-pf-vdisplay.ps1` step 2 (proven on-box). Best-effort + idempotent: only NOT-present nodes
 /// (`Status != OK`) are removed, so the LIVE session's monitor (`Status OK`) is never touched; any
 /// failure is logged and swallowed. Returns the number removed.
+///
+/// The outcome is logged UNCONDITIONALLY, as found + removed: the old script counted only removals
+/// and the host spoke only when that count was positive, so a reap whose pnputil never launched and
+/// a box with no ghosts produced byte-identical logs (silence) — the same vacuous-signal family as
+/// the `status=OK` trap [`reload_vdisplay_adapter`] answers — while ghosts ratcheted toward the
+/// wedge with every sleep cycle.
 fn reap_ghost_monitors() -> u32 {
     // Mirrors reset-pf-vdisplay.ps1 step 2. powershell is always present for the SYSTEM service; the
     // matched tokens ('OK', 'punktfunk', the InstanceId) are locale-invariant, so this is safe on a
     // non-English box (unlike a .ps1 *file* read in the machine codepage).
+    //
+    // pnputil is resolved by full path and `$LASTEXITCODE` pre-seeded to failure before every
+    // launch, exactly like the reload path below: a LocalSystem service's PATH need not include
+    // System32 (and a SYSTEM process must not trust PATH anyway — a planted `pnputil.exe` would run
+    // elevated), and the old bare-name call failed INVISIBLY there — `SilentlyContinue` swallowed
+    // the miss, no exit code was written, and the ghosts stayed to wedge `IOCTL_ADD` at 0x80070490.
     const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $g = Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }; \
-        $n = 0; foreach ($d in $g) { pnputil /remove-device $d.InstanceId *> $null; if ($LASTEXITCODE -eq 0) { $n++ } }; \
-        Write-Output $n";
+        $g = @(Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }); \
+        $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); \
+        $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
+        Write-Output ($g.Count.ToString() + ' ' + $n)";
     // Resolve powershell by full path — the LocalSystem service's PATH is not guaranteed to include
     // System32 — with a bare-name fallback.
     let ps = std::env::var("SystemRoot")
@@ -125,22 +138,46 @@ fn reap_ghost_monitors() -> u32 {
         .output()
     {
         Ok(o) => {
-            let n = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0);
-            if n > 0 {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            let Some((found, removed)) = parse_reap_output(&raw) else {
                 tracing::warn!(
-                    reaped = n,
+                    output = %raw.trim(),
+                    "pf-vdisplay: ghost-monitor reap died before reporting — ghost nodes (if any) still pin IddCx monitor slots"
+                );
+                return 0;
+            };
+            if found == 0 {
+                tracing::info!("pf-vdisplay: no ghost (not-present) virtual-monitor nodes to reap");
+            } else if removed < found {
+                tracing::warn!(
+                    found,
+                    removed,
+                    "pf-vdisplay: ghost-monitor reap could NOT remove every ghost node — the leftovers keep pinning IddCx monitor slots toward the 0x80070490 wedge"
+                );
+            } else {
+                tracing::warn!(
+                    reaped = removed,
                     "pf-vdisplay: reaped ghost (not-present) virtual-monitor nodes — IddCx slot-exhaustion prevention"
                 );
             }
-            n
+            removed
         }
         Err(e) => {
             tracing::warn!(error = %e, "pf-vdisplay: ghost-monitor reap could not spawn powershell");
             0
         }
+    }
+}
+
+/// Parse [`reap_ghost_monitors`]'s script output — `"<found> <removed>"`. Split out to be testable
+/// without a box, like [`classify_reload_output`]: the field failure this answers was a reap whose
+/// outcome could not be decoded from the log at all, so the decoding is worth pinning down. `None`
+/// = the script died before reporting (callers treat that as "removed nothing", loudly).
+fn parse_reap_output(out: &str) -> Option<(u32, u32)> {
+    let mut it = out.split_whitespace().map(str::parse::<u32>);
+    match (it.next(), it.next()) {
+        (Some(Ok(found)), Some(Ok(removed))) => Some((found, removed)),
+        _ => None,
     }
 }
 
@@ -178,6 +215,14 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
     // device description — locale-invariant). Same spawn shape as `reap_ghost_monitors` above; the
     // reported tokens are ours, so parsing them is locale-invariant too.
     //
+    // The selector prefers LIVE devnodes: `Get-PnpDevice` also lists not-present PHANTOMS (an
+    // upgrade/reinstall leftover), and the old `Select-Object -First 1` could hand every recovery
+    // attempt a phantom — whose disable AND restart both fail — while a live node sat unexamined.
+    // A phantom-only state gets its own truthful refusal: no reload lever can revive a devnode
+    // record whose device is GONE; only re-creating the node (reinstall) can. `Present` is the
+    // authoritative bit, with `Status -ne 'Unknown'` as the fallback should it read null; live
+    // `OK` nodes sort ahead of problem-state ones.
+    //
     // Every step that can fail is `-ErrorAction Stop` inside a `try` — the old script ran the whole
     // cycle under `SilentlyContinue` and then reported `(Get-PnpDevice …).Status`, which reports the
     // DEVICE, not the cycle: a disable that was refused left the device untouched, started, and
@@ -188,10 +233,19 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
     // let "never ran" read as "returned 0". Pre-seeding a failure means only a real exit 0 reports a
     // reload. pnputil is resolved by full path — a LocalSystem service's PATH need not include
     // System32.
+    //
+    // The REFUSED line carries the evidence a field log needs to tell the failure modes apart
+    // (2026-08-08: a woken box logged only `REFUSED Generic failure` — the WMI catch-all — leaving
+    // handle-veto vs phantom vs problem-state undecidable): how many devnodes matched and how many
+    // are live, the chosen node's PnP Status + ConfigManager problem code, and the pnputil
+    // /restart-device exit code the old script threw away (3010 = needs a reboot, which is its own
+    // diagnosis).
     const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $ad = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' } | Select-Object -First 1; \
-        if (-not $ad) { Write-Output 'ABSENT'; exit }; \
-        $id = $ad.InstanceId; $err = ''; \
+        $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }); \
+        if ($all.Count -eq 0) { Write-Output 'ABSENT'; exit }; \
+        $live = @($all | Where-Object { $_.Present -or $_.Status -ne 'Unknown' } | Sort-Object { $_.Status -ne 'OK' }); \
+        if ($live.Count -eq 0) { Write-Output ('REFUSED only phantom (not-present) adapter devnodes remain (' + $all.Count + ') - the device node itself is gone and no reload can revive it; reinstalling the host re-creates it'); exit }; \
+        $ad = $live[0]; $id = $ad.InstanceId; $err = ''; \
         try { \
             Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 2; \
             try { Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop } \
@@ -201,9 +255,11 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
         } catch { $err = ($_.Exception.Message -replace '\\s+', ' ') }; \
         $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); $LASTEXITCODE = 1; \
         if (Test-Path $pnp) { & $pnp /restart-device $id *> $null }; \
-        if ($LASTEXITCODE -eq 0) { Start-Sleep -Seconds 2; \
+        $rx = $LASTEXITCODE; \
+        if ($rx -eq 0) { Start-Sleep -Seconds 2; \
             Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
-        else { Enable-PnpDevice -InstanceId $id -Confirm:$false; Write-Output ('REFUSED ' + $err) }";
+        else { Enable-PnpDevice -InstanceId $id -Confirm:$false; \
+            Write-Output ('REFUSED devnodes=' + $all.Count + ' live=' + $live.Count + ' status=' + $ad.Status + ' problem=' + $ad.ConfigManagerErrorCode + ' restart_exit=' + $rx + ' ' + $err) }";
     let ps = std::env::var("SystemRoot")
         .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
         .unwrap_or_else(|_| "powershell.exe".to_string());
@@ -1050,10 +1106,12 @@ const BRIEF_RETRY: Duration = Duration::from_secs(3);
 /// them rather than N interleaved ones — each of which tears down the stack the others are waiting
 /// on. The second caller through typically finds the interface already up and returns at once.
 ///
-/// Taken ONLY by [`ensure_available`], which holds no manager lock, and released before the retire
-/// hook below takes the manager's `device` mutex. That is what keeps the lock order one-way:
-/// [`VdisplayDriver::open`] runs *inside* that same `device` mutex, so if it could also take this
-/// lock the two orders would invert and deadlock. It cannot — it never reloads.
+/// Taken ONLY by [`ensure_available`], which holds no manager lock. The lock order is one-way —
+/// `RECOVERY` → `device`: the recovery's handle-release hooks (`invalidate_cached_device`, which
+/// drops the manager's reference so the control handle can CLOSE before the PnP cycle) take the
+/// `device` mutex while this is held. It must stay one-way: [`VdisplayDriver::open`] runs *inside*
+/// that same `device` mutex, so if it could also take this lock the two orders would invert and
+/// deadlock. It cannot — it never reloads.
 static RECOVERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [`is_available`], with self-heal — and with PATIENCE, which is the part that matters after a
@@ -1069,10 +1127,11 @@ pub fn ensure_available() -> Result<()> {
         let _serialize = RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
         wait_for_interface(NOT_READY_GRACE, true)
     };
-    // OUTSIDE the recovery lock, by the ordering contract on `RECOVERY`. A reload tore the driver
-    // stack down and back up, so any control handle a previous session cached is dead by
-    // construction — retire it while we know that for certain, rather than leaving the next session
-    // to discover it by having an IOCTL fail. No-op before any backend opened the device.
+    // A reload tore the driver stack down and back up, so any control handle cached MEANWHILE (a
+    // racing open during the arrival window) is dead by construction — retire it while we know
+    // that for certain, rather than leaving the next session to discover it by having an IOCTL
+    // fail. Usually a no-op now: the recovery path already released the manager's reference
+    // before the reload (the handle-drain that lets the PnP cycle proceed at all).
     if reloaded {
         super::manager::invalidate_cached_device(
             "the pf-vdisplay adapter was reloaded (hostless-zombie recovery)",
@@ -1119,12 +1178,33 @@ fn wait_for_interface(not_ready_grace: Duration, reload: bool) -> (Result<OwnedH
         // Track how long we have seen NOTHING. Reset by any sighting, so a device that flickers
         // between absent and not-ready is treated as the transition it is.
         if probe.is_absent() {
+            if absent_since.is_none() && reload {
+                // First absent sighting on the recovery path: drop the manager's reference to the
+                // (dead) control device NOW, so the ABSENT_SETTLE below doubles as the drain window
+                // for every outstanding `Arc` clone — the handle then actually CLOSES before the
+                // reload runs. An open control handle is exactly what vetoes the PnP disable (and
+                // can wedge the pnputil restart) that the reload leans on; reset-pf-vdisplay.ps1
+                // stops the whole host service to get the same release (field 2026-08-08: every
+                // reload on a woken box came back REFUSED `Generic failure`). Gated on `reload`:
+                // the BRIEF_RETRY caller runs inside the manager's `device` mutex, where taking it
+                // again would deadlock — and that caller never reloads anyway.
+                super::manager::invalidate_cached_device(
+                    "control interface absent — releasing the host's own device handle ahead of a \
+                     possible adapter reload",
+                );
+            }
             absent_since.get_or_insert_with(Instant::now);
         } else {
             absent_since = None;
         }
         let absent_long_enough = absent_since.is_some_and(|t| t.elapsed() >= ABSENT_SETTLE);
         if reload && !reloaded && (absent_long_enough || Instant::now() >= deadline) {
+            // The not-ready path reaches here without the absent-sighting release above — drop the
+            // manager's reference now for the same reason (idempotent: a second call is a no-op).
+            super::manager::invalidate_cached_device(
+                "adapter reload imminent — releasing the host's own device handle (open handles \
+                 veto the PnP cycle)",
+            );
             match reload_vdisplay_adapter() {
                 // No devnode at all — waiting cannot conjure a driver. Fail immediately rather than
                 // burning the arrival window on a box that simply does not have it installed.
@@ -1195,6 +1275,32 @@ mod tests {
         }
     }
 
+    /// A refusal must carry evidence, not just a verdict. The 2026-08-08 field log showed only
+    /// `REFUSED Generic failure` — the WMI catch-all — leaving handle-veto vs phantom vs
+    /// problem-state undecidable from the log. The enriched line's tokens (devnode counts, PnP
+    /// status, problem code, the pnputil restart exit code the old script discarded) must survive
+    /// decoding verbatim, and the phantom-only state must decode as a refusal too — a reload
+    /// cannot revive a devnode record whose device is gone.
+    #[test]
+    fn a_refusal_keeps_its_evidence() {
+        let why = match classify_reload_output(
+            "REFUSED devnodes=2 live=1 status=OK problem=0 restart_exit=3010 Generic failure",
+        ) {
+            AdapterCycle::Refused(why) => why,
+            other => panic!("expected Refused, got {}", variant(&other)),
+        };
+        for token in ["devnodes=2", "live=1", "status=OK", "restart_exit=3010"] {
+            assert!(why.contains(token), "{token} must survive: {why:?}");
+        }
+        assert!(matches!(
+            classify_reload_output(
+                "REFUSED only phantom (not-present) adapter devnodes remain (2) - the device node \
+                 itself is gone and no reload can revive it; reinstalling the host re-creates it"
+            ),
+            AdapterCycle::Refused(why) if why.contains("phantom")
+        ));
+    }
+
     /// The outcomes callers branch on: `NotInstalled` fails a session fast, `Reloaded` earns the
     /// arrival window, and the lever that worked stays visible in the log (`restart` means the
     /// disable was refused and something still holds the device open).
@@ -1224,6 +1330,29 @@ mod tests {
             classify_reload_output("   "),
             AdapterCycle::Refused(_)
         ));
+    }
+
+    /// The reap's outcome must decode losslessly — the field ratchet (0.23→0.25) was a reap whose
+    /// bare-named pnputil never launched under the LocalSystem PATH while the host stayed silent:
+    /// "no ghosts" and "removed nothing" were byte-identical. Found and removed now travel
+    /// separately so a leftover ghost is loud, and the old single-number output (or a powershell
+    /// that died before reporting) must not decode as anything.
+    #[test]
+    fn reap_output_decodes_found_and_removed() {
+        assert_eq!(parse_reap_output("3 3\r\n"), Some((3, 3)));
+        assert_eq!(
+            parse_reap_output("4 0"),
+            Some((4, 0)),
+            "pnputil unlaunchable"
+        );
+        assert_eq!(parse_reap_output("0 0"), Some((0, 0)), "clean box");
+        for dead in ["5", "", "   ", "garbage", "OK"] {
+            assert_eq!(
+                parse_reap_output(dead),
+                None,
+                "{dead:?} is not a reap report"
+            );
+        }
     }
 
     /// `is_absent` is what decides between WAITING and performing device surgery, so the two states

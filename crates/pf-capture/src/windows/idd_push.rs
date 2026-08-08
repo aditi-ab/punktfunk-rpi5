@@ -547,7 +547,8 @@ pub struct IddPushCapturer {
     _keepalive: Box<dyn Send>,
 }
 // SAFETY: `IddPushCapturer` is `!Send` only because of its `*mut SharedHeader` raw pointer (and the
-// COM interfaces / the broker's bare control `HANDLE`, which is process-global and never closed). It is
+// COM interfaces; the frame/cursor delivery closures own `Arc` clones of the control device and are
+// `Send + Sync` on their own). It is
 // created, used, and dropped by a SINGLE thread — the owning capture/encode thread — never shared: the
 // `ID3D11DeviceContext` is the device's IMMEDIATE context (single-threaded by D3D11 contract) and is
 // only ever touched from that thread, and the header pointer (into the mapping this struct owns) is

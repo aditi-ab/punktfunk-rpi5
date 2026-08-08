@@ -194,27 +194,29 @@ pub fn capture_virtual_output(
     crate::inject::set_stream_target(Some(target.target_id));
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
-    // The sealed-channel delivery seam: resolve the pf-vdisplay control device ONCE (it is
-    // process-global — a dead one is retired, kept alive — so the raw value is stable for the
-    // process) and wrap `send_frame_channel` in a `Send + Sync` closure the IDD-push capturer calls
-    // at ring attach. This is the ONE reach into `crate::vdisplay` the capturer would otherwise make;
-    // building it here keeps the capture→vdisplay dependency out of pf-capture (plan §W6).
+    // The sealed-channel delivery seam: resolve the pf-vdisplay control device ONCE and wrap
+    // `send_frame_channel` in a `Send + Sync` closure the IDD-push capturer calls at ring attach.
+    // This is the ONE reach into `crate::vdisplay` the capturer would otherwise make; building it
+    // here keeps the capture→vdisplay dependency out of pf-capture (plan §W6).
     let control = crate::vdisplay::manager::control_device_handle().ok_or_else(|| {
         anyhow::anyhow!(
             "pf-vdisplay control device not open (monitor not created via the manager?)"
         )
     })?;
-    // `HANDLE` is not `Send`; capture the raw value and rebuild it inside the closure (the control
-    // device is never closed for the process lifetime, so the value stays valid).
-    let control_raw = control.0 as isize;
+    // Each closure keeps its own `Arc<OwnedHandle>` clone (`Send + Sync`), so the handle is open
+    // for exactly as long as any delivery closure lives — and CLOSES once the manager retires it
+    // and the last session drops, which is what lets the wake-from-sleep recovery's PnP device
+    // cycle proceed (an open control handle vetoes it).
+    let control_frame = control.clone();
     let sender: pf_capture::FrameChannelSender = std::sync::Arc::new(
         move |req: &pf_driver_proto::control::SetFrameChannelRequest| {
-            // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is never
-            // closed for the process lifetime, so reconstructing the `HANDLE` and issuing the
-            // `IOCTL_SET_FRAME_CHANNEL` is sound (`send_frame_channel`'s precondition).
+            // SAFETY: the captured `control_frame` Arc keeps the control handle open across this
+            // call — `send_frame_channel`'s precondition.
             unsafe {
                 crate::vdisplay::driver::send_frame_channel(
-                    windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                    windows::Win32::Foundation::HANDLE(
+                        std::os::windows::io::AsRawHandle::as_raw_handle(&*control_frame),
+                    ),
                     req,
                 )
             }
@@ -231,14 +233,17 @@ pub fn capture_virtual_output(
     // Cursor-forward sessions (M2c): hand the capturer the v5 cursor-channel delivery closure —
     // its presence opts the session in (the capturer creates + delivers the CursorShm section,
     // the driver declares the IddCx hardware cursor). Built exactly like `sender` above.
+    let control_cursor = control.clone();
     let cursor_sender: Option<pf_capture::CursorChannelSender> = want.hw_cursor.then(|| {
         std::sync::Arc::new(
             move |req: &pf_driver_proto::control::SetCursorChannelRequest| {
-                // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is
-                // never closed for the process lifetime (`send_cursor_channel`'s precondition).
+                // SAFETY: the captured `control_cursor` Arc keeps the control handle open across
+                // this call (`send_cursor_channel`'s precondition).
                 unsafe {
                     crate::vdisplay::driver::send_cursor_channel(
-                        windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                        windows::Win32::Foundation::HANDLE(
+                            std::os::windows::io::AsRawHandle::as_raw_handle(&*control_cursor),
+                        ),
                         req,
                     )
                 }
@@ -261,11 +266,13 @@ pub fn capture_virtual_output(
                 target_id,
                 enable: enable as u32,
             };
-            // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is
-            // never closed for the process lifetime (`send_cursor_forward`'s precondition).
+            // SAFETY: the captured `control` Arc keeps the control handle open across this call
+            // (`send_cursor_forward`'s precondition).
             unsafe {
                 crate::vdisplay::driver::send_cursor_forward(
-                    windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                    windows::Win32::Foundation::HANDLE(
+                        std::os::windows::io::AsRawHandle::as_raw_handle(&*control),
+                    ),
                     &req,
                 )?;
             }
