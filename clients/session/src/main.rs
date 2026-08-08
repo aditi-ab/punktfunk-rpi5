@@ -325,6 +325,22 @@ mod session_main {
         };
         // Before the struct literal — `vulkan` moves into it below.
         let phase_lock = vulkan.as_ref().is_some_and(|v| v.present_timing);
+        // …and the 4:4:4 promise, for the same reason: asked while the device bundle is
+        // still borrowable. `&&` short-circuits, so a box that never enabled Full chroma
+        // pays no capability queries for a feature it does not want.
+        let want_444 = settings.enable_444
+            && pf_client_core::video::hevc_444_hardware_decodable(vulkan.as_ref());
+        if settings.enable_444 && !want_444 {
+            // Loud, because the user turned a switch on and is not getting it. The
+            // alternative is what this replaces: the host grants 4:4:4, the decode ladder
+            // has no rung that can take it, and the session drops HEVC entirely.
+            tracing::warn!(
+                "Full chroma (4:4:4) requested but this device has no 4:4:4 HEVC decode — \
+                 asking for 4:2:0 instead. Advertising it would cost the whole codec: 4:4:4 \
+                 is granted on HEVC only, and there is no software HEVC decoder to fall back \
+                 to (PyroWave carries 4:4:4 on any GPU, if the link can take it)."
+            );
+        }
         SessionParams {
             host: addr,
             port,
@@ -356,30 +372,16 @@ mod session_main {
             // slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
             // The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges
             // on multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
-            // 4:4:4 is opt-in and off by default (Settings "Full chroma"): the bit only says
+            // 4:4:4 is opt-in and off by default (Settings "Full chroma"): the bit says
             // "upgrade me if you can" — the host still gates on its own policy, its capturer,
             // HEVC, and a real GPU 4:4:4 encode probe, and answers the resolved chroma in the
-            // Welcome BEFORE we build a decoder. Advertised whenever the user asks because
-            // every path can DISPLAY it: the Vulkan presenter samples the 2-plane 4:4:4 pool
-            // formats (hardware RExt decode where the driver offers it — NVIDIA today),
-            // with the decoder ladder demoting on its own. No capability probe gates the
-            // bit — but note (M8) that the software rung below it is 4:2:0 8-bit ONLY and
-            // refuses anything else rather than mis-scaling it, so on a box whose hardware
-            // 4:4:4 decode fails the floor is a codec fallback, not a converted picture.
+            // Welcome BEFORE we build a decoder. It is now ALSO gated on this device being
+            // able to decode 4:4:4 (`want_444`, computed above); the rule and its reasoning
+            // live in `video::video_caps_for`, which is where they get tested.
             // The cost stays VISIBLE, not silent: the Detailed stats overlay prints the
             // resolved chroma ("4:4:4→4:2:0" when the host declined) and the decode path
             // frames actually took.
-            video_caps: punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
-                | if settings.hdr_enabled {
-                    punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
-                } else {
-                    0
-                }
-                | if settings.enable_444 {
-                    punktfunk_core::quic::VIDEO_CAP_444
-                } else {
-                    0
-                },
+            video_caps: pf_client_core::video::video_caps_for(settings.hdr_enabled, want_444),
             // This panel's HDR colour volume → the host's virtual-display EDID, so host
             // apps tone-map to the real glass. Windows reads it from DXGI (the
             // `--window-pos` monitor; advanced-color outputs only) — gated on the HDR
@@ -496,6 +498,12 @@ mod session_main {
     /// decode is already the default just no-ops. Append rather than clobber so a user's own
     /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=native-vaapi` still overrides the decoder
     /// choice (the pre-M10 `vaapi` spelling reaches the same rung — it migrates, loudly).
+    ///
+    /// ⚠⚠ Called from the TOP of [`run`], ahead of the `--list-adapters` / `--probe-decode`
+    /// early exits — not merely "before `run_session` creates the instance". Those flags
+    /// create Vulkan instances of their own and RADV latches `RADV_PERFTEST` when its ICD
+    /// initialises, so a call placed after them leaves the triage tool describing a device
+    /// that cannot decode while the streaming path decodes on it.
     #[cfg(target_os = "linux")]
     fn enable_radv_video_decode() {
         const TOKEN: &str = "video_decode";
@@ -578,6 +586,23 @@ mod session_main {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+
+        // Before ANY Vulkan call — and that includes the two probe flags below, which is the
+        // whole reason this sits at the top of `run` instead of beside the session setup it
+        // was written for. Make RADV expose its video-decode queue + extensions so the
+        // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated
+        // RADV). Windows drivers (NVIDIA/AMD Adrenalin) expose theirs unconditionally.
+        //
+        // ⚠⚠ It USED to sit after the `--list-adapters` / `--probe-decode` / `--list-audio` /
+        // `--pair` early exits, which meant the triage tool answered a DIFFERENT question from
+        // the one the streaming path asks. Measured on a Steam Deck (2026-08-08, canary
+        // `e22af40f`), same binary, back to back: bare `--probe-decode` printed `vulkan video
+        // decode: no`, `driver decode ops: none (0x0)`, `no queue family advertises
+        // VIDEO_DECODE`; the same call with `RADV_PERFTEST=video_decode` in the environment
+        // printed `YES` and `H.264, H.265, AV1, VP9`. The tool exists to be believed, so any
+        // Deck triage that consulted it reached the opposite of the truth.
+        #[cfg(target_os = "linux")]
+        enable_radv_video_decode();
 
         // `--list-adapters`: print the Vulkan physical devices' marketing names (one per
         // line, discrete first) for the desktop shells' GPU picker, then exit.
@@ -753,11 +778,8 @@ mod session_main {
             return headless_pair(&pin);
         }
 
-        // Before any Vulkan call: make RADV expose its video-decode queue + extensions so the
-        // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated RADV).
-        // Windows drivers (NVIDIA/AMD Adrenalin) expose theirs unconditionally.
-        #[cfg(target_os = "linux")]
-        enable_radv_video_decode();
+        // (The RADV video-decode opt-in that used to live here now runs at the very top of
+        // `run` — it has to precede the probe flags too, not just the session.)
 
         // The Settings device picks → env, unless the user already forced one by hand:
         // the GPU (the shells' pickers store the adapter's marketing name) for the
