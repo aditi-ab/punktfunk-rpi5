@@ -320,6 +320,46 @@ jobs:
         run: |
           VERSION="$VERSION" BUNDLE_FFMPEG=1 bash packaging/debian/build-deb.sh
 
+      # punktfunk-gamescope for apt. Same reasoning as the RPM leg in rpm.yml: without a packaged
+      # build, a Debian/Ubuntu box has no route to the patched gamescope except compiling it, and a
+      # stock gamescope streams SDR, cursorless, and tells every game its display is 60 Hz.
+      #
+      # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
+      # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
+      - uses: actions/cache@v4
+        id: gamescope
+        with:
+          path: gs-cache
+          key: punktfunk-gamescope-noble-${{ hashFiles('packaging/gamescope/**') }}
+
+      - name: Build the patched gamescope
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # Best-effort, exactly like rpm.yml: the host packages above are the primary delivery and
+        # work without this binary, so a hiccup building an unrelated tree must not fail the job.
+        # `build-dep gamescope` resolves the distro's much older packaged version, so it can come up
+        # short — that is what the `|| true`s absorb, and the marker check downstream is what makes
+        # a half-built result impossible to ship.
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y --no-install-recommends meson ninja-build glslc git || true
+          apt-get build-dep -y gamescope || true
+          if bash packaging/gamescope/build-punktfunk-gamescope.sh \
+               --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
+            install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
+          else
+            echo "::warning::punktfunk-gamescope failed to build on noble — no .deb this run (gamescope sessions stay SDR)"
+          fi
+
+      - name: Build punktfunk-gamescope .deb
+        # Picked up by the publish loop below, which globs dist/*.deb.
+        run: |
+          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
+            bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
+          else
+            echo "::warning::no usable punktfunk-gamescope — skipping its .deb"
+          fi
+
       - name: Publish to the Gitea apt registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}

@@ -260,6 +260,18 @@ pub struct HostConfig {
     /// encode, so this is the knob that decides how bright "white" looks on the client's panel.
     /// `None` = leave gamescope's own default.
     pub gamescope_sdr_nits: Option<u32>,
+    /// `PUNKTFUNK_GAMESCOPE_REFRESH_RATES` — extra refresh rates (Hz, comma-separated) a gamescope
+    /// session offers its clients on top of the one it runs at, e.g. `60,90,120`.
+    ///
+    /// A headless gamescope has no EDID, so it cannot work out what else its display could run at:
+    /// on a stock build it advertises exactly ONE rate and Steam's in-session display settings show
+    /// a single entry. Our `+pfhdr3` build takes this list (`--custom-refresh-rates`) and publishes
+    /// it, which is what puts real choices in that menu. The session's own rate is always included
+    /// whatever is set here, so this can only ever ADD options.
+    ///
+    /// Empty (the default) = advertise only the negotiated rate. Ignored on a stock gamescope,
+    /// which has no flag to take it.
+    pub gamescope_refresh_rates: Vec<u32>,
     /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
     /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
     /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
@@ -379,6 +391,12 @@ impl HostConfig {
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| (1..=10_000).contains(n)),
+            // Unparseable entries are DROPPED rather than failing the host: this only ever widens a
+            // menu, and the session's own rate is added back unconditionally, so the worst a typo
+            // can cost is the extra option the operator wanted — never the session.
+            gamescope_refresh_rates: parse_refresh_rates(
+                val("PUNKTFUNK_GAMESCOPE_REFRESH_RATES").as_deref(),
+            ),
             recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
                 .filter(|s| !s.trim().is_empty()),
             on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),
@@ -395,6 +413,20 @@ impl HostConfig {
                 .clamp(1, 4),
         }
     }
+}
+
+/// `"60, 90,120"` → `[60, 90, 120]`, sorted and deduped. Junk entries and out-of-range rates are
+/// skipped rather than rejected wholesale — see the call site for why. Pure + unit-tested.
+fn parse_refresh_rates(raw: Option<&str>) -> Vec<u32> {
+    let mut out: Vec<u32> = raw
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .filter(|&hz| (1..=1000).contains(&hz))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 impl HostConfig {
@@ -444,6 +476,24 @@ mod tests {
         assert_eq!(c.game_fps(30), 30);
         // An invalid rate stays invalid rather than being laundered into a real one.
         assert_eq!(c.game_fps(0), 0);
+    }
+
+    #[test]
+    fn refresh_rate_list_parses_and_tolerates_junk() {
+        assert_eq!(parse_refresh_rates(Some("60,90,120")), vec![60, 90, 120]);
+        // Spaces, unsorted input and duplicates all normalise.
+        assert_eq!(
+            parse_refresh_rates(Some(" 120, 60 ,90, 60")),
+            vec![60, 90, 120]
+        );
+        // Unset and empty are the default: advertise only the session's own rate.
+        assert!(parse_refresh_rates(None).is_empty());
+        assert!(parse_refresh_rates(Some("")).is_empty());
+        assert!(parse_refresh_rates(Some("   ")).is_empty());
+        // A typo costs its own entry, never the whole list — the knob only widens a menu.
+        assert_eq!(parse_refresh_rates(Some("60,abc,120")), vec![60, 120]);
+        // Out of range in both directions (0 is not a refresh rate; 1920 is a width).
+        assert_eq!(parse_refresh_rates(Some("0,60,1920")), vec![60]);
     }
 
     #[test]

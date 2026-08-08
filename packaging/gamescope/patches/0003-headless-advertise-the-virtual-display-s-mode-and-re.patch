@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Sat, 8 Aug 2026 13:13:09 +0000
+Subject: [PATCH] headless: advertise the virtual display's mode and refresh
+ rates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A headless gamescope is how a remote-desktop/streaming host gives a game a
+display: the caller passes the client's exact mode with -W/-H/-r and expects
+the session to run at it. It does composite at that rate — but it never told
+anyone. CHeadlessConnector returned an empty span from both GetModes() and
+GetValidDynamicRefreshRates(), and reported GAMESCOPE_SCREEN_TYPE_INTERNAL.
+
+Both halves of that are visible to clients:
+
+  * update_mode_atoms() takes the INTERNAL branch, which DELETES
+    GAMESCOPE_DISPLAY_MODE_LIST_EXTERNAL — so there is no resolution list.
+  * wlserver_send_gamescope_control() finds no valid dynamic refresh rates and
+    falls through to a one-entry list built from g_nOutputRefresh — so there is
+    no refresh list either, just whatever the session happens to run at. With
+    -r absent that is the 60 Hz default from Init(), and a client on a 120 Hz
+    panel is told its display is 60 Hz and caps itself accordingly.
+
+Populate both from the mode Init() has already resolved, and report EXTERNAL:
+a virtual display is not a built-in panel, and INTERNAL is what suppressed the
+mode list in the first place. GetConnector() follows so a lookup by type cannot
+contradict the connector's own answer.
+
+--custom-refresh-rates lists the rates the display may switch between, for a
+backend that has no EDID to derive them from (gamescope-session-plus already
+passes this env through, gated on the flag existing). The running rate is always
+included, so the advertised set can never exclude the mode in use.
+
+Only the headless backend changes; every other backend derives its modes from a
+real connector and is untouched.
+---
+ src/Backends/HeadlessBackend.cpp | 66 ++++++++++++++++++++++++++++++--
+ src/main.cpp                     | 41 ++++++++++++++++++++
+ 2 files changed, 103 insertions(+), 4 deletions(-)
+
+diff --git a/src/Backends/HeadlessBackend.cpp b/src/Backends/HeadlessBackend.cpp
+index 8e45400..3168c88 100644
+--- a/src/Backends/HeadlessBackend.cpp
++++ b/src/Backends/HeadlessBackend.cpp
+@@ -3,8 +3,13 @@
+ #include "wlserver.hpp"
+ #include "refresh_rate.h"
+ 
++#include <algorithm>
++#include <vector>
++
+ extern int g_nPreferredOutputWidth;
+ extern int g_nPreferredOutputHeight;
++// `--custom-refresh-rates` (main.cpp): the rates this virtual display may switch between.
++extern std::vector<uint32_t> g_customRefreshRates;
+ 
+ namespace gamescope
+ {
+@@ -18,9 +23,16 @@ namespace gamescope
+         {
+         }
+ 
++        // A headless gamescope IS a virtual display: its mode is whatever the caller asked
++        // for (`-W`/`-H`/`-r`), never a fixed built-in panel. Reporting INTERNAL made
++        // `update_mode_atoms` DELETE GAMESCOPE_DISPLAY_MODE_LIST_EXTERNAL and set the
++        // GAMESCOPE_CONTROL_DISPLAY_FLAG_INTERNAL_DISPLAY flag, so a client driving this
++        // session was offered no resolutions at all — and, with the empty rate list below,
++        // no refresh rates either. EXTERNAL is both the honest answer and the one that lets
++        // the mode list reach Steam.
+         virtual gamescope::GamescopeScreenType GetScreenType() const override
+         {
+-            return GAMESCOPE_SCREEN_TYPE_INTERNAL;
++            return GAMESCOPE_SCREEN_TYPE_EXTERNAL;
+         }
+         virtual GamescopePanelOrientation GetCurrentOrientation() const override
+         {
+@@ -44,7 +56,7 @@ namespace gamescope
+ 		}
+         virtual std::span<const BackendMode> GetModes() const override
+         {
+-            return std::span<const BackendMode>{};
++            return m_Modes;
+         }
+ 
+         virtual bool SupportsVRR() const override
+@@ -58,7 +70,7 @@ namespace gamescope
+         }
+         virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const override
+         {
+-            return std::span<const uint32_t>{};
++            return m_ValidDynamicRefreshRates;
+         }
+ 
+         virtual void GetNativeColorimetry(
+@@ -90,8 +102,42 @@ namespace gamescope
+             return 0;
+ 		}
+ 
++        // Publish the mode this session was actually started with, plus every refresh rate it
++        // is allowed to switch between. Called once from CHeadlessBackend::Init(), after the
++        // -W/-H/-r defaults are resolved, because that is the first point at which the answer
++        // exists — and it has to exist before the first `gamescope_control` bind, which is
++        // what hands Steam the list.
++        void SetVirtualMode( uint32_t uWidth, uint32_t uHeight, uint32_t uRefreshHz,
++                             std::span<const uint32_t> uOfferRatesHz )
++        {
++            m_ValidDynamicRefreshRates.clear();
++            m_Modes.clear();
++
++            auto AddRate = [ this ]( uint32_t uRate )
++            {
++                if ( !uRate )
++                    return;
++                if ( std::find( m_ValidDynamicRefreshRates.begin(), m_ValidDynamicRefreshRates.end(), uRate )
++                     == m_ValidDynamicRefreshRates.end() )
++                    m_ValidDynamicRefreshRates.push_back( uRate );
++            };
++
++            for ( uint32_t uRate : uOfferRatesHz )
++                AddRate( uRate );
++            // The rate we are running at is always offerable, whatever the caller listed —
++            // otherwise Steam is handed a set that excludes the mode it is looking at.
++            AddRate( uRefreshHz );
++
++            std::sort( m_ValidDynamicRefreshRates.begin(), m_ValidDynamicRefreshRates.end() );
++
++            for ( uint32_t uRate : m_ValidDynamicRefreshRates )
++                m_Modes.push_back( BackendMode{ uWidth, uHeight, uRate } );
++        }
++
+     private:
+         BackendConnectorHDRInfo m_HDRInfo{};
++        std::vector<BackendMode> m_Modes;
++        std::vector<uint32_t> m_ValidDynamicRefreshRates;
+     };
+ 
+ 	class CHeadlessBackend final : public CBaseBackend
+@@ -125,6 +171,16 @@ namespace gamescope
+ 			if ( g_nOutputRefresh == 0 )
+ 				g_nOutputRefresh = ConvertHztomHz( 60 );
+ 
++			// Hand the connector the resolved mode. Until this existed the headless connector
++			// advertised NOTHING — no modes, no dynamic refresh rates — so `wlserver`'s
++			// `active_display_info` fell through to a one-entry list built from g_nOutputRefresh
++			// and every client concluded the display was a 60 Hz panel it could not change.
++			m_Connector.SetVirtualMode(
++				uint32_t( g_nOutputWidth ),
++				uint32_t( g_nOutputHeight ),
++				ConvertmHzToHz( uint32_t( g_nOutputRefresh ) ),
++				g_customRefreshRates );
++
+ 			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
+ 			{
+ 				return false;
+@@ -200,7 +256,9 @@ namespace gamescope
+ 		}
+ 		virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override
+ 		{
+-			if ( eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL )
++			// Must agree with CHeadlessConnector::GetScreenType() — a lookup by type that
++			// contradicted the connector's own answer would hand callers the wrong screen.
++			if ( eScreenType == GAMESCOPE_SCREEN_TYPE_EXTERNAL )
+ 				return &m_Connector;
+ 
+ 			return nullptr;
+diff --git a/src/main.cpp b/src/main.cpp
+index 1eb35b3..2c4fb50 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -92,6 +92,7 @@ const struct option *gamescope_options = (struct option[]){
+ 	{ "prefer-output", required_argument, nullptr, 'O' },
+ 	{ "default-touch-mode", required_argument, nullptr, 0 },
+ 	{ "generate-drm-mode", required_argument, nullptr, 0 },
++	{ "custom-refresh-rates", required_argument, nullptr, 0 },
+ 	{ "immediate-flips", no_argument, nullptr, 0 },
+ 	{ "framerate-limit", required_argument, nullptr, 0 },
+ 
+@@ -232,6 +233,7 @@ const char usage[] =
+ 	"  -O, --prefer-output            list of connectors in order of preference (ex: DP-1,DP-2,DP-3,HDMI-A-1)\n"
+ 	"  --default-touch-mode           0: hover, 1: left, 2: right, 3: middle, 4: passthrough\n"
+ 	"  --generate-drm-mode            DRM mode generation algorithm (cvt, fixed)\n"
++	"  --custom-refresh-rates         comma-separated refresh rates (Hz) this display may switch between, eg. 60,90,120 (headless only)\n"
+ 	"  --immediate-flips              Enable immediate flips, may result in tearing\n"
+ 	"\n"
+ #if HAVE_OPENVR
+@@ -297,6 +299,10 @@ int g_nNestedHeight = 0;
+ int g_nNestedRefresh = 0;
+ int g_nNestedUnfocusedRefresh = 0;
+ int g_nNestedDisplayIndex = 0;
++// `--custom-refresh-rates`, in Hz. Consumed by the headless backend, which has no EDID to
++// derive a mode list from and so cannot answer "what else could this display run at" on its
++// own. Empty = offer only the rate the session was started at.
++std::vector<uint32_t> g_customRefreshRates;
+ 
+ uint32_t g_nOutputWidth = 0;
+ uint32_t g_nOutputHeight = 0;
+@@ -447,6 +453,39 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
+ 	}
+ }
+ 
++// `--custom-refresh-rates 60,90,120` -> { 60, 90, 120 }. Anything unparseable is a hard error,
++// exactly like every other option value: silently dropping a rate would leave a display
++// advertising a list the caller never asked for, which is worse than not starting.
++static std::vector<uint32_t> parse_refresh_rate_list(const char *str)
++{
++	std::vector<uint32_t> rates;
++	std::string_view svRest{ str };
++	while ( !svRest.empty() )
++	{
++		const size_t nComma = svRest.find( ',' );
++		std::string_view svTok = svRest.substr( 0, nComma );
++		svRest = nComma == std::string_view::npos ? std::string_view{} : svRest.substr( nComma + 1 );
++
++		// `Parse` is `std::from_chars`, which rejects leading blanks outright — trim so that a
++		// perfectly ordinary "60, 90, 120" is not an error.
++		while ( !svTok.empty() && svTok.front() == ' ' )
++			svTok.remove_prefix( 1 );
++		while ( !svTok.empty() && svTok.back() == ' ' )
++			svTok.remove_suffix( 1 );
++
++		std::optional<uint32_t> oRate = gamescope::Parse<uint32_t>( svTok );
++		// 1000 Hz is not a limit anyone will meet; it is there so a typo'd "1920" cannot become a
++		// refresh rate that every consumer then has to sanity-check for us.
++		if ( !oRate || *oRate == 0 || *oRate > 1000 )
++		{
++			fprintf( stderr, "gamescope: invalid value for --custom-refresh-rates: %s\n", str );
++			exit( 1 );
++		}
++		rates.push_back( *oRate );
++	}
++	return rates;
++}
++
+ static int parse_integer(const char *str, const char *optionName)
+ {
+ 	auto result = gamescope::Parse<int>(str);
+@@ -800,6 +839,8 @@ int main(int argc, char **argv)
+ 					gamescope::cv_touch_click_mode = (gamescope::TouchClickMode) parse_integer( optarg, opt_name );
+ 				} else if (strcmp(opt_name, "generate-drm-mode") == 0) {
+ 					g_eGamescopeModeGeneration = parse_gamescope_mode_generation( optarg );
++				} else if (strcmp(opt_name, "custom-refresh-rates") == 0) {
++					g_customRefreshRates = parse_refresh_rate_list( optarg );
+ 				} else if (strcmp(opt_name, "force-orientation") == 0) {
+ 					g_DesiredInternalOrientation = force_orientation( optarg );
+ 				} else if (strcmp(opt_name, "sharpness") == 0 ||

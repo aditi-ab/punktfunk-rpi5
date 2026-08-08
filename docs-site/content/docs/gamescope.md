@@ -161,6 +161,9 @@ To stream real HDR you need `punktfunk-gamescope`: gamescope plus a small patch 
 own name and does **not** replace your system gamescope — your Gaming Mode keeps using that one.
 
 - **Bazzite / Fedora Atomic** — included in the Punktfunk sysext; `punktfunk-sysext update` gets it.
+- **Fedora, Nobara and other RPM boxes** — `sudo dnf install punktfunk-gamescope` from the same
+  Punktfunk repo the host comes from.
+- **Debian / Ubuntu** — `sudo apt install punktfunk-gamescope` from the Punktfunk apt repo.
 - **Arch** — the `punktfunk-gamescope` package.
 - **SteamOS (Steam Deck installer)** — built and wired automatically by
   `scripts/steamdeck/install.sh` / `update.sh`.
@@ -200,6 +203,22 @@ These apply to the **Gaming Mode (gamescope)** path only; the desktop path is un
   capture node, so the overlay is missing from an otherwise perfect picture. Either case is logged
   at startup with the version found. Bazzite's and SteamOS's current gamescope is past both; this
   only bites if you've pinned an old one.
+- **On a stock gamescope, Gaming Mode reports the wrong refresh rate — and offers no resolutions.**
+  A headless gamescope has no EDID, and upstream's headless connector advertises no display modes
+  and no refresh rates at all. Steam's in-session display settings then show a single refresh entry
+  and an empty resolution list, and that one entry is whatever the session was launched with — or
+  **60 Hz** if the launch flag went missing. Games that pace themselves to the display will hold
+  themselves there, even though the stream is running at your client's full rate (the client's own
+  fps counter keeps reading correctly, because the encoder repeats held frames — so the counter is
+  not the thing to trust here; an in-game fps readout is). `punktfunk-gamescope` publishes the real
+  mode and rate, and `PUNKTFUNK_GAMESCOPE_REFRESH_RATES=60,90,120` puts more than one entry in that
+  menu. If the host log says *"the session did not start at the mode we asked for"*, a file in
+  `/etc/gamescope-session-plus/sessions.d/` is overriding `GAMESCOPE_BIN` or setting `GAMESCOPECMD`.
+- **The performance overlay (fps / frametime / stats) needs the patched build.** It is mangoapp,
+  which gamescope draws as an *external overlay* — a layer upstream's capture composite has never
+  included on any version, so on a stock gamescope you can turn the overlay on and it simply will
+  not appear in the stream. There is no host-side substitute: the host cannot reconstruct another
+  process's overlay window. `punktfunk-gamescope` paints it into the capture stream.
 - **The cursor comes from the compositor when it can, and from the host otherwise.** A stock
   gamescope leaves the pointer out of its captured image, so the host reads it separately and draws
   it into every frame — a full pass over the picture, and the fastest encode source cannot blend at

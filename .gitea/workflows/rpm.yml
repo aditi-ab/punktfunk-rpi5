@@ -213,6 +213,40 @@ jobs:
             echo "::warning::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
           fi
 
+      # The same binary, as an ordinary RPM. The sysext below is the Atomic/Bazzite delivery; this
+      # is the one a traditional Fedora-family box (Nobara, plain Fedora) can actually install —
+      # until it existed those users had no packaged route to the patched build at all, and a stock
+      # gamescope tells every game its display is 60 Hz whatever the client negotiated.
+      #
+      # Same best-effort rule as the build above: no binary, no package, and the host stays on its
+      # existing SDR/host-composited path. The spec re-checks the +pfhdr marker itself.
+      - name: Package punktfunk-gamescope as an RPM
+        run: |
+          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
+            bash packaging/gamescope/build-gamescope-rpm.sh \
+              --binary gs-cache/punktfunk-gamescope \
+              --release "$PF_RELEASE"
+          else
+            echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — skipping its RPM"
+          fi
+
+      - name: Publish punktfunk-gamescope to the Gitea RPM registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          shopt -s nullglob
+          for rpm in dist/punktfunk-gamescope-*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) continue;; esac
+            NAME=$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)
+            VR=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpm" 2>/dev/null)
+            ARCH=$(rpm -qp --qf '%{ARCH}' "$rpm" 2>/dev/null)
+            echo "uploading $rpm"
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/package/$NAME/$VR/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/upload"
+          done
+
       # The no-layering Bazzite path: wrap the just-built host + web RPMs into a systemd-sysext
       # image and publish it to the per-Fedora-major feed (punktfunk-sysext/f43[-canary], …) that
       # `punktfunk-sysext install|update` reads. Same RPMs, same channels — just no rpm-ostree.

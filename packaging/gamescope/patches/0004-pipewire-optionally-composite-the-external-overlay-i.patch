@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Sat, 8 Aug 2026 13:17:14 +0000
+Subject: [PATCH] pipewire: optionally composite the external overlay into the
+ capture stream
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+paint_pipewire() is a separate, reduced composite from the scanout one. It
+paints the focus window, the override window and — since 3.16.23 — the Steam
+overlay, but it has never referenced externalOverlayWindow. That layer is
+mangoapp: the fps / frametime / stats readout the Deck UI turns on.
+
+On a real handheld the omission is invisible, because the person who enabled
+the overlay is looking at the panel it is drawn on. For a consumer whose ONLY
+view of the session is this node — a remote-desktop or streaming host — the
+overlay simply does not exist: the user turns it on, sees nothing, and there is
+nothing they can configure to change that.
+
+Add --pipewire-composite-external-overlay, off by default for the same reason
+--pipewire-composite-cursor is: the node has never carried this layer, and a
+consumer showing the stream to the same person already looking at the screen
+would get two of them.
+
+Two details worth naming:
+
+- The overlay's commit id joins the repaint test. Its numbers change every
+  frame precisely while the picture behind them is static, which is exactly
+  the case the existing focus/override-only test skips — without this the
+  stream would show a frozen overlay.
+- It is painted WITHOUT NoScale, unlike paint_all. There the overlay is
+  already sized to the output; here currentOutputWidth/Height are the capture
+  size, so a stream captured at another resolution needs it scaled to match.
+
+Notifications are deliberately left out: unlike a performance overlay, they are
+not something the viewer asked to see on that screen.
+---
+ src/main.cpp         |  3 +++
+ src/steamcompmgr.cpp | 39 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 2c4fb50..b406caf 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -143,6 +143,7 @@ const struct option *gamescope_options = (struct option[]){
+ 	{ "disable-color-management", no_argument, nullptr, 0 },
+ 	{ "sdr-gamut-wideness", required_argument, nullptr, 0 },
+ 	{ "pipewire-composite-cursor", no_argument, nullptr, 0 },
++	{ "pipewire-composite-external-overlay", no_argument, nullptr, 0 },
+ 	{ "hdr-enabled", no_argument, nullptr, 0 },
+ 	{ "hdr-sdr-content-nits", required_argument, nullptr, 0 },
+ 	{ "hdr-itm-enabled", no_argument, nullptr, 0 },
+@@ -208,6 +209,8 @@ const char usage[] =
+ 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
+ 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
+ 	"  --pipewire-composite-cursor    composite the cursor into the PipeWire capture stream (off by default: the node has never carried it, and a consumer that draws its own would get two)\n"
++	"  --pipewire-composite-external-overlay\n"
++	"                                 composite the external overlay layer (mangoapp) into the PipeWire capture stream (off by default, like the cursor)\n"
+ 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
+ 	"                                 If this is not set, and there is a HDR client, it will be tonemapped SDR.\n"
+ 	"  --sdr-gamut-wideness           Set the 'wideness' of the gamut for SDR comment. 0 - 1.\n"
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 5c65420..0d293c6 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -2323,6 +2323,12 @@ gamescope::ConVar<bool> cv_pipewire_composite_cursor{ "pipewire_composite_cursor
+ 	"default: the node has never carried the pointer, and a consumer that draws its own would get "
+ 	"two." };
+ 
++gamescope::ConVar<bool> cv_pipewire_composite_external_overlay{ "pipewire_composite_external_overlay", false,
++	"Composite the external overlay layer (mangoapp — the performance overlay) into the PipeWire "
++	"capture stream (--pipewire-composite-external-overlay). Off by default, like the cursor: the "
++	"node has never carried it, and a consumer showing the stream to the same person already "
++	"looking at the screen would get two." };
++
+ static void paint_pipewire()
+ {
+ 	static struct pipewire_buffer *s_pPipewireBuffer = nullptr;
+@@ -2440,14 +2446,31 @@ static void paint_pipewire()
+ 		}
+ 	}
+ 
++	// The external overlay — mangoapp, i.e. the fps/frametime/stats readout. `paint_all` draws
++	// it on the scanout composite; this reduced one never referenced it, so a consumer whose
++	// ONLY view of the session is this node could not see the overlay the user had turned on.
++	// Gated on the focus-appid for the same reason the Steam overlay above is: a consumer that
++	// asked for one specific app is asking for that app, not for the session's chrome.
++	static uint64_t s_ulLastExternalOverlayCommitId = 0;
++	steamcompmgr_win_t *pExternalOverlay = nullptr;
++	if ( cv_pipewire_composite_external_overlay && !ulFocusAppId &&
++	     pFocus->externalOverlayWindow && pFocus->externalOverlayWindow->opacity )
++		pExternalOverlay = pFocus->externalOverlayWindow;
++	// Its commit id has to join the repaint test below, or the overlay would freeze at whatever
++	// it read when the game last presented — the numbers on it change every frame precisely
++	// WHILE the picture behind them is static, which is the case the test would otherwise skip.
++	const uint64_t ulExternalOverlayCommitId = window_last_done_commit_id( pExternalOverlay );
++
+ 	if ( ulFocusCommitId == s_ulLastFocusCommitId &&
+ 	     ulOverrideCommitId == s_ulLastOverrideCommitId &&
++	     ulExternalOverlayCommitId == s_ulLastExternalOverlayCommitId &&
+ 	     bDrawCursor == s_bLastCursorDrawn &&
+ 	     nCursorX == s_nLastCursorX && nCursorY == s_nLastCursorY )
+ 		return;
+ 
+ 	s_ulLastFocusCommitId = ulFocusCommitId;
+ 	s_ulLastOverrideCommitId = ulOverrideCommitId;
++	s_ulLastExternalOverlayCommitId = ulExternalOverlayCommitId;
+ 	s_bLastCursorDrawn = bDrawCursor;
+ 	s_nLastCursorX = nCursorX;
+ 	s_nLastCursorY = nCursorY;
+@@ -2475,6 +2498,16 @@ static void paint_pipewire()
+ 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
+ 	}
+ 
++	// Deliberately WITHOUT `NoScale`, which is what the scanout composite uses: there the
++	// overlay is already sized to the output, while here `currentOutputWidth/Height` are the
++	// capture size, and a stream captured at anything other than the session's own resolution
++	// would otherwise get the overlay at the wrong size in the corner.
++	if ( pExternalOverlay )
++	{
++		paint_window( pExternalOverlay, pExternalOverlay, &frameInfo, nullptr, PaintWindowFlag::NoFilter |
++				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 ) );
++	}
++
+ 	// The cursor, when this stream was asked for it. gamescope keeps the pointer OUT of the
+ 	// PipeWire node by default — it lives on a hardware plane for scanout, and a remote-play
+ 	// consumer that draws its own would end up with two — so a consumer that has no cursor of
+@@ -8457,6 +8490,12 @@ steamcompmgr_main(int argc, char **argv)
+ 					cv_pipewire_composite_cursor = true;
+ #else
+ 					fprintf( stderr, "gamescope: --pipewire-composite-cursor ignored (built without PipeWire)\n" );
++#endif
++				} else if (strcmp(opt_name, "pipewire-composite-external-overlay") == 0) {
++#if HAVE_PIPEWIRE
++					cv_pipewire_composite_external_overlay = true;
++#else
++					fprintf( stderr, "gamescope: --pipewire-composite-external-overlay ignored (built without PipeWire)\n" );
+ #endif
+ 				} else if (strcmp(opt_name, "hdr-enabled") == 0 || strcmp(opt_name, "hdr-enable") == 0) {
+ 					cv_hdr_enabled = true;
