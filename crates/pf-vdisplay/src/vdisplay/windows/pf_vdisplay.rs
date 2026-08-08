@@ -100,14 +100,27 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
 /// `reset-pf-vdisplay.ps1` step 2 (proven on-box). Best-effort + idempotent: only NOT-present nodes
 /// (`Status != OK`) are removed, so the LIVE session's monitor (`Status OK`) is never touched; any
 /// failure is logged and swallowed. Returns the number removed.
+///
+/// The outcome is logged UNCONDITIONALLY, as found + removed: the old script counted only removals
+/// and the host spoke only when that count was positive, so a reap whose pnputil never launched and
+/// a box with no ghosts produced byte-identical logs (silence) — the same vacuous-signal family as
+/// the `status=OK` trap [`reload_vdisplay_adapter`] answers — while ghosts ratcheted toward the
+/// wedge with every sleep cycle.
 fn reap_ghost_monitors() -> u32 {
     // Mirrors reset-pf-vdisplay.ps1 step 2. powershell is always present for the SYSTEM service; the
     // matched tokens ('OK', 'punktfunk', the InstanceId) are locale-invariant, so this is safe on a
     // non-English box (unlike a .ps1 *file* read in the machine codepage).
+    //
+    // pnputil is resolved by full path and `$LASTEXITCODE` pre-seeded to failure before every
+    // launch, exactly like the reload path below: a LocalSystem service's PATH need not include
+    // System32 (and a SYSTEM process must not trust PATH anyway — a planted `pnputil.exe` would run
+    // elevated), and the old bare-name call failed INVISIBLY there — `SilentlyContinue` swallowed
+    // the miss, no exit code was written, and the ghosts stayed to wedge `IOCTL_ADD` at 0x80070490.
     const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $g = Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }; \
-        $n = 0; foreach ($d in $g) { pnputil /remove-device $d.InstanceId *> $null; if ($LASTEXITCODE -eq 0) { $n++ } }; \
-        Write-Output $n";
+        $g = @(Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }); \
+        $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); \
+        $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
+        Write-Output ($g.Count.ToString() + ' ' + $n)";
     // Resolve powershell by full path — the LocalSystem service's PATH is not guaranteed to include
     // System32 — with a bare-name fallback.
     let ps = std::env::var("SystemRoot")
@@ -125,22 +138,46 @@ fn reap_ghost_monitors() -> u32 {
         .output()
     {
         Ok(o) => {
-            let n = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0);
-            if n > 0 {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            let Some((found, removed)) = parse_reap_output(&raw) else {
                 tracing::warn!(
-                    reaped = n,
+                    output = %raw.trim(),
+                    "pf-vdisplay: ghost-monitor reap died before reporting — ghost nodes (if any) still pin IddCx monitor slots"
+                );
+                return 0;
+            };
+            if found == 0 {
+                tracing::info!("pf-vdisplay: no ghost (not-present) virtual-monitor nodes to reap");
+            } else if removed < found {
+                tracing::warn!(
+                    found,
+                    removed,
+                    "pf-vdisplay: ghost-monitor reap could NOT remove every ghost node — the leftovers keep pinning IddCx monitor slots toward the 0x80070490 wedge"
+                );
+            } else {
+                tracing::warn!(
+                    reaped = removed,
                     "pf-vdisplay: reaped ghost (not-present) virtual-monitor nodes — IddCx slot-exhaustion prevention"
                 );
             }
-            n
+            removed
         }
         Err(e) => {
             tracing::warn!(error = %e, "pf-vdisplay: ghost-monitor reap could not spawn powershell");
             0
         }
+    }
+}
+
+/// Parse [`reap_ghost_monitors`]'s script output — `"<found> <removed>"`. Split out to be testable
+/// without a box, like [`classify_reload_output`]: the field failure this answers was a reap whose
+/// outcome could not be decoded from the log at all, so the decoding is worth pinning down. `None`
+/// = the script died before reporting (callers treat that as "removed nothing", loudly).
+fn parse_reap_output(out: &str) -> Option<(u32, u32)> {
+    let mut it = out.split_whitespace().map(str::parse::<u32>);
+    match (it.next(), it.next()) {
+        (Some(Ok(found)), Some(Ok(removed))) => Some((found, removed)),
+        _ => None,
     }
 }
 
@@ -1224,6 +1261,29 @@ mod tests {
             classify_reload_output("   "),
             AdapterCycle::Refused(_)
         ));
+    }
+
+    /// The reap's outcome must decode losslessly — the field ratchet (0.23→0.25) was a reap whose
+    /// bare-named pnputil never launched under the LocalSystem PATH while the host stayed silent:
+    /// "no ghosts" and "removed nothing" were byte-identical. Found and removed now travel
+    /// separately so a leftover ghost is loud, and the old single-number output (or a powershell
+    /// that died before reporting) must not decode as anything.
+    #[test]
+    fn reap_output_decodes_found_and_removed() {
+        assert_eq!(parse_reap_output("3 3\r\n"), Some((3, 3)));
+        assert_eq!(
+            parse_reap_output("4 0"),
+            Some((4, 0)),
+            "pnputil unlaunchable"
+        );
+        assert_eq!(parse_reap_output("0 0"), Some((0, 0)), "clean box");
+        for dead in ["5", "", "   ", "garbage", "OK"] {
+            assert_eq!(
+                parse_reap_output(dead),
+                None,
+                "{dead:?} is not a reap report"
+            );
+        }
     }
 
     /// `is_absent` is what decides between WAITING and performing device surgery, so the two states
