@@ -12,6 +12,13 @@ ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 # found") aborted the whole update before the service restarts.
 warn() { printf '\033[1;33m  !!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+# Create a system group if it is missing (needs sudo). Idempotent, and mirrors what the
+# deb/rpm/arch scriptlets do — a udev rule that chgrp's to a group nobody created fails silently.
+ensure_group() {
+    getent group "$1" >/dev/null 2>&1 && return 0
+    sudo groupadd --system "$1" 2>/dev/null || return 1
+    ok "created the '$1' system group"
+}
 
 SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
 BOX="${PUNKTFUNK_BOX:-pf2}"
@@ -81,11 +88,27 @@ EOF
     ok "punktfunk-rebuild-check.service installed (auto-rebuild after SteamOS updates)"
 fi
 
+CONFIG="$HOME/.config/punktfunk"
+
+# Secret hygiene, retrofitted. install.sh §3 does this for fresh installs — but only install.sh
+# ever did, so a Deck that was set up once and only ever *updated* since kept the old modes
+# forever. This directory holds web.env (console login password + session secret), the mgmt token
+# and the host key; a plain `mkdir -p` left it 0755 at the Deck's ambient umask and web.env itself
+# 0644, i.e. readable by every local account (2026-08-05 review L-19). Both chmods are idempotent.
+[ -d "$CONFIG" ] && chmod 700 "$CONFIG" 2>/dev/null || true
+if [ -f "$CONFIG/web.env" ] && find "$CONFIG/web.env" -maxdepth 0 -perm /0077 2>/dev/null | grep -q .; then
+    chmod 600 "$CONFIG/web.env"
+    warn "web.env was group/world-readable — an older install wrote it at the default umask."
+    warn "Tightened to 0600, but that does NOT un-expose the password it already leaked to every"
+    warn "local account. Rotate it: edit PUNKTFUNK_UI_PASSWORD in $CONFIG/web.env, then"
+    warn "  systemctl --user restart punktfunk-web"
+fi
+
 # Retrofit config that install.sh now writes but older installs predate (both idempotent):
 # RADV_PERFTEST — Van Gogh RADV still gates VK_KHR_video_encode_* behind it; without it the
 # Vulkan backend can't open and sessions silently fall back to libav VAAPI. The KWin .desktop —
 # KWin only grants the restricted capture/input globals to the exe a .desktop authorizes.
-HOST_ENV="$HOME/.config/punktfunk/host.env"
+HOST_ENV="$CONFIG/host.env"
 if [ -f "$HOST_ENV" ] && ! grep -q '^RADV_PERFTEST=' "$HOST_ENV"; then
     printf '\n# Van Gogh RADV gates VK_KHR_video_encode_* behind this (Vulkan Video encode).\nRADV_PERFTEST=video_encode\n' >> "$HOST_ENV"
     ok "host.env: added RADV_PERFTEST=video_encode"
@@ -127,6 +150,25 @@ if [ "$SUDO_OK" = 1 ]; then
     if id -nG "$USER" | grep -qw input; then :; else
         sudo usermod -aG input "$USER"
         warn "added $USER to the 'input' group — REBOOT (or log out/in) for it to apply"
+    fi
+    # 'punktfunk' owns the usbip vhci attach/detach nodes (60-punktfunk.rules), deliberately NOT
+    # 'input' — writing 'attach' materialises an arbitrary emulated USB device, a root-only kernel
+    # primitive that must not ride on the group every gamepad guide tells you to join
+    # (security-review 2026-08-05 M-4). No Deck install ever created it, so the rule's chgrp failed
+    # and the native Steam Deck pad silently never attached. Retrofit both group and membership.
+    # `if ensure_group` (not `ensure_group || true`): a failed groupadd must not fall through to a
+    # usermod against a group that does not exist — under `set -e` that would abort the update
+    # before the service restarts at the bottom, leaving the host down.
+    if ensure_group punktfunk; then
+        if id -nG "$USER" | grep -qw punktfunk; then :; else
+            sudo usermod -aG punktfunk "$USER"
+            warn "added $USER to the 'punktfunk' group (usbip vhci — the native Steam Deck pad needs it)"
+            warn "  — REBOOT (or log out/in) for it to apply. That group can emulate arbitrary USB"
+            warn "  devices; 'sudo gpasswd -d $USER punktfunk' drops it if you do not want the native pad."
+        fi
+    else
+        warn "could not create the 'punktfunk' group — the native Steam Deck pad will not attach."
+        warn "By hand: sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
     fi
     # Register the tuning on Valve's atomic-update preserve list (see install.sh §4): without
     # this, every SteamOS A/B update strips the three files above again (verified live —

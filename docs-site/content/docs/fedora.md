@@ -93,6 +93,18 @@ sudo dnf install punktfunk
 sudo usermod -aG input "$USER"     # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
+Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro — it reaches games
+as a real USB pad, which is why Steam Input adopts it), also join `punktfunk`:
+
+```sh
+sudo usermod -aG punktfunk "$USER"  # usbip/vhci access (re-login to apply)
+```
+
+That is a second group on purpose: it grants write access to the usbip `attach` file, which
+materialises an arbitrary emulated USB device, so it stays off the `input` group everyone is
+routinely told to join. Join it only on a machine you trust. Skip it and the pad simply arrives as
+an ordinary Xbox 360 controller.
+
 Updates later are just `sudo dnf upgrade punktfunk`, followed by
 `systemctl --user restart punktfunk-host` so the running host picks up the new binary. The package
 ships the systemd user units, the udev rule, the UDP socket-buffer sysctl tuning, and example

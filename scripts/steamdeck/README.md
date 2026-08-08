@@ -85,7 +85,13 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
 - **System tuning (sudo):** `/etc/sysctl.d/99-punktfunk-net.conf` (32 MB UDP buffers — the #1
   high-bitrate lever), `/etc/udev/rules.d/60-punktfunk.rules` (`uinput`/`uhid` access),
   `/etc/modules-load.d/punktfunk.conf` (`vhci-hcd` for the native Deck pad), `$USER` in the `input`
-  group — and `/etc/atomic-update.conf.d/punktfunk.conf`, which registers the three files on
+  group **and in `punktfunk`** — the latter created here if missing, because the udev rule
+  `chgrp`s the vhci `attach`/`detach` nodes to it and a rule that names a nonexistent group fails
+  silently, leaving the native Deck pad unable to attach (the deb/rpm/arch scriptlets `groupadd` it;
+  nothing on this path did until now). It is separate from `input` on purpose: writing `attach`
+  materialises an arbitrary emulated USB device (security-review 2026-08-05 M-4). Drop it with
+  `sudo gpasswd -d "$USER" punktfunk` if you would rather stream without that pad.
+  Plus `/etc/atomic-update.conf.d/punktfunk.conf`, which registers the three files on
   SteamOS's atomic-update keep list so A/B OS updates carry them over (verified: without it an
   update silently strips them — pads degrade to Xbox 360, buffers drop to 208 KB).
 
@@ -104,8 +110,13 @@ host advertises over mDNS as `_punktfunk._udp`, so clients discover it automatic
 
 - **distrobox required.** If missing: `curl -sfL https://raw.githubusercontent.com/89luca89/distrobox/main/install | sh -s -- --prefix ~/.local` (then ensure `~/.local/bin` is on PATH).
 - **First build is slow** (~10–15 min + ~1 GB toolchain/image). Incremental afterwards.
-- **No passwordless sudo** → the installer skips the sysctl/udev/input steps with a warning; high
-  bitrates will drop packets until you apply `99-punktfunk-net.conf` and join `input` yourself.
+- **No passwordless sudo** → the installer skips the sysctl/udev/group steps with a warning; high
+  bitrates will drop packets until you apply `99-punktfunk-net.conf` and join `input` (and
+  `punktfunk`, for the native Deck pad) yourself. The script prints the exact commands.
+- **Installed before 0.25.0?** `web.env` was written at the ambient umask, i.e. world-readable, so
+  the console password and session secret leaked to every local account. `install.sh`/`update.sh`
+  now tighten `~/.config/punktfunk` to `0700` and `web.env` to `0600` on every run and say so —
+  but rotate `PUNKTFUNK_UI_PASSWORD` afterwards, because a chmod does not un-leak a read secret.
 - **Game Mode auto-suspend** drops the host off the network on idle — disable it (Settings → Power)
   for a headless host.
 - **WiFi tx ceiling** ≈ 250 Mbps goodput (a Deck hardware/driver packet-rate limit, band-independent);

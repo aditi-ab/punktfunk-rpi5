@@ -67,6 +67,12 @@ MSG
 
 post_upgrade() {
   _ensure_update_group
+  # Also on UPGRADE, not just post_install: 'punktfunk' was introduced in 0.25.0, so every box that
+  # reached it by `pacman -Syu` from 0.24.x ran only this function and never got the group at all —
+  # leaving 60-punktfunk.rules to chgrp to a nonexistent group, the vhci attach/detach nodes
+  # root-only, and the virtual Steam Deck pad silently unable to attach. groupadd is idempotent, so
+  # this is a no-op on boxes that installed fresh.
+  _ensure_punktfunk_group
   udevadm control --reload-rules 2>/dev/null || true
   sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
   _warn_stale_firewall_ports

@@ -250,6 +250,31 @@ switch mouse mode, disconnect, fullscreen — are in
   button (see [Updating](/docs/updating)). Swapping `punktfunk-host.exe` by hand does not fix it,
   because the stale controller device keeps the driver it was already bound to.
 
+## The pad works, but arrives as an Xbox 360 controller instead of a Steam Deck
+
+Only the **virtual Steam Deck controller** (paddles, trackpads, gyro) is missing here — ordinary
+gamepad input is fine. That pad reaches games as a real USB device over usbip, and the sysfs files
+it attaches through are owned by a group called `punktfunk`, separate from `input`. Four things
+have to line up on the Linux host, and none of them announces itself when it doesn't:
+
+```sh
+getent group punktfunk                         # the group exists at all
+id -nG | tr ' ' '\n' | grep -x punktfunk       # ...and you are in it
+ls -l /sys/devices/platform/vhci_hcd.0/attach  # owned by punktfunk, mode 0660
+lsmod | grep vhci_hcd                          # the transport module is loaded
+```
+
+If the group is missing entirely, the udev rule tried to `chgrp` to a group nobody created, so the
+nodes stayed root-only. That was the case on installs that reached 0.25.0 by **upgrade** on Arch,
+on NixOS, on the Bazzite sysext, and on Steam Deck source installs. Re-running your package
+manager's upgrade (or `update.sh` on a Deck) creates it now; otherwise `sudo groupadd --system
+punktfunk` by hand. Then `sudo usermod -aG punktfunk "$USER"` and **log out and back in** — group
+changes only reach the host's `systemd --user` service on a fresh login, and on a Deck a reboot is
+the reliable way to get one.
+
+Joining the group is optional, and there is a real reason it is not automatic: writing that
+`attach` file materialises an arbitrary emulated USB device. Skip it on a machine you share.
+
 ## Copy and paste between host and client does nothing
 
 The shared clipboard needs **two** separate switches on, and turning on only one looks exactly like

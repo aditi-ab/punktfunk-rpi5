@@ -1,9 +1,10 @@
 # NixOS integration for punktfunk — the declarative equivalent of everything the RPM/deb do in
 # their %install + %post (packaging/rpm/punktfunk.spec, packaging/debian/build-deb.sh):
 # the systemd *user* service, the uinput/uhid/vhci udev rules, the vhci-hcd autoload, the 32 MB
-# UDP socket-buffer sysctls, the firewall openers, the `input`-group membership for virtual
-# gamepads, the management web console (`services.punktfunk.web`, on by default with the host — the
-# RPM/deb Recommends), and the opt-in plugin/script runner (`services.punktfunk.scripting`).
+# UDP socket-buffer sysctls, the firewall openers, the `input`- and `punktfunk`-group membership
+# for virtual gamepads, the management web console (`services.punktfunk.web`, on by default with
+# the host — the RPM/deb Recommends), and the opt-in plugin/script runner
+# (`services.punktfunk.scripting`).
 #
 # Usage (flake):
 #   { inputs.punktfunk.url = "git+https://git.unom.io/unom/punktfunk";
@@ -111,9 +112,11 @@ in
         default = [ ];
         example = [ "alice" ];
         description = ''
-          Users to add to the `input` group — required for the virtual gamepads the host creates
-          (`/dev/uinput`, `/dev/uhid`, and the usbip/vhci virtual Steam Deck). The host runs as
-          these users' `systemd --user` service.
+          Users to add to the `input` and `punktfunk` groups — required for the virtual gamepads
+          the host creates: `input` covers `/dev/uinput` and `/dev/uhid`, `punktfunk` covers the
+          usbip/vhci nodes the virtual Steam Deck pad attaches through. The second is separate on
+          purpose — it can emulate arbitrary USB hardware, so only list users you would trust with
+          that. The host runs as these users' `systemd --user` service.
         '';
       };
 
@@ -326,9 +329,22 @@ in
       ];
 
       # `input` group membership for the virtual-gamepad nodes (mirrors the RPM's usermod hint).
+      #
+      # `punktfunk` is the SECOND group 60-punktfunk.rules needs: it owns the usbip vhci
+      # attach/detach nodes, and is deliberately not `input` because writing `attach` materialises
+      # an arbitrary emulated USB device — a root-only kernel primitive that must not ride on the
+      # group every gamepad guide tells you to join (security-review 2026-08-05 M-4). Declaring the
+      # group is not optional: the rule shells out to `chgrp punktfunk`, which fails outright if
+      # nothing ever created it, leaving the nodes root-only and the virtual Steam Deck pad unable
+      # to attach. Membership follows `host.users`, which is already the explicit "these users run
+      # the host" list this option's description scopes to the usbip/vhci pad.
       users.groups.input = { };
+      users.groups.punktfunk = { };
       users.users = genAttrs cfg.host.users (_: {
-        extraGroups = [ "input" ];
+        extraGroups = [
+          "input"
+          "punktfunk"
+        ];
       });
 
       # Status-tray autostart entry (self-gating: `--autostart` exits unless this user runs a host).

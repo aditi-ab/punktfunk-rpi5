@@ -155,6 +155,12 @@ you; on NixOS the module does steps 1 and 2, and [NixOS](#nixos) above has the u
    input](/docs/input#pen-and-stylus) both need `/dev/uinput` — then re-login. The exact
    command differs per distro — see your guide (`usermod -aG input "$USER"`, or `ujust
    add-user-to-input-group` on Bazzite).
+
+   Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro), also join
+   `punktfunk`: `sudo usermod -aG punktfunk "$USER"`. Your package created that group at install
+   time; it gates the usbip nodes that pad attaches through, and it is separate from `input` on
+   purpose, because writing them can present arbitrary emulated USB hardware. Join it only on a
+   machine you trust — skipping it costs you nothing but that one pad type.
 2. Put your `host.env` in place, then start the host. Every Linux package ships a systemd **user**
    unit, so you don't run the host by hand — but that unit reads `~/.config/punktfunk/host.env` and
    won't start until the file exists. Each package ships a template to copy; your distro and desktop

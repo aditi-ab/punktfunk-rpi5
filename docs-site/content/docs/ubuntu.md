@@ -111,6 +111,18 @@ re-login so the new group membership takes effect:
 sudo usermod -aG input "$USER"     # re-login to apply
 ```
 
+Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro), also join
+`punktfunk`. That pad reaches games as a real USB device over usbip — which is what makes Steam
+Input adopt it — and the group gating those nodes is deliberately separate from `input`, because
+writing the usbip `attach` file can materialise arbitrary emulated USB hardware:
+
+```sh
+sudo usermod -aG punktfunk "$USER"  # re-login to apply
+```
+
+Join it only on a machine you trust. Skip it and everything else still works; the pad just arrives
+as an ordinary Xbox 360 controller.
+
 ## 4. Check it installed
 
 Before moving on, confirm the binary is there and nothing else is competing for the same job:
