@@ -592,11 +592,24 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
         SettingsGroup("Interface") {
             ToggleRow(
                 title = "Controller-optimized UI",
-                subtitle = "Switch to the console home when a controller is connected. A TV " +
-                    "always uses it.",
+                subtitle = "Swap the touch home for the console home — the host carousel and " +
+                    "gamepad chrome. A TV always uses it.",
                 checked = s.gamepadUiEnabled,
                 onCheckedChange = { on -> update(s.copy(gamepadUiEnabled = on)) },
             )
+            // Only decides anything while the switch above is on, so it is HIDDEN rather than
+            // dimmed when it isn't — a picker whose every option changes nothing is worse than
+            // no picker, and this group is short enough that nothing jumps far.
+            if (s.gamepadUiEnabled) {
+                SettingDropdown(
+                    label = "Show it",
+                    options = GAMEPAD_UI_MODE_OPTIONS,
+                    selected = s.gamepadUiMode,
+                    caption = "With a controller: the touch home comes back when the last one " +
+                        "disconnects. Always keeps the console home either way — for a device " +
+                        "that lives docked to a TV.",
+                ) { v -> update(s.copy(gamepadUiMode = v)) }
+            }
         }
     }
 }

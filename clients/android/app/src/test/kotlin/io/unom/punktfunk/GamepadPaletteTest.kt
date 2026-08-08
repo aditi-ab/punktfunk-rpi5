@@ -33,14 +33,14 @@ class GamepadPaletteTest {
     fun tableMatchesTheOtherClients() {
         assertEquals(
             listOf(
-                "violet", "nebula", "abyss", "ember", "moss", "graphite",
+                "violet", "oled", "nebula", "abyss", "ember", "moss", "graphite",
                 "holo", "sunset", "bloom", "dawn", "mint", "opal",
             ),
             GamepadPalette.ALL.map { it.id },
         )
         // Dark fields lead, pale ones follow, so stepping the row walks one direction.
         val firstLight = GamepadPalette.ALL.indexOfFirst { it.light }
-        assertEquals(6, firstLight)
+        assertEquals(7, firstLight)
         assertTrue(GamepadPalette.ALL.drop(firstLight).all { it.light })
         // An unknown name is a newer client's palette, not an error.
         assertEquals("violet", GamepadPalette.named("chartreuse").id)
@@ -70,6 +70,25 @@ class GamepadPaletteTest {
             val floor = if (p.id == "graphite" || p.id == "opal") 20.0 else 45.0
             assertTrue("${p.id} spans only $spread° of hue", spread >= floor)
         }
+    }
+
+    /**
+     * OLED is the one palette whose selling point is measurable: it has to be genuinely black,
+     * not merely the darkest of the dark fields. The blob field this client draws samples the
+     * ramp at 0.15/0.40/0.65/0.90, so its darkest blob lands in the all-black head of the ramp.
+     */
+    @Test
+    fun oledIsActuallyBlack() {
+        val oled = GamepadPalette.named("oled")
+        assertEquals(Triple(0.0, 0.0, 0.0), oled.ground)
+        assertEquals(0f, oled.blobColors[0].red, 1e-6f)
+        assertEquals(0f, oled.blobColors[0].green, 1e-6f)
+        assertEquals(0f, oled.blobColors[0].blue, 1e-6f)
+        val mean = oled.stops.sumOf { luma(it) } / oled.stops.size
+        val darkestOther = GamepadPalette.ALL
+            .filter { it.id != "oled" && it.stops.isNotEmpty() }
+            .minOf { p -> p.stops.sumOf { luma(it) } / p.stops.size }
+        assertTrue("oled means $mean, barely under $darkestOther", mean < darkestOther / 2)
     }
 
     /** A pale palette really is pale — its ink flips, so a mislabelled one is unreadable. */

@@ -67,7 +67,7 @@ class GamepadPalette(
         )
 
         /**
-         * The twelve shipped palettes: the brand default, five more dark fields, then six pale
+         * The thirteen shipped palettes: the brand default, six more dark fields, then six pale
          * ones. Cycling order runs dark → light, so stepping the row walks the range one way.
          */
         val ALL = listOf(
@@ -75,6 +75,22 @@ class GamepadPalette(
             GamepadPalette(
                 "violet", "Violet", emptyList(),
                 ground = Triple(0.075, 0.060, 0.160),
+                accent = Triple(0.525, 0.471, 0.961), light = false,
+            ),
+            GamepadPalette(
+                // For OLED and AMOLED panels, where a black pixel is a pixel switched off — no
+                // glow, no power. The first two stops are literally (0,0,0), so the shaded half
+                // of the field is genuinely off rather than "very dark grey", and the ground is
+                // pure black too: the calm mix on the form screens lifts toward nothing. What is
+                // left is a faint indigo→violet ember in the bright corner. The accent stays the
+                // brand violet — focus has to be findable on black.
+                "oled", "OLED",
+                listOf(
+                    Triple(0.000, 0.000, 0.000), Triple(0.000, 0.000, 0.000),
+                    Triple(0.010, 0.020, 0.100), Triple(0.045, 0.016, 0.115),
+                    Triple(0.120, 0.024, 0.130),
+                ),
+                ground = Triple(0.0, 0.0, 0.0),
                 accent = Triple(0.525, 0.471, 0.961), light = false,
             ),
             GamepadPalette(

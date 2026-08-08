@@ -94,11 +94,20 @@ data class Settings(
     val touchMode: TouchMode = TouchMode.TRACKPAD,
     /**
      * Swap the whole home screen for the controller-optimized "console" UI (the host carousel +
-     * gamepad chrome) whenever a controller is connected — mirrors the Apple client's
-     * `gamepadUIEnabled`. On by default; turn it off to keep the touch UI even with a pad attached.
+     * gamepad chrome) — mirrors the Apple client's `gamepadUIEnabled`. On by default; turn it off
+     * to keep the touch UI even with a pad attached. WHEN it takes over is [gamepadUiMode].
      * A TV (leanback) is always in this mode regardless (its remote/pad is the only input).
      */
     val gamepadUiEnabled: Boolean = true,
+    /**
+     * When [gamepadUiEnabled] actually takes over — the cross-client `gamepad_ui_mode` pair,
+     * mirroring the Apple client's `gamepadUIMode`: `"connected"` (default, and what the switch
+     * has always meant) waits for a controller; `"always"` keeps the console UI with no pad in
+     * reach, for a phone or tablet that lives docked to a TV. Read only while [gamepadUiEnabled]
+     * is on, which is why both settings screens hide the row when the switch is off. Anything
+     * unrecognized resolves to `"connected"`. A TV ignores it — it is always in console mode.
+     */
+    val gamepadUiMode: String = GAMEPAD_UI_WHEN_CONNECTED,
     /**
      * Show the experimental game-library browser (the coverflow reached with Y from a saved host).
      * Fetched from the host's management API over mTLS; needs a paired host. Mirrors the Apple
@@ -107,9 +116,10 @@ data class Settings(
     val libraryEnabled: Boolean = true,
     /**
      * Which colour family the console (gamepad) UI's living backdrop drifts through — the
-     * cross-client `ui_palette` key: `"violet"` (the brand default), `"tide"`, `"forest"`,
-     * `"ember"`, `"rose"`, `"graphite"`. See [GamepadPalette], whose table and maths mirror the
-     * desktop console's and the Apple client's under the same names. Presentation only: nothing
+     * cross-client `ui_palette` key: `"violet"` (the brand default), then `"oled"`, `"nebula"`,
+     * `"abyss"`, `"ember"`, `"moss"`, `"graphite"`, then the six pale fields. See
+     * [GamepadPalette], whose table and maths mirror the desktop console's and the Apple
+     * client's under the same names. Presentation only: nothing
      * about a stream depends on it, so it is a device preference and never part of a profile.
      * An unknown value reads as the default rather than failing — a newer client may have shipped
      * a palette this build doesn't know.
@@ -303,6 +313,8 @@ class SettingsStore(context: Context) {
             // Migration: the pre-enum Boolean "trackpad_mode" (true = trackpad, false = direct).
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
+        gamepadUiMode = prefs.getString(K_GAMEPAD_UI_MODE, GAMEPAD_UI_WHEN_CONNECTED)
+            ?: GAMEPAD_UI_WHEN_CONNECTED,
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
         uiPalette = prefs.getString(K_UI_PALETTE, "violet") ?: "violet",
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
@@ -344,6 +356,7 @@ class SettingsStore(context: Context) {
             .putString(K_STATS_VERBOSITY, s.statsVerbosity.name)
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
+            .putString(K_GAMEPAD_UI_MODE, s.gamepadUiMode)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
             .putString(K_UI_PALETTE, s.uiPalette)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
@@ -384,6 +397,7 @@ class SettingsStore(context: Context) {
         const val K_HUD = "stats_hud_enabled"
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
+        const val K_GAMEPAD_UI_MODE = "gamepad_ui_mode"
         const val K_LIBRARY = "library_enabled"
         const val K_UI_PALETTE = "ui_palette"
 
@@ -777,6 +791,13 @@ fun smoothBufferOptions(hz: Int): List<Pair<Int, String>> {
         3 to "3 frames (${cost(3)})",
     )
 }
+
+/** (stored value, label) for when the console UI takes over — the Apple client's table verbatim.
+ * Only offered while [Settings.gamepadUiEnabled] is on; a TV is in console mode either way. */
+val GAMEPAD_UI_MODE_OPTIONS = listOf(
+    GAMEPAD_UI_WHEN_CONNECTED to "With a controller",
+    GAMEPAD_UI_ALWAYS to "Always",
+)
 
 /** (mode, label) for the touch-input model. */
 val TOUCH_MODE_OPTIONS = listOf(

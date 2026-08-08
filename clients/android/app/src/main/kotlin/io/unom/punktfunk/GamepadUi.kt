@@ -17,14 +17,34 @@ import androidx.compose.ui.platform.LocalContext
 import io.unom.punktfunk.kit.Gamepad
 
 /**
+ * [Settings.gamepadUiMode]: take over only while a controller is attached. The default, and what
+ * the switch meant when it was a lone Boolean.
+ */
+const val GAMEPAD_UI_WHEN_CONNECTED = "connected"
+
+/**
+ * [Settings.gamepadUiMode]: take over whenever the switch is on, pad or no pad — for a phone or
+ * tablet that lives docked to a TV, where the console layout is the one wanted and the pad is not
+ * always awake.
+ */
+const val GAMEPAD_UI_ALWAYS = "always"
+
+/**
  * Whether the controller-optimized "console" home (the host carousel + gamepad chrome) should
  * replace the touch UI — the Android mirror of the Apple client's `GamepadUIEnvironment.isActive`:
- * the user's [enabled] setting AND (a controller is attached OR this is a TV OR the dev [forced]
- * flag). A TV counts unconditionally — its remote/gamepad is the only input, so it's always the
- * console UI (as long as the setting is on).
+ * the user's [enabled] setting AND (the [mode] is [GAMEPAD_UI_ALWAYS] OR a controller is attached
+ * OR this is a TV OR the dev [forced] flag). A TV counts unconditionally — its remote/gamepad is
+ * the only input, so it's always the console UI (as long as the setting is on), which is why the
+ * mode row means nothing there. An unrecognized [mode] waits for a controller, so a value a newer
+ * client wrote can never strand this one in a layout it has no way back out of.
  */
-fun gamepadUiActive(enabled: Boolean, controllerConnected: Boolean, tv: Boolean, forced: Boolean): Boolean =
-    enabled && (controllerConnected || tv || forced)
+fun gamepadUiActive(
+    enabled: Boolean,
+    mode: String,
+    controllerConnected: Boolean,
+    tv: Boolean,
+    forced: Boolean,
+): Boolean = enabled && (mode == GAMEPAD_UI_ALWAYS || controllerConnected || tv || forced)
 
 /** True on a TV: the leanback/television feature or the TELEVISION ui-mode. */
 fun isTvDevice(context: Context): Boolean {

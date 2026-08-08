@@ -246,16 +246,33 @@ const CELL_RAMP: [f64; 16] = [
     -0.10,  0.08, -0.06,  0.12,
 ];
 
-/// The twelve shipped palettes: the brand default, five more dark fields, then six pale ones.
+/// The thirteen shipped palettes: the brand default, six more dark fields, then six pale ones.
 /// Cycling order runs dark → light, so stepping the row walks the whole range in one direction.
 /// Adding one here adds it to every console settings screen; the Apple and Android tables must
 /// gain the same entry to keep the `ui_palette` key portable.
 #[rustfmt::skip]
-pub const PALETTES: [Palette; 12] = [
+pub const PALETTES: [Palette; 13] = [
     // --- dark fields (white ink) ---
     Palette {
         id: "violet", name: "Violet", stops: None,
         ground: (0.075, 0.060, 0.160), accent: (0.525, 0.471, 0.961), light: false,
+    },
+    Palette {
+        // For OLED and AMOLED panels, where a black pixel is a pixel switched off — no glow,
+        // no power. The ramp's first two stops are literally (0,0,0), so the whole shaded half
+        // of the field is genuinely off rather than "very dark grey", and the ground is pure
+        // black too: the calm mix on the form screens lifts toward nothing, so settings and
+        // pairing sit on an unlit panel. What is left is a faint indigo→violet ember in the
+        // bright corner, dim enough to stay under a tenth of the other dark fields' mean
+        // luminance while keeping the backdrop a field with somewhere to go rather than a
+        // dead rectangle. The accent stays the brand violet — focus has to be findable on
+        // black.
+        id: "oled", name: "OLED",
+        stops: Some(&[
+            (0.000, 0.000, 0.000), (0.000, 0.000, 0.000), (0.010, 0.020, 0.100),
+            (0.045, 0.016, 0.115), (0.120, 0.024, 0.130),
+        ]),
+        ground: (0.0, 0.0, 0.0), accent: (0.525, 0.471, 0.961), light: false,
     },
     Palette {
         // Deep indigo climbing through violet into a hot magenta.
@@ -857,7 +874,7 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "violet", "nebula", "abyss", "ember", "moss", "graphite", "holo", "sunset",
+                "violet", "oled", "nebula", "abyss", "ember", "moss", "graphite", "holo", "sunset",
                 "bloom", "dawn", "mint", "opal",
             ]
         );
@@ -867,7 +884,36 @@ mod tests {
             .position(|p| p.light)
             .expect("some are light");
         assert!(PALETTES[first_light..].iter().all(|p| p.light));
-        assert_eq!(first_light, 6);
+        assert_eq!(first_light, 7);
+    }
+
+    /// OLED is the one palette whose selling point is measurable: it has to be genuinely
+    /// black, not merely the darkest of the dark fields. Pure black corners, a mean well
+    /// under every other field's, and a ground that lifts to nothing on the form screens.
+    #[test]
+    fn oled_is_actually_black() {
+        let luma = |c: (f64, f64, f64)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
+        let oled = palette("oled");
+        assert_eq!(
+            oled.ground,
+            (0.0, 0.0, 0.0),
+            "the calm lift must be nothing"
+        );
+        let cells = oled.mesh_colors();
+        assert!(
+            cells.iter().filter(|c| luma(**c) == 0.0).count() >= 3,
+            "the shaded corner has to be switched off, not dimmed"
+        );
+        let mean = cells.iter().map(|c| luma(*c)).sum::<f64>() / 16.0;
+        let darkest_other = PALETTES
+            .iter()
+            .filter(|p| p.id != "oled")
+            .map(|p| p.mesh_colors().iter().map(|c| luma(*c)).sum::<f64>() / 16.0)
+            .fold(f64::MAX, f64::min);
+        assert!(
+            mean < darkest_other / 2.0,
+            "oled means {mean:.3}, only half a stop under {darkest_other:.3}"
+        );
     }
 
     /// Every colour a palette produces stays in gamut, and a pale palette really is pale —

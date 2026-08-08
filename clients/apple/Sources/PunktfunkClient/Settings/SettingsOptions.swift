@@ -53,6 +53,14 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// When the gamepad UI takes over (`DefaultsKey.gamepadUIMode`) — only meaningful while
+    /// `gamepadUIEnabled` is on, so every surface that offers it hides the row when the switch
+    /// is off rather than showing a picker that decides nothing.
+    static let gamepadUIModes: [(label: String, tag: String)] = [
+        ("With a controller", GamepadUIEnvironment.modeWhenConnected),
+        ("Always", GamepadUIEnvironment.modeAlways),
+    ]
+
     /// Presentation intent (`DefaultsKey.presentPriority` — the 2026-07 rebuild that replaced
     /// the visible stage picker with intent; see SessionPresenter's PresentPriority and
     /// design/apple-presentation-rebuild.md). The stage ladder survives only as the hidden

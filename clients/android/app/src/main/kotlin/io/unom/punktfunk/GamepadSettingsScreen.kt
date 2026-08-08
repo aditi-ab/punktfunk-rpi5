@@ -665,6 +665,21 @@ internal fun buildSettingsRows(
             "Turn off to use the touch interface even with a controller connected.",
             s.gamepadUiEnabled,
         ) { update(s.copy(gamepadUiEnabled = it)) },
+    ) + listOfNotNull(
+        // WHEN the switch above takes over. Built only while it is ON: turn the switch off from
+        // this very screen and the row under the cursor would otherwise be one deciding nothing,
+        // on a screen that is itself about to disappear.
+        if (s.gamepadUiEnabled) {
+            choice(
+                "gamepadUIMode", GpTab.INTERFACE, null, "Show it",
+                "With a controller: the touch interface comes back when the last one " +
+                    "disconnects. Always keeps this layout either way — for a device that lives " +
+                    "docked to a TV. A TV itself is always in this mode regardless.",
+                GAMEPAD_UI_MODE_OPTIONS, s.gamepadUiMode,
+            ) { update(s.copy(gamepadUiMode = it)) }
+        } else {
+            null
+        },
     )
 }
 

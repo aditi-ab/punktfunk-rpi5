@@ -724,10 +724,23 @@ extension SettingsView {
             #endif
             #if !os(tvOS)
             if !inProfileScope {
-                described("With a controller connected, the host list and library switch to a "
-                    + "controller-friendly layout — larger focus targets, a swipeable cover "
-                    + "browser.") {
+                described("The host list and library switch to a controller-friendly layout — "
+                    + "larger focus targets, a swipeable cover browser.") {
                     Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
+                }
+                // Only meaningful while the switch above is on, so it is HIDDEN rather than
+                // disabled when it isn't: a picker whose every option decides nothing is worse
+                // than no picker, and this Section is short enough that nothing jumps far.
+                if gamepadUIEnabled {
+                    described("With a controller: the touch interface comes back when the last "
+                        + "one disconnects. Always keeps the controller-friendly layout either "
+                        + "way — for a device that lives on a TV.") {
+                        Picker("Show it", selection: $gamepadUIMode) {
+                            ForEach(SettingsOptions.gamepadUIModes, id: \.tag) { option in
+                                Text(option.label).tag(option.tag)
+                            }
+                        }
+                    }
                 }
             }
             #endif

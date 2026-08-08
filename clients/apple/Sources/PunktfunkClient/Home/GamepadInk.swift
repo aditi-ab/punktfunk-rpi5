@@ -85,16 +85,40 @@ extension EnvironmentValues {
 }
 
 extension View {
-    /// Resolve the stored `ui_palette` and publish its ink to everything below. Applied by the
-    /// gamepad screens' common root so no individual view has to read the setting.
-    func gamepadPaletteInk() -> some View { modifier(GamepadInkModifier()) }
+    /// Resolve the stored `ui_palette` and publish its ink — AND the matching colour scheme — to
+    /// everything below. Applied by the gamepad screens' common root so no individual view has to
+    /// read the setting.
+    ///
+    /// `active` exists for the one surface that is the same view in both worlds: `LibraryView`
+    /// renders the coverflow under the gamepad UI and a plain grid without it. Passing `false`
+    /// publishes nothing, because the touch/desktop layouts sit on the SYSTEM background, where a
+    /// palette's scheme would invert their own system colours instead of matching them.
+    func gamepadPaletteInk(_ active: Bool = true) -> some View {
+        modifier(GamepadInkModifier(active: active))
+    }
 }
 
 private struct GamepadInkModifier: ViewModifier {
+    var active = true
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
+    /// The ambient scheme from ABOVE this modifier — what gets republished unchanged when the
+    /// gamepad UI isn't the one drawing, so `active: false` is a true no-op rather than a branch
+    /// that would change this view's identity.
+    @Environment(\.colorScheme) private var systemScheme
 
     func body(content: Content) -> some View {
-        content.environment(\.gamepadInk, GamepadInk.of(GamepadPalette.named(paletteID)))
+        let palette = GamepadPalette.named(paletteID)
+        return content
+            .environment(\.gamepadInk, active ? GamepadInk.of(palette) : .dark)
+            // The ink alone was never enough. Every SYSTEM-derived colour that lands on these
+            // screens — `.secondary` in a placeholder, a `.bordered` button's chrome, a
+            // NavigationStack's title, a material's frost — resolves against the DEVICE's
+            // appearance, which no part of this app had ever set. On iPhone and Mac that is often
+            // Light, so the pale palettes looked correct by accident; an Apple TV is Dark
+            // essentially always, so on tvOS every one of them came out WHITE on a pale field and
+            // the interface was unreadable. Publishing the scheme here — once, beside the ink it
+            // has to agree with — is what makes a pale palette mean "light" to UIKit too.
+            .environment(\.colorScheme, active ? (palette.light ? .light : .dark) : systemScheme)
     }
 }
 

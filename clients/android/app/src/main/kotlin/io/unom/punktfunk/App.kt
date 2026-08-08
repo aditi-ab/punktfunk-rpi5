@@ -69,11 +69,14 @@ fun App(forceGamepadUi: Boolean = false) {
     // later manual Back out of the library is not undone by a stale value.
     var reopenLibraryHostId by remember { mutableStateOf<String?>(null) }
 
-    // Console (gamepad) mode mirrors the Apple client: the setting AND (a pad is attached OR this is
-    // a TV OR the dev force flag). Flips live as controllers connect/disconnect.
+    // Console (gamepad) mode mirrors the Apple client: the setting AND (its mode says Always OR a
+    // pad is attached OR this is a TV OR the dev force flag). Flips live as controllers
+    // connect/disconnect — unless the mode is Always, where it simply stays.
     val tv = remember { isTvDevice(context) }
     val controllerConnected by rememberControllerConnected()
-    val gamepadUi = gamepadUiActive(settings.gamepadUiEnabled, controllerConnected, tv, forceGamepadUi)
+    val gamepadUi = gamepadUiActive(
+        settings.gamepadUiEnabled, settings.gamepadUiMode, controllerConnected, tv, forceGamepadUi,
+    )
 
     // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
     // activity instance (the normal case under `launchMode = standard`) can refuse it before that

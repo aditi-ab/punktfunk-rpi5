@@ -81,6 +81,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    /// When the switch above takes over — the row is only built while it is on.
+    @AppStorage(DefaultsKey.gamepadUIMode) private var gamepadUIMode =
+        GamepadUIEnvironment.modeWhenConnected
     /// The gamepad UI's background colour family — the backdrop BEHIND this screen re-colours as
     /// the row steps, which is why the picker lives here and not in a sheet.
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
@@ -659,6 +662,21 @@ struct GamepadSettingsView: View {
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
         ]
+        // WHEN the switch above takes over. Built only while it is on: with the switch off this
+        // screen is unreachable in the first place (no gamepad UI to open it from), so a row
+        // that decides nothing would exist purely to be found in a screenshot.
+        if gamepadUIEnabled, let at = list.firstIndex(where: { $0.id == "gamepadUI" }) {
+            list.insert(
+                choiceRow(
+                    id: "gamepadUIMode", tab: .interface, icon: "gamecontroller.circle",
+                    label: "Show it",
+                    detail: "With a controller: the touch interface comes back when the last one "
+                        + "disconnects. Always keeps this layout either way — for a device that "
+                        + "lives on a TV.",
+                    options: SettingsOptions.gamepadUIModes, current: gamepadUIMode
+                ) { gamepadUIMode = $0 },
+                at: at + 1)
+        }
         #if os(macOS)
         // The windowed safe-present toggle slots in after "Smoothness buffer" (staying inside
         // the Video tab) — macOS only, mirroring the touch SettingsView's Presentation row
@@ -707,6 +725,14 @@ struct GamepadSettingsView: View {
                 at: anchor + 1)
         }
         #endif
+        // The smoothness buffer only decides anything under Smoothness. Every other settings
+        // surface — touch, tvOS, the GTK and WinUI shells — hides it under Lowest latency; this
+        // screen alone left it live and steppable, which is a row that thuds or silently stores
+        // a value nothing reads. Removed here rather than omitted from the literal above so the
+        // macOS safe-present insertion can still anchor on it.
+        if presentPriority != "smooth" {
+            list.removeAll { $0.id == "smoothBuffer" }
+        }
         return list + profileRows
     }
 

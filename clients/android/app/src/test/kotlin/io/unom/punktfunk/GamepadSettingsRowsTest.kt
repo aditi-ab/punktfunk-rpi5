@@ -95,4 +95,47 @@ class GamepadSettingsRowsTest {
         // Drawn as a switch, and reading the persisted default.
         assertEquals(true, row(on, "dsCapture").toggled)
     }
+
+    /**
+     * The activation-mode row is a sub-setting of the Controller-optimized UI switch, so it is
+     * OFFERED only while that switch is on — hidden rather than dimmed, because with the switch
+     * off this whole screen is about to be replaced by the touch UI and a dimmed row there would
+     * be one last thing to step past on the way out.
+     */
+    @Test
+    fun `the activation-mode row follows the switch it belongs to`() {
+        fun ids(enabled: Boolean) = buildSettingsRows(
+            Settings(gamepadUiEnabled = enabled),
+            hasBodyVibrator = false, hasGyroscope = false, av1Capable = false,
+        ) {}.map { it.id }
+
+        val on = ids(enabled = true)
+        assertTrue("the mode row is missing", "gamepadUIMode" in on)
+        assertEquals(
+            "the mode belongs directly under the switch it qualifies",
+            on.indexOf("gamepadUI") + 1,
+            on.indexOf("gamepadUIMode"),
+        )
+        val off = ids(enabled = false)
+        assertFalse("the mode row must not outlive its switch", "gamepadUIMode" in off)
+        assertTrue("the switch itself stays, or it could never be turned back on", "gamepadUI" in off)
+    }
+
+    /** Stepping the mode row writes the shared `gamepad_ui_mode` value, and wraps on A. */
+    @Test
+    fun `the activation-mode row steps the shared key`() {
+        var s = Settings()
+        fun mode() = buildSettingsRows(
+            s, hasBodyVibrator = false, hasGyroscope = false, av1Capable = false,
+        ) { s = it }.first { it.id == "gamepadUIMode" }
+
+        assertEquals(GAMEPAD_UI_WHEN_CONNECTED, s.gamepadUiMode)
+        assertEquals("With a controller", mode().value)
+        assertFalse("already the first = thud", mode().adjust(-1))
+        assertTrue(mode().adjust(1))
+        assertEquals(GAMEPAD_UI_ALWAYS, s.gamepadUiMode)
+        // A from the last entry wraps home.
+        mode().activate()
+        assertEquals(GAMEPAD_UI_WHEN_CONNECTED, s.gamepadUiMode)
+    }
 }
