@@ -844,6 +844,7 @@ fn parse_spike(args: &[String]) -> Result<Options> {
     let mut bitrate_mbps = 20u64;
     let mut out: Option<PathBuf> = None;
     let mut loopback = true;
+    let mut wire_chunk: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -906,6 +907,12 @@ fn parse_spike(args: &[String]) -> Result<Options> {
             }
             "--out" => out = Some(PathBuf::from(next()?)),
             "--no-loopback" => loopback = false,
+            "--wire-chunk" => {
+                let v: usize = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --wire-chunk (bytes)"))?;
+                wire_chunk = (v > 0).then_some(v);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -940,6 +947,7 @@ fn parse_spike(args: &[String]) -> Result<Options> {
         bitrate_bps: bitrate_mbps.saturating_mul(1_000_000),
         out,
         loopback,
+        wire_chunk,
     })
 }
 
@@ -1020,6 +1028,11 @@ SPIKE OPTIONS:
     --width <W> --height <H>     synthetic source size (default: 1920x1080)
     --out <PATH>                 raw Annex-B output (default: /tmp/punktfunk-spike.<ext>)
     --no-loopback                skip the punktfunk_core round-trip verification
+    --wire-chunk <BYTES>         PyroWave datagram-aligned packetization at this shard payload
+                                 (a real session passes its negotiated shard_payload, e.g. 1408).
+                                 With PUNKTFUNK_PYROWAVE_STREAMED_AU=1 also armed, the AU is
+                                 drained through poll_chunk and sealed as a STREAMED wire frame
+                                 (VIDEO_CAP_STREAMED_AU), then byte-verified by the loopback
     -h, --help                   this help
 
 NOTES:

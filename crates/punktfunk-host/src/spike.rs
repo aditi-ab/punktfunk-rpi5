@@ -48,6 +48,17 @@ pub struct Options {
     pub out: PathBuf,
     /// Also round-trip every AU through a `punktfunk_core` host→client loopback and verify.
     pub loopback: bool,
+    /// PyroWave datagram-aligned packetization at this shard payload
+    /// ([`Encoder::set_wire_chunking`], plan §4.4) — what a real session passes from its
+    /// negotiated `shard_payload`. `None` = the dense one-packet-per-AU shape.
+    ///
+    /// This is also the switch that makes the STREAMED-AU wire reachable from the spike: with
+    /// it set and `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` armed, the encoder's `poll_chunk` hands the
+    /// AU out in window-aligned pieces and the loopback seals them through
+    /// `begin_streamed_frame_at`/`seal_streamed_chunk`/`seal_streamed_finish` — the same path a
+    /// `VIDEO_CAP_STREAMED_AU` client drives. Without it there is no way to exercise PW6 end to
+    /// end outside a real client session.
+    pub wire_chunk: Option<usize>,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -167,6 +178,18 @@ pub fn run(opts: Options) -> Result<()> {
     )
     .context("open encoder")?;
 
+    // Datagram-aligned packetization (§4.4) — and, with the PW6 knob armed, the gate that makes
+    // `supports_chunked_poll()` true so the drain below takes the streamed-AU path.
+    if let Some(c) = opts.wire_chunk {
+        encoder.set_wire_chunking(c);
+        tracing::info!(
+            shard_payload = c,
+            chunked_poll = encoder.supports_chunked_poll(),
+            "spike: wire chunking on (chunked_poll=false means PUNKTFUNK_PYROWAVE_STREAMED_AU \
+             is not armed — the AU still goes out whole)"
+        );
+    }
+
     let mut sink = BufWriter::new(
         File::create(&opts.out).with_context(|| format!("create {}", opts.out.display()))?,
     );
@@ -206,6 +229,12 @@ pub fn run(opts: Options) -> Result<()> {
         out = %opts.out.display(),
         elapsed_s = format!("{elapsed:.2}"),
         encode_fps = format!("{:.1}", stats.encoded as f64 / elapsed.max(1e-9)),
+        // 0 = the whole-AU drain; > encoded = the streamed drain actually cut AUs into pieces.
+        chunks = stats.chunks,
+        chunks_per_au = format!(
+            "{:.1}",
+            stats.chunks as f64 / (stats.encoded.max(1)) as f64
+        ),
         "spike capture→encode→file complete"
     );
 
@@ -229,6 +258,9 @@ struct Stats {
     encoded: u64,
     keyframes: u64,
     bytes_out: u64,
+    /// Streamed-AU drain only: total chunks polled across all AUs (1 per AU means the cut never
+    /// engaged — the knob is off or the AU fits one chunk).
+    chunks: u64,
 }
 
 fn drain_encoder(
@@ -237,6 +269,12 @@ fn drain_encoder(
     mut lb: Option<&mut Loopback>,
     stats: &mut Stats,
 ) -> Result<()> {
+    // Streamed-AU drain (PW6): the encoder hands the finished AU out in shard-aligned pieces and
+    // the loopback seals each piece as it arrives, exactly as the native host's send thread does.
+    // Re-queried per drain, never cached — the trait's contract.
+    if encoder.supports_chunked_poll() {
+        return drain_encoder_chunked(encoder, sink, lb, stats);
+    }
     while let Some(au) = encoder.poll().context("encoder poll")? {
         sink.write_all(&au.data).context("write AU to file")?;
         stats.encoded += 1;
@@ -246,6 +284,49 @@ fn drain_encoder(
         }
         if let Some(lb) = lb.as_deref_mut() {
             lb.submit(&au)?;
+        }
+    }
+    Ok(())
+}
+
+/// The streamed-AU drain. Each chunk is sealed into the open wire frame the moment it is polled;
+/// the concatenation is kept only so the completed AU can still be written to the file sink and
+/// byte-compared against what the client reassembled — which is the point of the leg: it proves
+/// the chunks the encoder cut, sealed through the sentinel-block wire, reassemble to EXACTLY the
+/// AU `poll()` would have produced.
+fn drain_encoder_chunked(
+    encoder: &mut dyn Encoder,
+    sink: &mut impl Write,
+    mut lb: Option<&mut Loopback>,
+    stats: &mut Stats,
+) -> Result<()> {
+    let mut whole: Vec<u8> = Vec::new();
+    let mut chunks = 0u32;
+    while let Some(c) = encoder.poll_chunk().context("encoder poll_chunk")? {
+        if c.first {
+            whole.clear();
+            chunks = 0;
+            if let Some(lb) = lb.as_deref_mut() {
+                lb.streamed_begin(c.pts_ns, c.keyframe)?;
+            }
+        }
+        whole.extend_from_slice(&c.data);
+        chunks += 1;
+        if let Some(lb) = lb.as_deref_mut() {
+            lb.streamed_chunk(&c.data)?;
+        }
+        if !c.last {
+            continue;
+        }
+        sink.write_all(&whole).context("write AU to file")?;
+        stats.encoded += 1;
+        stats.bytes_out += whole.len() as u64;
+        stats.chunks += chunks as u64;
+        if c.keyframe {
+            stats.keyframes += 1;
+        }
+        if let Some(lb) = lb.as_deref_mut() {
+            lb.streamed_finish(&whole)?;
         }
     }
     Ok(())
@@ -261,6 +342,14 @@ struct Loopback {
     recovered: u64,
     mismatches: u64,
     bytes: u64,
+    /// The streamed AU currently open (PW6). `Some` strictly between `streamed_begin` and
+    /// `streamed_finish`, mirroring the native send thread's `StreamedOpen`.
+    open: Option<punktfunk_core::packet::StreamedAu>,
+    /// Wire frame index for the streamed path. `submit_frame` uses the packetizer's internal
+    /// counter and `begin_streamed_frame_at` takes an explicit one; a session must use ONE
+    /// numbering style, and the spike never mixes them (`supports_chunked_poll()` is constant
+    /// for a PyroWave session, so every AU takes the same route).
+    next_index: u32,
 }
 
 impl Loopback {
@@ -277,7 +366,99 @@ impl Loopback {
             recovered: 0,
             mismatches: 0,
             bytes: 0,
+            open: None,
+            next_index: 0,
         })
+    }
+
+    /// Open a streamed AU on the wire (PW6). The client side needs no opt-in: a streamed frame
+    /// completes exactly like a whole one and is handed up as a single `Frame` — which is the
+    /// finding this leg exists to demonstrate rather than assert.
+    fn streamed_begin(&mut self, pts_ns: u64, keyframe: bool) -> Result<()> {
+        if self.open.is_some() {
+            return Err(anyhow!(
+                "streamed AU still open at begin — a previous AU never sent its `last` chunk"
+            ));
+        }
+        let mut flags = FLAG_PIC as u32;
+        if keyframe {
+            flags |= FLAG_SOF as u32;
+        }
+        let idx = self.next_index;
+        self.next_index = self.next_index.wrapping_add(1);
+        self.open = Some(
+            self.host
+                .begin_streamed_frame_at(pts_ns, flags, idx)
+                .map_err(|e| anyhow!("begin_streamed_frame_at: {e:?}"))?,
+        );
+        Ok(())
+    }
+
+    /// Seal + send one encoder chunk. The returned batch is often EMPTY (the sealer buffers
+    /// until a whole FEC block accumulates) — that is the normal case, not an error.
+    fn streamed_chunk(&mut self, data: &[u8]) -> Result<()> {
+        let au = self
+            .open
+            .as_mut()
+            .ok_or_else(|| anyhow!("streamed chunk with no open AU"))?;
+        let wires = self
+            .host
+            .seal_streamed_chunk(au, data, false)
+            .map_err(|e| anyhow!("seal_streamed_chunk: {e:?}"))?;
+        self.send(wires)
+    }
+
+    /// Close the AU (final block carries the real totals) and verify what the client got.
+    fn streamed_finish(&mut self, expect: &[u8]) -> Result<()> {
+        let au = self
+            .open
+            .take()
+            .ok_or_else(|| anyhow!("streamed finish with no open AU"))?;
+        let wires = self
+            .host
+            .seal_streamed_finish(au)
+            .map_err(|e| anyhow!("seal_streamed_finish: {e:?}"))?;
+        self.send(wires)?;
+        self.submitted += 1;
+        self.bytes += expect.len() as u64;
+        self.verify(expect)
+    }
+
+    fn send(&mut self, wires: Vec<Vec<u8>>) -> Result<()> {
+        if wires.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        self.host
+            .send_sealed(&refs)
+            .map_err(|e| anyhow!("send_sealed: {e:?}"))?;
+        drop(refs);
+        self.host.reclaim_wires(wires);
+        Ok(())
+    }
+
+    /// Drain whatever the client can now reassemble and byte-compare it to `expect`.
+    fn verify(&mut self, expect: &[u8]) -> Result<()> {
+        loop {
+            match self.client.poll_frame() {
+                Ok(frame) => {
+                    self.recovered += 1;
+                    if frame.data != expect {
+                        self.mismatches += 1;
+                        tracing::warn!(
+                            recovered = self.recovered,
+                            got = frame.data.len(),
+                            expected = expect.len(),
+                            complete = frame.complete,
+                            "loopback AU mismatch"
+                        );
+                    }
+                }
+                Err(punktfunk_core::PunktfunkError::NoFrame) => break,
+                Err(e) => return Err(anyhow!("client poll_frame: {e:?}")),
+            }
+        }
+        Ok(())
     }
 
     fn submit(&mut self, au: &EncodedFrame) -> Result<()> {

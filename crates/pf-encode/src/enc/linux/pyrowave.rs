@@ -2607,4 +2607,147 @@ mod tests {
         assert!(!priority_refused(vk::Result::ERROR_EXTENSION_NOT_PRESENT));
         assert!(!priority_refused(vk::Result::SUCCESS));
     }
+
+    // ---- PW6: the streamed-AU cut, on real GPU output ----------------------------------------
+    // Appended at module END per the wave plan's ownership rule.
+
+    /// Walk a windowed AU back into the flat codec-packet stream — the clients' parse
+    /// (`video_pyrowave.rs::push_window`, Apple's `MetalWaveletDecoder`), so upstream's decoder
+    /// sees exactly what a real client would feed it.
+    fn walk_windows(au: &[u8], window: usize) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut frag: Vec<u8> = Vec::new();
+        for win in au.chunks(window) {
+            let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+            let kind = u16::from_le_bytes([win[2], win[3]]);
+            let body = &win[4..4 + used];
+            match kind {
+                0 => stream.extend_from_slice(body),
+                1 => frag = body.to_vec(),
+                2 => frag.extend_from_slice(body),
+                3 => {
+                    frag.extend_from_slice(body);
+                    stream.extend_from_slice(&frag);
+                    frag.clear();
+                }
+                k => panic!("unknown window kind {k}"),
+            }
+        }
+        stream
+    }
+
+    /// Luma PSNR (dB) of a decoded Y plane against the BT.709 limited-range luma of the source
+    /// BGRA — the same math `rgb2yuv.comp` runs on the GPU. Luma only: chroma is subsampled on
+    /// the 4:2:0 path, and luma is where wavelet quantisation shows.
+    fn luma_psnr(src_bgra: &[u8], decoded_y: &[u8]) -> f64 {
+        assert_eq!(src_bgra.len(), decoded_y.len() * 4);
+        let mut sse = 0.0f64;
+        for (px, &got) in src_bgra.chunks_exact(4).zip(decoded_y) {
+            let (b, g, r) = (px[0] as f64, px[1] as f64, px[2] as f64);
+            let want = 16.0 + 0.1826 * r + 0.6142 * g + 0.0620 * b;
+            let d = want - got as f64;
+            sse += d * d;
+        }
+        let mse = sse / decoded_y.len() as f64;
+        if mse <= f64::EPSILON {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
+
+    /// PW6 on-glass: with `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` armed, a real GPU encode of a BUSY
+    /// test card must come out of `poll_chunk` in several window-aligned pieces that concatenate
+    /// to a decodable AU — and the picture must survive, verified by PSNR against the CSC's own
+    /// BT.709 math rather than by "it ran".
+    ///
+    /// Flat fills are useless here (they false-greened the Windows bring-up): a solid colour
+    /// reassembles convincingly even when whole subbands are missing. The busy card puts energy
+    /// in every subband, so a cut that lost or reordered a window shows up as a PSNR collapse.
+    ///
+    /// `#[ignore]`d: needs a real Vulkan 1.3 GPU.
+    ///   cargo test -p pf-encode --features pyrowave --no-run
+    ///   PUNKTFUNK_PYROWAVE_STREAMED_AU=1 <bin> --ignored --nocapture pyrowave_streamed_chunks
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn pyrowave_streamed_chunks_reassemble_and_keep_the_picture() {
+        const WINDOW: usize = 1408;
+        // 1280x720 at 60 Mb/s ≈ 125 KB/AU — comfortably several 256 KiB-target chunks' worth of
+        // windows at the default step once the step is clamped to the AU, and big enough that the
+        // AU spans many windows.
+        let (w, h) = (1280u32, 720u32);
+        let mut enc = PyroWaveEncoder::open(w, h, 60, 200_000_000, crate::ChromaFormat::Yuv420)
+            .expect("open pyrowave encoder");
+        enc.set_wire_chunking(WINDOW);
+
+        assert!(
+            enc.supports_chunked_poll(),
+            "PUNKTFUNK_PYROWAVE_STREAMED_AU=1 must be set in the ENVIRONMENT of this test binary \
+             — without it PW6 is off by design and there is nothing to verify"
+        );
+
+        for seed in [7u32, 11, 13] {
+            let frame = test_card(w, h, seed);
+            let FramePayload::Cpu(ref src) = frame.payload else {
+                panic!("test card is a CPU frame")
+            };
+            let src = src.clone();
+            enc.submit(&frame).expect("submit");
+
+            // Drain the AU through the chunked poll, exactly as the native pump does.
+            let mut au = Vec::new();
+            let (mut chunks, mut firsts, mut lasts) = (0u32, 0u32, 0u32);
+            loop {
+                let c = enc
+                    .poll_chunk()
+                    .expect("poll_chunk")
+                    .expect("an AU is in flight");
+                assert!(c.chunk_aligned, "wire chunking is on");
+                assert!(c.keyframe, "every pyrowave AU is a keyframe");
+                assert_eq!(
+                    c.data.len() % WINDOW,
+                    0,
+                    "every chunk is a whole number of windows — a cut inside a window would \
+                     split the 4-byte framing prefix from its body"
+                );
+                chunks += 1;
+                firsts += u32::from(c.first);
+                lasts += u32::from(c.last);
+                au.extend_from_slice(&c.data);
+                if c.last {
+                    break;
+                }
+            }
+            assert_eq!(firsts, 1, "exactly one opening chunk");
+            assert_eq!(lasts, 1, "exactly one closing chunk");
+            assert!(
+                chunks > 1,
+                "seed {seed}: the AU came out in ONE piece ({} B) — the cut never engaged, so \
+                 this run proves nothing about PW6",
+                au.len()
+            );
+            assert_eq!(au.len() % WINDOW, 0, "the AU is a whole number of windows");
+
+            // A second `poll_chunk` must report the AU is done, not dribble more bytes.
+            assert!(
+                enc.poll_chunk().expect("poll_chunk after last").is_none(),
+                "no AU is in flight once `last` was handed out"
+            );
+
+            // The picture: window-walk (the client's parse) → upstream's own decoder → PSNR.
+            let stream = walk_windows(&au, WINDOW);
+            // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+            let (y, _cb, _cr) = unsafe { decode_planes(w, h, &stream) };
+            let psnr = luma_psnr(&src, &y);
+            eprintln!(
+                "seed {seed}: {chunks} chunks, {} B AU ({} windows), luma PSNR {psnr:.2} dB",
+                au.len(),
+                au.len() / WINDOW
+            );
+            assert!(
+                psnr > 30.0,
+                "seed {seed}: luma PSNR {psnr:.2} dB — the streamed reassembly lost or reordered \
+                 picture data (a flat-fill test would NOT have caught this)"
+            );
+        }
+    }
 }
