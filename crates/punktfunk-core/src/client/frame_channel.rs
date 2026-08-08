@@ -353,6 +353,18 @@ impl FrameChannel {
     /// all-intra stream ([`Self::set_all_intra`]) a multi-deep queue drains to the NEWEST AU
     /// instead — the skipped ones are already superseded and decode independently, so showing
     /// them only adds latency.
+    ///
+    /// ⚠ **The all-intra drain counts QUEUE ENTRIES and assumes one entry == one AU.** That holds
+    /// today only because slice-progressive delivery is refused on PyroWave
+    /// (`client/pump/handshake.rs`; see [`crate::session::Session::set_deliver_frame_parts`]).
+    /// Turn parts on for an all-intra stream and one AU pushes several entries, at which point
+    /// `len > 1` no longer means "the consumer is behind": this fires mid-AU, hands back a SUFFIX
+    /// and `clear()`s that AU's own prefixes — a headerless frame, every frame. Anyone making the
+    /// two composable must skip whole SUPERSEDED AUs (drop up to the newest entry whose
+    /// `part.first` is set, never split an AU), give `push`'s `FRAME_QUEUE_HARD_CAP` eviction the
+    /// same rule, and count `skipped_total` in AUs. Host-side streamed AUs
+    /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) are NOT affected — they still arrive as one
+    /// completed `Frame` per AU.
     pub(crate) fn pop(&self, timeout: Duration) -> FramePop {
         let mut st = self.inner.lock().unwrap();
         if st.q.is_empty() && !st.closed {
