@@ -643,11 +643,13 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
     //   Mutter    + NVIDIA (RTX 5070 Ti)   outcome=NoFence
     //   gamescope + RADV   (Deck VANGOGH)  300 samples, ALL NoFence, mean 23us, max 48us,
     //                                      p50 and p99 both in the <=100us bucket
-    // Every producer tested attaches NO implicit fence, so this is one ioctl and a return, not a
-    // block: there is nothing to wait on and moving it to the consumer side buys nothing. The
-    // 100 ms budget is a guard for a producer that DOES fence, not a cost we pay today.
-    // KWin/AMD is the one combination still unmeasured. The histogram below is how to re-check:
-    // run with PUNKTFUNK_PERF=1 and read the p99 bucket.
+    //   KWin      + RADV   (Deck desktop)  no implicit fence either
+    // That is EVERY compositor × vendor combination this fleet has, and not one of them attaches an
+    // implicit fence — so this is one ioctl and a return, not a block: there is nothing to wait on,
+    // and moving it to the consumer side buys nothing. The 100 ms budget stays as a guard for a
+    // producer that DOES fence, which is a real thing even if nothing here does it. The histogram
+    // below is how to re-check if that ever changes: run with PUNKTFUNK_PERF=1 and read the p99
+    // bucket.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
         // PW4 step 1: time the wait. Two `Instant::now()` per frame on a path that is already
         // making a syscall — and this is the measurement that decides whether PW4 ships at all.
