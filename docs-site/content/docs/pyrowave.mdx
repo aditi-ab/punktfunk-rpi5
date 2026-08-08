@@ -101,6 +101,27 @@ dropped packets.
 
 The stats overlay shows `pyrowave` as the decode path when the mode is active.
 
+## Checking the host is really zero-copy
+
+On a Linux host the CPU fallback mentioned above is not an error — the session still streams, it
+just pays a full-resolution copy of every frame, which shows up as a lower frame-rate ceiling and
+higher CPU use rather than as anything obviously broken. The host log states which path a session
+took, once, when the capture starts:
+
+```
+capture pipeline resolved: dmabuf-passthrough → pyrowave
+```
+
+`dmabuf-passthrough` is the good one: the compositor's buffer goes straight into the wavelet
+encoder. `cpu` means the copy is happening, and a second line says why — a compositor that would
+not allocate a dmabuf, `PUNKTFUNK_ZEROCOPY` set to `0`, or a per-frame fall-through such as the
+compositor serving shared memory after agreeing to dmabufs. Each distinct reason is logged once per
+session with a running count, so a persistent downgrade is easy to tell from a hiccup while the
+display mode settles.
+
+If you see `cpu` and did not ask for it, check that `PUNKTFUNK_ZEROCOPY` is unset (it defaults to
+on) and read the accompanying line — it names the cause and the fix.
+
 ## Current limits
 
 - Linux and Windows hosts; Linux clients (the GTK desktop app and the session client, including

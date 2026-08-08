@@ -70,6 +70,10 @@ struct UserData {
     linear_nv12_failed: bool,
     /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
     dbg_log_n: u64,
+    /// Raw-passthrough frames that silently fell through to the CPU de-pad path, by reason — see
+    /// [`PassthroughFallbacks`]. Per-session: a fresh `UserData` is built per pipeline, so a
+    /// compositor that starts serving dmabufs again after a rebuild gets a fresh log budget.
+    passthrough_fallbacks: PassthroughFallbacks,
     /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
     cursor: CursorState,
     /// `Some((w, h))` while the producer's negotiated size is a sacrificial birth mode and a
@@ -239,6 +243,210 @@ impl NegotiationPlan {
     }
 }
 
+/// Which capture arm a negotiated pipeline actually resolved to.
+///
+/// The 2026-08-08 PyroWave triage had to reconstruct this from four files, because no single line
+/// ever states it: the arm is the product of a policy, a latch, an importer that may or may not
+/// have constructed, and a modifier list. A degraded host and a healthy one logged the same
+/// thing. [`resolved_capture_arm`] plus the one INFO line at pipeline build is the whole fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CaptureArm {
+    /// Raw dmabufs handed straight to the encoder, which imports them itself — libva (VAAPI) or
+    /// the PyroWave encoder's own Vulkan device. No host pixel touch.
+    DmabufPassthrough,
+    /// dmabufs imported to CUDA device buffers by the EGL→CUDA worker, for NVENC. No host pixel
+    /// touch either, but a different failure surface (the worker, the modifier negotiation).
+    CudaImport,
+    /// CPU frames: an mmap de-pad of every frame, then whatever CSC + upload the encoder needs.
+    /// The slow path — always a downgrade when the consumer could have taken a dmabuf.
+    Cpu,
+}
+
+impl CaptureArm {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            CaptureArm::DmabufPassthrough => "dmabuf-passthrough",
+            CaptureArm::CudaImport => "cuda-import",
+            CaptureArm::Cpu => "cpu",
+        }
+    }
+}
+
+/// Resolve the arm this pipeline ended up on. **Pure** — `have_importer` and `want_dmabuf` are the
+/// two runtime facts `negotiation_plan` cannot know (whether the importer constructed, and what
+/// modifier list that yielded); everything else is already in the plan.
+pub(super) fn resolved_capture_arm(
+    plan: &NegotiationPlan,
+    have_importer: bool,
+    want_dmabuf: bool,
+) -> CaptureArm {
+    if !want_dmabuf {
+        // No dmabuf offer at all: SHM/CPU frames, whatever the plan wanted.
+        CaptureArm::Cpu
+    } else if plan.vaapi_passthrough {
+        CaptureArm::DmabufPassthrough
+    } else if have_importer {
+        CaptureArm::CudaImport
+    } else {
+        // Unreachable via `want_dmabuf` (it requires `have_importer || vaapi_passthrough`), but
+        // stated rather than `unreachable!()`: a logging helper must never be the thing that
+        // panics a capture thread.
+        CaptureArm::Cpu
+    }
+}
+
+/// Who consumes the captured frames — the fact that decides whether a CPU arm is a *downgrade*
+/// worth warning about, and what to call it in the log.
+///
+/// Derived from the resolved [`ZeroCopyPolicy`](crate::ZeroCopyPolicy), **not** from the encoder
+/// pref: `pyrowave_session` is per-session (the negotiated codec), so a PyroWave session on an
+/// otherwise-NVENC host reads as PyroWave here. Naming the pref instead is exactly how a PyroWave
+/// session's CPU downgrade came to be reported as an NVENC one — or, on an NVIDIA host, not
+/// reported at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConsumerKind {
+    /// This session encodes PyroWave: the wavelet encoder's own Vulkan device imports dmabufs on
+    /// any vendor, so a CPU arm costs it the passthrough it was designed around.
+    PyroWave,
+    /// The VAAPI backend (AMD/Intel): libva imports the dmabuf and CSCs on the GPU.
+    Vaapi,
+    /// NVENC, fed by the EGL→CUDA importer.
+    Nvenc,
+    /// The software encoder — CPU frames are its native input, so a CPU arm is no downgrade.
+    Software,
+}
+
+impl ConsumerKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ConsumerKind::PyroWave => "pyrowave",
+            ConsumerKind::Vaapi => "vaapi",
+            ConsumerKind::Nvenc => "nvenc",
+            ConsumerKind::Software => "software",
+        }
+    }
+
+    /// Whether landing on [`CaptureArm::Cpu`] is a performance downgrade for this consumer (i.e.
+    /// worth a `warn!`). True for every GPU consumer; false for the software encoder, which wants
+    /// CPU frames anyway.
+    pub(super) fn cpu_is_downgrade(self) -> bool {
+        !matches!(self, ConsumerKind::Software)
+    }
+}
+
+/// Classify the frames' consumer. **Pure.** `pyrowave_session` wins over `backend_is_vaapi`
+/// because it is the per-session truth and the pref is host-global (a PyroWave session also flips
+/// `backend_is_vaapi` on, via `linux_zero_copy_is_vaapi`'s `Pyrowave` arm — so testing vaapi first
+/// would swallow every PyroWave session).
+pub(super) fn consumer_kind(
+    pyrowave_session: bool,
+    backend_is_vaapi: bool,
+    backend_is_gpu: bool,
+) -> ConsumerKind {
+    if pyrowave_session {
+        ConsumerKind::PyroWave
+    } else if !backend_is_gpu {
+        ConsumerKind::Software
+    } else if backend_is_vaapi {
+        ConsumerKind::Vaapi
+    } else {
+        ConsumerKind::Nvenc
+    }
+}
+
+/// Why a frame on the raw-dmabuf passthrough could not be handed to the encoder and fell through
+/// to the CPU de-pad path instead.
+///
+/// Each variant is a *different* diagnosis with a different fix, and all four were silent: the
+/// passthrough block simply fell out of its `if` and the frame took the slow path, so a session
+/// that had negotiated zero-copy could pay CPU costs on every frame while logging a healthy
+/// "advertising DMA-BUF modifiers" line at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassthroughFallback {
+    /// No format negotiated yet — transient, and expected around a renegotiation.
+    NoFormat,
+    /// The producer delivered an SHM/MemFd buffer for this frame, not a dmabuf.
+    NotDmabuf,
+    /// The negotiated pixel format has no DRM fourcc, so it cannot be described to the encoder.
+    NoFourcc,
+    /// `F_DUPFD_CLOEXEC` failed — the fd could not be duplicated to outlive the buffer recycle
+    /// (an fd-limit symptom, not a graphics one).
+    DupFailed,
+}
+
+impl PassthroughFallback {
+    fn bit(self) -> u8 {
+        match self {
+            PassthroughFallback::NoFormat => 1 << 0,
+            PassthroughFallback::NotDmabuf => 1 << 1,
+            PassthroughFallback::NoFourcc => 1 << 2,
+            PassthroughFallback::DupFailed => 1 << 3,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            PassthroughFallback::NoFormat => "no format negotiated yet",
+            PassthroughFallback::NotDmabuf => "the producer delivered an SHM/MemFd buffer",
+            PassthroughFallback::NoFourcc => "the negotiated format has no DRM fourcc",
+            PassthroughFallback::DupFailed => "F_DUPFD_CLOEXEC failed on the dmabuf fd",
+        }
+    }
+
+    /// What actually happens to the frame. Three of the four reasons downgrade it to the CPU
+    /// de-pad path; `NoFormat` does not — the CPU path needs `ud.format` too and returns without
+    /// de-padding, so that frame is DROPPED. Worth the distinction: "slower" and "gone" are
+    /// different faults, and a diagnostic that conflates them is the thing PW2 exists to remove.
+    pub(super) fn falls_back_to_cpu(self) -> bool {
+        !matches!(self, PassthroughFallback::NoFormat)
+    }
+
+    /// What to do about it — the half a log line is useless without.
+    pub(super) fn hint(self) -> &'static str {
+        match self {
+            PassthroughFallback::NoFormat => {
+                "harmless if it stops: the first buffers can arrive before param_changed"
+            }
+            PassthroughFallback::NotDmabuf => {
+                "the compositor accepted the dmabuf offer and is serving memory anyway — check \
+                 PUNKTFUNK_FORCE_SHM and the compositor's allocator"
+            }
+            PassthroughFallback::NoFourcc => {
+                "a capture format the encoder path cannot describe — file it, the negotiation \
+                 should not have accepted it"
+            }
+            PassthroughFallback::DupFailed => "out of file descriptors — raise the host's NOFILE",
+        }
+    }
+}
+
+/// Per-session tally of raw-passthrough frames that fell through to the CPU path, with a one-line
+/// budget per distinct reason.
+///
+/// Rate-limiting is what makes this shippable: `.process` runs per frame, so an unconditional log
+/// would flood at the capture rate. Per *reason* rather than per session, because the four reasons
+/// diagnose different faults and a transient `NoFormat` at open must not spend the budget a
+/// persistent `NotDmabuf` needs.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PassthroughFallbacks {
+    frames: u64,
+    logged: u8,
+}
+
+impl PassthroughFallbacks {
+    /// Record one fall-through. Returns `Some(frames_so_far)` the FIRST time each distinct reason
+    /// is seen this session — the caller logs then and only then, so at most four lines per
+    /// session regardless of frame rate.
+    pub(super) fn note(&mut self, reason: PassthroughFallback) -> Option<u64> {
+        self.frames += 1;
+        let bit = reason.bit();
+        (self.logged & bit == 0).then(|| {
+            self.logged |= bit;
+            self.frames
+        })
+    }
+}
+
 /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
 /// the stream is poisoned for rebuild. A tiled import failure must NEVER fall through to the
 /// CPU mmap path — de-padding tiled bytes as linear produces a scrambled image — so after a
@@ -374,102 +582,129 @@ fn consume_frame(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer) {
 
     // Raw DMA-BUF passthrough: packed RGB is imported for GPU CSC; producer-native NV12 can
     // be consumed by the Vulkan Video encoder without another color conversion.
+    //
+    // The block below either publishes a dmabuf and RETURNS, or breaks with the reason it could
+    // not — so every non-success exit is named and counted instead of silently falling out of
+    // three nested `if`s into the CPU path, which is how a session that had negotiated zero-copy
+    // could pay a full CPU pixel touch per frame while logging nothing but a healthy open.
     if ud.vaapi_passthrough {
-        if let Some(fmt) = ud.format {
-            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-                if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
-                    let chunk = datas[0].chunk();
-                    let offset = chunk.offset();
-                    let stride = chunk.stride().max(0) as u32;
-                    // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
-                    // object; plane 1's chunk carries the REAL UV offset/stride (compositors
-                    // may align the Y plane before UV). Pass it through instead of assuming
-                    // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
-                    // by inode, not fd number; a genuinely two-BO frame cannot travel through
-                    // the single-fd import — drop it with a diagnosis instead of streaming
-                    // garbage chroma.
-                    let plane1 =
-                        if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
-                            // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
-                            // owned by the live PipeWire buffer for this callback, and `fstat`
-                            // only writes the out-param structs, whose fields are read only after
-                            // the `== 0` success checks.
-                            let same_bo = unsafe {
-                                let mut s0: libc::stat = std::mem::zeroed();
-                                let mut s1: libc::stat = std::mem::zeroed();
-                                libc::fstat(datas[0].fd() as i32, &mut s0) == 0
-                                    && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
-                                    && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
-                            };
-                            if !same_bo {
-                                warn_once(
-                                    "NV12 planes live in different buffer objects — frames \
-                                 dropped (single-fd import only)",
-                                );
-                                return;
-                            }
-                            let c1 = datas[1].chunk();
-                            Some((c1.offset(), c1.stride().max(0) as u32))
-                        } else {
-                            None
-                        };
-                    // dup the fd so it survives the SPA buffer recycle — the encode thread
-                    // imports it. Content stability across the brief import/encode window relies
-                    // on the compositor's buffer-pool depth, like any zero-copy capture.
-                    // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
-                    // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
-                    // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
-                    // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
-                    let dup =
-                        unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
-                    if dup >= 0 {
-                        let pts_ns = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
-                        ud.publish(CapturedFrame {
-                            width: w as u32,
-                            height: h as u32,
-                            pts_ns,
-                            format: fmt,
-                            payload: FramePayload::Dmabuf(DmabufFrame {
-                                // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
-                                // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
-                                // ownership and closes it exactly once on drop — no alias, no
-                                // double-close.
-                                fd: unsafe { OwnedFd::from_raw_fd(dup) },
-                                fourcc,
-                                modifier: ud.modifier,
-                                offset,
-                                stride,
-                                plane1,
-                            }),
-                            // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
-                            // embeds its pointer in the produced pixels, so native NV12 has none.
-                            cursor: ud.cursor.overlay(),
-                        });
-                        static ONCE: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(true);
-                        if ONCE.swap(false, Ordering::Relaxed) {
-                            tracing::info!(
-                                w,
-                                h,
-                                modifier = ud.modifier,
-                                fourcc = format_args!("{:#010x}", fourcc),
-                                source = if fmt == PixelFormat::Nv12 {
-                                    "producer-native NV12"
-                                } else {
-                                    "packed RGB (encoder GPU CSC)"
-                                },
-                                "zero-copy: handing the raw DMA-BUF to the encoder"
-                            );
-                        }
-                        return;
-                    }
-                }
+        let reason = 'passthrough: {
+            let Some(fmt) = ud.format else {
+                break 'passthrough PassthroughFallback::NoFormat;
+            };
+            if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
+                break 'passthrough PassthroughFallback::NotDmabuf;
             }
+            let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
+                break 'passthrough PassthroughFallback::NoFourcc;
+            };
+            let chunk = datas[0].chunk();
+            let offset = chunk.offset();
+            let stride = chunk.stride().max(0) as u32;
+            // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
+            // object; plane 1's chunk carries the REAL UV offset/stride (compositors
+            // may align the Y plane before UV). Pass it through instead of assuming
+            // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
+            // by inode, not fd number; a genuinely two-BO frame cannot travel through
+            // the single-fd import — drop it with a diagnosis instead of streaming
+            // garbage chroma.
+            let plane1 = if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
+                // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
+                // owned by the live PipeWire buffer for this callback, and `fstat`
+                // only writes the out-param structs, whose fields are read only after
+                // the `== 0` success checks.
+                let same_bo = unsafe {
+                    let mut s0: libc::stat = std::mem::zeroed();
+                    let mut s1: libc::stat = std::mem::zeroed();
+                    libc::fstat(datas[0].fd() as i32, &mut s0) == 0
+                        && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
+                        && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
+                };
+                if !same_bo {
+                    warn_once(
+                        "NV12 planes live in different buffer objects — frames \
+                                 dropped (single-fd import only)",
+                    );
+                    // Not a fall-through: this frame is DROPPED, not downgraded (de-padding it as
+                    // linear would stream scrambled chroma), so it is not counted below.
+                    return;
+                }
+                let c1 = datas[1].chunk();
+                Some((c1.offset(), c1.stride().max(0) as u32))
+            } else {
+                None
+            };
+            // dup the fd so it survives the SPA buffer recycle — the encode thread
+            // imports it. Content stability across the brief import/encode window relies
+            // on the compositor's buffer-pool depth, like any zero-copy capture.
+            // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
+            // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
+            // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
+            // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
+            let dup = unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                break 'passthrough PassthroughFallback::DupFailed;
+            }
+            let pts_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            ud.publish(CapturedFrame {
+                width: w as u32,
+                height: h as u32,
+                pts_ns,
+                format: fmt,
+                payload: FramePayload::Dmabuf(DmabufFrame {
+                    // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
+                    // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
+                    // ownership and closes it exactly once on drop — no alias, no
+                    // double-close.
+                    fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                    fourcc,
+                    modifier: ud.modifier,
+                    offset,
+                    stride,
+                    plane1,
+                }),
+                // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
+                // embeds its pointer in the produced pixels, so native NV12 has none.
+                cursor: ud.cursor.overlay(),
+            });
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if ONCE.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    w,
+                    h,
+                    modifier = ud.modifier,
+                    fourcc = format_args!("{:#010x}", fourcc),
+                    source = if fmt == PixelFormat::Nv12 {
+                        "producer-native NV12"
+                    } else {
+                        "packed RGB (encoder GPU CSC)"
+                    },
+                    "zero-copy: handing the raw DMA-BUF to the encoder"
+                );
+            }
+            return;
+        };
+        // The passthrough declined this frame. Say so ONCE per distinct reason (`.process` runs
+        // per frame — see `PassthroughFallbacks`), carrying the running count so a persistent
+        // downgrade is distinguishable from a one-frame hiccup at renegotiation.
+        if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
+            tracing::warn!(
+                frames,
+                "zero-copy raw-dmabuf passthrough did not take this frame: {} — {} ({})",
+                reason.as_str(),
+                if reason.falls_back_to_cpu() {
+                    "it falls back to the CPU capture path, costing a full-resolution mmap \
+                     de-pad plus the encoder's own upload on every such frame"
+                } else {
+                    "the frame is DROPPED — the CPU de-pad path needs the negotiated format \
+                     too, so nothing streams while this persists"
+                },
+                reason.hint()
+            );
         }
-        // Not a dmabuf (or unmappable format) — fall through to the CPU de-pad path.
     }
 
     // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
@@ -912,6 +1147,25 @@ pub fn pipewire_thread(
         want_dmabuf && !vaapi_passthrough && !want_hdr,
         Ordering::Relaxed,
     );
+    // The ONE line that says which arm this session actually got, and who consumes it. Everything
+    // below explains a particular arm; nothing below states the answer. Reconstructing it from the
+    // detail lines cost the 2026-08-08 PyroWave triage four files, and on the one arm that matters
+    // most — a PyroWave session downgraded to CPU on an NVIDIA host — there was no detail line to
+    // reconstruct it from at all (see the final `else if` of this chain).
+    let consumer = consumer_kind(
+        policy.pyrowave_session,
+        backend_is_vaapi,
+        policy.backend_is_gpu,
+    );
+    let arm = resolved_capture_arm(&plan, importer.is_some(), want_dmabuf);
+    tracing::info!(
+        capture_arm = arm.as_str(),
+        consumer = consumer.as_str(),
+        modifier_count = modifiers.len(),
+        "capture pipeline resolved: {} → {}",
+        arm.as_str(),
+        consumer.as_str()
+    );
     if force_shm {
         tracing::info!(
             "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
@@ -942,19 +1196,34 @@ pub fn pipewire_thread(
             sample = ?&modifiers[..modifiers.len().min(6)],
             "zero-copy: advertising EGL-importable dmabuf modifiers"
         );
-    } else if backend_is_vaapi && policy.backend_is_gpu {
+    } else if consumer.cpu_is_downgrade() {
         // Reached only when no dmabuf is advertised at all (every arm above rules out a
-        // zero-copy path), so this genuinely IS the CPU capture path: a VAAPI session then pays
-        // three full-frame CPU touches (mmap de-pad + swscale RGB→NV12 + surface upload) —
+        // zero-copy path), so this genuinely IS the CPU capture path: the consumer then pays
+        // full-frame CPU touches (mmap de-pad + whatever CSC/upload it needs) —
         // make the silent fallback visible.
         // The `raw_dmabuf_latched` arm above catches the latched downgrade, so by here zero-copy
         // is off at the source: the env var, or the session's own output format.
+        //
+        // The gate used to be `backend_is_vaapi && backend_is_gpu`, which is why a PyroWave
+        // session's CPU downgrade was invisible on an NVIDIA/auto host: `backend_is_vaapi` reads
+        // the host-global encoder pref, so a per-session PyroWave negotiation there is `false` and
+        // fell out of the chain logging NOTHING. `consumer_kind` asks the per-session question
+        // instead, and excludes only the software encoder (which wants CPU frames).
         tracing::warn!(
-            "VAAPI encode with the CPU capture path (per-frame de-pad + swscale CSC + \
-             upload) — zero-copy is off for this capture ({}); clear PUNKTFUNK_ZEROCOPY to \
-             restore the dmabuf default",
+            consumer = consumer.as_str(),
+            "{} encode with the CPU capture path (per-frame de-pad + CSC + upload) — \
+             zero-copy is off for this capture ({}); set PUNKTFUNK_ZEROCOPY=1 to restore the \
+             dmabuf default",
+            consumer.as_str(),
             if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
                 "PUNKTFUNK_ZEROCOPY is set falsy"
+            } else if want_hdr && !policy.hdr_cuda_ok {
+                // Reachable and NOT the output format's doing: `build_importer` drops an HDR
+                // capture whose encoder cannot take a packed 10-bit CUDA payload (libav's HDR
+                // route swscales into a P010 hardware frame). Naming the output format here
+                // would send the reader hunting the wrong knob.
+                "this HDR session's encoder cannot ingest a 10-bit CUDA payload, so the capture \
+                 stays on CPU frames"
             } else {
                 "this session's output format asked for CPU frames"
             }
@@ -986,6 +1255,7 @@ pub fn pipewire_thread(
         yuv444: want_444,
         linear_nv12_failed: false,
         dbg_log_n: 0,
+        passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(cursor_id0_hides),
         expect_dims: if expect_exact_dims {
             preferred.map(|(w, h, _)| (w, h))
@@ -1707,5 +1977,143 @@ mod tests {
             assert!(!p.prefer_native_nv12);
             assert!(!p.want_dmabuf(false, &[0]));
         }
+    }
+
+    // ---- PW2: capture-arm observability (pure halves) -------------------------------------
+    //
+    // Env-var reads race under a shared test process, so these assert against the pure functions
+    // the logging sites call — the same rule `negotiation_plan_invariants` follows.
+
+    use super::{
+        consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, PassthroughFallback,
+        PassthroughFallbacks,
+    };
+
+    /// A PyroWave session is PyroWave even though it also flips `backend_is_vaapi` on (the
+    /// `linux_zero_copy_is_vaapi` `Pyrowave` arm). Getting this precedence backwards is the exact
+    /// shape of the bug PW2 fixes: the session gets reported as somebody else's backend.
+    #[test]
+    fn pyrowave_outranks_the_host_global_backend_pref() {
+        assert_eq!(consumer_kind(true, true, true), ConsumerKind::PyroWave);
+        // ...and on an NVIDIA/auto host, where `backend_is_vaapi` is false, it is still PyroWave —
+        // the case that previously logged nothing at all.
+        assert_eq!(consumer_kind(true, false, true), ConsumerKind::PyroWave);
+    }
+
+    /// The non-PyroWave consumers, and the one that must NOT warn on a CPU arm.
+    #[test]
+    fn consumer_kinds_and_which_ones_a_cpu_arm_degrades() {
+        assert_eq!(consumer_kind(false, true, true), ConsumerKind::Vaapi);
+        assert_eq!(consumer_kind(false, false, true), ConsumerKind::Nvenc);
+        // No GPU backend ⇒ the software encoder, whose native input IS CPU frames.
+        assert_eq!(consumer_kind(false, false, false), ConsumerKind::Software);
+        assert!(ConsumerKind::PyroWave.cpu_is_downgrade());
+        assert!(ConsumerKind::Vaapi.cpu_is_downgrade());
+        assert!(ConsumerKind::Nvenc.cpu_is_downgrade());
+        assert!(!ConsumerKind::Software.cpu_is_downgrade());
+    }
+
+    /// The arm is a function of the plan plus the two runtime facts. Pinned against every plan the
+    /// resolver can produce, so the headline line can never claim an arm the session did not take.
+    #[test]
+    fn resolved_arm_matches_the_plan_that_produced_it() {
+        // PyroWave/VAAPI raw passthrough.
+        let p = negotiation_plan(NegotiationInputs {
+            pyrowave_session: true,
+            ..nvenc()
+        });
+        assert!(p.vaapi_passthrough);
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[0])),
+            CaptureArm::DmabufPassthrough
+        );
+        // NVENC via the EGL→CUDA importer.
+        let p = negotiation_plan(nvenc());
+        assert!(p.build_importer);
+        assert_eq!(
+            resolved_capture_arm(&p, true, p.want_dmabuf(true, &[0])),
+            CaptureArm::CudaImport
+        );
+        // The importer was meant to be built but did not construct (no driver): CPU, not a
+        // cuda-import the session never got.
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[0])),
+            CaptureArm::Cpu
+        );
+        // An empty modifier list is a CPU arm even under a live passthrough plan.
+        let p = negotiation_plan(NegotiationInputs {
+            pyrowave_session: true,
+            ..nvenc()
+        });
+        assert_eq!(
+            resolved_capture_arm(&p, false, p.want_dmabuf(false, &[])),
+            CaptureArm::Cpu
+        );
+        // Forced SHM: CPU regardless of everything else.
+        let p = negotiation_plan(NegotiationInputs {
+            force_shm: true,
+            ..nvenc()
+        });
+        assert_eq!(
+            resolved_capture_arm(&p, true, p.want_dmabuf(true, &[0])),
+            CaptureArm::Cpu
+        );
+    }
+
+    /// The rate limiter: ONE line per distinct reason per session, counting every fall-through.
+    /// `.process` runs per frame, so an off-by-one here is a log flood at the capture rate.
+    #[test]
+    fn fallback_log_budget_is_one_line_per_reason() {
+        let mut f = PassthroughFallbacks::default();
+        // First of a reason logs, and reports the running total (not a per-reason count).
+        assert_eq!(f.note(PassthroughFallback::NotDmabuf), Some(1));
+        // Repeats of the SAME reason never log again, but are still counted.
+        for _ in 0..1_000 {
+            assert_eq!(f.note(PassthroughFallback::NotDmabuf), None);
+        }
+        // A DIFFERENT reason is a different diagnosis and gets its own line, carrying the
+        // now-large total — which is what distinguishes a persistent downgrade from a hiccup.
+        assert_eq!(f.note(PassthroughFallback::DupFailed), Some(1002));
+        assert_eq!(f.note(PassthroughFallback::DupFailed), None);
+        // All four reasons fit the budget independently; the tally counts every frame.
+        assert_eq!(f.note(PassthroughFallback::NoFormat), Some(1004));
+        assert_eq!(f.note(PassthroughFallback::NoFourcc), Some(1005));
+        // Budget spent: every reason has logged once, so nothing logs again however long the
+        // session runs.
+        for r in [
+            PassthroughFallback::NoFormat,
+            PassthroughFallback::NotDmabuf,
+            PassthroughFallback::NoFourcc,
+            PassthroughFallback::DupFailed,
+        ] {
+            assert_eq!(f.note(r), None);
+        }
+    }
+
+    /// Every reason is distinguishable (a shared bit would silence one of them) and carries an
+    /// actionable hint — a reason with no fix is a line the reader cannot use.
+    #[test]
+    fn every_fallback_reason_is_distinct_and_actionable() {
+        let all = [
+            PassthroughFallback::NoFormat,
+            PassthroughFallback::NotDmabuf,
+            PassthroughFallback::NoFourcc,
+            PassthroughFallback::DupFailed,
+        ];
+        let mut f = PassthroughFallbacks::default();
+        for r in all {
+            assert!(
+                f.note(r).is_some(),
+                "{r:?} shares a bit with an earlier reason"
+            );
+            assert!(!r.as_str().is_empty());
+            assert!(!r.hint().is_empty());
+        }
+        // Only `NoFormat` drops the frame; the other three downgrade it. The log line picks its
+        // consequence clause off this, so an inverted answer would print the opposite of the truth.
+        assert!(!PassthroughFallback::NoFormat.falls_back_to_cpu());
+        assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
+        assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
+        assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
     }
 }

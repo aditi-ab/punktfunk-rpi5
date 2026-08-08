@@ -890,7 +890,13 @@ fn parse_spike(args: &[String]) -> Result<Options> {
                     "h264" => Codec::H264,
                     "h265" | "hevc" => Codec::H265,
                     "av1" => Codec::Av1,
-                    other => bail!("unknown --codec '{other}' (h264|h265|av1)"),
+                    // The spike is the only way to drive a PyroWave capture→encode pass without
+                    // a client, which is what the Linux-host PyroWave work measures against.
+                    // Needs the `pyrowave` feature (default-on) and pairs with
+                    // `PUNKTFUNK_ENCODER=pyrowave`, which is what puts the CAPTURE side on the
+                    // raw-dmabuf passthrough.
+                    "pyrowave" => Codec::PyroWave,
+                    other => bail!("unknown --codec '{other}' (h264|h265|av1|pyrowave)"),
                 }
             }
             "--bitrate" => {
@@ -1007,7 +1013,9 @@ SPIKE OPTIONS:
                                  KWin virtual output at --width x --height and captures it
     --seconds <N>                capture duration in seconds (default: 5)
     --fps <N>                    target frame rate (default: 60)
-    --codec <h264|h265|av1>      NVENC codec (default: h265)
+    --codec <h264|h265|av1|pyrowave>
+                                 encode codec (default: h265). 'pyrowave' also wants
+                                 PUNKTFUNK_ENCODER=pyrowave so capture takes the passthrough
     --bitrate <MBPS>             target bitrate in Mbps (default: 20)
     --width <W> --height <H>     synthetic source size (default: 1920x1080)
     --out <PATH>                 raw Annex-B output (default: /tmp/punktfunk-spike.<ext>)
