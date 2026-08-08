@@ -46,6 +46,10 @@ pub mod orchestrate;
 // The host's OS-identity chain (mDNS `os=` TXT): sanitize + icon-walk order. Pure string
 // logic, built everywhere (the Apple/Android ports mirror it rather than link it).
 pub mod os;
+// "A system overlay owns the controller" for gamescope Gaming Mode — the signal behind the
+// gamepad input mask, which SDL's own focus gate structurally cannot provide there.
+#[cfg(target_os = "linux")]
+pub mod overlay_focus;
 // Client settings profiles: the override catalog + the one connect-time resolver
 // (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
 // the bindings live on.
