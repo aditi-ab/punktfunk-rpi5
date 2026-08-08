@@ -1553,6 +1553,46 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
              encoder supports chunked output"
         );
     }
+    // A mode switch the control task accepted BEFORE the pipeline was built (the client connects at
+    // one mode and immediately asks for its real one — a fractional-scale panel resolving its native
+    // pixel size does exactly this, ~3 s ahead of bring-up finishing) used to be served the long way
+    // round: build the whole pipeline at the now-stale mode, then immediately rebuild at the new one
+    // in the loop below. That wastes a display create + capture attach + encoder open on every such
+    // connect, and on GNOME it is actively destructive — the rebuild is create-before-drop, so two
+    // `RecordVirtual` monitors ~400 ms apart segfault mutter 50.4 inside
+    // `meta_monitor_manager_rebuild`, taking down the whole desktop session (and with it the game
+    // just launched into it, which then looks like the GAME crashed). Adopt the newest queued mode
+    // here and build ONCE.
+    //
+    // Only on the inline path: a PREPARED pipeline is already built at the old mode, so adopting a
+    // new `mode` there would just make this variable disagree with the display that exists. Those
+    // sessions keep the rebuild-in-the-loop behavior. No accept ack is owed either way — the
+    // client's mode slot already flipped when control accepted the switch (it acks on accept, not
+    // on rebuild); the H2/H3 *correction* ack the rebuild would have sent is preserved below.
+    let mut mode = mode;
+    let mut adopted_at_bringup = false;
+    if prepared.is_none() {
+        let mut queued = None;
+        while let Ok(m) = reconfig.try_recv() {
+            queued = Some(m);
+        }
+        if let Some(m) = queued.filter(|m| *m != mode) {
+            adopted_at_bringup = true;
+            tracing::info!(
+                stale = ?mode,
+                adopted = ?m,
+                "a mode switch was accepted before bring-up finished — building at the new mode \
+                 instead of building twice"
+            );
+            mode = m;
+            // Mirror the loop's rebuild: PyroWave's Automatic bitrate is a per-mode ~1.6 bpp pin, so
+            // a resolution change moves the operating point. Explicit client rates stay put.
+            if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
+                bitrate_kbps =
+                    resolve_bitrate_kbps_for(plan.codec, 0, &mode, plan.chroma, plan.bit_depth);
+            }
+        }
+    }
     tracing::info!(
         compositor = compositor.id(),
         ?mode,
@@ -1666,6 +1706,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         &live_bitrate,
         &retarget_tx,
     );
+    // H2/H3 correction, carried over from the rebuild this bring-up replaced: the client APPLIED
+    // the mode when control accepted it, but the backend may have honored a different one (KWin
+    // caps a virtual output's refresh; a fallback delivers the size the source actually produces).
+    // Only for a mode adopted at bring-up — an ordinary connect's mode came from the Welcome, not
+    // from an accept the client has already acted on, so it is not owed a correction here.
+    if adopted_at_bringup {
+        let actual = delivered_mode(frame.width, frame.height, interval);
+        if actual != mode {
+            let _ = reconfig_result_tx.send(Reconfigured {
+                accepted: true,
+                mode: actual,
+            });
+        }
+    }
 
     // Capture is live — launch the requested title so it renders onto the streamed output and
     // grabs focus. Windows spawns the library id into the interactive user session; Linux spawns
