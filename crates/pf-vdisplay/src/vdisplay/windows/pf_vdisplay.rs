@@ -215,6 +215,14 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
     // device description — locale-invariant). Same spawn shape as `reap_ghost_monitors` above; the
     // reported tokens are ours, so parsing them is locale-invariant too.
     //
+    // The selector prefers LIVE devnodes: `Get-PnpDevice` also lists not-present PHANTOMS (an
+    // upgrade/reinstall leftover), and the old `Select-Object -First 1` could hand every recovery
+    // attempt a phantom — whose disable AND restart both fail — while a live node sat unexamined.
+    // A phantom-only state gets its own truthful refusal: no reload lever can revive a devnode
+    // record whose device is GONE; only re-creating the node (reinstall) can. `Present` is the
+    // authoritative bit, with `Status -ne 'Unknown'` as the fallback should it read null; live
+    // `OK` nodes sort ahead of problem-state ones.
+    //
     // Every step that can fail is `-ErrorAction Stop` inside a `try` — the old script ran the whole
     // cycle under `SilentlyContinue` and then reported `(Get-PnpDevice …).Status`, which reports the
     // DEVICE, not the cycle: a disable that was refused left the device untouched, started, and
@@ -225,10 +233,19 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
     // let "never ran" read as "returned 0". Pre-seeding a failure means only a real exit 0 reports a
     // reload. pnputil is resolved by full path — a LocalSystem service's PATH need not include
     // System32.
+    //
+    // The REFUSED line carries the evidence a field log needs to tell the failure modes apart
+    // (2026-08-08: a woken box logged only `REFUSED Generic failure` — the WMI catch-all — leaving
+    // handle-veto vs phantom vs problem-state undecidable): how many devnodes matched and how many
+    // are live, the chosen node's PnP Status + ConfigManager problem code, and the pnputil
+    // /restart-device exit code the old script threw away (3010 = needs a reboot, which is its own
+    // diagnosis).
     const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $ad = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' } | Select-Object -First 1; \
-        if (-not $ad) { Write-Output 'ABSENT'; exit }; \
-        $id = $ad.InstanceId; $err = ''; \
+        $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }); \
+        if ($all.Count -eq 0) { Write-Output 'ABSENT'; exit }; \
+        $live = @($all | Where-Object { $_.Present -or $_.Status -ne 'Unknown' } | Sort-Object { $_.Status -ne 'OK' }); \
+        if ($live.Count -eq 0) { Write-Output ('REFUSED only phantom (not-present) adapter devnodes remain (' + $all.Count + ') - the device node itself is gone and no reload can revive it; reinstalling the host re-creates it'); exit }; \
+        $ad = $live[0]; $id = $ad.InstanceId; $err = ''; \
         try { \
             Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 2; \
             try { Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop } \
@@ -238,9 +255,11 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
         } catch { $err = ($_.Exception.Message -replace '\\s+', ' ') }; \
         $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); $LASTEXITCODE = 1; \
         if (Test-Path $pnp) { & $pnp /restart-device $id *> $null }; \
-        if ($LASTEXITCODE -eq 0) { Start-Sleep -Seconds 2; \
+        $rx = $LASTEXITCODE; \
+        if ($rx -eq 0) { Start-Sleep -Seconds 2; \
             Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
-        else { Enable-PnpDevice -InstanceId $id -Confirm:$false; Write-Output ('REFUSED ' + $err) }";
+        else { Enable-PnpDevice -InstanceId $id -Confirm:$false; \
+            Write-Output ('REFUSED devnodes=' + $all.Count + ' live=' + $live.Count + ' status=' + $ad.Status + ' problem=' + $ad.ConfigManagerErrorCode + ' restart_exit=' + $rx + ' ' + $err) }";
     let ps = std::env::var("SystemRoot")
         .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
         .unwrap_or_else(|_| "powershell.exe".to_string());
@@ -1230,6 +1249,32 @@ mod tests {
                 "{stale:?} is a device status, not a reload outcome"
             );
         }
+    }
+
+    /// A refusal must carry evidence, not just a verdict. The 2026-08-08 field log showed only
+    /// `REFUSED Generic failure` — the WMI catch-all — leaving handle-veto vs phantom vs
+    /// problem-state undecidable from the log. The enriched line's tokens (devnode counts, PnP
+    /// status, problem code, the pnputil restart exit code the old script discarded) must survive
+    /// decoding verbatim, and the phantom-only state must decode as a refusal too — a reload
+    /// cannot revive a devnode record whose device is gone.
+    #[test]
+    fn a_refusal_keeps_its_evidence() {
+        let why = match classify_reload_output(
+            "REFUSED devnodes=2 live=1 status=OK problem=0 restart_exit=3010 Generic failure",
+        ) {
+            AdapterCycle::Refused(why) => why,
+            other => panic!("expected Refused, got {}", variant(&other)),
+        };
+        for token in ["devnodes=2", "live=1", "status=OK", "restart_exit=3010"] {
+            assert!(why.contains(token), "{token} must survive: {why:?}");
+        }
+        assert!(matches!(
+            classify_reload_output(
+                "REFUSED only phantom (not-present) adapter devnodes remain (2) - the device node \
+                 itself is gone and no reload can revive it; reinstalling the host re-creates it"
+            ),
+            AdapterCycle::Refused(why) if why.contains("phantom")
+        ));
     }
 
     /// The outcomes callers branch on: `NotInstalled` fails a session fast, `Reloaded` earns the
