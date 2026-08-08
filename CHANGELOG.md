@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.25.0
 
-395 commits since v0.24.0.
+407 commits since v0.24.0.
 
 ### Versions
 
@@ -413,6 +413,41 @@ parity is new entirely: 7 legs, bit-identical on RDNA3.
 ⚠ Promoting D3D11VA AV1 to `verified` **changes rung selection** on Windows Intel/unknown vendors, not
 just a label. VAAPI stays `verified = false` deliberately — one vendor, never soaked; flipping it
 would move `auto` off Vulkan Video on every Linux AMD/Intel client including the Deck.
+
+### FFmpeg 9, and the Arch soname trap
+
+`pf-encode` now builds against **FFmpeg 9**. The host still links libavcodec unconditionally; the
+client has none (see above).
+
+⚠ **`pacman` is the only one of our packaging formats that does not derive dependencies from ELF
+`DT_NEEDED`.** rpm auto-generates `libavcodec.so.62()(64bit)`, `dpkg-shlibdeps` emits `libavcodec62`,
+nix pins the closure — but a bare `depends=('ffmpeg')` let `pacman -Syu` walk the host across a
+soname bump with no warning and no conflict. FFmpeg 8 → 9 (`2:9.0-5`: libavutil .60→.61, libavcodec
+.62→.63, libavfilter .11→.12, libavdevice .62→.63, libswscale .9→.10) therefore **bricked every
+Arch/CachyOS install**: the dynamic loader cannot start the binary, so it is **exit 127 before
+`main()`** in a systemd restart loop, with nothing in the host's own log to explain it.
+`ldd /usr/bin/punktfunk-host | grep "not found"` is the one-line diagnosis.
+
+⭐ The fix is **SONAME deps, not a hand-written version bound**: `depends=(… 'libavcodec.so'
+'libavutil.so' …)`. Arch's ffmpeg declares matching `provides=(libavcodec.so=63-64 …)`, and makepkg
+rewrites each bare `libfoo.so` into `libfoo.so=<soname>-<arch>` by reading the built binary's
+`DT_NEEDED` — so the bound tracks whatever FFmpeg the builder linked against with nothing to
+maintain across the next bump. A literal `ffmpeg<2:9` would go stale on every bump. pacman now
+refuses the upgrade instead of bricking the install. All seven libs are listed even though
+`--as-needed` currently drops two: an unlinked soname is left bare by makepkg and satisfied by any
+ffmpeg, so listing it costs nothing and a future link picks up the bound automatically.
+
+### Linux playback filled the buffer ceiling
+
+The PipeWire playback callback sized its writes from the mapped buffer's **capacity** — PipeWire's
+quantum limit, 8192 frames ≈ 170 ms — instead of the graph's per-cycle ask (`pw_buffer.requested`).
+Every cycle queued up to 170 ms of PCM downstream of the ring **and** taught `JitterPolicy` that the
+device drains 170 ms per callback, so the underrun floor (want + one frame) rose above any depth the
+A/V sync loop could request: sync measured audio ~280 ms late and was then forbidden — **by its own
+continuity rule** — from draining it. The first on-glass run of the latency overhaul showed exactly
+that: `audio buffer 272 ms, a/v +284 ms`, stable. Now honours `requested` (capacity remains both the
+ceiling and the fallback when `requested == 0`) and logs requested-vs-capacity once per stream.
+Needs libpipewire ≥ 0.3.49; every ship target clears it.
 
 ### Windows audio substrate
 
