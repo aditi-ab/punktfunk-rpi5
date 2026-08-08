@@ -303,6 +303,58 @@ def _native_client() -> str | None:
     return None
 
 
+# The one architecture the flatpak client is built for.
+_FLATPAK_ARCH = "x86_64"
+
+
+def _flatpak_ref() -> dict | None:
+    """The INSTALLED client flatpak resolved to a SCOPE and a BRANCH, or None when there is none.
+
+    ``{"scope": "--user"|"--system", "branch": "canary", "ref": "io.unom.Punktfunk//canary"}``.
+
+    ⭐⭐ **Naming no branch is not a shorthand for "the only one".** flatpak refuses an ambiguous
+    ref rather than guessing at one, and the ambiguity does not need two branches *installed*:
+    the punktfunk remote publishes `stable` AND `canary`, so an unqualified
+    ``flatpak remote-info <origin> io.unom.Punktfunk`` errors with "Multiple branches available"
+    on a Deck that has exactly one. That error is why the client update check silently answered
+    "up to date" on every Deck — so every query downstream now names the ref in full.
+
+    Read off the exported tree rather than by shelling out to ``flatpak list``, because
+    :func:`_client_argv` is on the path of every headless call and a subprocess per call would be
+    absurd (the same reason :func:`_flatpak_installed` reads the filesystem). ``active`` is the
+    symlink flatpak points at the deployed commit — its presence is what makes a branch directory
+    an INSTALL rather than the leftovers of one.
+
+    With more than one branch installed, `stable` wins, because that is the branch a plain
+    ``flatpak run`` resolves to: the check has to describe the client the launcher really starts,
+    or a stale `stable` silently beats a current `canary` in both places at once.
+    """
+    if not _flatpak():
+        return None
+    for root, scope in (
+        (Path(decky.DECKY_USER_HOME) / ".local" / "share" / "flatpak", "--user"),
+        (Path("/var/lib/flatpak"), "--system"),
+    ):
+        try:
+            branches = sorted(
+                p.name for p in (root / "app" / APP_ID / _FLATPAK_ARCH).iterdir()
+                if (p / "active").exists()
+            )
+        except OSError:
+            continue  # not installed in this scope
+        if not branches:
+            continue
+        branch = "stable" if "stable" in branches else branches[0]
+        if len(branches) > 1:
+            decky.logger.warning(
+                "%s is installed on %d branches (%s) — using %s, the one `flatpak run` resolves "
+                "to; uninstall the others so the client you launch is the client we update",
+                APP_ID, len(branches), ", ".join(branches), branch,
+            )
+        return {"scope": scope, "branch": branch, "ref": f"{APP_ID}//{branch}"}
+    return None
+
+
 def _flatpak_installed() -> bool:
     """True when the flatpak APP is actually installed — not merely that `flatpak` exists.
 
@@ -310,10 +362,7 @@ def _flatpak_installed() -> bool:
     because this is on the path of every headless call and a subprocess per call would be absurd.
     Both scopes count: the Deck installs --user, a distro image may ship it system-wide.
     """
-    if not _flatpak():
-        return False
-    user = Path(decky.DECKY_USER_HOME) / ".local" / "share" / "flatpak" / "app" / APP_ID
-    return user.exists() or Path("/var/lib/flatpak/app", APP_ID).exists()
+    return _flatpak_ref() is not None
 
 
 def _client_argv() -> list[str] | None:
@@ -323,15 +372,21 @@ def _client_argv() -> list[str] | None:
     behaving exactly as it did. A native binary is the fallback — and on a machine with no
     flatpak client, the thing that makes the plugin work at all. `PF_DECKY_CLIENT=native|flatpak`
     forces one when a machine has both.
+
+    The branch is PINNED (`--branch=`, which keeps the app id last — :func:`_cli_argv` appends
+    `--command=` and flatpak treats everything after the id as the app's own argv), so the client
+    this launches is the exact ref :func:`_client_update_state` checks and :meth:`Plugin.
+    update_client` updates.
     """
     forced = os.environ.get("PF_DECKY_CLIENT", "").strip().lower()
     native = _native_client()
     if forced == "native":
         return [native] if native else None
-    if forced != "flatpak" and not _flatpak_installed() and native:
+    ref = _flatpak_ref()
+    if forced != "flatpak" and not ref and native:
         return [native]
-    if _flatpak_installed():
-        return [_flatpak(), "run", "--arch=x86_64", APP_ID]
+    if ref:
+        return [_flatpak(), "run", f"--arch={_FLATPAK_ARCH}", f"--branch={ref['branch']}", APP_ID]
     return [native] if native else None
 
 
@@ -575,27 +630,44 @@ def _looks_outdated(stderr: str) -> bool:
 
 
 async def _client_update_state() -> dict:
-    """Is a newer commit of the flatpak client available in the remote it tracks? The client is a
-    **per-user** install (so ``sudo flatpak update``, which is system-scope, never touches it), and
-    it versions independently of this plugin — so we compare the installed commit against the
-    remote's here and let the QAM offer a user-scope update. Best-effort; all-``False`` on any error
-    (not installed, no flatpak, offline).
+    """Is a newer commit of the flatpak client available in the remote it tracks? The client
+    versions independently of this plugin, so we compare the installed commit against the
+    remote's here and let the QAM offer an update in the scope the client is actually installed
+    in — a per-user install is one ``sudo flatpak update`` (system-scope) never reaches.
 
     Flatpak keeps its OWN comparison (commits, not versions) because it is the exact one: a
     flatpak built from main between releases carries the release's crate version, so the
     signed-manifest comparison the native path uses would call it up to date when it isn't.
-    Native installs have no commit to compare and go through :func:`_native_update_state`."""
-    state = {"available": False, "installed": "", "remote": ""}
-    rc, info = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
+    Native installs have no commit to compare and go through :func:`_native_update_state`.
+
+    ⚠ Every query names the ref IN FULL (see :func:`_flatpak_ref`) — the remote publishes both
+    `stable` and `canary`, and an unqualified one is an error, not a default."""
+    state = {"available": False, "installed": "", "remote": "", "error": ""}
+    ref = _flatpak_ref()
+    if not ref:
+        return state  # no flatpak client in either scope
+    scope, full = ref["scope"], ref["ref"]
+    rc, info = await _flatpak_capture(["info", scope, full], timeout=10.0)
     if rc != 0:
-        return state  # client not installed as a user app / no flatpak
+        decky.logger.warning("flatpak info %s %s failed (rc=%s): %s", scope, full, rc, info[-200:])
+        state["error"] = "client-unavailable"
+        return state
     state["installed"] = _field_from(info, "Commit")
     origin = _field_from(info, "Origin")
     if not origin:
+        state["error"] = "no-origin"  # a sideloaded bundle tracks no remote to compare against
         return state
-    rc, rinfo = await _flatpak_capture(["remote-info", "--user", origin, APP_ID], timeout=25.0)
+    rc, rinfo = await _flatpak_capture(["remote-info", scope, origin, full], timeout=25.0)
     if rc != 0:
-        return state  # remote unreachable — treat as "up to date", retry next check
+        # ⭐ NOT "up to date". Silently swallowing this is precisely how the whole leg stayed
+        # broken in the field: an unqualified ref made every one of these calls fail, and
+        # returning `available=False` dressed the failure up as good news. A check that could
+        # not run says so, and the panel says so too.
+        decky.logger.warning(
+            "flatpak remote-info %s %s failed (rc=%s): %s", origin, full, rc, rinfo.strip()[-200:]
+        )
+        state["error"] = "fetch-failed"
+        return state
     state["remote"] = _field_from(rinfo, "Commit")
     state["available"] = bool(
         state["installed"] and state["remote"] and state["installed"] != state["remote"]
@@ -946,8 +1018,9 @@ class Plugin:
     async def update_client(self) -> dict:
         """Update the **client**, by whichever route this box's install actually supports.
 
-        * **flatpak** — ``flatpak update --user`` in the USER installation, the scope a Steam
-          Deck install lives in and which ``sudo flatpak update`` (system-scope) never reaches.
+        * **flatpak** — ``flatpak update`` against the FULL ref, in the scope the client is
+          installed in (a per-user install is one ``sudo flatpak update`` never reaches, and an
+          unqualified ref is an error on a remote publishing more than one branch).
         * **native, one-tap capable** (.deb / .rpm / pacman with the packaged root helper and
           the operator's group opt-in) — ``punktfunk-client --apply-update``, which starts the
           fixed, parameterless ``punktfunk-client-update.service`` through polkit. This backend
@@ -960,18 +1033,22 @@ class Plugin:
         """
         if not _client_is_flatpak():
             return await self._update_native_client()
-        _, before = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
+        ref = _flatpak_ref()
+        if not ref:
+            return {"ok": False, "updated": False, "error": "client-unavailable"}
+        scope, full = ref["scope"], ref["ref"]
+        _, before = await _flatpak_capture(["info", scope, full], timeout=10.0)
         before_commit = _field_from(before, "Commit")
-        rc, out = await _flatpak_capture(["update", "--user", "-y", APP_ID], timeout=300.0)
+        rc, out = await _flatpak_capture(["update", scope, "-y", full], timeout=300.0)
         if rc != 0:
             decky.logger.warning("flatpak client update failed (rc=%s): %s", rc, out[-400:])
             return {"ok": False, "updated": False, "error": "update-failed"}
-        _, after = await _flatpak_capture(["info", "--user", APP_ID], timeout=10.0)
+        _, after = await _flatpak_capture(["info", scope, full], timeout=10.0)
         after_commit = _field_from(after, "Commit")
         updated = bool(before_commit and after_commit and before_commit != after_commit)
         decky.logger.info(
-            "flatpak client update: %s -> %s (updated=%s)",
-            before_commit[:10], after_commit[:10], updated,
+            "flatpak client update (%s %s): %s -> %s (updated=%s)",
+            scope, full, before_commit[:10], after_commit[:10], updated,
         )
         _update_cache["data"] = None  # invalidate the cached "update available" snapshot
         return {"ok": True, "updated": updated}
@@ -1018,12 +1095,20 @@ class Plugin:
         try:
             if _client_is_flatpak():
                 cu = await _client_update_state()
+                ref = _flatpak_ref()
                 result["client_update_available"] = bool(cu["available"])
                 result["client_current"] = (cu["installed"] or "")[:10]
                 result["client_latest"] = (cu["remote"] or "")[:10]
                 result["client_install"] = "flatpak"
                 result["client_applier"] = "flatpak"
-                result["client_command"] = f"flatpak update --user {APP_ID}"
+                # The line a user could actually run — same scope, same full ref we use. The old
+                # unqualified one errored out ("Multiple branches available") when pasted, too.
+                result["client_command"] = (
+                    f"flatpak update {ref['scope']} -y {ref['ref']}" if ref else ""
+                )
+                if cu["error"]:
+                    # Same contract as the native leg: "couldn't tell" is never "up to date".
+                    result["client_error"] = cu["error"]
             else:
                 nu = await _native_update_state()
                 result["client_update_available"] = bool(nu.get("update_available"))

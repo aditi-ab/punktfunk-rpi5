@@ -33,6 +33,7 @@ import {
   applyUpdate,
   checkForUpdatesNow,
   clientUpdateIsManualOnly,
+  clientUpdateIsOneTap,
   hasUpdate,
   HostView,
   needsPair,
@@ -183,8 +184,11 @@ const QamPanel: FC = () => {
                 onClick={() => applyUpdate(update!, check)}
                 label={
                   update!.update_available
-                    ? `Plugin v${update!.current} → v${update!.latest}${
-                        update!.client_update_available ? " + client" : ""
+                    ? // "+ client" only when this tap will really install it. A manual-only
+                      // client rides along as a toast with the command, and promising it in the
+                      // label would make that read as a failure.
+                      `Plugin v${update!.current} → v${update!.latest}${
+                        clientUpdateIsOneTap(update) ? " + client" : ""
                       }`
                     : "New client version"
                 }
