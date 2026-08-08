@@ -147,7 +147,10 @@ if [ "$WITH_WEB" = 1 ]; then
     distrobox enter "$BOX" -- bash -lc "
 set -e
 export PATH=\$HOME/.bun/bin:\$PATH
-cd '$SRC/web' && bun install --frozen-lockfile && bun run build
+# --ignore-scripts + explicit codegen: keep in step with scripts/steamdeck/update.sh, which
+# explains why (web's `postinstall` writes the COMMITTED web/bun.nix; its `prepare`/codegen is
+# required because src/api/gen, src/paraglide and src/routeTree.gen.ts are gitignored).
+cd '$SRC/web' && bun install --frozen-lockfile --ignore-scripts && bun run codegen && bun run build
 "
     [ -f "$SRC/web/.output/server/index.mjs" ] || die "web build did not produce web/.output/server/index.mjs"
     ok "web console built"
