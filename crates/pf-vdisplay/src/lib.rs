@@ -130,6 +130,22 @@ impl Compositor {
         }
     }
 
+    /// Does this backend need a compositor that is ALREADY RUNNING for this uid?
+    ///
+    /// Every desktop backend attaches to a live session — it asks Mutter/KWin/sway/Hyprland to mint
+    /// a virtual output over their IPC, so with nothing running there is no one to ask and `create`
+    /// can only fail (on GNOME: `RemoteDesktop.CreateSession:
+    /// org.freedesktop.DBus.Error.ServiceUnknown`). [`Compositor::Gamescope`] is the exception: it
+    /// stands its own session up from nothing (bare headless spawn / managed takeover), which is
+    /// exactly why a headless box pins to it.
+    ///
+    /// Callers use this to tell "the session is up" from "the session is a corpse" BEFORE marching a
+    /// client into a doomed bring-up — the state a compositor crash leaves behind (gnome-shell
+    /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so it never returns on its own).
+    pub fn needs_live_session(self) -> bool {
+        !matches!(self, Compositor::Gamescope)
+    }
+
     /// Human label for UIs.
     pub fn label(self) -> &'static str {
         match self {
