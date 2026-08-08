@@ -216,6 +216,70 @@ fn submit_queues_collide(graphics_qf: u32, decode_qf: u32) -> bool {
     graphics_qf == decode_qf
 }
 
+/// The queue lock this device's decode lane submits under. One function so the
+/// pre-session shape probe ([`hevc_shape_supported`]) and the real decoder cannot pick
+/// different serialization for the same device.
+fn queue_lock_for(vk: &VulkanDecodeDevice) -> Box<dyn pf_vkdecode::QueueLock> {
+    if submit_queues_collide(vk.graphics_qf, vk.decode_qf) {
+        Box::new(NativeQueueLock::Shared(vk.queue_lock.clone()))
+    } else {
+        Box::new(NativeQueueLock::Uncontended)
+    }
+}
+
+/// The presenter's handles in pf-vkdecode's shape. Same reason as [`queue_lock_for`]:
+/// the probe must ask about the DEVICE THE SESSION WOULD USE, not a re-derived one.
+fn device_handles(vk: &VulkanDecodeDevice) -> DeviceHandles {
+    DeviceHandles {
+        get_instance_proc_addr: vk.get_instance_proc_addr,
+        instance: vk.instance,
+        physical_device: vk.physical_device,
+        device: vk.device,
+        decode_qf: vk.decode_qf,
+        decode_queue_index: DECODE_QUEUE_INDEX,
+        graphics_qf: vk.graphics_qf,
+    }
+}
+
+/// Can this device hardware-decode HEVC at the given picture shape? Asked BEFORE the
+/// Hello, so the client never advertises a shape it would have to refuse a session over.
+///
+/// This is the same question, through the same code, that
+/// [`NativeVulkanDecoder::new`]'s H.265 arm asks at construction — `VkH265Decoder::new`
+/// then `probe_stream_support` — deliberately, so an advertisement and the rung that has
+/// to honour it cannot disagree. It creates and drops a decoder object; that costs a
+/// handful of driver capability queries and no session, no images and no submits.
+///
+/// `false` when the presenter has no Vulkan Video decode at all, which for 4:4:4 is the
+/// right answer rather than a missing one — see
+/// [`crate::video::hevc_444_hardware_decodable`] for why no other rung can be asked.
+pub(crate) fn hevc_shape_supported(
+    vk: &VulkanDecodeDevice,
+    chroma_format_idc: u8,
+    bit_depth_luma_minus8: u8,
+) -> bool {
+    if !vk.video_decode {
+        return false;
+    }
+    // The device-independent half first: a shape pf-vkdecode has no picture format for
+    // needs no driver to refuse it (and `probe_stream_support` would only re-derive it).
+    if pf_vkdecode::output_format_for(chroma_format_idc, bit_depth_luma_minus8).is_none() {
+        return false;
+    }
+    // SAFETY: the `DeviceHandles` contract exactly as `NativeVulkanDecoder::new` states
+    // it — these are the presenter's live instance/device, which outlive this call by
+    // construction (the presenter owns them for the whole process, and this runs on its
+    // thread while building the session's Hello). The decoder is dropped before return,
+    // so nothing outlives the borrow.
+    let dec = unsafe { pf_vkdecode::VkH265Decoder::new(&device_handles(vk), queue_lock_for(vk)) };
+    match dec {
+        Ok(d) => d
+            .probe_stream_support(chroma_format_idc, bit_depth_luma_minus8)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// [`pf_vkdecode::QueueLock`] over the device's shared [`crate::video::QueueLock`] —
 /// or over nothing, when the decode queue provably has no other submitter (see the
 /// module doc's queue-lock section).
@@ -934,21 +998,8 @@ impl NativeVulkanDecoder {
         if !vk.video_decode {
             bail!("presenter device lacks Vulkan Video decode");
         }
-        let lock: Box<dyn pf_vkdecode::QueueLock> =
-            if submit_queues_collide(vk.graphics_qf, vk.decode_qf) {
-                Box::new(NativeQueueLock::Shared(vk.queue_lock.clone()))
-            } else {
-                Box::new(NativeQueueLock::Uncontended)
-            };
-        let handles = DeviceHandles {
-            get_instance_proc_addr: vk.get_instance_proc_addr,
-            instance: vk.instance,
-            physical_device: vk.physical_device,
-            device: vk.device,
-            decode_qf: vk.decode_qf,
-            decode_queue_index: DECODE_QUEUE_INDEX,
-            graphics_qf: vk.graphics_qf,
-        };
+        let lock = queue_lock_for(vk);
+        let handles = device_handles(vk);
         // The `DeviceHandles` caller contract, held for the decoder's whole lifetime
         // and identical for both arms (it is the HANDLES' contract, not the codec's):
         // the handles are the presenter's live instance/device, which outlives every

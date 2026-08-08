@@ -1531,6 +1531,85 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     d3d11
 }
 
+/// Can this client actually DECODE 4:4:4 HEVC — the question `VIDEO_CAP_444` is a promise
+/// about, and the one nothing asked until a Steam Deck lost HEVC over it.
+///
+/// The bit used to ride the "Full chroma" toggle alone, with a comment saying the software
+/// rung was the floor underneath it. M8 removed that floor: there is no CPU HEVC decoder at
+/// all ([`software_decodable_codecs`]), and the host grants 4:4:4 only on HEVC. So on a
+/// device with no 4:4:4 decode the toggle did not cost crispness — it cost the whole codec.
+/// The Welcome resolves the chroma before a decoder exists, the native Vulkan constructor
+/// then refuses the shape, VAAPI refuses it too, and the session reconnects on H.264 with
+/// "HEVC decoding failed on this device" (field report 2026-08-08, Deck / VanGogh).
+///
+/// ⭐ Answered from the VULKAN rung alone, and that is exact rather than approximate: it is
+/// the only rung in this build that implements 4:4:4 at all. `pf_vaadec::profile_for` maps
+/// only `chroma_format_idc == 1` and errors `UnsupportedShape` on 3; `pf_dxvadec`'s config
+/// refuses "anything but 4:2:0" by construction; the CPU rung is 8-bit 4:2:0 only. So a
+/// device whose Vulkan driver offers no 4:4:4 decode profile has no 4:4:4 path in this
+/// client, whatever its silicon can do. (That is why an Intel box — whose hardware HAS done
+/// HEVC 4:4:4 since Ice Lake — is still a `false` here: our DXVA/VAAPI rungs do not
+/// implement it, so advertising it would be a lie about US, not about the GPU.)
+///
+/// ⚠ Both depths are required, not either: with HDR on, the host may resolve 4:4:4 **10-bit**,
+/// and a device offering `YUV444_8` but not `YUV444_10` would land in exactly the hole this
+/// closes. Asking for both costs one extra capability query and removes the case entirely.
+///
+/// ⚠ Deliberately NOT extended to `VIDEO_CAP_10BIT`/`VIDEO_CAP_HDR`, which are advertised
+/// unprobed for the same reason this one was. The asymmetry is real: all three hardware
+/// rungs implement 10-bit 4:2:0 (`profile_for` maps `(H265, 1, 10)` and `(Av1, 1, 10)`;
+/// pf-dxvadec carries P010), so a Vulkan-only probe there would answer `false` on boxes
+/// whose VAAPI/DXVA rung decodes 10-bit perfectly and would silently withdraw HDR from
+/// them — a visible regression bought against a case that has never been observed. Gating
+/// 10-bit honestly needs a libva/D3D11 probe, which this path cannot afford (same reason
+/// [`av1_hardware_decodable`] does not consult VAAPI).
+pub fn hevc_444_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        vk.is_some_and(|v| {
+            crate::video_vk_native::hevc_shape_supported(v, CHROMA_444, 0)
+                && crate::video_vk_native::hevc_shape_supported(v, CHROMA_444, 2)
+        })
+    }
+    // No native Vulkan rung is compiled in off the two desktop OSes, so nothing here can
+    // decode 4:4:4 and the honest answer is a constant.
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = vk;
+        false
+    }
+}
+
+/// `chroma_format_idc` for 4:4:4 (H.265 7.4.3.2) — spelled once so the two depth probes
+/// above and any future caller cannot disagree about the magic number.
+const CHROMA_444: u8 = 3;
+
+/// The desktop session's `video_caps` bitfield, as a pure function of the two user
+/// switches that move it — so the rule can be tested without a GPU, a host or a Hello.
+///
+/// `want_444` is the "Full chroma" setting **already ANDed with this device's ability to
+/// decode it** ([`hevc_444_hardware_decodable`]). Split that way on purpose: the caller
+/// owns the expensive driver question and can log its own refusal with the user's setting
+/// in hand, while the bit arithmetic — the part that was wrong — stays testable.
+///
+/// `MULTI_SLICE` is unconditional and is decoder truth for THIS embedder: every desktop
+/// decode stack (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) handles AUs carrying
+/// several slice NALs, so the host may keep its multi-slice low-latency default (§7 LN1).
+/// ⚠ The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges on
+/// multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
+///
+/// HDR off means 10-bit is not advertised either, so the host never upgrades depth.
+pub fn video_caps_for(hdr_enabled: bool, want_444: bool) -> u8 {
+    let mut caps = punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
+    if hdr_enabled {
+        caps |= punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
+    }
+    if want_444 {
+        caps |= punktfunk_core::quic::VIDEO_CAP_444;
+    }
+    caps
+}
+
 /// [`decodable_codecs`] plus the PyroWave bit when the presenter's device passed the
 /// compute-feature probe, minus the codecs `decoder_pref` makes unreachable.
 /// Advertisement-only: `resolve_codec` never auto-picks PyroWave — the session must also
@@ -2700,6 +2779,53 @@ impl VulkanDecodeDevice {
 mod tests {
     use super::*;
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+
+    /// The 4:4:4 advertisement is a PROMISE, and M8 removed the floor that used to make a
+    /// broken one survivable: there is no CPU HEVC decoder, and the host grants 4:4:4 on
+    /// HEVC only, so advertising it on a device that cannot decode it costs the entire
+    /// codec (field 2026-08-08, Steam Deck / VanGogh — HEVC fell back to H.264).
+    ///
+    /// The device question needs a GPU; THIS is the half that does not, and it is the half
+    /// that was wrong — the bit used to ride `enable_444` alone.
+    #[test]
+    fn the_444_bit_needs_the_setting_and_a_device_that_can_decode_it() {
+        const V444: u8 = punktfunk_core::quic::VIDEO_CAP_444;
+        // The regression itself: setting on, device can't → the bit must NOT go out.
+        assert_eq!(
+            video_caps_for(true, false) & V444,
+            0,
+            "a 4:4:4 promise this device cannot keep costs HEVC entirely"
+        );
+        // ...and the feature still works where it can be honoured.
+        assert_ne!(video_caps_for(true, true) & V444, 0);
+        // Never advertised unasked, whatever the device can do.
+        assert_eq!(video_caps_for(true, false) & V444, 0);
+        assert_eq!(video_caps_for(false, false) & V444, 0);
+
+        // The 4:4:4 gate must not disturb the other two bits (10-bit/HDR is deliberately
+        // NOT probe-gated — see `hevc_444_hardware_decodable`'s docs for why).
+        const HDR_BITS: u8 =
+            punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
+        for want_444 in [false, true] {
+            assert_eq!(video_caps_for(true, want_444) & HDR_BITS, HDR_BITS);
+            assert_eq!(video_caps_for(false, want_444) & HDR_BITS, 0);
+            assert_ne!(
+                video_caps_for(false, want_444) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+                0,
+                "MULTI_SLICE is unconditional for this embedder"
+            );
+        }
+    }
+
+    /// No presenter Vulkan device ⇒ no 4:4:4, and that is an ANSWER rather than a missing
+    /// one: the native Vulkan rung is the only one in this build that implements 4:4:4 at
+    /// all (`pf_vaadec::profile_for` errors on `chroma_format_idc == 3`, pf-dxvadec refuses
+    /// anything but 4:2:0, the CPU rung is 8-bit 4:2:0). The `Some` arm needs real hardware
+    /// and lives in the GPU suites.
+    #[test]
+    fn no_vulkan_device_means_no_444_promise() {
+        assert!(!hevc_444_hardware_decodable(None));
+    }
 
     /// The reconnect rule, as the invariant it is: an exhausted codec must come back as
     /// one this client can decode ALL THE WAY DOWN, and must never come back as itself.
