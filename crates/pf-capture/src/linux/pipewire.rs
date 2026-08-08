@@ -1162,6 +1162,12 @@ pub fn pipewire_thread(
         capture_arm = arm.as_str(),
         consumer = consumer.as_str(),
         modifier_count = modifiers.len(),
+        // PW3(c): the latch state belongs on the same line as the arm. A `cpu` arm has two very
+        // different explanations — "this host was never going to do dmabuf" and "something failed
+        // earlier and we are still living with the verdict" — and only the second is a bug worth
+        // chasing. Reading it here also means the retry/clear behaviour is observable rather than
+        // inferred.
+        raw_dmabuf_latch = pf_zerocopy::raw_dmabuf_latch_state(),
         "capture pipeline resolved: {} → {}",
         arm.as_str(),
         consumer.as_str()
