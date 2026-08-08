@@ -120,7 +120,9 @@ export interface UpdateInfo {
   client_applier: string;
   client_command: string; // one copy-pastable line that updates this install by hand
   client_opt_in: string; // set when one-tap WOULD work after `usermod -aG punktfunk-update`
-  client_error?: string; // the client check couldn't complete (e.g. "client-outdated")
+  // The client check couldn't complete — NEVER rendered as "up to date". "client-outdated" |
+  // "client-unavailable" | "no-origin" | "fetch-failed" (flatpak: the remote was unreachable).
+  client_error?: string;
   error?: string; // "update-channel-unknown" (dev build) | "fetch-failed"
 }
 

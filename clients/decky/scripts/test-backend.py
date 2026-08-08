@@ -30,6 +30,10 @@ sys.modules["decky"] = decky
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main  # noqa: E402  (the plugin backend)
 
+# The argv fixtures below monkey-patch `_client_argv` to pin one install shape; the
+# _flatpak_ref block wants the REAL resolver back, so keep a handle on it.
+_real_client_argv = main._client_argv
+
 failures = 0
 
 
@@ -74,6 +78,60 @@ main._client_argv = lambda: [str(tmp / "punktfunk-client")]
 check("cli argv: native without a sibling CLI is None", main._cli_argv() is None)
 (tmp / "punktfunk").write_text("")
 check("cli argv: native sibling found", main._cli_argv() == [str(tmp / "punktfunk")])
+
+# ---- _flatpak_ref: the branch must be NAMED, always ---------------------------------------
+#
+# The bug this exists to prevent: every client-update query used to name no branch, and the
+# punktfunk remote publishes `stable` AND `canary` — so `flatpak remote-info <origin>
+# io.unom.Punktfunk` failed with "Multiple branches available", the check swallowed the failure,
+# and the panel reported the client up to date forever. One branch INSTALLED is not enough to
+# make the query unambiguous; the ambiguity lives on the remote.
+shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
+_fp_root = Path("/tmp/pf-test-home/.local/share/flatpak/app/io.unom.Punktfunk/x86_64")
+main._flatpak = lambda: "/usr/bin/flatpak"
+main._client_argv = _real_client_argv  # undo the fixture patches above
+
+check("ref: nothing installed => None", main._flatpak_ref() is None)
+
+
+def _install_branch(name: str):
+    """A deployed branch: the `active` symlink is what distinguishes an install from leftovers."""
+    commit = _fp_root / name / "deadbeef"
+    commit.mkdir(parents=True, exist_ok=True)
+    (_fp_root / name / "active").symlink_to("deadbeef")
+
+
+(_fp_root / "canary").mkdir(parents=True, exist_ok=True)
+check("ref: a branch dir without `active` is leftovers, not an install", main._flatpak_ref() is None)
+
+_install_branch("canary")
+ref = main._flatpak_ref()
+check("ref: the single installed branch is used", ref == {
+    "scope": "--user", "branch": "canary", "ref": "io.unom.Punktfunk//canary",
+})
+check(
+    "ref: the launcher pins that branch, app id still LAST",
+    main._client_argv() == [
+        "/usr/bin/flatpak", "run", "--arch=x86_64", "--branch=canary", "io.unom.Punktfunk",
+    ],
+)
+# The pin must survive _cli_argv's rewrite, or the CLI runs a different build than the GUI.
+check(
+    "ref: --command= is inserted before the app id, keeping the pin",
+    main._cli_argv() == [
+        "/usr/bin/flatpak", "run", "--arch=x86_64", "--branch=canary",
+        "--command=punktfunk", "io.unom.Punktfunk",
+    ],
+)
+
+# Two installed: `stable` is what a plain `flatpak run` resolves to, so it must be what we
+# check and update too — otherwise a leftover stale `stable` wins the launch while `canary`
+# gets the update, and the two halves disagree about which client is even running.
+_install_branch("stable")
+check("ref: with both installed, stable wins (what `flatpak run` picks)",
+      main._flatpak_ref()["branch"] == "stable")
+
+shutil.rmtree("/tmp/pf-test-home", ignore_errors=True)
 
 # ---- _cli_error: the CLI's exit-code contract -------------------------------------------
 #
