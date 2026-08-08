@@ -26,9 +26,15 @@ import { m } from "@/paraglide/messages";
  * A library source's settings, rendered as a **generic form** from the plugin's own JSON Schema.
  *
  * The point (design D7, closing G8): a scanner plugin ships no SPA at all. It serves
- * `GET/PUT /__config` from the kit, and the console renders whatever schema comes back. Everything
- * goes through the existing session-gated `/plugin-ui/<id>/…` proxy, so there is **zero new host
- * surface** — the browser never learns the plugin's port or secret.
+ * `GET/PUT /__config` from the kit, and the console renders whatever schema comes back. The browser
+ * never learns the plugin's port or secret — the console reads it server-side over loopback.
+ *
+ * That read goes through `/api/plugin-config/<id>` on the CONSOLE origin, not the `/plugin-ui/…`
+ * proxy this used to call. Plugin UIs live on their own origin (2026-08-05 review H-3) and the
+ * console origin now answers 404 for `/plugin-ui/**` by design, which broke this drawer for every
+ * library plugin — it is the one consumer of that path that is not an iframe. What it needs is
+ * DATA, not an embedded UI, so it gets JSON same-origin and no plugin markup ever reaches the
+ * console origin.
  *
  * Fields the derivation can't express fall back to a raw JSON editor. That fallback is what bounds
  * the risk of the whole approach: worst case the drawer is a validated textarea, and the PUT still
@@ -51,7 +57,7 @@ export const SourceSettingsDialog: FC<{
 		let cancelled = false;
 		(async () => {
 			try {
-				const res = await fetch(`/plugin-ui/${pluginId}/__config`, {
+				const res = await fetch(`/api/plugin-config/${pluginId}`, {
 					credentials: "same-origin",
 				});
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -77,7 +83,7 @@ export const SourceSettingsDialog: FC<{
 	const save = async (value: JsonObject) => {
 		setSaving(true);
 		try {
-			const res = await fetch(`/plugin-ui/${pluginId}/__config`, {
+			const res = await fetch(`/api/plugin-config/${pluginId}`, {
 				method: "PUT",
 				credentials: "same-origin",
 				headers: { "content-type": "application/json" },
