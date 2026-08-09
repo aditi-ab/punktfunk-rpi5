@@ -222,17 +222,10 @@ jobs:
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
             install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
           else
-            # Best-effort on canary, HARD on a stable tag. A `::warning::` here is what let
-            # v0.26.0 publish release notes promising a Fedora gamescope package that did not
-            # exist: the step "succeeded", the job was green, and the only evidence was a warning
-            # nobody reads. A release must not be able to make a claim its own CI silently
-            # dropped, so on `refs/tags/v*` this is an error.
-            case "$GITHUB_REF" in
-              refs/tags/v*)
-                echo "::error::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — a stable tag must not ship without it (the release notes and docs-site say it is installable)"
-                exit 1
-                ;;
-            esac
+            # Warn only, even on a tag — the hard gate is the LAST step of this job. Failing here
+            # would skip the sysext build, the sysext feed, AND the release attach below, so a
+            # missing gamescope would also withhold the punktfunk RPMs and the .raw images that
+            # built perfectly well. deb.yml learned that the expensive way on v0.26.0.
             echo "::warning::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
           fi
 
@@ -250,15 +243,7 @@ jobs:
               --binary gs-cache/punktfunk-gamescope \
               --release "$PF_RELEASE"
           else
-            # The authoritative "does this package exist" decision, and the one that also covers
-            # the cache path — the build step above is skipped entirely on a cache hit, so a stale
-            # or empty cache would otherwise reach here and skip in silence on a release.
-            case "$GITHUB_REF" in
-              refs/tags/v*)
-                echo "::error::no usable punktfunk-gamescope for f${{ matrix.fedver }} — a stable tag must not ship without its RPM"
-                exit 1
-                ;;
-            esac
+            # Warn only — see the note on the build step. The gate is the last step of this job.
             echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — skipping its RPM"
           fi
 
@@ -342,3 +327,26 @@ jobs:
           for raw in dist-sysext/*.raw; do
             upsert_asset "$RID" "$raw" "$(basename "$raw" .raw).f${{ matrix.fedver }}.raw"
           done
+
+      # A release must not be able to make a claim its own CI silently dropped — v0.26.0's notes
+      # said the patched gamescope was dnf-installable while both Fedora bases had skipped it on a
+      # `::warning::` (missing libstdc++-static, which the -static-libstdc++ link needs).
+      #
+      # ⚠ LAST step on purpose, matching deb.yml: failing at the build step instead would skip the
+      # sysext image, the feed publish AND the attach above, withholding the punktfunk RPMs and
+      # .raw images that built perfectly well. Everything good ships first; the job goes red after.
+      - name: A stable tag must ship the gamescope RPM
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        run: |
+          shopt -s nullglob
+          built=(dist/punktfunk-gamescope-*.rpm)
+          keep=()
+          for r in "${built[@]}"; do
+            case "$r" in *debuginfo*|*debugsource*) continue;; esac
+            keep+=("$r")
+          done
+          if [ ${#keep[@]} -eq 0 ]; then
+            echo "::error::no punktfunk-gamescope RPM was built for f${{ matrix.fedver }} — a stable tag must not ship without it (the release notes and docs-site say it is installable). Everything else in this job published normally; see the gamescope build step above for the meson error."
+            exit 1
+          fi
+          echo "gamescope RPM present: ${keep[*]}"
