@@ -1219,6 +1219,11 @@ pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2: u32 = 9;
 /// topology and four controller slots. Used by capture clients that own the physical Puck;
 /// ordinary wired/BLE SC2 capture remains `STEAMCONTROLLER2`.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK: u32 = 10;
+/// Xbox Elite Wireless Controller Series 2 (`045E:0B22`, Bluetooth): a Windows-only HID identity
+/// through the UMDF minidriver, so glyphs and the device name read Elite. Folds to X-Box 360
+/// elsewhere. ⚠️ Identity only — the four paddles still fold/drop exactly as on the other X-Box
+/// classes (`DUALSENSEEDGE` is the pad with native back-button slots).
+pub const PUNKTFUNK_GAMEPAD_XBOXELITE: u32 = 11;
 
 /// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 /// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
@@ -1344,6 +1349,7 @@ const _: () = {
     assert!(
         PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK == GamepadPref::SteamController2Puck.to_u8() as u32
     );
+    assert!(PUNKTFUNK_GAMEPAD_XBOXELITE == GamepadPref::XboxElite.to_u8() as u32);
     // Extended button bits mirror the wire `input::gamepad` constants.
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);

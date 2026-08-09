@@ -2,7 +2,9 @@
 //
 // A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
 // (VID 054C / PID 0CE6), DualShock 4 (device_type=1), DualSense Edge (device_type=2), Steam Deck
-// (device_type=3) or Xbox Wireless Controller (device_type=4, VID 045E / PID 0B13) using the
+// (device_type=3), Xbox Wireless Controller (device_type=4, VID 045E / PID 0B13), Xbox One S
+// (device_type=5, 045E / 02FD) or Xbox Elite Wireless Controller Series 2 (device_type=6,
+// 045E / 0B22) using the
 // report descriptors + feature blobs punktfunk already ships in `inject/`. Games see a genuine
 // HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
 //
@@ -73,7 +75,7 @@ const DS_EDGE_PID: u16 = 0x0DF2;
 const DECK_VID: u16 = 0x28DE;
 const DECK_PID: u16 = 0x1205;
 
-// ---- Xbox Wireless Controller identity (device_type=4) ----
+// ---- Xbox identities (device_type = 4 Wireless / 5 One S / 6 Elite Series 2) ----
 //
 // WHY THIS EXISTS (field 2026-08-09, `punktfunk-field-windows-pad-dead-0260`): the OTHER Windows
 // Xbox backend — `pf-xusb` — registers ONLY `GUID_DEVINTERFACE_XUSB` and has no HID collection at
@@ -89,17 +91,37 @@ const DECK_PID: u16 = 0x1205;
 // never existed and inbox promotion has nothing to match. The Xbox pads that genuinely ARE HID are
 // the Bluetooth ones, which Windows binds through HIDCLASS.
 const XBOX_VID: u16 = 0x045E;
-/// Xbox Wireless Controller (Series X|S), Bluetooth. Chosen over the Xbox One S BT id `0x02FD`
-/// because the host's OS floor is Windows 11 22H2, where this is the current-generation identity
-/// (so glyphs read "Xbox Series") and SDL's mapping database covers it.
+/// Xbox Wireless Controller (Series X|S), Bluetooth — `device_type = 4`, the default Xbox identity.
+/// Chosen over the Xbox One S BT id `0x02FD` because the host's OS floor is Windows 11 22H2, where
+/// this is the current-generation identity (so glyphs read "Xbox Series") and SDL's mapping
+/// database covers it.
 ///
-/// ⚠️ **If on-glass shows Windows does not promote this to an Xbox-profile pad, try `0x02FD`
-/// (Xbox One S BT) — it has the broadest inbox coverage.** Deliberately one named constant so that
-/// experiment is a one-line change.
+/// ⭐ It is also the PID Microsoft's own `xinputhid.inf` allow-lists **twice** (once as a
+/// `BTHLEDevice` stage-1 id, once as a plain `HID\…&IG_00` stage-2 id) — measured off `.173`,
+/// 2026-08-09. That is not what promotes OUR pad (a software devnode matches no allow-list entry;
+/// `pfGamepadXbox`'s `AddReg` writes what the matching sections would have written), but it is why
+/// this stays the default of the three.
 const XBOX_PID: u16 = 0x0B13;
-/// Alternate identity for the promotion experiment above — Xbox One S controller over Bluetooth.
-#[allow(dead_code)]
+/// Xbox One S controller over Bluetooth — `device_type = 5`.
+///
+/// ⚠️ **`02FD` appears in `xinputhid.inf` only as a `BTHENUM` (classic-BT bus) id — it has NO
+/// stage-2 `HID\…&IG_00` model line.** That killed it as a "try another PID" lever for the
+/// promotion work (handoff §4 B1). It does not block it as an IDENTITY, because our promotion
+/// comes from the INF's own `AddReg` rather than from matching Microsoft's list — but if a future
+/// Windows servicing update makes promotion depend on the allow-list again, this identity is the
+/// one that loses it first. Worth re-measuring on glass before recommending it to anyone.
 const XBOX_PID_ONE_S: u16 = 0x02FD;
+/// Xbox Elite Wireless Controller Series 2 — `device_type = 6`. This is the pad
+/// `tools/hid-descriptor-dump` captured on `.173` (`BTHLE\DEV_686CE647F191`, `REV_0521`), so it is
+/// the one identity here whose real hardware we have measured directly.
+const XBOX_PID_ELITE2: u16 = 0x0B22;
+/// bcdDevice for every Xbox identity.
+///
+/// Deliberately ONE value rather than per-identity: the real Elite reports `REV_0521` (measured on
+/// `.173`) but `create_swdevice` synthesizes the devnode's USB ids with a hardcoded `&REV_0100`
+/// regardless, and SDL folds the version into its joystick GUID — so a version that disagrees with
+/// the devnode buys nothing and risks missing a stock mapping. Revisit only with a measurement
+/// that shows a consumer keying on it.
 const XBOX_VER: u16 = 0x0407;
 
 // Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino (== inject/dualsense.rs).
@@ -271,7 +293,23 @@ static DECK_RDESC: [u8; 38] = [
     0x08, 0x95, 0x40, 0xb1, 0x02, 0xc0,
 ];
 
-// ---- Xbox Wireless Controller assets (served when the host stamps device_type=4) ----
+// ---- Xbox assets (served when the host stamps device_type = 4, 5 or 6) ----
+//
+// ⭐⭐ **ONE DESCRIPTOR SERVES ALL THREE XBOX IDENTITIES, DELIBERATELY.** Xbox Wireless (4),
+// Xbox One S (5) and Xbox Elite Series 2 (6) differ ONLY in VID/PID, product string and INF model
+// line — in HID terms they are the same pad: same two 16-bit stick pairs, same trigger pair, same
+// hat, same 15 buttons, same rumble output report. A report descriptor is the report SHAPE, not
+// the identity; the identity is what SDL/Steam/Windows key their stock mappings off, and that
+// travels in `hid_attrs`.
+//
+// This is load-bearing, not laziness. The ⚠️ block below is the record of what ONE hand-written
+// descriptor has already cost: three separate bugs (no Feature report ⇒ the sealed channel never
+// opened and the pad served neutral forever; no OUTPUT item ⇒ no rumble of any kind and dead
+// host-side code; a layout that provably disagrees with the captured hardware). Two more
+// hand-written descriptors would multiply that debt by three for no measured gain, and each would
+// need its own capture, its own `wReportLength`, its own `xbox_proto` layout tests and its own
+// on-glass verification. When a Linux-hidraw capture settles the real layout (handoff §3.3), it
+// lands here ONCE and all three identities get it.
 //
 // A standards-clean Game Pad collection matching the Bluetooth Xbox layout: two 16-bit stick pairs,
 // two 10-bit triggers on the Simulation page, a null-state hat, and 15 buttons. Report `0x01`,
@@ -474,6 +512,7 @@ static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01
 static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
 static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
 static DECK_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x26, 0x00]; // 38 bytes
+// Serves device_type 4, 5 AND 6 — one descriptor, three identities (see the XBOX_RDESC header).
 static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xDF, 0x00]; // 223 bytes
 
 // Each `wReportLength` above is a SECOND copy of a length that already exists as its descriptor's
@@ -492,13 +531,21 @@ const _: () = assert!(declared_len(&DECK_HID_DESC) == DECK_RDESC.len());
 const _: () = assert!(declared_len(&XBOX_HID_DESC) == XBOX_RDESC.len());
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
-// `devtype` selects the identity: PS family (same Sony VID/version) or the N4-spike Deck.
+// `devtype` selects the identity: PS family (same Sony VID/version), the N4-spike Deck, or one of
+// the three Xbox pads (same Microsoft VID/version — only the PID differs, which is the entire
+// difference between them; they share a report descriptor).
+//
+// ⚠️ THIS is where an Xbox identity is actually decided. Everything else in the Xbox path —
+// descriptor, HID descriptor, report length, neutral report — is shared, so a new Xbox model is a
+// PID here, a product string in `on_get_string`, an INF model line and nothing else.
 fn hid_attrs(devtype: u8) -> [u8; 32] {
     let (vid, pid, ver) = match devtype {
         1 => (DS_VID, DS4_PID, DS_VER),
         2 => (DS_VID, DS_EDGE_PID, DS_VER),
         3 => (DECK_VID, DECK_PID, DS_VER),
         4 => (XBOX_VID, XBOX_PID, XBOX_VER),
+        5 => (XBOX_VID, XBOX_PID_ONE_S, XBOX_VER),
+        6 => (XBOX_VID, XBOX_PID_ELITE2, XBOX_VER),
         _ => (DS_VID, DS_PID, DS_VER),
     };
     let mut a = [0u8; 32];
@@ -518,10 +565,11 @@ fn hid_attrs(devtype: u8) -> [u8; 32] {
 /// the caller's buffer rather than truncating — so handing hidclass 64 bytes for a 16-byte report
 /// fails every single read and the pad looks dead.
 ///
-/// Returns 64 for every pre-existing identity, so this is provably a no-op for them.
+/// Returns 64 for every pre-existing identity, so this is provably a no-op for them. All three
+/// Xbox identities share one descriptor, hence one report length.
 fn input_report_len(devtype: u8) -> usize {
     match devtype {
-        4 => XBOX_INPUT_REPORT_LEN,
+        4 | 5 | 6 => XBOX_INPUT_REPORT_LEN,
         _ => 64,
     }
 }
@@ -578,7 +626,8 @@ fn neutral_report(devtype: u8) -> [u8; 64] {
     match devtype {
         1 => DS4_NEUTRAL_REPORT,
         3 => DECK_NEUTRAL_REPORT,
-        4 => XBOX_NEUTRAL_REPORT,
+        // Wireless / One S / Elite Series 2 — one report shape, three identities.
+        4 | 5 | 6 => XBOX_NEUTRAL_REPORT,
         _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
     }
 }
@@ -731,8 +780,8 @@ static RING_PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
 /// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge,
-/// 3 = Steam Deck) — the neutral-report shape when the channel detaches, and the fallback identity
-/// while unattached.
+/// 3 = Steam Deck, 4 = Xbox Wireless, 5 = Xbox One S, 6 = Xbox Elite Series 2) — the
+/// neutral-report shape when the channel detaches, and the fallback identity while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd` ([`devtype_from_hwids`]);
 /// `u32::MAX` = not resolved. See [`device_type`] for why this exists.
@@ -748,9 +797,14 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 /// can never disagree.
 ///
 /// Order matters: `pf_dualsense` is a prefix of `pf_dualsenseedge`, so the Edge is tested first.
+/// (No Xbox token is a prefix of another — `pf_xboxwireless` / `pf_xboxones` / `pf_xboxelite`
+/// diverge at the 8th character — but `hwid_devtype_table_matches_the_driver` re-checks that for
+/// every pair rather than trusting this note.)
 fn devtype_from_hwids(ids: &str) -> Option<u8> {
     for (token, devtype) in [
         ("pf_xboxwireless", 4u8),
+        ("pf_xboxones", 5),
+        ("pf_xboxelite", 6),
         ("pf_steamdeck", 3),
         ("pf_dualsenseedge", 2),
         ("pf_dualshock4", 1),
@@ -1039,15 +1093,17 @@ extern "C" fn evt_io_device_control(
             1 => &DS4_HID_DESC,
             2 => &EDGE_HID_DESC,
             3 => &DECK_HID_DESC,
-            4 => &XBOX_HID_DESC,
+            4 | 5 | 6 => &XBOX_HID_DESC,
             _ => &HID_DESC,
         }),
         IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
+        // The three Xbox identities share ONE report descriptor on purpose — see the XBOX_RDESC
+        // header. Only `hid_attrs` (VID/PID) and `on_get_string` (product string) tell them apart.
         IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(match device_type() {
             1 => &DS4_RDESC[..],
             2 => &DS_EDGE_RDESC[..],
             3 => &DECK_RDESC[..],
-            4 => &XBOX_RDESC[..],
+            4 | 5 | 6 => &XBOX_RDESC[..],
             _ => &DUALSENSE_RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
@@ -1309,7 +1365,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0 | 0x000e => match devtype {
             1 => "Sony Computer Entertainment".into(),
             3 => "Valve Software".into(),
-            4 => "Microsoft".into(),
+            4 | 5 | 6 => "Microsoft".into(),
             _ => "Sony Interactive Entertainment".into(),
         },
         // Per-pad serials (see `pad_index`): SDL reads this via HidD_GetSerialNumberString and
@@ -1322,15 +1378,29 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             2 => format!("35533AD6E7{:02X}", 0x75u8.wrapping_add(pad_index())),
             3 => format!("FVPF{:08X}", 0x5046_0000u32 | pad_index() as u32),
             // Xbox pads report a Bluetooth MAC-shaped serial; the low octet carries the pad index
-            // so Steam dedups multiple forwarded pads, exactly like the PS identities above.
+            // so Steam dedups multiple forwarded pads, exactly like the PS identities above. Each
+            // Xbox identity gets its OWN base octet (0x10 / 0x30 / 0x50) rather than sharing one:
+            // a mixed session can present a Wireless pad and an Elite at once, and two identities
+            // whose serials differ only by pad index are one off-by-one away from colliding — the
+            // failure being Steam silently treating two live pads as one device.
             4 => format!("F4B0FC2A6C{:02X}", 0x10u8.wrapping_add(pad_index())),
+            5 => format!("F4B0FC2A6C{:02X}", 0x30u8.wrapping_add(pad_index())),
+            6 => format!("F4B0FC2A6C{:02X}", 0x50u8.wrapping_add(pad_index())),
             _ => format!("35533AD6E7{:02X}", 0x74u8.wrapping_add(pad_index())),
         },
         _ => match devtype {
             1 => "Wireless Controller".into(),
             2 => "DualSense Edge Wireless Controller".into(),
             3 => "Steam Deck Controller".into(),
-            4 => "Xbox Wireless Controller".into(),
+            // ⚠️ 4 and 5 share a product string ON PURPOSE — a real Xbox Wireless Controller
+            // (Series X|S, `0B13`) and a real Xbox One S pad (`02FD`) BOTH report exactly
+            // "Xbox Wireless Controller" over Bluetooth. The PID is what tells them apart, and
+            // that is what SDL/Steam/Windows key their stock mappings off. Do not "fix" this by
+            // inventing a distinguishing string; it would make the One S identity a device that
+            // has never existed. (The INF's Device Manager descriptions DO differ — that string
+            // is ours, not the pad's.)
+            4 | 5 => "Xbox Wireless Controller".into(),
+            6 => "Xbox Elite Wireless Controller Series 2".into(),
             _ => "DualSense Wireless Controller".into(),
         },
     };
@@ -1343,7 +1413,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
 }
 
 /// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck,
-/// 4 = Xbox Wireless Controller.
+/// 4 = Xbox Wireless Controller, 5 = Xbox One S, 6 = Xbox Elite Wireless Controller Series 2.
 /// Read fresh on each enumeration query — cheap.
 ///
 /// ⚠️ **The sealed section cannot answer the enumeration queries.** hidclass asks for

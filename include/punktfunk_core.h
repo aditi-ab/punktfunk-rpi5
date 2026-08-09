@@ -236,6 +236,12 @@
 // ordinary wired/BLE SC2 capture remains `STEAMCONTROLLER2`.
 #define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK 10
 
+// Xbox Elite Wireless Controller Series 2 (`045E:0B22`, Bluetooth): a Windows-only HID identity
+// through the UMDF minidriver, so glyphs and the device name read Elite. Folds to X-Box 360
+// elsewhere. ⚠️ Identity only — the four paddles still fold/drop exactly as on the other X-Box
+// classes (`DUALSENSEEDGE` is the pad with native back-button slots).
+#define PUNKTFUNK_GAMEPAD_XBOXELITE 11
+
 // Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 // (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
 // `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.

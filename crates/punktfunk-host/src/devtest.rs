@@ -368,6 +368,14 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     let xbox = args.iter().any(|a| a == "--xbox");
     // `--xboxhid` drives the HID Xbox backend (device-type 4) instead of `--xbox`'s XUSB companion.
     let xboxhid = args.iter().any(|a| a == "--xboxhid");
+    // The other two HID Xbox identities (device-types 5 and 6). Same backend, same report
+    // descriptor — only VID/PID, product string and hardware id differ — so these legs exist for
+    // exactly one question each: does Windows PROMOTE that PID the way it promotes `0B13`?
+    // `02FD` in particular has no stage-2 `HID\…&IG_00` line in Microsoft's `xinputhid.inf`, so
+    // it is the one worth watching. Check for the `IG_00` token, the XUSB interface, an XInput
+    // slot and rumble, exactly as the `--xboxhid` run did.
+    let xboxones = args.iter().any(|a| a == "--xboxones");
+    let xboxelite = args.iter().any(|a| a == "--xboxelite");
     // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
     // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
     // report byte 10 (0x80|0x40) next to Cross. `--deck` drives the Steam Deck backend
@@ -480,6 +488,20 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         drive!(
             crate::inject::xbox_windows::XboxWindowsManager::new(),
             "Xbox Wireless Controller (HID)"
+        );
+    } else if xboxones {
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                crate::inject::xbox_windows::XboxWinProto::one_s()
+            ),
+            "Xbox One S Controller (HID, 045E:02FD)"
+        );
+    } else if xboxelite {
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                crate::inject::xbox_windows::XboxWinProto::elite()
+            ),
+            "Xbox Elite Wireless Controller Series 2 (HID, 045E:0B22)"
         );
     } else if ds4 {
         drive!(

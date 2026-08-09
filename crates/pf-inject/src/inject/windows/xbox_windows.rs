@@ -1,5 +1,6 @@
-//! Virtual Xbox Wireless Controller on Windows via the UMDF HID minidriver (device-type 4) — the
-//! HID-visible alternative to [`super::gamepad_windows`]'s XUSB companion.
+//! Virtual Xbox pads on Windows via the UMDF HID minidriver — Xbox Wireless (device-type 4),
+//! Xbox One S (5) and Xbox Elite Series 2 (6), the HID-visible alternative to
+//! [`super::gamepad_windows`]'s XUSB companion.
 //!
 //! **Why this exists.** `pf-xusb` registers only `GUID_DEVINTERFACE_XUSB` and exposes no HID
 //! collection, so Steam's hidapi enumeration, DirectInput, `joy.cpl` and WGI/GameInput cannot see
@@ -10,15 +11,16 @@
 //! and install path the PlayStation pads already ship on.
 //!
 //! Transport is identical to the PS/Deck pads: a `SwDeviceCreate` devnode plus the sealed
-//! shared-memory channel, with `device_type = 4` stamped before the magic so the driver resolves
-//! the Xbox identity before hidclass asks it for descriptors. The codec is
-//! [`super::xbox_proto`]; the report it writes mirrors the driver's `XBOX_RDESC` byte for byte.
+//! shared-memory channel, with the identity's `device_type` stamped before the magic so the driver
+//! resolves it before hidclass asks for descriptors. The codec is
+//! [`super::xbox_proto`]; the report it writes mirrors the driver's `XBOX_RDESC` byte for byte —
+//! **one descriptor, all three identities** (see `WinXboxIdentity` below).
 //!
-//! ⚠️ **The synthesized USB identity is a BLUETOOTH Xbox pad (`045E:0B13`) on purpose.** The wired
-//! ids the rest of the tree uses (`045E:028E` X-Box 360, `045E:02EA` Xbox One S USB) are
-//! vendor-class XUSB/GIP devices that expose no HID interface on real hardware — a HID child
-//! claiming one is a device that has never existed, and Windows' inbox promotion would have nothing
-//! to match. See `pf-gamepad`'s `XBOX_PID` for the alternate to try if `0B13` is not promoted.
+//! ⚠️ **Every synthesized USB identity here is a BLUETOOTH Xbox pad on purpose.** The wired ids the
+//! rest of the tree uses (`045E:028E` X-Box 360, `045E:02EA` Xbox One S USB) are vendor-class
+//! XUSB/GIP devices that expose no HID interface on real hardware — a HID child claiming one is a
+//! device that has never existed, and Windows' inbox promotion would have nothing to match. The
+//! Bluetooth ids (`0B13` / `02FD` / `0B22`) are the Xbox pads that genuinely ARE HID.
 //!
 //! ⚠️ **No rich plane.** An Xbox pad has no touchpad, no lightbar, no adaptive triggers and no
 //! IMU in its HID contract, so `apply_rich` / `clear_rich` / `neutralize_gyro` are deliberately
@@ -36,14 +38,106 @@ use anyhow::Result;
 use punktfunk_core::quic::RichInput;
 use std::time::Duration;
 
-/// The hardware id this pad's devnode carries. Must be one `pf_gamepad.inx` declares — a package
-/// rename must never touch it (`dualsense_windows::tests::hwid_matches_inf` enforces that).
-pub(super) const XBOX_HWID: &str = "pf_xboxwireless";
+/// One of the Xbox identities this backend can present. Mirrors `WinDsIdentity`
+/// (`super::dualsense_windows`) for the PlayStation family: the whole transport (section layout,
+/// report codec, output parse, INF install section) is shared, and only the PnP identity plus the
+/// `device_type` stamp differ.
+///
+/// ⭐ **All three share ONE report descriptor in the driver** — `XBOX_RDESC`. In HID terms they are
+/// the same pad: same stick pairs, same trigger pair, same hat, same 15 buttons, same rumble output
+/// report. A descriptor is the report SHAPE; the identity is what SDL/Steam/Windows key their stock
+/// mappings off, and that travels in the VID/PID below. See the `XBOX_RDESC` provenance block in
+/// `packaging/windows/drivers/pf-gamepad/src/lib.rs` for why inventing two more hand-written
+/// descriptors would be a net loss.
+pub(super) struct WinXboxIdentity {
+    /// `device_type` stamped into the section — the driver picks its VID/PID and product string
+    /// off it, before hidclass asks anything.
+    pub devtype: u8,
+    /// PnP instance-id prefix — distinct namespaces per identity, so two Xbox models never reuse
+    /// the same devnode shell.
+    pub instance_prefix: &'static str,
+    /// The INF-matched hardware id. Must be one `pf_gamepad.inx` declares, on a model line that
+    /// installs `pfGamepadXbox` — a package rename must never touch it
+    /// (`dualsense_windows::tests::hwid_matches_inf` and
+    /// `only_the_xbox_identity_installs_the_xinputhid_section` enforce both halves).
+    pub hwid: &'static str,
+    /// The USB VID&PID token synthesized onto the devnode so hidclass derives the real-pad HID
+    /// child ids (`HID\VID_045E&PID_xxxx`) — the identity SDL/RawInput/WGI read, and the one
+    /// Windows' own Xbox INFs match when they decide whether to promote a HID gamepad.
+    pub usb_vid_pid: &'static str,
+    /// Device Manager description.
+    pub description: &'static str,
+}
 
-/// The USB VID&PID token synthesized onto the devnode so hidclass derives the real-pad HID child
-/// ids (`HID\VID_045E&PID_0B13`) — the identity SDL/RawInput/WGI read, and the one Windows' own
-/// Xbox INFs match when they decide whether to promote a HID gamepad to an Xbox-profile pad.
-const XBOX_USB_VID_PID: &str = "VID_045E&PID_0B13";
+impl WinXboxIdentity {
+    /// Xbox Wireless Controller (Series X|S) over Bluetooth, `045E:0B13` — the default.
+    ///
+    /// ⭐ Its PID is on Microsoft's `xinputhid.inf` allow-list twice (measured on `.173`,
+    /// 2026-08-09). That is not what promotes OUR pad — a software devnode matches no allow-list
+    /// entry, so `pfGamepadXbox`'s `AddReg` writes the two registry values those sections would
+    /// have written — but it is why this identity, not one of the two below, stays the default.
+    pub(super) const fn wireless() -> WinXboxIdentity {
+        WinXboxIdentity {
+            devtype: pf_driver_proto::gamepad::DEVTYPE_XBOX,
+            instance_prefix: "pf_xbox",
+            hwid: "pf_xboxwireless",
+            usb_vid_pid: "VID_045E&PID_0B13",
+            description: "Punktfunk Virtual Xbox Wireless Controller",
+        }
+    }
+
+    /// Xbox One S controller over Bluetooth, `045E:02FD`.
+    ///
+    /// ⚠️ `02FD` appears in `xinputhid.inf` only as a `BTHENUM` (classic-BT bus) id — it has **no**
+    /// stage-2 `HID\…&IG_00` model line, unlike `0B13`. Promotion here rides entirely on our own
+    /// `AddReg`, so it should behave identically; but if a servicing update ever makes promotion
+    /// depend on Microsoft's list again, this is the identity that loses it first. UNVERIFIED on
+    /// glass.
+    pub(super) const fn one_s() -> WinXboxIdentity {
+        WinXboxIdentity {
+            devtype: pf_driver_proto::gamepad::DEVTYPE_XBOX_ONE_S,
+            instance_prefix: "pf_xbox_ones",
+            hwid: "pf_xboxones",
+            usb_vid_pid: "VID_045E&PID_02FD",
+            description: "Punktfunk Virtual Xbox One S Controller",
+        }
+    }
+
+    /// Xbox Elite Wireless Controller Series 2, `045E:0B22` — the pad
+    /// `tools/hid-descriptor-dump` captured on `.173`, so the one identity here whose real hardware
+    /// has been measured directly.
+    ///
+    /// ⚠️ **No paddles yet.** `BTN_PADDLE1..4` still fold/drop for this identity exactly as for the
+    /// other two; the Elite is merely the first Xbox pad that *could* carry them natively. Adding
+    /// them is blocked on a measurement, not on effort — once `xinputhid` promotes the pad it
+    /// claims the HID collection exclusively, so extra buttons declared in the descriptor may be
+    /// invisible to every consumer anyway (handoff §3.6). Measure before building.
+    pub(super) const fn elite() -> WinXboxIdentity {
+        WinXboxIdentity {
+            devtype: pf_driver_proto::gamepad::DEVTYPE_XBOX_ELITE,
+            instance_prefix: "pf_xbox_elite",
+            hwid: "pf_xboxelite",
+            usb_vid_pid: "VID_045E&PID_0B22",
+            description: "Punktfunk Virtual Xbox Elite Wireless Controller Series 2",
+        }
+    }
+}
+
+/// Every Xbox identity this backend can build, in wire order (`device_type` 4, 5, 6).
+///
+/// A table rather than three loose constructors because the INF tests sweep it: each entry's
+/// `hwid` must appear in `pf_gamepad.inx` **on a `pfGamepadXbox` model line**, and every non-Xbox
+/// model line must NOT be on that section. A new identity added here without its INF line fails
+/// those tests instead of failing on a user's box.
+///
+/// `static`, not `const`, on purpose: [`XboxWinProto`] holds a `&'static WinXboxIdentity`, and a
+/// `const` is inlined at each use site — `&CONST[i]` would depend on rvalue static promotion to
+/// come out `'static` at all.
+pub(super) static XBOX_IDENTITIES: [WinXboxIdentity; 3] = [
+    WinXboxIdentity::wireless(),
+    WinXboxIdentity::one_s(),
+    WinXboxIdentity::elite(),
+];
 
 /// A single virtual Xbox pad: the `SwDeviceCreate`'d `pf_xbox_<index>` devnode plus the sealed
 /// shared-memory channel. Dropping it removes the devnode and closes both sections.
@@ -61,9 +155,9 @@ pub struct XboxWinPad {
 }
 
 impl XboxWinPad {
-    /// Create the sealed channel, stamp `device_type = Xbox` FIRST + the pad index + the neutral
-    /// report + the magic LAST, then spawn the devnode under the Bluetooth Xbox identity.
-    fn open(index: u8) -> Result<XboxWinPad> {
+    /// Create the sealed channel, stamp `device_type` FIRST + the pad index + the neutral report +
+    /// the magic LAST, then spawn the devnode under `id`'s Bluetooth Xbox identity.
+    fn open(index: u8, id: &WinXboxIdentity) -> Result<XboxWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
         let base = channel.data_base();
@@ -71,7 +165,7 @@ impl XboxWinPad {
         // device_type MUST land before the magic — the driver reads it the moment it attaches, and
         // a late stamp enumerates the pad with the default DualSense identity (the Deck's bug).
         unsafe {
-            *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_XBOX;
+            *base.add(OFF_DEVTYPE) = id.devtype;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             // Ring capability `2` = "this host drains the v2.2 long ring" (see the DualSense open).
             std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
@@ -81,17 +175,20 @@ impl XboxWinPad {
             );
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
-        let inst = format!("pf_xbox_{index}");
+        let inst = format!("{}_{index}", id.instance_prefix);
         let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
+            // Per-FAMILY tag, like "PFDS" for the whole PlayStation family: the three Xbox
+            // identities share it because only one of them can ever hold a given pad index (the
+            // router keeps a live device in its owning manager), so their containers never collide.
             container_tag: 0x5046_5842, // "PFXB"
             container_index: index,
-            hwid: XBOX_HWID,
-            usb_vid_pid: XBOX_USB_VID_PID,
+            hwid: id.hwid,
+            usb_vid_pid: id.usb_vid_pid,
             // A Bluetooth pad is not a USB composite device, so there is no interface number to
             // synthesize — unlike the Deck, whose Steam promotion gate needs `&MI_02`.
             usb_mi: None,
-            description: "Punktfunk Virtual Xbox Wireless Controller",
+            description: id.description,
         })?; // Propagate — swallowing latched the slot to a pad with no devnode (see the DS4 twin).
         channel.bind_devnode(
             index as u32,
@@ -99,14 +196,14 @@ impl XboxWinPad {
             super::gamepad_raii::ProofTransport::HidFeatureReport,
         );
         let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
-        // Bounded eager delivery — the driver must read `device_type = 4` before hidclass asks it
-        // for descriptors, or the pad enumerates as a DualSense.
+        // Bounded eager delivery — the driver must read the `device_type` stamp before hidclass
+        // asks it for descriptors, or the pad enumerates as a DualSense.
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(XboxWinPad {
             _sw,
             channel,
             attach: super::gamepad_raii::DriverAttach::new(
-                "pf_xboxwireless",
+                id.hwid,
                 "pf_gamepad.inf", // one driver package serves every identity
                 "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
                 boot_name,
@@ -190,8 +287,37 @@ fn parse_xbox_output(bytes: &[u8]) -> Option<(u16, u16, u16, u16)> {
 
 /// The Windows-Xbox half of the shared stateful manager (see [`PadProto`]). Lifecycle (slot table,
 /// unplug sweep, heartbeat, rumble dedup) lives in [`UhidManager`], exactly as for the PS pads.
-#[derive(Default)]
-pub struct XboxWinProto;
+///
+/// The identity is a field rather than three separate proto types because nothing else about the
+/// backend varies: same codec, same output parse, same rumble plane. `Default` is the Xbox Wireless
+/// Controller, so `XboxWindowsManager::new()` keeps its previous meaning exactly.
+pub struct XboxWinProto {
+    identity: &'static WinXboxIdentity,
+}
+
+impl Default for XboxWinProto {
+    fn default() -> XboxWinProto {
+        XboxWinProto {
+            identity: &XBOX_IDENTITIES[0],
+        }
+    }
+}
+
+impl XboxWinProto {
+    /// The Xbox One S identity (`045E:02FD`) — `UhidManager::with_backend(XboxWinProto::one_s())`.
+    pub fn one_s() -> XboxWinProto {
+        XboxWinProto {
+            identity: &XBOX_IDENTITIES[1],
+        }
+    }
+
+    /// The Xbox Elite Series 2 identity (`045E:0B22`).
+    pub fn elite() -> XboxWinProto {
+        XboxWinProto {
+            identity: &XBOX_IDENTITIES[2],
+        }
+    }
+}
 
 impl PadProto for XboxWinProto {
     type Pad = XboxWinPad;
@@ -202,10 +328,12 @@ impl PadProto for XboxWinProto {
         " (install/repair: punktfunk-host.exe driver install --gamepad)";
 
     fn open(&mut self, idx: u8) -> Result<XboxWinPad> {
-        let p = XboxWinPad::open(idx)?;
+        let p = XboxWinPad::open(idx, self.identity)?;
         tracing::info!(
             index = idx,
-            "virtual Xbox Wireless Controller created (Windows UMDF HID identity 045E:0B13)"
+            identity = self.identity.usb_vid_pid,
+            description = self.identity.description,
+            "virtual Xbox pad created (Windows UMDF HID)"
         );
         Ok(p)
     }

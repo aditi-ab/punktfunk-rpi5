@@ -276,6 +276,9 @@ impl PadInfo {
             GamepadPref::DualSenseEdge => "DualSense Edge",
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
+            // Unreachable from `pref_for_type` today — SDL has no Elite `GamepadType` — but a
+            // pinned setting can carry it, and an empty label there reads as a plain Xbox pad.
+            GamepadPref::XboxElite => "Xbox Elite Series 2",
             GamepadPref::SteamDeck => "Steam Deck",
             GamepadPref::SteamController => "Steam Controller",
             GamepadPref::SteamController2 => "Steam Controller 2",

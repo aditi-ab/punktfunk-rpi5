@@ -126,8 +126,18 @@ struct Pads {
     /// The HID-visible Xbox pad ([`crate::inject::xbox_windows`]) — used INSTEAD of `xbox360`'s
     /// XUSB companion when [`super::gamepad::windows_xbox_hid`] says so. Never both at once: two
     /// devices for one wire pad is the "the game sees two controllers" bug.
+    ///
+    /// Three managers because the HID backend now has three IDENTITIES (Xbox Wireless `045E:0B13`,
+    /// Xbox One S `045E:02FD`, Elite Series 2 `045E:0B22`) and a manager is bound to one at
+    /// construction. They are otherwise the same backend — same codec, same report descriptor,
+    /// same rumble plane — so the split is purely so a mixed session can present, say, a Series
+    /// pad on slot 0 and an Elite on slot 1.
     #[cfg(target_os = "windows")]
     xbox_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
+    #[cfg(target_os = "windows")]
+    xbox_one_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
+    #[cfg(target_os = "windows")]
+    xbox_elite_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
     #[cfg(target_os = "windows")]
     dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -171,6 +181,10 @@ impl Pads {
             dualsense_win: None,
             #[cfg(target_os = "windows")]
             xbox_hid: None,
+            #[cfg(target_os = "windows")]
+            xbox_one_hid: None,
+            #[cfg(target_os = "windows")]
+            xbox_elite_hid: None,
             #[cfg(target_os = "windows")]
             dualsense_edge_win: None,
             #[cfg(target_os = "windows")]
@@ -298,17 +312,38 @@ impl Pads {
                 .steamdeck_win
                 .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
                 .handle(ev),
-            // The Xbox pad, as a real HID device rather than the XUSB companion. This is now the
+            // The Xbox pads, as real HID devices rather than the XUSB companion. This is now the
             // DEFAULT (see `windows_xbox_hid`; `PUNKTFUNK_XBOX_BACKEND=xusb` reverts it). It is no
             // longer a trade: with the `xinputhid` bus filter the INF attaches, the HID pad keeps
             // classic XInput AND gains everything XUSB never had — Steam, SDL, RawInput,
             // DirectInput, `joy.cpl`, WGI — plus rumble, which the XUSB path could not source.
+            //
+            // Three arms, one per identity. The `windows_xbox_hid()` guard stays on each: with the
+            // escape hatch set, `degrade_xbox_identity` has already folded One/Elite to Xbox360, so
+            // only Xbox360 can reach here and it must fall through to the XUSB companion below.
             #[cfg(target_os = "windows")]
-            GamepadPref::Xbox360 | GamepadPref::XboxOne if super::gamepad::windows_xbox_hid() => {
-                self.xbox_hid
-                    .get_or_insert_with(crate::inject::xbox_windows::XboxWindowsManager::new)
-                    .handle(ev)
-            }
+            GamepadPref::Xbox360 if super::gamepad::windows_xbox_hid() => self
+                .xbox_hid
+                .get_or_insert_with(crate::inject::xbox_windows::XboxWindowsManager::new)
+                .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::XboxOne if super::gamepad::windows_xbox_hid() => self
+                .xbox_one_hid
+                .get_or_insert_with(|| {
+                    crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                        crate::inject::xbox_windows::XboxWinProto::one_s(),
+                    )
+                })
+                .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::XboxElite if super::gamepad::windows_xbox_hid() => self
+                .xbox_elite_hid
+                .get_or_insert_with(|| {
+                    crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                        crate::inject::xbox_windows::XboxWinProto::elite(),
+                    )
+                })
+                .handle(ev),
             _ => self
                 .xbox360
                 .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
@@ -431,7 +466,8 @@ impl Pads {
     /// player LEDs / adaptive triggers) for the UHID/UMDF pads. The `&mut` closure re-borrows
     /// satisfy `FnMut` for each backend.
     ///
-    /// Only the Windows HID Xbox backend (`xbox_hid`) can ever report non-zero trigger levels — no
+    /// Only the Windows HID Xbox backends (`xbox_hid` and its two identity siblings) can ever
+    /// report non-zero trigger levels — no
     /// other backend's source packet has a field for them (see `PadFeedback::rumble`), so they pass
     /// zeros and the v3 datagram they produce is a v2 datagram with a zero tail.
     fn pump(
@@ -474,9 +510,17 @@ impl Pads {
         }
         #[cfg(target_os = "windows")]
         {
-            if let Some(m) = &mut self.xbox_hid {
-                // Rumble only — an Xbox pad has no rich-feedback plane (no lightbar / adaptive
-                // triggers), same as its XUSB sibling above.
+            // All three HID Xbox identities. Rumble only — an Xbox pad has no rich-feedback plane
+            // (no lightbar / adaptive triggers), same as its XUSB sibling above. Missing one of
+            // these is silent: the pad works and simply never rumbles.
+            for m in [
+                &mut self.xbox_hid,
+                &mut self.xbox_one_hid,
+                &mut self.xbox_elite_hid,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 m.pump(&mut rumble, &mut hidout);
             }
             if let Some(m) = &mut self.dualsense_win {

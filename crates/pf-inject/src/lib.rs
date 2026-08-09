@@ -474,8 +474,9 @@ pub mod uhid_abi;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
-/// Transport-independent Xbox Wireless Controller HID codec — the report the `pf-gamepad` UMDF
-/// driver serves under device-type 4, giving an Xbox pad the HID footing `pf-xusb` never had
+/// Transport-independent Xbox HID codec — the report the `pf-gamepad` UMDF driver serves under
+/// device-types 4, 5 and 6 (Xbox Wireless / One S / Elite Series 2, which share one descriptor and
+/// differ only in VID/PID), giving an Xbox pad the HID footing `pf-xusb` never had
 /// (Steam / WGI / GameInput / DirectInput cannot see an XUSB-interface-only device).
 ///
 /// Deliberately NOT cfg-gated to linux/windows like its siblings: it is pure byte-packing with no
@@ -484,9 +485,11 @@ pub mod uhid_manager;
 /// has until a Windows box is reachable.
 #[path = "inject/proto/xbox_proto.rs"]
 pub mod xbox_proto;
-/// Windows: virtual Xbox Wireless Controller via the same UMDF minidriver (device-type 4) — the
-/// HID-visible alternative to [`gamepad_windows`]'s XUSB companion, which Steam / WGI / GameInput /
-/// DirectInput cannot enumerate at all because it registers only the XUSB device interface.
+/// Windows: virtual Xbox pads via the same UMDF minidriver — Xbox Wireless (device-type 4),
+/// Xbox One S (5) and Xbox Elite Series 2 (6), the HID-visible alternative to
+/// [`gamepad_windows`]'s XUSB companion, which Steam / WGI / GameInput / DirectInput cannot
+/// enumerate at all because it registers only the XUSB device interface. The three identities
+/// share one report descriptor and differ only in VID/PID, product string and INF model line.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/xbox_windows.rs"]
 pub mod xbox_windows;
