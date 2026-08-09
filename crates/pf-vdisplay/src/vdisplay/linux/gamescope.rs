@@ -218,6 +218,23 @@ fn clear_takeover() {
 /// box back to gaming mode). No-op when no takeover file exists (a clean start). Call once from
 /// `serve` alongside [`start_restore_worker`].
 pub fn restore_takeover_on_startup() {
+    // BEFORE anything else, and unconditionally — this one is not about a takeover.
+    //
+    // The `gamescope-session-plus@` bind drop-in ([`session_plus_dropin_path`]) applies to the
+    // TEMPLATE, so it also reaches the unit the box autologs into at boot, and every path it names
+    // lives in tmpfs. A copy left behind by a host that died — or by 0.26.0-canary, which wrote it
+    // under `$HOME` where a reboot could not clear it — therefore asks the box's own Game Mode for
+    // a mount namespace whose bind sources no longer exist. That is a box that cannot enter Game
+    // Mode at all, with no punktfunk running to explain it. Clearing it here is the upgrade path
+    // for every box that already ran that build.
+    if remove_session_plus_dropin() {
+        tracing::warn!(
+            "gamescope: removed a leftover gamescope-session-plus bind drop-in from a previous \
+             host instance — it asks the box's OWN Game Mode session for a mount namespace, and \
+             everything it binds lives in tmpfs, so after a reboot that unit could not start at all"
+        );
+        systemctl_user(&["daemon-reload"]);
+    }
     let Ok(bytes) = std::fs::read(takeover_state_path()) else {
         return; // no takeover file — clean start
     };
@@ -930,8 +947,30 @@ fn remove_steamos_dropin() {
 /// `systemd-run`, so the bind has to arrive as a drop-in or Nobara's hardcoded
 /// `/usr/bin/gamescope` wins there too (see [`DISTRO_GAMESCOPE_PATH`]).
 ///
+/// **In `$XDG_RUNTIME_DIR`, not `$HOME`**, and that placement is load-bearing. This drop-in
+/// applies to the whole `gamescope-session-plus@` TEMPLATE, so it also reaches the unit the box
+/// autologs into at every boot — and both paths it names live in tmpfs. A copy left in
+/// `~/.config/systemd/user/` therefore survives a reboot that deletes everything it points at, and
+/// a `BindReadOnlyPaths=` whose source is gone fails the unit outright: the box can no longer
+/// enter Game Mode at all, with no punktfunk running and nothing to say why.
+/// `$XDG_RUNTIME_DIR/systemd/user/` is on systemd's user unit search path and dies with the login
+/// session, so a stale one cannot outlive the host that wrote it. (Drop-ins are collected from
+/// every directory on that path, so the lower search priority of the runtime directory costs
+/// nothing — and if a systemd ever ignored it, the session would simply run the distro's stock
+/// gamescope, which is the safe direction.)
+///
 /// `zz-` so it sorts last, matching the SteamOS drop-in convention above.
 fn session_plus_dropin_path() -> std::path::PathBuf {
+    let base = crate::session::runtime_dir();
+    std::path::Path::new(&base)
+        .join("systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-bind.conf")
+}
+
+/// Where 0.26.0-canary wrote the same drop-in: under `$HOME`, where it outlives the runtime paths
+/// it names. Every box that ran that build has one on disk right now, and it is what leaves the
+/// box unable to start Game Mode after a reboot — so this host removes it wherever it finds it
+/// ([`remove_session_plus_dropin`]), including once at startup before anything else runs.
+fn legacy_session_plus_dropin_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string());
     std::path::Path::new(&home)
         .join(".config/systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-bind.conf")
@@ -941,28 +980,34 @@ fn session_plus_dropin_path() -> std::path::PathBuf {
 /// the WSI opt-out when the box's layer was built for a different gamescope. `PF_HZ`/`PF_HDR_ARGS`
 /// ride along because the wrapper reads them (without `PF_HZ` it falls back to 60).
 ///
-/// A no-op returning `Ok(false)` when there is nothing to redirect, so a box already running our
-/// binary keeps a clean unit.
+/// When there is no bind to arm ([`arm_session_bind`] said no — the usual answer on every distro
+/// whose session script honours `GAMESCOPE_BIN`) it REMOVES any drop-in instead of writing an
+/// inert one, and reports `Ok(false)`. That is not tidiness: everything else in this file is an
+/// `Environment=`, and the whole cost of the mechanism — the mount namespace, and the user
+/// namespace that comes with it — is bought by the bind alone. A drop-in that kept only the env
+/// lines would be harmless; one that kept the bind while the host had decided against it would be
+/// the crash-loop this backstop exists to prevent.
 fn write_session_plus_dropin(
     wrapper: &std::path::Path,
     mode: Mode,
     hdr: bool,
     wsi_ok: bool,
 ) -> Result<bool> {
-    if gamescope_bin() == DISTRO_GAMESCOPE_PATH {
+    let Some(bind) = arm_session_bind(wrapper) else {
+        remove_session_plus_dropin();
         return Ok(false);
-    }
+    };
     let path = session_plus_dropin_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let body = format!(
         "[Service]\n\
-         BindReadOnlyPaths={wrapper}:{DISTRO_GAMESCOPE_PATH}\n\
+         {binds}\
          Environment=PF_HZ={hz}\n\
          Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
          {wsi}",
-        wrapper = wrapper.display(),
+        binds = bind.unit_lines(),
         hz = game_hz(mode.refresh_hz),
         hdr_args = hdr_args(hdr)
             .into_iter()
@@ -979,10 +1024,23 @@ fn write_session_plus_dropin(
     Ok(true)
 }
 
-/// Remove the box-session drop-in (restore-on-disconnect). Best-effort, mirroring
-/// [`remove_steamos_dropin`].
-fn remove_session_plus_dropin() {
-    let _ = std::fs::remove_file(session_plus_dropin_path());
+/// Remove the box-session drop-in from BOTH homes it has had — the runtime one this host writes
+/// and the `$HOME` one 0.26.0-canary wrote (see [`legacy_session_plus_dropin_path`]). Best-effort,
+/// mirroring [`remove_steamos_dropin`]; reports whether anything was actually removed, because the
+/// caller then owes systemd a `daemon-reload` (a removal that isn't reloaded still applies at the
+/// unit's next start, which for the box's own session unit means its next BOOT).
+fn remove_session_plus_dropin() -> bool {
+    // A loop, not an `any`/`all`: BOTH paths must be tried every time. Short-circuiting on the
+    // first success would leave the other one — and the one it would leave is the `$HOME` copy that
+    // outlives a reboot.
+    let mut removed = false;
+    for path in [
+        session_plus_dropin_path(),
+        legacy_session_plus_dropin_path(),
+    ] {
+        removed |= std::fs::remove_file(&path).is_ok();
+    }
+    removed
 }
 
 /// Take over SteamOS's `gamescope-session.target` headless at the CLIENT's mode: write the shim + a
@@ -1148,7 +1206,7 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     ]);
     // Same two fixes the transient path gets, but this unit is the BOX's own — they have to arrive
     // as a drop-in, and `daemon-reload` before the restart or systemd runs the old unit.
-    match write_gamescope_bin_wrapper()
+    let mut bound = match write_gamescope_bin_wrapper()
         .and_then(|w| write_session_plus_dropin(&w, mode, hdr, wsi_layer_matches_our_gamescope()))
     {
         Ok(true) => {
@@ -1159,18 +1217,25 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
                  session unit — a session script that hardcodes that path (Nobara) gets the \
                  patched build on this restart too"
             );
-            systemctl_user(&["daemon-reload"]);
+            true
         }
-        Ok(false) => {}
+        Ok(false) => false,
         // Best-effort: a box whose session already runs our binary loses nothing, and a failure
         // here must not block a restart that would otherwise work.
-        Err(e) => tracing::warn!(error = %e, "gamescope: could not write the box-session drop-in"),
-    }
+        Err(e) => {
+            tracing::warn!(error = %e, "gamescope: could not write the box-session drop-in");
+            false
+        }
+    };
+    // Unconditional, unlike the old "only when we wrote one": `write_session_plus_dropin` also
+    // REMOVES a drop-in (a stale one from a build that wrote it to `$HOME`, or one this process
+    // disarmed), and a removal systemd has not reloaded still applies at the unit's next start.
+    systemctl_user(&["daemon-reload"]);
     systemctl_user(&["restart", &unit]);
     // Wait for the relaunched session to come up at the new size and publish its capture node. The
     // node appears when gamescope is up (well before Steam finishes booting); the caller's
     // first-frame retry absorbs Steam's cold start.
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if current_gamescope_output_size() == Some(target) {
             if let Some(node) = find_gamescope_node() {
@@ -1184,6 +1249,20 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
             }
         }
         if Instant::now() >= deadline {
+            // RUNTIME BACKSTOP — and this is the unit it matters most for. This is the BOX's own
+            // session: if the bind keeps killing it, `gamescope-session-plus`'s short-session
+            // tracker eventually stops trying and hands the seat to the desktop session, which is
+            // how a streaming attempt ends with the user on plasma and unable to get back. Drop the
+            // drop-in, reload, and give it one more restart without it.
+            if bound {
+                note_bind_hazard(&unit);
+                remove_session_plus_dropin();
+                systemctl_user(&["daemon-reload"]);
+                systemctl_user(&["restart", &unit]);
+                bound = false;
+                deadline = Instant::now() + Duration::from_secs(45);
+                continue;
+            }
             bail!(
                 "box game-mode session did not come up at {}x{} within 45s after relaunch \
                  (Steam may still be booting)",
@@ -2790,24 +2869,570 @@ fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
 /// "pipeline build failed (out of retries)".
 const DISTRO_GAMESCOPE_PATH: &str = "/usr/bin/gamescope";
 
-/// Bind our wrapper over [`DISTRO_GAMESCOPE_PATH`] **inside the session unit's mount namespace**,
-/// so a script that hardcodes that path still gets the patched build.
+/// The socket directory every Xwayland — and so every gamescope — insists on before it will open a
+/// display. See [`SessionBind`] for why the host has to care about a path it never reads itself.
+const X11_SOCKET_DIR: &str = "/tmp/.X11-unix";
+
+/// Does the box's `gamescope-session-plus` script HARDCODE [`DISTRO_GAMESCOPE_PATH`] — i.e. is the
+/// bind the only lever left, or does the ordinary `GAMESCOPE_BIN` env var already reach gamescope?
 ///
-/// Deliberately a bind rather than replacing the distro's binary: `punktfunk-gamescope` ships under
-/// its own name precisely so it sits BESIDE the distro package (a Steam gaming session keeps using
-/// its own gamescope — see packaging/gamescope/README.md). The bind is scoped to this transient
-/// unit, so nothing outside the session sees it and nothing is written to `/usr`.
+/// Pure over the script text so the answer is testable: mentions `GAMESCOPE_BIN` anywhere ⇒ the
+/// documented lever exists and the bind is unnecessary; never mentions it but does name the
+/// absolute path ⇒ Nobara's shape, where the env var, the PATH shim and `PUNKTFUNK_GAMESCOPE_BIN`
+/// all miss at once. Anything else ⇒ we cannot say the bind would help, so we don't arm it.
 ///
-/// Skipped when the resolved binary IS the distro path (nothing to redirect) — binding a file over
-/// itself is pointless, and on a box with no `punktfunk-gamescope` we must not pretend otherwise.
-fn session_gamescope_bind(wrapper: &std::path::Path) -> Option<String> {
-    if gamescope_bin() == DISTRO_GAMESCOPE_PATH {
+/// It reads the MAIN script only. A `sessions.d` fragment that presets `GAMESCOPECMD` with its own
+/// absolute path defeats `GAMESCOPE_BIN` just as thoroughly and is invisible here — that case still
+/// lands, as it always did, in [`verify_managed_spawn_flags`].
+fn script_hardcodes_gamescope(script: &str) -> bool {
+    !script.contains("GAMESCOPE_BIN") && names_the_distro_binary(script)
+}
+
+/// Does `script` name [`DISTRO_GAMESCOPE_PATH`] as a COMPLETE path rather than as the prefix of a
+/// longer one? A plain `contains` also matches `/usr/bin/gamescopectl` and
+/// `/usr/bin/gamescope-session-plus` — both of which really do appear in these scripts, and neither
+/// of which is the binary the redirect is about. Getting this wrong arms a mount namespace on a box
+/// that has no use for one.
+fn names_the_distro_binary(script: &str) -> bool {
+    script.match_indices(DISTRO_GAMESCOPE_PATH).any(|(at, _)| {
+        let after = &script[at + DISTRO_GAMESCOPE_PATH.len()..];
+        !after
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    })
+}
+
+/// The session script's text, read once per process. `None` when it cannot be read at all, which
+/// [`plan_bind`] treats as "do not arm" — a box we cannot inspect keeps the behaviour that works.
+fn session_script() -> Option<&'static str> {
+    static SCRIPT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SCRIPT
+        .get_or_init(|| {
+            // Bounded read: this is a shell script (~30 KiB on every distro that ships one), and
+            // an unbounded read of an arbitrary path a package could replace is not a thing to do
+            // on the connect path.
+            let bytes = std::fs::read(SESSION_PLUS_BIN).ok()?;
+            if bytes.len() > 1 << 20 {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .as_deref()
+}
+
+/// Why the host is NOT redirecting [`DISTRO_GAMESCOPE_PATH`] for this launch. Each arm is a
+/// different sentence to an operator reading the log, which is the whole reason it is an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindOff {
+    /// The resolved binary IS the distro path — a bind over itself redirects nothing.
+    SameBinary,
+    /// The resolved gamescope is a bare NAME, not an absolute path, so the wrapper would resolve it
+    /// through `PATH` inside the unit — onto the path we just bound the wrapper over.
+    UnresolvedBinary,
+    /// The session script honours `GAMESCOPE_BIN` (or never names the absolute path): the ordinary
+    /// env lever already reaches gamescope, so the namespace would be cost without benefit.
+    EnvLeverSuffices,
+    /// The session script could not be read — fail closed rather than arm a mechanism we cannot
+    /// show is needed.
+    ScriptUnreadable,
+    /// `PUNKTFUNK_GAMESCOPE_BIND=0`.
+    OperatorOff,
+    /// [`note_bind_hazard`] fired: a session launched with the bind armed never came up.
+    Disarmed,
+}
+
+/// What the session unit's `/usr/bin/gamescope` redirect should be for this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindPlan {
+    /// No redirect, and therefore NO mount namespace for the unit at all.
+    Off(BindOff),
+    /// Redirect. `x11` additionally binds a user-owned socket directory over [`X11_SOCKET_DIR`],
+    /// which is what stops the namespace from killing the session (see [`SessionBind`]).
+    Arm { x11: bool },
+}
+
+/// The decision, pure. Ordered so the answers that are about CORRECTNESS come first (a redirect
+/// that would do nothing, or that would make the wrapper re-exec itself), then the operator's
+/// knob, then the backstop, then what the box actually needs.
+///
+/// `enabled` is `PUNKTFUNK_GAMESCOPE_BIND`: `None` = auto, `Some(false)` = never, `Some(true)` =
+/// force (skip the script probe — for a `GAMESCOPE_BIN` defeated somewhere the host cannot read,
+/// e.g. a `sessions.d` fragment presetting `GAMESCOPECMD`). Force deliberately does NOT outrank
+/// `disarmed`: the backstop is the safety net, and a forced box that crash-loops must still stop.
+///
+/// `x11_dir_uid` is the owner of [`X11_SOCKET_DIR`] as the HOST sees it (`None` = absent).
+fn plan_bind(
+    resolved_bin: &str,
+    script: Option<&str>,
+    enabled: Option<bool>,
+    disarmed: bool,
+    x11_dir_uid: Option<u32>,
+    our_uid: u32,
+) -> BindPlan {
+    if resolved_bin == DISTRO_GAMESCOPE_PATH {
+        return BindPlan::Off(BindOff::SameBinary);
+    }
+    // A bare name is not safe to bind AROUND. The wrapper's body is `exec <resolved> …`, so a
+    // relative name is resolved through `PATH` *inside* the unit — where it lands on the very path
+    // we bound the wrapper over, and the wrapper re-execs itself until the box gives up.
+    // [`gamescope_bin`] falls back to a bare name when its `PATH` walk finds nothing, so this is
+    // reachable, not theoretical.
+    if !resolved_bin.starts_with('/') {
+        return BindPlan::Off(BindOff::UnresolvedBinary);
+    }
+    if enabled == Some(false) {
+        return BindPlan::Off(BindOff::OperatorOff);
+    }
+    if disarmed {
+        return BindPlan::Off(BindOff::Disarmed);
+    }
+    if enabled != Some(true) {
+        let Some(script) = script else {
+            return BindPlan::Off(BindOff::ScriptUnreadable);
+        };
+        if !script_hardcodes_gamescope(script) {
+            return BindPlan::Off(BindOff::EnvLeverSuffices);
+        }
+    }
+    // The socket directory only needs replacing when it is owned by somebody else (root, on every
+    // normal box) — that is exactly the ownership the user namespace cannot map. A directory that
+    // is already ours reads as ours inside too, and an ABSENT one is no hazard either: gamescope
+    // creates it itself, inside the namespace, owned by us.
+    BindPlan::Arm {
+        x11: x11_dir_uid.is_some_and(|uid| uid != our_uid),
+    }
+}
+
+/// An armed redirect, resolved to concrete paths — the single place that knows the systemd
+/// spelling, so the transient unit ([`launch_session`]) and the box's own unit
+/// ([`write_session_plus_dropin`]) cannot drift apart.
+///
+/// **Why there are two binds and not one.** The redirect itself is
+/// `BindReadOnlyPaths=<wrapper>:/usr/bin/gamescope`: a bind rather than a replacement because
+/// `punktfunk-gamescope` ships under its own name precisely so it sits BESIDE the distro package
+/// (see packaging/gamescope/README.md), and it is scoped to the unit, so nothing outside sees it
+/// and nothing is written to `/usr`.
+///
+/// But asking a systemd **user** unit for a mount namespace also gets you a **user** namespace —
+/// an unprivileged manager cannot create the first without the second — and systemd maps exactly
+/// one id into it (`uid_map` = `1000 1000 1`). Every root-owned path the session then inspects
+/// reads as `65534`, and gamescope's Xwayland inspects one:
+///
+/// ```text
+/// on disk (no namespace):       drwxrwxrwt 2 0 0      /tmp/.X11-unix
+/// inside a user unit, no bind:  drwxrwxrwt 2 0 0      /tmp/.X11-unix
+/// inside a user unit WITH bind: drwxrwxrwt 2 65534 65534  /tmp/.X11-unix   ← nobody
+/// ```
+///
+/// wlroots' `check_socket_dir` wants that directory owned by root **or us**, sees `nobody`, and
+/// refuses every display number:
+///
+/// ```text
+/// Error wlserver: [xwayland/sockets.c:100] /tmp/.X11-unix not owned by root or us   (×11)
+/// Error wlserver: [xwayland/sockets.c:217] No display available in the first 33
+/// → SIGSEGV in run_pipewire
+/// ```
+///
+/// Three of those in a row feed `gamescope-session-plus`'s short-session tracker, which gives up,
+/// runs `steamos-session-select`, and rewrites the user's session to **plasma** — so the symptom a
+/// user reports is "I got thrown onto KDE and can't get back", two removes from the cause, and it
+/// survives the reboot they would naturally try. Measured on home-nobara-1 (fc44), canary
+/// g13179011, 2026-08-09.
+///
+/// So the fix is to give the namespace a socket directory it CAN accept: a 0700 directory under
+/// `$XDG_RUNTIME_DIR` that we own, bound read-WRITE (Xwayland has to create the socket in it).
+/// Inside the namespace the check reads "us" and Xwayland starts.
+///
+/// **What that costs.** The session's Xwayland socket FILE is then only on the unit's `/tmp`, so a
+/// process outside the namespace cannot reach it by path. The one host-side X client is the XFixes
+/// cursor reader (`pf-capture`'s `xfixes_cursor`), and it is not in play whenever this bind is:
+/// the bind only arms for a resolved `punktfunk-gamescope`, whose patch level 2+ paints the pointer
+/// into the capture node itself, so `SessionPlan::gamescope_cursor` is false and the reader is
+/// never spawned (`session_plan::gamescope_needs_host_cursor`). On the ATTACH route, where the
+/// reader IS spawned, it reaches the display over the ABSTRACT socket `@/tmp/.X11-unix/X<n>` —
+/// x11rb tries that before the filesystem path, and an abstract socket lives in the network
+/// namespace, which this unit does not get one of. If that ever fails, the reader logs and retries
+/// forever; the stream runs without a composited pointer. Nothing else host-side opens an X
+/// connection: capture is PipeWire, injection is libei/EIS, clipboard is Wayland.
+struct SessionBind {
+    wrapper: std::path::PathBuf,
+    /// The user-owned directory bound over [`X11_SOCKET_DIR`], or `None` when the real one is
+    /// already ours and needs no replacing.
+    x11_dir: Option<std::path::PathBuf>,
+}
+
+impl SessionBind {
+    /// The `[Service]` settings this bind is, one per line — the shared spelling behind both
+    /// renderers below.
+    fn properties(&self) -> Vec<String> {
+        let mut props = vec![format!(
+            "BindReadOnlyPaths={}:{DISTRO_GAMESCOPE_PATH}",
+            self.wrapper.display()
+        )];
+        if let Some(dir) = &self.x11_dir {
+            // Read-WRITE: Xwayland creates its socket in here.
+            props.push(format!("BindPaths={}:{X11_SOCKET_DIR}", dir.display()));
+        }
+        props
+    }
+
+    /// `systemd-run --property=` arguments (the transient unit).
+    fn run_args(&self) -> Vec<String> {
+        self.properties()
+            .into_iter()
+            .map(|p| format!("--property={p}"))
+            .collect()
+    }
+
+    /// Drop-in body lines (the box's own unit).
+    fn unit_lines(&self) -> String {
+        self.properties()
+            .into_iter()
+            .map(|p| format!("{p}\n"))
+            .collect()
+    }
+}
+
+/// Owner of [`X11_SOCKET_DIR`] as the host sees it. `lstat`, matching wlroots' own check — a
+/// symlink there is not a directory it will accept either.
+fn x11_socket_dir_owner() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(X11_SOCKET_DIR)
+        .ok()
+        .map(|md| md.uid())
+}
+
+/// The user-owned socket directory bound over [`X11_SOCKET_DIR`]: per-user, in tmpfs, **0700**.
+///
+/// 0700 is not decoration. wlroots accepts the directory if it is owned by root or us AND either
+/// carries the sticky bit or is not group/other-writable; 0700 satisfies the second under either
+/// reading of that rule, and it is the same "not a world-writable /tmp path" discipline every
+/// other host-written runtime path in this module follows.
+fn session_x11_dir() -> std::path::PathBuf {
+    let base = crate::session::runtime_dir();
+    std::path::Path::new(&base).join("punktfunk-x11")
+}
+
+/// Create (or re-assert) [`session_x11_dir`] and drop dead sockets from it.
+fn ensure_session_x11_dir() -> Result<std::path::PathBuf> {
+    let dir = session_x11_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    prune_stale_x11_sockets(&dir);
+    Ok(dir)
+}
+
+/// Remove `X<n>` sockets nothing is listening on.
+///
+/// A session we tore down with SIGKILL ([`kill_unit`], which is how the F44 GPU-context leak is
+/// avoided) never unlinks its Xwayland socket. wlroots walks display numbers 0..32 and gives up
+/// after the last one, so left alone these corpses would silently cost one display number per
+/// relaunch until a long-lived host could no longer start a session at all. On the real
+/// `/tmp/.X11-unix` a boot-time tmpfiles clean papers over that; our directory has no such helper.
+///
+/// The liveness test is a connect: a listening X server accepts instantly, a corpse refuses. So a
+/// live session's socket can never be the one removed — including a socket belonging to some other
+/// gamescope that happens to share this directory.
+fn prune_stale_x11_sockets(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        use std::os::unix::fs::FileTypeExt;
+        if !std::fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_socket()) {
+            continue;
+        }
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            continue; // somebody is listening — not ours to remove
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Prove, on THIS box, that the bind set we are about to arm leaves gamescope a socket directory it
+/// will accept — before handing it to a unit whose failure costs the user their session.
+///
+/// It is the field reproduction, run by the host:
+///
+/// ```text
+/// systemd-run --user --wait --collect --pipe \
+///   --property=BindReadOnlyPaths=/etc/hostname:/etc/hostname -- /usr/bin/ls -ldn /tmp/.X11-unix
+///   → 65534 65534          # any mount-namespace property, no compensation
+/// systemd-run --user --wait --collect --pipe -- /usr/bin/ls -ldn /tmp/.X11-unix
+///   → 0 0                  # no namespace at all
+/// ```
+///
+/// Same properties, a throwaway unit, and `stat` reads back the owner of [`X11_SOCKET_DIR`] from
+/// INSIDE the namespace. Our uid ⇒ wlroots' "owned by root or us" will pass and the session can
+/// start. Anything else — including a unit that would not start, a systemd that rejects one of the
+/// properties, or no user manager at all — is a refusal, because every one of those is also a
+/// reason the real session would have failed.
+///
+/// Cached for the process: both bound paths are fixed for a host's lifetime, and the answer is a
+/// property of this systemd and this kernel, not of the session. The probe runs no session script,
+/// so it cannot feed `gamescope-session-plus`'s short-session tracker.
+///
+/// Budgeted, because this sits on the CONNECT path: `systemd-run --wait` against a wedged user
+/// manager would otherwise block a client's handshake forever, and a probe that cannot answer is
+/// a refusal anyway.
+fn bind_survives_namespace(bind: &SessionBind) -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
+        for arg in bind.run_args() {
+            cmd.arg(arg);
+        }
+        // Absolute, because the probe unit's PATH is the user manager's, not ours — and on the
+        // very box this matters for, a bare name could resolve through the bind we just made.
+        cmd.args(["--", "/usr/bin/stat", "-c", "%u", X11_SOCKET_DIR]);
+        let out = crate::proc::output_within(&mut cmd, BIND_PROBE_BUDGET);
+        let owner = match &out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok(),
+            _ => None,
+        };
+        let ours = crate::proc::current_uid();
+        match owner {
+            Some(uid) if uid == ours => {
+                tracing::debug!(
+                    uid,
+                    "gamescope: probed the session unit's namespace — {X11_SOCKET_DIR} reads as \
+                     ours inside it, so gamescope's Xwayland will accept it"
+                );
+                true
+            }
+            Some(uid) => {
+                tracing::warn!(
+                    uid,
+                    ours,
+                    "gamescope: probed the session unit's namespace and {X11_SOCKET_DIR} reads as \
+                     uid {uid} inside it, not ours — gamescope's Xwayland would refuse it and the \
+                     session would never start. NOT redirecting {DISTRO_GAMESCOPE_PATH}; the \
+                     session runs the distro's stock gamescope instead (no HDR, no in-node cursor, \
+                     games see 60 Hz) but it starts."
+                );
+                false
+            }
+            None => {
+                tracing::warn!(
+                    error = ?out.as_ref().err(),
+                    status = ?out.as_ref().ok().map(|o| o.status),
+                    "gamescope: could not probe the session unit's namespace (systemd-run --user \
+                     failed, or it rejected one of the bind properties) — NOT redirecting \
+                     {DISTRO_GAMESCOPE_PATH}, since whatever stopped the probe would have stopped \
+                     the session too"
+                );
+                false
+            }
+        }
+    })
+}
+
+/// How long [`bind_survives_namespace`] may take. Generous for what it is — one transient unit that
+/// runs `stat` — and short enough that a wedged user manager costs a connect a moment, not the
+/// session.
+const BIND_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Has a session launched WITH the bind armed failed to come up? Same shape and the same reasoning
+/// as [`note_spawn_flags_lost`]: a process-wide, one-way latch, because nothing we can observe
+/// proves the next session would fare better — and the failure it guards against is the worst one
+/// this backend has (a crash-loop that ends with the box's session rewritten to the desktop).
+fn bind_disarmed() -> bool {
+    BIND_DISARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Disarm the bind for the rest of this host process and say why, as loudly as the failure
+/// deserves. `failed_unit` names the unit that did not come up, so the two callers — the transient
+/// session and the box's own — read differently in a log.
+fn note_bind_hazard(failed_unit: &str) {
+    BIND_DISARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    match session_log_refusal() {
+        Some(marker) => tracing::error!(
+            unit = failed_unit,
+            evidence = marker,
+            "gamescope: the session did not come up with the {DISTRO_GAMESCOPE_PATH} bind armed, \
+             and its log carries the signature of the reason — a mount namespace in a systemd USER \
+             unit is also a USER namespace, in which only this uid is mapped, so root-owned \
+             {X11_SOCKET_DIR} reads as `nobody` and gamescope's Xwayland refuses to open a display. \
+             Disarming the bind and relaunching without it: the session runs the distro's stock \
+             gamescope (no HDR, no in-node cursor, games see 60 Hz) but it STARTS. The bind stays \
+             off until this host process restarts."
+        ),
+        None => tracing::warn!(
+            unit = failed_unit,
+            "gamescope: the session did not come up with the {DISTRO_GAMESCOPE_PATH} bind armed. \
+             Nothing in the session log names the known cause (the user namespace that comes with \
+             the unit's mount namespace, which makes root-owned {X11_SOCKET_DIR} read as `nobody` \
+             to gamescope's Xwayland), so this may be an unrelated failure — disarming and \
+             relaunching without the bind anyway, because a session that will not start is worse \
+             than one without our flags. The bind stays off until this host process restarts."
+        ),
+    }
+}
+
+static BIND_DISARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The lines wlroots prints when the socket-directory check fails, and the one it prints after it
+/// has failed for every display number. Either is proof this is the namespace bug and not, say, a
+/// Steam that would not start.
+const XWAYLAND_REFUSAL_MARKERS: [&str; 2] = [
+    "not owned by root or us",
+    "No display available in the first",
+];
+
+/// Which refusal marker (if any) a session log carries. Pure so the matching is testable against
+/// the exact field lines.
+fn xwayland_refusal_marker(log: &str) -> Option<&'static str> {
+    XWAYLAND_REFUSAL_MARKERS
+        .into_iter()
+        .find(|marker| log.contains(marker))
+}
+
+/// Scan the logs `gamescope-session-plus` writes for the Xwayland refusal — evidence that a failed
+/// launch was THIS bug. Best-effort and bounded: a missing or unreadable log just means we cannot
+/// confirm it, never that we assume the opposite.
+fn session_log_refusal() -> Option<&'static str> {
+    let home = std::env::var("HOME").ok()?;
+    for name in [".gamescope-stderr.log", ".gamescope-stdout.log"] {
+        let path = std::path::Path::new(&home).join(name);
+        if let Some(marker) = tail_of(&path, 64 << 10)
+            .as_deref()
+            .and_then(xwayland_refusal_marker)
+        {
+            return Some(marker);
+        }
+    }
+    None
+}
+
+/// The last `max` bytes of a file, lossily as text. Bounded because these logs are written by
+/// someone else's script and a chatty gamescope can make them large.
+fn tail_of(path: &std::path::Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > max {
+        f.seek(SeekFrom::Start(len - max)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Resolve [`plan_bind`] against the live box, log the outcome for an operator, and return the
+/// armed bind (or `None` — in which case the unit gets NO mount namespace, which is the state
+/// every box was in before the redirect existed and the state every non-hardcoding distro stays
+/// in).
+fn arm_session_bind(wrapper: &std::path::Path) -> Option<SessionBind> {
+    let plan = plan_bind(
+        gamescope_bin(),
+        session_script(),
+        pf_host_config::config().gamescope_bind,
+        bind_disarmed(),
+        x11_socket_dir_owner(),
+        crate::proc::current_uid(),
+    );
+    let x11 = match plan {
+        BindPlan::Arm { x11 } => x11,
+        // Only the arms an operator could act on are worth a line each; `SameBinary` and
+        // `EnvLeverSuffices` are the ordinary answer on almost every box.
+        BindPlan::Off(BindOff::SameBinary | BindOff::EnvLeverSuffices) => {
+            tracing::debug!(
+                bin = %gamescope_bin(),
+                "gamescope: no {DISTRO_GAMESCOPE_PATH} redirect needed for this session"
+            );
+            return None;
+        }
+        BindPlan::Off(BindOff::UnresolvedBinary) => {
+            tracing::warn!(
+                bin = %gamescope_bin(),
+                "gamescope: the resolved gamescope is a bare name, not an absolute path — not \
+                 redirecting {DISTRO_GAMESCOPE_PATH}, because the wrapper resolves that name \
+                 through PATH inside the unit and would land back on the redirect itself. Put the \
+                 binary on the host's PATH, or set PUNKTFUNK_GAMESCOPE_BIN to an absolute path."
+            );
+            return None;
+        }
+        BindPlan::Off(BindOff::ScriptUnreadable) => {
+            tracing::debug!(
+                script = SESSION_PLUS_BIN,
+                "gamescope: cannot read the session script, so cannot show a {DISTRO_GAMESCOPE_PATH} \
+                 redirect is needed — not arming one"
+            );
+            return None;
+        }
+        BindPlan::Off(BindOff::OperatorOff) => {
+            tracing::info!(
+                "gamescope: PUNKTFUNK_GAMESCOPE_BIND=0 — never redirecting {DISTRO_GAMESCOPE_PATH}. \
+                 On a distro whose gamescope-session-plus hardcodes that path the session runs the \
+                 distro's stock gamescope: no HDR, no in-node cursor, and games see gamescope's \
+                 60 Hz headless default."
+            );
+            return None;
+        }
+        BindPlan::Off(BindOff::Disarmed) => {
+            tracing::info!(
+                "gamescope: the {DISTRO_GAMESCOPE_PATH} redirect is disarmed for this host process \
+                 — an earlier session did not come up with it armed. Running the distro's stock \
+                 gamescope (no HDR, no in-node cursor). Restart punktfunk-host to try it again."
+            );
+            return None;
+        }
+    };
+    let x11_dir = if x11 {
+        match ensure_session_x11_dir() {
+            Ok(dir) => Some(dir),
+            // No socket directory we own ⇒ no way to survive the user namespace the redirect
+            // costs ⇒ do not arm it. Degraded beats a session that cannot start.
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "gamescope: could not prepare a user-owned {X11_SOCKET_DIR} for the session's \
+                     mount namespace — NOT redirecting {DISTRO_GAMESCOPE_PATH}, because the \
+                     namespace alone would stop gamescope's Xwayland from opening a display. The \
+                     session runs the distro's stock gamescope instead."
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let bind = SessionBind {
+        wrapper: wrapper.to_path_buf(),
+        x11_dir,
+    };
+    // Everything above is a decision about what SHOULD work. This is the one check that asks the
+    // box, and it is the last gate before a unit whose failure costs the user their session.
+    if !bind_survives_namespace(&bind) {
         return None;
     }
-    Some(format!(
-        "--property=BindReadOnlyPaths={}:{DISTRO_GAMESCOPE_PATH}",
-        wrapper.display()
-    ))
+    match &bind.x11_dir {
+        Some(dir) => tracing::info!(
+            bin = %gamescope_bin(),
+            x11_dir = %dir.display(),
+            "gamescope: binding the patched build over {DISTRO_GAMESCOPE_PATH} inside the session \
+             unit — this box's gamescope-session-plus hardcodes that path and reads GAMESCOPE_BIN \
+             nowhere (Nobara), so nothing else reaches it. Nothing outside this unit is affected. A \
+             user-owned {X11_SOCKET_DIR} rides along because the mount namespace that redirect \
+             costs brings a USER namespace with it, in which the real (root-owned) socket directory \
+             reads as `nobody` and gamescope's Xwayland refuses to open a display."
+        ),
+        None => tracing::info!(
+            bin = %gamescope_bin(),
+            "gamescope: binding the patched build over {DISTRO_GAMESCOPE_PATH} inside the session \
+             unit — this box's gamescope-session-plus hardcodes that path and reads GAMESCOPE_BIN \
+             nowhere (Nobara), so nothing else reaches it. Nothing outside this unit is affected. \
+             {X11_SOCKET_DIR} is already ours, so the unit's user namespace maps it unchanged and \
+             it needs no replacing."
+        ),
+    }
+    Some(bind)
 }
 
 /// Whether the box's `VkLayer_FROG_gamescope_wsi` can be trusted against the gamescope we run.
@@ -2874,16 +3499,9 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         r.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
     };
     // Redirect a hardcoded `/usr/bin/gamescope` at our wrapper, for session scripts that never
-    // read `GAMESCOPE_BIN` (Nobara). Computed once so the log line below reflects what we did.
-    let bind = session_gamescope_bind(&wrapper);
-    if bind.is_some() {
-        tracing::info!(
-            bin = %gamescope_bin(),
-            "gamescope: binding the patched build over {DISTRO_GAMESCOPE_PATH} inside the session \
-             unit — a session script that hardcodes that path (Nobara) gets the patched build \
-             instead of the distro's stock one. Nothing outside this unit is affected."
-        );
-    }
+    // read `GAMESCOPE_BIN` (Nobara). `mut` because the backstop below drops it and relaunches:
+    // an armed bind is the one thing here that can stop the session coming up at all.
+    let mut bind = arm_session_bind(&wrapper);
     // The distro's Vulkan WSI layer speaks the distro gamescope's protocol; ours may differ, and a
     // mismatch kills every Vulkan client (Steam included) with no error but a black screen.
     let wsi_ok = wsi_layer_matches_our_gamescope();
@@ -2895,11 +3513,11 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
              which shows up as a black screen with no other symptom."
         );
     }
-    let start_unit = || -> Result<()> {
+    let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
         let mut cmd = Command::new("systemd-run");
         cmd.args(["--user", "--collect", &format!("--unit={unit_name}")]);
-        if let Some(b) = bind.as_deref() {
-            cmd.arg(b);
+        for arg in bind.map(SessionBind::run_args).unwrap_or_default() {
+            cmd.arg(arg);
         }
         if !wsi_ok {
             cmd.arg("--setenv=ENABLE_GAMESCOPE_WSI=0");
@@ -2941,9 +3559,9 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         }
         Ok(())
     };
-    start_unit()?;
+    start_unit(bind.as_ref())?;
     // Steam Big Picture cold-start is far slower than a bare app — poll the node for up to 45s.
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(id) = find_gamescope_node() {
             // `GAMESCOPE_BIN` is a session-plus convention, not a guarantee — confirm the session
@@ -2960,6 +3578,19 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         }
         if Instant::now() >= deadline {
             stop_session(unit_name);
+            // RUNTIME BACKSTOP. An armed bind is the only thing here that can make the session
+            // fail to start *because of us*, and the way it fails is the expensive one: gamescope
+            // dies over and over, the session-plus short-session tracker gives up, and the box's
+            // session is rewritten to the desktop — a state that survives the reboot a user tries.
+            // So spend the second 45 s without it rather than returning a failure: a stock-gamescope
+            // session (no HDR, no in-node cursor, 60 Hz) is a working Game Mode, and the latch keeps
+            // every later launch this process makes on that path.
+            if bind.take().is_some() {
+                note_bind_hazard(unit_name);
+                start_unit(None)?;
+                deadline = Instant::now() + Duration::from_secs(45);
+                continue;
+            }
             anyhow::bail!(
                 "gamescope-session-plus '{client}' did not publish a Video/Source node within 45s \
                  (Steam failed to start? — `journalctl --user -u {unit_name}`)"
@@ -2982,7 +3613,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             let _ = Command::new("systemctl")
                 .args(["--user", "reset-failed", unit_name])
                 .status();
-            start_unit()?;
+            start_unit(bind.as_ref())?;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -3324,8 +3955,10 @@ mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
         display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
-        is_steam_launch, missing_flags, mode_mismatch, nested_wrapper_script, sentinel_advanced,
-        shape_dedicated_command, DmHelperError,
+        is_steam_launch, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
+        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
+        xwayland_refusal_marker, BindOff, BindPlan, DmHelperError, SessionBind,
+        DISTRO_GAMESCOPE_PATH, X11_SOCKET_DIR,
     };
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
@@ -3716,5 +4349,200 @@ mod tests {
             ]
         )
         .is_empty());
+    }
+
+    /// Nobara's line 244 verbatim (the file that started this), against the upstream shape that
+    /// honours the documented lever. Only the first needs a bind — and getting that backwards
+    /// costs every OTHER distro a mount namespace it has no use for, which is what made 0.26.0-1
+    /// unstartable on boxes that never had the hardcode at all.
+    #[test]
+    fn only_a_script_that_hardcodes_the_path_needs_the_bind() {
+        let nobara = "if [ -z \"$GAMESCOPECMD\" ]; then\n    \
+                      GAMESCOPECMD=\"/usr/bin/gamescope \\\n";
+        assert!(script_hardcodes_gamescope(nobara));
+
+        // Upstream / Bazzite: the env var is right there in the script.
+        let upstream = "GAMESCOPE_BIN=${GAMESCOPE_BIN:-/usr/bin/gamescope}\n\
+                        GAMESCOPECMD=\"$GAMESCOPE_BIN \\\n";
+        assert!(
+            !script_hardcodes_gamescope(upstream),
+            "a script that reads GAMESCOPE_BIN needs no namespace to reach our binary"
+        );
+
+        // Mentions the var but not the path, and vice versa in the other direction: neither is the
+        // shape the bind fixes, so neither arms it.
+        assert!(!script_hardcodes_gamescope(
+            "exec ${GAMESCOPE_BIN} \"$@\"\n"
+        ));
+        assert!(!script_hardcodes_gamescope("exec gamescope \"$@\"\n"));
+
+        // The two longer paths that START with the one we redirect. A plain `contains` would read
+        // either as a hardcode and buy the box a mount namespace for nothing.
+        assert!(!script_hardcodes_gamescope(
+            "/usr/bin/gamescopectl takescreenshot\n"
+        ));
+        assert!(!script_hardcodes_gamescope(
+            "exec /usr/bin/gamescope-session-plus \"$@\"\n"
+        ));
+        // …while the real one still counts, whether a quote, a space or a newline follows it.
+        assert!(script_hardcodes_gamescope("GS=\"/usr/bin/gamescope\"\n"));
+        assert!(script_hardcodes_gamescope("exec /usr/bin/gamescope\n"));
+        assert!(script_hardcodes_gamescope(
+            "exec /usr/bin/gamescope -W 1920\n"
+        ));
+    }
+
+    /// The decision matrix, in the order the arms are meant to win. Every `Off` arm here is a box
+    /// that gets NO mount namespace — the state every box was in before the redirect existed.
+    #[test]
+    fn bind_is_armed_only_where_it_is_needed_and_survivable() {
+        const OURS: &str = "/usr/bin/punktfunk-gamescope";
+        const AUTO: Option<bool> = None;
+        const OFF: Option<bool> = Some(false);
+        const FORCE: Option<bool> = Some(true);
+        let hardcoded = Some("GAMESCOPECMD=\"/usr/bin/gamescope -W\"");
+        let honours = Some("GAMESCOPECMD=\"${GAMESCOPE_BIN} -W\"");
+
+        // The case the mechanism exists for: hardcoding script, our binary, root-owned socket dir
+        // ⇒ redirect AND replace the socket directory, or the namespace kills Xwayland.
+        assert_eq!(
+            plan_bind(OURS, hardcoded, AUTO, false, Some(0), 1000),
+            BindPlan::Arm { x11: true }
+        );
+
+        // A socket directory already owned by us maps to us inside the user namespace too, so
+        // there is nothing to compensate for — and an ABSENT one is created, inside, by us.
+        assert_eq!(
+            plan_bind(OURS, hardcoded, AUTO, false, Some(1000), 1000),
+            BindPlan::Arm { x11: false }
+        );
+        assert_eq!(
+            plan_bind(OURS, hardcoded, AUTO, false, None, 1000),
+            BindPlan::Arm { x11: false }
+        );
+
+        // Nothing to redirect: the resolved binary IS the distro path. Checked before everything
+        // else, because it is true regardless of what the script or the operator says.
+        assert_eq!(
+            plan_bind(
+                DISTRO_GAMESCOPE_PATH,
+                hardcoded,
+                FORCE,
+                false,
+                Some(0),
+                1000
+            ),
+            BindPlan::Off(BindOff::SameBinary)
+        );
+
+        // A bare name — `gamescope_bin`'s fallback when its PATH walk finds nothing. Binding
+        // around it makes the wrapper `exec` a name that now resolves to the wrapper, so not even
+        // a forcing operator gets it.
+        assert_eq!(
+            plan_bind("gamescope", hardcoded, FORCE, false, Some(0), 1000),
+            BindPlan::Off(BindOff::UnresolvedBinary)
+        );
+
+        // The ordinary answer on Bazzite/SteamOS-likes: the env lever lands, so no namespace.
+        assert_eq!(
+            plan_bind(OURS, honours, AUTO, false, Some(0), 1000),
+            BindPlan::Off(BindOff::EnvLeverSuffices)
+        );
+
+        // Fail closed on a box we cannot inspect.
+        assert_eq!(
+            plan_bind(OURS, None, AUTO, false, Some(0), 1000),
+            BindPlan::Off(BindOff::ScriptUnreadable)
+        );
+
+        // Both retreats outrank the need: an operator's `=0`, and the runtime backstop's latch.
+        assert_eq!(
+            plan_bind(OURS, hardcoded, OFF, false, Some(0), 1000),
+            BindPlan::Off(BindOff::OperatorOff)
+        );
+        assert_eq!(
+            plan_bind(OURS, hardcoded, AUTO, true, Some(0), 1000),
+            BindPlan::Off(BindOff::Disarmed)
+        );
+
+        // `=1` skips the script probe (for a GAMESCOPE_BIN defeated in a `sessions.d` fragment the
+        // host cannot read) — but it does NOT outrank the backstop, or a forced box that
+        // crash-loops would never stop.
+        assert_eq!(
+            plan_bind(OURS, honours, FORCE, false, Some(0), 1000),
+            BindPlan::Arm { x11: true }
+        );
+        assert_eq!(
+            plan_bind(OURS, None, FORCE, false, Some(0), 1000),
+            BindPlan::Arm { x11: true }
+        );
+        assert_eq!(
+            plan_bind(OURS, honours, FORCE, true, Some(0), 1000),
+            BindPlan::Off(BindOff::Disarmed)
+        );
+    }
+
+    /// The two renderers must spell the SAME settings — the transient unit takes them as
+    /// `systemd-run --property=`, the box's own unit as drop-in lines, and a session that got only
+    /// half of them is the crash this whole mechanism is guarding.
+    #[test]
+    fn both_bind_renderers_carry_the_socket_directory() {
+        let bind = SessionBind {
+            wrapper: std::path::PathBuf::from("/run/user/1000/punktfunk-gamescope-bin"),
+            x11_dir: Some(std::path::PathBuf::from("/run/user/1000/punktfunk-x11")),
+        };
+        assert_eq!(
+            bind.run_args(),
+            vec![
+                format!(
+                    "--property=BindReadOnlyPaths=/run/user/1000/punktfunk-gamescope-bin:{DISTRO_GAMESCOPE_PATH}"
+                ),
+                format!("--property=BindPaths=/run/user/1000/punktfunk-x11:{X11_SOCKET_DIR}"),
+            ]
+        );
+        assert_eq!(
+            bind.unit_lines(),
+            format!(
+                "BindReadOnlyPaths=/run/user/1000/punktfunk-gamescope-bin:{DISTRO_GAMESCOPE_PATH}\n\
+                 BindPaths=/run/user/1000/punktfunk-x11:{X11_SOCKET_DIR}\n"
+            )
+        );
+        // The socket-directory bind must be read-WRITE (Xwayland creates its socket in there); a
+        // read-only one would fail exactly as loudly as no bind at all.
+        assert!(bind.unit_lines().contains("BindPaths="));
+
+        // No compensation needed ⇒ exactly one setting, and the unit line ends in a newline so the
+        // `Environment=` lines after it in the drop-in body still parse.
+        let plain = SessionBind {
+            wrapper: std::path::PathBuf::from("/run/user/1000/punktfunk-gamescope-bin"),
+            x11_dir: None,
+        };
+        assert_eq!(plain.run_args().len(), 1);
+        assert!(plain.unit_lines().ends_with('\n'));
+        assert!(!plain.unit_lines().contains("BindPaths="));
+    }
+
+    /// The exact lines the failing box logged (home-nobara-1, canary g13179011). They are what
+    /// turns the backstop's message from "something went wrong" into a named cause.
+    #[test]
+    fn the_xwayland_refusal_is_recognised_from_a_real_log() {
+        assert_eq!(
+            xwayland_refusal_marker(
+                "Error wlserver: [xwayland/sockets.c:100] /tmp/.X11-unix not owned by root or us\n"
+            ),
+            Some("not owned by root or us")
+        );
+        assert_eq!(
+            xwayland_refusal_marker(
+                "Error wlserver: [xwayland/sockets.c:217] No display available in the first 33\n"
+            ),
+            Some("No display available in the first")
+        );
+        // A session that failed for some other reason must NOT be reported as this bug — the
+        // backstop still disarms, but it says so differently.
+        assert_eq!(
+            xwayland_refusal_marker("steam.sh: line 1: pipewire: command not found\n"),
+            None
+        );
     }
 }
