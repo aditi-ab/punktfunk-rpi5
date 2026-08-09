@@ -299,7 +299,8 @@ impl PadProto for DsLinuxProto {
     fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
             // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
             // going through hid-playstation get their stops surfaced reliably, but Steam Input
@@ -401,7 +402,8 @@ impl PadProto for DsEdgeLinuxProto {
     fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
             // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
             // going through hid-playstation get their stops surfaced reliably, but Steam Input

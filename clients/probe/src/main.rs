@@ -1274,13 +1274,18 @@ async fn session(args: Args) -> Result<()> {
                     }
                 } else if let Some(u) = punktfunk_core::quic::decode_rumble_envelope(&d) {
                     // Log the first rumble so a loopback test can see the self-terminating v2
-                    // envelope tail (seq + TTL) arrived, not just the level.
+                    // envelope tail (seq + TTL) arrived, not just the level. `lt`/`rt` are the v3
+                    // impulse-trigger levels: printed beside the envelope because the wire-leg
+                    // check for trigger rumble is exactly "non-zero lt/rt AND the envelope still
+                    // present" — i.e. the trigger tail did not displace the seq/TTL tail.
                     if !rumble_logged {
                         rumble_logged = true;
                         tracing::info!(
                             pad = u.pad,
                             low = u.low,
                             high = u.high,
+                            lt = u.left_trigger,
+                            rt = u.right_trigger,
                             envelope = ?u.envelope,
                             "rumble (0xCA)"
                         );

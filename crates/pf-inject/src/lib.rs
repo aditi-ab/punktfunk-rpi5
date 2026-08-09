@@ -389,13 +389,22 @@ pub mod mouse_windows;
 /// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]), driven by [`pad_slots`] for
 /// every backend manager — replaces the per-backend permanent `broken` latch with capped-backoff
 /// retry.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+///
+/// Built on every target, not just the two that have pad backends: it is pure timing arithmetic
+/// over `std::time`, and gating it meant its tests — and [`pad_slots`]', which need it — could not
+/// run on a developer machine at all. See [`pad_slots`].
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
 /// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
 /// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
 /// manager used to copy-paste (G12).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+///
+/// Built on every target for the same reason as [`pad_gate`]: nothing in it touches an OS pad API
+/// (the backend supplies the pad type and the `open` closure), so the platform gate bought
+/// nothing and cost the ability to run the table's tests off a host box. That matters most for
+/// [`pad_slots::PadCreateFault`], whose whole job is to describe a `cfg(windows)` failure that
+/// only a Windows box can produce — the classification either has tests that run everywhere, or
+/// it has none that anyone runs.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
 /// The `sensor_timestamp` every virtual Sony pad stamps into its input reports
@@ -474,6 +483,25 @@ pub mod uhid_abi;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// Transport-independent Xbox HID codec — the report the `pf-gamepad` UMDF driver serves under
+/// device-types 4, 5 and 6 (Xbox Wireless / One S / Elite Series 2, which share one descriptor and
+/// differ only in VID/PID), giving an Xbox pad the HID footing `pf-xusb` never had
+/// (Steam / WGI / GameInput / DirectInput cannot see an XUSB-interface-only device).
+///
+/// Deliberately NOT cfg-gated to linux/windows like its siblings: it is pure byte-packing with no
+/// OS surface, so its layout tests compile and run on any host — including the macOS dev machines
+/// where the Windows backends cannot be built at all. That is the only automated check this codec
+/// has until a Windows box is reachable.
+#[path = "inject/proto/xbox_proto.rs"]
+pub mod xbox_proto;
+/// Windows: virtual Xbox pads via the same UMDF minidriver — Xbox Wireless (device-type 4),
+/// Xbox One S (5) and Xbox Elite Series 2 (6), the HID-visible alternative to
+/// [`gamepad_windows`]'s XUSB companion, which Steam / WGI / GameInput / DirectInput cannot
+/// enumerate at all because it registers only the XUSB device interface. The three identities
+/// share one report descriptor and differ only in VID/PID, product string and INF model line.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/xbox_windows.rs"]
+pub mod xbox_windows;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
@@ -484,7 +512,7 @@ pub mod gamepad {
             GamepadManager
         }
         pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
-        pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
+        pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16, u16, u16)) {}
     }
 }
 /// Linux: the "Punktfunk Pen" uinput virtual tablet (design/pen-tablet-input.md §5) — the

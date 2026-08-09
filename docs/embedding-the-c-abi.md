@@ -484,6 +484,29 @@ Pull these on your feedback thread (or poll with `timeout_ms = 0`). Same
   Amplitudes 0..0xFFFF; `(0,0)` = stop. `ttl_ms` is a host-supplied self-terminating lease — render
   the level for that long unless renewed; `PUNKTFUNK_RUMBLE_NO_TTL` means fall back to your own
   staleness timeout. (The v1 `_next_rumble` drops the TTL — prefer v2.)
+- **Rumble, policy-engine form** — `punktfunk_connection_next_rumble_cmd(c, &pad, &low, &high,
+  &backstop_ms, timeout)` hands you **effective commands** instead of raw wire state: the core owns
+  lease expiry, legacy-host staleness and close-drain zeros, so you apply what you are told and keep
+  no staleness policy of your own. `backstop_ms` is a safety net for APIs that take a duration
+  (ignored by explicit-stop APIs; `0` on stops). Pick **one** rumble API per connection — they
+  consume the same plane.
+- **Rumble with trigger motors** (ABI ≥ 18) — `punktfunk_connection_next_rumble_cmd2(c, &pad, &low,
+  &high, &left_trigger, &right_trigger, &backstop_ms, timeout)` is the same command with the two
+  Xbox impulse-trigger levels, on the same 0..0xFFFF scale; a stop is all four at zero. It is a
+  **new symbol, not a wider `_cmd`** — `_cmd` keeps its signature and its two-handle view forever,
+  so existing embedders need no change. Render the trigger pair only on a pad that has trigger
+  motors (Windows: `IGameInputDevice::SetRumbleState`'s `leftTrigger`/`rightTrigger`, or WGI's
+  `GamepadVibration`; SDL: `SDL_RumbleGamepadTriggers` gated on
+  `SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN`; Apple: `GCHapticsLocalityLeftTrigger` /
+  `…RightTrigger`) and **drop them otherwise — never fold them into a handle motor**: impulse-trigger
+  content is continuous (a racing title drives it off engine RPM and tyre slip while the handles stay
+  near silent), so folding drones a handle flat-out for the whole race at a level the game never
+  asked for. A pad without trigger motors is the common case, not an error; do not log per command.
+  Note that on a trigger-driving host a `_cmd` caller now sees commands carrying `low == high == 0`
+  while only the triggers run — correct (its motors *should* be silent) and idempotent.
+  Nothing sources non-zero trigger levels end to end yet: only the Windows HID Xbox pad has the
+  channel at all (XInput's `XINPUT_VIBRATION` and evdev's `FF_RUMBLE` each have exactly two
+  members), and it is reachable only through GameInput/WGI.
 - **DualSense HID output** — `punktfunk_connection_next_hidout(c, &out, timeout)`. `out.kind` selects
   lightbar RGB / player LEDs / adaptive-trigger effect / trackpad haptic. Replay on a real DualSense
   via the platform's controller API. Only a DualSense-backend session emits these.
@@ -629,7 +652,10 @@ shared-mode render. Request 6/8 channels at connect for surround.
 and emit `GAMEPAD_BUTTON`/`GAMEPAD_AXIS` events. Because a real Xbox pad drives this, connect with
 `PUNKTFUNK_GAMEPAD_XBOXONE` for matching glyphs. Rumble comes **back** from the host — feed
 `punktfunk_connection_next_rumble2` into `IGameInputDevice::SetRumbleState` (map `low`→
-low-frequency, `high`→high-frequency motors).
+low-frequency, `high`→high-frequency motors). `GameInputRumbleParams` has two more members,
+`leftTrigger`/`rightTrigger`, and this is the one platform API that can drive them: use
+`punktfunk_connection_next_rumble_cmd2` (ABI ≥ 18) instead and fill all four. The host can only
+ever source non-zero trigger levels from its Windows HID Xbox pad, so expect zeros elsewhere.
 
 **Skeleton (C++):**
 

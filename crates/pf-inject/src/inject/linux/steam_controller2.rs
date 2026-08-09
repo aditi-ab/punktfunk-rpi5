@@ -369,7 +369,8 @@ impl PadProto for TritonProto {
             })
             .collect();
         PadFeedback {
-            rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout,
             // Rumble-plane liveness: Steam is a hidraw writer here too, so the shared
             // abandoned-rumble force-off applies (the raw 0xCD passthrough plane is unaffected).

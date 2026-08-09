@@ -791,6 +791,37 @@ pub mod gamepad {
     /// Steam Input on Windows when the devnode's synthesized USB hardware ids carry `&MI_02`
     /// (the wired controller interface — the N4-spike finding).
     pub const DEVTYPE_STEAMDECK: u8 = 3;
+    /// `device_type` = Xbox Wireless Controller (`VID_045E&PID_0B13` HID identity — a Bluetooth
+    /// Xbox pad, which unlike the wired `045E:028E`/`045E:02EA` ids IS a real HID device).
+    ///
+    /// This exists because the OTHER Windows Xbox backend, `pf-xusb`, registers only
+    /// `GUID_DEVINTERFACE_XUSB` and has no HID collection — so Steam, WGI, GameInput, DirectInput
+    /// and `joy.cpl` cannot enumerate it at all, and only classic `XInputGetState` ever sees it
+    /// (field 2026-08-09). Routing an Xbox pad through this identity instead puts it on the same
+    /// HID footing the PlayStation pads have always had.
+    ///
+    /// ⚠️ Unlike its siblings the Xbox input report is NOT 64 bytes — it is
+    /// `XBOX_INPUT_REPORT_LEN` (16). The driver serves per-identity report lengths because
+    /// hidclass sizes its buffer from the descriptor and refuses an over-long source.
+    pub const DEVTYPE_XBOX: u8 = 4;
+    /// `device_type` = Xbox One S controller over Bluetooth (`VID_045E&PID_02FD`).
+    ///
+    /// ⭐ **Shares [`DEVTYPE_XBOX`]'s report descriptor, byte for byte.** All three Xbox identities
+    /// are the same pad in HID terms — same axes, same trigger pair, same hat, same 15 buttons,
+    /// same rumble output report — and differ ONLY in VID/PID, product string and INF model line.
+    /// The descriptor is the report SHAPE; the identity is what the OS keys mappings off. Giving
+    /// each identity its own hand-written descriptor would triple a debt that has already cost
+    /// three separate bugs (see the `XBOX_RDESC` provenance block in the driver).
+    pub const DEVTYPE_XBOX_ONE_S: u8 = 5;
+    /// `device_type` = Xbox Elite Wireless Controller Series 2 (`VID_045E&PID_0B22`) — the
+    /// hardware `tools/hid-descriptor-dump` captured on `.173`.
+    ///
+    /// ⚠️ The four paddles are NOT in this identity's report yet. See [`DEVTYPE_XBOX_ONE_S`] for
+    /// why the descriptor is shared, and `design/xbox-pad-windows-handoff.md` §4 WP-C for the
+    /// unresolved tension: once the pad is promoted, `xinputhid` claims the HID collection
+    /// exclusively, so extra buttons declared here may be invisible to every consumer anyway.
+    /// That needs measuring before it is built.
+    pub const DEVTYPE_XBOX_ELITE: u8 = 6;
 
     /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
     /// the host's positive "driver is alive on this section" signal (health check + version audit).

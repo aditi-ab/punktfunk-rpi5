@@ -25,7 +25,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use pf_driver_proto::gamepad::XusbShm;
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
 use pf_umdf_util::nt_success;
@@ -34,7 +34,7 @@ use pf_umdf_util::wdf::{self, Request};
 use wdk_sys::{
     GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
     WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES,
-    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFREQUEST, WDFTIMER,
+    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFQUEUE__, WDFREQUEST, WDFTIMER,
     call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
 };
 
@@ -78,6 +78,15 @@ const XUSB_VERSION: u16 = 0x0103;
 
 // ---- WDF enum values ----
 const WdfIoQueueDispatchParallel: i32 = 2;
+const WdfIoQueueDispatchManual: i32 = 3;
+
+/// Manual queue holding pended [`IOCTL_XUSB_WAIT_FOR_INPUT`] requests; the periodic timer completes
+/// them when the host publishes a new packet. See [`evt_timer`].
+static WAIT_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut());
+/// The `dwPacketNumber` the last completed wait reported — the edge the timer compares against, so
+/// a waiter is only released when the state actually MOVED (that is the contract of an async wait;
+/// completing it unconditionally would spin the caller at timer rate).
+static WAIT_LAST_PACKET: AtomicU32 = AtomicU32::new(0);
 const WdfUseDefault: i32 = 2; // WDF_TRI_STATE
 const WdfExecutionLevelInheritFromParent: i32 = 1; // WDF_EXECUTION_LEVEL
 const WdfSynchronizationScopeInheritFromParent: i32 = 1; // WDF_SYNCHRONIZATION_SCOPE
@@ -272,6 +281,35 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         return st;
     }
 
+    // Manual queue for the ASYNC input wait (`IOCTL_XUSB_WAIT_FOR_INPUT`), completed by the timer.
+    //
+    // Declining that IOCTL is enough for CLASSIC XInput — `xinput1_4` just falls back to synchronous
+    // GET_STATE polling, which is why the pad has always worked there. It is NOT enough for
+    // WGI/GameInput: those poll asynchronously, so to them the decline is not a fallback but a
+    // refusal, and the device is never admitted. Measured 2026-08-09 on .173 — the pad reaches
+    // XInput slot 1 with live data while WGI/GameInput never see it at all.
+    // SAFETY: a zeroed WDF_IO_QUEUE_CONFIG is valid; we then set Size + the fields we use.
+    let mut wcfg: WDF_IO_QUEUE_CONFIG = unsafe { core::mem::zeroed() };
+    wcfg.Size = core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG;
+    wcfg.DispatchType = WdfIoQueueDispatchManual;
+    wcfg.PowerManaged = WdfUseDefault;
+    let mut wait_queue: WDFQUEUE = core::ptr::null_mut();
+    // SAFETY: `device` + `wcfg` are valid; attributes null; `wait_queue` receives the handle.
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut wcfg,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut wait_queue
+        )
+    };
+    if !nt_success(st) {
+        dbglog!("[pf-xusb] wait WdfIoQueueCreate failed 0x{:08x}", st as u32);
+        return st;
+    }
+    WAIT_QUEUE.store(wait_queue, Ordering::SeqCst);
+
     // Run the sealed-channel handshake on a worker (must NOT block EvtDeviceAdd): publish our pid in
     // the bootstrap mailbox and poll for the host's delivered DATA handle, so the pad attaches (and
     // the host's driver-attach health check goes green) even before any game polls XInput. Bounded;
@@ -333,6 +371,28 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
 extern "C" fn evt_timer(_timer: WDFTIMER) {
     let live = CHANNEL.pump(&channel_cfg()).is_some();
     HOST_LIVE.store(live, Ordering::Relaxed);
+
+    // Release one pended `WAIT_FOR_INPUT` per tick, but only on a real edge — the host bumps
+    // `dwPacketNumber` whenever it publishes new state, so an unchanged packet means nothing moved
+    // and a waiter that is completed anyway would just spin its caller at timer rate.
+    let data = CHANNEL.data();
+    let (packet, ..) = read_state(data);
+    if packet == WAIT_LAST_PACKET.load(Ordering::Relaxed) {
+        return;
+    }
+    let wq: WDFQUEUE = WAIT_QUEUE.load(Ordering::SeqCst);
+    if wq.is_null() {
+        return;
+    }
+    // SAFETY: `wq` is the live manual queue created in EvtDeviceAdd — the contract
+    // `retrieve_next_request` requires. `None` simply means nobody is waiting.
+    if let Some(request) = unsafe { wdf::retrieve_next_request(wq) } {
+        WAIT_LAST_PACKET.store(packet, Ordering::Relaxed);
+        // Answer with the same 29-byte GET_STATE payload the synchronous path serves, so a caller
+        // that waits and a caller that polls observe byte-identical state.
+        let st = request.copy_to_output(&build_get_state(data));
+        request.complete(st);
+    }
 }
 
 /// The current controller state from the attached DATA section (zeros / neutral when unattached).
@@ -504,8 +564,26 @@ extern "C" fn evt_io_device_control(
         IOCTL_XUSB_GET_BATTERY_INFORMATION => request.copy_to_output(&[0x00, 0x01, 0x03, 0x00]),
         IOCTL_XUSB_SET_STATE => on_set_state(&request, data),
         IOCTL_XUSB_POWER_DOWN | IOCTL_XUSB_GET_XINPUT_MANAGEMENT_DRIVER => STATUS_SUCCESS,
-        // Decline the async waits → xinput1_4 falls back to synchronous GET_STATE polling.
-        IOCTL_XUSB_WAIT_GUIDE_BUTTON | IOCTL_XUSB_WAIT_FOR_INPUT => STATUS_INVALID_DEVICE_REQUEST,
+        // The async input wait is PENDED on the manual queue and completed by the timer when the
+        // packet number moves (see `evt_timer`) — WGI/GameInput poll this way and will not admit a
+        // device that refuses it. Classic `xinput1_4` never issues it (it polls GET_STATE), so this
+        // costs the working path nothing. A forward failure completes the request with its error.
+        IOCTL_XUSB_WAIT_FOR_INPUT => {
+            let wq: WDFQUEUE = WAIT_QUEUE.load(Ordering::SeqCst);
+            if wq.is_null() {
+                STATUS_INVALID_DEVICE_REQUEST
+            } else {
+                // SAFETY: `wq` is the live manual queue created in EvtDeviceAdd; `request` is this
+                // dispatch's request and is CONSUMED by the forward (hence the early return).
+                match unsafe { request.forward_to_queue(wq) } {
+                    Ok(()) => return,
+                    Err((req, st)) => req.complete(st),
+                }
+                return;
+            }
+        }
+        // Still declined: the guide-button wait has no state of ours to signal on.
+        IOCTL_XUSB_WAIT_GUIDE_BUTTON => STATUS_INVALID_DEVICE_REQUEST,
         other => {
             dbglog!("[pf-xusb] unhandled IOCTL 0x{other:08x} in={input_len} out={output_len}");
             STATUS_INVALID_DEVICE_REQUEST

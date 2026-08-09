@@ -22,6 +22,14 @@
 //! a per-pad mailbox and commands are generated on demand, so a stalled embedder wakes to ONE
 //! current-level command instead of a backlog — and a stop can never be the update that an
 //! overflowing queue drops.
+//!
+//! A pad carries FOUR motor levels ([`Levels`]): the two handles plus the two Xbox impulse-trigger
+//! motors off the 0xCA v3 tail (`design/trigger-rumble-plane.md`). They deliberately share one
+//! lease, one seq and one policy — they are a single statement of the pad's feedback state at one
+//! instant, so the whole apparatus above (expiry, staleness, keepalives, close drain) governs the
+//! trigger motors with no second timeline. Every liveness test is therefore against all four
+//! levels, not the handles: a trigger-only rumble is the *normal* shape of impulse-trigger
+//! content, and a two-field test would silence it on arrival.
 
 use crate::input::MAX_PADS;
 use std::sync::{Condvar, Mutex};
@@ -52,17 +60,40 @@ const BACKSTOP_LEGACY_MS: u32 = 2000;
 /// header already has ~170 instances of, and one this has no reason to add to.
 const MAX_LEASE_MS: u16 = 5_000;
 
-/// One effective actuator command. `(0, 0)` means stop now. `backstop_ms` is a safety-net
-/// duration for platform APIs that take one (SDL rumble, Android one-shots): the engine emits
-/// explicit zeros at every policy stop, so the backstop only matters if the embedder thread itself
-/// stalls; platforms with explicit-stop APIs ignore it. Zero commands carry `backstop_ms == 0`.
+/// One effective actuator command: four motor levels for one pad at one instant. All-zero means
+/// stop now. `backstop_ms` is a safety-net duration for platform APIs that take one (SDL rumble,
+/// Android one-shots): the engine emits explicit zeros at every policy stop, so the backstop only
+/// matters if the embedder thread itself stalls; platforms with explicit-stop APIs ignore it. Zero
+/// commands carry `backstop_ms == 0`.
+///
+/// `left_trigger`/`right_trigger` are the Xbox impulse-trigger motors off the 0xCA v3 tail
+/// (`design/trigger-rumble-plane.md`), on the same `0..=0xFFFF` scale as `low`/`high`. A renderer
+/// on a pad without trigger motors ignores them — that is the *normal* case, not an error, and the
+/// engine deliberately does not fold them into the handles (folding a racing title's continuous
+/// trigger stream onto a handle motor drones flat-out for the whole race; §8 of the design).
+///
+/// A pre-trigger embedder reading only `(low, high)` stays correct: the four levels are one
+/// statement of the pad's state, so a trigger-only rumble reads as "handles silent", which is what
+/// its actuator should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RumbleCommand {
     pub pad: u16,
     pub low: u16,
     pub high: u16,
+    pub left_trigger: u16,
+    pub right_trigger: u16,
     pub backstop_ms: u32,
 }
+
+/// One pad's four motor levels, in wire order: `(low, high, left_trigger, right_trigger)`. The two
+/// handle motors first so the pre-trigger `(low, high)` reading is a literal prefix of this one.
+type Levels = (u16, u16, u16, u16);
+
+/// The reserved "this actuator group is silent" value. Every liveness test in the engine is
+/// against ALL FOUR levels: a rumble that drives only the impulse triggers — the normal shape of
+/// racing-title content, where the handles stay at rest — must read as LIVE, or it would be
+/// silenced on arrival by a two-field test that never saw its levels.
+const SILENT: Levels = (0, 0, 0, 0);
 
 /// A physical actuator's declared quirks — how a platform parameterizes the shared policy instead
 /// of forking it. Defaults (all zero/false) describe a well-behaved actuator.
@@ -96,7 +127,7 @@ pub struct ActuatorQuirks {
 
 #[derive(Clone, Copy)]
 struct PadState {
-    level: (u16, u16),
+    level: Levels,
     /// v2 lease expiry — `None` for a zero level or a legacy pad.
     deadline: Option<Instant>,
     /// Last v2 TTL (drives the backstop); 0 ⇔ legacy.
@@ -106,23 +137,23 @@ struct PadState {
     /// A wire update landed since the last emit (level change OR renewal — renewals re-emit).
     dirty: bool,
     next_keepalive: Option<Instant>,
-    /// The exact value last handed to an embedder. `(0, 0)` ⇔ the engine believes this actuator is
-    /// silent. It replaces a free-running jitter phase because one field answers all three live
-    /// questions: would re-sending this be a no-op device write (the dedupe nudge), is a stop
-    /// redundant, and would the nudge synthesize the reserved stop.
-    last_emit: (u16, u16),
+    /// The exact value last handed to an embedder. [`SILENT`] ⇔ the engine believes this pad's
+    /// actuators are all silent. It replaces a free-running jitter phase because one field answers
+    /// all three live questions: would re-sending this be a no-op device write (the dedupe nudge),
+    /// is a stop redundant, and would the nudge synthesize the reserved stop.
+    last_emit: Levels,
     quirks: ActuatorQuirks,
 }
 
 impl PadState {
     const NEUTRAL: PadState = PadState {
-        level: (0, 0),
+        level: SILENT,
         deadline: None,
         ttl_ms: 0,
         legacy_wire: None,
         dirty: false,
         next_keepalive: None,
-        last_emit: (0, 0),
+        last_emit: SILENT,
         quirks: ActuatorQuirks {
             keepalive_ms: 0,
             min_pulse_ms: 0,
@@ -139,18 +170,22 @@ impl PadState {
         b.max(self.quirks.min_pulse_ms as u32)
     }
 
-    /// Zero the pad's level + timers and produce the stop command.
+    /// Zero the pad's levels + timers and produce the stop command — all four motors, so a policy
+    /// stop silences the impulse triggers on the same event as the handles (which is the whole
+    /// reason they share one lease and one seq).
     fn silence(&mut self, pad: u16) -> RumbleCommand {
-        self.level = (0, 0);
+        self.level = SILENT;
         self.deadline = None;
         self.legacy_wire = None;
         self.next_keepalive = None;
         self.dirty = false;
-        self.last_emit = (0, 0);
+        self.last_emit = SILENT;
         RumbleCommand {
             pad,
             low: 0,
             high: 0,
+            left_trigger: 0,
+            right_trigger: 0,
             backstop_ms: 0,
         }
     }
@@ -166,25 +201,39 @@ impl PadState {
     /// gap between *distinct* device writes to 80 ms at the default cadence and 100 ms at the
     /// floor, on an actuator whose quirk declares 40.
     ///
-    /// The nudge is refused when it would synthesize the reserved `(0, 0)` stop. That is level
-    /// `(1, 0)` and only that: `high` must already be 0, and `low ^ 1 == 0` implies `low == 1`.
+    /// The nudge is refused when it would synthesize the reserved all-zero stop. **Re-derived for
+    /// four levels, not mechanically widened** — the old proof reasoned about exactly two fields.
+    /// `emit` is only ever reached with `level != SILENT` (every caller in [`RumbleEngine::poll`]
+    /// guards on it), the nudge touches `low` alone, and it changes `low` by ±1 in the LSB. So the
+    /// nudged tuple can equal [`SILENT`] only when the three untouched levels are already zero AND
+    /// `low ^ 1 == 0`, i.e. exactly level `(1, 0, 0, 0)` — the same single case as before, now
+    /// conditioned on `high`, `left_trigger` and `right_trigger` together instead of `high` alone.
     /// There the LSB steps up instead, so the phase still alternates (1 ↔ 3, two parts in 65535)
     /// and the pad never receives a stop the policy did not order.
+    ///
+    /// The nudge stays on `low` even for a trigger-only level, where it lifts a resting handle
+    /// motor from 0 to 1. That is not new behaviour in kind — a `(0, high)` level has always been
+    /// nudged to `(1, high)` — and one part in 65535 is below any actuator's threshold. Moving it
+    /// to whichever level is non-zero would make the dedupe phase depend on which motors a
+    /// particular command happens to drive, which is exactly the free-running-phase failure
+    /// `last_emit` was introduced to remove.
     fn emit(&mut self, pad: u16) -> RumbleCommand {
-        let (mut low, high) = self.level;
-        if self.quirks.dedup_jitter && (low, high) == self.last_emit {
+        let (mut low, high, lt, rt) = self.level;
+        if self.quirks.dedup_jitter && self.level == self.last_emit {
             let alt = low ^ 1;
-            low = if (alt, high) == (0, 0) {
+            low = if (alt, high, lt, rt) == SILENT {
                 low | 0b10
             } else {
                 alt
             };
         }
-        self.last_emit = (low, high);
+        self.last_emit = (low, high, lt, rt);
         RumbleCommand {
             pad,
             low,
             high,
+            left_trigger: lt,
+            right_trigger: rt,
             backstop_ms: self.backstop(),
         }
     }
@@ -210,18 +259,26 @@ impl RumbleEngine {
     /// Fold one seq-gated wire update in. Every update dirties the pad (renewals re-emit so
     /// platform duration timers re-arm); a v2 update replaces the lease deadline, a legacy update
     /// refreshes the staleness clock.
+    ///
+    /// `lt`/`rt` are the v3 impulse-trigger levels — zero for a v1/v2 datagram, because on a
+    /// level-triggered plane an absent field means "off now", never "keep what you had".
+    // Four levels, a pad index, a clock and a lease: grouping them would move the field list one
+    // hop from the two call sites (the demux feed and the tests) for nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn wire_update(
         &mut self,
         now: Instant,
         pad: u16,
         low: u16,
         high: u16,
+        lt: u16,
+        rt: u16,
         ttl_ms: Option<u16>,
     ) {
         let Some(p) = self.pads.get_mut(pad as usize) else {
             return;
         };
-        p.level = (low, high);
+        p.level = (low, high, lt, rt);
         p.dirty = true;
         match ttl_ms {
             Some(t) => {
@@ -229,7 +286,10 @@ impl RumbleEngine {
                 let t = t.min(MAX_LEASE_MS);
                 p.ttl_ms = t;
                 p.legacy_wire = None;
-                p.deadline = if (low, high) != (0, 0) {
+                // All four levels decide whether there is a lease to run: a trigger-only rumble
+                // against silent handles is a LIVE level and must get a deadline, not the
+                // instantly-expired `None` a two-field test would have handed it.
+                p.deadline = if p.level != SILENT {
                     Some(now + Duration::from_millis(t as u64))
                 } else {
                     None
@@ -261,7 +321,7 @@ impl RumbleEngine {
         for i in 0..MAX_PADS {
             let p = &mut self.pads[i];
             let pad = i as u16;
-            if p.level != (0, 0) {
+            if p.level != SILENT {
                 // 1) v2 lease expiry — the host stopped renewing (died / stopped caring). This
                 // firing in the wild is the signature of a host-side bug: worth a log line.
                 if let Some(d) = p.deadline {
@@ -284,7 +344,7 @@ impl RumbleEngine {
             // 3) a wire update to relay (level change or renewal re-arm).
             if p.dirty {
                 p.dirty = false;
-                if p.level == (0, 0) {
+                if p.level == SILENT {
                     // Relay a stop only if the actuator is, as far as the engine knows, still
                     // buzzing. A zero on an already-silent pad heals nothing and costs every
                     // embedder a command — Android an unconditional log line plus a binder
@@ -293,8 +353,8 @@ impl RumbleEngine {
                     // `PUNKTFUNK_RUMBLE_ENVELOPE=0`) the legacy flat 500 ms refresh, which re-sends
                     // zeros for every latched pad for the rest of the session. The burst still
                     // heals the case it exists for: a LOST first stop leaves the pad buzzing, so
-                    // `last_emit != (0, 0)` and the re-send does emit.
-                    if p.last_emit != (0, 0) {
+                    // `last_emit != SILENT` and the re-send does emit.
+                    if p.last_emit != SILENT {
                         return (Some(p.silence(pad)), None);
                     }
                     continue;
@@ -308,7 +368,7 @@ impl RumbleEngine {
             // 4) actuator-decay keepalive, bounded by (1)/(2) above by construction: an expired
             // or stale pad was silenced before reaching here, so a keepalive can never sustain a
             // level the policy has ended.
-            if p.level != (0, 0) && p.quirks.keepalive_ms > 0 {
+            if p.level != SILENT && p.quirks.keepalive_ms > 0 {
                 let ka = Duration::from_millis(p.quirks.keepalive_ms as u64);
                 let due = *p.next_keepalive.get_or_insert(now + ka);
                 if now >= due {
@@ -325,7 +385,7 @@ impl RumbleEngine {
     /// silences every platform by contract instead of by per-client accident.
     pub(crate) fn close_drain(&mut self) -> Option<RumbleCommand> {
         for i in 0..MAX_PADS {
-            if self.pads[i].level != (0, 0) {
+            if self.pads[i].level != SILENT {
                 return Some(self.pads[i].silence(i as u16));
             }
         }
@@ -349,9 +409,18 @@ struct SharedState {
 pub(crate) struct RumbleFeed(pub(crate) std::sync::Arc<RumbleShared>);
 
 impl RumbleFeed {
-    pub(crate) fn wire_update(&self, pad: u16, low: u16, high: u16, ttl_ms: Option<u16>) {
+    pub(crate) fn wire_update(
+        &self,
+        pad: u16,
+        low: u16,
+        high: u16,
+        lt: u16,
+        rt: u16,
+        ttl_ms: Option<u16>,
+    ) {
         let mut g = self.0.inner.lock().unwrap();
-        g.engine.wire_update(Instant::now(), pad, low, high, ttl_ms);
+        g.engine
+            .wire_update(Instant::now(), pad, low, high, lt, rt, ttl_ms);
         drop(g);
         self.0.cv.notify_all();
     }
@@ -425,7 +494,30 @@ mod tests {
         dedup_jitter: true,
     };
 
-    /// Drain the engine the way an embedder does: poll until nothing is due.
+    /// Feed a HANDLE-ONLY wire update — what every producer but the Windows HID Xbox pad emits
+    /// (XInput's `XINPUT_VIBRATION` and evdev's `FF_RUMBLE` have two members and no third), so it
+    /// is also what the pre-v3 tests below are all about. Trigger cases call `wire4` instead.
+    fn wire(e: &mut RumbleEngine, t: Instant, pad: u16, low: u16, high: u16, ttl: Option<u16>) {
+        e.wire_update(t, pad, low, high, 0, 0, ttl);
+    }
+
+    /// Feed a full v3 wire update, all four levels.
+    #[allow(clippy::too_many_arguments)]
+    fn wire4(
+        e: &mut RumbleEngine,
+        t: Instant,
+        pad: u16,
+        low: u16,
+        high: u16,
+        lt: u16,
+        rt: u16,
+        ttl: Option<u16>,
+    ) {
+        e.wire_update(t, pad, low, high, lt, rt, ttl);
+    }
+
+    /// Drain the engine the way an embedder does: poll until nothing is due. Handle levels only —
+    /// `drain4` is the four-level view.
     fn drain(e: &mut RumbleEngine, t: Instant) -> Vec<(u16, u16)> {
         let mut out = Vec::new();
         while let (Some(c), _) = e.poll(t) {
@@ -434,15 +526,30 @@ mod tests {
         out
     }
 
+    fn drain4(e: &mut RumbleEngine, t: Instant) -> Vec<Levels> {
+        let mut out = Vec::new();
+        while let (Some(c), _) = e.poll(t) {
+            out.push((c.low, c.high, c.left_trigger, c.right_trigger));
+        }
+        out
+    }
+
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
     }
 
+    /// A handle-only expected command — the shape every pre-v3 assertion below is written in.
     fn cmd(pad: u16, low: u16, high: u16, backstop_ms: u32) -> RumbleCommand {
+        cmd4(pad, low, high, 0, 0, backstop_ms)
+    }
+
+    fn cmd4(pad: u16, low: u16, high: u16, lt: u16, rt: u16, backstop_ms: u32) -> RumbleCommand {
         RumbleCommand {
             pad,
             low,
             high,
+            left_trigger: lt,
+            right_trigger: rt,
             backstop_ms,
         }
     }
@@ -451,7 +558,7 @@ mod tests {
     fn v2_level_emits_and_expires_at_the_lease() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 0x4000, 0x8000, Some(400));
+        wire(&mut e, t0, 0, 0x4000, 0x8000, Some(400));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 0x4000, 0x8000, 800))); // backstop = 2×ttl
                                                                      // No renewal: at the deadline the engine self-silences — the host-died safety net.
         let (c, wake) = e.poll(t0 + ms(200));
@@ -465,11 +572,11 @@ mod tests {
     fn renewal_re_emits_and_extends_the_deadline() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 0, Some(400));
+        wire(&mut e, t0, 0, 100, 0, Some(400));
         assert!(e.poll(t0).0.is_some());
         // A same-level renewal at t+300 re-emits (platform duration timers re-arm) and pushes the
         // deadline to t+700 — so t+500 (past the ORIGINAL deadline) still rumbles.
-        e.wire_update(t0 + ms(300), 0, 100, 0, Some(400));
+        wire(&mut e, t0 + ms(300), 0, 100, 0, Some(400));
         assert_eq!(e.poll(t0 + ms(300)).0, Some(cmd(0, 100, 0, 800)));
         assert_eq!(e.poll(t0 + ms(500)).0, None);
         assert_eq!(e.poll(t0 + ms(700)).0, Some(cmd(0, 0, 0, 0)));
@@ -479,9 +586,9 @@ mod tests {
     fn explicit_stop_is_immediate_and_cancels_the_lease() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 2, 500, 500, Some(400));
+        wire(&mut e, t0, 2, 500, 500, Some(400));
         assert!(e.poll(t0).0.is_some());
-        e.wire_update(t0 + ms(50), 2, 0, 0, Some(0));
+        wire(&mut e, t0 + ms(50), 2, 0, 0, Some(0));
         assert_eq!(e.poll(t0 + ms(50)).0, Some(cmd(2, 0, 0, 0)));
         assert_eq!(e.poll(t0 + ms(600)), (None, None)); // no phantom expiry later
     }
@@ -490,10 +597,10 @@ mod tests {
     fn legacy_host_gets_the_uniform_staleness_bound() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 300, 0, None); // legacy: no TTL
+        wire(&mut e, t0, 0, 300, 0, None); // legacy: no TTL
         assert_eq!(e.poll(t0).0, Some(cmd(0, 300, 0, 2000)));
         // The legacy 500 ms refresh keeps it alive…
-        e.wire_update(t0 + ms(500), 0, 300, 0, None);
+        wire(&mut e, t0 + ms(500), 0, 300, 0, None);
         assert_eq!(e.poll(t0 + ms(500)).0, Some(cmd(0, 300, 0, 2000)));
         assert_eq!(e.poll(t0 + ms(1400)).0, None); // 900 ms since last wire — inside the bound
                                                    // …and one second of silence cuts it, on every platform alike.
@@ -512,7 +619,7 @@ mod tests {
             },
         );
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(400));
+        wire(&mut e, t0, 0, 100, 200, Some(400));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 200, 800)));
         // Keepalives at the quirk cadence, alternating the low LSB to defeat SDL's dedupe.
         assert_eq!(e.poll(t0 + ms(40)).0, Some(cmd(0, 101, 200, 800)));
@@ -526,7 +633,7 @@ mod tests {
     fn quirk_registered_mid_rumble_starts_keepalives() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 0, Some(400));
+        wire(&mut e, t0, 0, 100, 0, Some(400));
         assert!(e.poll(t0).0.is_some());
         e.set_quirks(
             0,
@@ -555,7 +662,7 @@ mod tests {
             },
         );
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 0, Some(100));
+        wire(&mut e, t0, 0, 100, 0, Some(100));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 0, 5000)));
     }
 
@@ -563,8 +670,8 @@ mod tests {
     fn close_drain_silences_every_buzzing_pad_once() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 0, Some(400));
-        e.wire_update(t0, 3, 0, 900, Some(400));
+        wire(&mut e, t0, 0, 100, 0, Some(400));
+        wire(&mut e, t0, 3, 0, 900, Some(400));
         let _ = e.poll(t0);
         let _ = e.poll(t0);
         let a = e.close_drain().unwrap();
@@ -581,7 +688,7 @@ mod tests {
         // 20 renewals landed while the embedder was stalled — state, not a queue: exactly one
         // command comes out, carrying the latest level.
         for k in 0..20u64 {
-            e.wire_update(t0 + ms(k * 120), 0, 100 + k as u16, 0, Some(400));
+            wire(&mut e, t0 + ms(k * 120), 0, 100 + k as u16, 0, Some(400));
         }
         let t = t0 + ms(20 * 120);
         assert_eq!(e.poll(t).0, Some(cmd(0, 119, 0, 800)));
@@ -592,7 +699,7 @@ mod tests {
     fn shared_close_delivers_drain_zero_then_closed() {
         let shared = std::sync::Arc::new(RumbleShared::new());
         let feed = RumbleFeed(shared.clone());
-        feed.wire_update(1, 100, 0, Some(400));
+        feed.wire_update(1, 100, 0, 0, 0, Some(400));
         assert_eq!(
             shared.next_command(ms(100)).unwrap().unwrap(),
             cmd(1, 100, 0, 800)
@@ -613,12 +720,12 @@ mod tests {
         let mut e = RumbleEngine::new();
         e.set_quirks(0, DECK);
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(400));
+        wire(&mut e, t0, 0, 100, 200, Some(400));
         assert_eq!(drain(&mut e, t0), vec![(100, 200)]);
         assert_eq!(drain(&mut e, t0 + ms(40)), vec![(101, 200)]);
         assert_eq!(drain(&mut e, t0 + ms(80)), vec![(100, 200)]);
         // The renewal at the 120 ms default cadence: same level, must still be a distinct write.
-        e.wire_update(t0 + ms(120), 0, 100, 200, Some(400));
+        wire(&mut e, t0 + ms(120), 0, 100, 200, Some(400));
         assert_eq!(drain(&mut e, t0 + ms(120)), vec![(101, 200)]);
         assert_eq!(drain(&mut e, t0 + ms(160)), vec![(100, 200)]);
     }
@@ -634,7 +741,7 @@ mod tests {
         for tick in 0..=360u64 {
             let t = t0 + ms(tick);
             if tick % 60 == 0 {
-                e.wire_update(t, 0, 100, 200, Some(400));
+                wire(&mut e, t, 0, 100, 200, Some(400));
             }
             for v in drain(&mut e, t) {
                 assert_ne!(v, (0, 0), "a live lease must never emit the stop sentinel");
@@ -657,9 +764,9 @@ mod tests {
     fn default_quirks_pads_get_the_level_verbatim_on_every_renewal() {
         let mut e = RumbleEngine::new(); // Apple / Android / plain SDL
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(400));
+        wire(&mut e, t0, 0, 100, 200, Some(400));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 200, 800)));
-        e.wire_update(t0 + ms(120), 0, 100, 200, Some(400));
+        wire(&mut e, t0 + ms(120), 0, 100, 200, Some(400));
         assert_eq!(e.poll(t0 + ms(120)).0, Some(cmd(0, 100, 200, 800)));
     }
 
@@ -670,7 +777,7 @@ mod tests {
         let mut e = RumbleEngine::new();
         e.set_quirks(0, DECK);
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 1, 0, Some(400));
+        wire(&mut e, t0, 0, 1, 0, Some(400));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 1, 0, 800)));
         assert_eq!(e.poll(t0 + ms(40)).0, Some(cmd(0, 3, 0, 800)));
         assert_eq!(e.poll(t0 + ms(80)).0, Some(cmd(0, 1, 0, 800)));
@@ -683,20 +790,20 @@ mod tests {
     fn a_redundant_stop_is_dropped_but_the_burst_still_heals_a_lost_one() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(400));
+        wire(&mut e, t0, 0, 100, 200, Some(400));
         assert_eq!(drain(&mut e, t0), vec![(100, 200)]);
         // First stop reaches the embedder…
-        e.wire_update(t0 + ms(10), 0, 0, 0, Some(0));
+        wire(&mut e, t0 + ms(10), 0, 0, 0, Some(0));
         assert_eq!(drain(&mut e, t0 + ms(10)), vec![(0, 0)]);
         // …and the burst re-sends behind it are now silent.
-        e.wire_update(t0 + ms(20), 0, 0, 0, Some(0));
-        e.wire_update(t0 + ms(30), 0, 0, 0, Some(0));
+        wire(&mut e, t0 + ms(20), 0, 0, 0, Some(0));
+        wire(&mut e, t0 + ms(30), 0, 0, 0, Some(0));
         assert_eq!(drain(&mut e, t0 + ms(30)), Vec::new());
 
         // But if the pad is buzzing (the stop that mattered was lost), a re-send still emits.
-        e.wire_update(t0 + ms(40), 0, 100, 200, Some(400));
+        wire(&mut e, t0 + ms(40), 0, 100, 200, Some(400));
         assert_eq!(drain(&mut e, t0 + ms(40)), vec![(100, 200)]);
-        e.wire_update(t0 + ms(50), 0, 0, 0, Some(0));
+        wire(&mut e, t0 + ms(50), 0, 0, 0, Some(0));
         assert_eq!(drain(&mut e, t0 + ms(50)), vec![(0, 0)]);
     }
 
@@ -707,7 +814,7 @@ mod tests {
     fn an_overlong_lease_is_clamped_to_the_ceiling() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(u16::MAX));
+        wire(&mut e, t0, 0, 100, 200, Some(u16::MAX));
         assert_eq!(e.poll(t0).0, Some(cmd(0, 100, 200, 5000)));
         // Silenced at the ceiling, not at the 65 s the sender asked for.
         assert!(e.poll(t0 + ms(MAX_LEASE_MS as u64 - 1)).0.is_none());
@@ -726,11 +833,112 @@ mod tests {
     fn a_zero_ttl_envelope_silences_rather_than_taking_the_legacy_backstop() {
         let mut e = RumbleEngine::new();
         let t0 = Instant::now();
-        e.wire_update(t0, 0, 100, 200, Some(0));
+        wire(&mut e, t0, 0, 100, 200, Some(0));
         assert_eq!(
             e.poll(t0).0,
             Some(cmd(0, 0, 0, 0)),
             "a zero-length lease must expire immediately, not emit with a legacy backstop"
         );
+    }
+
+    /// **The single most likely way to ship trigger rumble broken** (design §5): a rumble that
+    /// drives ONLY the impulse triggers is the normal shape of the content — racing titles run the
+    /// triggers continuously against silent handles. Every liveness test in the engine used to be
+    /// `(low, high) == (0, 0)`; left that way, a trigger-only update is read as a stop, dropped as
+    /// redundant on a silent pad, and the feature is dead with no error anywhere.
+    #[test]
+    fn a_trigger_only_rumble_is_a_live_level_not_a_stop() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        wire4(&mut e, t0, 0, 0, 0, 0x8000, 0, Some(400));
+        assert_eq!(
+            e.poll(t0).0,
+            Some(cmd4(0, 0, 0, 0x8000, 0, 800)),
+            "a trigger-only level must emit with a live backstop"
+        );
+        // It runs on the pad's ONE shared lease, exactly like the handles: no renewal, so the
+        // whole group silences at the deadline.
+        assert_eq!(e.poll(t0 + ms(200)), (None, Some(t0 + ms(400))));
+        assert_eq!(e.poll(t0 + ms(400)).0, Some(cmd(0, 0, 0, 0)));
+        assert_eq!(e.poll(t0 + ms(500)), (None, None));
+    }
+
+    /// Backward compatibility for the pre-trigger C entry point
+    /// (`punktfunk_connection_next_rumble_cmd`, which writes `pad`/`low`/`high`/`backstop_ms` and
+    /// has no slot for the other two). Its embedder sees the same command, truncated to its first
+    /// two levels — and that truncation is CORRECT rather than merely tolerable: with no trigger
+    /// motors to drive, "handles silent" is what its actuator should do. The one visible
+    /// difference is that trigger traffic now produces commands where before the demux dropped it,
+    /// so such an embedder sees redundant handle stops while a trigger-only rumble runs. They are
+    /// idempotent; the redundant-stop suppression cannot apply, because the command is not silent.
+    #[test]
+    fn the_old_two_field_view_of_a_trigger_command_is_silent_handles() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        wire4(&mut e, t0, 0, 0x1111, 0, 0x8000, 0x4000, Some(400));
+        let c = e.poll(t0).0.unwrap();
+        assert_eq!((c.pad, c.low, c.high, c.backstop_ms), (0, 0x1111, 0, 800));
+        assert_eq!((c.left_trigger, c.right_trigger), (0x8000, 0x4000));
+        // Handles released, triggers still driven: the old view reads (0, 0) — a stop for the
+        // motors it owns — while the new view keeps the triggers alive.
+        wire4(&mut e, t0 + ms(50), 0, 0, 0, 0x8000, 0x4000, Some(400));
+        let c = e.poll(t0 + ms(50)).0.unwrap();
+        assert_eq!((c.low, c.high), (0, 0));
+        assert_eq!((c.left_trigger, c.right_trigger), (0x8000, 0x4000));
+        assert_ne!(
+            c.backstop_ms, 0,
+            "not a stop command — the pad is still live"
+        );
+    }
+
+    /// The trigger levels ride the pad's ONE seq/lease/keepalive apparatus, so a Deck-class
+    /// actuator's re-kicks carry them unchanged — and the dedupe nudge still only ever moves
+    /// `low`, never a trigger level (which would be a device write the policy did not order).
+    #[test]
+    fn keepalives_carry_the_trigger_levels_and_only_nudge_low() {
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        let t0 = Instant::now();
+        wire4(&mut e, t0, 0, 100, 200, 300, 400, Some(400));
+        assert_eq!(drain4(&mut e, t0), vec![(100, 200, 300, 400)]);
+        assert_eq!(drain4(&mut e, t0 + ms(40)), vec![(101, 200, 300, 400)]);
+        assert_eq!(drain4(&mut e, t0 + ms(80)), vec![(100, 200, 300, 400)]);
+    }
+
+    /// The four-field re-derivation of the jitter proof (design §8): the reserved stop is now
+    /// all-four-zero, so the nudge must refuse only at `(1, 0, 0, 0)` — and must NOT refuse at
+    /// `(1, 0, lt, rt)`, where flipping the LSB is perfectly safe because the triggers keep the
+    /// command non-silent. A mechanical widening that kept testing `high` alone would get the
+    /// first case right and the second one wrong in the harmless direction; testing `(alt, high)`
+    /// against `(0, 0)` would get the first case wrong and send a Deck a stop nobody ordered.
+    #[test]
+    fn the_jitter_never_synthesizes_the_four_field_stop_sentinel() {
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        let t0 = Instant::now();
+        // (1, 0, 0, 0): the ONE level whose LSB flip is the reserved stop — step up instead.
+        wire(&mut e, t0, 0, 1, 0, Some(400));
+        assert_eq!(drain4(&mut e, t0), vec![(1, 0, 0, 0)]);
+        assert_eq!(drain4(&mut e, t0 + ms(40)), vec![(3, 0, 0, 0)]);
+        assert_eq!(drain4(&mut e, t0 + ms(80)), vec![(1, 0, 0, 0)]);
+        // (1, 0, lt, 0): a live trigger level, so the plain LSB flip to 0 is safe and taken.
+        let mut e = RumbleEngine::new();
+        e.set_quirks(0, DECK);
+        wire4(&mut e, t0, 0, 1, 0, 0x8000, 0, Some(400));
+        assert_eq!(drain4(&mut e, t0), vec![(1, 0, 0x8000, 0)]);
+        assert_eq!(drain4(&mut e, t0 + ms(40)), vec![(0, 0, 0x8000, 0)]);
+        assert_eq!(drain4(&mut e, t0 + ms(80)), vec![(1, 0, 0x8000, 0)]);
+    }
+
+    /// A pad still buzzing on the triggers alone must be silenced by the close drain — the same
+    /// contract the handles have, and the reason `close_drain` tests all four levels.
+    #[test]
+    fn close_drain_silences_a_trigger_only_pad() {
+        let mut e = RumbleEngine::new();
+        let t0 = Instant::now();
+        wire4(&mut e, t0, 2, 0, 0, 0, 0x9000, Some(400));
+        assert!(e.poll(t0).0.is_some());
+        assert_eq!(e.close_drain(), Some(cmd(2, 0, 0, 0)));
+        assert_eq!(e.close_drain(), None);
     }
 }

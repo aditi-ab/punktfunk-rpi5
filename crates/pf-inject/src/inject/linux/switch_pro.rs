@@ -173,7 +173,8 @@ impl SwitchProPad {
                             let _ = self.write_report(&build_usb_ack(cmd));
                         }
                         Some(SwitchOutput::Subcmd { id, args, rumble }) => {
-                            fb.rumble = Some(rumble);
+                            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+                            fb.rumble = Some((rumble.0, rumble.1, 0, 0));
                             if id == 0x30 {
                                 // Player lights ride the subcommand itself; still ack it.
                                 if let Some(&arg) = args.first() {
@@ -185,7 +186,7 @@ impl SwitchProPad {
                             }
                             self.answer_subcmd(id, &args);
                         }
-                        Some(SwitchOutput::Rumble(r)) => fb.rumble = Some(r),
+                        Some(SwitchOutput::Rumble(r)) => fb.rumble = Some((r.0, r.1, 0, 0)),
                         None => {}
                     }
                 }

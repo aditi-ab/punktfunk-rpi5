@@ -36,7 +36,9 @@ enum RumbleTuning {
     /// classic Xbox ERM rotor ignores it. On split-handle pads the wire's two motors render at
     /// distinct frequencies mirroring the real hardware they emulate — low/left ≈ the heavy
     /// low-frequency rotor, high/right ≈ the light buzzer; a single combined actuator keeps the
-    /// proven mid value.
+    /// proven mid value. The impulse-trigger motors are small and light — the same character as
+    /// the high/right buzzer — so they reuse `sharpnessHigh` rather than introduce a number
+    /// nobody has measured on real trigger hardware.
     static let sharpnessLow: Float = 0.3
     static let sharpnessHigh: Float = 0.7
     static let sharpnessCombined: Float = 0.5
@@ -140,9 +142,21 @@ final class RumbleRenderer: @unchecked Sendable {
     private var controller: GCController?
     private var low: Motor?
     private var high: Motor?
-    /// Wire-truth target (raw wire units) — the engine command's level, applied verbatim; the
-    /// core policy engine owns when it ends (explicit zero commands), so no deadline lives here.
-    private var target: (low: UInt16, high: UInt16) = (0, 0)
+    /// The two Xbox impulse-trigger motors, when the pad offers
+    /// `GCHapticsLocality.leftTrigger`/`.rightTrigger`. **Nil is the normal case** — every pad but
+    /// an Xbox One/Series/Elite has no such actuator, and the tree has already observed Xbox pads
+    /// on Apple exposing no haptics engine at all — so their absence is never logged and never
+    /// counts as a setup failure. Independent of the handle split: a pad may offer trigger
+    /// localities with or without split handles, and losing one does not implicate the other.
+    private var leftTrigger: Motor?
+    private var rightTrigger: Motor?
+    /// Wire-truth target (raw wire units) — the engine command's four levels, applied verbatim;
+    /// the core policy engine owns when it ends (explicit zero commands), so no deadline lives
+    /// here. The trigger levels are only ever non-zero against a Windows HID Xbox host pad; every
+    /// other backend on every OS lacks the channel entirely (XInput's `XINPUT_VIBRATION` and
+    /// evdev's `FF_RUMBLE` each carry exactly two magnitudes).
+    private var target: (low: UInt16, high: UInt16, leftTrigger: UInt16, rightTrigger: UInt16) =
+        (0, 0, 0, 0)
     /// Runs while anything is (or should be) audible: staleness watchdog, segment re-arm,
     /// throttled-level catch-up, engine rebuild after a reset, HID keepalive. Nil while silent,
     /// so an idle controller costs no timer wakeups and no radio traffic.
@@ -216,22 +230,28 @@ final class RumbleRenderer: @unchecked Sendable {
         }
     }
 
-    /// Set the wire-truth target. Called with every 0xCA state the host sends — level changes AND
-    /// renewals (v2) / 500 ms refreshes (legacy); both stamp liveness and, for v2, refresh the
-    /// self-termination deadline. `ttlMs` is the envelope lease in ms, or [`RumbleTuning.noTTL`]
-    /// against a legacy host (no lease → the staleness watchdog is the backstop). Renewals at an
-    /// unchanged level extend the deadline before the idempotence guard, so a held rumble never
-    /// lapses mid-effect.
-    func apply(low lowAmp: UInt16, high highAmp: UInt16) {
+    /// Set the wire-truth target: one policy-engine command's four motor levels, applied verbatim.
+    /// Called with every 0xCA state the host sends — level changes AND renewals — and the core
+    /// engine owns when a level ends (it emits explicit zero commands), so nothing here decides.
+    ///
+    /// `leftTrigger`/`rightTrigger` are the Xbox impulse-trigger motors. They default to zero so
+    /// handle-only callers (the debug test panel, the tuning tests) read unchanged, which is also
+    /// the wire's own rule: on a level-triggered plane an absent level is off, never "keep what
+    /// you had".
+    func apply(
+        low lowAmp: UInt16, high highAmp: UInt16, leftTrigger ltAmp: UInt16 = 0,
+        rightTrigger rtAmp: UInt16 = 0
+    ) {
         queue.async {
-            let active = lowAmp != 0 || highAmp != 0
+            let next = (lowAmp, highAmp, ltAmp, rtAmp)
+            let active = next != (0, 0, 0, 0)
             if active != self.wasActive {
                 self.wasActive = active
                 log.debug(
-                    "rumble: \(active ? "active" : "stop", privacy: .public) low=\(lowAmp, privacy: .public) high=\(highAmp, privacy: .public)")
+                    "rumble: \(active ? "active" : "stop", privacy: .public) low=\(lowAmp, privacy: .public) high=\(highAmp, privacy: .public) lt=\(ltAmp, privacy: .public) rt=\(rtAmp, privacy: .public)")
             }
-            guard (lowAmp, highAmp) != self.target else { return }
-            self.target = (lowAmp, highAmp)
+            guard next != self.target else { return }
+            self.target = next
             self.render()
         }
     }
@@ -241,7 +261,7 @@ final class RumbleRenderer: @unchecked Sendable {
         queue.sync {
             self.ticker?.cancel()
             self.ticker = nil
-            self.target = (0, 0)
+            self.target = (0, 0, 0, 0)
             self.wasActive = false
             self.teardown()
             self.closeHID()
@@ -256,7 +276,7 @@ final class RumbleRenderer: @unchecked Sendable {
         defer { updateTicker() }
         if renderHID() { return }
         guard !broken else { return }
-        let audible = target.low != 0 || target.high != 0
+        let audible = target != (0, 0, 0, 0)
         if audible, low == nil, high == nil, DispatchTime.now() >= retryAfter {
             setup()
         }
@@ -274,6 +294,18 @@ final class RumbleRenderer: @unchecked Sendable {
             let mixed = RumbleTuning.combined(low: target.low, high: target.high)
             ok = reconcile(&low, to: RumbleTuning.amplitude(mixed))
         }
+        // Impulse triggers: rendered ONLY where the hardware has the actuators, never folded into
+        // the handles. `reconcile` on a nil slot is a no-op returning true, so a pad without them
+        // silently drops the levels — which is the correct degrade and the common case.
+        //
+        // Their outcome is deliberately kept OUT of `ok`: a trigger engine erroring must not tear
+        // down the handle engines (which are what the pad's rumble mostly is) nor flip
+        // `preferCombined`, which is a statement about the handle split and nothing else. Nothing
+        // is orphaned by that — a failed reconcile leaves the slot's Motor in place, so the next
+        // tick simply retries it, and an engine that is genuinely dead fires its
+        // stopped/reset handler, which tears down all four slots for a lazy rebuild.
+        _ = reconcile(&leftTrigger, to: RumbleTuning.amplitude(target.leftTrigger))
+        _ = reconcile(&rightTrigger, to: RumbleTuning.amplitude(target.rightTrigger))
         if !ok {
             let wasSplit = high != nil
             teardown()
@@ -410,9 +442,11 @@ final class RumbleRenderer: @unchecked Sendable {
     /// The ticker runs only while something needs tending — any nonzero target (watchdog,
     /// throttle catch-up, HID keepalive, post-reset engine rebuild) or segments still alive.
     private func updateTicker() {
-        let needed = target != (0, 0)
+        let needed = target != (0, 0, 0, 0)
             || low?.current != nil || low?.retiring != nil
             || high?.current != nil || high?.retiring != nil
+            || leftTrigger?.current != nil || leftTrigger?.retiring != nil
+            || rightTrigger?.current != nil || rightTrigger?.retiring != nil
         if needed, ticker == nil {
             let t = DispatchSource.makeTimerSource(queue: queue)
             t.schedule(
@@ -477,6 +511,26 @@ final class RumbleRenderer: @unchecked Sendable {
                 preferCombined = true
                 log.info("rumble: split-handle engines failing — will retry with one combined engine")
             }
+            // Return before the trigger engines: the retry path re-enters setup() on the same
+            // `low == nil, high == nil` condition, so building them here would leak a fresh pair
+            // on every attempt (teardown() only runs on the failure paths above, and this is not
+            // one of them).
+            return
+        }
+        // Impulse-trigger motors, built last and best-effort. Independent of the handle split —
+        // the localities are separate and a pad can offer either, both or neither — and NOT part
+        // of the failure test above: nil here is the ordinary state of every pad that is not an
+        // Xbox One/Series/Elite, so it must not read as "engine setup failed", back off the handle
+        // engines, or produce a log line on a path that runs per controller attach.
+        //
+        // Whether a given pad + OS pair actually reports these localities is UNVERIFIED on glass.
+        // The degrade needs no code: `createEngine(withLocality:)` returns nil, the slots stay nil,
+        // and `reconcile` no-ops on them.
+        if localities.contains(.leftTrigger) {
+            leftTrigger = makeMotor(haptics, .leftTrigger, sharpness: RumbleTuning.sharpnessHigh)
+        }
+        if localities.contains(.rightTrigger) {
+            rightTrigger = makeMotor(haptics, .rightTrigger, sharpness: RumbleTuning.sharpnessHigh)
         }
     }
 
@@ -563,7 +617,7 @@ final class RumbleRenderer: @unchecked Sendable {
     }
 
     private func teardown() {
-        for m in [low, high].compactMap({ $0 }) {
+        for m in [low, high, leftTrigger, rightTrigger].compactMap({ $0 }) {
             // Disarm the handlers before stopping so stop() can't re-enter teardown via them.
             // (Both properties are non-optional closures on this SDK, so assign no-ops, not nil.)
             m.engine.stoppedHandler = { _ in }
@@ -577,6 +631,8 @@ final class RumbleRenderer: @unchecked Sendable {
         }
         low = nil
         high = nil
+        leftTrigger = nil
+        rightTrigger = nil
     }
 
     private func seconds(since t: DispatchTime) -> TimeInterval {
@@ -624,6 +680,16 @@ final class RumbleRenderer: @unchecked Sendable {
     /// Write the target to the DualSense over HID if that's the active backend; false → not a
     /// HID pad, so the caller renders via CoreHaptics. Deduped on the pad's 0...255 resolution,
     /// with a periodic keepalive re-write while nonzero (the ticker calls back in here).
+    ///
+    /// **The impulse-trigger levels are deliberately dropped here, and there is no mapping to
+    /// invent.** A DualSense has *adaptive* triggers — force resistance on a trigger you press,
+    /// driven by the separate 0xCD `HidOutput.Trigger` plane — and no trigger *motors*. The two
+    /// features are unrelated hardware that only share a word: an Xbox Series pad has trigger
+    /// motors and no adaptive triggers, a DualSense has the reverse. Routing wire trigger rumble
+    /// into either the DS5 rumble bytes (which are the two handles) or the adaptive-trigger
+    /// parameter block would fabricate feedback the game never asked for. This path returning
+    /// `true` also means a macOS DualSense never reaches the CoreHaptics trigger localities above,
+    /// which is correct for the same reason.
     private func renderHID() -> Bool {
         #if os(macOS)
         guard let hid = dualSenseHID else { return false }

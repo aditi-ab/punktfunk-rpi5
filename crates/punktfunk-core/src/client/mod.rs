@@ -1232,9 +1232,14 @@ impl NativeClient {
     /// the engine emits the level on every wire update (renewals re-arm duration-parameterized
     /// APIs), an explicit zero at lease expiry / legacy staleness / connection close, and
     /// quirk-declared keepalives ([`NativeClient::set_rumble_quirks`]). Apply commands verbatim:
-    /// `(0, 0)` = stop now; non-zero = run at this level, with `backstop_ms` as the safety-net
+    /// all-zero = stop now; non-zero = run at this level, with `backstop_ms` as the safety-net
     /// duration for APIs that take one. [`PunktfunkError::NoFrame`] on timeout;
     /// [`PunktfunkError::Closed`] once the session ended AND every close-drain stop was delivered.
+    ///
+    /// A command carries FOUR levels: the two handle motors plus the two Xbox impulse-trigger
+    /// motors ([`RumbleCommand`]). Render the trigger pair only on a pad that has trigger motors
+    /// (SDL: `has_rumble_triggers()`); dropping them otherwise is the correct degrade, and folding
+    /// them into a handle is specifically not — see [`RumbleCommand`] for why.
     ///
     /// One puller thread, and one API: an embedder uses EITHER this or
     /// `next_rumble`/`next_rumble_ttl` for a connection's lifetime, never both (both consume the

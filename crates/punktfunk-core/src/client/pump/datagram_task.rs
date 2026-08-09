@@ -91,8 +91,24 @@ pub(super) async fn run(
                         let ttl = u.envelope.map(|e| e.ttl_ms);
                         // Both consumers are fed; an embedder drains exactly one of them
                         // (the legacy queue, or the policy engine's command API).
+                        //
+                        // Only the policy engine carries `u.left_trigger`/`u.right_trigger` (the
+                        // v3 impulse-trigger tail). The legacy queue's tuple is the shape two
+                        // frozen C entry points read through fixed out-params
+                        // (`punktfunk_connection_next_rumble`/`_next_rumble2`), so it stays at the
+                        // two handle levels forever: an out-of-tree embedder on those symbols must
+                        // keep behaving exactly as it did. That is the §5 compatibility table's
+                        // "new host, old client" cell, and it is now a per-API property rather
+                        // than a per-client one — the same session can serve both.
                         let _ = rumble_tx.try_send((u.pad, u.low, u.high, ttl));
-                        rumble_feed.wire_update(u.pad, u.low, u.high, ttl);
+                        rumble_feed.wire_update(
+                            u.pad,
+                            u.low,
+                            u.high,
+                            u.left_trigger,
+                            u.right_trigger,
+                            ttl,
+                        );
                     }
                 }
             }

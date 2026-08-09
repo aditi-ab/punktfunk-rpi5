@@ -123,6 +123,21 @@ struct Pads {
     steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
+    /// The HID-visible Xbox pad ([`crate::inject::xbox_windows`]) — used INSTEAD of `xbox360`'s
+    /// XUSB companion when [`super::gamepad::windows_xbox_hid`] says so. Never both at once: two
+    /// devices for one wire pad is the "the game sees two controllers" bug.
+    ///
+    /// Three managers because the HID backend now has three IDENTITIES (Xbox Wireless `045E:0B13`,
+    /// Xbox One S `045E:02FD`, Elite Series 2 `045E:0B22`) and a manager is bound to one at
+    /// construction. They are otherwise the same backend — same codec, same report descriptor,
+    /// same rumble plane — so the split is purely so a mixed session can present, say, a Series
+    /// pad on slot 0 and an Elite on slot 1.
+    #[cfg(target_os = "windows")]
+    xbox_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
+    #[cfg(target_os = "windows")]
+    xbox_one_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
+    #[cfg(target_os = "windows")]
+    xbox_elite_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
     #[cfg(target_os = "windows")]
     dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -164,6 +179,12 @@ impl Pads {
             steamctrl2_puck: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
+            #[cfg(target_os = "windows")]
+            xbox_hid: None,
+            #[cfg(target_os = "windows")]
+            xbox_one_hid: None,
+            #[cfg(target_os = "windows")]
+            xbox_elite_hid: None,
             #[cfg(target_os = "windows")]
             dualsense_edge_win: None,
             #[cfg(target_os = "windows")]
@@ -291,6 +312,38 @@ impl Pads {
                 .steamdeck_win
                 .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
                 .handle(ev),
+            // The Xbox pads, as real HID devices rather than the XUSB companion. This is now the
+            // DEFAULT (see `windows_xbox_hid`; `PUNKTFUNK_XBOX_BACKEND=xusb` reverts it). It is no
+            // longer a trade: with the `xinputhid` bus filter the INF attaches, the HID pad keeps
+            // classic XInput AND gains everything XUSB never had — Steam, SDL, RawInput,
+            // DirectInput, `joy.cpl`, WGI — plus rumble, which the XUSB path could not source.
+            //
+            // Three arms, one per identity. The `windows_xbox_hid()` guard stays on each: with the
+            // escape hatch set, `degrade_xbox_identity` has already folded One/Elite to Xbox360, so
+            // only Xbox360 can reach here and it must fall through to the XUSB companion below.
+            #[cfg(target_os = "windows")]
+            GamepadPref::Xbox360 if super::gamepad::windows_xbox_hid() => self
+                .xbox_hid
+                .get_or_insert_with(crate::inject::xbox_windows::XboxWindowsManager::new)
+                .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::XboxOne if super::gamepad::windows_xbox_hid() => self
+                .xbox_one_hid
+                .get_or_insert_with(|| {
+                    crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                        crate::inject::xbox_windows::XboxWinProto::one_s(),
+                    )
+                })
+                .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::XboxElite if super::gamepad::windows_xbox_hid() => self
+                .xbox_elite_hid
+                .get_or_insert_with(|| {
+                    crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                        crate::inject::xbox_windows::XboxWinProto::elite(),
+                    )
+                })
+                .handle(ev),
             _ => self
                 .xbox360
                 .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
@@ -408,12 +461,18 @@ impl Pads {
     }
 
     /// Service feedback for every instantiated backend each cycle. `rumble` carries motor
-    /// force-feedback on the universal plane (every backend, tagged with its own pad index);
-    /// `hidout` carries rich feedback (lightbar / player LEDs / adaptive triggers) for the UHID/UMDF
-    /// pads. The `&mut` closure re-borrows satisfy `FnMut` for each backend.
+    /// force-feedback on the universal plane (every backend, tagged with its own pad index) as
+    /// `(pad, low, high, left_trigger, right_trigger)`; `hidout` carries rich feedback (lightbar /
+    /// player LEDs / adaptive triggers) for the UHID/UMDF pads. The `&mut` closure re-borrows
+    /// satisfy `FnMut` for each backend.
+    ///
+    /// Only the Windows HID Xbox backends (`xbox_hid` and its two identity siblings) can ever
+    /// report non-zero trigger levels — no
+    /// other backend's source packet has a field for them (see `PadFeedback::rumble`), so they pass
+    /// zeros and the v3 datagram they produce is a v2 datagram with a zero tail.
     fn pump(
         &mut self,
-        mut rumble: impl FnMut(u16, u16, u16),
+        mut rumble: impl FnMut(u16, u16, u16, u16, u16),
         mut hidout: impl FnMut(punktfunk_core::quic::HidOutput),
     ) {
         if let Some(m) = &mut self.xbox360 {
@@ -451,6 +510,19 @@ impl Pads {
         }
         #[cfg(target_os = "windows")]
         {
+            // All three HID Xbox identities. Rumble only — an Xbox pad has no rich-feedback plane
+            // (no lightbar / adaptive triggers), same as its XUSB sibling above. Missing one of
+            // these is silent: the pad works and simply never rumbles.
+            for m in [
+                &mut self.xbox_hid,
+                &mut self.xbox_one_hid,
+                &mut self.xbox_elite_hid,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                m.pump(&mut rumble, &mut hidout);
+            }
             if let Some(m) = &mut self.dualsense_win {
                 m.pump(&mut rumble, &mut hidout);
             }
@@ -731,26 +803,58 @@ const RUMBLE_STOP_BURST: u8 = 2;
 /// life of the connection because the client gates on it with a wrapping half-space compare and
 /// never resets its side (`punktfunk-core/src/client/pump/datagram_task.rs`). Resetting it here is
 /// the bug pinned by [`tests::rumble_seq_survives_a_removal_so_the_client_gate_accepts`].
-fn clear_pad_feedback(state: &mut (u16, u16), seen: &mut bool, stop_burst: &mut u8) {
-    *state = (0, 0);
+fn clear_pad_feedback(state: &mut RumbleLevels, seen: &mut bool, stop_burst: &mut u8) {
+    *state = (0, 0, 0, 0);
     *seen = false;
     *stop_burst = 0;
 }
 
+/// One pad's four motor levels as the 0xCA plane orders them:
+/// `(low, high, left_trigger, right_trigger)`, all `0..=0xFFFF`. Kept as one value rather than four
+/// parallel arrays because they are a single statement of the pad's feedback state at one instant —
+/// the same reason they share one `seq` and one TTL on the wire.
+type RumbleLevels = (u16, u16, u16, u16);
+
+/// Is this pad's feedback fully silent? **All four** motors, and that is the whole point of it
+/// being a named predicate rather than an inline comparison repeated at each site.
+///
+/// Every "is this pad quiet?" decision in the rumble path routes through here: whether to log the
+/// silent→active transition, whether to arm the post-stop burst, and — the one that decides
+/// whether the feature works at all — whether the envelope gets a live TTL or the `0` that means
+/// *stop*. Written as a two-field test, a trigger-only rumble (the normal shape of
+/// impulse-trigger content: racing titles drive the triggers continuously while the handles stay
+/// near-silent) is stamped `ttl = 0`, the client reads an already-expired lease and silences on
+/// arrival, and nothing anywhere logs an error. See
+/// [`tests::a_trigger_only_rumble_gets_a_live_ttl`].
+fn rumble_silent(lv: RumbleLevels) -> bool {
+    lv == (0, 0, 0, 0)
+}
+
 /// Send one rumble datagram on the universal 0xCA plane. `envelope_on` picks the self-terminating
-/// v2 form (`[level][seq][ttl_ms]`, the default) or the legacy v1 level datagram (the
-/// `PUNKTFUNK_RUMBLE_ENVELOPE=0` bisect hatch). Best-effort like every side-plane datagram.
+/// v3 form (`[level][seq][ttl_ms][trigger levels]`, the default) or the legacy v1 level datagram
+/// (the `PUNKTFUNK_RUMBLE_ENVELOPE=0` bisect hatch). Best-effort like every side-plane datagram.
+///
+/// v3 goes out **unconditionally** while the envelope is on — not "only when a trigger level is
+/// non-zero". A wire form that depends on history is how you get a bug that reproduces only after a
+/// specific sequence of events, and the four extra bytes cost nothing: a client that predates v3
+/// reads the 10-byte prefix and ignores them.
+///
+/// ⚠️ The bisect hatch drops to v1, which takes trigger rumble down with it (v1 has no tail at
+/// all). That is correct for a hatch whose job is to reproduce the pre-envelope wire, but it means
+/// "trigger rumble stopped working" is an expected symptom of setting it — do not bisect a trigger
+/// bug into this hatch and conclude the hatch fixed it.
 fn send_rumble(
     conn: &quinn::Connection,
     envelope_on: bool,
     pad: u16,
-    low: u16,
-    high: u16,
+    lv: RumbleLevels,
     seq: u8,
     ttl_ms: u16,
 ) {
+    let (low, high, lt, rt) = lv;
     let d: Vec<u8> = if envelope_on {
-        punktfunk_core::quic::encode_rumble_datagram_v2(pad, low, high, seq, ttl_ms).to_vec()
+        punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt)
+            .to_vec()
     } else {
         punktfunk_core::quic::encode_rumble_datagram(pad, low, high).to_vec()
     };
@@ -767,11 +871,14 @@ fn send_rumble(
 /// the session; the pointer/keyboard injector (and its portal grant) lives in the service,
 /// across sessions.
 ///
-/// Rumble is emitted as self-terminating 0xCA v2 envelopes (`[level][seq][ttl_ms]`): the host owns
-/// the timeline, renewing an active level every ~`RUMBLE_TTL_MS × 3/10` ms and letting an
-/// abandoned one expire client-side, so "stuck rumble" is inexpressible on the wire (see
-/// `punktfunk-planning/design/rumble-envelope-plan.md`). `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to
-/// legacy v1 level datagrams + the flat 500 ms refresh (bisect hatch).
+/// Rumble is emitted as self-terminating 0xCA v3 envelopes
+/// (`[level][seq][ttl_ms][trigger levels]`): the host owns the timeline, renewing an active level
+/// every ~`RUMBLE_TTL_MS × 3/10` ms and letting an abandoned one expire client-side, so "stuck
+/// rumble" is inexpressible on the wire (see `punktfunk-planning/design/rumble-envelope-plan.md`
+/// and `design/trigger-rumble-plane.md`). The four motors share one `seq` and one TTL, so the
+/// trigger pair inherits the whole envelope apparatus unchanged.
+/// `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to legacy v1 level datagrams + the flat 500 ms refresh
+/// (bisect hatch — which drops trigger rumble with it, see [`send_rumble`]).
 pub(super) fn input_thread(
     rx: std::sync::mpsc::Receiver<ClientInput>,
     conn: quinn::Connection,
@@ -792,14 +899,20 @@ pub(super) fn input_thread(
     // Last applied snapshot seq per pad (`None` until the first one): the reorder gate for
     // `InputKind::GamepadState` — a late datagram with an older seq must not roll held state back.
     let mut pad_seq: [Option<u8>; MAX_WIRE_PADS] = [None; MAX_WIRE_PADS];
-    // Rumble self-terminating envelopes (0xCA v2). Each non-zero level is authorized for
+    // Rumble self-terminating envelopes (0xCA v3). Each non-zero level is authorized for
     // `rumble_ttl_ms`; the host renews an active pad every `rumble_renew` and lets an abandoned
     // one expire on the client, so a dropped transition heals on the next renewal and a stop that
     // is lost heals via the stop burst (or the client's own TTL expiry). `rumble_seq` is the
     // per-pad wrapping reorder counter (bumped on changes AND renewals) the client gates on;
     // `rumble_stop_burst` counts the post-stop zero re-sends still owed. `PUNKTFUNK_RUMBLE_ENVELOPE=0`
     // reverts to legacy v1 datagrams re-sent flat every 500 ms.
-    let mut rumble_state = [(0u16, 0u16); MAX_WIRE_PADS];
+    //
+    // `rumble_state` holds ALL FOUR levels (see `RumbleLevels`), and every "is this pad silent?"
+    // test below is an all-four-zero test for one specific reason: a trigger-only rumble — the
+    // normal shape of impulse-trigger content, since racing titles drive the triggers continuously
+    // against near-silent handles — would otherwise be stamped `ttl = 0`, which the client reads as
+    // an instantly-expired lease. That is trigger rumble that never plays, with no error anywhere.
+    let mut rumble_state = [(0u16, 0u16, 0u16, 0u16); MAX_WIRE_PADS];
     let mut rumble_seen = [false; MAX_WIRE_PADS];
     let mut rumble_seq = [0u8; MAX_WIRE_PADS];
     let mut rumble_stop_burst = [0u8; MAX_WIRE_PADS];
@@ -1014,43 +1127,50 @@ pub(super) fn input_thread(
         // EVIOCSFF, and HID handshakes must be answered promptly). Rumble → the universal 0xCA
         // plane; rich/raw HID feedback → 0xCD.
         pads.pump(
-            |pad, low, high| {
+            |pad, low, high, lt, rt| {
+                let lv: RumbleLevels = (low, high, lt, rt);
+                let silent = rumble_silent(lv);
                 let idx = pad as usize;
                 if idx < MAX_WIRE_PADS {
                     let prev = rumble_state[idx];
                     // Log the silent→active transition (once per buzz) so a live test can tell
                     // "host never gets rumble from the game" apart from "client doesn't render it".
-                    if prev == (0, 0) && (low != 0 || high != 0) {
-                        tracing::debug!(pad, low, high, "rumble: forwarding to client (0xCA)");
+                    // It carries `lt`/`rt` because it is the attribution line for exactly the
+                    // trigger case too — without them a "triggers never buzzed" report cannot be
+                    // split into "the host never saw them" and "the client never rendered them".
+                    if rumble_silent(prev) && !silent {
+                        tracing::debug!(
+                            pad,
+                            low,
+                            high,
+                            lt,
+                            rt,
+                            "rumble: forwarding to client (0xCA)"
+                        );
                     }
-                    rumble_state[idx] = (low, high);
+                    rumble_state[idx] = lv;
                     rumble_seen[idx] = true;
                     // Bump the reorder counter on every change, then arm the stop burst on a
                     // transition to zero (so a lost stop still reaches a legacy client) and clear
                     // it when the game re-asserts a non-zero level.
                     rumble_seq[idx] = rumble_seq[idx].wrapping_add(1);
-                    if (low, high) == (0, 0) {
-                        rumble_stop_burst[idx] = if prev != (0, 0) { RUMBLE_STOP_BURST } else { 0 };
+                    if silent {
+                        rumble_stop_burst[idx] = if !rumble_silent(prev) {
+                            RUMBLE_STOP_BURST
+                        } else {
+                            0
+                        };
                     } else {
                         rumble_stop_burst[idx] = 0;
                     }
-                    let ttl = if (low, high) == (0, 0) {
-                        0
-                    } else {
-                        rumble_ttl_ms
-                    };
-                    send_rumble(
-                        &conn,
-                        rumble_envelope_on,
-                        pad,
-                        low,
-                        high,
-                        rumble_seq[idx],
-                        ttl,
-                    );
+                    // A pad with ANY of its four motors asserted gets a live lease. Testing only
+                    // `(low, high)` here would stamp a trigger-only rumble `ttl = 0` — an
+                    // already-expired lease the client silences on arrival.
+                    let ttl = if silent { 0 } else { rumble_ttl_ms };
+                    send_rumble(&conn, rumble_envelope_on, pad, lv, rumble_seq[idx], ttl);
                 } else {
                     // Out-of-range pad (a backend never produces these) — forward without gating.
-                    send_rumble(&conn, rumble_envelope_on, pad, low, high, 0, rumble_ttl_ms);
+                    send_rumble(&conn, rumble_envelope_on, pad, lv, 0, rumble_ttl_ms);
                 }
             },
             |h| {
@@ -1070,27 +1190,21 @@ pub(super) fn input_thread(
                     if !rumble_seen[i] {
                         continue;
                     }
-                    let (low, high) = rumble_state[i];
-                    if (low, high) != (0, 0) {
+                    let lv = rumble_state[i];
+                    if !rumble_silent(lv) {
                         rumble_seq[i] = rumble_seq[i].wrapping_add(1);
-                        send_rumble(
-                            &conn,
-                            true,
-                            i as u16,
-                            low,
-                            high,
-                            rumble_seq[i],
-                            rumble_ttl_ms,
-                        );
+                        send_rumble(&conn, true, i as u16, lv, rumble_seq[i], rumble_ttl_ms);
                     } else if rumble_stop_burst[i] > 0 {
                         rumble_stop_burst[i] -= 1;
                         rumble_seq[i] = rumble_seq[i].wrapping_add(1);
-                        send_rumble(&conn, true, i as u16, 0, 0, rumble_seq[i], 0);
+                        send_rumble(&conn, true, i as u16, (0, 0, 0, 0), rumble_seq[i], 0);
                     }
                 }
             } else {
-                // Legacy: re-send the current level of every seen pad every 500 ms (v1).
-                for (i, &(low, high)) in rumble_state.iter().enumerate() {
+                // Legacy: re-send the current level of every seen pad every 500 ms (v1). The
+                // trigger levels are dropped here by construction — v1 has no tail (see
+                // `send_rumble`).
+                for (i, &(low, high, _, _)) in rumble_state.iter().enumerate() {
                     if rumble_seen[i] {
                         let d = punktfunk_core::quic::encode_rumble_datagram(i as u16, low, high);
                         let _ = conn.send_datagram(d.to_vec().into());
@@ -1259,11 +1373,12 @@ mod tests {
         assert_eq!(gate, Some(100));
 
         // The pad is unplugged mid-buzz: the lease is cleared, the counter is not.
-        let (mut state, mut seen, mut burst) = ((0x1234u16, 0x5678u16), true, RUMBLE_STOP_BURST);
+        let (mut state, mut seen, mut burst) =
+            ((0x1234, 0x5678, 0x9ABC, 0xDEF0), true, RUMBLE_STOP_BURST);
         clear_pad_feedback(&mut state, &mut seen, &mut burst);
         assert_eq!(
             (state, seen, burst),
-            ((0, 0), false, 0),
+            ((0, 0, 0, 0), false, 0),
             "lease not cleared"
         );
 
@@ -1304,5 +1419,50 @@ mod tests {
         assert!(s.apply(&gp(InputKind::GamepadAxis, AXIS_LT, 9_999, 0)));
         assert_eq!(s.left_trigger, 255);
         assert!(!s.apply(&gp(InputKind::GamepadAxis, 42, 1, 0)));
+    }
+
+    /// The single most likely way to ship trigger rumble broken (design/trigger-rumble-plane.md
+    /// §5): a rumble that drives ONLY the impulse triggers must still get a live lease.
+    ///
+    /// The pre-existing silence test was `(low, high) == (0, 0)`, and a trigger-only level passes
+    /// it. Stamped `ttl = 0`, the envelope reaches the client as an already-expired lease, which
+    /// it silences on arrival — trigger rumble that never plays, with no error on either side.
+    /// Drives the real predicate and the real encoder/decoder pair, so it fails if either moves.
+    #[test]
+    fn a_trigger_only_rumble_gets_a_live_ttl() {
+        use punktfunk_core::quic::{decode_rumble_envelope, encode_rumble_datagram_v3};
+
+        // What a racing title's impulse-trigger stream looks like: handles at rest throughout.
+        let trigger_only: RumbleLevels = (0, 0, 0x8000, 0);
+        assert!(
+            !rumble_silent(trigger_only),
+            "a trigger-only level was read as silence — the ttl=0 trap"
+        );
+        let ttl = if rumble_silent(trigger_only) {
+            0
+        } else {
+            RUMBLE_TTL_MS
+        };
+        let d = encode_rumble_datagram_v3(0, 0, 0, 1, ttl, trigger_only.2, trigger_only.3);
+        let u = decode_rumble_envelope(&d).expect("v3 envelope decodes");
+        assert_eq!(
+            u.envelope.expect("v3 carries the v2 tail").ttl_ms,
+            RUMBLE_TTL_MS,
+            "trigger-only rumble was stamped with a dead lease"
+        );
+        assert_eq!((u.left_trigger, u.right_trigger), (0x8000, 0));
+        assert_eq!((u.low, u.high), (0, 0), "handles stay at rest");
+
+        // The reserved stop is still expressible, and is still the ONLY thing that gets ttl = 0.
+        assert!(rumble_silent((0, 0, 0, 0)));
+        for lv in [
+            (1, 0, 0, 0),
+            (0, 1, 0, 0),
+            (0, 0, 1, 0),
+            (0, 0, 0, 1),
+            (0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF),
+        ] {
+            assert!(!rumble_silent(lv), "{lv:?} must not read as a stop");
+        }
     }
 }

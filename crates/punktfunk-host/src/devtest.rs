@@ -270,8 +270,10 @@ pub fn switchpro_test(args: &[String]) -> Result<()> {
     let (mut i, mut last_write) = (0i32, Instant::now());
     while Instant::now() < deadline {
         let fb = pad.service(0);
-        if let Some((low, high)) = fb.rumble {
-            println!("  rumble from kernel/game: low={low} high={high}");
+        // `lt`/`rt` are structurally always zero here — a Switch Pro has no trigger motors —
+        // but this harness reads the shared `PadFeedback`, so it prints all four levels.
+        if let Some((low, high, lt, rt)) = fb.rumble {
+            println!("  rumble from kernel/game: low={low} high={high} lt={lt} rt={rt}");
         }
         for o in fb.hidout {
             println!("  hid output from kernel/game: {o:?}");
@@ -364,6 +366,16 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         .unwrap_or(0);
     let ds4 = args.iter().any(|a| a == "--ds4");
     let xbox = args.iter().any(|a| a == "--xbox");
+    // `--xboxhid` drives the HID Xbox backend (device-type 4) instead of `--xbox`'s XUSB companion.
+    let xboxhid = args.iter().any(|a| a == "--xboxhid");
+    // The other two HID Xbox identities (device-types 5 and 6). Same backend, same report
+    // descriptor — only VID/PID, product string and hardware id differ — so these legs exist for
+    // exactly one question each: does Windows PROMOTE that PID the way it promotes `0B13`?
+    // `02FD` in particular has no stage-2 `HID\…&IG_00` line in Microsoft's `xinputhid.inf`, so
+    // it is the one worth watching. Check for the `IG_00` token, the XUSB interface, an XInput
+    // slot and rumble, exactly as the `--xboxhid` run did.
+    let xboxones = args.iter().any(|a| a == "--xboxones");
+    let xboxelite = args.iter().any(|a| a == "--xboxelite");
     // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
     // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
     // report byte 10 (0x80|0x40) next to Cross. `--deck` drives the Steam Deck backend
@@ -386,6 +398,23 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                 capabilities: 0,
                 audio_caps: 0,
             });
+            // 🛑 Never announce a pad that was not built. The arrival above only ASKS for one; a
+            // failed create logs an ERROR and leaves the slot empty, and this harness would then
+            // cheerfully print "virtual X up" and stream frames into nothing for `secs` seconds.
+            // Every probe the operator runs next (joy.cpl, XInputGetState, a WGI enumeration) still
+            // finds a device on this index — the one the OTHER process owns — so the run produces a
+            // plausible, wrong measurement instead of a failure. That happened on `.173`
+            // (2026-08-09): the host service held pad 0, the create was denied, and a frozen XInput
+            // packet count off the incumbent pad was read as a result. A harness that cannot build
+            // its own device has nothing to measure, so stop.
+            if mgr.live_pads() == 0 {
+                anyhow::bail!(
+                    "no virtual {} was created at index {idx} — see the ERROR above for the \
+                     cause. NOT measuring: any device answering on this index belongs to another \
+                     process (a live session's pad), and reading it would look like a result.",
+                    $label
+                );
+            }
             println!(
                 "virtual {} up — cycling Cross + sweeping the left stick for {secs}s. Watch \
                  it in joy.cpl / Steam / a game; any feedback the game sends prints below.",
@@ -395,7 +424,9 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             let (mut i, mut last) = (0i32, Instant::now());
             while Instant::now() < deadline {
                 mgr.pump(
-                    |pad, lo, hi| println!("  rumble from game: pad={pad} low={lo} high={hi}"),
+                    |pad, lo, hi, lt, rt| println!(
+                        "  rumble from game: pad={pad} low={lo} high={hi} lt={lt} rt={rt}"
+                    ),
                     |o| println!("  hid output from game: {o:?}"),
                 );
                 if last.elapsed() >= Duration::from_millis(400) {
@@ -406,17 +437,28 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                     } else {
                         0
                     };
-                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    // 🛑 Sweep EVERY analogue axis, each on its own phase, and ramp both triggers.
+                    //
+                    // This used to drive LS-X alone and leave the other five at zero, which makes
+                    // the harness unable to tell "this axis is not mapped" from "nothing is driving
+                    // it" — the two look identical in any consumer. That is exactly how a DEAD
+                    // RIGHT STICK survived every bench measurement of the Windows HID Xbox pad and
+                    // was found only on glass (2026-08-09): `XInputGetState` read `RX [0..0]` and it
+                    // was written off as "the devtest doesn't move it", which was true and useless.
+                    // Distinct phases mean one run tells you which axes arrive AND that they are not
+                    // crosstalking onto each other's bytes.
+                    let phase = |off: i32| ((((i + off) % 64) - 32) * 1024) as i16;
+                    let trig = ((i % 32) * 8).clamp(0, 255) as u8;
                     mgr.handle(&GamepadEvent::State(GamepadFrame {
                         index: idx as i16,
                         active_mask: 1 << idx,
                         buttons,
-                        left_trigger: 0,
-                        right_trigger: 0,
-                        ls_x: lx,
-                        ls_y: 0,
-                        rs_x: 0,
-                        rs_y: 0,
+                        left_trigger: trig,
+                        right_trigger: 255 - trig,
+                        ls_x: phase(0),
+                        ls_y: phase(16),
+                        rs_x: phase(32),
+                        rs_y: phase(48),
                     }));
                 }
                 std::thread::sleep(Duration::from_millis(15));
@@ -433,6 +475,13 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             capabilities: 0,
             audio_caps: 0,
         });
+        // Same guard as the `drive!` macro's — see the long note there.
+        if mgr.live_pads() == 0 {
+            anyhow::bail!(
+                "no virtual Xbox 360 (XUSB) was created at index {idx} — see the ERROR above. NOT \
+                 measuring: a device answering on this index belongs to another process."
+            );
+        }
         println!(
             "virtual Xbox 360 (XUSB) up — sweeping LS + toggling A for {secs}s. Check with \
              an XInput game or xinputtest.exe."
@@ -440,8 +489,10 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut t = 0i32;
         while Instant::now() < deadline {
-            mgr.pump_rumble(|pad, lo, hi| {
-                println!("  rumble from game: pad={pad} low={lo} high={hi}")
+            // `lt`/`rt` are structurally always zero on XUSB (see `pump_rumble`); printed so
+            // the harness output is comparable line-for-line with the HID Xbox backend's.
+            mgr.pump_rumble(|pad, lo, hi, lt, rt| {
+                println!("  rumble from game: pad={pad} low={lo} high={hi} lt={lt} rt={rt}")
             });
             t += 1;
             let lx = (((t % 200) - 100) * 327).clamp(-32768, 32767) as i16; // sweep ±32700
@@ -463,6 +514,30 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             }));
             std::thread::sleep(Duration::from_millis(15));
         }
+    } else if xboxhid {
+        // The HID Xbox pad (device-type 4) — the SHIPPING SwDeviceCreate identity, not a devgen
+        // node. That distinction is the whole point of this leg: a devgen devnode carries no USB
+        // hardware ids, so its HID child comes up `HID\VID_045E&UP:0001_U:0005` with no PID token,
+        // and the question this exists to answer — does Windows promote our pad to an Xbox-profile
+        // device (an `IG_` token, XInput, WGI `Gamepad`) — turns on exactly that PID being present.
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::new(),
+            "Xbox Wireless Controller (HID)"
+        );
+    } else if xboxones {
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                crate::inject::xbox_windows::XboxWinProto::one_s()
+            ),
+            "Xbox One S Controller (HID, 045E:02FD)"
+        );
+    } else if xboxelite {
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::with_backend(
+                crate::inject::xbox_windows::XboxWinProto::elite()
+            ),
+            "Xbox Elite Wireless Controller Series 2 (HID, 045E:0B22)"
+        );
     } else if ds4 {
         drive!(
             crate::inject::dualshock4_windows::DualShock4WindowsManager::new(),

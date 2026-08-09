@@ -232,7 +232,8 @@ impl PadProto for Ds4WinProto {
     fn service(&self, pad: &mut Ds4WinPad, idx: u8) -> PadFeedback {
         let fb = pad.service();
         PadFeedback {
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb
                 .led
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })

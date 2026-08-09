@@ -1,7 +1,8 @@
 ;/*++
 ; punktfunk virtual gamepads — UMDF2 HID minidriver INF.
-; One package, four hardware ids: DualSense, DualShock 4, DualSense Edge, Steam Deck — which is why
-; the package is called pf_gamepad and not pf_dualsense (it never was one identity).
+; One package, seven hardware ids: DualSense, DualShock 4, DualSense Edge, Steam Deck, and three
+; Xbox pads (Wireless / One S / Elite Series 2) — which is why the package is called pf_gamepad and
+; not pf_dualsense (it never was one identity).
 ;
 ; ⚠️ The HARDWARE IDS below deliberately keep their old names (`pf_dualsense`, `pf_dualshock4`,
 ; `pf_dualsenseedge`, `pf_steamdeck`). They are the binding contract with every devnode the host
@@ -34,10 +35,12 @@ pf_gamepad.dll=1
 [pf.NT$ARCH$.10.0...22000]
 ; Hardware ids: `root\pf_dualsense` for a root-enumerated devnode (devgen/devcon tests); `pf_dualsense`
 ; for the host's SwDeviceCreate'd DualSense (the `root\` prefix is reserved for root enumeration, so
-; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` / `pf_steamdeck`
-; for the host's other virtual pads — ONE driver binds all of them (every model line below installs
-; the same `pfGamepad` section) and serves the matching HID identity per the device_type byte the
-; host stamps into shared memory.
+; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` /
+; `pf_steamdeck` / `pf_xboxwireless` / `pf_xboxones` / `pf_xboxelite` for the host's other virtual
+; pads — ONE driver binds all of them and serves the matching HID identity per the device_type byte
+; the host stamps into shared memory. TWO install sections, though: the PlayStation/Deck ids share
+; `pfGamepad`, and the three Xbox ids install `pfGamepadXbox`, which additionally attaches the
+; `xinputhid` bus filter (see the ⚠️ below the Deck line).
 ;
 ; Each id carries its OWN description: Device Manager reads this string, and a single shared
 ; "Virtual DualSense" made an emulated DualShock 4 look like the controller-type setting had been
@@ -47,6 +50,19 @@ pf_gamepad.dll=1
 %DeviceDescDS4%=pfGamepad, pf_dualshock4
 %DeviceDescEdge%=pfGamepad, pf_dualsenseedge
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
+; ⚠️ The Xbox lines install their OWN section, `pfGamepadXbox`, and must keep doing so. Every other
+; identity shares `pfGamepad`; the Xbox ones additionally attach the `xinputhid` bus filter, and
+; putting that on a DualSense / DualShock 4 / Edge / Steam Deck would hand a PlayStation pad to
+; Microsoft's Xbox translator. The two sections are otherwise identical — keep them in step.
+; (`only_the_xbox_identity_installs_the_xinputhid_section`, in pf-inject, asserts both directions.)
+;
+; The three Xbox identities differ ONLY in hardware id, Device Manager description and the VID/PID
+; + product string the driver serves off the resulting device_type — they share one report
+; descriptor and one install section, because in HID terms they are the same pad. See the
+; `XBOX_RDESC` header in src/lib.rs for why that sharing is deliberate.
+%DeviceDescXbox%=pfGamepadXbox, root\pf_xboxwireless, pf_xboxwireless
+%DeviceDescXboxOneS%=pfGamepadXbox, root\pf_xboxones, pf_xboxones
+%DeviceDescXboxElite%=pfGamepadXbox, root\pf_xboxelite, pf_xboxelite
 
 [pfGamepad.NT]
 CopyFiles=UMDriverCopy
@@ -82,6 +98,77 @@ UmdfFsContextUsePolicy=CanUseFsContext2
 ; across multiple simultaneous controllers (multi-pad).
 UmdfHostProcessSharing=ProcessSharingDisabled
 
+; ---------------------------------------------------------------------------------------------
+; The Xbox identity: `pfGamepad` plus the two registry values that make Windows PROMOTE the pad.
+;
+; Measured on .173, 2026-08-09. Without these, our HID Xbox pad is invisible to classic XInput and
+; to WGI `Gamepad`, and gets no rumble — the exact field symptom that started this work. With them
+; the HID child gains the `IG_00` token, an XUSB interface appears, XInput reads it (full stick
+; range and buttons) and `XInputSetState` rumble arrives back as HID output report 0x03.
+;
+; ⭐ Both values come straight out of Microsoft's own `xinputhid.inf`, which promotes Xbox pads by
+; an explicit hardware-id ALLOW-LIST (its own comment: "we can not use a Compatability ID … and so
+; rely on individual hardware IDs"). A software-enumerated devnode can never match those ids, so we
+; write what the matching install sections would have written. `045E:0B13`, the PID this identity
+; claims, is on that allow-list — twice.
+;
+; 🛑 THE PAIRING IS LOAD-BEARING AND THE TWO VALUES GO IN DIFFERENT KEYS. An A/B on the live box:
+; removing `DevicePropertyFlags` alone reverts ALL of it — no `IG_00`, no XUSB interface, no XInput,
+; no WGI entry — while `UpperFilters` alone is completely inert. `DevicePropertyFlags = 1` is
+; `BusDevice` in `xinputhid.h`, which Microsoft's comment glosses as "a focused bus filter driver
+; for the IG_ problem". It is not a description of the device; it is the switch that tells the
+; filter what job to do. An earlier session installed the filter WITHOUT it, measured a device that
+; produced nothing, and concluded the filter was broken and must never ship. It was not broken; it
+; had never been switched on.
+;
+; ⚠️ Both go on THIS node — the parent/transport devnode — not on the HID child. That is where a
+; real Xbox pad carries them: the Elite's Bluetooth transport node has `DevicePropertyFlags=1` and
+; the filter, while its HID child has plain `input.inf` and neither.
+[pfGamepadXbox.NT]
+CopyFiles=UMDriverCopy
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT
+; HKR in a DDInstall section is the SOFTWARE (driver) key — Control\Class\{...}\<NNNN>.
+AddReg=pfGamepadXbox_SW_AddReg
+
+[pfGamepadXbox.NT.hw]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.hw
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.hw
+; HKR in a .HW section is the HARDWARE (device) key — Enum\<instance>.
+AddReg=pfGamepadXbox_HW_AddReg
+
+[pfGamepadXbox.NT.Services]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.Services
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Services
+
+[pfGamepadXbox.NT.Filters]
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Filters
+
+[pfGamepadXbox.NT.Wdf]
+UmdfService="pf_gamepad", pf_gamepad_Install
+UmdfServiceOrder=pf_gamepad
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction=Copy
+UmdfFsContextUsePolicy=CanUseFsContext2
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[pfGamepadXbox_SW_AddReg]
+; 1 = BusDevice. See the block above — this is the half that actually does the work.
+HKR,,"DevicePropertyFlags",0x00010001,1
+
+[pfGamepadXbox_HW_AddReg]
+; 0x00010008 = REG_MULTI_SZ | APPEND, matching xinputhid.inf: append rather than replace, so we
+; never clobber a filter someone else put on the stack.
+HKR,,"UpperFilters",0x00010008,"xinputhid"
+
 [pf_gamepad_Install]
 UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary="%13%\pf_gamepad.dll"
@@ -100,3 +187,10 @@ DeviceDesc         ="Punktfunk Virtual DualSense"
 DeviceDescDS4      ="Punktfunk Virtual DualShock 4"
 DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
 DeviceDescDeck     ="Punktfunk Virtual Steam Deck Controller"
+DeviceDescXbox     ="Punktfunk Virtual Xbox Wireless Controller"
+; ⚠️ This one deliberately does NOT match the product string the driver serves for device_type 5.
+; A real Xbox One S pad reports "Xbox Wireless Controller" over Bluetooth, exactly like the Series
+; X|S pad above — the PID is the only thing that separates them on the wire. Device Manager,
+; however, has to let a human tell our two virtual pads apart, and this string is ours to choose.
+DeviceDescXboxOneS ="Punktfunk Virtual Xbox One S Controller"
+DeviceDescXboxElite="Punktfunk Virtual Xbox Elite Wireless Controller Series 2"

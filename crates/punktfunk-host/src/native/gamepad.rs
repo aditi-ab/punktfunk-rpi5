@@ -41,7 +41,7 @@ pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
         cfg!(target_os = "linux"),
         cfg!(target_os = "windows"),
     );
-    degrade_steam_on_conflict(degrade_if_no_uhid(chosen))
+    degrade_xbox_identity(degrade_steam_on_conflict(degrade_if_no_uhid(chosen)))
 }
 
 /// Pure selection of the session's virtual-gamepad backend: the client's explicit `pref` wins,
@@ -49,9 +49,18 @@ pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
 ///
 /// `linux`/`windows` flag the host platform. DualSense and DualShock 4 each have both a Linux (UHID
 /// hid-playstation) and a Windows (UMDF minidriver) backend; on any other platform such a wish degrades
-/// to X-Box 360 (never an error: a session without rich pads still streams). X-Box One/Series is a
-/// distinct uinput *identity* on Linux, but XInput-identical to the 360 pad on Windows (the XUSB
-/// companion presents a 360 identity), so it degrades to `Xbox360` there.
+/// to X-Box 360 (never an error: a session without rich pads still streams).
+///
+/// The X-Box identities are now distinct on BOTH platforms: a uinput identity on Linux (360 /
+/// One S), and a UMDF HID identity on Windows (360 → `045E:0B13`, One → `045E:02FD`, Elite →
+/// `045E:0B22`). The Windows fold of One/Series into the 360 pad is gone with the reason for it —
+/// it existed because the only Windows X-Box backend was the XUSB companion, which presents one
+/// fixed 360 identity and cannot vary it. The Elite has no Linux identity (`PadIdentity` stops at
+/// One S), so it folds there.
+///
+/// ⚠️ **This is compile-time only.** `PUNKTFUNK_XBOX_BACKEND=xusb` puts Windows back on the
+/// companion at RUNTIME, which un-varies the identity again — that is [`degrade_xbox_identity`]'s
+/// job, not this function's.
 fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool) -> GamepadPref {
     let want = match pref {
         GamepadPref::Auto => env
@@ -63,9 +72,12 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // DualSense / DualShock 4: Linux UHID hid-playstation, or the Windows UMDF minidriver backend.
         GamepadPref::DualSense if linux || windows => GamepadPref::DualSense,
         GamepadPref::DualShock4 if linux || windows => GamepadPref::DualShock4,
-        // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
-        // Windows (XInput can't tell them apart anyway).
-        GamepadPref::XboxOne if linux => GamepadPref::XboxOne,
+        // One/Series: a real, distinct uinput identity on Linux, and — since the HID X-Box backend
+        // became the default — a distinct UMDF HID identity (`045E:02FD`) on Windows too.
+        GamepadPref::XboxOne if linux || windows => GamepadPref::XboxOne,
+        // Elite Series 2: Windows-only (UMDF device-type 6, `045E:0B22`). There is no Linux uinput
+        // Elite identity to fold onto, so it takes the `_` arm and lands on the 360 pad there.
+        GamepadPref::XboxElite if windows => GamepadPref::XboxElite,
         // Steam Deck / classic Steam Controller: Linux UHID hid-steam (Windows Steam devices
         // are the N4 spike).
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
@@ -221,6 +233,75 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
+/// Runtime degrade for the two non-default Windows X-Box identities (One S / Elite Series 2): with
+/// `PUNKTFUNK_XBOX_BACKEND=xusb` the session runs the XUSB companion, which presents ONE fixed
+/// X-Box 360 identity and has no way to vary VID/PID — so the pad a player gets is a 360 pad no
+/// matter what was asked for. Fold here so the `Welcome` echo says so.
+///
+/// This is a runtime check and [`pick_gamepad`] is a compile-time one, which is exactly the split
+/// [`degrade_if_no_uhid`] already draws. Without it, asking for an Elite under the escape hatch
+/// resolves to `xboxelite`, echoes `xboxelite`, and builds a 360 pad — the class of silent lie
+/// `pad_motion_reaches` and the fold-logging in [`resolve_gamepad`] exist to prevent.
+///
+/// A no-op on every non-Windows host: `XboxElite` never survives `pick_gamepad` there, and
+/// `XboxOne` is a genuine uinput identity on Linux.
+#[cfg(target_os = "windows")]
+fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
+    if matches!(chosen, GamepadPref::XboxOne | GamepadPref::XboxElite) && !windows_xbox_hid() {
+        tracing::warn!(
+            wanted = chosen.as_str(),
+            "PUNKTFUNK_XBOX_BACKEND=xusb selects the XUSB companion, which has one fixed X-Box 360 \
+             identity — falling back to the 360 pad"
+        );
+        return GamepadPref::Xbox360;
+    }
+    chosen
+}
+
+#[cfg(not(target_os = "windows"))]
+fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
+    chosen
+}
+
+/// Whether an Xbox-family pad should be built as a real **HID** device
+/// ([`crate::inject::xbox_windows`]) instead of the **XUSB** companion
+/// ([`crate::inject::gamepad`]). Windows only. **HID is the default**; set
+/// `PUNKTFUNK_XBOX_BACKEND=xusb` to go back to the companion.
+///
+/// **Why HID is now the default.** The XUSB companion registers only `GUID_DEVINTERFACE_XUSB` and
+/// exposes no HID collection, so Steam's hidapi enumeration, DirectInput, `joy.cpl` and
+/// WGI/GameInput cannot see it at all — only classic `XInputGetState` via xinput1_4's interface walk
+/// does. That is what left a reporter with a dead controller for two weeks (2026-08-09) until they
+/// switched the client to DualSense, a real HID pad.
+///
+/// This was an opt-in knob for exactly one reason: the HID pad could not reach classic XInput, so
+/// defaulting to it would have traded a known-working path for an unproven one. **That objection is
+/// gone.** `pf_gamepad.inx`'s `pfGamepadXbox` section now attaches the `xinputhid` bus filter
+/// (`UpperFilters` + `DevicePropertyFlags=1`), and with it the HID pad is promoted exactly like real
+/// hardware: measured on `.173` 2026-08-09 it gains the `IG_00` token and an XUSB interface, classic
+/// XInput reads it live (full stick range and buttons), `XInputSetState` rumble round-trips, and it
+/// keeps everything the XUSB companion never had — Steam, SDL, RawInput, DirectInput, `joy.cpl`.
+/// ⇒ the HID backend is now a **superset** of the XUSB one, which is the condition the old comment
+/// set for flipping.
+///
+/// ⚠️ `xusb` stays as an escape hatch because the promotion depends on Microsoft's inbox
+/// `xinputhid.inf` and its hardware-id allow-list. If a Windows servicing update changes that, or a
+/// box has a third-party filter on the stack, one env var restores the previous behaviour without a
+/// reinstall.
+///
+/// The two backends are mutually exclusive per pad by construction (one match arm or the other) —
+/// presenting both would hand a game two controllers for one pair of hands.
+#[cfg(target_os = "windows")]
+pub(super) fn windows_xbox_hid() -> bool {
+    match std::env::var("PUNKTFUNK_XBOX_BACKEND") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("xusb") => false,
+        // Anything else — unset, empty, "hid", or a typo — takes the default. A misspelled opt-out
+        // silently landing on the OLD path is the worse failure: it is invisible, and it is the
+        // path with no HID collection.
+        _ => true,
+    }
+}
+
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
@@ -239,6 +320,9 @@ pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
     // Steam controller — its own Steam Input would then manage two Decks (confirmed conflict-prone on
     // a Deck-as-host). `PUNKTFUNK_STEAM_FORCE=1` overrides.
     let chosen = degrade_steam_on_conflict(chosen);
+    // The XUSB escape hatch can only present a 360 identity, so the One S / Elite wishes fold when
+    // `PUNKTFUNK_XBOX_BACKEND=xusb` is set.
+    let chosen = degrade_xbox_identity(chosen);
     match pref {
         GamepadPref::Auto => {
             // The operator's env knob deserves a diagnostic when it didn't drive the
@@ -335,10 +419,21 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("ps4"), true, false), DualShock4);
         assert_eq!(pick_gamepad(DualShock4, None, false, true), DualShock4);
         assert_eq!(pick_gamepad(DualShock4, None, false, false), Xbox360);
-        // X-Box One: a distinct uinput identity on Linux, folded into the 360 pad on Windows.
+        // X-Box One: a distinct uinput identity on Linux AND a distinct UMDF HID identity
+        // (`045E:02FD`) on Windows. The old Windows fold to Xbox360 is deliberately gone — it
+        // existed only because the XUSB companion has one fixed 360 identity, and the HID backend
+        // is the default now. `degrade_xbox_identity` puts the fold back when the escape hatch
+        // `PUNKTFUNK_XBOX_BACKEND=xusb` is set; that is a runtime check this pure one can't make.
         assert_eq!(pick_gamepad(XboxOne, None, true, false), XboxOne);
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
-        assert_eq!(pick_gamepad(XboxOne, None, false, true), Xbox360);
+        assert_eq!(pick_gamepad(XboxOne, None, false, true), XboxOne);
+        assert_eq!(pick_gamepad(XboxOne, None, false, false), Xbox360);
+        // X-Box Elite Series 2: Windows-only (UMDF device-type 6). No Linux uinput Elite identity
+        // exists, so it folds to the 360 pad there rather than pretending.
+        assert_eq!(pick_gamepad(XboxElite, None, false, true), XboxElite);
+        assert_eq!(pick_gamepad(Auto, Some("elite"), false, true), XboxElite);
+        assert_eq!(pick_gamepad(XboxElite, None, true, false), Xbox360);
+        assert_eq!(pick_gamepad(XboxElite, None, false, false), Xbox360);
 
         // Steam Deck: native on Linux (UHID/usbip/gadget) AND Windows (UMDF device-type 3,
         // Steam-Input-promoted via MI_02 — gamepad-new-types N4); Xbox360 elsewhere.

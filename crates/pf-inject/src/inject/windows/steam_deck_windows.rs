@@ -231,7 +231,8 @@ impl PadProto for DeckWinProto {
         // presence is the rumble-plane activity signal, even at an unchanged level.
         let (rumble, resync) = pad.service();
         PadFeedback {
-            rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: Vec::new(),
             rumble_drove: Some(rumble.is_some()),
             resync,

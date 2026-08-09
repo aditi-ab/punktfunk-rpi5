@@ -145,7 +145,18 @@ pub use stats::Stats;
 /// connection was simply lost. Purely a read of state the core already had: no new call is required
 /// of an embedder, a client that never calls it is unchanged, and the host sends exactly the same
 /// bytes either way, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 17;
+/// v18: added `punktfunk_connection_next_rumble_cmd2` — the policy engine's rumble command with the
+/// two Xbox impulse-trigger motor levels off the 0xCA v3 tail
+/// (`design/trigger-rumble-plane.md`), which the fixed out-params of
+/// `punktfunk_connection_next_rumble_cmd` have no room for. A NEW symbol, not a widened one: an
+/// exported parameter list is part of the contract, and growing one in place breaks every
+/// out-of-tree embedder at once. The old entry point is unchanged in signature AND in the levels
+/// it reports — it keeps writing the two handle motors, which is the correct instruction for the
+/// actuators it owns, so an embedder that never adopts the new symbol behaves exactly as before.
+/// Additive and client-local: the v3 tail has been on the wire (and length-tolerant in both
+/// decoders) since it landed, and the host sends the same bytes either way, so [`WIRE_VERSION`] is
+/// unchanged.
+pub const ABI_VERSION: u32 = 18;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

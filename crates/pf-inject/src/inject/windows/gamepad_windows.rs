@@ -296,6 +296,13 @@ impl GamepadManager {
         }
     }
 
+    /// How many virtual pads this manager has actually BUILT — the bring-up harness's
+    /// "did the create happen?" check; see [`crate::uhid_manager::UhidManager::live_pads`] for why
+    /// only a harness should ask.
+    pub fn live_pads(&self) -> usize {
+        self.slots.live()
+    }
+
     fn ensure(&mut self, idx: usize) {
         if self.slots.ensure(idx, XusbWinPad::open) {
             tracing::info!(
@@ -356,7 +363,12 @@ impl GamepadManager {
     /// Relay any changed rumble level to the client. XUSB motors are 0..255; the wire carries
     /// 0..65535, so scale by 257. `large` (low-frequency) → the datagram's `low`, `small`
     /// (high-frequency) → `high` — matching the other backends.
-    pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
+    ///
+    /// The two trigger levels `send` also takes are always zero here and always will be: the XUSB
+    /// `SET_STATE` packet this backend parses carries `rumble_large`/`rumble_small` and nothing
+    /// else, mirroring `XINPUT_VIBRATION`'s two members. Impulse-trigger rumble is only reachable
+    /// through the HID-visible Xbox identity (WGI / GameInput), never through the XUSB companion.
+    pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16, u16, u16)) {
         // Finish any unplug whose removal frame only armed the grace — the producer sends that
         // frame once, so without this the XUSB devnode would outlive the controller.
         let swept = self.slots.reap();
@@ -369,7 +381,7 @@ impl GamepadManager {
                 self.last_active[i] = Instant::now();
                 if self.last_rumble[i] != (large, small) {
                     self.last_rumble[i] = (large, small);
-                    send(i as u16, large as u16 * 257, small as u16 * 257);
+                    send(i as u16, large as u16 * 257, small as u16 * 257, 0, 0);
                 }
             } else if self.last_rumble[i] != (0, 0)
                 && crate::uhid_manager::rumble_idle_timeout()
@@ -386,7 +398,7 @@ impl GamepadManager {
                     "rumble: stale residual (game stopped driving the pad) — forcing off"
                 );
                 self.last_rumble[i] = (0, 0);
-                send(i as u16, 0, 0);
+                send(i as u16, 0, 0, 0, 0);
             }
         }
     }

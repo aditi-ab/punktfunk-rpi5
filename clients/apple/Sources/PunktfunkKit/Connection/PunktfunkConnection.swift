@@ -1002,22 +1002,34 @@ public final class PunktfunkConnection {
     /// Pull the next EFFECTIVE rumble command from the core's shared rumble policy engine — the
     /// uniform replacement for per-platform rumble policy. The engine owns every decision
     /// (v2 lease expiry, legacy-host staleness at a uniform 1 s, connection-close drain zeros),
-    /// so apply commands verbatim: `(0, 0)` = stop now, non-zero = run at this level.
+    /// so apply commands verbatim: all-zero = stop now, non-zero = run at this level.
     /// `backstopMs` is a safety-net duration for duration-parameterized platform APIs — the
     /// CoreHaptics renderer ignores it (its finite segment ceiling is the equivalent net).
     /// Drain from the (single) feedback thread, alongside `nextHidOutput`.
+    ///
+    /// A command carries FOUR motor levels: the two handles plus the two Xbox impulse-trigger
+    /// motors (`leftTrigger`/`rightTrigger`, same 0...0xFFFF scale), which arrive on the 0xCA
+    /// plane's v3 tail. This calls the core's `_cmd2` entry point — `_cmd` is the frozen
+    /// two-handle form kept for out-of-tree embedders, and there is no reason for this client to
+    /// stay on it: a pad that reports no `GCHapticsLocality.leftTrigger`/`.rightTrigger` simply
+    /// has no engine for those levels and they go nowhere, which is the normal case.
     public func nextRumbleCommand(timeoutMs: UInt32 = 0) throws
-        -> (pad: UInt16, low: UInt16, high: UInt16, backstopMs: UInt32)?
+        -> (
+            pad: UInt16, low: UInt16, high: UInt16, leftTrigger: UInt16, rightTrigger: UInt16,
+            backstopMs: UInt32
+        )?
     {
         feedbackLock.lock()
         defer { feedbackLock.unlock() }
         guard let h = liveHandle() else { throw PunktfunkClientError.closed }
 
         var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0, backstop: UInt32 = 0
-        let rc = punktfunk_connection_next_rumble_cmd(h, &pad, &low, &high, &backstop, timeoutMs)
+        var lt: UInt16 = 0, rt: UInt16 = 0
+        let rc = punktfunk_connection_next_rumble_cmd2(
+            h, &pad, &low, &high, &lt, &rt, &backstop, timeoutMs)
         switch rc {
         case statusOK:
-            return (pad, low, high, backstop)
+            return (pad, low, high, lt, rt, backstop)
         case statusNoFrame:
             return nil
         case statusClosed:

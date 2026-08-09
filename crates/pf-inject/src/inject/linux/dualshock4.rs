@@ -314,7 +314,8 @@ impl PadProto for Ds4LinuxProto {
     fn service(&self, pad: &mut DualShock4Pad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb
                 .led
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })

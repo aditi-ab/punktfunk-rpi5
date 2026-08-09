@@ -46,6 +46,11 @@ members = [
 exclude = [
     "packaging/linux/steam-deck-gadget/usbip-poc",
     "clients/android/native/vendor/ndk",
+    # Bring-your-own-hardware measurement tools. `hid-descriptor-dump` pulls `hidapi`, a C library
+    # wanting libudev on Linux; `win-input-matrix` is Windows-only and asks the live input stacks
+    # what they can see. Neither belongs in `cargo build --workspace` or on a CI leg with no pad.
+    "tools/hid-descriptor-dump",
+    "tools/win-input-matrix",
 ]
 
 # ndk 0.9.0 verbatim from crates.io plus ONE visibility change (and two warning fixes — an

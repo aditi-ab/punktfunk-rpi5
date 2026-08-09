@@ -1458,9 +1458,14 @@ async fn serve_session(
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
         use punktfunk_core::quic::HidOutput;
-        // v2 envelope (seq 0, 400 ms TTL) so the loopback/probe assertion covers the self-
-        // terminating tail, not just the level.
-        let d = punktfunk_core::quic::encode_rumble_datagram_v2(0, 0x4000, 0x8000, 0, 400);
+        // v3 envelope (seq 0, 400 ms TTL, both impulse-trigger motors asserted) so the
+        // loopback/probe assertion covers the self-terminating tail AND the trigger tail behind
+        // it, not just the level. The trigger levels are deliberately DIFFERENT from each other
+        // and from the handles: a decoder that reads the wrong offset produces a plausible-looking
+        // number rather than a zero, so identical values would hide the mistake.
+        let d = punktfunk_core::quic::encode_rumble_datagram_v3(
+            0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000,
+        );
         let _ = conn.send_datagram(d.to_vec().into());
         for h in [
             HidOutput::Led {
@@ -1825,9 +1830,20 @@ async fn serve_session(
         .await
         .is_err()
     {
+        // Name what is still held, not just that a thread was let go. The input thread OWNS this
+        // session's virtual gamepads (`input_thread`'s `Pads`, dropped only when that fn returns),
+        // and on Windows each one holds a `SwDeviceCreate` devnode plus the `Global\pf…-boot-<idx>`
+        // bootstrap mailbox for its pad index. Detaching therefore leaves the pads plugged in and
+        // the index taken: the next session — or a bring-up run beside this host — is denied that
+        // index until this thread finally returns, and *that* failure surfaces somewhere else
+        // entirely (see `pf_inject::pad_slots::PadCreateFault::IndexOwnedElsewhere`). An operator
+        // reading only the later error has no way back to this line unless it says so here.
         tracing::warn!(
             grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
-            "audio/input threads did not exit after the connection closed — detaching them"
+            "audio/input threads did not exit after the connection closed — detaching them. This \
+             session's virtual gamepads are STILL HELD by the detached input thread (devnode + \
+             pad-index mailbox on Windows), so a pad create on the same index will be refused as \
+             already-owned until it returns"
         );
     }
     // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the

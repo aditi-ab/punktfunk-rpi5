@@ -686,7 +686,8 @@ impl PadProto for DsWinProto {
             // feed the abandoned-rumble force-off's activity clock (the historical unbounded
             // stuck-ON path, now doubly closed by the lossless report ring).
             rumble_drove: Some(fb.rumble.is_some()),
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
             resync: fb.resync,
         }
@@ -995,14 +996,26 @@ mod drain_tests {
             "/../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx"
         );
         let inf = std::fs::read_to_string(inx).expect("read pf_gamepad.inx");
-        // The [Models] lines: `%DeviceDesc…%=pfGamepad, <hwid>[, <hwid>…]`.
+        // The [Models] lines: `%DeviceDesc…%=<InstallSection>, <hwid>[, <hwid>…]`.
+        //
+        // ⚠️ Match the install section by PREFIX, not by the exact string `pfGamepad,`. The Xbox
+        // line installs `pfGamepadXbox` — a section of its own, because that identity additionally
+        // attaches the `xinputhid` bus filter and the four PlayStation/Deck identities must not get
+        // it. An exact match silently stopped seeing the Xbox ids the moment that split happened,
+        // which is precisely the "this test went vacuous" failure the assert below guards against,
+        // except it failed loudly instead. Keep this tolerant of further per-identity sections.
         let declared: Vec<String> = inf
             .lines()
             .map(str::trim)
             .filter(|l| !l.starts_with(';'))
-            .filter_map(|l| l.split_once("=pfGamepad,"))
-            .flat_map(|(_, ids)| {
-                ids.split(',')
+            .filter_map(|l| l.split_once('='))
+            .filter(|(_, rhs)| rhs.trim_start().starts_with("pfGamepad"))
+            .flat_map(|(_, rhs)| {
+                // `pfGamepad[Suffix], <hwid>[, <hwid>…]` — drop the section name, keep the ids.
+                // `AddReg=pfGamepadXbox_HW_AddReg` reaches here too and contributes nothing,
+                // because it has no comma.
+                rhs.split(',')
+                    .skip(1)
                     .map(|id| id.trim().to_ascii_lowercase())
                     .collect::<Vec<_>>()
             })
@@ -1018,7 +1031,15 @@ mod drain_tests {
             WinDsIdentity::dualsense_edge().hwid,
             super::super::dualshock4_windows::DS4_HWID,
             super::super::steam_deck_windows::DECK_HWID,
-        ] {
+        ]
+        .into_iter()
+        // Every Xbox identity, not just the first — a new one added to the table without its INF
+        // model line is exactly the "pad exists, never starts, never answers a proof" failure.
+        .chain(
+            super::super::xbox_windows::XBOX_IDENTITIES
+                .iter()
+                .map(|i| i.hwid),
+        ) {
             let want = hwid.to_ascii_lowercase();
             let rooted = format!("root\\{want}");
             assert!(
@@ -1028,6 +1049,81 @@ mod drain_tests {
                 "the host creates pad devnodes with hardware id {hwid:?}, which pf_gamepad.inx \
                  does not declare (it has {declared:?}) — PnP would bind inbox input.inf/HidUsb \
                  instead and the pad would never start"
+            );
+        }
+    }
+
+    /// EVERY Xbox identity must install its OWN section, and the PlayStation/Deck identities must
+    /// not install that one.
+    ///
+    /// `pfGamepadXbox` attaches Microsoft's `xinputhid` as an upper filter and sets
+    /// `DevicePropertyFlags=1` (`BusDevice`), which is what makes Windows promote our Xbox pad —
+    /// it mints the `IG_00` token, registers an XUSB interface, and lets classic XInput and rumble
+    /// through. Applied to a DualSense, DualShock 4, Edge or Steam Deck it would hand a
+    /// PlayStation pad to Microsoft's **Xbox** translator, which claims the HID collection
+    /// exclusively and would take a working pad away from Steam and SDL.
+    ///
+    /// Merging the two sections back together is a one-line edit that looks like tidying and is
+    /// not, so assert the split rather than trusting a comment to survive. Both directions matter,
+    /// and so does the count: a new Xbox identity whose model line was pasted from a PlayStation
+    /// one installs `pfGamepad`, enumerates perfectly, and is simply never promoted — a silent
+    /// half-failure that reads on glass as "XInput doesn't see it", the original field symptom.
+    #[test]
+    fn only_the_xbox_identity_installs_the_xinputhid_section() {
+        let inx = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx"
+        );
+        let inf = std::fs::read_to_string(inx).expect("read pf_gamepad.inx");
+        let xbox: Vec<String> = super::super::xbox_windows::XBOX_IDENTITIES
+            .iter()
+            .map(|i| i.hwid.to_ascii_lowercase())
+            .collect();
+
+        let mut seen: Vec<&str> = Vec::new();
+        for line in inf.lines().map(str::trim).filter(|l| !l.starts_with(';')) {
+            let Some((_, rhs)) = line.split_once('=') else {
+                continue;
+            };
+            let rhs = rhs.trim_start();
+            let Some((section, ids)) = rhs.split_once(',') else {
+                continue;
+            };
+            if !section.starts_with("pfGamepad") {
+                continue;
+            }
+            let ids: Vec<String> = ids
+                .split(',')
+                .map(|i| i.trim().to_ascii_lowercase())
+                .collect();
+            // `contains`, not `==`: the model lines carry both the bare id and its `root\` twin.
+            let matched: Vec<&str> = xbox
+                .iter()
+                .filter(|x| ids.iter().any(|i| i.contains(x.as_str())))
+                .map(String::as_str)
+                .collect();
+            if matched.is_empty() {
+                assert_eq!(
+                    section, "pfGamepad",
+                    "a non-Xbox model line ({ids:?}) installs {section:?}; if that section carries \
+                     the xinputhid filter, this pad is about to be handed to Microsoft's Xbox \
+                     translator"
+                );
+            } else {
+                seen.extend(matched);
+                assert_ne!(
+                    section, "pfGamepad",
+                    "an Xbox model line ({ids:?}) installs the SHARED section, so either the \
+                     xinputhid filter would be attached to every PlayStation and Deck pad too, or \
+                     this Xbox pad silently never gets promoted"
+                );
+            }
+        }
+        for want in &xbox {
+            assert!(
+                seen.contains(&want.as_str()),
+                "no [Models] line mentions {want:?} — either the identity has no INF line at all, \
+                 or the parse went vacuous; fix that rather than deleting the assert"
             );
         }
     }
@@ -1071,7 +1167,7 @@ mod drain_tests {
             .collect();
         assert_eq!(
             entries.len(),
-            4,
+            7,
             "parsed {entries:?} out of the driver's table — the shape changed and this test went \
              vacuous; fix the parse rather than deleting the assert"
         );
@@ -1098,7 +1194,16 @@ mod drain_tests {
                 super::super::steam_deck_windows::DECK_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
             ),
-        ] {
+        ]
+        .into_iter()
+        // All three Xbox identities: they share a report descriptor, so a hwid→devtype slip does
+        // NOT show up as a mangled report the way the Deck's did — it shows up as the wrong PID and
+        // the wrong product string, i.e. an Elite that Steam maps as a Series X|S pad.
+        .chain(
+            super::super::xbox_windows::XBOX_IDENTITIES
+                .iter()
+                .map(|i| (i.hwid, i.devtype)),
+        ) {
             let want = hwid.to_ascii_lowercase();
             let got = entries.iter().find(|(id, _)| *id == want);
             assert_eq!(

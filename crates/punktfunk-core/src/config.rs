@@ -140,8 +140,8 @@ impl CompositorPref {
 /// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
 /// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
 /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-/// `9 = SteamController2`, `10 = SteamController2Puck`), appended to `Hello`/`Welcome` — older
-/// peers simply omit/ignore it (an unknown byte degrades to `Auto`).
+/// `9 = SteamController2`, `10 = SteamController2Puck`, `11 = XboxElite`), appended to
+/// `Hello`/`Welcome` — older peers simply omit/ignore it (an unknown byte degrades to `Auto`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
     /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
@@ -151,9 +151,11 @@ pub enum GamepadPref {
     Xbox360,
     /// UHID DualSense (kernel `hid-playstation`) — adaptive triggers, lightbar, touchpad, motion.
     DualSense,
-    /// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity
-    /// (VID/PID/name), so games show One/Series glyphs. XInput-identical otherwise (impulse-trigger
-    /// rumble is unreachable through any virtual pad, so there's no game-visible gain over `Xbox360`).
+    /// X-Box One / Series pad. On Linux, the X-Box 360 uinput backend with the One/Series USB
+    /// identity (VID/PID/name), so games show One/Series glyphs — XInput-identical otherwise. On
+    /// Windows it is a distinct HID identity (`045E:02FD`, Bluetooth Xbox One S) through the UMDF
+    /// minidriver; it used to fold to `Xbox360` there, because the only Windows Xbox backend was
+    /// the XUSB companion, which presents one fixed 360 identity and cannot vary it.
     XboxOne,
     /// UHID DualShock 4 (kernel `hid-playstation`, ≥ 6.2) — lightbar, touchpad, motion, rumble. Like
     /// `DualSense` minus adaptive triggers / player LEDs / mute. Needs Linux UHID on the host.
@@ -186,6 +188,21 @@ pub enum GamepadPref {
     /// native seven-interface Puck topology (CDC pair, four controller slots, management HID)
     /// rather than relabelling its reports as a wired `1302`.
     SteamController2Puck,
+    /// Xbox Elite Wireless Controller Series 2 (Microsoft `045E:0B22`, Bluetooth) — a Windows-only
+    /// HID identity through the UMDF minidriver, so glyphs and the Device Manager name read Elite.
+    ///
+    /// ⚠️ **Glyphs and identity only, today.** The four paddles (`BTN_PADDLE1..4`) still fold or
+    /// drop exactly as on the other Xbox classes; the Elite is merely the first Xbox identity that
+    /// *could* carry them natively. Wiring them up is blocked on a measurement, not on effort —
+    /// once Windows promotes the pad, `xinputhid` claims its HID collection exclusively, so extra
+    /// buttons declared in the report descriptor may reach no consumer at all
+    /// (`design/xbox-pad-windows-handoff.md` §3.6). Do not advertise paddle support off this
+    /// variant until that is measured; `DualSenseEdge` stays the only virtual pad with native
+    /// back-button slots.
+    ///
+    /// Folds to `Xbox360` everywhere but Windows: there is no Linux uinput Elite identity
+    /// (`PadIdentity` has 360 and One S only).
+    XboxElite,
 }
 
 impl GamepadPref {
@@ -211,7 +228,8 @@ impl GamepadPref {
     pub const fn has_motion(self) -> bool {
         match self {
             GamepadPref::Auto => true, // unknown; assume it can, see above
-            GamepadPref::Xbox360 | GamepadPref::XboxOne => false,
+            // No Xbox pad has a gyro in its HID contract — Elite Series 2 included.
+            GamepadPref::Xbox360 | GamepadPref::XboxOne | GamepadPref::XboxElite => false,
             GamepadPref::DualSense
             | GamepadPref::DualShock4
             | GamepadPref::DualSenseEdge
@@ -225,7 +243,7 @@ impl GamepadPref {
 
     /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
     /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-    /// `9 = SteamController2`, `10 = SteamController2Puck`.
+    /// `9 = SteamController2`, `10 = SteamController2Puck`, `11 = XboxElite`.
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -239,6 +257,7 @@ impl GamepadPref {
             GamepadPref::SwitchPro => 8,
             GamepadPref::SteamController2 => 9,
             GamepadPref::SteamController2Puck => 10,
+            GamepadPref::XboxElite => 11,
         }
     }
 
@@ -256,6 +275,7 @@ impl GamepadPref {
             8 => GamepadPref::SwitchPro,
             9 => GamepadPref::SteamController2,
             10 => GamepadPref::SteamController2Puck,
+            11 => GamepadPref::XboxElite,
             _ => GamepadPref::Auto,
         }
     }
@@ -269,6 +289,10 @@ impl GamepadPref {
             "dualsense" | "ds" | "ps5" => GamepadPref::DualSense,
             "xboxone" | "xbox-one" | "xone" | "xbox1" | "series" | "xboxseries" => {
                 GamepadPref::XboxOne
+            }
+            // "elite" is unambiguous here — the DualSense Edge answers to "edge", never "elite".
+            "xboxelite" | "xbox-elite" | "elite" | "xboxelite2" | "elite2" => {
+                GamepadPref::XboxElite
             }
             "dualshock4" | "dualshock" | "ds4" | "ps4" => GamepadPref::DualShock4,
             "steamdeck" | "steam-deck" | "deck" => GamepadPref::SteamDeck,
@@ -289,7 +313,7 @@ impl GamepadPref {
 
     /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
     /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`, `"dualsenseedge"`, `"switchpro"`,
-    /// `"steamcontroller2"`, `"steamcontroller2puck"`).
+    /// `"steamcontroller2"`, `"steamcontroller2puck"`, `"xboxelite"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
@@ -303,6 +327,7 @@ impl GamepadPref {
             GamepadPref::SwitchPro => "switchpro",
             GamepadPref::SteamController2 => "steamcontroller2",
             GamepadPref::SteamController2Puck => "steamcontroller2puck",
+            GamepadPref::XboxElite => "xboxelite",
         }
     }
 }
@@ -833,7 +858,11 @@ mod tests {
     /// into a host that drops every one.
     #[test]
     fn only_the_xbox_classes_lack_a_motion_plane() {
-        for p in [GamepadPref::Xbox360, GamepadPref::XboxOne] {
+        for p in [
+            GamepadPref::Xbox360,
+            GamepadPref::XboxOne,
+            GamepadPref::XboxElite,
+        ] {
             assert!(
                 !p.has_motion(),
                 "{} should have no motion plane",
@@ -910,11 +939,12 @@ mod tests {
             GamepadPref::SwitchPro,
             GamepadPref::SteamController2,
             GamepadPref::SteamController2Puck,
+            GamepadPref::XboxElite,
         ] {
             assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
             assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
         }
-        // Every wire byte 0..=10 is assigned, distinct, and pinned (forward-compat with peers
+        // Every wire byte 0..=11 is assigned, distinct, and pinned (forward-compat with peers
         // that only know a prefix of the range).
         for (v, p) in [
             (0, GamepadPref::Auto),
@@ -928,12 +958,13 @@ mod tests {
             (8, GamepadPref::SwitchPro),
             (9, GamepadPref::SteamController2),
             (10, GamepadPref::SteamController2Puck),
+            (11, GamepadPref::XboxElite),
         ] {
             assert_eq!(p.to_u8(), v);
             assert_eq!(GamepadPref::from_u8(v), p);
         }
         // The next unassigned byte degrades to Auto today; assigning it later must update this.
-        assert_eq!(GamepadPref::from_u8(11), GamepadPref::Auto);
+        assert_eq!(GamepadPref::from_u8(12), GamepadPref::Auto);
         // Aliases + unknowns.
         assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
         assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
@@ -964,6 +995,24 @@ mod tests {
             Some(GamepadPref::XboxOne)
         );
         assert_eq!(GamepadPref::from_name("series"), Some(GamepadPref::XboxOne));
+        // The Elite's aliases, and the one that could plausibly have been stolen: "edge" is the
+        // DualSense Edge and must stay so — the two are different pads on different vendors.
+        assert_eq!(
+            GamepadPref::from_name("Elite"),
+            Some(GamepadPref::XboxElite)
+        );
+        assert_eq!(
+            GamepadPref::from_name("xbox-elite"),
+            Some(GamepadPref::XboxElite)
+        );
+        assert_eq!(
+            GamepadPref::from_name("elite2"),
+            Some(GamepadPref::XboxElite)
+        );
+        assert_eq!(
+            GamepadPref::from_name("edge"),
+            Some(GamepadPref::DualSenseEdge)
+        );
         assert_eq!(GamepadPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto (forward-compatible).
         assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);

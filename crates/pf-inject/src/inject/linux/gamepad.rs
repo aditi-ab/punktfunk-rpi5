@@ -705,9 +705,14 @@ impl GamepadManager {
             .ensure(idx, |i| VirtualPad::create(i as usize, identity));
     }
 
-    /// Service every pad's FF protocol; `send(index, low, high)` is invoked for each pad whose
-    /// mixed rumble level changed. Call frequently (games block in `EVIOCSFF` until answered).
-    pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
+    /// Service every pad's FF protocol; `send(index, low, high, left_trigger, right_trigger)` is
+    /// invoked for each pad whose mixed rumble level changed. Call frequently (games block in
+    /// `EVIOCSFF` until answered).
+    ///
+    /// The two trigger levels are always zero here and always will be: evdev's `FF_RUMBLE` effect
+    /// is `{ u16 strong_magnitude, u16 weak_magnitude }` and has no third field, so impulse-trigger
+    /// rumble is unreachable through this backend no matter what the client can render.
+    pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16, u16, u16)) {
         // Finish any unplug whose removal frame only armed the grace — the producer sends that
         // frame once, so without this the uinput node would outlive the controller. The swept
         // mask is discarded because this manager keeps no per-index sibling state (the pads mix
@@ -715,7 +720,7 @@ impl GamepadManager {
         self.slots.reap();
         for (i, pad) in self.slots.iter_mut() {
             if let Some((low, high)) = pad.pump_ff() {
-                send(i as u16, low, high);
+                send(i as u16, low, high, 0, 0);
             }
         }
     }

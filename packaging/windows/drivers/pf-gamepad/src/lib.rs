@@ -1,7 +1,10 @@
 // punktfunk virtual DualSense / DualShock 4 / DualSense Edge — UMDF2 HID minidriver.
 //
 // A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
-// (VID 054C / PID 0CE6), DualShock 4 (device_type=1) or DualSense Edge (device_type=2) using the
+// (VID 054C / PID 0CE6), DualShock 4 (device_type=1), DualSense Edge (device_type=2), Steam Deck
+// (device_type=3), Xbox Wireless Controller (device_type=4, VID 045E / PID 0B13), Xbox One S
+// (device_type=5, 045E / 02FD) or Xbox Elite Wireless Controller Series 2 (device_type=6,
+// 045E / 0B22) using the
 // report descriptors + feature blobs punktfunk already ships in `inject/`. Games see a genuine
 // HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
 //
@@ -71,6 +74,55 @@ const DS_EDGE_PID: u16 = 0x0DF2;
 /// CLIENT streaming to a Windows host declares it, and `steam_deck_windows` builds the pad.
 const DECK_VID: u16 = 0x28DE;
 const DECK_PID: u16 = 0x1205;
+
+// ---- Xbox identities (device_type = 4 Wireless / 5 One S / 6 Elite Series 2) ----
+//
+// WHY THIS EXISTS (field 2026-08-09, `punktfunk-field-windows-pad-dead-0260`): the OTHER Windows
+// Xbox backend — `pf-xusb` — registers ONLY `GUID_DEVINTERFACE_XUSB` and has no HID collection at
+// all, so it is invisible to Steam's hidapi enumeration, to DirectInput, to `joy.cpl`, and to
+// WGI/GameInput. Only classic `XInputGetState` via xinput1_4's interface walk ever sees it. A
+// reporter spent two weeks on a dead controller for exactly that reason, and switching the client
+// to DualSense — a REAL HID pad through this driver — fixed it instantly. This identity gives the
+// Xbox pad the same HID footing the PlayStation ones have always had.
+//
+// ⚠️⚠️ **The VID/PID is a BLUETOOTH Xbox controller on purpose.** The wired ids the rest of the
+// tree uses (`045E:028E` X-Box 360, `045E:02EA` Xbox One S USB) are vendor-class XUSB/GIP devices —
+// they expose NO HID interface on real hardware, so a HID child claiming one is a device that has
+// never existed and inbox promotion has nothing to match. The Xbox pads that genuinely ARE HID are
+// the Bluetooth ones, which Windows binds through HIDCLASS.
+const XBOX_VID: u16 = 0x045E;
+/// Xbox Wireless Controller (Series X|S), Bluetooth — `device_type = 4`, the default Xbox identity.
+/// Chosen over the Xbox One S BT id `0x02FD` because the host's OS floor is Windows 11 22H2, where
+/// this is the current-generation identity (so glyphs read "Xbox Series") and SDL's mapping
+/// database covers it.
+///
+/// ⭐ It is also the PID Microsoft's own `xinputhid.inf` allow-lists **twice** (once as a
+/// `BTHLEDevice` stage-1 id, once as a plain `HID\…&IG_00` stage-2 id) — measured off `.173`,
+/// 2026-08-09. That is not what promotes OUR pad (a software devnode matches no allow-list entry;
+/// `pfGamepadXbox`'s `AddReg` writes what the matching sections would have written), but it is why
+/// this stays the default of the three.
+const XBOX_PID: u16 = 0x0B13;
+/// Xbox One S controller over Bluetooth — `device_type = 5`.
+///
+/// ⚠️ **`02FD` appears in `xinputhid.inf` only as a `BTHENUM` (classic-BT bus) id — it has NO
+/// stage-2 `HID\…&IG_00` model line.** That killed it as a "try another PID" lever for the
+/// promotion work (handoff §4 B1). It does not block it as an IDENTITY, because our promotion
+/// comes from the INF's own `AddReg` rather than from matching Microsoft's list — but if a future
+/// Windows servicing update makes promotion depend on the allow-list again, this identity is the
+/// one that loses it first. Worth re-measuring on glass before recommending it to anyone.
+const XBOX_PID_ONE_S: u16 = 0x02FD;
+/// Xbox Elite Wireless Controller Series 2 — `device_type = 6`. This is the pad
+/// `tools/hid-descriptor-dump` captured on `.173` (`BTHLE\DEV_686CE647F191`, `REV_0521`), so it is
+/// the one identity here whose real hardware we have measured directly.
+const XBOX_PID_ELITE2: u16 = 0x0B22;
+/// bcdDevice for every Xbox identity.
+///
+/// Deliberately ONE value rather than per-identity: the real Elite reports `REV_0521` (measured on
+/// `.173`) but `create_swdevice` synthesizes the devnode's USB ids with a hardcoded `&REV_0100`
+/// regardless, and SDL folds the version into its joystick GUID — so a version that disagrees with
+/// the devnode buys nothing and risks missing a stock mapping. Revisit only with a measurement
+/// that shows a consumer keying on it.
+const XBOX_VER: u16 = 0x0407;
 
 // Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino (== inject/dualsense.rs).
 // NOTE: inject/dualsense.rs comments this as "232 bytes" — that comment is wrong; it is 273.
@@ -241,6 +293,229 @@ static DECK_RDESC: [u8; 38] = [
     0x08, 0x95, 0x40, 0xb1, 0x02, 0xc0,
 ];
 
+// ---- Xbox assets (served when the host stamps device_type = 4, 5 or 6) ----
+//
+// ⭐⭐ **ONE DESCRIPTOR SERVES ALL THREE XBOX IDENTITIES, DELIBERATELY.** Xbox Wireless (4),
+// Xbox One S (5) and Xbox Elite Series 2 (6) differ ONLY in VID/PID, product string and INF model
+// line — in HID terms they are the same pad: same two 16-bit stick pairs, same trigger pair, same
+// hat, same 15 buttons, same rumble output report. A report descriptor is the report SHAPE, not
+// the identity; the identity is what SDL/Steam/Windows key their stock mappings off, and that
+// travels in `hid_attrs`.
+//
+// This is load-bearing, not laziness. The ⚠️ block below is the record of what ONE hand-written
+// descriptor has already cost: three separate bugs (no Feature report ⇒ the sealed channel never
+// opened and the pad served neutral forever; no OUTPUT item ⇒ no rumble of any kind and dead
+// host-side code; a layout that provably disagrees with the captured hardware). Two more
+// hand-written descriptors would multiply that debt by three for no measured gain, and each would
+// need its own capture, its own `wReportLength`, its own `xbox_proto` layout tests and its own
+// on-glass verification. When a Linux-hidraw capture settles the real layout (handoff §3.3), it
+// lands here ONCE and all three identities get it.
+//
+// A standards-clean Game Pad collection matching the Bluetooth Xbox layout: two 16-bit stick pairs,
+// two 10-bit triggers on the Simulation page, a null-state hat, and 15 buttons. Report `0x01`,
+// [`XBOX_INPUT_REPORT_LEN`] bytes on the wire including the id. `inject/proto/xbox_proto.rs` packs
+// the matching bytes host-side; `xbox_proto`'s tests pin the two together.
+//
+// ⚠️⚠️⚠️ **PROVENANCE: this descriptor is CONSTRUCTED, not captured — unlike every sibling here
+// (`DUALSENSE_RDESC` verbatim from inputtino, `DS4_RDESC` verbatim from `inject/dualshock4.rs`,
+// `DECK_RDESC` captured off a real `28DE:1205`). It has never been compared against a real pad.**
+// That matters more than usual: we claim a REAL Microsoft VID/PID, and SDL / Steam / Windows keep
+// built-in mappings keyed off that VID/PID. If a consumer applies its stock `045E:0B13` mapping to a
+// report laid out differently from the real device, every control silently lands on the wrong
+// action — the same class of bug this whole change exists to kill.
+//
+// ⭐ **2026-08-09 — THE CAPTURE NOW EXISTS AND THIS BLOB DISAGREES WITH IT.** A real Xbox Elite
+// Series 2 (`045E:0B22`, Bluetooth LE) was captured on `.173` with `tools/hid-descriptor-dump`; the
+// dump, its provenance and the DualSense control that validates the tool are in
+// `tools/hid-descriptor-dump/captures/`. Re-take it any time with `--vid 045E --pid 0B22`, and
+// decode THIS array through the same decoder — no hardware needed — with:
+//
+//     hid-descriptor-dump --rust-source packaging/windows/drivers/pf-gamepad/src/lib.rs \
+//                         --symbol XBOX_RDESC
+//
+// Four differences, and the ORDER one is the dangerous one:
+//   * the real pad's game-controller report is **UNNUMBERED** (15 bytes of fields, no report id);
+//     this one declares Report ID 1;
+//   * it carries **ONE combined 16-bit `Z`** trigger axis at byte 8, not two Simulation-page axes;
+//   * it declares **16 buttons at byte 10, BEFORE the hat** — this one puts 15 buttons AFTER it;
+//   * neither has an OUTPUT collection, so the rumble gap is real on both.
+//
+// 🛑 **Do NOT simply paste the capture over this array.** Two blockers, recorded in
+// `design/xbox-pad-windows-handoff.md` §3.3: (1) it is unverified whether Windows' view equals the
+// pad's NATIVE report map — `xinputhid` filters that pad and the captured shape is the legacy
+// DirectInput view, so cross-check on Linux hidraw first; (2) **the real descriptor has no Feature
+// report, and we cannot ship without one** — `0x85` is the sealed channel's proof transport, and
+// report ids are all-or-nothing, so declaring it forces a numbered input report the real pad does
+// not have. Matching the hardware byte for byte and keeping the sealed channel as it stands are
+// mutually exclusive; that needs a decision, not a paste. Whatever lands, re-run `xbox_proto`'s
+// layout tests — they pin these offsets on the host side.
+//
+// ⚠️ The trailing vendor-defined Feature report `0x85` is NOT cosmetic and must not be trimmed as
+// "unused": it is the CHANNEL PROOF transport (`ProofTransport::HidFeatureReport`). The captured
+// PlayStation descriptors already declared `0x85`, which is why the proof "costs no descriptor
+// change" there — but this descriptor is constructed, so it has to declare the report itself. Built
+// without it the pad enumerates perfectly and then delivers NOTHING: hidclass rejects the host's
+// `HidD_GetFeature` before the driver sees it, the host refuses to hand over the DATA section
+// (measured on .173 2026-08-09 — WGI `RawGameController` saw `045E:0B13` with every axis pinned at
+// 0.5000 and a timestamp frozen for 12 consecutive samples), and the pad serves only its neutral
+// report forever. `0x3F` payload bytes so `FeatureReportByteLength` lands on 64, the buffer size
+// `channel_proof::query` asks with; the proof itself needs 17.
+#[rustfmt::skip]
+static XBOX_RDESC: [u8; 223] = [
+    0x05, 0x01,                    // Usage Page (Generic Desktop)
+    0x09, 0x05,                    // Usage (Game Pad)
+    0xA1, 0x01,                    // Collection (Application)
+    0x85, 0x01,                    //   Report ID (1)
+    0x09, 0x01,                    //   Usage (Pointer)
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x09, 0x30,                    //     Usage (X)          — left stick X
+    0x09, 0x31,                    //     Usage (Y)          — left stick Y
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x27, 0xFF, 0xFF, 0x00, 0x00,  //     Logical Maximum (65535)
+    0x95, 0x02,                    //     Report Count (2)
+    0x75, 0x10,                    //     Report Size (16)
+    0x81, 0x02,                    //     Input (Data,Var,Abs)
+    0xC0,                          //   End Collection
+    // 🛑 THE RIGHT STICK IS `Z`/`Rz`, NOT `Rx`/`Ry`. This declared `Rx`/`Ry` until 2026-08-09 and
+    // the right stick was DEAD: measured on `.173`, with every axis sweeping on its own phase,
+    // `LX`/`LY`/`LT`/`RT` all reached XInput and `RX [0..0] RY [-1..-1]` never moved. Left and right
+    // were declared identically here apart from these two usage bytes, so the usages are the whole
+    // difference — `xinputhid`, which translates this collection into XUSB, maps `Z`/`Rz` to the
+    // right stick and does not treat `Rx`/`Ry` as one. `DUALSENSE_RDESC` above (a real capture) uses
+    // `Z`/`Rz` for its right stick too; the PS pads put the TRIGGERS on `Rx`/`Ry`, which is probably
+    // where the original mistake came from.
+    // ⚠️ This survived every bench measurement because the devtest only ever swept LS-X — the axis
+    // that worked — so `RX [0..0]` read as "nothing is driving it". It was found on glass. The
+    // devtest now sweeps all six axes on distinct phases so the harness can tell those two apart.
+    0x09, 0x01,                    //   Usage (Pointer)
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x09, 0x32,                    //     Usage (Z)          — right stick X
+    0x09, 0x35,                    //     Usage (Rz)         — right stick Y
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x27, 0xFF, 0xFF, 0x00, 0x00,  //     Logical Maximum (65535)
+    0x95, 0x02,                    //     Report Count (2)
+    0x75, 0x10,                    //     Report Size (16)
+    0x81, 0x02,                    //     Input (Data,Var,Abs)
+    0xC0,                          //   End Collection
+    0x05, 0x02,                    //   Usage Page (Simulation Controls)
+    0x09, 0xC5,                    //   Usage (Brake)        — left trigger
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,              //   Logical Maximum (1023)
+    0x95, 0x01,                    //   Report Count (1)
+    0x75, 0x10,                    //   Report Size (16)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)
+    0x09, 0xC4,                    //   Usage (Accelerator)  — right trigger
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x03,              //   Logical Maximum (1023)
+    0x95, 0x01,                    //   Report Count (1)
+    0x75, 0x10,                    //   Report Size (16)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)
+    0x05, 0x01,                    //   Usage Page (Generic Desktop)
+    0x09, 0x39,                    //   Usage (Hat switch)
+    0x15, 0x01,                    //   Logical Minimum (1)
+    0x25, 0x08,                    //   Logical Maximum (8)
+    0x35, 0x00,                    //   Physical Minimum (0)
+    0x46, 0x3B, 0x01,              //   Physical Maximum (315)
+    0x65, 0x14,                    //   Unit (Eng Rot: Degrees)
+    0x75, 0x04,                    //   Report Size (4)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x42,                    //   Input (Data,Var,Abs,Null State)
+    0x65, 0x00,                    //   Unit (None)
+    0x75, 0x04,                    //   Report Size (4)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Cnst,Var,Abs) — pad the hat byte
+    0x05, 0x09,                    //   Usage Page (Button)
+    0x19, 0x01,                    //   Usage Minimum (Button 1)
+    0x29, 0x0F,                    //   Usage Maximum (Button 15)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x01,                    //   Logical Maximum (1)
+    0x75, 0x01,                    //   Report Size (1)
+    0x95, 0x0F,                    //   Report Count (15)
+    0x81, 0x02,                    //   Input (Data,Var,Abs)
+    0x75, 0x01,                    //   Report Size (1)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Cnst,Var,Abs) — pad to a byte boundary
+    // ---- Rumble OUTPUT report `0x03` (Physical Interface Device page) ----
+    //
+    // Without this the pad can receive NOTHING. hidclass routes an output report only if the
+    // descriptor declares one, so with no `0x91` item `on_output_report` never fires,
+    // `publish_output` never writes the ring, and `parse_xbox_output`
+    // (`inject/windows/xbox_windows.rs`) is unreachable code — the whole host-side rumble plane is
+    // already built and was simply never fed. That is why the HID Xbox pad had no rumble at all,
+    // not merely no trigger rumble.
+    //
+    // ⚠️ PROVENANCE — HAND-WRITTEN, and it could not be otherwise. Every other output collection in
+    // this file is a capture, and §3 of `design/xbox-pad-windows-handoff.md` insists on captures.
+    // But the Elite capture taken for that work reports `OUTPUT items: 0` (Windows exposes no
+    // literal report-descriptor bytes; hidapi reconstructs from `HidD_GetPreparsedData`, and that
+    // reconstruction carries no output collection for this pad). So there was nothing to copy.
+    // This block is the documented Xbox One S / Elite Bluetooth rumble report — PID-page
+    // `Set Effect Report`, id `0x03`, 8 payload bytes — chosen because it is exactly the layout
+    // `parse_xbox_output` and `design/trigger-rumble-plane.md` §2.1 already specify:
+    //     [0x03][enable][left_trigger][right_trigger][left][right][duration][delay][loop]
+    // with magnitudes 0..100 (hence `Logical Maximum (100)`, not 255).
+    // **Replace it with a Linux hidraw capture when one can be taken** — that is the only route to
+    // byte-exact truth here, and the enable-bit assignments for the two TRIGGER actuators remain
+    // unverified (see trigger-rumble-plane.md WP0).
+    //
+    // Declared AFTER the final Input item and re-stating every global it uses, so it cannot
+    // retroactively alter the 16-byte input layout `xbox_proto`'s tests pin.
+    0x05, 0x0F,                    //   Usage Page (Physical Interface Device)
+    0x09, 0x21,                    //   Usage (Set Effect Report)
+    0x85, 0x03,                    //   Report ID (3)
+    0xA1, 0x02,                    //   Collection (Logical)
+    0x09, 0x97,                    //     Usage (DC Enable Actuators)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x01,                    //     Logical Maximum (1)
+    0x75, 0x04,                    //     Report Size (4)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs) — the enable mask, low nibble
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x00,                    //     Logical Maximum (0)
+    0x75, 0x04,                    //     Report Size (4)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x03,                    //     Output (Cnst,Var,Abs) — pad the enable byte
+    0x09, 0x70,                    //     Usage (Magnitude)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x64,                    //     Logical Maximum (100) — percent, NOT 255
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x04,                    //     Report Count (4) — LT, RT, left handle, right handle
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x09, 0x50,                    //     Usage (Duration)
+    0x66, 0x01, 0x10,              //     Unit (SI Linear: seconds)
+    0x55, 0x0E,                    //     Unit Exponent (-2) — centiseconds
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x26, 0xFF, 0x00,              //     Logical Maximum (255)
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x09, 0xA7,                    //     Usage (Start Delay) — same unit and range as Duration
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x65, 0x00,                    //     Unit (None)
+    0x55, 0x00,                    //     Unit Exponent (0)
+    0x09, 0x7C,                    //     Usage (Loop Count)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0xC0,                          //   End Collection
+    // The channel-proof feature report — see the ⚠️ above. Declared last so it cannot disturb the
+    // INPUT layout `xbox_proto` packs against: every global item here (Report Size/Count, Logical
+    // Min/Max) is re-stated after the final Input item, so nothing above is retroactively changed.
+    0x06, 0x00, 0xFF,              //   Usage Page (Vendor Defined 0xFF00)
+    0x85, 0x85,                    //   Report ID (0x85)
+    0x09, 0x2D,                    //   Usage (0x2D) — the id the PS descriptors use for it
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,              //   Logical Maximum (255)
+    0x75, 0x08,                    //   Report Size (8)
+    0x95, 0x3F,                    //   Report Count (63) — 1 id + 63 = 64 = FeatureReportByteLength
+    0xB1, 0x02,                    //   Feature (Data,Var,Abs)
+    0xC0,                          // End Collection
+];
+
+/// Bytes the Xbox input report occupies on the wire, report id included — 1 id + 8 sticks +
+/// 4 triggers + 1 hat + 2 buttons. hidclass sizes its READ_REPORT buffer from the descriptor, and
+/// [`Request::copy_to_output`] REFUSES a source longer than that buffer (it does not truncate), so
+/// the completion path must serve exactly this many bytes. See [`input_report_len`].
+const XBOX_INPUT_REPORT_LEN: usize = 16;
+
 // HID descriptor (9 bytes, packed): len, type=0x21, bcdHID=0x0100, country=0, numDesc=1, then
 // {reportType=0x22, wReportLength}. DualSense = 273 (0x0111); DualShock 4 = 507 (0x01FB);
 // DualSense Edge = 389 (0x0185).
@@ -248,22 +523,66 @@ static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01
 static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
 static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
 static DECK_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x26, 0x00]; // 38 bytes
+// Serves device_type 4, 5 AND 6 — one descriptor, three identities (see the XBOX_RDESC header).
+static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xDF, 0x00]; // 223 bytes
+
+// Each `wReportLength` above is a SECOND copy of a length that already exists as its descriptor's
+// array size, and the two are edited in different places. Getting them out of step does not fail
+// loudly — hidclass asks for `wReportLength` bytes and then parses whatever it got, so the pad
+// either enumerates with a truncated descriptor or fails to enumerate at all, with nothing naming
+// the cause. Assert the pairing at compile time instead; adding an item to a descriptor now cannot
+// build until its length is updated too.
+const fn declared_len(hid_desc: &[u8; 9]) -> usize {
+    (hid_desc[7] as usize) | ((hid_desc[8] as usize) << 8)
+}
+const _: () = assert!(declared_len(&HID_DESC) == DUALSENSE_RDESC.len());
+const _: () = assert!(declared_len(&DS4_HID_DESC) == DS4_RDESC.len());
+const _: () = assert!(declared_len(&EDGE_HID_DESC) == DS_EDGE_RDESC.len());
+const _: () = assert!(declared_len(&DECK_HID_DESC) == DECK_RDESC.len());
+const _: () = assert!(declared_len(&XBOX_HID_DESC) == XBOX_RDESC.len());
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
-// `devtype` selects the identity: PS family (same Sony VID/version) or the N4-spike Deck.
+// `devtype` selects the identity: PS family (same Sony VID/version), the N4-spike Deck, or one of
+// the three Xbox pads (same Microsoft VID/version — only the PID differs, which is the entire
+// difference between them; they share a report descriptor).
+//
+// ⚠️ THIS is where an Xbox identity is actually decided. Everything else in the Xbox path —
+// descriptor, HID descriptor, report length, neutral report — is shared, so a new Xbox model is a
+// PID here, a product string in `on_get_string`, an INF model line and nothing else.
 fn hid_attrs(devtype: u8) -> [u8; 32] {
-    let (vid, pid) = match devtype {
-        1 => (DS_VID, DS4_PID),
-        2 => (DS_VID, DS_EDGE_PID),
-        3 => (DECK_VID, DECK_PID),
-        _ => (DS_VID, DS_PID),
+    let (vid, pid, ver) = match devtype {
+        1 => (DS_VID, DS4_PID, DS_VER),
+        2 => (DS_VID, DS_EDGE_PID, DS_VER),
+        3 => (DECK_VID, DECK_PID, DS_VER),
+        4 => (XBOX_VID, XBOX_PID, XBOX_VER),
+        5 => (XBOX_VID, XBOX_PID_ONE_S, XBOX_VER),
+        6 => (XBOX_VID, XBOX_PID_ELITE2, XBOX_VER),
+        _ => (DS_VID, DS_PID, DS_VER),
     };
     let mut a = [0u8; 32];
     a[0..4].copy_from_slice(&32u32.to_le_bytes());
     a[4..6].copy_from_slice(&vid.to_le_bytes());
     a[6..8].copy_from_slice(&pid.to_le_bytes());
-    a[8..10].copy_from_slice(&DS_VER.to_le_bytes());
+    a[8..10].copy_from_slice(&ver.to_le_bytes());
     a
+}
+
+/// Bytes to hand a pended `IOCTL_HID_READ_REPORT`, per identity.
+///
+/// The PlayStation/Deck identities all declare 64-byte input reports, which is why the report slot
+/// and [`INPUT_REPORT`] are 64 bytes wide and the completion path could hand the whole buffer over
+/// unconditionally. The Xbox identity declares a [`XBOX_INPUT_REPORT_LEN`]-byte report, and
+/// [`Request::copy_to_output`] returns `STATUS_INVALID_BUFFER_SIZE` when the source is LONGER than
+/// the caller's buffer rather than truncating — so handing hidclass 64 bytes for a 16-byte report
+/// fails every single read and the pad looks dead.
+///
+/// Returns 64 for every pre-existing identity, so this is provably a no-op for them. All three
+/// Xbox identities share one descriptor, hence one report length.
+fn input_report_len(devtype: u8) -> usize {
+    match devtype {
+        4 | 5 | 6 => XBOX_INPUT_REPORT_LEN,
+        _ => 64,
+    }
 }
 
 // Neutral DualSense input report 0x01 (64 bytes): sticks centered (0x80), triggers 0, dpad neutral (8).
@@ -299,10 +618,27 @@ const DECK_NEUTRAL_REPORT: [u8; 64] = {
     r[3] = 0x3C;
     r
 };
+// Neutral Xbox input report 0x01: both sticks centred (0x8000 on a 0..65535 axis), triggers 0,
+// hat 0 (the descriptor's NULL state — the logical range starts at 1), no buttons held. Only the
+// first [`XBOX_INPUT_REPORT_LEN`] bytes are ever served; the rest of the 64-byte slot stays zero so
+// the shared [`INPUT_REPORT`] type is unchanged.
+const XBOX_NEUTRAL_REPORT: [u8; 64] = {
+    let mut r = [0u8; 64];
+    r[0] = 0x01; // report id
+    r[2] = 0x80; // LX = 0x8000 (little-endian)
+    r[3] = 0xFF; // LY = 0x7FFF — the Y axes are INVERTED (+y is up on the wire, down in HID),
+    r[4] = 0x7F; //   and mirroring an even-sized range centres one unit low. See `xbox_proto`.
+    r[6] = 0x80; // RX = 0x8000
+    r[7] = 0xFF; // RY = 0x7FFF
+    r[8] = 0x7F;
+    r
+};
 fn neutral_report(devtype: u8) -> [u8; 64] {
     match devtype {
         1 => DS4_NEUTRAL_REPORT,
         3 => DECK_NEUTRAL_REPORT,
+        // Wireless / One S / Elite Series 2 — one report shape, three identities.
+        4 | 5 | 6 => XBOX_NEUTRAL_REPORT,
         _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
     }
 }
@@ -455,8 +791,8 @@ static RING_PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
 /// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge,
-/// 3 = Steam Deck) — the neutral-report shape when the channel detaches, and the fallback identity
-/// while unattached.
+/// 3 = Steam Deck, 4 = Xbox Wireless, 5 = Xbox One S, 6 = Xbox Elite Series 2) — the
+/// neutral-report shape when the channel detaches, and the fallback identity while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// The identity resolved from the devnode's PnP hardware ids at `EvtDeviceAdd` ([`devtype_from_hwids`]);
 /// `u32::MAX` = not resolved. See [`device_type`] for why this exists.
@@ -472,9 +808,15 @@ static TICK: AtomicU32 = AtomicU32::new(0);
 /// can never disagree.
 ///
 /// Order matters: `pf_dualsense` is a prefix of `pf_dualsenseedge`, so the Edge is tested first.
+/// (No Xbox token is a prefix of another — `pf_xboxwireless` / `pf_xboxones` / `pf_xboxelite`
+/// diverge at the 8th character — but `hwid_devtype_table_matches_the_driver` re-checks that for
+/// every pair rather than trusting this note.)
 fn devtype_from_hwids(ids: &str) -> Option<u8> {
     for (token, devtype) in [
-        ("pf_steamdeck", 3u8),
+        ("pf_xboxwireless", 4u8),
+        ("pf_xboxones", 5),
+        ("pf_xboxelite", 6),
+        ("pf_steamdeck", 3),
         ("pf_dualsenseedge", 2),
         ("pf_dualshock4", 1),
         ("pf_dualsense", 0),
@@ -724,7 +1066,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // SAFETY: timer valid; the due time is TIMER_PERIOD_MS in 100 ns units, negative = relative.
     let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, due) };
 
-    log("[pf-gamepad] device ready (DualSense 054C:0CE6)");
+    log("[pf-gamepad] device ready");
     STATUS_SUCCESS
 }
 
@@ -762,13 +1104,17 @@ extern "C" fn evt_io_device_control(
             1 => &DS4_HID_DESC,
             2 => &EDGE_HID_DESC,
             3 => &DECK_HID_DESC,
+            4 | 5 | 6 => &XBOX_HID_DESC,
             _ => &HID_DESC,
         }),
         IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
+        // The three Xbox identities share ONE report descriptor on purpose — see the XBOX_RDESC
+        // header. Only `hid_attrs` (VID/PID) and `on_get_string` (product string) tell them apart.
         IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(match device_type() {
             1 => &DS4_RDESC[..],
             2 => &DS_EDGE_RDESC[..],
             3 => &DECK_RDESC[..],
+            4 | 5 | 6 => &XBOX_RDESC[..],
             _ => &DUALSENSE_RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
@@ -776,7 +1122,13 @@ extern "C" fn evt_io_device_control(
         }
         IOCTL_UMDF_HID_SET_FEATURE => on_set_feature(&request),
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
-        IOCTL_UMDF_HID_GET_INPUT_REPORT => request.copy_to_output(&neutral_report(device_type())),
+        // Sliced to the identity's declared report length for the same reason the timer's
+        // completion is (see `input_report_len`): a source longer than the caller's buffer is
+        // refused outright, not truncated.
+        IOCTL_UMDF_HID_GET_INPUT_REPORT => {
+            let dt = device_type();
+            request.copy_to_output(&neutral_report(dt)[..input_report_len(dt)])
+        }
         IOCTL_HID_GET_STRING => on_get_string(&request),
         // The channel proof (see `pf_umdf_util::hid`): the host asks THIS devnode which process
         // serves it, and duplicates the DATA section into the answer — so it never has to trust the
@@ -1024,6 +1376,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0 | 0x000e => match devtype {
             1 => "Sony Computer Entertainment".into(),
             3 => "Valve Software".into(),
+            4 | 5 | 6 => "Microsoft".into(),
             _ => "Sony Interactive Entertainment".into(),
         },
         // Per-pad serials (see `pad_index`): SDL reads this via HidD_GetSerialNumberString and
@@ -1035,12 +1388,30 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             1 => format!("DEADBEEF00{:02X}", 0x01u8.wrapping_add(pad_index())),
             2 => format!("35533AD6E7{:02X}", 0x75u8.wrapping_add(pad_index())),
             3 => format!("FVPF{:08X}", 0x5046_0000u32 | pad_index() as u32),
+            // Xbox pads report a Bluetooth MAC-shaped serial; the low octet carries the pad index
+            // so Steam dedups multiple forwarded pads, exactly like the PS identities above. Each
+            // Xbox identity gets its OWN base octet (0x10 / 0x30 / 0x50) rather than sharing one:
+            // a mixed session can present a Wireless pad and an Elite at once, and two identities
+            // whose serials differ only by pad index are one off-by-one away from colliding — the
+            // failure being Steam silently treating two live pads as one device.
+            4 => format!("F4B0FC2A6C{:02X}", 0x10u8.wrapping_add(pad_index())),
+            5 => format!("F4B0FC2A6C{:02X}", 0x30u8.wrapping_add(pad_index())),
+            6 => format!("F4B0FC2A6C{:02X}", 0x50u8.wrapping_add(pad_index())),
             _ => format!("35533AD6E7{:02X}", 0x74u8.wrapping_add(pad_index())),
         },
         _ => match devtype {
             1 => "Wireless Controller".into(),
             2 => "DualSense Edge Wireless Controller".into(),
             3 => "Steam Deck Controller".into(),
+            // ⚠️ 4 and 5 share a product string ON PURPOSE — a real Xbox Wireless Controller
+            // (Series X|S, `0B13`) and a real Xbox One S pad (`02FD`) BOTH report exactly
+            // "Xbox Wireless Controller" over Bluetooth. The PID is what tells them apart, and
+            // that is what SDL/Steam/Windows key their stock mappings off. Do not "fix" this by
+            // inventing a distinguishing string; it would make the One S identity a device that
+            // has never existed. (The INF's Device Manager descriptions DO differ — that string
+            // is ours, not the pad's.)
+            4 | 5 => "Xbox Wireless Controller".into(),
+            6 => "Xbox Elite Wireless Controller Series 2".into(),
             _ => "DualSense Wireless Controller".into(),
         },
     };
@@ -1052,7 +1423,8 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     request.copy_to_output(&wide)
 }
 
-/// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck.
+/// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck,
+/// 4 = Xbox Wireless Controller, 5 = Xbox One S, 6 = Xbox Elite Wireless Controller Series 2.
 /// Read fresh on each enumeration query — cheap.
 ///
 /// ⚠️ **The sealed section cannot answer the enumeration queries.** hidclass asks for
@@ -1142,7 +1514,10 @@ extern "C" fn evt_timer(timer: WDFTIMER) {
     // SAFETY: `queue` is that live manual queue — the exact contract `retrieve_next_request` needs.
     if let Some(request) = unsafe { wdf::retrieve_next_request(queue) } {
         let report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
-        let st = request.copy_to_output(&report);
+        // Serve exactly what this identity's descriptor declares — `copy_to_output` REFUSES a
+        // source longer than hidclass's buffer instead of truncating, so a 64-byte hand-over for
+        // the Xbox pad's 16-byte report would fail every read and the pad would look dead.
+        let st = request.copy_to_output(&report[..input_report_len(device_type())]);
         request.complete(st);
     }
 }

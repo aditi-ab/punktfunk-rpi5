@@ -18,13 +18,21 @@ use std::time::{Duration, Instant};
 /// 0xCD feedback events (lightbar / player LEDs / adaptive triggers), deduped via [`HidoutDedup`].
 #[derive(Default)]
 pub struct PadFeedback {
-    /// `(low, high)` motor levels, if the pass saw a rumble report.
+    /// `(low, high, left_trigger, right_trigger)` motor levels, if the pass saw a rumble report.
     ///
     /// Range is `0..=0xFFFF` — this said `0..=0xFF00`, which is only true of the backends that
     /// widen the device's 8-bit motor byte by `<< 8` (the UHID/DualSense path). The Windows
     /// backend widens by `× 257` and does reach 0xFFFF, and this type carries both. Neither is a
     /// defect: consumers narrow with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255.
-    pub rumble: Option<(u16, u16)>,
+    ///
+    /// The two trailing fields are the Xbox impulse-trigger motors, which ride the 0xCA plane's
+    /// v3 tail (design/trigger-rumble-plane.md). **Exactly one backend can ever set them non-zero**
+    /// — the Windows HID Xbox pad, whose output report `0x03` has fields for them. Every other
+    /// backend reports `(low, high, 0, 0)` because the packet it parses has nowhere to carry them:
+    /// XUSB's `SET_STATE` is `rumble_large`/`rumble_small`, evdev's `FF_RUMBLE` is strong/weak,
+    /// and a DualSense's trigger actuators are *adaptive* (force resistance, on the 0xCD plane)
+    /// rather than motors. That is a permanent property of those protocols, not a gap to fill.
+    pub rumble: Option<(u16, u16, u16, u16)>,
     pub hidout: Vec<HidOutput>,
     /// Whether the game drove this pad's RUMBLE plane this poll — at least one output report
     /// asserted the vibration fields (valid-flag set, including an explicit zero), not merely any
@@ -119,8 +127,11 @@ pub struct UhidManager<B: PadProto> {
     slots: PadSlots<B::Pad>,
     /// Each pad's current full report — buttons/sticks merged with persisted rich-plane fields.
     state: Vec<B::State>,
-    /// Last rumble forwarded per pad, so a report that only changes rich feedback doesn't re-send it.
-    last_rumble: Vec<(u16, u16)>,
+    /// Last rumble forwarded per pad, so a report that only changes rich feedback doesn't re-send
+    /// it. All FOUR levels, deliberately: dedup on the handle pair alone would swallow a
+    /// trigger-only change — a racing title's impulse-trigger stream against silent handles — and
+    /// the pad would never rumble, with nothing logged anywhere.
+    last_rumble: Vec<(u16, u16, u16, u16)>,
     /// Last rich feedback forwarded per pad, so an output report that only changed the rumble
     /// doesn't re-send unchanged lightbar/LED/trigger state.
     hidout_dedup: Vec<HidoutDedup>,
@@ -254,13 +265,26 @@ impl<B: PadProto> UhidManager<B> {
             backend,
             slots: PadSlots::new(B::LABEL, B::DEVICE, B::CREATE_HINT),
             state,
-            last_rumble: vec![(0, 0); MAX_PADS],
+            last_rumble: vec![(0, 0, 0, 0); MAX_PADS],
             hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             last_active: vec![Instant::now(); MAX_PADS],
             last_motion: vec![None; MAX_PADS],
             overflow_warn: vec![OverflowWarn::default(); MAX_PADS],
         }
+    }
+
+    /// How many virtual pads this manager has actually BUILT
+    /// ([`PadSlots::live`](crate::pad_slots::PadSlots::live)).
+    ///
+    /// For bring-up harnesses, which are the only callers that can act on it: a create failure
+    /// leaves the slot empty and only logs, so a harness that pushes frames regardless still
+    /// "works" — it just drives nothing, while whatever OTHER process owns that pad index keeps
+    /// answering every probe the operator then runs. That is how a stale pad's frozen XInput
+    /// packet count was once read as a measurement (2026-08-09, `.173`). A session has no use for
+    /// this: its pads come and go with the client's `active_mask` and zero is a normal state.
+    pub fn live_pads(&self) -> usize {
+        self.slots.live()
     }
 
     /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
@@ -339,13 +363,14 @@ impl<B: PadProto> UhidManager<B> {
     }
 
     /// Service every pad: answer any pending driver/kernel handshake and route a game's feedback
-    /// back out. `rumble` is invoked `(index, low, high)` only when the motor level *changes* (the
-    /// universal 0xCA plane); `hidout` is invoked per rich feedback event that isn't an exact
-    /// repeat of the last-forwarded value (the 0xCD plane). Call frequently — kernel/driver init
-    /// handshakes block until answered.
+    /// back out. `rumble` is invoked `(index, low, high, left_trigger, right_trigger)` only when
+    /// the motor level *changes* (the universal 0xCA plane — the trigger pair is non-zero only on
+    /// the Windows HID Xbox pad, see [`PadFeedback::rumble`]); `hidout` is invoked per rich
+    /// feedback event that isn't an exact repeat of the last-forwarded value (the 0xCD plane).
+    /// Call frequently — kernel/driver init handshakes block until answered.
     pub fn pump(
         &mut self,
-        mut rumble: impl FnMut(u16, u16, u16),
+        mut rumble: impl FnMut(u16, u16, u16, u16, u16),
         mut hidout: impl FnMut(HidOutput),
     ) {
         let now = Instant::now();
@@ -369,9 +394,9 @@ impl<B: PadProto> UhidManager<B> {
                 // the next LED/trigger state re-forwards. WARN through the per-pad rate limiter —
                 // a storm overflows every poll and the raw line once flooded a whole log export.
                 self.overflow_warn[i].note(now, B::LABEL, i);
-                if self.last_rumble[i] != (0, 0) {
-                    self.last_rumble[i] = (0, 0);
-                    rumble(i as u16, 0, 0);
+                if self.last_rumble[i] != (0, 0, 0, 0) {
+                    self.last_rumble[i] = (0, 0, 0, 0);
+                    rumble(i as u16, 0, 0, 0, 0);
                 }
                 self.hidout_dedup[i] = HidoutDedup::default();
             }
@@ -385,9 +410,9 @@ impl<B: PadProto> UhidManager<B> {
             if let Some(r) = fb.rumble {
                 if self.last_rumble[i] != r {
                     self.last_rumble[i] = r;
-                    rumble(i as u16, r.0, r.1);
+                    rumble(i as u16, r.0, r.1, r.2, r.3);
                 }
-            } else if self.last_rumble[i] != (0, 0)
+            } else if self.last_rumble[i] != (0, 0, 0, 0)
                 && rumble_idle_timeout()
                     .is_some_and(|t| now.duration_since(self.last_active[i]) >= t)
             {
@@ -400,10 +425,12 @@ impl<B: PadProto> UhidManager<B> {
                     index = i,
                     prev_low = self.last_rumble[i].0,
                     prev_high = self.last_rumble[i].1,
+                    prev_lt = self.last_rumble[i].2,
+                    prev_rt = self.last_rumble[i].3,
                     "rumble: stale residual (game stopped driving the rumble plane) — forcing off"
                 );
-                self.last_rumble[i] = (0, 0);
-                rumble(i as u16, 0, 0);
+                self.last_rumble[i] = (0, 0, 0, 0);
+                rumble(i as u16, 0, 0, 0, 0);
             }
             for h in fb.hidout {
                 // Skip rich feedback that repeats the last-forwarded value (a game's output report
@@ -469,7 +496,7 @@ impl<B: PadProto> UhidManager<B> {
     /// (re)connect starts from scratch and is always forwarded.
     fn reset_pad(&mut self, idx: usize) {
         self.state[idx] = self.backend.neutral();
-        self.last_rumble[idx] = (0, 0);
+        self.last_rumble[idx] = (0, 0, 0, 0);
         self.hidout_dedup[idx].clear();
         self.last_write[idx] = Instant::now();
         self.last_active[idx] = Instant::now();
@@ -733,14 +760,14 @@ mod tests {
         m.handle(&frame(1, 0b00, 0));
         assert!(m.slots.get(1).is_some(), "inside the grace — not yet swept");
         // A tick inside the grace must NOT flap the devnode (pad_slots::SWEEP_GRACE).
-        m.pump(|_, _, _| {}, |_| {});
+        m.pump(|_, _, _, _, _| {}, |_| {});
         assert!(
             m.slots.get(1).is_some(),
             "a tick inside the grace dropped it"
         );
         // Grace elapsed: the next tick completes the unplug, with no further frame.
         m.slots.expire_grace();
-        m.pump(|_, _, _| {}, |_| {});
+        m.pump(|_, _, _, _, _| {}, |_| {});
         assert!(
             m.slots.get(1).is_none(),
             "the pump tick never completed the unplug"
@@ -783,7 +810,10 @@ mod tests {
         m.handle(&frame(0, 0b1, 0));
         let collect = |m: &mut UhidManager<MockProto>| {
             let out = RefCell::new(Vec::new());
-            m.pump(|i, lo, hi| out.borrow_mut().push((i, lo, hi)), |_| {});
+            m.pump(
+                |i, lo, hi, lt, rt| out.borrow_mut().push((i, lo, hi, lt, rt)),
+                |_| {},
+            );
             out.into_inner()
         };
         let rumble = |r| PadFeedback {
@@ -792,12 +822,16 @@ mod tests {
             rumble_drove: Some(true),
             resync: false,
         };
-        *m.backend.feedback.borrow_mut() = vec![rumble((100, 0)), rumble((100, 0)), rumble((7, 7))];
-        assert_eq!(collect(&mut m), vec![(0, 100, 0)]); // first value forwards
+        *m.backend.feedback.borrow_mut() = vec![
+            rumble((100, 0, 0, 0)),
+            rumble((100, 0, 0, 0)),
+            rumble((7, 7, 0, 0)),
+        ];
+        assert_eq!(collect(&mut m), vec![(0, 100, 0, 0, 0)]); // first value forwards
         assert_eq!(collect(&mut m), vec![]); // exact repeat deduped
-        assert_eq!(collect(&mut m), vec![(0, 7, 7)]); // change forwards
-                                                      // Unplug + recreate re-arms the dedup: the same level forwards again. The unplug completes
-                                                      // on a PUMP tick, not on a second frame — that is all production ever sends.
+        assert_eq!(collect(&mut m), vec![(0, 7, 7, 0, 0)]); // change forwards
+                                                            // Unplug + recreate re-arms the dedup: the same level forwards again. The unplug completes
+                                                            // on a PUMP tick, not on a second frame — that is all production ever sends.
         m.handle(&frame(0, 0b0, 0)); // the one removal frame — arms the grace
         m.slots.expire_grace();
         assert_eq!(collect(&mut m), vec![]); // this tick reaps; nothing queued to forward
@@ -806,8 +840,43 @@ mod tests {
             "the pump tick completed the unplug"
         );
         m.handle(&frame(0, 0b1, 0));
-        *m.backend.feedback.borrow_mut() = vec![rumble((7, 7))];
-        assert_eq!(collect(&mut m), vec![(0, 7, 7)]);
+        *m.backend.feedback.borrow_mut() = vec![rumble((7, 7, 0, 0))];
+        assert_eq!(collect(&mut m), vec![(0, 7, 7, 0, 0)]);
+    }
+
+    /// The dedup compares all FOUR levels. Comparing only the handle pair would swallow a
+    /// trigger-only change — which is the *normal* shape of impulse-trigger content, since racing
+    /// titles drive the triggers continuously against near-silent handles — and the pad would
+    /// simply never rumble, with nothing logged and nothing on the wire to look at.
+    #[test]
+    fn a_trigger_only_change_is_forwarded_not_deduped_away() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        let collect = |m: &mut UhidManager<MockProto>| {
+            let out = RefCell::new(Vec::new());
+            m.pump(
+                |i, lo, hi, lt, rt| out.borrow_mut().push((i, lo, hi, lt, rt)),
+                |_| {},
+            );
+            out.into_inner()
+        };
+        let rumble = |r| PadFeedback {
+            rumble: Some(r),
+            hidout: Vec::new(),
+            rumble_drove: Some(true),
+            resync: false,
+        };
+        // Handles silent throughout; only the trigger motors move.
+        *m.backend.feedback.borrow_mut() = vec![
+            rumble((0, 0, 0x8000, 0)),
+            rumble((0, 0, 0x8000, 0)),
+            rumble((0, 0, 0x8000, 0x4000)),
+            rumble((0, 0, 0, 0)),
+        ];
+        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0x8000, 0)]);
+        assert_eq!(collect(&mut m), vec![], "exact repeat still dedups");
+        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0x8000, 0x4000)]);
+        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0, 0)], "the stop forwards");
     }
 
     #[test]
@@ -816,17 +885,20 @@ mod tests {
         m.handle(&frame(0, 0b1, 0));
         let collect = |m: &mut UhidManager<MockProto>| {
             let out = RefCell::new(Vec::new());
-            m.pump(|i, lo, hi| out.borrow_mut().push((i, lo, hi)), |_| {});
+            m.pump(
+                |i, lo, hi, lt, rt| out.borrow_mut().push((i, lo, hi, lt, rt)),
+                |_| {},
+            );
             out.into_inner()
         };
         // The game latches a non-zero rumble (a fresh report drove the pad).
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
-            rumble: Some((200, 0)),
+            rumble: Some((200, 0, 0, 0)),
             hidout: Vec::new(),
             rumble_drove: Some(true),
             resync: false,
         }];
-        assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
+        assert_eq!(collect(&mut m), vec![(0, 200, 0, 0, 0)]);
 
         // The game stops driving the RUMBLE plane — no output report at all, or (equivalently, the
         // confirmed stuck-ON case) a stream of LED/adaptive-trigger reports that never assert the
@@ -845,7 +917,7 @@ mod tests {
         // exactly once, then stays off (no repeated zero spam).
         m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
         *m.backend.feedback.borrow_mut() = vec![idle(), idle()];
-        assert_eq!(collect(&mut m), vec![(0, 0, 0)]); // forced off
+        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0, 0)]); // forced off
         assert_eq!(collect(&mut m), vec![]); // already zero — no repeat
     }
 
@@ -855,16 +927,19 @@ mod tests {
         m.handle(&frame(0, 0b1, 0));
         let collect = |m: &mut UhidManager<MockProto>| {
             let out = RefCell::new(Vec::new());
-            m.pump(|i, lo, hi| out.borrow_mut().push((i, lo, hi)), |_| {});
+            m.pump(
+                |i, lo, hi, lt, rt| out.borrow_mut().push((i, lo, hi, lt, rt)),
+                |_| {},
+            );
             out.into_inner()
         };
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
-            rumble: Some((200, 0)),
+            rumble: Some((200, 0, 0, 0)),
             hidout: Vec::new(),
             rumble_drove: Some(true),
             resync: false,
         }];
-        assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
+        assert_eq!(collect(&mut m), vec![(0, 200, 0, 0, 0)]);
 
         // Even with a stale clock, a poll where the game drove the rumble plane refreshes
         // activity, so the held rumble is NOT cut. Backends report that as
@@ -872,7 +947,7 @@ mod tests {
         // the manager also honors the bare `rumble_drove: Some(true)` shape defensively.
         m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
-            rumble: Some((200, 0)),
+            rumble: Some((200, 0, 0, 0)),
             hidout: Vec::new(),
             rumble_drove: Some(true),
             resync: false,
@@ -906,7 +981,7 @@ mod tests {
         }];
         let out = RefCell::new(0u32);
         m.pump(
-            |_, _, _| {},
+            |_, _, _, _, _| {},
             |_| {
                 *out.borrow_mut() += 1;
             },
@@ -976,7 +1051,7 @@ mod tests {
             let rumbles = RefCell::new(Vec::new());
             let hidouts = RefCell::new(0u32);
             m.pump(
-                |i, lo, hi| rumbles.borrow_mut().push((i, lo, hi)),
+                |i, lo, hi, lt, rt| rumbles.borrow_mut().push((i, lo, hi, lt, rt)),
                 |_| *hidouts.borrow_mut() += 1,
             );
             (rumbles.into_inner(), hidouts.into_inner())
@@ -984,12 +1059,12 @@ mod tests {
 
         // Latch a rumble + an LED.
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
-            rumble: Some((100, 0)),
+            rumble: Some((100, 0, 0, 0)),
             hidout: vec![led(10)],
             rumble_drove: Some(true),
             resync: false,
         }];
-        assert_eq!(collect(&mut m), (vec![(0, 100, 0)], 1));
+        assert_eq!(collect(&mut m), (vec![(0, 100, 0, 0, 0)], 1));
 
         // Overflow poll: no reports survived, resync flagged → forced stop, exactly once.
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
@@ -998,22 +1073,22 @@ mod tests {
             rumble_drove: Some(false),
             resync: true,
         }];
-        assert_eq!(collect(&mut m), (vec![(0, 0, 0)], 0));
+        assert_eq!(collect(&mut m), (vec![(0, 0, 0, 0, 0)], 0));
 
         // The game re-asserts the SAME rumble + LED state: both must re-forward (the rumble
         // because the forced stop reset `last_rumble`, the LED because the dedup was re-armed).
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
-            rumble: Some((100, 0)),
+            rumble: Some((100, 0, 0, 0)),
             hidout: vec![led(10)],
             rumble_drove: Some(true),
             resync: false,
         }];
-        assert_eq!(collect(&mut m), (vec![(0, 100, 0)], 1));
+        assert_eq!(collect(&mut m), (vec![(0, 100, 0, 0, 0)], 1));
 
         // A resync with nothing latched forwards no spurious stop.
         *m.backend.feedback.borrow_mut() = vec![
             PadFeedback {
-                rumble: Some((0, 0)),
+                rumble: Some((0, 0, 0, 0)),
                 hidout: Vec::new(),
                 rumble_drove: Some(true),
                 resync: false,
@@ -1025,7 +1100,7 @@ mod tests {
                 resync: true,
             },
         ];
-        assert_eq!(collect(&mut m), (vec![(0, 0, 0)], 0)); // the explicit stop
+        assert_eq!(collect(&mut m), (vec![(0, 0, 0, 0, 0)], 0)); // the explicit stop
         assert_eq!(collect(&mut m), (vec![], 0)); // resync at zero — silent
     }
 }
