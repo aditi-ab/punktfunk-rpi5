@@ -580,7 +580,7 @@ fn hid_attrs(devtype: u8) -> [u8; 32] {
 /// Xbox identities share one descriptor, hence one report length.
 fn input_report_len(devtype: u8) -> usize {
     match devtype {
-        4 | 5 | 6 => XBOX_INPUT_REPORT_LEN,
+        4..=6 => XBOX_INPUT_REPORT_LEN,
         _ => 64,
     }
 }
@@ -638,7 +638,7 @@ fn neutral_report(devtype: u8) -> [u8; 64] {
         1 => DS4_NEUTRAL_REPORT,
         3 => DECK_NEUTRAL_REPORT,
         // Wireless / One S / Elite Series 2 — one report shape, three identities.
-        4 | 5 | 6 => XBOX_NEUTRAL_REPORT,
+        4..=6 => XBOX_NEUTRAL_REPORT,
         _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
     }
 }
@@ -1104,7 +1104,7 @@ extern "C" fn evt_io_device_control(
             1 => &DS4_HID_DESC,
             2 => &EDGE_HID_DESC,
             3 => &DECK_HID_DESC,
-            4 | 5 | 6 => &XBOX_HID_DESC,
+            4..=6 => &XBOX_HID_DESC,
             _ => &HID_DESC,
         }),
         IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
@@ -1114,7 +1114,7 @@ extern "C" fn evt_io_device_control(
             1 => &DS4_RDESC[..],
             2 => &DS_EDGE_RDESC[..],
             3 => &DECK_RDESC[..],
-            4 | 5 | 6 => &XBOX_RDESC[..],
+            4..=6 => &XBOX_RDESC[..],
             _ => &DUALSENSE_RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
@@ -1376,7 +1376,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0 | 0x000e => match devtype {
             1 => "Sony Computer Entertainment".into(),
             3 => "Valve Software".into(),
-            4 | 5 | 6 => "Microsoft".into(),
+            4..=6 => "Microsoft".into(),
             _ => "Sony Interactive Entertainment".into(),
         },
         // Per-pad serials (see `pad_index`): SDL reads this via HidD_GetSerialNumberString and
