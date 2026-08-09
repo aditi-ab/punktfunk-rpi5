@@ -58,7 +58,7 @@ index 9fc54f0..1eb35b3 100644
  	"                                 If this is not set, and there is a HDR client, it will be tonemapped SDR.\n"
  	"  --sdr-gamut-wideness           Set the 'wideness' of the gamut for SDR comment. 0 - 1.\n"
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 01b2abf..5c65420 100644
+index 83c751b..a8a816f 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -2316,6 +2316,13 @@ static void update_touch_scaling( const struct FrameInfo_t *frameInfo )
@@ -146,9 +146,9 @@ index 01b2abf..5c65420 100644
 +	}
 +
  	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
- 		? vulkan_acquire_capture_texture( uWidth, uHeight, false, DRM_FORMAT_XRGB2101010 )
+ 		? vulkan_acquire_capture_texture( uWidth, uHeight, false, vulkan_get_rgb10_capture_format() )
  		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
-@@ -8397,6 +8452,12 @@ steamcompmgr_main(int argc, char **argv)
+@@ -8404,6 +8459,12 @@ steamcompmgr_main(int argc, char **argv)
  					g_FadeOutDuration = atoi(optarg);
  				} else if (strcmp(opt_name, "force-windows-fullscreen") == 0) {
  					bForceWindowsFullscreen = true;

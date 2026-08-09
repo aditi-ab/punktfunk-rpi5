@@ -17,7 +17,23 @@
 # can't supply a passphrase non-interactively here.
 #
 # Usage (in rpm.yml, after build-rpm.sh): RPM_GPG_PRIVATE_KEY=... bash packaging/rpm/sign-rpms.sh
+#
+# Takes the RPMs to sign as arguments, defaulting to `dist/*.rpm`. The argument form exists because
+# punktfunk-gamescope is built LATER in the job than the host RPMs — it is a ~10-minute C++ build
+# behind its own cache — so it misses the main signing pass entirely and needs a second one just
+# for itself. It shipped unsigned into a `gpgcheck=1` repo that way, which made
+# `dnf install punktfunk-gamescope` fail with "The package is not signed" for every Fedora/Nobara
+# user: the package was in the channel and still uninstallable.
 set -euo pipefail
+
+# Default target, and a real glob rather than a literal when nothing matched.
+if [ "$#" -gt 0 ]; then
+  RPMS=("$@")
+else
+  shopt -s nullglob
+  RPMS=(dist/*.rpm)
+fi
+[ "${#RPMS[@]}" -gt 0 ] || { echo "no RPMs to sign" >&2; exit 1; }
 
 if [ -z "${RPM_GPG_PRIVATE_KEY:-}" ]; then
   case "${GITHUB_REF:-}" in
@@ -47,11 +63,11 @@ KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}
 # correctly. (A custom __gpg_sign_cmd passed via --define reached gpg with those filename macros
 # UNEXPANDED -> "No such file or directory".) Just point rpm at our key; the GNUPGHOME above
 # (passphrase-less key + loopback) lets gpg sign headless.
-for rpm in dist/*.rpm; do
+for rpm in "${RPMS[@]}"; do
   rpmsign --define "_gpg_name $KEYID" --addsign "$rpm"
 done
 
 # Verify locally so a bad signature fails the build before publishing.
 rpm --import <(gpg --export --armor "$KEYID")
-rpmkeys --checksig dist/*.rpm
-echo "signed + verified $(find dist -name '*.rpm' | wc -l) RPM(s) with key $KEYID"
+rpmkeys --checksig "${RPMS[@]}"
+echo "signed + verified ${#RPMS[@]} RPM(s) with key $KEYID"

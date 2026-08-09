@@ -1,4 +1,4 @@
-From 509fb928c7dc3307372629ca692f4c895c4fe984 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
 Date: Sat, 8 Aug 2026 19:17:25 +0200
 Subject: [PATCH] punktfunk: never destroy the Vulkan device or output at exit
@@ -49,7 +49,7 @@ Both are needed: pinning only the device relocated the fault into
  2 files changed, 35 insertions(+), 4 deletions(-)
 
 diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
-index 5c2dd11..8cd5ca2 100644
+index 3f7ea90..0382a4b 100644
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
 @@ -118,7 +118,37 @@ static VkResult vulkan_load_module()
@@ -102,10 +102,10 @@ index 5c2dd11..8cd5ca2 100644
  static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
  {
 diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
-index b6749d4..a9335c4 100644
+index c49b95f..ee98b38 100644
 --- a/src/rendervulkan.hpp
 +++ b/src/rendervulkan.hpp
-@@ -564,7 +564,7 @@ enum ShaderType {
+@@ -565,7 +565,7 @@ enum ShaderType {
  	SHADER_TYPE_COUNT
  };
  
@@ -114,12 +114,9 @@ index b6749d4..a9335c4 100644
  
  struct SamplerState
  {
-@@ -1007,4 +1007,4 @@ void vulkan_wait_idle();
- // Whether the driver implements VK_EXT_physical_device_drm
- bool vulkan_has_drm_props();
+@@ -1010,4 +1010,4 @@ bool vulkan_has_drm_props();
+ 
+ bool vulkan_has_drm_modifiers_for_features(VkFormat format, VkFormatFeatureFlags features);
  
 -extern CVulkanDevice g_device;
 +extern CVulkanDevice &g_device;
--- 
-2.55.0
-

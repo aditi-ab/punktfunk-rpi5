@@ -62,7 +62,7 @@ index 2c4fb50..b406caf 100644
  	"                                 If this is not set, and there is a HDR client, it will be tonemapped SDR.\n"
  	"  --sdr-gamut-wideness           Set the 'wideness' of the gamut for SDR comment. 0 - 1.\n"
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 5c65420..0d293c6 100644
+index a8a816f..64e1a8c 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -2323,6 +2323,12 @@ gamescope::ConVar<bool> cv_pipewire_composite_cursor{ "pipewire_composite_cursor
@@ -127,7 +127,7 @@ index 5c65420..0d293c6 100644
  	// The cursor, when this stream was asked for it. gamescope keeps the pointer OUT of the
  	// PipeWire node by default — it lives on a hardware plane for scanout, and a remote-play
  	// consumer that draws its own would end up with two — so a consumer that has no cursor of
-@@ -8457,6 +8490,12 @@ steamcompmgr_main(int argc, char **argv)
+@@ -8464,6 +8497,12 @@ steamcompmgr_main(int argc, char **argv)
  					cv_pipewire_composite_cursor = true;
  #else
  					fprintf( stderr, "gamescope: --pipewire-composite-cursor ignored (built without PipeWire)\n" );

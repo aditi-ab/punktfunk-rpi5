@@ -25,7 +25,7 @@ set -euo pipefail
 
 # The pinned upstream. Bump together with the patches (they are `git am`-able and rebase cheaply —
 # two files, mirroring code that already exists in-tree; see README.md).
-GAMESCOPE_REV="8c676c399c761e4540587f61004c957993d12fea"
+GAMESCOPE_REV="5fb8dce4a09d0a68d097b9faf9513782106bc843"
 GAMESCOPE_REPO="https://github.com/ValveSoftware/gamescope.git"
 
 REV="$GAMESCOPE_REV" PREFIX=/usr DESTDIR="" SRCDIR="" JOBS="" SETCAP=1
