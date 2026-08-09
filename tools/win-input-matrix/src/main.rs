@@ -41,7 +41,9 @@ mod imp {
     };
     use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     use windows::Win32::System::Com::CoIncrementMTAUsage;
-    use windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+    use windows::Win32::UI::Input::XboxController::{
+        XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
+    };
     // `Interface` brings `cast()` into scope, which is how a WinRT `Gamepad` is correlated to the
     // `RawGameController` that knows its name.
     use windows::core::{GUID, Interface};
@@ -156,6 +158,45 @@ mod imp {
             eprintln!("warning: could not subscribe to WGI Added events; counts may read zero");
         }
         std::thread::sleep(Duration::from_millis(1500));
+    }
+
+    /// Drive rumble into an XInput slot and hold it, so the other end of the pipe can be watched.
+    ///
+    /// This is the WP0 probe from `design/trigger-rumble-plane.md`: does anything Windows-side ever
+    /// write an output report back to a synthesized `045E:0B13`? For the HID backend the chain
+    /// under test is `XInputSetState` → `xinputhid` → a HID output report on our collection →
+    /// `on_output_report` → the shm out-ring → `parse_xbox_output`, and the observable is the
+    /// devtest printing `rumble from game`. Run this with the devtest live and watch its stdout.
+    ///
+    /// ⚠️ `XINPUT_VIBRATION` has exactly TWO members, so this can only ever drive the two handle
+    /// motors — it can never source TRIGGER rumble. That is a property of the API, not of our
+    /// plumbing, and it is why the trigger plane needs its own transport.
+    fn rumble(slot: u32, seconds: u64) {
+        println!("== RUMBLE PROBE: XInputSetState(slot {slot}) for {seconds}s ==");
+        let v = XINPUT_VIBRATION {
+            wLeftMotorSpeed: 0xFFFF,
+            wRightMotorSpeed: 0x8000,
+        };
+        // SAFETY: `v` is a valid, fully-initialised XINPUT_VIBRATION.
+        let rc = unsafe { XInputSetState(slot, &v) };
+        println!(
+            "  set  low=0xFFFF high=0x8000 -> rc={rc}{}",
+            if rc == 0 {
+                " (accepted)"
+            } else {
+                " (REJECTED)"
+            }
+        );
+        if rc != 0 {
+            println!("  (slot not connected — nothing downstream can be concluded)");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(seconds));
+        let off = XINPUT_VIBRATION::default();
+        // SAFETY: as above.
+        let rc2 = unsafe { XInputSetState(slot, &off) };
+        println!("  clear low=0 high=0 -> rc={rc2}");
+        println!("  ⇒ now check the devtest stdout for `rumble from game`.");
     }
 
     fn xinput() {
@@ -281,6 +322,100 @@ mod imp {
         }
     }
 
+    /// Sample XInput over the whole watch window and report the RANGE each axis covered.
+    ///
+    /// A single `XInputGetState` call cannot tell "translated correctly" from "stuck at zero" —
+    /// a sweeping stick reads 0 every time it crosses centre. `dwPacketNumber` advancing proves
+    /// the state is changing at all; the min/max spread proves the AXES specifically are, which is
+    /// the half that can fail on its own while buttons work.
+    struct XiTrack {
+        first_packet: u32,
+        last_packet: u32,
+        lx: (i16, i16),
+        ly: (i16, i16),
+        rx: (i16, i16),
+        ry: (i16, i16),
+        buttons: u16,
+        lt: (u8, u8),
+        rt: (u8, u8),
+    }
+
+    fn xinput_watch(rounds: usize) {
+        println!("\n== XINPUT WATCH ({rounds} samples) — do PACKETS advance and AXES move? ==");
+        for slot in 0..4u32 {
+            let mut t: Option<XiTrack> = None;
+            for _ in 0..rounds {
+                let mut st = XINPUT_STATE::default();
+                // SAFETY: `st` is a valid, fully-initialised XINPUT_STATE.
+                if unsafe { XInputGetState(slot, &mut st) } != 0 {
+                    break;
+                }
+                let g = st.Gamepad;
+                match &mut t {
+                    None => {
+                        t = Some(XiTrack {
+                            first_packet: st.dwPacketNumber,
+                            last_packet: st.dwPacketNumber,
+                            lx: (g.sThumbLX, g.sThumbLX),
+                            ly: (g.sThumbLY, g.sThumbLY),
+                            rx: (g.sThumbRX, g.sThumbRX),
+                            ry: (g.sThumbRY, g.sThumbRY),
+                            buttons: g.wButtons.0,
+                            lt: (g.bLeftTrigger, g.bLeftTrigger),
+                            rt: (g.bRightTrigger, g.bRightTrigger),
+                        });
+                    }
+                    Some(t) => {
+                        t.last_packet = st.dwPacketNumber;
+                        t.lx = (t.lx.0.min(g.sThumbLX), t.lx.1.max(g.sThumbLX));
+                        t.ly = (t.ly.0.min(g.sThumbLY), t.ly.1.max(g.sThumbLY));
+                        t.rx = (t.rx.0.min(g.sThumbRX), t.rx.1.max(g.sThumbRX));
+                        t.ry = (t.ry.0.min(g.sThumbRY), t.ry.1.max(g.sThumbRY));
+                        t.buttons |= g.wButtons.0;
+                        t.lt = (t.lt.0.min(g.bLeftTrigger), t.lt.1.max(g.bLeftTrigger));
+                        t.rt = (t.rt.0.min(g.bRightTrigger), t.rt.1.max(g.bRightTrigger));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            match t {
+                None => println!("  slot {slot}: not connected"),
+                Some(t) => {
+                    let moved = t.last_packet != t.first_packet;
+                    let axes_moved = t.lx.0 != t.lx.1
+                        || t.ly.0 != t.ly.1
+                        || t.rx.0 != t.rx.1
+                        || t.ry.0 != t.ry.1
+                        || t.lt.0 != t.lt.1
+                        || t.rt.0 != t.rt.1;
+                    println!(
+                        "  slot {slot}: packets {}..{} ({}), buttons seen 0x{:04X}",
+                        t.first_packet,
+                        t.last_packet,
+                        if moved { "ADVANCING" } else { "FROZEN" },
+                        t.buttons
+                    );
+                    println!(
+                        "    LX [{}..{}]  LY [{}..{}]  RX [{}..{}]  RY [{}..{}]  LT [{}..{}]  RT [{}..{}]  -> axes {}",
+                        t.lx.0,
+                        t.lx.1,
+                        t.ly.0,
+                        t.ly.1,
+                        t.rx.0,
+                        t.rx.1,
+                        t.ry.0,
+                        t.ry.1,
+                        t.lt.0,
+                        t.lt.1,
+                        t.rt.0,
+                        t.rt.1,
+                        if axes_moved { "MOVING" } else { "STUCK" }
+                    );
+                }
+            }
+        }
+    }
+
     /// Flag every device whose current reading differs from the baseline one. Once a device has
     /// moved it stays flagged — a pad that twitches once in twenty samples is still LIVE.
     fn mark_moved(base: &[Sample], now: &[Sample], moved: &mut [bool]) {
@@ -350,6 +485,7 @@ mod imp {
     pub fn run() {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut rounds = 0usize;
+        let mut rumble_slot: Option<u32> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -357,10 +493,16 @@ mod imp {
                     rounds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(20);
                     i += 1;
                 }
+                "--rumble" => {
+                    rumble_slot = Some(args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0));
+                    i += 1;
+                }
                 "--help" | "-h" => {
                     println!(
-                        "win-input-matrix [--watch N]\n\n  \
-                         --watch N   sample WGI N times and report LIVE vs MUTE per device\n\n\
+                        "win-input-matrix [--watch N] [--rumble SLOT]\n\n  \
+                         --watch N     sample WGI N times and report LIVE vs MUTE per device\n  \
+                         --rumble SLOT drive XInputSetState into that slot for 3 s (WP0 probe:\n                \
+                         does anything write an output report back to our pad?)\n\n\
                          ALWAYS take a baseline with your virtual pad STOPPED and diff it: a real\n\
                          pad on the box owns XInput slot 0 and shows up in WGI."
                     );
@@ -412,6 +554,11 @@ mod imp {
 
         if rounds > 0 {
             watch(rounds);
+            xinput_watch(rounds);
+        }
+        if let Some(slot) = rumble_slot {
+            println!();
+            rumble(slot, 3);
         }
     }
 }

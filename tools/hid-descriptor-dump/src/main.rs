@@ -54,22 +54,28 @@ fn extract_rust_array(src: &str, symbol: &str) -> Result<Vec<u8>, String> {
     let at = src
         .find(&format!("static {symbol}:"))
         .ok_or_else(|| format!("no `static {symbol}:` in that file"))?;
-    let open = src[at..]
-        .find('[')
-        .and_then(|i| src[at + i + 1..].find('[').map(|j| at + i + 1 + j + 1))
-        .ok_or("could not find the array literal")?;
-    let close = src[open..]
-        .find(']')
-        .ok_or("array literal is never closed")?
-        + open;
-    // Strip trailing `// ...` comments LINE BY LINE before splitting on commas — the annotations in
-    // these arrays contain commas themselves (`// Input (Data,Var,Abs)`), so comma-splitting first
-    // scatters comment text into the byte stream.
-    let body: String = src[open..close]
+
+    // 🛑 STRIP COMMENTS FIRST, then find the brackets — not the other way round. These arrays are
+    // heavily annotated and the annotations contain both `,` and `]` (a comment documenting a wire
+    // layout as `[0x03][enable][left]…` is real, and it appears inside `XBOX_RDESC`). Locating the
+    // closing bracket on the raw text stops at the first `]` in a COMMENT and silently truncates
+    // the array — which reads as a corrupt descriptor rather than a parse bug.
+    let tail: String = src[at..]
         .lines()
         .map(|l| l.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
+
+    // First `[` is the type's `[u8; N]`; the next one opens the literal.
+    let open = tail
+        .find('[')
+        .and_then(|i| tail[i + 1..].find('[').map(|j| i + 1 + j + 1))
+        .ok_or("could not find the array literal")?;
+    let close = tail[open..]
+        .find(']')
+        .ok_or("array literal is never closed")?
+        + open;
+    let body = &tail[open..close];
     let mut out = Vec::new();
     for tok in body.split(',') {
         let tok = tok.trim();

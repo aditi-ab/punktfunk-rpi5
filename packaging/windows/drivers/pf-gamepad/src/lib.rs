@@ -323,7 +323,7 @@ static DECK_RDESC: [u8; 38] = [
 // report forever. `0x3F` payload bytes so `FeatureReportByteLength` lands on 64, the buffer size
 // `channel_proof::query` asks with; the proof itself needs 17.
 #[rustfmt::skip]
-static XBOX_RDESC: [u8; 150] = [
+static XBOX_RDESC: [u8; 223] = [
     0x05, 0x01,                    // Usage Page (Generic Desktop)
     0x09, 0x05,                    // Usage (Game Pad)
     0xA1, 0x01,                    // Collection (Application)
@@ -386,6 +386,67 @@ static XBOX_RDESC: [u8; 150] = [
     0x75, 0x01,                    //   Report Size (1)
     0x95, 0x01,                    //   Report Count (1)
     0x81, 0x03,                    //   Input (Cnst,Var,Abs) — pad to a byte boundary
+    // ---- Rumble OUTPUT report `0x03` (Physical Interface Device page) ----
+    //
+    // Without this the pad can receive NOTHING. hidclass routes an output report only if the
+    // descriptor declares one, so with no `0x91` item `on_output_report` never fires,
+    // `publish_output` never writes the ring, and `parse_xbox_output`
+    // (`inject/windows/xbox_windows.rs`) is unreachable code — the whole host-side rumble plane is
+    // already built and was simply never fed. That is why the HID Xbox pad had no rumble at all,
+    // not merely no trigger rumble.
+    //
+    // ⚠️ PROVENANCE — HAND-WRITTEN, and it could not be otherwise. Every other output collection in
+    // this file is a capture, and §3 of `design/xbox-pad-windows-handoff.md` insists on captures.
+    // But the Elite capture taken for that work reports `OUTPUT items: 0` (Windows exposes no
+    // literal report-descriptor bytes; hidapi reconstructs from `HidD_GetPreparsedData`, and that
+    // reconstruction carries no output collection for this pad). So there was nothing to copy.
+    // This block is the documented Xbox One S / Elite Bluetooth rumble report — PID-page
+    // `Set Effect Report`, id `0x03`, 8 payload bytes — chosen because it is exactly the layout
+    // `parse_xbox_output` and `design/trigger-rumble-plane.md` §2.1 already specify:
+    //     [0x03][enable][left_trigger][right_trigger][left][right][duration][delay][loop]
+    // with magnitudes 0..100 (hence `Logical Maximum (100)`, not 255).
+    // **Replace it with a Linux hidraw capture when one can be taken** — that is the only route to
+    // byte-exact truth here, and the enable-bit assignments for the two TRIGGER actuators remain
+    // unverified (see trigger-rumble-plane.md WP0).
+    //
+    // Declared AFTER the final Input item and re-stating every global it uses, so it cannot
+    // retroactively alter the 16-byte input layout `xbox_proto`'s tests pin.
+    0x05, 0x0F,                    //   Usage Page (Physical Interface Device)
+    0x09, 0x21,                    //   Usage (Set Effect Report)
+    0x85, 0x03,                    //   Report ID (3)
+    0xA1, 0x02,                    //   Collection (Logical)
+    0x09, 0x97,                    //     Usage (DC Enable Actuators)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x01,                    //     Logical Maximum (1)
+    0x75, 0x04,                    //     Report Size (4)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs) — the enable mask, low nibble
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x00,                    //     Logical Maximum (0)
+    0x75, 0x04,                    //     Report Size (4)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x03,                    //     Output (Cnst,Var,Abs) — pad the enable byte
+    0x09, 0x70,                    //     Usage (Magnitude)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x64,                    //     Logical Maximum (100) — percent, NOT 255
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x04,                    //     Report Count (4) — LT, RT, left handle, right handle
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x09, 0x50,                    //     Usage (Duration)
+    0x66, 0x01, 0x10,              //     Unit (SI Linear: seconds)
+    0x55, 0x0E,                    //     Unit Exponent (-2) — centiseconds
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x26, 0xFF, 0x00,              //     Logical Maximum (255)
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x01,                    //     Report Count (1)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x09, 0xA7,                    //     Usage (Start Delay) — same unit and range as Duration
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0x65, 0x00,                    //     Unit (None)
+    0x55, 0x00,                    //     Unit Exponent (0)
+    0x09, 0x7C,                    //     Usage (Loop Count)
+    0x91, 0x02,                    //     Output (Data,Var,Abs)
+    0xC0,                          //   End Collection
     // The channel-proof feature report — see the ⚠️ above. Declared last so it cannot disturb the
     // INPUT layout `xbox_proto` packs against: every global item here (Report Size/Count, Logical
     // Min/Max) is re-stated after the final Input item, so nothing above is retroactively changed.
@@ -413,7 +474,22 @@ static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01
 static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
 static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
 static DECK_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x26, 0x00]; // 38 bytes
-static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x96, 0x00]; // 150 bytes
+static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xDF, 0x00]; // 223 bytes
+
+// Each `wReportLength` above is a SECOND copy of a length that already exists as its descriptor's
+// array size, and the two are edited in different places. Getting them out of step does not fail
+// loudly — hidclass asks for `wReportLength` bytes and then parses whatever it got, so the pad
+// either enumerates with a truncated descriptor or fails to enumerate at all, with nothing naming
+// the cause. Assert the pairing at compile time instead; adding an item to a descriptor now cannot
+// build until its length is updated too.
+const fn declared_len(hid_desc: &[u8; 9]) -> usize {
+    (hid_desc[7] as usize) | ((hid_desc[8] as usize) << 8)
+}
+const _: () = assert!(declared_len(&HID_DESC) == DUALSENSE_RDESC.len());
+const _: () = assert!(declared_len(&DS4_HID_DESC) == DS4_RDESC.len());
+const _: () = assert!(declared_len(&EDGE_HID_DESC) == DS_EDGE_RDESC.len());
+const _: () = assert!(declared_len(&DECK_HID_DESC) == DECK_RDESC.len());
+const _: () = assert!(declared_len(&XBOX_HID_DESC) == XBOX_RDESC.len());
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
 // `devtype` selects the identity: PS family (same Sony VID/version) or the N4-spike Deck.
