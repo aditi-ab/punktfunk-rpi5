@@ -247,6 +247,31 @@ jobs:
             echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — skipping its RPM"
           fi
 
+      # A SECOND signing pass, for this package only. The main "Sign RPMs" step ran back at build
+      # time, long before this RPM existed — the gamescope build sits behind its own ~10-minute
+      # cache and deliberately runs after the host RPMs are already published. So every
+      # punktfunk-gamescope RPM went to the registry UNSIGNED, and the repo file we tell users to
+      # install carries gpgcheck=1: `dnf install punktfunk-gamescope` failed with "The package is
+      # not signed" on every Fedora and Nobara box. The package was in the channel the whole time
+      # and could not be installed from it — which is worse than absent, because the release notes
+      # and the docs-site both say it is there.
+      #
+      # Same fail-closed rule as the first pass: sign-rpms.sh hard-fails on refs/tags/v* if the org
+      # secret is missing, rather than republishing something a user's dnf will reject.
+      - name: Sign punktfunk-gamescope
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: |
+          shopt -s nullglob
+          rpms=(dist/punktfunk-gamescope-*.rpm)
+          # No RPM here is the best-effort skip above, already warned about — not a signing failure.
+          if [ "${#rpms[@]}" -eq 0 ]; then
+            echo "no punktfunk-gamescope RPM to sign (see the packaging step above)"
+            exit 0
+          fi
+          bash packaging/rpm/sign-rpms.sh "${rpms[@]}"
+
       - name: Publish punktfunk-gamescope to the Gitea RPM registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}

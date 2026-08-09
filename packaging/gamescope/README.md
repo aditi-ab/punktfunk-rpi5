@@ -97,14 +97,21 @@ distro's `gamescope`.
 
 ## Building
 
-Pinned upstream: `8c676c39` (master, 2026-07-27 — tags through 3.16.25). The patches apply
-cleanly to that commit; they touch `src/pipewire.cpp`, `src/steamcompmgr.cpp` and
-`src/meson.build` only.
+Pinned upstream: `5fb8dce4` (master, 2026-08-03 — `3.16.25-11-g5fb8dce`). The patches apply
+cleanly to that commit; they touch `src/pipewire.cpp`, `src/steamcompmgr.cpp`,
+`src/rendervulkan.cpp`, `src/rendervulkan.hpp` and `src/meson.build` only.
+
+The bump from `8c676c39` is deliberate: it brings upstream's `vulkan_get_rgb10_capture_format()`
+(`ff6b924`), which probes `linearTilingFeatures` for STORAGE+SAMPLED and falls back to
+`DRM_FORMAT_XBGR2101010` on devices that cannot do linear-tiled `A2R10G10B10` — i.e. every
+NVIDIA. That covers the paths that are upstream's rather than ours: the RGB intermediate
+`paint_pipewire()` acquires when the stream is YCbCr, and AVIF screenshots. Our own 10-bit RGB
+node is covered by patch `0001`, which offers `xBGR_210LE` first for the same reason.
 
 ```sh
 git clone https://github.com/ValveSoftware/gamescope.git
 cd gamescope
-git checkout 8c676c39
+git checkout 5fb8dce4
 git submodule update --init --recursive          # or let meson fetch the subprojects
 git am /path/to/punktfunk/packaging/gamescope/patches/*.patch
 

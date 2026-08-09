@@ -32,12 +32,12 @@ follow what the app happens to render.
 Works on the headless backend as well as a real connector: no HDR display is
 involved anywhere in the LUT set.
 ---
- src/pipewire.cpp     | 114 +++++++++++++++++++++++++++++++++----------
+ src/pipewire.cpp     | 123 ++++++++++++++++++++++++++++++++++---------
  src/steamcompmgr.cpp |  21 ++++++--
- 2 files changed, 106 insertions(+), 29 deletions(-)
+ 2 files changed, 115 insertions(+), 29 deletions(-)
 
 diff --git a/src/pipewire.cpp b/src/pipewire.cpp
-index 76b3ea8..6b56b01 100644
+index 76b3ea8..c84b19c 100644
 --- a/src/pipewire.cpp
 +++ b/src/pipewire.cpp
 @@ -18,6 +18,40 @@
@@ -159,7 +159,7 @@ index 76b3ea8..6b56b01 100644
  	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
  
  //	for (auto& param : params)
-@@ -166,6 +209,14 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
+@@ -166,6 +209,23 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
  
  	build_format_params(builder, SPA_VIDEO_FORMAT_BGRx, params);
  	build_format_params(builder, SPA_VIDEO_FORMAT_NV12, params);
@@ -168,13 +168,22 @@ index 76b3ea8..6b56b01 100644
 +	// negotiates today's 8-bit stream keeps negotiating it bit-for-bit. Only a consumer that
 +	// asks for a 10-bit format by name — and accepts the MANDATORY BT.2020 + PQ colorimetry
 +	// above — ever reaches these.
-+	build_format_params(builder, SPA_VIDEO_FORMAT_xRGB_210LE, params);
++	//
++	// xBGR_210LE FIRST, and that order is correctness, not style. A consumer takes the first pod
++	// it can use, and xBGR is the only one every vendor fills correctly: capture textures are
++	// mappable, hence linear-tiled, and linear STORAGE for A2R10G10B10 is an optional Vulkan
++	// feature NVIDIA does not implement — there the composite's `imageStore` lands in XBGR order,
++	// so a consumer that took xRGB_210LE gets a buffer LABELLED XRGB2101010 and FILLED as XBGR,
++	// i.e. red and blue swapped, with every format mapping on both ends individually correct.
++	// A2B10G10R10 is the universally supported packed-10 format, so leading with it costs nothing
++	// on AMD or Intel. xRGB_210LE stays as the second pod for a consumer that only speaks it.
 +	build_format_params(builder, SPA_VIDEO_FORMAT_xBGR_210LE, params);
++	build_format_params(builder, SPA_VIDEO_FORMAT_xRGB_210LE, params);
 +#endif
  
  	return params;
  }
-@@ -288,7 +339,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
+@@ -288,7 +348,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
  	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
  		pwr_log.debugf("renegotiating stream params (size: %dx%d)", s_nCaptureWidth, s_nCaptureHeight);
  
@@ -183,7 +192,7 @@ index 76b3ea8..6b56b01 100644
  		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
  		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
  		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
-@@ -412,6 +463,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
+@@ -412,6 +472,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
  		state->video_info.size.width, state->video_info.size.height,
  		s_nRequestedWidth, s_nRequestedHeight,
  		state->video_info.format, state->shm_stride, shm_size, state->dmabuf);
@@ -196,7 +205,7 @@ index 76b3ea8..6b56b01 100644
  }
  
  static void randname(char *buf)
-@@ -450,6 +507,11 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
+@@ -450,6 +516,11 @@ uint32_t spa_format_to_drm(uint32_t spa_format)
  	switch (spa_format)
  	{
  		case SPA_VIDEO_FORMAT_NV12: return DRM_FORMAT_NV12;
@@ -208,7 +217,7 @@ index 76b3ea8..6b56b01 100644
  		default:
  		case SPA_VIDEO_FORMAT_BGR: return DRM_FORMAT_XRGB8888;
  	}
-@@ -715,7 +777,7 @@ bool init_pipewire(void)
+@@ -715,7 +786,7 @@ bool init_pipewire(void)
  	s_nOutputHeight = g_nOutputHeight;
  	calculate_capture_size();
  
@@ -218,7 +227,7 @@ index 76b3ea8..6b56b01 100644
  	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
  
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index ff9ae1f..01b2abf 100644
+index ecb3808..83c751b 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -2335,17 +2335,32 @@ static void paint_pipewire()
