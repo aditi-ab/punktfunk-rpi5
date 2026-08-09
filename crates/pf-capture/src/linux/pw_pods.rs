@@ -121,6 +121,38 @@ pub(super) fn build_dmabuf_format(
 /// SDR — the same outcome as not offering HDR.
 const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
 
+/// The two 10-bit PQ formats an HDR session offers, **in negotiation order**. The order is not a
+/// style choice — on NVIDIA it is the difference between correct colour and red/blue swapped.
+///
+/// `xBGR_210LE` (DRM `XBGR2101010`, Vulkan `A2B10G10R10_UNORM_PACK32`) comes FIRST because the
+/// first compatible consumer pod wins, and it is the only one gamescope fills correctly on every
+/// vendor:
+///
+/// * `A2R10G10B10_UNORM_PACK32` **linear-tiled storage** is an optional Vulkan feature that
+///   NVIDIA does not implement. gamescope's capture textures are mappable, hence linear, so on
+///   NVIDIA its composite `imageStore` into that image lands in XBGR order — the bytes come out
+///   byte-reversed while the buffer is still LABELLED `XRGB2101010`.
+/// * The host believes the label: `xRGB_210LE → PixelFormat::X2Rgb10 →`
+///   `NV_ENC_BUFFER_FORMAT_ARGB10`. Every mapping in that chain is individually correct, which is
+///   exactly why the bug is invisible from this side — the *content* is what's wrong.
+/// * Upstream gamescope hit the same wall and fixed it with `vulkan_get_rgb10_capture_format()`,
+///   which probes `linearTilingFeatures` for STORAGE+SAMPLED and falls back to `XBGR2101010`.
+///   That landed AFTER 3.16.25, so the pinned `punktfunk-gamescope` (3.16.25-7-g60561e2 +pfhdr4)
+///   predates it and cannot self-correct — hence fixing the preference host-side, where it ships
+///   in the host binary with no gamescope rebuild.
+///
+/// Preferring xBGR costs nothing anywhere else: `A2B10G10R10_UNORM_PACK32` is the universally
+/// supported packed-10 format (it is the standard HDR10 swapchain format), it is what upstream
+/// falls back to, and `X2Bgr10` has a first-class encoder path (NVENC `ABGR10`, VAAPI
+/// `X2BGR10LE`). `xRGB_210LE` stays as the second pod so a producer that somehow offers only it
+/// can still negotiate HDR rather than falling off to the SDR downgrade.
+///
+/// ⚠ The real fix belongs upstream in the patch set: `spa_format_to_drm()` should offer only the
+/// format `vulkan_get_rgb10_capture_format()` reports. Until the gamescope pin moves past that
+/// commit, THIS ORDER is what keeps NVIDIA HDR sessions correct — do not "tidy" it.
+pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
+    [VideoFormat::xBGR_210LE, VideoFormat::xRGB_210LE];
+
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
     preferred: Option<(u32, u32, u32)>,
@@ -595,5 +627,38 @@ mod tests {
         );
         // The minimum must not exceed what producers already serve, or the ask becomes a demand.
         const { assert!(POOL_MIN <= 2) };
+    }
+
+    /// xBGR_210LE must be offered FIRST, and this is a correctness test, not a style one.
+    ///
+    /// The first compatible consumer pod wins the negotiation. Leading with `xRGB_210LE` makes an
+    /// NVIDIA gamescope session land on `XRGB2101010`, whose linear-tiled `A2R10G10B10` storage
+    /// NVIDIA does not support — gamescope's composite `imageStore` writes XBGR bytes under an
+    /// XRGB label and the whole stream comes out with red and blue swapped. Every format mapping
+    /// on the host side is individually correct, so nothing downstream can detect it.
+    ///
+    /// Field-confirmed 2026-08-09 on the RTX 5070 Ti Bazzite host with 0.26.0. See the
+    /// [`HDR_FORMAT_ORDER`] docs for the upstream fix this predates.
+    #[test]
+    fn hdr_offers_xbgr_before_xrgb() {
+        assert_eq!(
+            HDR_FORMAT_ORDER[0],
+            VideoFormat::xBGR_210LE,
+            "xBGR_210LE must be offered first — leading with xRGB_210LE swaps red and blue on \
+             every NVIDIA gamescope HDR session"
+        );
+        assert_eq!(
+            HDR_FORMAT_ORDER[1],
+            VideoFormat::xRGB_210LE,
+            "xRGB_210LE stays as the fallback pod so a producer offering only it can still \
+             negotiate HDR instead of dropping to the SDR downgrade"
+        );
+        // Both must still build: the order is a preference, never a removal.
+        for fmt in HDR_FORMAT_ORDER {
+            assert!(
+                !build_hdr_dmabuf_format(fmt, None).unwrap().is_empty(),
+                "{fmt:?} must still produce a format pod"
+            );
+        }
     }
 }
