@@ -1,0 +1,34 @@
+# Ask every Windows input API, in one shot, whether it can see a given gamepad.
+#
+# The whole Xbox-pad-on-Windows programme is a matrix of five rows — classic XInput, WGI `Gamepad`,
+# WGI `RawGameController`, GameInput, and the HID/DirectInput/Steam family — and until this crate
+# existed NOTHING in the tree measured any of it. Every reading in
+# `design/xbox-pad-windows-handoff.md` came from ad-hoc off-tree tools, which is why several of them
+# could not be reproduced or A/B'd later. This makes the matrix a command.
+#
+# Deliberately NOT a workspace member (see the root `Cargo.toml` `exclude` list): it is a
+# bring-your-own-hardware measurement tool, Windows-only, and has no business on a CI leg.
+#
+#     cargo run --release -- --watch 20
+#
+[workspace]
+
+[package]
+name = "win-input-matrix"
+description = "Which Windows input APIs can see this gamepad? XInput / WGI Gamepad / WGI RawGameController / XUSB"
+version = "0.26.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_XboxController",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Com",
+    "Gaming_Input",
+    "Foundation",
+    "Foundation_Collections",
+] }
