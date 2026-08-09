@@ -347,21 +347,32 @@ resolve_binaries() {
 
 # --- log assertions --------------------------------------------------------------------------------
 
-logs_have()    { LC_ALL=C grep -qF -- "$2" "$1" 2>/dev/null; }
-logs_first()   { LC_ALL=C grep -m1 -F -- "$2" "$1" 2>/dev/null; }
+# EVERY log read goes through this. `tracing`'s fmt layer emits SGR escapes around field NAMES, so a
+# real line reads `p99_us\e[0m\e[2m=\e[0m4601` — the message text is plain but `key=value` is not.
+# That is invisible in a hand-written fixture and fatal in the field: it cost the first real V3a run
+# on .25, where both arms encoded 2700 frames perfectly and the kit reported "fewer than 3 usable
+# perf windows" because `p99_us=\([0-9]*\)` could not match. Anything matching a FIELD (priority=,
+# p99_us=, reason=) breaks without this; anything matching prose only got lucky.
+# The spike is also launched with NO_COLOR=1 so fresh logs are plain — this strips the rest
+# (journalctl, an operator's own capture, a log from an older build).
+strip_ansi() { LC_ALL=C sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'; }
+log_cat()    { [ -r "$1" ] && LC_ALL=C strip_ansi <"$1"; }
+
+logs_have()    { log_cat "$1" | LC_ALL=C grep -qF -- "$2"; }
+logs_first()   { log_cat "$1" | LC_ALL=C grep -m1 -F -- "$2"; }
 # Always a number, even for a log that does not exist — a bare `grep -c` prints nothing on a missing
 # file and `[ "" -ge 1 ]` is a bash syntax error, not a failed assertion. (The default has to be
 # applied in the SHELL: `sed 's/^$/0/'` sees no line at all on empty input and emits nothing.)
 logs_count() {
-  local n; n="$(LC_ALL=C grep -cF -- "$2" "$1" 2>/dev/null | tr -dc '0-9')"
+  local n; n="$(log_cat "$1" | LC_ALL=C grep -cF -- "$2" | tr -dc '0-9')"
   printf '%s' "${n:-0}"
 }
 perf_windows() { logs_count "$1" "$L_PERF"; }
 # Perf windows that appear AFTER a marker line. This is what "the stream survived" actually means
 # for the chaos leg: a warn followed by silence is a dead session that logged politely.
 perf_windows_after() {
-  LC_ALL=C awk -v m="$2" -v p="$L_PERF" \
-    'index($0,m){seen=1; next} seen && index($0,p){n++} END{print n+0}' "$1" 2>/dev/null
+  log_cat "$1" | LC_ALL=C awk -v m="$2" -v p="$L_PERF" \
+    'index($0,m){seen=1; next} seen && index($0,p){n++} END{print n+0}'
 }
 
 # The single most important assertion in the measured legs: prove the arm is the arm it claims.
@@ -381,7 +392,7 @@ assert_worker_arm() {
   if logs_have "$log" "$L_LEAVING"; then
     info "$tag: the session LEFT the worker mid-run: $(logs_first "$log" "$L_LEAVING" | sed 's/^.*pyrowave: /pyrowave: /')"; rc=1
   fi
-  if logs_have "$log" "$L_CAPTURE" && ! LC_ALL=C grep -F -- "$L_CAPTURE" "$log" | grep -q 'dmabuf-passthrough'; then
+  if logs_have "$log" "$L_CAPTURE" && ! log_cat "$log" | LC_ALL=C grep -F -- "$L_CAPTURE" | grep -q 'dmabuf-passthrough'; then
     info "$tag: capture arm is not dmabuf-passthrough — $(logs_first "$log" "$L_CAPTURE" | sed 's/^.*capture pipeline/capture pipeline/')"
     info "$tag: a non-dmabuf frame pins the session in-process, so this arm is NOT the worker."
     rc=1
@@ -410,8 +421,8 @@ assert_inline_arm() {
 #
 # In worker mode the line comes from the WORKER process on inherited stderr; in-process it comes
 # from the host. Either way it lands in the log this kit captures.
-perf_p99_series() { LC_ALL=C grep -F -- "$L_PERF" "$1" 2>/dev/null | sed -n 's/.*p99_us=\([0-9][0-9]*\).*/\1/p'; }
-perf_p50_series() { LC_ALL=C grep -F -- "$L_PERF" "$1" 2>/dev/null | sed -n 's/.*p50_us=\([0-9][0-9]*\).*/\1/p'; }
+perf_p99_series() { log_cat "$1" | LC_ALL=C grep -F -- "$L_PERF" | sed -n 's/.*p99_us=\([0-9][0-9]*\).*/\1/p'; }
+perf_p50_series() { log_cat "$1" | LC_ALL=C grep -F -- "$L_PERF" | sed -n 's/.*p50_us=\([0-9][0-9]*\).*/\1/p'; }
 
 # LC_ALL=C on every awk here is load-bearing, not decoration: under a comma-decimal locale awk
 # PRINTS "6,40" for a millisecond figure and, worse, READS "1.0" as 1 — which would silently turn
@@ -491,7 +502,10 @@ run_spike() {
   local arm="$1" wall="$2"; shift 2
   local log="$LOG_DIR/$arm.log" kv
   SPIKE_LOG="$log"; SPIKE_PID=''
-  local -a envs=(PUNKTFUNK_PERF=1)
+  # NO_COLOR: keep the captured log plain at the source. `log_cat` strips SGR escapes anyway, but a
+  # plain log is also the one a human greps by hand when a leg goes red, and `p99_us\e[0m\e[2m=…`
+  # defeats the obvious grep just as thoroughly as it defeated this kit's parser.
+  local -a envs=(PUNKTFUNK_PERF=1 NO_COLOR=1)
   for kv in "$@"; do envs+=("$kv"); done
   local -a cmd=("$HOST_BIN" spike --codec pyrowave --source "$SPIKE_SOURCE"
                 --width "$OPT_WIDTH" --height "$OPT_HEIGHT" --fps "$OPT_FPS"
@@ -1163,6 +1177,28 @@ leg_selftest() {
   } > "$log"
   _eq 'median p50/p99/windows, warm-up excluded' "$(perf_summary "$log")" '2800 6400 3'
   _eq 'perf window count'                        "$(perf_windows "$log")" '4'
+
+  # A real log is not this clean, and the difference is not cosmetic. `tracing` wraps every field
+  # NAME in SGR escapes, so the bytes are `p99_us\e[0m\e[2m=\e[0m6400` and `p99_us=\([0-9]*\)` never
+  # matches. The plain fixtures above passed while the kit was structurally unable to read a real
+  # log: the first V3a run on .25 encoded 2700 frames in BOTH arms and was reported as "fewer than 3
+  # usable perf windows". Same numbers as the plain fixture, same expected answer — the ONLY
+  # difference is the escapes, so a regression here can only mean the stripping broke.
+  local alog="$d/perf-ansi.log" E=$'\033'
+  # One field at a time, deliberately: the first draft of this fixture built the whole line in a
+  # single printf and silently emitted 27 placeholders against 23 arguments, so the tail escapes
+  # came out empty and the fixture failed for its own reasons rather than the code's.
+  _ansi_kv()   { printf '%s[3m%s%s[0m%s[2m=%s[0m%s' "$E" "$1" "$E" "$E" "$E" "$2"; }
+  _ansi_perf() { # $1 p50_us, $2 p99_us — the exact field shape `tracing` emits
+    printf '%s[2m2026-08-09T14:25:07Z%s[0m %s[32m INFO%s[0m %s ' "$E" "$E" "$E" "$E" "$L_PERF"
+    _ansi_kv frames 120 ; printf ' '
+    _ansi_kv p50_us "$1"; printf ' '
+    _ansi_kv p99_us "$2"; printf ' '
+    _ansi_kv depth 1    ; printf '\n'
+  }
+  { _ansi_perf 9000 99000; _ansi_perf 2600 6000; _ansi_perf 2800 6400; _ansi_perf 3000 7000; } > "$alog"
+  _eq 'ANSI-wrapped fields parse identically'    "$(perf_summary "$alog")" '2800 6400 3'
+  _eq 'ANSI window count'                        "$(perf_windows "$alog")" '4'
   _eq 'a missing log counts 0, never empty'      "$(perf_windows "$d/nope.log")" '0'
   # "the stream survived the kill" is windows AFTER the death line, not windows anywhere.
   local klog="$d/kill.log"
