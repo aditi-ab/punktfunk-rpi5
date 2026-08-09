@@ -328,7 +328,7 @@ impl VirtualDisplay for GamescopeDisplay {
                 // client's resolution (the box is headless, so its game-mode mode is ours to set).
                 // Reuse if it already matches (fast, no restart); otherwise relaunch the box's own
                 // session at the client mode. Without this the client gets the box's default mode.
-                ensure_box_gamescope_mode(mode)?
+                ensure_box_gamescope_mode(mode, self.hdr)?
             } else {
                 id.parse()
                     .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
@@ -494,7 +494,7 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             "gamescope: managed takeover unavailable — degrading to ATTACH (mirroring the box's \
              own game-mode session)"
         );
-        let node_id = ensure_box_gamescope_mode(mode)?;
+        let node_id = ensure_box_gamescope_mode(mode, hdr)?;
         point_injector_at_eis();
         return Ok(VirtualOutput {
             node_id,
@@ -923,6 +923,68 @@ fn remove_steamos_dropin() {
     let _ = std::fs::remove_file(steamos_dropin_path());
 }
 
+/// Drop-in for the box's OWN autologin `gamescope-session-plus@*.service`.
+///
+/// The transient-unit path ([`launch_session`]) can pass `BindReadOnlyPaths` straight to
+/// `systemd-run`, but a box that owns an autologin session is RESTARTED in place instead — no
+/// `systemd-run`, so the bind has to arrive as a drop-in or Nobara's hardcoded
+/// `/usr/bin/gamescope` wins there too (see [`DISTRO_GAMESCOPE_PATH`]).
+///
+/// `zz-` so it sorts last, matching the SteamOS drop-in convention above.
+fn session_plus_dropin_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string());
+    std::path::Path::new(&home)
+        .join(".config/systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-bind.conf")
+}
+
+/// Write the box-session drop-in carrying the same two fixes the transient path gets: the bind, and
+/// the WSI opt-out when the box's layer was built for a different gamescope. `PF_HZ`/`PF_HDR_ARGS`
+/// ride along because the wrapper reads them (without `PF_HZ` it falls back to 60).
+///
+/// A no-op returning `Ok(false)` when there is nothing to redirect, so a box already running our
+/// binary keeps a clean unit.
+fn write_session_plus_dropin(
+    wrapper: &std::path::Path,
+    mode: Mode,
+    hdr: bool,
+    wsi_ok: bool,
+) -> Result<bool> {
+    if gamescope_bin() == DISTRO_GAMESCOPE_PATH {
+        return Ok(false);
+    }
+    let path = session_plus_dropin_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let body = format!(
+        "[Service]\n\
+         BindReadOnlyPaths={wrapper}:{DISTRO_GAMESCOPE_PATH}\n\
+         Environment=PF_HZ={hz}\n\
+         Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
+         {wsi}",
+        wrapper = wrapper.display(),
+        hz = game_hz(mode.refresh_hz),
+        hdr_args = hdr_args(hdr)
+            .into_iter()
+            .chain(cursor_args())
+            .collect::<Vec<_>>()
+            .join(" "),
+        wsi = if wsi_ok {
+            String::new()
+        } else {
+            "Environment=ENABLE_GAMESCOPE_WSI=0\n".to_string()
+        },
+    );
+    std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
+    Ok(true)
+}
+
+/// Remove the box-session drop-in (restore-on-disconnect). Best-effort, mirroring
+/// [`remove_steamos_dropin`].
+fn remove_session_plus_dropin() {
+    let _ = std::fs::remove_file(session_plus_dropin_path());
+}
+
 /// Take over SteamOS's `gamescope-session.target` headless at the CLIENT's mode: write the shim + a
 /// drop-in carrying the mode, `daemon-reload`, then RESTART the target so `steam-launcher.service`
 /// brings Steam up in the fresh headless gamescope — and attach to its node. A same-mode reconnect
@@ -1012,7 +1074,7 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
 /// box's own unit (rather than spawning a competing one) avoids the autologin-respawn fight the old
 /// MANAGED path hit. A headless box has no physical panel, so its game-mode resolution is ours to set;
 /// Steam restarts only on an actual resolution CHANGE.
-fn ensure_box_gamescope_mode(mode: Mode) -> Result<u32> {
+fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     let target = (mode.width, mode.height);
     // Fast path: already at the client's resolution — just attach to the live node.
     if current_gamescope_output_size() == Some(target) {
@@ -1084,6 +1146,26 @@ fn ensure_box_gamescope_mode(mode: Mode) -> Result<u32> {
         &format!("SCREEN_HEIGHT={}", mode.height),
         &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
     ]);
+    // Same two fixes the transient path gets, but this unit is the BOX's own — they have to arrive
+    // as a drop-in, and `daemon-reload` before the restart or systemd runs the old unit.
+    match write_gamescope_bin_wrapper()
+        .and_then(|w| write_session_plus_dropin(&w, mode, hdr, wsi_layer_matches_our_gamescope()))
+    {
+        Ok(true) => {
+            tracing::info!(
+                bin = %gamescope_bin(),
+                %unit,
+                "gamescope: dropped in a bind over {DISTRO_GAMESCOPE_PATH} for the box's own \
+                 session unit — a session script that hardcodes that path (Nobara) gets the \
+                 patched build on this restart too"
+            );
+            systemctl_user(&["daemon-reload"]);
+        }
+        Ok(false) => {}
+        // Best-effort: a box whose session already runs our binary loses nothing, and a failure
+        // here must not block a restart that would otherwise work.
+        Err(e) => tracing::warn!(error = %e, "gamescope: could not write the box-session drop-in"),
+    }
     systemctl_user(&["restart", &unit]);
     // Wait for the relaunched session to come up at the new size and publish its capture node. The
     // node appears when gamescope is up (well before Steam finishes booting); the caller's
@@ -2257,6 +2339,12 @@ fn do_restore_tv_session() {
         }
         return;
     }
+    // Hand the box back its OWN gamescope before restarting its session: our bind drop-in exists
+    // to serve a punktfunk stream, and leaving it would silently put the patched build (plus our
+    // HDR/cursor flags) under the user's ordinary game mode — exactly the "sits beside the distro
+    // package" rule this whole design rests on.
+    remove_session_plus_dropin();
+    systemctl_user(&["daemon-reload"]);
     for unit in units {
         let _ = Command::new("systemctl")
             .args(["--user", "start", &unit])
