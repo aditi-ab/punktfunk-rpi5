@@ -344,10 +344,31 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends meson ninja-build glslc git || true
           apt-get build-dep -y gamescope || true
+          # NOT best-effort. `build-dep gamescope` resolves the distro's much older packaged
+          # gamescope — where noble has one at all — so it misses what the master tree needs, and
+          # wayland-protocols is the gap that actually stops the build: meson dies in
+          # protocol/meson.build with "Neither a subproject directory nor a wayland-protocols.wrap
+          # file was found", because the tree has no wrap fallback for it. That is what happened on
+          # the v0.26.0 tag: the step warned and skipped, the job stayed green, and the release
+          # shipped with no gamescope .deb while the notes said it had one.
+          apt-get install -y --no-install-recommends wayland-protocols
+          # The remaining Arch makedepends the older packaged gamescope does not necessarily pull.
+          # Best-effort: meson falls back or does without, and a name that moves between Ubuntu
+          # releases should not fail the job. (No libstdc++ static package is needed here — g++
+          # ships libstdc++.a, which is why only Fedora tripped the sanity check.)
+          apt-get install -y --no-install-recommends libglm-dev cmake libxcursor-dev || true
           if bash packaging/gamescope/build-punktfunk-gamescope.sh \
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
             install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
           else
+            # Best-effort on canary, HARD on a stable tag — same reasoning as rpm.yml. A warning
+            # here is what let v0.26.0 promise an apt-installable gamescope that was never built.
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error::punktfunk-gamescope failed to build on noble — a stable tag must not ship without it (the release notes and docs-site say it is installable)"
+                exit 1
+                ;;
+            esac
             echo "::warning::punktfunk-gamescope failed to build on noble — no .deb this run (gamescope sessions stay SDR)"
           fi
 
@@ -357,6 +378,13 @@ jobs:
           if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
             bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
           else
+            # Authoritative, and covers the cache path the build step skips — same as rpm.yml.
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error::no usable punktfunk-gamescope — a stable tag must not ship without its .deb"
+                exit 1
+                ;;
+            esac
             echo "::warning::no usable punktfunk-gamescope — skipping its .deb"
           fi
 
