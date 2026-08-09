@@ -1824,9 +1824,20 @@ async fn serve_session(
         .await
         .is_err()
     {
+        // Name what is still held, not just that a thread was let go. The input thread OWNS this
+        // session's virtual gamepads (`input_thread`'s `Pads`, dropped only when that fn returns),
+        // and on Windows each one holds a `SwDeviceCreate` devnode plus the `Global\pf…-boot-<idx>`
+        // bootstrap mailbox for its pad index. Detaching therefore leaves the pads plugged in and
+        // the index taken: the next session — or a bring-up run beside this host — is denied that
+        // index until this thread finally returns, and *that* failure surfaces somewhere else
+        // entirely (see `pf_inject::pad_slots::PadCreateFault::IndexOwnedElsewhere`). An operator
+        // reading only the later error has no way back to this line unless it says so here.
         tracing::warn!(
             grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
-            "audio/input threads did not exit after the connection closed — detaching them"
+            "audio/input threads did not exit after the connection closed — detaching them. This \
+             session's virtual gamepads are STILL HELD by the detached input thread (devnode + \
+             pad-index mailbox on Windows), so a pad create on the same index will be refused as \
+             already-owned until it returns"
         );
     }
     // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the

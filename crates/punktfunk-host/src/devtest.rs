@@ -398,6 +398,23 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                 capabilities: 0,
                 audio_caps: 0,
             });
+            // 🛑 Never announce a pad that was not built. The arrival above only ASKS for one; a
+            // failed create logs an ERROR and leaves the slot empty, and this harness would then
+            // cheerfully print "virtual X up" and stream frames into nothing for `secs` seconds.
+            // Every probe the operator runs next (joy.cpl, XInputGetState, a WGI enumeration) still
+            // finds a device on this index — the one the OTHER process owns — so the run produces a
+            // plausible, wrong measurement instead of a failure. That happened on `.173`
+            // (2026-08-09): the host service held pad 0, the create was denied, and a frozen XInput
+            // packet count off the incumbent pad was read as a result. A harness that cannot build
+            // its own device has nothing to measure, so stop.
+            if mgr.live_pads() == 0 {
+                anyhow::bail!(
+                    "no virtual {} was created at index {idx} — see the ERROR above for the \
+                     cause. NOT measuring: any device answering on this index belongs to another \
+                     process (a live session's pad), and reading it would look like a result.",
+                    $label
+                );
+            }
             println!(
                 "virtual {} up — cycling Cross + sweeping the left stick for {secs}s. Watch \
                  it in joy.cpl / Steam / a game; any feedback the game sends prints below.",
@@ -458,6 +475,13 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             capabilities: 0,
             audio_caps: 0,
         });
+        // Same guard as the `drive!` macro's — see the long note there.
+        if mgr.live_pads() == 0 {
+            anyhow::bail!(
+                "no virtual Xbox 360 (XUSB) was created at index {idx} — see the ERROR above. NOT \
+                 measuring: a device answering on this index belongs to another process."
+            );
+        }
         println!(
             "virtual Xbox 360 (XUSB) up — sweeping LS + toggling A for {secs}s. Check with \
              an XInput game or xinputtest.exe."

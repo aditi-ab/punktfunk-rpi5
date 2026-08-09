@@ -389,13 +389,22 @@ pub mod mouse_windows;
 /// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]), driven by [`pad_slots`] for
 /// every backend manager — replaces the per-backend permanent `broken` latch with capped-backoff
 /// retry.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+///
+/// Built on every target, not just the two that have pad backends: it is pure timing arithmetic
+/// over `std::time`, and gating it meant its tests — and [`pad_slots`]', which need it — could not
+/// run on a developer machine at all. See [`pad_slots`].
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
 /// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
 /// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
 /// manager used to copy-paste (G12).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+///
+/// Built on every target for the same reason as [`pad_gate`]: nothing in it touches an OS pad API
+/// (the backend supplies the pad type and the `open` closure), so the platform gate bought
+/// nothing and cost the ability to run the table's tests off a host box. That matters most for
+/// [`pad_slots::PadCreateFault`], whose whole job is to describe a `cfg(windows)` failure that
+/// only a Windows box can produce — the classification either has tests that run everywhere, or
+/// it has none that anyone runs.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
 /// The `sensor_timestamp` every virtual Sony pad stamps into its input reports

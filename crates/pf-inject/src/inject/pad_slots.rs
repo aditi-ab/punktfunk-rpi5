@@ -16,6 +16,78 @@ const _: () = assert!(MAX_PADS <= 16);
 /// quiet.
 const SWEEP_GRACE: Duration = Duration::from_millis(300);
 
+/// A create failure whose CAUSE the backend was able to identify, attached to the `anyhow` error
+/// it returns (`err.context(PadCreateFault::…)`) so [`PadSlots::ensure`] can print the matching
+/// remedy instead of the backend's default one.
+///
+/// Why this exists. The create-failure line's remedy is a per-backend constant (`PadSlots`'s
+/// `hint`, from [`PadSlots::new`]), and on Windows that constant says "install/repair: punktfunk-host.exe
+/// driver install --gamepad", because a pad create that fails there has nearly always failed for
+/// want of the UMDF driver package. Nearly. On 2026-08-09 a `.173` devtest hit a create that
+/// failed for the opposite reason — the drivers were fine and a LIVE SIBLING PROCESS already owned
+/// the pad index's OS-level name — and the line told the operator to repair a driver that was
+/// working. Worse, the run carried on: the retry could not succeed while the other process held
+/// the index, and everything measured afterwards was that other process's pad (a frozen XInput
+/// packet count read as a real measurement). A wrong remedy is worse than no remedy, so a backend
+/// that can name the cause now says so and the line follows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadCreateFault {
+    /// The OS-level name this pad index needs — on Windows the `Global\pf…-boot-<index>` bootstrap
+    /// mailbox — is already held by another LIVE process.
+    ///
+    /// Retrying stays right and is deliberately left alone: the name frees itself the moment the
+    /// owner releases it (a session ending, a service restart), and that is exactly how the field
+    /// case recovered. What retrying can never do is *hurry* it, and no driver install affects it
+    /// at all — which is the whole content of [`Self::hint`].
+    IndexOwnedElsewhere,
+}
+
+impl PadCreateFault {
+    /// Short tag for the structured `fault` log field — greppable; the prose lives in
+    /// [`Self::hint`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PadCreateFault::IndexOwnedElsewhere => "index-owned-elsewhere",
+        }
+    }
+
+    /// The remedy this fault gets INSTEAD of the backend's default hint.
+    pub fn hint(self) -> &'static str {
+        match self {
+            PadCreateFault::IndexOwnedElsewhere => {
+                " — this pad index is already owned by another LIVE process (on a Windows host \
+                 that is the LocalSystem PunktfunkHost service, whose session still holds the \
+                 pad). The drivers are not the problem and reinstalling them will not help: the \
+                 retry succeeds on its own once that process releases the index (end its session, \
+                 or Restart-Service PunktfunkHost), or run against a pad index it does not hold."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PadCreateFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PadCreateFault::IndexOwnedElsewhere => f.write_str(
+                "the OS name this pad index needs is already owned by another live process",
+            ),
+        }
+    }
+}
+
+/// The fault a backend attached to a create error, if any.
+///
+/// An `anyhow` context downcast, which is what makes this usable from a backend: the fault is
+/// found however many further `.context()` layers were wrapped around it on the way up, so a
+/// backend can attach it at the exact call that failed and still describe the failure in its own
+/// words afterwards. Split out of [`PadSlots::ensure`] so the choice is testable without standing
+/// up a tracing subscriber — and so the downcast-through-context behaviour this depends on is
+/// pinned by a test rather than assumed (the attaching code is `cfg(windows)` and cannot be
+/// compiled, let alone run, on a developer machine).
+fn create_fault(err: &anyhow::Error) -> Option<PadCreateFault> {
+    err.downcast_ref::<PadCreateFault>().copied()
+}
+
 /// What one [`PadSlots::sweep`] changed, as bitmasks over the wire pad indices.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Sweep {
@@ -172,16 +244,41 @@ impl<P> PadSlots<P> {
                 true
             }
             Err(e) => {
+                // Which remedy to print. The backend's default `hint` assumes the failure is the
+                // one that dominates the field — on Windows an absent or stale driver package —
+                // and sends the operator to reinstall. For a create that failed because a live
+                // sibling owns this index that advice is not merely useless, it is a wrong lead
+                // that costs a debugging session (2026-08-09, `.173`), so a named fault overrides
+                // it. Anonymous failures keep the previous wording byte for byte.
+                //
+                // `index` is new and unconditional: the line used to name the backend and the
+                // device but never the SLOT, so a multi-pad session's failure could not be told
+                // from any other pad's.
+                let fault = create_fault(&e);
                 tracing::error!(
+                    index = idx,
                     error = %format!("{e:#}"),
+                    fault = fault.map_or("unclassified", PadCreateFault::as_str),
                     "virtual {} creation failed — retrying with backoff{}",
                     self.device,
-                    self.hint
+                    fault.map_or(self.hint, PadCreateFault::hint)
                 );
                 self.gate.on_failure(Instant::now());
                 false
             }
         }
+    }
+
+    /// How many pads this table currently holds.
+    ///
+    /// The question a bring-up harness has to ask before it believes anything it measures: a
+    /// create that failed leaves the slot empty and [`Self::ensure`] only logs, so a devtest that
+    /// pushes frames regardless is measuring whatever OTHER process's pad is answering on that
+    /// index — which is exactly how a stale pad's frozen packet count was once read as a result
+    /// (2026-08-09). Not `len` (and so not paired with `is_empty`): it counts LIVE pads, not the
+    /// fixed [`MAX_PADS`] slots the table always has.
+    pub fn live(&self) -> usize {
+        self.pads.iter().flatten().count()
     }
 
     /// The live pad at `idx`, if any (out-of-range → `None`).
@@ -348,6 +445,93 @@ mod tests {
             Sweep::default()
         );
         assert_eq!(s.get(1), Some(&7), "the glitch never reached the drop");
+    }
+
+    /// The mechanism the Windows backend's diagnosis rests on, and the one thing about it that
+    /// could quietly stop working: [`create_fault`] must find the fault through however many
+    /// `.context()` layers wrapped it. The real chain is built in `gamepad_raii::create_named`
+    /// (`cfg(windows)`, so neither compiled nor run here) and has exactly this shape — the OS
+    /// error at the bottom, the fault, then the human sentence on top — so reproduce it verbatim.
+    #[test]
+    fn a_named_fault_survives_the_context_layers_wrapped_around_it() {
+        let err = anyhow::Error::msg("Zugriff verweigert (0x80070005)")
+            .context(PadCreateFault::IndexOwnedElsewhere)
+            .context("bootstrap mailbox Global\\pfds-boot-0 already exists");
+        assert_eq!(
+            create_fault(&err),
+            Some(PadCreateFault::IndexOwnedElsewhere)
+        );
+        // …and the operator-facing rendering still carries every layer, newest first, so the
+        // underlying OS error is never traded away for the diagnosis.
+        let shown = format!("{err:#}");
+        assert!(shown.contains("Global\\pfds-boot-0"), "{shown}");
+        assert!(
+            shown.contains("already owned by another live process"),
+            "{shown}"
+        );
+        assert!(shown.contains("0x80070005"), "{shown}");
+    }
+
+    #[test]
+    fn an_unclassified_failure_carries_no_fault() {
+        // Every other backend failure — a missing driver, a wedged PnP, an EBUSY on /dev/uinput —
+        // must keep the backend's own hint, so the absence of a fault has to read as absence.
+        assert_eq!(
+            create_fault(&anyhow::Error::msg("SwDeviceCreate failed")),
+            None
+        );
+    }
+
+    /// THE regression this classification exists for: the contended remedy must not send an
+    /// operator to reinstall a driver that is working fine, and must name what actually has to
+    /// happen. Asserted on the text because the text is the whole deliverable.
+    #[test]
+    fn the_contended_hint_never_tells_the_operator_to_reinstall_drivers() {
+        let hint = PadCreateFault::IndexOwnedElsewhere.hint();
+        assert!(
+            !hint.contains("driver install"),
+            "the contended hint must not repeat the driver-repair advice: {hint}"
+        );
+        assert!(hint.contains("already owned"), "{hint}");
+        assert!(hint.contains("Restart-Service"), "{hint}");
+    }
+
+    /// A named fault must not turn the create into a permanent latch — that latch is the exact
+    /// `broken: bool` behaviour [`PadGate`] was built to remove, and the field case healed by
+    /// itself precisely because the retry was still running when the owning service restarted.
+    #[test]
+    fn a_contended_create_still_backs_off_and_retries_rather_than_latching() {
+        let mut s = slots();
+        let contended = || {
+            Err(anyhow::Error::msg("Zugriff verweigert")
+                .context(PadCreateFault::IndexOwnedElsewhere))
+        };
+        assert!(!s.ensure(0, |_| contended()));
+        assert_eq!(s.live(), 0);
+        // Backed off, not latched: once the window elapses the closure runs again. `ensure` reads
+        // the wall clock, so clear the backoff directly rather than sleeping through it — the
+        // window's own arithmetic is pinned by `pad_gate`'s tests.
+        s.gate.on_success();
+        let mut ran = false;
+        assert!(s.ensure(0, |i| {
+            ran = true;
+            Ok(i as u32)
+        }));
+        assert!(ran, "the create was never re-attempted");
+        assert_eq!(s.live(), 1);
+    }
+
+    #[test]
+    fn live_counts_built_pads_not_slots() {
+        let mut s = slots();
+        assert_eq!(s.live(), 0, "an empty table has no pads, only slots");
+        assert!(s.ensure(0, |_| Ok(0)));
+        assert!(s.ensure(4, |_| Ok(4)));
+        assert_eq!(s.live(), 2);
+        let t0 = Instant::now();
+        s.sweep_at(0, t0);
+        s.sweep_at(0, t0 + SWEEP_GRACE);
+        assert_eq!(s.live(), 0);
     }
 
     #[test]

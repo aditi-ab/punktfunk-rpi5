@@ -296,6 +296,13 @@ impl GamepadManager {
         }
     }
 
+    /// How many virtual pads this manager has actually BUILT — the bring-up harness's
+    /// "did the create happen?" check; see [`crate::uhid_manager::UhidManager::live_pads`] for why
+    /// only a harness should ask.
+    pub fn live_pads(&self) -> usize {
+        self.slots.live()
+    }
+
     fn ensure(&mut self, idx: usize) {
         if self.slots.ensure(idx, XusbWinPad::open) {
             tracing::info!(

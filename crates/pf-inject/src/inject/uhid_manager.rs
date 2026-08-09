@@ -274,6 +274,19 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
+    /// How many virtual pads this manager has actually BUILT
+    /// ([`PadSlots::live`](crate::pad_slots::PadSlots::live)).
+    ///
+    /// For bring-up harnesses, which are the only callers that can act on it: a create failure
+    /// leaves the slot empty and only logs, so a harness that pushes frames regardless still
+    /// "works" — it just drives nothing, while whatever OTHER process owns that pad index keeps
+    /// answering every probe the operator then runs. That is how a stale pad's frozen XInput
+    /// packet count was once read as a measurement (2026-08-09, `.173`). A session has no use for
+    /// this: its pads come and go with the client's `active_mask` and zero is a normal state.
+    pub fn live_pads(&self) -> usize {
+        self.slots.live()
+    }
+
     /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
     pub fn handle(&mut self, ev: &GamepadEvent) {
         match ev {

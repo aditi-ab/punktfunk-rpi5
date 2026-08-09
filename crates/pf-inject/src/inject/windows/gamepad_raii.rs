@@ -53,7 +53,8 @@
 use super::channel_proof;
 /// Re-exported so a pad backend needs only one `use` to wire up its channel.
 pub(super) use super::channel_proof::ProofTransport;
-use anyhow::{anyhow, bail, Context, Result};
+use crate::pad_slots::PadCreateFault;
+use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -67,16 +68,17 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Devices::Enumeration::Pnp::{SwDeviceClose, HSWDEVICE};
 use windows::Win32::Foundation::{
-    DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+    FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, SetEvent, WaitForSingleObject, PROCESS_DUP_HANDLE,
@@ -171,6 +173,16 @@ impl Shm {
     /// don't control — we close and retry briefly (our own driver holds the name for microseconds per
     /// poll tick), then fail loudly rather than run the handshake through an attacker-owned (or
     /// another host instance's) mailbox.
+    ///
+    /// ⚠️ That squat check only ever sees the collisions we are ALLOWED to see. `CreateFileMappingW`
+    /// opens a pre-existing object with full access, so a caller the incumbent's DACL excludes is
+    /// refused with `ERROR_ACCESS_DENIED` and never reaches the `ERROR_ALREADY_EXISTS` branch at
+    /// all — and that is the collision the field actually produces, because this SDDL grants SYSTEM
+    /// and LocalService only, while the host service runs as LocalSystem and a hand-run devtest
+    /// runs as an elevated Administrator. So the "another punktfunk-host instance is serving this
+    /// pad index" diagnosis below was unreachable for the one pairing that happens: on `.173`
+    /// (2026-08-09) it surfaced as a bare `Zugriff verweigert (0x80070005)` under a line telling the
+    /// operator to reinstall the drivers. [`classify_named_create_failure`] is what restores it.
     pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
         // Build the descriptor ONCE and reuse it across the squat-retry loop — it (and the OS
         // allocation it owns) lives to the end of this fn, so it outlives every create below.
@@ -183,8 +195,10 @@ impl Shm {
             }
             // SAFETY: clearing the thread error slot so ERROR_ALREADY_EXISTS below is unambiguous.
             unsafe { SetLastError(WIN32_ERROR(0)) };
-            let shm = Self::create_inner(&sa.sa, PCWSTR(name.as_ptr()), size)
-                .with_context(|| format!("create gamepad bootstrap mailbox {name}"))?;
+            let shm = match Self::create_inner(&sa.sa, PCWSTR(name.as_ptr()), size) {
+                Ok(shm) => shm,
+                Err(e) => return Err(classify_named_create_failure(name, e)),
+            };
             // SAFETY: read immediately after the create; windows-rs only touches the error slot on
             // failure, so a success here preserves CreateFileMappingW's ALREADY_EXISTS signal.
             if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
@@ -192,11 +206,16 @@ impl Shm {
             }
             // `shm` drops here → unmap + close our handle to the foreign object, then retry.
         }
-        bail!(
+        // Reached only when we COULD open the incumbent (same account — two hosts both as SYSTEM,
+        // or a LocalService squatter). The cross-account case exits through
+        // `classify_named_create_failure` above; both carry the same fault, because to everything
+        // downstream they are the same event: this index is taken.
+        Err(anyhow!(
             "bootstrap mailbox {name} already exists and stayed alive across retries — another \
              punktfunk-host instance is serving this pad index, or a local service is squatting the \
              name (gamepad DoS attempt?)"
-        );
+        )
+        .context(PadCreateFault::IndexOwnedElsewhere))
     }
 
     fn create_inner(sa: &SECURITY_ATTRIBUTES, name: PCWSTR, size: usize) -> Result<Shm> {
@@ -247,6 +266,76 @@ impl Drop for Shm {
         unsafe {
             let _ = UnmapViewOfFile(self.view);
         }
+    }
+}
+
+/// Turn a failed NAMED-section create into an error that names the cause, because
+/// `CreateFileMappingW` collapses two OPPOSITE situations into one `ERROR_ACCESS_DENIED`
+/// (`0x80070005`, and on a German box the entirely unsearchable "Zugriff verweigert" the field
+/// report carried):
+///
+/// * **the name is TAKEN, by someone whose object we may not open.** Creating over an existing name
+///   is really an open, and an open is access-checked against the incumbent's DACL. The mailbox
+///   SDDL grants SYSTEM + LocalService only, so the exact pairing that occurs on a dev box — the
+///   LocalSystem host service holding pad 0 for a live session while an operator runs
+///   `punktfunk-host.exe dualsense-windows-test` from an elevated Administrator console — is
+///   refused here rather than reported as the squat it is.
+/// * **the name is FREE and we may not create it.** `Global\` names need `SeCreateGlobalPrivilege`,
+///   which SYSTEM and services hold and an ordinary (even elevated) user token does not.
+///
+/// `OpenFileMappingW` separates them, because the object-manager lookup happens BEFORE the access
+/// check: an absent name is `ERROR_FILE_NOT_FOUND`, a present one we are not in the DACL of is
+/// `ERROR_ACCESS_DENIED`. Everything else keeps the original wording.
+///
+/// The contended case additionally carries a [`PadCreateFault`], which is what stops the pad
+/// manager's failure line from telling the operator to reinstall a driver that is working
+/// perfectly (see [`crate::pad_slots::PadCreateFault`]).
+fn classify_named_create_failure(name: &HSTRING, e: anyhow::Error) -> anyhow::Error {
+    let denied = e
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|w| w.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    if !denied {
+        return e.context(format!("create gamepad bootstrap mailbox {name}"));
+    }
+    if named_section_exists(name) {
+        return e
+            .context(PadCreateFault::IndexOwnedElsewhere)
+            .context(format!(
+            "bootstrap mailbox {name} exists and belongs to a process this one may not open — a \
+             live session's pad, held by the LocalSystem host service (its mailboxes grant SYSTEM \
+             + LocalService only, so an Administrator console sees ACCESS_DENIED, not \
+             ALREADY_EXISTS). Nothing is wrong with the drivers"
+        ));
+    }
+    e.context(format!(
+        "create gamepad bootstrap mailbox {name}: access denied although the name is FREE — this \
+         process may not create Global\\ objects at all (that needs SeCreateGlobalPrivilege, which \
+         SYSTEM and services hold and a user token does not)"
+    ))
+}
+
+/// Whether a section with this name exists right now, as seen from THIS process — the
+/// disambiguation [`classify_named_create_failure`] runs on. `true` also when the object is there
+/// but closed to us, which is the case that matters: ACCESS_DENIED from an OPEN means the name
+/// resolved and only the access check failed.
+///
+/// Deliberately not a security decision — a hostile squatter can make this say either thing. It
+/// only ever chooses which sentence to print.
+fn named_section_exists(name: &HSTRING) -> bool {
+    // SAFETY: `name` is a live NUL-terminated UTF-16 string for the duration of the call. Ask for
+    // the least access there is (`FILE_MAP_READ`): the handle is closed immediately and never
+    // mapped — we want the lookup's verdict, not the object.
+    let opened = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())) };
+    match opened {
+        Ok(h) => {
+            // SAFETY: `h` is the handle just opened here and referenced nowhere else.
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            true
+        }
+        // ERROR_FILE_NOT_FOUND (and anything else) reads as absent; ACCESS_DENIED is presence.
+        Err(e) => e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
     }
 }
 
