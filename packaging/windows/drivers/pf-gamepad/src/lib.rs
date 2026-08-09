@@ -376,10 +376,21 @@ static XBOX_RDESC: [u8; 223] = [
     0x75, 0x10,                    //     Report Size (16)
     0x81, 0x02,                    //     Input (Data,Var,Abs)
     0xC0,                          //   End Collection
+    // 🛑 THE RIGHT STICK IS `Z`/`Rz`, NOT `Rx`/`Ry`. This declared `Rx`/`Ry` until 2026-08-09 and
+    // the right stick was DEAD: measured on `.173`, with every axis sweeping on its own phase,
+    // `LX`/`LY`/`LT`/`RT` all reached XInput and `RX [0..0] RY [-1..-1]` never moved. Left and right
+    // were declared identically here apart from these two usage bytes, so the usages are the whole
+    // difference — `xinputhid`, which translates this collection into XUSB, maps `Z`/`Rz` to the
+    // right stick and does not treat `Rx`/`Ry` as one. `DUALSENSE_RDESC` above (a real capture) uses
+    // `Z`/`Rz` for its right stick too; the PS pads put the TRIGGERS on `Rx`/`Ry`, which is probably
+    // where the original mistake came from.
+    // ⚠️ This survived every bench measurement because the devtest only ever swept LS-X — the axis
+    // that worked — so `RX [0..0]` read as "nothing is driving it". It was found on glass. The
+    // devtest now sweeps all six axes on distinct phases so the harness can tell those two apart.
     0x09, 0x01,                    //   Usage (Pointer)
     0xA1, 0x00,                    //   Collection (Physical)
-    0x09, 0x33,                    //     Usage (Rx)         — right stick X
-    0x09, 0x34,                    //     Usage (Ry)         — right stick Y
+    0x09, 0x32,                    //     Usage (Z)          — right stick X
+    0x09, 0x35,                    //     Usage (Rz)         — right stick Y
     0x15, 0x00,                    //     Logical Minimum (0)
     0x27, 0xFF, 0xFF, 0x00, 0x00,  //     Logical Maximum (65535)
     0x95, 0x02,                    //     Report Count (2)

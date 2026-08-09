@@ -420,17 +420,28 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                     } else {
                         0
                     };
-                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    // 🛑 Sweep EVERY analogue axis, each on its own phase, and ramp both triggers.
+                    //
+                    // This used to drive LS-X alone and leave the other five at zero, which makes
+                    // the harness unable to tell "this axis is not mapped" from "nothing is driving
+                    // it" — the two look identical in any consumer. That is exactly how a DEAD
+                    // RIGHT STICK survived every bench measurement of the Windows HID Xbox pad and
+                    // was found only on glass (2026-08-09): `XInputGetState` read `RX [0..0]` and it
+                    // was written off as "the devtest doesn't move it", which was true and useless.
+                    // Distinct phases mean one run tells you which axes arrive AND that they are not
+                    // crosstalking onto each other's bytes.
+                    let phase = |off: i32| ((((i + off) % 64) - 32) * 1024) as i16;
+                    let trig = ((i % 32) * 8).clamp(0, 255) as u8;
                     mgr.handle(&GamepadEvent::State(GamepadFrame {
                         index: idx as i16,
                         active_mask: 1 << idx,
                         buttons,
-                        left_trigger: 0,
-                        right_trigger: 0,
-                        ls_x: lx,
-                        ls_y: 0,
-                        rs_x: 0,
-                        rs_y: 0,
+                        left_trigger: trig,
+                        right_trigger: 255 - trig,
+                        ls_x: phase(0),
+                        ls_y: phase(16),
+                        rs_x: phase(32),
+                        rs_y: phase(48),
                     }));
                 }
                 std::thread::sleep(Duration::from_millis(15));
