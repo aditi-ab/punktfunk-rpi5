@@ -221,6 +221,30 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
+/// Whether an Xbox-family pad should be built as a real **HID** device
+/// ([`crate::inject::xbox_windows`]) instead of the **XUSB** companion
+/// ([`crate::inject::gamepad`]). Windows only; `PUNKTFUNK_XBOX_BACKEND=hid` opts in.
+///
+/// **Why this is a knob and not simply the new default.** The XUSB companion registers only
+/// `GUID_DEVINTERFACE_XUSB` and exposes no HID collection, so Steam's hidapi enumeration,
+/// DirectInput, `joy.cpl` and WGI/GameInput cannot see it at all — only classic `XInputGetState`
+/// via xinput1_4's interface walk does. That is what left a reporter with a dead controller for two
+/// weeks (2026-08-09) until they switched the client to DualSense, a real HID pad.
+///
+/// But the converse is not yet proven: classic-XInput games DO read the XUSB pad today, and whether
+/// Windows promotes our HID pad into an Xbox-profile device that XInput and WGI `Gamepad` accept is
+/// exactly the open question. Until that is settled on glass, flipping the default would trade a
+/// known-working path for an unproven one. Opt in, measure, then decide.
+///
+/// The two backends are mutually exclusive per pad by construction (one match arm or the other) —
+/// presenting both would hand a game two controllers for one pair of hands.
+#[cfg(target_os = "windows")]
+pub(super) fn windows_xbox_hid() -> bool {
+    std::env::var("PUNKTFUNK_XBOX_BACKEND")
+        .map(|v| v.trim().eq_ignore_ascii_case("hid"))
+        .unwrap_or(false)
+}
+
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {

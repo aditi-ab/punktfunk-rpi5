@@ -123,6 +123,11 @@ struct Pads {
     steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
+    /// The HID-visible Xbox pad ([`crate::inject::xbox_windows`]) — used INSTEAD of `xbox360`'s
+    /// XUSB companion when [`super::gamepad::windows_xbox_hid`] says so. Never both at once: two
+    /// devices for one wire pad is the "the game sees two controllers" bug.
+    #[cfg(target_os = "windows")]
+    xbox_hid: Option<crate::inject::xbox_windows::XboxWindowsManager>,
     #[cfg(target_os = "windows")]
     dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -164,6 +169,8 @@ impl Pads {
             steamctrl2_puck: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
+            #[cfg(target_os = "windows")]
+            xbox_hid: None,
             #[cfg(target_os = "windows")]
             dualsense_edge_win: None,
             #[cfg(target_os = "windows")]
@@ -291,6 +298,16 @@ impl Pads {
                 .steamdeck_win
                 .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
                 .handle(ev),
+            // The Xbox pad, as a real HID device rather than the XUSB companion. Opt-in for now
+            // (see `windows_xbox_hid`): XUSB is what classic-XInput games read today, and this
+            // trades that for the Steam / WGI / GameInput / DirectInput visibility XUSB can never
+            // have — a swap that has to be proven on glass before it becomes the default.
+            #[cfg(target_os = "windows")]
+            GamepadPref::Xbox360 | GamepadPref::XboxOne if super::gamepad::windows_xbox_hid() => {
+                self.xbox_hid
+                    .get_or_insert_with(crate::inject::xbox_windows::XboxWindowsManager::new)
+                    .handle(ev)
+            }
             _ => self
                 .xbox360
                 .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
@@ -451,6 +468,11 @@ impl Pads {
         }
         #[cfg(target_os = "windows")]
         {
+            if let Some(m) = &mut self.xbox_hid {
+                // Rumble only — an Xbox pad has no rich-feedback plane (no lightbar / adaptive
+                // triggers), same as its XUSB sibling above.
+                m.pump(&mut rumble, &mut hidout);
+            }
             if let Some(m) = &mut self.dualsense_win {
                 m.pump(&mut rumble, &mut hidout);
             }
