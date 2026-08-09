@@ -364,6 +364,8 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         .unwrap_or(0);
     let ds4 = args.iter().any(|a| a == "--ds4");
     let xbox = args.iter().any(|a| a == "--xbox");
+    // `--xboxhid` drives the HID Xbox backend (device-type 4) instead of `--xbox`'s XUSB companion.
+    let xboxhid = args.iter().any(|a| a == "--xboxhid");
     // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
     // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
     // report byte 10 (0x80|0x40) next to Cross. `--deck` drives the Steam Deck backend
@@ -463,6 +465,16 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             }));
             std::thread::sleep(Duration::from_millis(15));
         }
+    } else if xboxhid {
+        // The HID Xbox pad (device-type 4) — the SHIPPING SwDeviceCreate identity, not a devgen
+        // node. That distinction is the whole point of this leg: a devgen devnode carries no USB
+        // hardware ids, so its HID child comes up `HID\VID_045E&UP:0001_U:0005` with no PID token,
+        // and the question this exists to answer — does Windows promote our pad to an Xbox-profile
+        // device (an `IG_` token, XInput, WGI `Gamepad`) — turns on exactly that PID being present.
+        drive!(
+            crate::inject::xbox_windows::XboxWindowsManager::new(),
+            "Xbox Wireless Controller (HID)"
+        );
     } else if ds4 {
         drive!(
             crate::inject::dualshock4_windows::DualShock4WindowsManager::new(),

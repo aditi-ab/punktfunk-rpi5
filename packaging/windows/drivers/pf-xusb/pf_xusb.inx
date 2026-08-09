@@ -39,6 +39,17 @@ pf_xusb.dll
 [pfXusb.NT.HW]
 Include=WUDFRD.inf
 Needs=WUDFRD.NT.HW
+AddReg=pfXusb_HW_AddReg
+
+; The WGI/GameInput admission tripwire. Classic `xinput1_4` needs nothing here — it finds us by the
+; XUSB device-interface GUID and polls GET_STATE, which is why the pad has always worked there
+; (verified on .173 2026-08-09: our pad takes XInput slot 1 with live state). WGI and GameInput
+; instead expect the in-box `xinputhid` filter on the stack, and without it they never admit the
+; device however correct its IOCTL surface is. Pairs with the async WAIT_FOR_INPUT pump in
+; src/lib.rs — the filter and the async wait are the two halves this driver's README has always
+; listed as the missing WGI work; neither needs kernel-mode code.
+[pfXusb_HW_AddReg]
+HKR,,"UpperFilters",0x00010000,"xinputhid"
 
 [pfXusb.NT.Services]
 Include=WUDFRD.inf
