@@ -4,6 +4,7 @@ use super::pw_cursor::{composite_cursor, update_cursor_meta, CursorState};
 use super::pw_pods::{
     build_cursor_meta_param, build_default_format_obj, build_dmabuf_buffers, build_dmabuf_format,
     build_hdr_dmabuf_format, build_mappable_buffers, build_shm_only_buffers, serialize_pod,
+    HDR_FORMAT_ORDER,
 };
 use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{Context, Result};
@@ -1850,13 +1851,15 @@ pub fn pipewire_thread(
     // negotiation-timeout path latches the process-wide SDR downgrade if nothing matches.
     let format_pods: Vec<Vec<u8>> = if want_hdr {
         tracing::info!(
-            "HDR capture: offering xRGB_210LE/xBGR_210LE LINEAR dmabufs with MANDATORY \
+            "HDR capture: offering xBGR_210LE/xRGB_210LE LINEAR dmabufs with MANDATORY \
              BT.2020 + SMPTE-2084 (PQ) colorimetry (GNOME 50+ monitor stream)"
         );
-        vec![
-            build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, preferred)?,
-            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, preferred)?,
-        ]
+        // ⚠ Order is the whole fix — see the NVIDIA note on `HDR_FORMAT_ORDER`. The first
+        // compatible consumer pod wins, so this is what a gamescope session actually lands on.
+        HDR_FORMAT_ORDER
+            .iter()
+            .map(|fmt| build_hdr_dmabuf_format(*fmt, preferred))
+            .collect::<Result<Vec<_>>>()?
     } else if want_dmabuf {
         let mut pods = Vec::with_capacity(if prefer_native_nv12 { 2 } else { 1 });
         if prefer_native_nv12 {
