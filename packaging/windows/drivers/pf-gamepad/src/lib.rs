@@ -291,8 +291,19 @@ static DECK_RDESC: [u8; 38] = [
 // `HKLM\SYSTEM\CurrentControlSet\Enum\BTHENUM\...\Device Parameters` or use a HID monitor;
 // `hidapi`'s `hidapi-hidtest` and Linux `/sys/class/hidraw/hidrawN/device/report_descriptor` both
 // dump it directly. Replace this blob and re-run the `xbox_proto` layout tests.
+//
+// ⚠️ The trailing vendor-defined Feature report `0x85` is NOT cosmetic and must not be trimmed as
+// "unused": it is the CHANNEL PROOF transport (`ProofTransport::HidFeatureReport`). The captured
+// PlayStation descriptors already declared `0x85`, which is why the proof "costs no descriptor
+// change" there — but this descriptor is constructed, so it has to declare the report itself. Built
+// without it the pad enumerates perfectly and then delivers NOTHING: hidclass rejects the host's
+// `HidD_GetFeature` before the driver sees it, the host refuses to hand over the DATA section
+// (measured on .173 2026-08-09 — WGI `RawGameController` saw `045E:0B13` with every axis pinned at
+// 0.5000 and a timestamp frozen for 12 consecutive samples), and the pad serves only its neutral
+// report forever. `0x3F` payload bytes so `FeatureReportByteLength` lands on 64, the buffer size
+// `channel_proof::query` asks with; the proof itself needs 17.
 #[rustfmt::skip]
-static XBOX_RDESC: [u8; 132] = [
+static XBOX_RDESC: [u8; 150] = [
     0x05, 0x01,                    // Usage Page (Generic Desktop)
     0x09, 0x05,                    // Usage (Game Pad)
     0xA1, 0x01,                    // Collection (Application)
@@ -355,6 +366,17 @@ static XBOX_RDESC: [u8; 132] = [
     0x75, 0x01,                    //   Report Size (1)
     0x95, 0x01,                    //   Report Count (1)
     0x81, 0x03,                    //   Input (Cnst,Var,Abs) — pad to a byte boundary
+    // The channel-proof feature report — see the ⚠️ above. Declared last so it cannot disturb the
+    // INPUT layout `xbox_proto` packs against: every global item here (Report Size/Count, Logical
+    // Min/Max) is re-stated after the final Input item, so nothing above is retroactively changed.
+    0x06, 0x00, 0xFF,              //   Usage Page (Vendor Defined 0xFF00)
+    0x85, 0x85,                    //   Report ID (0x85)
+    0x09, 0x2D,                    //   Usage (0x2D) — the id the PS descriptors use for it
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,              //   Logical Maximum (255)
+    0x75, 0x08,                    //   Report Size (8)
+    0x95, 0x3F,                    //   Report Count (63) — 1 id + 63 = 64 = FeatureReportByteLength
+    0xB1, 0x02,                    //   Feature (Data,Var,Abs)
     0xC0,                          // End Collection
 ];
 
@@ -371,7 +393,7 @@ static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01
 static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
 static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
 static DECK_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x26, 0x00]; // 38 bytes
-static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x84, 0x00]; // 132 bytes
+static XBOX_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x96, 0x00]; // 150 bytes
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
 // `devtype` selects the identity: PS family (same Sony VID/version) or the N4-spike Deck.
