@@ -41,9 +41,10 @@ import { QueryState } from "@/components/query-state";
 import { Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { InputNumber } from "@/components/ui/input-number";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { apiErrorMessage } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
@@ -177,17 +178,11 @@ export const DisplaySection: FC = () => {
 	});
 
 	return (
-		<div className="flex flex-col gap-card">
-			<Card>
-				<CardHeader>
-					<div className="flex flex-wrap items-center justify-between gap-2">
-						<CardTitle>{m.display_config_title()}</CardTitle>
-						{/* Visible without scrolling to the save button — the card is taller than the
-						    viewport, which is exactly how the pending edits went unnoticed. */}
-						{dirty && <Badge variant="warning">{m.display_unsaved()}</Badge>}
-					</div>
-				</CardHeader>
-				<CardContent className="space-y-4">
+		<DisplayTabs
+			dirty={dirty}
+			live={<LiveDisplays />}
+			configuration={
+				<>
 					<p className="max-w-prose text-sm text-muted-foreground">
 						{m.host_displays_help()}
 					</p>
@@ -226,19 +221,63 @@ export const DisplaySection: FC = () => {
 							/>
 						)}
 					</QueryState>
-				</CardContent>
-			</Card>
-			<Card>
-				<CardHeader>
-					<CardTitle>{m.display_live()}</CardTitle>
-				</CardHeader>
-				<CardContent>
-					<LiveDisplays />
-				</CardContent>
-			</Card>
-		</div>
+				</>
+			}
+		/>
 	);
 };
+
+/**
+ * The page's tab shell: **Configuration** and **Live displays** as the same pill strip the plugin
+ * UIs use, over a card per tab.
+ *
+ * Tabs rather than two stacked cards because the configuration card alone is taller than the
+ * viewport — which is how pending edits went unnoticed — and the live list sat below it, effectively
+ * off screen.
+ *
+ * Presentational on purpose, taking both panes as nodes: `DisplaySection` cannot be rendered in
+ * Storybook (it calls `useBlocker`, which needs a router), so putting the strip here is what keeps
+ * it reachable from a story. That matters more than usual on this page — `Displays.stories.tsx`
+ * exists to pin the MOTION NESTING of the preset grid, and inserting tabs changes that ancestor
+ * chain, so the story has to render the real one.
+ */
+export const DisplayTabs: FC<{
+	dirty: boolean;
+	configuration: ReactNode;
+	live: ReactNode;
+}> = ({ dirty, configuration, live }) => (
+	<Tabs defaultValue="configuration" className="gap-card">
+		<TabsList>
+			<TabsTrigger value="configuration">
+				{m.display_config_title()}
+				{/* The dirty marker rides the TAB, not the card header. It used to sit inside a card
+				    taller than the viewport; behind a tab it would vanish altogether while the Live
+				    tab was open. On the trigger it survives both — and the Custom block keeps its
+				    own inline badge, so nothing is lost when this tab IS open. */}
+				{dirty && (
+					<span
+						role="status"
+						aria-label={m.display_unsaved()}
+						className="ml-1.5 size-2 shrink-0 rounded-full bg-[var(--warning)]"
+					/>
+				)}
+			</TabsTrigger>
+			<TabsTrigger value="live">{m.display_live()}</TabsTrigger>
+		</TabsList>
+
+		<TabsContent value="configuration">
+			<Card>
+				<CardContent className="space-y-4 pt-6">{configuration}</CardContent>
+			</Card>
+		</TabsContent>
+
+		<TabsContent value="live">
+			<Card>
+				<CardContent className="pt-6">{live}</CardContent>
+			</Card>
+		</TabsContent>
+	</Tabs>
+);
 
 /**
  * The gate on anything that would throw unsaved Custom fields away — asked from three places (a

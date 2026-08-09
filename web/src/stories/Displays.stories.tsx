@@ -1,9 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
+import { userEvent, within } from "storybook/test";
 import type { DisplayPolicy } from "@/api/gen/model/displayPolicy";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { m } from "@/paraglide/messages";
-import { DisplayForm } from "@/sections/Displays/DisplayCard";
+import { DisplayForm, DisplayTabs } from "@/sections/Displays/DisplayCard";
 import {
 	displayCustomPresets,
 	displayEffective,
@@ -19,17 +18,29 @@ import {
  * frame while every other grid in the console staggered. It is invisible in a diff and invisible to
  * `tsc`; only a rendered page shows it.
  *
- * So the `<Card>` wrapper below is NOT decoration. It reproduces the page's motion nesting, which is
- * the thing under test — dropping it would make the story pass for the wrong reason.
+ * So the wrapper below is NOT decoration. It reproduces the page's motion nesting, which is the
+ * thing under test — dropping it would make the story pass for the wrong reason. It renders the
+ * page's real `DisplayTabs` shell for exactly that reason: the tabs sit between the page `<Section>`
+ * and the card, so they are part of the ancestor chain this story exists to pin.
  */
-const Harness = ({ seed }: { seed: DisplayPolicy }) => {
+const Harness = ({
+	seed,
+	dirty = false,
+}: {
+	seed: DisplayPolicy;
+	dirty?: boolean;
+}) => {
 	const [draft, setDraft] = useState<DisplayPolicy>(seed);
 	return (
-		<Card>
-			<CardHeader>
-				<CardTitle>{m.display_config_title()}</CardTitle>
-			</CardHeader>
-			<CardContent className="space-y-4">
+		<DisplayTabs
+			dirty={dirty}
+			live={
+				<p className="text-sm text-muted-foreground">
+					The live list reads `/display/state`, so it is not part of this story
+					— see the tab strip and the Configuration pane.
+				</p>
+			}
+			configuration={
 				<DisplayForm
 					draft={draft}
 					setDraft={setDraft}
@@ -41,11 +52,11 @@ const Harness = ({ seed }: { seed: DisplayPolicy }) => {
 					applyAxis={(patch) => setDraft({ ...draft, ...patch })}
 					saveDraft={() => {}}
 					busy={false}
-					dirty={false}
+					dirty={dirty}
 					revert={() => {}}
 				/>
-			</CardContent>
-		</Card>
+			}
+		/>
 	);
 };
 
@@ -70,11 +81,10 @@ export const CustomFields: Story = {
 export const NoCustomPresets: Story = {
 	args: { seed: displayPolicy },
 	render: (args) => (
-		<Card>
-			<CardHeader>
-				<CardTitle>{m.display_config_title()}</CardTitle>
-			</CardHeader>
-			<CardContent className="space-y-4">
+		<DisplayTabs
+			dirty={false}
+			live={null}
+			configuration={
 				<DisplayForm
 					draft={args.seed}
 					setDraft={() => {}}
@@ -89,7 +99,22 @@ export const NoCustomPresets: Story = {
 					dirty={false}
 					revert={() => {}}
 				/>
-			</CardContent>
-		</Card>
+			}
+		/>
 	),
+};
+
+/**
+ * Unsaved Custom edits, with the Configuration tab NOT open.
+ *
+ * The dirty marker has to survive being on the other tab — the whole reason it moved off the card
+ * header and onto the trigger. If this story ever shows a bare "Configuration" label, the warning
+ * has gone silent exactly when it matters most.
+ */
+export const UnsavedOnOtherTab: Story = {
+	args: { seed: { ...displayPolicy, preset: "custom" }, dirty: true },
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await userEvent.click(await canvas.findByRole("tab", { name: /Live/i }));
+	},
 };
