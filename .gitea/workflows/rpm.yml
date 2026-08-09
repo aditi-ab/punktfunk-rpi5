@@ -206,10 +206,33 @@ jobs:
           dnf -y install dnf-plugins-core meson ninja-build glslc || true
           dnf builddep -y gamescope || true
           dnf -y install xorg-x11-server-Xwayland-devel || true
+          # NOT best-effort: build-punktfunk-gamescope.sh appends `-static-libstdc++` to LDFLAGS
+          # (so the binary still starts on SteamOS's older libstdc++ — see its comment), and
+          # without the static library meson's very FIRST sanity check dies with
+          # "cannot find -lstdc++ / have you installed the static version", so nothing builds at
+          # all. That is what happened on the v0.26.0 tag: both Fedora bases warned and skipped,
+          # the job stayed green, and the release shipped with no gamescope RPM while the notes
+          # said it had one. A rename here must be LOUD, hence no `|| true`.
+          dnf -y install libstdc++-static
+          # The rest of the Arch package's makedepends that Fedora's older packaged gamescope does
+          # not necessarily pull. Best-effort: unlike the static runtime, meson finds fallbacks or
+          # does without, and a name that moves between Fedora releases should not fail the job.
+          dnf -y install wayland-protocols-devel glm-devel cmake libXcursor-devel || true
           if bash packaging/gamescope/build-punktfunk-gamescope.sh \
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
             install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
           else
+            # Best-effort on canary, HARD on a stable tag. A `::warning::` here is what let
+            # v0.26.0 publish release notes promising a Fedora gamescope package that did not
+            # exist: the step "succeeded", the job was green, and the only evidence was a warning
+            # nobody reads. A release must not be able to make a claim its own CI silently
+            # dropped, so on `refs/tags/v*` this is an error.
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — a stable tag must not ship without it (the release notes and docs-site say it is installable)"
+                exit 1
+                ;;
+            esac
             echo "::warning::punktfunk-gamescope failed to build for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
           fi
 
@@ -227,6 +250,15 @@ jobs:
               --binary gs-cache/punktfunk-gamescope \
               --release "$PF_RELEASE"
           else
+            # The authoritative "does this package exist" decision, and the one that also covers
+            # the cache path — the build step above is skipped entirely on a cache hit, so a stale
+            # or empty cache would otherwise reach here and skip in silence on a release.
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error::no usable punktfunk-gamescope for f${{ matrix.fedver }} — a stable tag must not ship without its RPM"
+                exit 1
+                ;;
+            esac
             echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — skipping its RPM"
           fi
 
