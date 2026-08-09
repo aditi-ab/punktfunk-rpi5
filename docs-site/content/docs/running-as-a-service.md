@@ -207,41 +207,61 @@ a Windows host, run `punktfunk-host service status` from an elevated prompt on t
 
 ## GPU scheduling priority
 
-The host binary carries **no Linux capability**, and on a KDE desktop it must not.
-
 The [PyroWave](/docs/pyrowave) codec encodes on the same GPU shader cores your game is using, so a
 demanding game can crowd it out and the stream's frame rate drops with it. The fix is to ask the
-driver to schedule the encode ahead of the game, and every driver we tested gates that request on
-`CAP_SYS_NICE`. Version 0.26.0-1 granted it for that reason — and it broke desktop streaming on
-every KDE box, so 0.26.0-2 takes it away again. The other codecs use a separate video engine on the
-GPU and were never affected.
+driver to schedule that encode ahead of the game, and every driver we tested gates the request on a
+single Linux capability, `CAP_SYS_NICE`. The other codecs use a separate video engine on the GPU and
+are unaffected either way.
 
-The two cannot coexist. To hand the host its virtual display, KWin first has to work out *which*
-program is asking, which it does by reading the connecting process's `/proc/<pid>/exe` and matching
-it against the `.desktop` file the packages install. Linux refuses that read for any process holding
-a capability the reader does not also hold — and KWin holds none. So a host with `CAP_SYS_NICE` is a
-host KWin cannot identify, and every session fails with:
+That capability cannot live on the host, so it lives next to it. Every way of installing a Linux
+host — apt, dnf, pacman, the Bazzite sysext, the NixOS module, the Steam Deck script — ships a
+second, deliberately small program alongside it, **`punktfunk-encode-worker`**, and grants
+`cap_sys_nice=ep` to *that*. The host starts one per PyroWave session, hands it the captured frames,
+and takes the compressed video back; the worker talks to nothing else, not your desktop and not the
+network.
+`punktfunk-host` itself carries **no capability, on any channel** — the posture it has had since
+0.25.0, and the one KDE needs.
+
+> **Never `setcap` `punktfunk-host`.** Not by hand, not through a systemd `AmbientCapabilities=`
+> line, not through a NixOS `security.wrappers` entry. All three put the capability in the same
+> place, and all three take KDE desktop streaming away completely. There is no capability the host
+> wants: the worker is the thing that needs one, and your packages already gave it one.
+
+Here is why a privileged host is so much worse than a privileged worker. To hand the host its
+virtual display, KWin first has to work out *which* program is asking, which it does by reading the
+connecting process's `/proc/<pid>/exe` and matching it against the `.desktop` file the packages
+install. Linux refuses that read unless the reader already holds every capability the target holds —
+and KWin holds none. So a host carrying a capability is a host KWin cannot identify, its restricted
+protocols are never offered, and every session fails at capture with:
 
 ```
 KWin virtual output failed: KWin does not expose zkde_screencast_unstable_v1 to this client
 ```
 
-which looks exactly like a missing `.desktop` file and cannot be fixed by reinstalling. Moving the
-grant into the systemd unit does not help either — same capability, same refused read.
-
-If you are on 0.26.0-1, update. On the Bazzite image the `/usr` is read-only, so the only repair is
-the next image (`sudo punktfunk-sysext update`). Elsewhere you can clear it by hand:
+which reads exactly like a missing or mis-installed `.desktop` file and survives reinstalling both
+ends. Version 0.26.0-1 granted the host the capability for the reason above and shipped precisely
+this, on every Linux channel; 0.26.0-2 revoked it everywhere. If you ever see that error, check the
+binaries before anything else — the host's own message names the capability when it finds one:
 
 ```sh
-getcap /usr/bin/punktfunk-host          # prints nothing when correct
-sudo setcap -r /usr/bin/punktfunk-host  # clear it, then restart the host
+getcap /usr/bin/punktfunk-host              # correct output is nothing at all
+getcap /usr/bin/punktfunk-encode-worker     # /usr/bin/punktfunk-encode-worker cap_sys_nice=ep
+
+sudo setcap -r /usr/bin/punktfunk-host      # clear it, then restart the host
 ```
 
-Losing the capability costs frame pacing under a GPU-bound game and nothing else — the host asks for
-the elevated priority, is refused, and encodes at the normal one. `PYROWAVE_QUEUE_PRIORITY=off`
-stops it asking at all. If you stream only with gamescope (Steam Gaming Mode) you can grant the
-capability yourself and keep the pacing, at the cost of desktop streaming; gamescope has no such
-identity check.
+On the Bazzite image `/usr` is read-only, so there is nothing to repair in place — take the next
+image (`sudo punktfunk-sysext update`). On NixOS the worker *is* wrapped, because a file capability
+cannot live on a read-only store path: the module creates the wrapper and points the host at it, and
+the host's own `ExecStart` stays on the plain store path.
+
+**The grant is best-effort, and no session depends on it.** A worker without the capability still
+encodes — it asks for the elevated priority, is refused, says so once, and runs at the normal one.
+So does a host that cannot find or start a worker at all: it encodes in-process, logs one line, and
+streams. The only thing at stake is frame pacing under a GPU-bound game.
+`PYROWAVE_QUEUE_PRIORITY=off` stops the host asking for priority, and `PUNKTFUNK_ENCODE_WORKER=off`
+keeps the encode in the host process — both on
+[Configuration](/docs/configuration#advanced-performance-tuning).
 
 ## Stopping and removing
 

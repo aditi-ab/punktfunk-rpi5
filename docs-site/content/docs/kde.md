@@ -140,6 +140,10 @@ The session unit brings up headless KWin; the host unit follows it and starts li
   inside the session. It exits 0 only when KWin is up *and* advertising the grant to the host, and
   prints the reason when it isn't — after a fresh install that is usually just the missing log out
   and back in. On the headless appliance session, also check `kwin_wayland --version` is ≥ 6.5.6.
+  The other cause has nothing to do with the `.desktop` file: `getcap /usr/bin/punktfunk-host` must
+  print **nothing at all**. A host binary carrying a Linux capability cannot be identified by KWin
+  and is never offered the protocol, however correctly its grant is installed — see
+  [GPU scheduling priority](/docs/running-as-a-service#gpu-scheduling-priority).
 - **Black screen / no picture:** confirm you're on a Wayland session (not X11) and, on NVIDIA, that
   the GL userspace is installed. More in [Troubleshooting](/docs/troubleshooting).
 

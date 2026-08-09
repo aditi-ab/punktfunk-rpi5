@@ -12,6 +12,84 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.27.0 — in development
+
+Sections accumulate here as work lands. The version table and the commit count are written at the
+version bump, alongside `docs/releases/v0.27.0.md` — see `docs/releases/README.md`.
+
+### `punktfunk-encode-worker` — the GPU-priority capability moves off the host
+
+0.26.0 left the PyroWave priority ladder wired and inert: it needs `CAP_SYS_NICE`, and 0.26.0-1
+proved the host can never hold one — see **PyroWave on Linux — Wave 2**, PW1, under v0.26.0 below. A
+capability-carrying process cannot be identified by KWin (`cap_ptrace_access_check` refuses
+`/proc/<pid>/exe` to a reader whose effective set is not a superset of the target's **permitted**
+set), so it never gets `zkde_screencast_unstable_v1` and every KDE desktop session dies. Neither
+`prctl(PR_SET_DUMPABLE, 1)` nor systemd `AmbientCapabilities=` nor a NixOS `security.wrappers` entry
+changes that — all three land the capability in the same permitted set.
+
+The capability therefore moves to a process that fronts nothing. **`punktfunk-encode-worker`** is a
+new workspace member and a new installed binary: it owns the priority-elevated Vulkan device for
+PyroWave sessions, receives capture dmabufs over a `SOCK_SEQPACKET` pair from its parent, and returns
+compressed access units. It connects to no compositor, no D-Bus and no network, so its
+non-dumpability costs nothing and its blast radius is one socket to the host that spawned it.
+
+🛑 **The invariant, for anyone packaging this:** the worker is a **separate file**. Never a hardlink
+to `punktfunk-host` and never a subcommand of it — a shared inode shares the file capability, which
+silently re-creates 0.26.0-1 on every KDE box. `punktfunk-host` carries no capability, on any
+channel, ever.
+
+- **The grants are re-targeted, not re-introduced.** Every channel that granted in 0.26.0-1 grants
+  again, at the worker: Arch `.install` (`post_install` **and** `post_upgrade` — a replaced binary is
+  a new inode), RPM `%caps(cap_sys_nice=ep)` in `%files` (never a `%post setcap`; this covers Fedora
+  and Bazzite layering), the Bazzite sysext staging tree pre-`mksquashfs` (which does record
+  `security.capability`), the deb `postinst`, the Deck installer, and NixOS
+  `security.wrappers.punktfunk-encode-worker`. Every #136 host-side removal stays verbatim, including
+  the sysext's host hard-fail.
+- **The sysext assertion is amended, not removed** — host must be empty (hard fail), worker must
+  carry **exactly** `cap_sys_nice=ep`. A *missing* worker capability is not an error: the grant is
+  best-effort everywhere.
+- **A new release-CI leg asserts the getcap matrix** on the built Arch package, the deb and the
+  mounted sysext raw. The 0.26.0-1 lesson was "verify the package, never the board"; this is that,
+  mechanized, and it is what would have caught the original break.
+- **On NixOS the env override is load-bearing**, not a convenience: a file capability cannot live on
+  a read-only store path, so the module wraps the worker and sets `PUNKTFUNK_ENCODE_WORKER` to the
+  wrapper path in the unit. An ambient grant is fine *here* — the worker is not a KWin client. The
+  host's `ExecStart` stays on the plain store path (the #136 fix stands).
+
+**Fallback ladder — no rung can kill a negotiated session.** Binary not found → spawn failure →
+handshake timeout → protocol or workspace-version mismatch → socket EOF mid-session all fall back to
+the **in-process encoder exactly as today**, at default priority, with one warning. Host and worker
+are different files now, so the version check is load-bearing rather than decorative; they ship
+lockstep in every channel. The in-process path stays compiled and tested — it is the floor, not dead
+code. `PYROWAVE_QUEUE_PRIORITY` keeps its 0.26.0 grammar and is now forwarded **explicitly** in the
+handshake rather than read from the worker's environment, which is sanitized at spawn; one env var
+still means one thing on both platforms.
+
+### Host and client environment variables
+
+- **`PUNKTFUNK_ENCODE_WORKER`** *(new, host, Linux)* — where to find the encode worker. Resolution
+  order: this variable → alongside `/proc/self/exe` → `PATH`. `off` forces the in-process encoder,
+  the debug escape hatch that makes the A/B a one-line change. Load-bearing on NixOS (above).
+- **`PYROWAVE_QUEUE_PRIORITY`** *(unchanged grammar, new consumer)* — the *intent*, forwarded to the
+  worker; the granted class comes back in the handshake and the host logs it centrally, so the
+  in-process INERT warning does not double-fire. When the worker is uncapped as well — an operator
+  stripped it, or the filesystem cannot store the capability — the same INERT wording fires, now
+  naming the worker binary rather than the host.
+
+### Documentation
+
+- `docs-site` **Running as a service → GPU scheduling priority** rewritten around the split: the
+  worker carries the capability, the host never does, and `setcap` on `punktfunk-host` is called out
+  as the thing an operator must never do, with the `zkde_screencast_unstable_v1` symptom spelled out
+  so anyone who already did it can self-diagnose. The anchor is unchanged, so existing links hold.
+- `configuration.md` gains the `PUNKTFUNK_ENCODE_WORKER` row and rewrites `PYROWAVE_QUEUE_PRIORITY`
+  off "the packages deliberately do not grant this".
+- The 0.26.0 user-facing notes describe a privilege that is deliberately not granted. That is the
+  record of what 0.26.0 shipped and is **not** rewritten; the new phrasing — granted to the worker,
+  never to the host — lives in `docs/releases/v0.27.0.md`.
+
+---
+
 ## v0.26.0
 
 52 commits since v0.25.0.
