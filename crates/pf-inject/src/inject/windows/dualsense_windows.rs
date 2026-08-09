@@ -1018,6 +1018,7 @@ mod drain_tests {
             WinDsIdentity::dualsense_edge().hwid,
             super::super::dualshock4_windows::DS4_HWID,
             super::super::steam_deck_windows::DECK_HWID,
+            super::super::xbox_windows::XBOX_HWID,
         ] {
             let want = hwid.to_ascii_lowercase();
             let rooted = format!("root\\{want}");
@@ -1071,7 +1072,7 @@ mod drain_tests {
             .collect();
         assert_eq!(
             entries.len(),
-            4,
+            5,
             "parsed {entries:?} out of the driver's table — the shape changed and this test went \
              vacuous; fix the parse rather than deleting the assert"
         );
@@ -1097,6 +1098,10 @@ mod drain_tests {
             (
                 super::super::steam_deck_windows::DECK_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+            ),
+            (
+                super::super::xbox_windows::XBOX_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_XBOX,
             ),
         ] {
             let want = hwid.to_ascii_lowercase();

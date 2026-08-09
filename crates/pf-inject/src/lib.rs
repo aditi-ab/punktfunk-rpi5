@@ -484,6 +484,12 @@ pub mod uhid_manager;
 /// has until a Windows box is reachable.
 #[path = "inject/proto/xbox_proto.rs"]
 pub mod xbox_proto;
+/// Windows: virtual Xbox Wireless Controller via the same UMDF minidriver (device-type 4) — the
+/// HID-visible alternative to [`gamepad_windows`]'s XUSB companion, which Steam / WGI / GameInput /
+/// DirectInput cannot enumerate at all because it registers only the XUSB device interface.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/xbox_windows.rs"]
+pub mod xbox_windows;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
