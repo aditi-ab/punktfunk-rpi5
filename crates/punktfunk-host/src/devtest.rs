@@ -270,8 +270,10 @@ pub fn switchpro_test(args: &[String]) -> Result<()> {
     let (mut i, mut last_write) = (0i32, Instant::now());
     while Instant::now() < deadline {
         let fb = pad.service(0);
-        if let Some((low, high)) = fb.rumble {
-            println!("  rumble from kernel/game: low={low} high={high}");
+        // `lt`/`rt` are structurally always zero here — a Switch Pro has no trigger motors —
+        // but this harness reads the shared `PadFeedback`, so it prints all four levels.
+        if let Some((low, high, lt, rt)) = fb.rumble {
+            println!("  rumble from kernel/game: low={low} high={high} lt={lt} rt={rt}");
         }
         for o in fb.hidout {
             println!("  hid output from kernel/game: {o:?}");
@@ -397,7 +399,9 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
             let (mut i, mut last) = (0i32, Instant::now());
             while Instant::now() < deadline {
                 mgr.pump(
-                    |pad, lo, hi| println!("  rumble from game: pad={pad} low={lo} high={hi}"),
+                    |pad, lo, hi, lt, rt| println!(
+                        "  rumble from game: pad={pad} low={lo} high={hi} lt={lt} rt={rt}"
+                    ),
                     |o| println!("  hid output from game: {o:?}"),
                 );
                 if last.elapsed() >= Duration::from_millis(400) {
@@ -442,8 +446,10 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut t = 0i32;
         while Instant::now() < deadline {
-            mgr.pump_rumble(|pad, lo, hi| {
-                println!("  rumble from game: pad={pad} low={lo} high={hi}")
+            // `lt`/`rt` are structurally always zero on XUSB (see `pump_rumble`); printed so
+            // the harness output is comparable line-for-line with the HID Xbox backend's.
+            mgr.pump_rumble(|pad, lo, hi, lt, rt| {
+                println!("  rumble from game: pad={pad} low={lo} high={hi} lt={lt} rt={rt}")
             });
             t += 1;
             let lx = (((t % 200) - 100) * 327).clamp(-32768, 32767) as i16; // sweep ±32700

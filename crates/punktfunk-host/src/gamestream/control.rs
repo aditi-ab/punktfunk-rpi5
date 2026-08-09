@@ -255,7 +255,13 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                 hdr_sent = true;
                             }
                         }
-                        pads.pump_rumble(|index, low, high| {
+                        // The GameStream leg carries the handle motors only: Moonlight's
+                        // trigger-rumble message (`ConnListenerRumbleTriggers`) is a separate
+                        // control-stream id we have not read out of moonlight-common-c yet, and
+                        // `low`/`high` here are already what `rumble_plaintext` (0x010B) encodes.
+                        // The uinput backend cannot source triggers anyway (evdev `FF_RUMBLE` has
+                        // two fields), so nothing is dropped today.
+                        pads.pump_rumble(|index, low, high, _lt, _rt| {
                             let pt = super::gamepad::rumble_plaintext(index, low, high);
                             out.push(encrypt_control(&key, &scheme, host_seq, &pt));
                             host_seq = host_seq.wrapping_add(1);
@@ -269,7 +275,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                     }
                 } else {
                     // No client/scheme yet: still answer FF uploads so games don't block.
-                    pads.pump_rumble(|_, _, _| {});
+                    pads.pump_rumble(|_, _, _, _, _| {});
                 }
                 // ENet needs frequent servicing for handshake/keepalive/retransmit.
                 std::thread::sleep(Duration::from_millis(2));

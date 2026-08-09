@@ -85,7 +85,8 @@ impl PadProto for DsEdgeWinProto {
     fn service(&self, pad: &mut DsWinPad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
             // Rumble-plane liveness, not any-report liveness — see the plain DualSense backend.
             rumble_drove: Some(fb.rumble.is_some()),

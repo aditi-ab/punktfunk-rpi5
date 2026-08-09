@@ -91,6 +91,15 @@ pub(super) async fn run(
                         let ttl = u.envelope.map(|e| e.ttl_ms);
                         // Both consumers are fed; an embedder drains exactly one of them
                         // (the legacy queue, or the policy engine's command API).
+                        //
+                        // `u.left_trigger`/`u.right_trigger` (the v3 tail) are decoded and
+                        // deliberately NOT forwarded yet: neither consumer has a slot for them.
+                        // Widening them is the client-engine work package — `RumbleCommand` grows
+                        // two fields, `ActuatorQuirks` learns whether the physical pad has trigger
+                        // motors, and the C ABI gains a `next_rumble_cmd2` beside the existing
+                        // fixed-out-param puller. Dropping them here is exactly what the §5
+                        // compatibility table calls "new host, old client": the handle motors
+                        // behave identically and the trigger levels are silently discarded.
                         let _ = rumble_tx.try_send((u.pad, u.low, u.high, ttl));
                         rumble_feed.wire_update(u.pad, u.low, u.high, ttl);
                     }

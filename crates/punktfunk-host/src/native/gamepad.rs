@@ -223,26 +223,41 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
 
 /// Whether an Xbox-family pad should be built as a real **HID** device
 /// ([`crate::inject::xbox_windows`]) instead of the **XUSB** companion
-/// ([`crate::inject::gamepad`]). Windows only; `PUNKTFUNK_XBOX_BACKEND=hid` opts in.
+/// ([`crate::inject::gamepad`]). Windows only. **HID is the default**; set
+/// `PUNKTFUNK_XBOX_BACKEND=xusb` to go back to the companion.
 ///
-/// **Why this is a knob and not simply the new default.** The XUSB companion registers only
-/// `GUID_DEVINTERFACE_XUSB` and exposes no HID collection, so Steam's hidapi enumeration,
-/// DirectInput, `joy.cpl` and WGI/GameInput cannot see it at all — only classic `XInputGetState`
-/// via xinput1_4's interface walk does. That is what left a reporter with a dead controller for two
-/// weeks (2026-08-09) until they switched the client to DualSense, a real HID pad.
+/// **Why HID is now the default.** The XUSB companion registers only `GUID_DEVINTERFACE_XUSB` and
+/// exposes no HID collection, so Steam's hidapi enumeration, DirectInput, `joy.cpl` and
+/// WGI/GameInput cannot see it at all — only classic `XInputGetState` via xinput1_4's interface walk
+/// does. That is what left a reporter with a dead controller for two weeks (2026-08-09) until they
+/// switched the client to DualSense, a real HID pad.
 ///
-/// But the converse is not yet proven: classic-XInput games DO read the XUSB pad today, and whether
-/// Windows promotes our HID pad into an Xbox-profile device that XInput and WGI `Gamepad` accept is
-/// exactly the open question. Until that is settled on glass, flipping the default would trade a
-/// known-working path for an unproven one. Opt in, measure, then decide.
+/// This was an opt-in knob for exactly one reason: the HID pad could not reach classic XInput, so
+/// defaulting to it would have traded a known-working path for an unproven one. **That objection is
+/// gone.** `pf_gamepad.inx`'s `pfGamepadXbox` section now attaches the `xinputhid` bus filter
+/// (`UpperFilters` + `DevicePropertyFlags=1`), and with it the HID pad is promoted exactly like real
+/// hardware: measured on `.173` 2026-08-09 it gains the `IG_00` token and an XUSB interface, classic
+/// XInput reads it live (full stick range and buttons), `XInputSetState` rumble round-trips, and it
+/// keeps everything the XUSB companion never had — Steam, SDL, RawInput, DirectInput, `joy.cpl`.
+/// ⇒ the HID backend is now a **superset** of the XUSB one, which is the condition the old comment
+/// set for flipping.
+///
+/// ⚠️ `xusb` stays as an escape hatch because the promotion depends on Microsoft's inbox
+/// `xinputhid.inf` and its hardware-id allow-list. If a Windows servicing update changes that, or a
+/// box has a third-party filter on the stack, one env var restores the previous behaviour without a
+/// reinstall.
 ///
 /// The two backends are mutually exclusive per pad by construction (one match arm or the other) —
 /// presenting both would hand a game two controllers for one pair of hands.
 #[cfg(target_os = "windows")]
 pub(super) fn windows_xbox_hid() -> bool {
-    std::env::var("PUNKTFUNK_XBOX_BACKEND")
-        .map(|v| v.trim().eq_ignore_ascii_case("hid"))
-        .unwrap_or(false)
+    match std::env::var("PUNKTFUNK_XBOX_BACKEND") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("xusb") => false,
+        // Anything else — unset, empty, "hid", or a typo — takes the default. A misspelled opt-out
+        // silently landing on the OLD path is the worse failure: it is invisible, and it is the
+        // path with no HID collection.
+        _ => true,
+    }
 }
 
 /// Resolve the client's gamepad-backend preference (the env/logging shell around

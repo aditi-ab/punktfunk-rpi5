@@ -1197,6 +1197,15 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Wire length of a v3 (envelope + impulse-trigger motors) rumble datagram — the v2 form plus a
+// `[u16 left_trigger LE][u16 right_trigger LE]` tail (see [`encode_rumble_datagram_v3`]). Second
+// use of the same append-extension the v2 tail introduced, and for the same reason: every reader
+// on this plane gates with `>=`, so a 14-byte datagram satisfies the v1 predicate (level only),
+// the v2 predicate (level + envelope) and this one, and each peer takes the prefix it knows.
+#define PUNKTFUNK_RUMBLE_V3_LEN 14
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
 // 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
 // 46–54 bytes; feature and output reports are at most 64).

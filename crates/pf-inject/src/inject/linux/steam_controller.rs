@@ -440,7 +440,8 @@ impl PadProto for SteamProto {
     fn service(&self, pad: &mut DeckTransport, _idx: u8) -> PadFeedback {
         let rumble = pad.service();
         PadFeedback {
-            rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: Vec::new(),
             // Rumble-plane liveness: a `0xEB` rumble command this poll. Steam Input drives this
             // pad over hidraw (the same abandonment semantics as the Windows Deck backend), so
@@ -570,7 +571,8 @@ impl PadProto for ScProto {
     fn service(&self, pad: &mut SteamDeckPad, _idx: u8) -> PadFeedback {
         let rumble = pad.service();
         PadFeedback {
-            rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: Vec::new(),
             // Rumble-plane liveness: the kernel registers no FF device for the classic SC, so
             // rumble only ever arrives from a hidraw writer (`0xEB`) — which is exactly the

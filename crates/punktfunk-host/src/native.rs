@@ -1452,9 +1452,14 @@ async fn serve_session(
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
         use punktfunk_core::quic::HidOutput;
-        // v2 envelope (seq 0, 400 ms TTL) so the loopback/probe assertion covers the self-
-        // terminating tail, not just the level.
-        let d = punktfunk_core::quic::encode_rumble_datagram_v2(0, 0x4000, 0x8000, 0, 400);
+        // v3 envelope (seq 0, 400 ms TTL, both impulse-trigger motors asserted) so the
+        // loopback/probe assertion covers the self-terminating tail AND the trigger tail behind
+        // it, not just the level. The trigger levels are deliberately DIFFERENT from each other
+        // and from the handles: a decoder that reads the wrong offset produces a plausible-looking
+        // number rather than a zero, so identical values would hide the mistake.
+        let d = punktfunk_core::quic::encode_rumble_datagram_v3(
+            0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000,
+        );
         let _ = conn.send_datagram(d.to_vec().into());
         for h in [
             HidOutput::Led {

@@ -686,7 +686,8 @@ impl PadProto for DsWinProto {
             // feed the abandoned-rumble force-off's activity clock (the historical unbounded
             // stuck-ON path, now doubly closed by the lossless report ring).
             rumble_drove: Some(fb.rumble.is_some()),
-            rumble: fb.rumble,
+            // No trigger motors on this protocol — see `PadFeedback::rumble`.
+            rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
             resync: fb.resync,
         }
@@ -995,14 +996,26 @@ mod drain_tests {
             "/../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx"
         );
         let inf = std::fs::read_to_string(inx).expect("read pf_gamepad.inx");
-        // The [Models] lines: `%DeviceDesc…%=pfGamepad, <hwid>[, <hwid>…]`.
+        // The [Models] lines: `%DeviceDesc…%=<InstallSection>, <hwid>[, <hwid>…]`.
+        //
+        // ⚠️ Match the install section by PREFIX, not by the exact string `pfGamepad,`. The Xbox
+        // line installs `pfGamepadXbox` — a section of its own, because that identity additionally
+        // attaches the `xinputhid` bus filter and the four PlayStation/Deck identities must not get
+        // it. An exact match silently stopped seeing the Xbox ids the moment that split happened,
+        // which is precisely the "this test went vacuous" failure the assert below guards against,
+        // except it failed loudly instead. Keep this tolerant of further per-identity sections.
         let declared: Vec<String> = inf
             .lines()
             .map(str::trim)
             .filter(|l| !l.starts_with(';'))
-            .filter_map(|l| l.split_once("=pfGamepad,"))
-            .flat_map(|(_, ids)| {
-                ids.split(',')
+            .filter_map(|l| l.split_once('='))
+            .filter(|(_, rhs)| rhs.trim_start().starts_with("pfGamepad"))
+            .flat_map(|(_, rhs)| {
+                // `pfGamepad[Suffix], <hwid>[, <hwid>…]` — drop the section name, keep the ids.
+                // `AddReg=pfGamepadXbox_HW_AddReg` reaches here too and contributes nothing,
+                // because it has no comma.
+                rhs.split(',')
+                    .skip(1)
                     .map(|id| id.trim().to_ascii_lowercase())
                     .collect::<Vec<_>>()
             })
@@ -1031,6 +1044,67 @@ mod drain_tests {
                  instead and the pad would never start"
             );
         }
+    }
+
+    /// The Xbox identity must install its OWN section, and the PlayStation/Deck identities must
+    /// not install that one.
+    ///
+    /// `pfGamepadXbox` attaches Microsoft's `xinputhid` as an upper filter and sets
+    /// `DevicePropertyFlags=1` (`BusDevice`), which is what makes Windows promote our Xbox pad —
+    /// it mints the `IG_00` token, registers an XUSB interface, and lets classic XInput and rumble
+    /// through. Applied to a DualSense, DualShock 4, Edge or Steam Deck it would hand a
+    /// PlayStation pad to Microsoft's **Xbox** translator, which claims the HID collection
+    /// exclusively and would take a working pad away from Steam and SDL.
+    ///
+    /// Merging the two sections back together is a one-line edit that looks like tidying and is
+    /// not, so assert the split rather than trusting a comment to survive.
+    #[test]
+    fn only_the_xbox_identity_installs_the_xinputhid_section() {
+        let inx = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx"
+        );
+        let inf = std::fs::read_to_string(inx).expect("read pf_gamepad.inx");
+        let xbox = super::super::xbox_windows::XBOX_HWID.to_ascii_lowercase();
+
+        let mut saw_xbox_model = false;
+        for line in inf.lines().map(str::trim).filter(|l| !l.starts_with(';')) {
+            let Some((_, rhs)) = line.split_once('=') else {
+                continue;
+            };
+            let rhs = rhs.trim_start();
+            let Some((section, ids)) = rhs.split_once(',') else {
+                continue;
+            };
+            if !section.starts_with("pfGamepad") {
+                continue;
+            }
+            let ids: Vec<String> = ids
+                .split(',')
+                .map(|i| i.trim().to_ascii_lowercase())
+                .collect();
+            let mentions_xbox = ids.iter().any(|i| i.contains(&xbox));
+            if mentions_xbox {
+                saw_xbox_model = true;
+                assert_ne!(
+                    section, "pfGamepad",
+                    "the Xbox model line installs the SHARED section, so the xinputhid filter \
+                     would be attached to every PlayStation and Deck pad too"
+                );
+            } else {
+                assert_eq!(
+                    section, "pfGamepad",
+                    "a non-Xbox model line ({ids:?}) installs {section:?}; if that section carries \
+                     the xinputhid filter, this pad is about to be handed to Microsoft's Xbox \
+                     translator"
+                );
+            }
+        }
+        assert!(
+            saw_xbox_model,
+            "no [Models] line mentions {xbox:?} — the parse went vacuous; fix it rather than \
+             deleting the assert"
+        );
     }
 
     /// The driver reads its HID identity back off the same hardware id — that mapping is what

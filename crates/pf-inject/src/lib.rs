@@ -500,7 +500,7 @@ pub mod gamepad {
             GamepadManager
         }
         pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
-        pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
+        pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16, u16, u16)) {}
     }
 }
 /// Linux: the "Punktfunk Pen" uinput virtual tablet (design/pen-tablet-input.md §5) — the

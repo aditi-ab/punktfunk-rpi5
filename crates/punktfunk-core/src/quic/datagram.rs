@@ -122,8 +122,9 @@ pub fn decode_audio_red_datagram(b: &[u8]) -> Option<(u32, u64, &[u8], Option<&[
 /// Legacy rumble datagram (v1), host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
 /// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop) as *level-triggered* state
 /// — it persists until superseded, which is why the host re-sends it periodically as its loss
-/// heal. New hosts emit the self-terminating [`encode_rumble_datagram_v2`] instead; this is kept
-/// for the loopback tests and as the wire an old host still speaks (a new client decodes both via
+/// heal. New hosts emit the self-terminating [`encode_rumble_datagram_v3`] instead; this is kept
+/// for the loopback tests, as the wire an old host still speaks, and as what the
+/// `PUNKTFUNK_RUMBLE_ENVELOPE=0` bisect hatch drops to (a new client decodes every form via
 /// [`decode_rumble_envelope`]).
 pub fn encode_rumble_datagram(pad: u16, low: u16, high: u16) -> [u8; 7] {
     let mut b = [0u8; 7];
@@ -141,6 +142,12 @@ pub const RUMBLE_V1_LEN: usize = 7;
 /// first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
 /// same dual-size idiom the HDR-luminance `AddRequest` tail uses.
 pub const RUMBLE_V2_LEN: usize = 10;
+/// Wire length of a v3 (envelope + impulse-trigger motors) rumble datagram — the v2 form plus a
+/// `[u16 left_trigger LE][u16 right_trigger LE]` tail (see [`encode_rumble_datagram_v3`]). Second
+/// use of the same append-extension the v2 tail introduced, and for the same reason: every reader
+/// on this plane gates with `>=`, so a 14-byte datagram satisfies the v1 predicate (level only),
+/// the v2 predicate (level + envelope) and this one, and each peer takes the prefix it knows.
+pub const RUMBLE_V3_LEN: usize = 14;
 
 /// Rumble envelope datagram (v2), host → client:
 /// `[0xCA][u16 pad LE][u16 low LE][u16 high LE][u8 seq][u16 ttl_ms LE]`.
@@ -163,6 +170,41 @@ pub fn encode_rumble_datagram_v2(pad: u16, low: u16, high: u16, seq: u8, ttl_ms:
     b
 }
 
+/// Rumble envelope datagram with the impulse-trigger motors (v3), host → client:
+/// `[0xCA][u16 pad LE][u16 low LE][u16 high LE][u8 seq][u16 ttl_ms LE][u16 lt LE][u16 rt LE]`.
+///
+/// The [`encode_rumble_datagram_v2`] envelope with the Xbox trigger motors appended, on the same
+/// `0..=0xFFFF` scale as `low`/`high` (design/trigger-rumble-plane.md §4).
+///
+/// **The four levels share ONE `seq` and ONE `ttl_ms`, deliberately.** They are a single statement
+/// of the pad's feedback state at one instant; a second sequence space would let a reordered
+/// datagram apply the handles from moment *t* and the triggers from *t−1*, a glitch nothing else
+/// in the system can currently produce. Sharing also means the whole v2 apparatus — the renewal
+/// cadence, the post-stop burst, the client's wrapping half-space `seq` gate, the receiver-side
+/// lease clamp — governs the trigger motors with no new code, so a trigger rumble whose host dies
+/// self-silences on the same lease as the handles.
+///
+/// Exactly one backend can ever source non-zero trigger levels: the Windows HID Xbox pad, whose
+/// output report `0x03` carries them. Classic XInput's `XINPUT_VIBRATION` and evdev's `FF_RUMBLE`
+/// have two members and no third, so every other producer passes `lt = rt = 0` — for those this is
+/// a v2 datagram with four zero bytes on the end, which is exactly what the length tolerance is
+/// for.
+pub fn encode_rumble_datagram_v3(
+    pad: u16,
+    low: u16,
+    high: u16,
+    seq: u8,
+    ttl_ms: u16,
+    lt: u16,
+    rt: u16,
+) -> [u8; RUMBLE_V3_LEN] {
+    let mut b = [0u8; RUMBLE_V3_LEN];
+    b[..RUMBLE_V2_LEN].copy_from_slice(&encode_rumble_datagram_v2(pad, low, high, seq, ttl_ms));
+    b[10..12].copy_from_slice(&lt.to_le_bytes());
+    b[12..14].copy_from_slice(&rt.to_le_bytes());
+    b
+}
+
 /// The self-termination tail of a v2 rumble envelope (see [`encode_rumble_datagram_v2`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RumbleEnvelope {
@@ -174,17 +216,28 @@ pub struct RumbleEnvelope {
 
 /// A decoded rumble update. `envelope` is `None` for a legacy 7-byte datagram (an old host, which
 /// has no seq/ttl — the client applies its own staleness policy), `Some` for a v2 envelope.
+///
+/// `left_trigger`/`right_trigger` are the Xbox impulse-trigger motors from a v3 datagram, on the
+/// same `0..=0xFFFF` scale as `low`/`high`, and they are **plain fields, not `Option`** even though
+/// only a v3 datagram carries them. A v1/v2 datagram decodes to `left_trigger = right_trigger = 0`.
+/// The temptation is to mirror `envelope` so a consumer could tell "old host" from "new host,
+/// triggers idle", but `Option` invites "absent → keep the previous value", and on a
+/// level-triggered plane that is the stuck-rumble bug in a new costume: `0xCA` means *these are the
+/// levels now*, so an absent field is zero. (`envelope` is genuinely optional because its absence
+/// selects a different *policy*, not a different level.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RumbleUpdate {
     pub pad: u16,
     pub low: u16,
     pub high: u16,
+    pub left_trigger: u16,
+    pub right_trigger: u16,
     pub envelope: Option<RumbleEnvelope>,
 }
 
-/// Parse a rumble datagram → `(pad, low, high)`, tolerating (and ignoring) a v2 envelope tail.
-/// `None` on bad tag/length. Kept for callers that only need the level (the probe, the loopback
-/// assertions); clients that honor TTL use [`decode_rumble_envelope`].
+/// Parse a rumble datagram → `(pad, low, high)`, tolerating (and ignoring) the v2 envelope and v3
+/// trigger tails. `None` on bad tag/length. Kept for callers that only need the handle level (the
+/// probe, the loopback assertions); clients that honor TTL use [`decode_rumble_envelope`].
 pub fn decode_rumble_datagram(b: &[u8]) -> Option<(u16, u16, u16)> {
     if b.len() < RUMBLE_V1_LEN || b[0] != RUMBLE_MAGIC {
         return None;
@@ -193,10 +246,15 @@ pub fn decode_rumble_datagram(b: &[u8]) -> Option<(u16, u16, u16)> {
     Some((u16at(1), u16at(3), u16at(5)))
 }
 
-/// Parse a rumble datagram → [`RumbleUpdate`], detecting the v2 envelope tail by length. A
-/// `>= RUMBLE_V2_LEN` buffer carries `seq`/`ttl_ms`; a 7..RUMBLE_V2_LEN buffer is a legacy level
+/// Parse a rumble datagram → [`RumbleUpdate`], detecting each appended tail by length. A
+/// `>= RUMBLE_V2_LEN` buffer carries `seq`/`ttl_ms`; a `>= RUMBLE_V3_LEN` buffer additionally
+/// carries the two impulse-trigger levels; a 7..RUMBLE_V2_LEN buffer is a legacy level
 /// (`envelope: None`) — the same tolerance as an old client would apply, so a torn/short tail
 /// degrades to a level rather than dropping. `None` on bad tag/length.
+///
+/// The one decoder for all three forms: v3 is not a separate wire, it is the same wire with more
+/// of it present. Absent trigger bytes read as zero rather than "unchanged" — see
+/// [`RumbleUpdate`] for why that is not negotiable on a level-triggered plane.
 pub fn decode_rumble_envelope(b: &[u8]) -> Option<RumbleUpdate> {
     if b.len() < RUMBLE_V1_LEN || b[0] != RUMBLE_MAGIC {
         return None;
@@ -206,10 +264,13 @@ pub fn decode_rumble_envelope(b: &[u8]) -> Option<RumbleUpdate> {
         seq: b[7],
         ttl_ms: u16::from_le_bytes([b[8], b[9]]),
     });
+    let triggers = b.len() >= RUMBLE_V3_LEN;
     Some(RumbleUpdate {
         pad: u16at(1),
         low: u16at(3),
         high: u16at(5),
+        left_trigger: if triggers { u16at(10) } else { 0 },
+        right_trigger: if triggers { u16at(12) } else { 0 },
         envelope,
     })
 }
@@ -1196,6 +1257,8 @@ mod tests {
                 pad: 2,
                 low: 0x4000,
                 high: 0x8000,
+                left_trigger: 0,
+                right_trigger: 0,
                 envelope: Some(RumbleEnvelope {
                     seq: 7,
                     ttl_ms: 400
@@ -1215,6 +1278,8 @@ mod tests {
                 pad: 3,
                 low: 0x1111,
                 high: 0x2222,
+                left_trigger: 0,
+                right_trigger: 0,
                 envelope: None,
             })
         );
@@ -1235,6 +1300,90 @@ mod tests {
         let mut wrong_tag = d;
         wrong_tag[0] = AUDIO_MAGIC;
         assert!(decode_rumble_envelope(&wrong_tag).is_none());
+    }
+
+    /// v3 (design/trigger-rumble-plane.md §4) is the v2 envelope with the two impulse-trigger
+    /// levels appended, and the prefix discipline the 0xCF plane uses three times over holds here
+    /// too: the first 10 bytes must be byte-identical to what v2 would have produced, or the
+    /// envelope a v2-era client reads is displaced and every TTL/seq guarantee on this plane
+    /// silently changes meaning.
+    #[test]
+    fn rumble_v3_roundtrips_and_keeps_the_v2_envelope_in_place() {
+        let v2 = encode_rumble_datagram_v2(2, 0x4000, 0x8000, 7, 400);
+        let v3 = encode_rumble_datagram_v3(2, 0x4000, 0x8000, 7, 400, 0x1234, 0xFFFF);
+        assert_eq!(v3.len(), RUMBLE_V3_LEN);
+        assert_eq!(&v3[..RUMBLE_V2_LEN], &v2[..], "v2 is a strict prefix of v3");
+        // The exact tail layout, LE, pinned as bytes: an endianness slip here reads a 0x1234
+        // trigger as 0x3412 and is invisible in a round-trip that uses the same encoder both ways.
+        assert_eq!(&v3[10..14], &[0x34, 0x12, 0xFF, 0xFF]);
+        assert_eq!(
+            decode_rumble_envelope(&v3),
+            Some(RumbleUpdate {
+                pad: 2,
+                low: 0x4000,
+                high: 0x8000,
+                left_trigger: 0x1234,
+                right_trigger: 0xFFFF,
+                envelope: Some(RumbleEnvelope {
+                    seq: 7,
+                    ttl_ms: 400
+                }),
+            })
+        );
+        // A trigger-only rumble (racing titles drive the triggers hard and the handles not at all)
+        // is expressible and survives the trip with the handles at rest.
+        let trig_only = encode_rumble_datagram_v3(0, 0, 0, 3, 400, 0x8000, 0);
+        let u = decode_rumble_envelope(&trig_only).unwrap();
+        assert_eq!((u.low, u.high), (0, 0));
+        assert_eq!((u.left_trigger, u.right_trigger), (0x8000, 0));
+        assert_eq!(u.envelope.unwrap().ttl_ms, 400);
+    }
+
+    /// Cross-version tolerance, both directions — the compatibility table in
+    /// design/trigger-rumble-plane.md §5, as code.
+    #[test]
+    fn rumble_v3_and_v2_parse_each_others_datagrams() {
+        let v3 = encode_rumble_datagram_v3(1, 0x1111, 0x2222, 9, 250, 0xAAAA, 0xBBBB);
+
+        // NEW host → OLD client: the v2-era readers see exactly what they saw before. The level
+        // decoder ignores both tails; the envelope decoder reads the same seq/ttl off bytes 7..10.
+        assert_eq!(decode_rumble_datagram(&v3), Some((1, 0x1111, 0x2222)));
+        assert_eq!(
+            decode_rumble_envelope(&v3).unwrap().envelope,
+            Some(RumbleEnvelope {
+                seq: 9,
+                ttl_ms: 250
+            })
+        );
+
+        // OLD host → NEW client: v1 and v2 decode with the triggers SILENT, not "unchanged".
+        for (form, d) in [
+            ("v1", encode_rumble_datagram(1, 0x1111, 0x2222).to_vec()),
+            (
+                "v2",
+                encode_rumble_datagram_v2(1, 0x1111, 0x2222, 9, 250).to_vec(),
+            ),
+        ] {
+            let u = decode_rumble_envelope(&d).unwrap();
+            assert_eq!(
+                (u.left_trigger, u.right_trigger),
+                (0, 0),
+                "{form} must decode to idle triggers"
+            );
+            assert_eq!((u.pad, u.low, u.high), (1, 0x1111, 0x2222));
+        }
+
+        // A torn trigger tail (11..14 bytes — the host never emits these, a truncating middlebox
+        // might) degrades to the v2 decode rather than reading half a level: a 13-byte buffer must
+        // not surface `rt` from one byte of it.
+        let v2 = decode_rumble_envelope(&encode_rumble_datagram_v2(1, 0x1111, 0x2222, 9, 250));
+        for n in RUMBLE_V2_LEN..RUMBLE_V3_LEN {
+            assert_eq!(
+                decode_rumble_envelope(&v3[..n]),
+                v2,
+                "partial trigger tail ({n} B) must degrade to the v2 decode"
+            );
+        }
     }
 
     #[test]
