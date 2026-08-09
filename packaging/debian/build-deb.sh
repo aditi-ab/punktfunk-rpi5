@@ -294,16 +294,23 @@ if [ "$1" = "configure" ]; then
     # primitive that must not ride on the group users are told to join for gamepads
     # (security-review 2026-08-05 M-4).
     getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
-    # CAP_SYS_NICE — the GPU-scheduling grant. PyroWave encodes on the shader cores a game
-    # saturates, and the driver gates the elevated global-priority Vulkan queue that fixes it on
-    # this capability: measured 2026-08-08 on an RTX 5070 Ti, WITHOUT it every priority class is
-    # refused and WITH it the encoder is granted REALTIME first try (RADV behaves the same).
-    # Without this line the knob exists and does nothing. Narrow: it permits raising scheduling
-    # priority only — no filesystem, network or user-switching privilege, and no setuid. Note a
-    # capability-carrying binary is AT_SECURE, so the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
-    # it and core dumps are suppressed by default. Best-effort: a box without libcap, or a
-    # filesystem that cannot store capabilities, just runs at default priority as before.
-    setcap 'cap_sys_nice=ep' /usr/bin/punktfunk-host 2>/dev/null || true
+    # NO capability on the host binary — and an active removal of the one 0.26.0-1 granted here.
+    #
+    # 0.26.0-1 ran `setcap cap_sys_nice=ep` at this point for the GPU-priority lever, and that broke
+    # desktop streaming on every KDE box. KWin advertises its restricted protocols
+    # (zkde_screencast_unstable_v1 for the virtual output, org_kde_kwin_fake_input for input) only
+    # to a client it can IDENTIFY, by resolving that client's /proc/<pid>/exe and matching it
+    # against an installed .desktop's Exec=. The kernel refuses that readlink to any reader whose
+    # effective set is not a superset of the target's PERMITTED set (cap_ptrace_access_check), and
+    # KWin holds no capabilities — so a capability here makes the host unidentifiable and the
+    # session dies with "KWin does not expose zkde_screencast_unstable_v1 to this client". Full
+    # matrix (and why PR_SET_DUMPABLE and AmbientCapabilities= both fail to rescue it) in
+    # packaging/arch/punktfunk-host.install.
+    #
+    # Costs pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a class is refused.
+    # postinst runs on upgrade too, so this heals boxes that installed 0.26.0-1. `setcap -r` exits
+    # non-zero on a file that has no capability, hence the redirect and `|| true`.
+    setcap -r /usr/bin/punktfunk-host 2>/dev/null || true
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true

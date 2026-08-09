@@ -130,28 +130,35 @@ SYSEXT_VERSION_ID=$PF_VR
 EXTENSION_RELOAD_MANAGER=1
 EOF
 
-# CAP_SYS_NICE on the host binary — the GPU-scheduling grant. PyroWave encodes on the GPU shader
-# cores a game saturates, and the driver gates the elevated global-priority Vulkan queue that fixes
-# it on this capability (measured 2026-08-08 on an RTX 5070 Ti: refused without it, granted REALTIME
-# with it; RADV the same). Narrow — scheduling priority only, no filesystem/network privilege, not
-# setuid.
+# NO CAP_SYS_NICE in the image — and an assertion that none crept back in.
 #
-# It has to be applied HERE, not in the merge hook: a merged sysext's /usr is a read-only squashfs,
-# so nothing can setcap it afterwards. And it cannot ride in from the RPM either — the spec declares
-# it with %caps, but rpm stores capabilities in its own header and `rpm2cpio | cpio` carries only
-# the payload, so the staged file arrives with no capability at all. mksquashfs DOES record
-# security.capability (only security.selinux is excluded below), so a setcap on the staging tree is
-# what ends up in the image.
+# 0.26.0-1 setcap'd the staged binary here for the GPU-priority lever. mksquashfs records
+# security.capability, so the capability really did ship: verified by mounting the published
+# punktfunk-0.26.0-1-x86-64.raw, where `getcap usr/bin/punktfunk-host` reports `cap_sys_nice=ep`.
+# That broke desktop streaming on every Bazzite KDE box, field-reported as
+# "KWin does not expose zkde_screencast_unstable_v1 to this client".
 #
-# Needs CAP_SETFCAP, i.e. root (or fakeroot) — a plain-user CI build cannot do it. That is not fatal:
-# the image just ships as it does today and the encode runs at default GPU priority, so warn and
-# carry on rather than fail a release build over a performance lever.
-if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
-  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-host" 2>/dev/null; then
-    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-host (GPU-priority lever active)"
-  else
-    echo "WARNING: could not setcap CAP_SYS_NICE (need root/CAP_SETFCAP) — the image will ship" >&2
-    echo "         without it and PyroWave will encode at default GPU priority." >&2
+# KWin advertises its restricted protocols (zkde_screencast_unstable_v1 for the virtual output,
+# org_kde_kwin_fake_input for input) only to a client it can IDENTIFY, by resolving that client's
+# /proc/<pid>/exe and matching it against an installed .desktop's Exec= — the image ships
+# usr/share/applications/io.unom.Punktfunk.Host.desktop for exactly that. The kernel refuses that
+# readlink to any reader whose effective set is not a superset of the target's PERMITTED set
+# (cap_ptrace_access_check), and KWin holds no capabilities. So a capability in this image makes the
+# host unidentifiable and every Desktop-mode session dies. Full matrix, including why neither
+# prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it, in
+# packaging/arch/punktfunk-host.install.
+#
+# A merged sysext's /usr is a read-only squashfs, so this cannot be repaired on the box — the image
+# is the only place it can be got right. Assert it rather than trust it: the RPM payload arrives via
+# `rpm2cpio | cpio`, which carries no capabilities today, but the spec is one `%caps()` away from
+# changing that and this build would silently bake it in.
+if [ -f "$STAGE/usr/bin/punktfunk-host" ] && command -v getcap >/dev/null 2>&1; then
+  staged_caps="$(getcap "$STAGE/usr/bin/punktfunk-host" 2>/dev/null || true)"
+  if [ -n "$staged_caps" ]; then
+    echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
+    echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
+    echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
+    exit 1
   fi
 fi
 

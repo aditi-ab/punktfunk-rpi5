@@ -477,15 +477,28 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %files
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md packaging/README.md
-# CAP_SYS_NICE — the GPU-scheduling grant, declared the RPM-native way so rpm applies it at
-# install, restores it on upgrade, and VERIFIES it (a plain %post setcap does none of those).
-# PyroWave encodes on the shader cores a game saturates; the elevated global-priority Vulkan queue
-# that fixes it is gated on this capability. Measured 2026-08-08 on an RTX 5070 Ti: without it
-# every priority class is refused, with it the encoder gets REALTIME first try (RADV the same).
-# Narrow — scheduling priority only, no filesystem/network/user-switching privilege, not setuid.
-# Consequences: the binary becomes AT_SECURE, so the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
-# it, and core dumps are suppressed by default.
-%caps(cap_sys_nice=ep) %{_bindir}/punktfunk-host
+# NO %caps() on the host binary. 0.26.0-1 declared `%caps(cap_sys_nice=ep)` here for the
+# GPU-priority lever and that BROKE DESKTOP STREAMING ON EVERY KDE BOX — on Fedora and, via
+# rpm-ostree layering, on Bazzite, where it was field-reported as
+# "KWin does not expose zkde_screencast_unstable_v1 to this client".
+#
+# KWin hands out its restricted Wayland protocols (zkde_screencast_unstable_v1 for the virtual
+# output, org_kde_kwin_fake_input for input) only to a client it can IDENTIFY, by resolving that
+# client's /proc/<pid>/exe and matching it against an installed .desktop's Exec= — ours is the
+# io.unom.Punktfunk.Host.desktop installed below. The kernel refuses that readlink to any reader
+# whose effective set is not a superset of the target's PERMITTED set (cap_ptrace_access_check),
+# and KWin holds no capabilities. So a capability here makes the host unidentifiable: KWin's
+# executablePath() is empty, no .desktop can match, and the globals are never advertised.
+# Measured on kernel 7.1.6 — see packaging/arch/punktfunk-host.install for the full matrix, incl.
+# why neither prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it.
+#
+# The cost of not having it is pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a
+# priority class is refused, and pf-frame's thread nice is a best-effort no-op. That is exactly
+# how 0.25.0 behaved, which is the behaviour that worked.
+#
+# rpm applies file capabilities from package metadata, so a package built WITHOUT %caps() installs
+# the binary with none and an upgrade from 0.26.0-1 clears it — no scriptlet needed.
+%{_bindir}/punktfunk-host
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %dir %{_libexecdir}/punktfunk

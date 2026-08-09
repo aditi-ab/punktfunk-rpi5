@@ -356,25 +356,25 @@ in
         allowedUDPPorts = nativeUDP ++ optionals cfg.host.gamestream gamestreamUDP;
       };
 
-      # CAP_SYS_NICE — the GPU-scheduling grant. PyroWave encodes on the GPU shader cores a game
-      # saturates; the elevated global-priority Vulkan queue that fixes it is gated on this
-      # capability (measured 2026-08-08, RTX 5070 Ti: without it EVERY priority class is refused,
-      # with it the encoder gets REALTIME on the first attempt; RADV behaves the same).
+      # NO CAP_SYS_NICE wrapper here — deliberately. 0.26.0-1 gave the host a
+      # `security.wrappers.punktfunk-host` carrying `cap_sys_nice=ep` for the GPU-priority lever,
+      # and that broke desktop streaming on every KDE box.
       #
-      # NixOS cannot `setcap` a store path — it is read-only and shared — so this goes through
-      # `security.wrappers`, which builds a small setcap'd wrapper in /run/wrappers/bin. The unit's
-      # ExecStart points at the wrapper below; everything else about the host is unchanged.
+      # KWin advertises its restricted Wayland protocols (zkde_screencast_unstable_v1 for the
+      # virtual output, org_kde_kwin_fake_input for input) only to a client it can IDENTIFY, by
+      # resolving that client's /proc/<pid>/exe and matching it against an installed .desktop's
+      # Exec= (packages.nix substitutes ours to the store path). The kernel refuses that readlink to
+      # any reader whose effective set is not a superset of the target's PERMITTED set
+      # (cap_ptrace_access_check), and KWin holds no capabilities.
       #
-      # Narrow: CAP_SYS_NICE permits raising scheduling priority only — no filesystem, network or
-      # user-switching privilege, and the wrapper is capability-based, NOT setuid. Two side effects
-      # to know: the wrapped binary is AT_SECURE (the loader ignores LD_LIBRARY_PATH/LD_PRELOAD for
-      # it) and core dumps are suppressed by default.
-      security.wrappers.punktfunk-host = {
-        source = "${cfg.host.package}/bin/punktfunk-host";
-        capabilities = "cap_sys_nice=ep";
-        owner = "root";
-        group = "root";
-      };
+      # A NixOS wrapper does not dodge this. It raises the capability into its AMBIENT set before
+      # exec'ing the store binary, precisely so the capability survives — which lands CAP_SYS_NICE
+      # in the exec'd process's permitted set and fails the readlink identically. Measured: an
+      # ambient-only grant (dumpable=1, CapPrm set) is refused exactly like a file capability. See
+      # packaging/arch/punktfunk-host.install for the full matrix.
+      #
+      # Costs pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a priority class is
+      # refused, and pf-frame's thread nice is a best-effort no-op — 0.25.0's behaviour exactly.
 
       systemd.user.services.punktfunk-host = {
         description = "punktfunk GameStream + punktfunk/1 streaming host";
@@ -394,12 +394,12 @@ in
         # PUNKTFUNK_GAMESCOPE_BIN so an operator's own override of that env still wins.
         ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
         serviceConfig = {
-          # Through the wrapper (see `security.wrappers.punktfunk-host` above), NOT the store path
-          # directly — the store path carries no capability and the GPU-priority lever would be
-          # inert. `config.security.wrapperDir` rather than a hard-coded /run/wrappers/bin so an
-          # operator who has moved it is still correct.
+          # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
+          # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is
+          # what lets KWin identify the host and grant it the screencast/fake-input protocols (see
+          # the note above the firewall block).
           ExecStart =
-            "${config.security.wrapperDir}/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
+            "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
           Restart = "on-failure";
           RestartSec = 2;
           EnvironmentFile =

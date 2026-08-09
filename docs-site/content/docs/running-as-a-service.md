@@ -207,33 +207,41 @@ a Windows host, run `punktfunk-host service status` from an elevated prompt on t
 
 ## GPU scheduling priority
 
-The Linux packages give the host binary one Linux capability, `CAP_SYS_NICE`, and it is worth
-knowing why it is there and how to take it away.
+The host binary carries **no Linux capability**, and on a KDE desktop it must not.
 
 The [PyroWave](/docs/pyrowave) codec encodes on the same GPU shader cores your game is using, so a
 demanding game can crowd it out and the stream's frame rate drops with it. The fix is to ask the
 driver to schedule the encode ahead of the game, and every driver we tested gates that request on
-this capability: without it the request is simply refused and nothing changes. The other codecs use
-a separate video engine on the GPU and are unaffected either way.
+`CAP_SYS_NICE`. Version 0.26.0-1 granted it for that reason — and it broke desktop streaming on
+every KDE box, so 0.26.0-2 takes it away again. The other codecs use a separate video engine on the
+GPU and were never affected.
 
-`CAP_SYS_NICE` lets a process raise its own scheduling priority. It grants no access to files,
-the network or other users' processes, and it is **not** the same as running as root — the host
-still runs as you, under your user session.
+The two cannot coexist. To hand the host its virtual display, KWin first has to work out *which*
+program is asking, which it does by reading the connecting process's `/proc/<pid>/exe` and matching
+it against the `.desktop` file the packages install. Linux refuses that read for any process holding
+a capability the reader does not also hold — and KWin holds none. So a host with `CAP_SYS_NICE` is a
+host KWin cannot identify, and every session fails with:
 
-To check, or to take it away:
-
-```sh
-getcap /usr/bin/punktfunk-host          # shows cap_sys_nice=ep when granted
-sudo setcap -r /usr/bin/punktfunk-host  # remove it; streaming still works
+```
+KWin virtual output failed: KWin does not expose zkde_screencast_unstable_v1 to this client
 ```
 
-Removing it costs you nothing unless you stream PyroWave, and you can also just set
-`PYROWAVE_QUEUE_PRIORITY=off` to stop the host asking. Note that a package update replaces the
-binary and re-applies the capability.
+which looks exactly like a missing `.desktop` file and cannot be fixed by reinstalling. Moving the
+grant into the systemd unit does not help either — same capability, same refused read.
 
-Two side effects, if you are debugging the host: a binary carrying a capability is treated as
-security-sensitive by the dynamic loader, so `LD_LIBRARY_PATH` and `LD_PRELOAD` are ignored for it,
-and it does not write core dumps by default.
+If you are on 0.26.0-1, update. On the Bazzite image the `/usr` is read-only, so the only repair is
+the next image (`sudo punktfunk-sysext update`). Elsewhere you can clear it by hand:
+
+```sh
+getcap /usr/bin/punktfunk-host          # prints nothing when correct
+sudo setcap -r /usr/bin/punktfunk-host  # clear it, then restart the host
+```
+
+Losing the capability costs frame pacing under a GPU-bound game and nothing else — the host asks for
+the elevated priority, is refused, and encodes at the normal one. `PYROWAVE_QUEUE_PRIORITY=off`
+stops it asking at all. If you stream only with gamescope (Steam Gaming Mode) you can grant the
+capability yourself and keep the pacing, at the cost of desktop streaming; gamescope has no such
+identity check.
 
 ## Stopping and removing
 

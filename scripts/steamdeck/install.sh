@@ -344,24 +344,23 @@ if [ "$SUDO_OK" = 1 ]; then
         warn "(everything else works; the pad arrives as a generic Xbox 360 controller). By hand:"
         warn "  sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
     fi
-    # CAP_SYS_NICE on the host binary — the GPU-scheduling grant, and the Deck is the box that
-    # needs it most: a Van Gogh APU shares one small GPU between the game and PyroWave's encode
-    # dispatch. The driver gates the elevated global-priority Vulkan queue on this capability
-    # (measured 2026-08-08 on an RTX 5070 Ti: refused without it, granted REALTIME with it; RADV
-    # behaves the same), so without this the knob exists and does nothing.
+    # NO CAP_SYS_NICE on the host binary — and a removal of the one 0.26.0-1 granted here.
     #
-    # The binary lives under $HOME, not /usr — so unlike the /etc drop-ins above this survives a
-    # SteamOS A/B update on its own and needs no atomic-keep entry. It DOES need re-applying after
-    # every rebuild, because a fresh binary is a new inode; re-running this installer does that.
+    # 0.26.0-1 setcap'd this binary for the GPU-priority lever, which on a Van Gogh APU is a real
+    # win. It also broke Desktop-mode streaming outright. Just above, this installer writes
+    # ~/.local/share/applications/io.unom.Punktfunk.Host.desktop with Exec=$BIN so KWin will grant
+    # the host its restricted protocols — and KWin makes that grant by resolving the client's
+    # /proc/<pid>/exe and matching it against that Exec=. The kernel refuses that readlink to any
+    # reader whose effective set is not a superset of the target's PERMITTED set
+    # (cap_ptrace_access_check), and KWin holds no capabilities. So the capability silently voided
+    # the .desktop written six lines earlier, and every Desktop-mode session died with
+    # "KWin does not expose zkde_screencast_unstable_v1 to this client". Gaming Mode (gamescope) is
+    # unaffected — it has no such gate. Full matrix in packaging/arch/punktfunk-host.install.
     #
-    # Narrow (scheduling priority only, no filesystem/network privilege, not setuid) and
-    # best-effort — a failure just means the encode runs at default priority as it does today.
+    # Costs pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a class is refused.
+    # `setcap -r` exits non-zero on a file that has no capability, hence the redirect.
     if [ -x "$BIN" ]; then
-        if sudo setcap 'cap_sys_nice=ep' "$BIN" 2>/dev/null; then
-            ok "granted CAP_SYS_NICE (PyroWave encode can outrank a GPU-bound game)"
-        else
-            warn "could not grant CAP_SYS_NICE to $BIN — PyroWave encode stays at default GPU priority"
-        fi
+        sudo setcap -r "$BIN" 2>/dev/null || true
     fi
     # SteamOS A/B updates rebuild /etc and DROP everything not on Valve's keep list — verified
     # live: an OS update stripped the udev rule + vhci autoload + UDP sysctl (gamepads silently
