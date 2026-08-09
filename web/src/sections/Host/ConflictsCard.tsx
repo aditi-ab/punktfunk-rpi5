@@ -28,7 +28,7 @@ export const ConflictsCard: FC = () => {
 	if (conflicts.length === 0) return null;
 	return (
 		<Card className="border-amber-600/40 dark:border-amber-500/40">
-			<CardContent className="flex items-start gap-3 p-card pt-card sm:pt-card">
+			<CardContent className="flex items-start gap-3">
 				<AlertTriangle className="mt-0.5 size-5 shrink-0 text-amber-600 dark:text-amber-500" />
 				<div className="min-w-0 flex-1 space-y-2">
 					<p className="text-sm font-medium text-amber-600 dark:text-amber-500">

@@ -27,13 +27,37 @@ const Card = ({
 );
 Card.displayName = "Card";
 
+/**
+ * The card inset, as ONE utility.
+ *
+ * It used to be `p-4 sm:p-6`, and that responsive pair is what made every padding override in this
+ * codebase unreliable: tailwind-merge resolves conflicts only *within* a variant, so a call-site
+ * `pt-6` beat the base `pt-0` and lost to `sm:pt-0` — correct on mobile, zero on desktop. Seven call
+ * sites had grown their own compensation for that in five different dialects.
+ *
+ * A single-variant token cannot half-lose. `--spacing-padding-card` is also what @unom/ui's own
+ * `Card` uses, so nested cards finally agree on their inset.
+ */
+const INSET = "p-padding-card";
+
+/**
+ * Body/footer padding, minus the top when something already sits above.
+ *
+ * The old code hard-coded `pt-0` because "a CardHeader supplies the top inset" — an assumption about
+ * a SIBLING that nothing enforced. Delete the header (exactly what tabbing a page does, since the
+ * tab label replaces the card title) and the top inset silently vanished at ≥640px. Asking the DOM
+ * instead of the author makes it self-correcting: first child keeps its inset, later children drop
+ * it.
+ */
+const INSET_AFTER_SIBLING = `${INSET} [&:not(:first-child)]:pt-0`;
+
 const CardHeader = React.forwardRef<
 	HTMLDivElement,
 	React.HTMLAttributes<HTMLDivElement>
 >(({ className, ...props }, ref) => (
 	<div
 		ref={ref}
-		className={cn("flex flex-col space-y-1.5 p-4 sm:p-6", className)}
+		className={cn("flex flex-col space-y-1.5", INSET, className)}
 		{...props}
 	/>
 ));
@@ -67,11 +91,12 @@ CardDescription.displayName = "CardDescription";
  * Card body. Pass `flush` for content that should meet the card's edges — a full-bleed table, most
  * commonly — instead of trying to cancel the padding from the outside.
  *
- * `className="p-0"` does NOT work for that: tailwind-merge only resolves conflicts *within the same
- * variant*, so `p-0` cancels `p-4` but leaves `sm:p-6` standing, and the padding silently returns at
- * ≥640px. Every call site that tried it ended up with a doubled inset once a `CardHeader` (which
- * brings its own `sm:p-6`) was nested inside — visible as one card whose title sits 24px further in
- * than its neighbours'.
+ * Do NOT reach for `className="p-0"`: `flush` exists precisely so that intent is expressed as a prop
+ * the component honours, rather than as a utility that has to out-argue the one already there.
+ *
+ * Conversely, you no longer need to ADD top padding when there is no header — that is automatic now.
+ * If you find yourself writing `pt-*` on a CardContent, the layout is telling you something else is
+ * wrong.
  */
 const CardContent = React.forwardRef<
 	HTMLDivElement,
@@ -79,7 +104,7 @@ const CardContent = React.forwardRef<
 >(({ className, flush = false, ...props }, ref) => (
 	<div
 		ref={ref}
-		className={cn(!flush && "p-4 pt-0 sm:p-6 sm:pt-0", className)}
+		className={cn(!flush && INSET_AFTER_SIBLING, className)}
 		{...props}
 	/>
 ));
@@ -91,7 +116,7 @@ const CardFooter = React.forwardRef<
 >(({ className, ...props }, ref) => (
 	<div
 		ref={ref}
-		className={cn("flex items-center p-4 pt-0 sm:p-6 sm:pt-0", className)}
+		className={cn("flex items-center", INSET_AFTER_SIBLING, className)}
 		{...props}
 	/>
 ));

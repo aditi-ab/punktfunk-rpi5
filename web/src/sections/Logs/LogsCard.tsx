@@ -238,13 +238,10 @@ export const LogsCard: FC<{
 
 	return (
 		<Card>
-			{/* This card has no CardHeader, so it has to put the top padding back itself — and it
-			    must do so at BOTH breakpoints. `CardContent` is `p-4 pt-0 sm:p-6 sm:pt-0`, and
-			    tailwind-merge only resolves conflicts within the same variant: a bare `pt-6` cancels
-			    `pt-0` but leaves `sm:pt-0` standing, so the padding was 24px on a phone and 0 on a
-			    desktop, with the filter row touching the card's edge. (Same trap the `p-0` note in
-			    components/ui/card.tsx describes, in the other direction.) */}
-			<CardContent className="flex flex-col gap-3 pt-4 sm:pt-6">
+			{/* No CardHeader here, and that no longer needs saying: CardContent keeps its top inset
+			    unless something precedes it. This card used to restore it by hand at both
+			    breakpoints. */}
+			<CardContent className="flex flex-col gap-3">
 				<div className="flex flex-wrap items-center gap-2">
 					<div className="flex items-center gap-1">
 						{LEVELS.map((l) => (

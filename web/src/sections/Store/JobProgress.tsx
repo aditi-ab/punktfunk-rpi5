@@ -55,7 +55,7 @@ export const JobProgressSection: FC<{
 		if (!job.isError) return null;
 		return (
 			<Card className="ring-2 ring-destructive/60">
-				<CardContent className="flex items-start gap-3 p-card pt-card sm:pt-card">
+				<CardContent className="flex items-start gap-3">
 					<XCircle className="mt-0.5 size-5 shrink-0 text-destructive" />
 					<div className="min-w-0 flex-1">
 						<p className="text-sm font-medium">{m.store_job_lost()}</p>
@@ -92,7 +92,7 @@ export const JobProgressCard: FC<{
 			className={failed ? "ring-2 ring-destructive/60" : undefined}
 			aria-live="polite"
 		>
-			<CardContent className="space-y-3 p-card pt-card sm:pt-card">
+			<CardContent className="space-y-3">
 				<div className="flex items-start gap-3">
 					{running ? (
 						<Spinner className="mt-0.5 size-5 shrink-0" />

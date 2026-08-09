@@ -135,7 +135,7 @@ export const PairedDevices: FC<{
 			<h2 className="text-lg font-medium">{m.pairing_native_devices()}</h2>
 		</CardHeader>
 
-		<CardContent className="p-6">
+		<CardContent>
 			<QueryState isLoading={isLoading} error={error} refetch={refetch}>
 				{rows.length === 0 ? (
 					m.pairing_native_empty()
