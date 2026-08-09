@@ -46,6 +46,9 @@ members = [
 exclude = [
     "packaging/linux/steam-deck-gadget/usbip-poc",
     "clients/android/native/vendor/ndk",
+    # Bring-your-own-hardware measurement tool: pulls `hidapi`, a C library wanting libudev on
+    # Linux, which has no place in `cargo build --workspace` or on a CI leg with no pad attached.
+    "tools/hid-descriptor-dump",
 ]
 
 # ndk 0.9.0 verbatim from crates.io plus ONE visibility change (and two warning fixes — an

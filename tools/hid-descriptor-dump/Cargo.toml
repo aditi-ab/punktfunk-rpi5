@@ -1,0 +1,27 @@
+# Capture a real HID device's report descriptor and decode it into something diffable against the
+# blobs `packaging/windows/drivers/pf-gamepad/src/lib.rs` serves. Every descriptor we ship must be
+# CAPTURED, not constructed (see that file's provenance warning, and the three bugs a constructed
+# one already cost us) — this is the tool that captures them.
+#
+# Deliberately NOT a workspace member (see the root `Cargo.toml` `exclude` list): it pulls `hidapi`,
+# a C library needing libudev on Linux, which we do not want in `cargo build --workspace` or on any
+# CI leg. It is a bring-your-own-hardware measurement tool — build it standalone on the box that has
+# the pad:
+#
+#     cargo run --manifest-path tools/hid-descriptor-dump/Cargo.toml -- --list
+#
+# Stands alone. Without this, cargo walks up, finds the repo's `[workspace]` and refuses to build a
+# package that root does not list as a member.
+[workspace]
+
+[package]
+name = "hid-descriptor-dump"
+description = "Capture and decode a real HID device's report descriptor, for diffing against the ones we synthesize"
+version = "0.26.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+hidapi = "2.6"

@@ -286,11 +286,31 @@ static DECK_RDESC: [u8; 38] = [
 // report laid out differently from the real device, every control silently lands on the wrong
 // action — the same class of bug this whole change exists to kill.
 //
-// **Before shipping: capture the report descriptor from a real Xbox Wireless Controller over
-// Bluetooth and diff it against this.** Recipe: pair the pad, then read
-// `HKLM\SYSTEM\CurrentControlSet\Enum\BTHENUM\...\Device Parameters` or use a HID monitor;
-// `hidapi`'s `hidapi-hidtest` and Linux `/sys/class/hidraw/hidrawN/device/report_descriptor` both
-// dump it directly. Replace this blob and re-run the `xbox_proto` layout tests.
+// ⭐ **2026-08-09 — THE CAPTURE NOW EXISTS AND THIS BLOB DISAGREES WITH IT.** A real Xbox Elite
+// Series 2 (`045E:0B22`, Bluetooth LE) was captured on `.173` with `tools/hid-descriptor-dump`; the
+// dump, its provenance and the DualSense control that validates the tool are in
+// `tools/hid-descriptor-dump/captures/`. Re-take it any time with `--vid 045E --pid 0B22`, and
+// decode THIS array through the same decoder — no hardware needed — with:
+//
+//     hid-descriptor-dump --rust-source packaging/windows/drivers/pf-gamepad/src/lib.rs \
+//                         --symbol XBOX_RDESC
+//
+// Four differences, and the ORDER one is the dangerous one:
+//   * the real pad's game-controller report is **UNNUMBERED** (15 bytes of fields, no report id);
+//     this one declares Report ID 1;
+//   * it carries **ONE combined 16-bit `Z`** trigger axis at byte 8, not two Simulation-page axes;
+//   * it declares **16 buttons at byte 10, BEFORE the hat** — this one puts 15 buttons AFTER it;
+//   * neither has an OUTPUT collection, so the rumble gap is real on both.
+//
+// 🛑 **Do NOT simply paste the capture over this array.** Two blockers, recorded in
+// `design/xbox-pad-windows-handoff.md` §3.3: (1) it is unverified whether Windows' view equals the
+// pad's NATIVE report map — `xinputhid` filters that pad and the captured shape is the legacy
+// DirectInput view, so cross-check on Linux hidraw first; (2) **the real descriptor has no Feature
+// report, and we cannot ship without one** — `0x85` is the sealed channel's proof transport, and
+// report ids are all-or-nothing, so declaring it forces a numbered input report the real pad does
+// not have. Matching the hardware byte for byte and keeping the sealed channel as it stands are
+// mutually exclusive; that needs a decision, not a paste. Whatever lands, re-run `xbox_proto`'s
+// layout tests — they pin these offsets on the host side.
 //
 // ⚠️ The trailing vendor-defined Feature report `0x85` is NOT cosmetic and must not be trimmed as
 // "unused": it is the CHANNEL PROOF transport (`ProofTransport::HidFeatureReport`). The captured
