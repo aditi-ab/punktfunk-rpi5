@@ -47,7 +47,7 @@ pf_gamepad.dll=1
 %DeviceDescDS4%=pfGamepad, pf_dualshock4
 %DeviceDescEdge%=pfGamepad, pf_dualsenseedge
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
-%DeviceDescXbox%=pfGamepad, pf_xboxwireless
+%DeviceDescXbox%=pfGamepad, root\pf_xboxwireless, pf_xboxwireless
 
 [pfGamepad.NT]
 CopyFiles=UMDriverCopy
