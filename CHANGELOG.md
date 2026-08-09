@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.26.0
 
-47 commits since v0.25.0.
+52 commits since v0.25.0.
 
 ### Versions
 
