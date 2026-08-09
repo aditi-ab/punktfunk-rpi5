@@ -599,6 +599,15 @@ pub struct PyroWaveEncoder {
     /// Session-fixed negotiated chroma: 4:4:4 = full-res RG8 chroma plane + per-pixel CSC
     /// (`rgb2yuv444.comp`) + `Chroma444` pyrowave objects.
     chroma444: bool,
+    /// What the global-priority ladder in `open_inner` actually produced, kept so it can be
+    /// REPORTED rather than only logged. `punktfunk-encode-worker` sends it back to the host in
+    /// its handshake, which is the process that owns the log pipeline and knows which binary to
+    /// name — see [`super::worker::PriorityOutcome`].
+    priority: super::worker::PriorityOutcome,
+    /// `VkPhysicalDeviceProperties::deviceName` of the device this encoder opened. Sanity for the
+    /// same handshake: on a multi-GPU host, "which GPU is the worker on" is otherwise invisible
+    /// from the host process.
+    device_name: String,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
     /// `PUNKTFUNK_PERF`: the synchronous encode's own duration, which is the quantity the
@@ -679,6 +688,18 @@ impl PyroWaveEncoder {
         );
     }
 
+    /// What the global-priority ladder produced for this encoder — the quantity
+    /// `punktfunk-encode-worker` reports back so the host can log the grant (or the INERT refusal)
+    /// once, naming the right binary.
+    pub(crate) fn priority_outcome(&self) -> super::worker::PriorityOutcome {
+        self.priority
+    }
+
+    /// The Vulkan device this encoder opened on.
+    pub(crate) fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn open(
         width: u32,
         height: u32,
@@ -686,7 +707,54 @@ impl PyroWaveEncoder {
         bitrate_bps: u64,
         chroma: crate::ChromaFormat,
     ) -> Result<Self> {
-        if !chroma.is_444() && (width % 2 != 0 || height % 2 != 0) {
+        // The in-process path reads the intent from ITS OWN environment, exactly as it always
+        // has, and owns the INERT warn. (`punktfunk-encode-worker` takes both from its parent —
+        // see `open_in_worker`.)
+        let intent = std::env::var("PYROWAVE_QUEUE_PRIORITY").ok();
+        Self::open_checked(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            chroma.is_444(),
+            intent.as_deref(),
+            true,
+        )
+    }
+
+    /// [`Self::open`] as `punktfunk-encode-worker` runs it.
+    ///
+    /// Two things differ, and only two — the encoder itself is opened by the identical code path,
+    /// which is what keeps the worker/in-process A/B honest:
+    ///
+    /// * `intent` arrives **explicitly** from the host's handshake rather than from this process's
+    ///   environment (which the worker strips of `PYROWAVE_QUEUE_PRIORITY` at startup), so one
+    ///   operator knob cannot come to mean two different things across the process boundary;
+    /// * the INERT warn is **left to the host**. It is the process with the log pipeline, and its
+    ///   wording has to name the worker binary — the historical text says "CAP_SYS_NICE on the
+    ///   host binary", which after 0.26.0-1 would send an operator to do the one thing that
+    ///   breaks every KDE session.
+    pub(crate) fn open_in_worker(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        chroma444: bool,
+        intent: Option<&str>,
+    ) -> Result<Self> {
+        Self::open_checked(width, height, fps, bitrate_bps, chroma444, intent, false)
+    }
+
+    fn open_checked(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        chroma444: bool,
+        intent: Option<&str>,
+        warn_inert: bool,
+    ) -> Result<Self> {
+        if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
         // Checked against the chroma actually being opened, NOT hardcoded 4:4:4. The 4:2:0 block
@@ -697,11 +765,11 @@ impl PyroWaveEncoder {
         // (its own bounds `assert` is compiled out by the Release vendored build).
         // `validate_dimensions` rejects the impossible-at-any-chroma modes earlier; this is the
         // 4:4:4-specific half plus defence in depth for the lab override.
-        if !crate::pyrowave_mode_fits_rdo(width, height, chroma.is_444()) {
+        if !crate::pyrowave_mode_fits_rdo(width, height, chroma444) {
             bail!(
                 "pyrowave {} at {width}x{height} exceeds the rate controller's 16-bit block \
                  index (see pyrowave-sys patches/0002 note) — lower the resolution",
-                if chroma.is_444() { "4:4:4" } else { "4:2:0" }
+                if chroma444 { "4:4:4" } else { "4:2:0" }
             );
         }
         // SAFETY: `open_inner` only issues Vulkan/pyrowave calls whose preconditions it
@@ -713,12 +781,27 @@ impl PyroWaveEncoder {
                 height,
                 fps.max(1),
                 bitrate_bps.max(1_000_000),
-                chroma.is_444(),
+                chroma444,
+                intent,
+                warn_inert,
             )
         }
     }
 
-    unsafe fn open_inner(w: u32, h: u32, fps: u32, bitrate: u64, chroma444: bool) -> Result<Self> {
+    /// `intent` is the raw `PYROWAVE_QUEUE_PRIORITY` value (`None` = unset ⇒ the default ladder),
+    /// resolved by the CALLER: in-process from this process's environment, in the worker from the
+    /// host's handshake. `warn_inert` decides whether THIS process emits the "every class refused"
+    /// warning — see [`Self::open_in_worker`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn open_inner(
+        w: u32,
+        h: u32,
+        fps: u32,
+        bitrate: u64,
+        chroma444: bool,
+        intent: Option<&str>,
+        warn_inert: bool,
+    ) -> Result<Self> {
         let entry = ash::Entry::load().context("load vulkan loader")?;
 
         let mut hold = DeviceHold {
@@ -860,8 +943,7 @@ impl PyroWaveEncoder {
             // Granite takes the inherit branch and the patch has never done anything here. This
             // is the Linux half. Must be pushed BEFORE the count/as_ptr wiring below, exactly
             // like queue_family_foreign above.
-            let gp_candidates =
-                queue_priority_candidates(std::env::var("PYROWAVE_QUEUE_PRIORITY").ok().as_deref());
+            let gp_candidates = queue_priority_candidates(intent);
             // Enable whichever alias the driver advertises (KHR = the promoted name), mirroring
             // pf-zerocopy's VkBridge probe so the two can never disagree about the spelling.
             let gp_ext =
@@ -943,13 +1025,18 @@ impl PyroWaveEncoder {
                     // created with. (The extension itself stays enabled and that is correct: it
                     // IS enabled on the device, it just carries no request.)
                     hold._queue_ci[0].p_next = std::ptr::null();
-                    if !gp_candidates.is_empty() && gp.is_some() {
+                    if !gp_candidates.is_empty() && gp.is_some() && warn_inert {
                         // MEASURED on .21 (RTX 5070 Ti, NVIDIA 610.43.02, 2026-08-08), and it is
                         // not a vendor quirk: an unprivileged host is refused EVERY class, and the
                         // same binary with `cap_sys_nice+ep` is granted REALTIME on the first
                         // attempt. So this arm is the normal state of a packaged host today, the
                         // lever is inert until the capability ships, and the message has to say
                         // which capability rather than leave an operator guessing.
+                        //
+                        // `warn_inert` is false in `punktfunk-encode-worker`: it reports the
+                        // outcome to its parent, which logs the same sentence naming the WORKER
+                        // binary. Sending an operator to `setcap` the host — which this wording
+                        // does — is precisely the 0.26.0-1 incident.
                         tracing::warn!(
                             "pyrowave: every global queue priority class was refused — encoding \
                              at default priority. The GPU-preemption lever is INERT without \
@@ -962,9 +1049,33 @@ impl PyroWaveEncoder {
                         .context("create device")?
                 }
             };
-            Ok((pd, family, device, foreign_qfi))
+            // The ladder's outcome, made reportable. `queue_priority_candidates` only ever yields
+            // REALTIME or HIGH, so the `Some(_)` arm is exact rather than a fallback (ash models
+            // the class as a newtype, not a Rust enum, so this cannot be a `match` on constants).
+            let priority = match chosen {
+                Some(c) if c == vk::QueueGlobalPriorityKHR::REALTIME => {
+                    super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::Realtime)
+                }
+                Some(_) => {
+                    super::worker::PriorityOutcome::Granted(super::worker::GrantedClass::High)
+                }
+                // Exactly the condition the INERT warn above fires on: something was asked for,
+                // the extension was there, and every class came back refused.
+                None if !gp_candidates.is_empty() && gp.is_some() => {
+                    super::worker::PriorityOutcome::Refused
+                }
+                None => super::worker::PriorityOutcome::NotRequested,
+            };
+            let device_name = instance
+                .get_physical_device_properties(pd)
+                .device_name_as_c_str()
+                .ok()
+                .and_then(|s| s.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            Ok((pd, family, device, foreign_qfi, priority, device_name))
         })();
-        let (pd, family, device, foreign_qfi) = match selected {
+        let (pd, family, device, foreign_qfi, priority, device_name) = match selected {
             Ok(v) => v,
             Err(e) => {
                 instance.destroy_instance(None);
@@ -1013,6 +1124,8 @@ impl PyroWaveEncoder {
             height: h,
             fps,
             chroma444,
+            priority,
+            device_name,
             frame_budget: budget_for(bitrate, fps),
             perf_us: Vec::new(),
             perf_logged_at: None,

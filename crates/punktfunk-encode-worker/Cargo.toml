@@ -1,0 +1,39 @@
+# The capability-carrying PyroWave encode worker (design/gpu-priority-capability-worker.md).
+#
+# 🛑 This is a SEPARATE BINARY on purpose, and it must stay one. It is the only Punktfunk file that
+# may carry `cap_sys_nice=ep`; `punktfunk-host` carries no capability on any channel, ever, because
+# a capped process cannot be identified by KWin (`cap_ptrace_access_check` refuses
+# `/proc/<pid>/exe` to a reader whose effective set is not a superset of the target's PERMITTED
+# set) and therefore never gets `zkde_screencast_unstable_v1` — that was 0.26.0-1, and it killed
+# every KDE desktop session. A hardlink to the host, or a hidden host subcommand, shares the inode
+# and so shares the capability: same incident, silently. Never do either.
+#
+# All the logic lives in `pf-encode::worker`; this crate is the file, not the code.
+[package]
+name = "punktfunk-encode-worker"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk PyroWave encode worker: owns the priority-elevated Vulkan device so the host never carries a capability."
+publish = false
+
+[[bin]]
+name = "punktfunk-encode-worker"
+path = "src/main.rs"
+
+[dependencies]
+# `features = ["pyrowave"]` unconditionally rather than through a feature of this crate: packaging
+# builds this with `cargo build -p punktfunk-encode-worker` and default features, and a worker
+# built without the codec would be a binary that hands every session straight back to the
+# in-process fallback while still carrying the capability. (No extra cost to the workspace:
+# punktfunk-host already has `default = ["pyrowave"]`, so a workspace build resolves it anyway.)
+pf-encode = { path = "../pf-encode", features = ["pyrowave"] }
+tracing = "0.1"
+# The worker's stderr is inherited from the host that spawned it, so its lines land in the same
+# journal — but it is a fresh process with no subscriber of its own, and without one the
+# device-pick and priority-ladder lines would go nowhere.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

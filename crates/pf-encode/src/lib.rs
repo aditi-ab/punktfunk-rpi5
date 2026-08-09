@@ -358,8 +358,17 @@ fn open_video_backend_linux(
     if codec == Codec::PyroWave {
         #[cfg(feature = "pyrowave")]
         {
-            return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
-                .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
+            // Through the worker seam, not straight at the encoder: PyroWave's GPU-priority lever
+            // needs CAP_SYS_NICE, which only `punktfunk-encode-worker` may carry. Every rung of
+            // that ladder ends at this exact in-process open — see `pyrowave_remote`.
+            return pyrowave_remote::open_preferring_worker(
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                chroma,
+            )
+            .map(|e| (e, "pyrowave"));
         }
         #[cfg(not(feature = "pyrowave"))]
         anyhow::bail!(
@@ -517,14 +526,16 @@ fn open_video_backend_linux(
                 // The lab override forces the wavelet stream onto a session negotiated for
                 // another codec — that session's chroma may be HEVC-4:4:4, which the
                 // pyrowave encoder doesn't do yet, so pin the override to 4:2:0.
-                pyrowave::PyroWaveEncoder::open(
+                // Same worker seam as the negotiated arm above: the lab override is where the
+                // A/B is measured, so it must not be the one path that skips the worker.
+                pyrowave_remote::open_preferring_worker(
                     width,
                     height,
                     fps,
                     bitrate_bps,
                     ChromaFormat::Yuv420,
                 )
-                .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
+                .map(|e| (e, "pyrowave"))
             }
             #[cfg(not(feature = "pyrowave"))]
             {
@@ -2035,6 +2046,18 @@ mod vk_util;
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 #[path = "enc/linux/pyrowave.rs"]
 mod pyrowave;
+// `punktfunk-encode-worker` (design/gpu-priority-capability-worker.md): the capability-carrying
+// process that owns the priority-elevated PyroWave device, because `punktfunk-host` may never hold
+// a file capability (0.26.0-1 — a capped host is unidentifiable to KWin and loses desktop
+// streaming). `worker` is the vocabulary plus the worker's own run loop, and it is `pub` for
+// exactly one caller: the ~30-line `main` of the separate `punktfunk-encode-worker` binary.
+// `pyrowave_remote` is the host-side proxy and its fallback ladder.
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[path = "enc/linux/pyrowave_remote.rs"]
+mod pyrowave_remote;
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[path = "enc/linux/worker.rs"]
+pub mod worker;
 // The Windows PyroWave encoder — NV12 zero-copy D3D11→Vulkan via pyrowave's own compat device
 // (design/pyrowave-windows-host-zerocopy.md). Same module name as the Linux one (per-platform
 // `#[path]`, mutually-exclusive cfg) so `crate::pyrowave::*` is flat on both.

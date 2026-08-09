@@ -3118,6 +3118,8 @@ dependencies = [
  "pf-zerocopy",
  "punktfunk-core",
  "pyrowave-sys",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3622,6 +3624,15 @@ dependencies = [
  "windows-sys 0.59.0",
  "zerocopy 0.8.52",
  "zeroize",
+]
+
+[[package]]
+name = "punktfunk-encode-worker"
+version = "0.26.0"
+dependencies = [
+ "pf-encode",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
