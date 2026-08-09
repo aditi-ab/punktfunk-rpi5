@@ -400,6 +400,28 @@ assert_worker_arm() {
   return $rc
 }
 
+# Why an arm produced nothing — checked BEFORE any arm-identity assert.
+#
+# "this arm is not the in-process arm" is a LIE when the truth is "capture never came up", and it
+# sends the reader looking at the wrong thing entirely. That cost a real V3b run on .21: a GNOME
+# consent dialog went unanswered, the spike died before opening an encoder, and the kit blamed the
+# arm construction — which was correct all along. Prints a human reason and returns 0 when the arm
+# never got far enough to be judged; returns 1 when the run is judgeable.
+spike_failure_reason() {
+  local log="$1" line
+  if logs_have "$log" 'timed out waiting for the ScreenCast portal'; then
+    printf '%s' "the xdg ScreenCast portal was never answered. GNOME and KDE raise a CONSENT DIALOG on the host's own screen, and it cannot be answered from inside a stream — approve it there, or run a leg that needs no portal"
+    return 0
+  fi
+  line="$(log_cat "$log" | LC_ALL=C grep -E 'ERROR' | head -1 | sed 's/^.*ERROR[[:space:]]*//')"
+  if [ -n "$line" ]; then printf '%s' "$line"; return 0; fi
+  if [ "$(perf_windows "$log")" = 0 ]; then
+    printf '%s' "the spike never encoded a frame — no PUNKTFUNK_PERF window in the log at all"
+    return 0
+  fi
+  return 1
+}
+
 assert_inline_arm() {
   local log="$1" tag="$2" rc=0
   if ! logs_have "$log" "$L_OFF"; then
@@ -798,6 +820,7 @@ leg_v2() {
   wait_spike "$OPT_SECONDS"
   local log="$SPIKE_LOG"
 
+  if why="$(spike_failure_reason "$log")"; then fail V2 "the run never got as far as an encoder: $why"; return 0; fi
   if ! assert_worker_arm "$log" V2; then
     fail V2 "the session did not run in the worker — see $log"; return 0
   fi
@@ -874,6 +897,8 @@ leg_v3a() {
   wait_spike "$OPT_SECONDS"
   local b_log="$SPIKE_LOG"
 
+  if why="$(spike_failure_reason "$a_log")"; then fail V3a "arm A never ran: $why"; return 0; fi
+  if why="$(spike_failure_reason "$b_log")"; then fail V3a "arm B never ran: $why"; return 0; fi
   assert_inline_arm "$a_log" V3a || { fail V3a "arm A is not the in-process arm — see $a_log"; return 0; }
   assert_worker_arm "$b_log" V3a || { fail V3a "arm B is not the worker arm — see $b_log"; return 0; }
 
@@ -909,6 +934,8 @@ leg_v3b() {
   wait_spike "$OPT_SECONDS"
   local b_log="$SPIKE_LOG"
 
+  if why="$(spike_failure_reason "$a_log")"; then fail V3b "arm A never ran: $why"; return 0; fi
+  if why="$(spike_failure_reason "$b_log")"; then fail V3b "arm B never ran: $why"; return 0; fi
   assert_inline_arm "$a_log" V3b || { fail V3b "arm A is not the in-process arm — see $a_log"; return 0; }
   assert_worker_arm "$b_log" V3b || { fail V3b "arm B is not the worker arm — see $b_log"; return 0; }
   if ! logs_have "$b_log" "$L_GRANTED"; then
