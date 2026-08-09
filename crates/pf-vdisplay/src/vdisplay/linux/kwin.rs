@@ -1093,6 +1093,19 @@ fn capability_denial_hint() -> String {
     let permitted = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| permitted_caps_from_status(&status));
+    capability_denial_hint_for(permitted)
+}
+
+/// The message half of [`capability_denial_hint`], split from the `/proc/self/status` read so it is
+/// testable against a *given* mask instead of whatever the test process happens to hold.
+///
+/// That distinction is not academic: the first version of this asserted the empty case by calling
+/// the real thing and trusting the test process to be uncapped. That holds on a dev box and is
+/// false in CI, where the runner container is root with a full permitted set
+/// (`CapPrm=0x000001ffffffffff`) — so the hint fired, correctly, and the test failed on a machine
+/// where nothing was wrong. A check whose answer depends on the ambient environment tests the
+/// environment, not the code.
+fn capability_denial_hint_for(permitted: Option<u64>) -> String {
     match permitted {
         Some(caps) if caps != 0 => format!(
             " — NOTE: this process carries capabilities (CapPrm={caps:#018x}), which is enough on \
@@ -1135,10 +1148,30 @@ mod capability_hint_tests {
 
     /// A capability-free host must not append the hint — the message it decorates is also printed
     /// on genuinely missing `.desktop` files, and a spurious "you have capabilities" line would
-    /// send the reader chasing a setcap that was never there. The test process has no capabilities.
+    /// send the reader chasing a setcap that was never there.
+    ///
+    /// Driven off an explicit mask rather than the test process's own: see
+    /// [`capability_denial_hint_for`] for why calling the real reader here fails in CI.
     #[test]
     fn silent_without_capabilities() {
-        assert_eq!(capability_denial_hint(), "");
+        assert_eq!(
+            capability_denial_hint_for(permitted_caps_from_status(CLEAN)),
+            ""
+        );
+        // Absent or unparseable field: also silent, never a panic and never a spurious hint.
+        assert_eq!(capability_denial_hint_for(None), "");
+    }
+
+    /// ...and the case that matters actually speaks, naming the mask and the repair. Without this
+    /// the test above passes just as well against a function that returns `""` unconditionally.
+    #[test]
+    fn names_the_mask_and_the_repair_when_capped() {
+        let hint = capability_denial_hint_for(permitted_caps_from_status(CAPPED));
+        assert!(
+            hint.contains("0x0000000000800000"),
+            "names the mask: {hint}"
+        );
+        assert!(hint.contains("setcap -r"), "names the repair: {hint}");
     }
 }
 
