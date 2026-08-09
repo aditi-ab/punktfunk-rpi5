@@ -290,7 +290,19 @@ same shader cores a game saturates; NVENC is immune because it has its own ASIC.
   ladder REALTIME → HIGH → no-priority, stepping only on refusal; a refused class can never fail the
   open. The extension probe reuses the `dev_ext_props` already fetched for `queue_family_foreign` and
   takes KHR or the EXT alias — the same spelling pf-zerocopy probes, so the two cannot disagree.
-  ⭐ **Needs `CAP_SYS_NICE`**, which the packaging now grants; without it the lever does nothing.
+  ⭐ **Needs `CAP_SYS_NICE`**, which the packaging granted in `0.26.0-1`; without it the lever does
+  nothing.
+  🛑 **Corrected in `0.26.0-2`: the packaging no longer grants it, and must not.** Every channel that
+  did (Arch `.install`, RPM `%caps()`, the Bazzite sysext image, the deb postinst, the NixOS
+  `security.wrappers` entry) broke desktop streaming on KDE outright — field-reported on CachyOS and
+  Bazzite as `KWin does not expose zkde_screencast_unstable_v1 to this client`. KWin identifies a
+  client by resolving its `/proc/<pid>/exe` against an installed `.desktop`, and the kernel refuses
+  that readlink to any reader whose effective set is not a superset of the target's **permitted**
+  set (`cap_ptrace_access_check`) — KWin has no capabilities, so a capability-carrying host is
+  unidentifiable and the restricted globals are never advertised. Neither `prctl(PR_SET_DUMPABLE, 1)`
+  nor systemd `AmbientCapabilities=` rescues it; only an uncapped process is identifiable. The lever
+  therefore stays wired but unexercised on a stock install (the ladder degrades to default priority),
+  and is opt-in for gamescope-only hosts, which have no such identity check.
 - **PW5 — two encoder handles.** `Encoder::Impl` owns exactly one each of `wavelet_img_high_res`,
   `bucket_buffer`, `meta_buffer`, `block_stat_buffer`, `payload_data`, `quant_buffer`, and
   `Impl::encode` *opens* by discarding them (an image barrier with `VK_IMAGE_LAYOUT_UNDEFINED` as the
@@ -414,7 +426,9 @@ emulator itself would land it outside both.
 
 ⏳ **Owed on glass:** iPhone + Bluetooth listen, Apple TV stats overlay, MacBook audio listen, the
 Deck HEVC/4:4:4 retest, a Windows wake-from-sleep cycle, and the PyroWave-under-game-load A/B on a
-Linux host with `CAP_SYS_NICE` actually granted — the number this whole wave is aimed at.
+Linux host with `CAP_SYS_NICE` actually granted — the number this whole wave is aimed at. ⚠ That
+last one now needs a **gamescope-only** host, or a hand-granted capability on a box you are not
+streaming the KDE desktop from: see the `0.26.0-2` correction under PW1 above.
 
 ---
 

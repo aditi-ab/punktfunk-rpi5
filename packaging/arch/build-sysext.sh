@@ -14,9 +14,17 @@
 # instead of 8-bit SDR (the host prefers that name on PATH and attempts HDR by default). Mirrors
 # the Bazzite image's fold-in, including the honesty check: the binary is verified by executing
 # its `+pfhdr` banner, never trusted by filename. Omit it and the image is exactly what it was —
-# the host then stays SDR on that backend, by design. (No CAP_SYS_NICE inside the image: file
-# capabilities don't survive this squashfs path — gamescope runs without it, pacing slightly
-# worse, same as the Bazzite sysext.)
+# the host then stays SDR on that backend, by design.
+#
+# No CAP_SYS_NICE inside the image, for either binary. ⚠ NOT because capabilities are lost on the
+# way in — that was this comment's earlier claim and it is false: mksquashfs records
+# security.capability, and the published Bazzite 0.26.0-1 image really did carry `cap_sys_nice=ep`
+# on usr/bin/punktfunk-host. It is left out on purpose. A capability on the HOST binary makes it
+# unidentifiable to KWin (which resolves a client's /proc/<pid>/exe to match it against a .desktop,
+# and cannot read it for a capability-carrying process) and kills every Desktop-mode session — see
+# packaging/bazzite/build-sysext.sh, which now hard-fails if one is staged. `punktfunk-gamescope`
+# is a compositor, not a KWin client, so it is unaffected by that rule and simply runs without the
+# capability here, pacing slightly worse.
 set -euo pipefail
 
 GAMESCOPE=""

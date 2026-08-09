@@ -421,11 +421,23 @@ bash /usr/share/punktfunk/bazzite/kde-desktop-setup.sh
 # then log out + back into the KDE Desktop session once (or reboot) so KWin restarts with the flag
 ```
 
-That writes `~/.config/environment.d/10-punktfunk-kwin.conf`
-(`KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`) and seeds the `kde-authorized` RemoteDesktop grant into
-`~/.local/share/flatpak/db/`. Gaming Mode is unaffected. To connect from Desktop Mode, switch to it
-(Steam → Power → Switch to Desktop), then connect the client; switching **mid-stream** requires a
-reconnect (the host resolves the backend per connect).
+That seeds the `kde-authorized` RemoteDesktop grant into `~/.local/share/flatpak/db/` — the input
+half. The **video** half needs no session-wide override: the image ships
+`io.unom.Punktfunk.Host.desktop`, whose `X-KDE-Wayland-Interfaces` grants the host KWin's
+`zkde_screencast` protocol on a normal Plasma login (least-privilege — only this binary, only that
+interface). Older versions of the script wrote a session-wide
+`KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` into `~/.config/environment.d/10-punktfunk-kwin.conf`; it now
+*removes* that file as an over-broad leftover. Gaming Mode is unaffected. To connect from Desktop
+Mode, switch to it (Steam → Power → Switch to Desktop), then connect the client; switching
+**mid-stream** requires a reconnect (the host resolves the backend per connect).
+
+> **On 0.26.0-1 specifically, Desktop mode is broken and no amount of this setup fixes it.** That
+> image shipped `cap_sys_nice=ep` on `/usr/bin/punktfunk-host`, and a capability-carrying process is
+> one KWin cannot identify (it resolves `/proc/<pid>/exe` to match the `.desktop`, and the kernel
+> refuses that read), so the session dies with `KWin does not expose zkde_screencast_unstable_v1 to
+> this client`. A merged sysext's `/usr` is read-only, so it cannot be repaired in place — take the
+> next image (`sudo punktfunk-sysext update`). `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` works around it
+> meanwhile by disabling the check that needs the identification.
 
 ---
 
