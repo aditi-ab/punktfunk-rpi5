@@ -93,17 +93,21 @@ sudo dnf install punktfunk
 sudo usermod -aG input "$USER"     # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
-Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro — it reaches games
-as a real USB pad, which is why Steam Input adopts it), also join `punktfunk`:
+Also join `punktfunk` if **either** applies — you want the **virtual Steam Deck controller**
+(paddles, trackpads, gyro — it reaches games as a real USB pad, which is why Steam Input adopts
+it), or this box autologins into Steam **Gaming Mode** (Nobara and friends) and you want the host
+to take that session over at the client's resolution:
 
 ```sh
-sudo usermod -aG punktfunk "$USER"  # usbip/vhci access (re-login to apply)
+sudo usermod -aG punktfunk "$USER"  # usbip/vhci + display-manager takeover (re-login to apply)
 ```
 
 That is a second group on purpose: it grants write access to the usbip `attach` file, which
 materialises an arbitrary emulated USB device, so it stays off the `input` group everyone is
-routinely told to join. Join it only on a machine you trust. Skip it and the pad simply arrives as
-an ordinary Xbox 360 controller.
+routinely told to join. Join it only on a machine you trust. Skip it on a plain desktop host and
+the pad simply arrives as an ordinary Xbox 360 controller; skip it on a Gaming Mode box and the
+takeover silently degrades to mirroring the box's own screen — see
+[gamescope](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
 Updates later are just `sudo dnf upgrade punktfunk`, followed by
 `systemctl --user restart punktfunk-host` so the running host picks up the new binary. The package

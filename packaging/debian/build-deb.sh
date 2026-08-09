@@ -292,7 +292,10 @@ if [ "$1" = "configure" ]; then
     # Owns the usbip vhci attach/detach nodes (60-punktfunk.rules). Deliberately NOT 'input':
     # writing 'attach' materialises an arbitrary emulated USB device — a root-only kernel
     # primitive that must not ride on the group users are told to join for gamepads
-    # (security-review 2026-08-05 M-4).
+    # (security-review 2026-08-05 M-4). It is ALSO the group pf-dm-helper authorizes on (its
+    # polkit action must stay allow_any, so membership is the real gate), i.e. what a managed
+    # gamescope takeover needs to stop the display manager. Creating the group is necessary and
+    # NOT sufficient for either use: membership is.
     getent group punktfunk >/dev/null 2>&1 || addgroup --system punktfunk 2>/dev/null || true
     # NO capability on the host binary — and an active removal of the one 0.26.0-1 granted here.
     #
@@ -318,8 +321,13 @@ if [ "$1" = "configure" ]; then
     sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
     echo "punktfunk-host installed. Add yourself to the 'input' group for virtual gamepads:"
     echo "    sudo usermod -aG input \"\$USER\"   # then re-login"
-    echo "For the virtual Steam Deck pad (usbip) ALSO: sudo usermod -aG punktfunk \"\$USER\""
-    echo "  — that group can emulate arbitrary USB devices; join it only on a machine you trust." 
+    # Naming only the usbip pad here is how a Nobara host shipped broken: its owner had no Deck
+    # pad, so they correctly skipped this group — and then every managed gamescope takeover
+    # degraded silently, because pf-dm-helper (which stops the display manager) gates on membership.
+    echo "ALSO join 'punktfunk' if this box streams Steam Gaming Mode (gamescope) or you want the"
+    echo "virtual Steam Deck pad: sudo usermod -aG punktfunk \"\$USER\"   # then log out and back in"
+    echo "  — it authorizes stopping the display manager for a managed gamescope session, and the"
+    echo "    pad's usbip nodes; it can emulate arbitrary USB devices, so join it only on a box you trust."
     echo "Config:  mkdir -p ~/.config/punktfunk && cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env"
     echo "Enable:  systemctl --user enable --now punktfunk-host"
     # Debian ships no active firewall and Ubuntu's ufw is inactive by default; hint whichever is present.

@@ -374,6 +374,12 @@ pub(crate) async fn serve(
     // A3: recover a TV takeover stranded by a crashed previous host instance (persisted to
     // $XDG_RUNTIME_DIR) — schedule a restore after a reconnect grace. No-op on a clean start.
     crate::vdisplay::restore_takeover_on_startup();
+    // …and check the takeover's one un-automatable prerequisite BEFORE a stream needs it: on a box
+    // that will use the takeover, the host's user must be in the `punktfunk` group the packaged
+    // privilege helper gates on. Missing membership fails nothing — the takeover degrades to
+    // mirroring the box's own session — so without this it surfaces only as a black screen on
+    // every connect. No-op off Linux and on any box the takeover can't apply to.
+    crate::vdisplay::preflight_takeover_privilege();
     // …and the other end of that: give the box its session back when WE are the ones going away.
     install_shutdown_restore();
     // Host-lifetime cover-art warmer: fetches + caches GOG/Xbox cover art (no-auth api.gog.com /

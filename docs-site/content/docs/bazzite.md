@@ -126,17 +126,21 @@ ujust add-user-to-input-group
 Then **log out and back in**. (A controller that's "detected but does nothing" is almost always this
 permission, not a client problem.)
 
-Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro), also join
-`punktfunk` — `usermod` is fine here, because unlike `input` this group is ours and the sysext
-creates it on merge:
+Then join `punktfunk` — `usermod` is fine here, because unlike `input` this group is ours and the
+sysext creates it on merge:
 
 ```sh
 sudo usermod -aG punktfunk "$USER"   # then log out and back in
 ```
 
-It is a separate group on purpose: it gates the usbip `attach` file, which can materialise
-arbitrary emulated USB hardware, so it is not folded into the group everyone is told to join for
-gamepads. Skip it and the pad arrives as an ordinary Xbox 360 controller instead.
+This box **is** a Gaming Mode box, so that group is not optional in practice: it authorizes the
+helper the host uses to stop the display manager when it takes the Gaming Mode session over at your
+client's resolution, and it gates the usbip `attach` file the **virtual Steam Deck controller**
+(paddles, trackpads, gyro) attaches through. It is a separate group on purpose — writing that file
+can materialise arbitrary emulated USB hardware, so it is not folded into the group everyone is
+told to join for gamepads. Without it the pad arrives as an ordinary Xbox 360 controller, and the
+takeover degrades to mirroring the box's own screen — see
+[gamescope](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
 ## Configure
 

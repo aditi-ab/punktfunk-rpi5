@@ -40,16 +40,37 @@ the [Bazzite template](/docs/bazzite) ships with **attach** chosen instead.
 
 ### Nobara and other autologin display managers
 
-The managed takeover has to stop the box's Gaming Mode session to free Steam. How it does that
-depends on the display manager driving the autologin:
+The managed takeover has to stop the box's Gaming Mode session to free Steam — and when that
+session is a display-manager autologin, it has to stop the **display manager** too, for the length
+of the stream. That is a privileged operation, and the privilege is granted to one group.
 
-- **SDDM** (Bazzite, SteamOS): handled automatically — no setup.
-- **plasmalogin** (Nobara) and other display managers: the host must stop the display manager
-  itself for the length of the stream and restart it afterwards, which needs privilege. The
-  packages ship that privilege: a root helper (`/usr/libexec/punktfunk/pf-dm-helper`, or
-  `/usr/lib/punktfunk/pf-dm-helper` from the Arch package) behind its own polkit action
-  (`io.unom.punktfunk.dm-helper`), invoked automatically when the plain
-  `systemctl` verbs are denied — no setup. The helper only stops/restores the unit the
+> **Join the `punktfunk` group on any box you stream Game Mode from.** The takeover's root helper
+> runs for members of that group and for nobody else, so this one command is what authorizes it:
+>
+> ```sh
+> sudo usermod -aG punktfunk "$USER"   # then log out and back in
+> ```
+>
+> Your package created the group at install time and put **nobody** in it, on purpose: it also
+> gates the usbip nodes the virtual Steam Deck pad attaches through, and writing those can present
+> arbitrary emulated USB hardware — so joining stays a deliberate act, on a machine you trust.
+> Skip it and nothing fails loudly. Every takeover degrades to mirroring the box's own session
+> (below), which on a box whose panel is off reads as a black screen on every connect. The host
+> checks this at startup on any box that will need the takeover and says so in its log; the
+> symptom side is [Game Mode: black screen on
+> connect](/docs/troubleshooting#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution).
+
+How the takeover gets that privilege depends on the display manager driving the autologin:
+
+- **SDDM** (Bazzite, SteamOS): SDDM survives having the session unit masked, so a box without the
+  grant still streams — at the cost of SDDM relogin-looping against the takeover for the whole
+  stream, which churns logind sessions and can starve the game.
+- **plasmalogin** (Nobara) and other display managers: masking is fatal there (the autologin
+  start-limit-kills the display manager), so the host stops the display manager itself and
+  restarts it afterwards. The packages ship that privilege: a root helper
+  (`/usr/libexec/punktfunk/pf-dm-helper`, or `/usr/lib/punktfunk/pf-dm-helper` from the Arch
+  package) behind its own polkit action (`io.unom.punktfunk.dm-helper`), invoked automatically
+  when the plain `systemctl` verbs are denied. The helper only stops/restores the unit the
   `display-manager.service` symlink points at, the same class of local-seat operation these
   distros already authorize for their own session switcher (Nobara's `os-session-select`).
 
@@ -71,8 +92,11 @@ depends on the display manager driving the autologin:
   With no privilege path at all the host degrades safely: it **attaches** to the live Gaming Mode
   session instead (Game Mode stays on the box's display at the box's own resolution, mirrored to
   the client — if your monitor stays on and the stream runs at the desktop's resolution, this is
-  what happened; check the host log for "managed takeover unavailable"). If the display-manager
-  restart ever loses its privilege mid-restore, `PUNKTFUNK_RECOVER_SESSION_CMD` (see
+  what happened; check the host log for "managed takeover unavailable"). That log line now quotes
+  the privileged path's own reason for refusing, so read it before changing anything: by far the
+  most common one is `not in the 'punktfunk' group`, which the group command above fixes and
+  neither a reinstall nor a polkit rule does. If the display-manager restart ever loses its
+  privilege mid-restore, `PUNKTFUNK_RECOVER_SESSION_CMD` (see
   [Configuration](/docs/configuration)) is fired as the fallback.
 
   **Lingering is required here**, and the host turns it on for you the first time it takes the box
@@ -81,7 +105,9 @@ depends on the display manager driving the autologin:
   taking the host with it, mid-stream, with the display manager down and nothing left to bring it
   back. If lingering can't be enabled the host refuses the takeover and degrades to attach instead
   (above) rather than risk that. Run `sudo loginctl enable-linger "$USER"` once, as the setup guides
-  ask; `loginctl disable-linger "$USER"` reverts it.
+  ask; `loginctl disable-linger "$USER"` reverts it. (A host with no login session of its own turns
+  lingering on through the *same* helper, so a missing group grant surfaces here first — the log
+  says "enabling lingering failed" and then quotes the same reason.)
 
   With the takeover authorized the **in-stream session switch round-trips** in managed mode:
   Steam's "Switch to Desktop" inside the streamed Game Mode returns the box to its desktop session
