@@ -356,19 +356,33 @@ jobs:
           # Best-effort: meson falls back or does without, and a name that moves between Ubuntu
           # releases should not fail the job. (No libstdc++ static package is needed here — g++
           # ships libstdc++.a, which is why only Fedora tripped the sanity check.)
-          apt-get install -y --no-install-recommends libglm-dev cmake libxcursor-dev || true
+          # `build-dep gamescope` gives noble almost nothing — the distro has no comparable package
+          # — so the tree's real dependency set has to be named outright. One `apt-get` per name on
+          # purpose: a single transaction aborts wholesale on one unknown package, which would
+          # install NOTHING and hide the real gap behind a name typo. Best-effort per package, with
+          # the missing one named; the end-of-job gate below is what actually decides.
+          for p in libxdamage-dev libxcomposite-dev libxrender-dev libxext-dev libxxf86vm-dev \
+                   libxtst-dev libx11-dev libxres-dev libxmu-dev libxcursor-dev libxi-dev \
+                   libxfixes-dev libxkbcommon-dev libxkbcommon-x11-dev libcap-dev libdrm-dev \
+                   libinput-dev libudev-dev libpipewire-0.3-dev libseat-dev libsdl2-dev \
+                   libluajit-5.1-dev libavif-dev libdecor-0-dev hwdata libglm-dev libbenchmark-dev \
+                   glslang-tools libvulkan-dev libwayland-dev libxcb1-dev libxcb-composite0-dev \
+                   libxcb-xfixes0-dev libxcb-res0-dev libxcb-ewmh-dev libxcb-icccm4-dev \
+                   libxcb-errors-dev libpixman-1-dev libdisplay-info-dev libgbm-dev libegl-dev \
+                   cmake xwayland; do
+            apt-get install -y --no-install-recommends "$p" \
+              || echo "::warning::no such noble package: $p (gamescope may still build without it)"
+          done
           if bash packaging/gamescope/build-punktfunk-gamescope.sh \
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
             install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
           else
-            # Best-effort on canary, HARD on a stable tag — same reasoning as rpm.yml. A warning
-            # here is what let v0.26.0 promise an apt-installable gamescope that was never built.
-            case "$GITHUB_REF" in
-              refs/tags/v*)
-                echo "::error::punktfunk-gamescope failed to build on noble — a stable tag must not ship without it (the release notes and docs-site say it is installable)"
-                exit 1
-                ;;
-            esac
+            # Warn only, even on a tag. The hard gate moved to the END of this job: failing HERE
+            # skips the host .deb's own publish + release-attach steps below, which is how the
+            # v0.26.0 release ended up still carrying the pre-CAP_SYS_NICE host .deb from an
+            # earlier tag commit — a KDE-breaking artifact withheld from replacement by a gate
+            # meant to protect the release. Never let a missing EXTRA stop a good artifact
+            # shipping; go red afterwards instead.
             echo "::warning::punktfunk-gamescope failed to build on noble — no .deb this run (gamescope sessions stay SDR)"
           fi
 
@@ -378,13 +392,7 @@ jobs:
           if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
             bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
           else
-            # Authoritative, and covers the cache path the build step skips — same as rpm.yml.
-            case "$GITHUB_REF" in
-              refs/tags/v*)
-                echo "::error::no usable punktfunk-gamescope — a stable tag must not ship without its .deb"
-                exit 1
-                ;;
-            esac
+            # Warn only — see the note on the build step. The gate is the last step of this job.
             echo "::warning::no usable punktfunk-gamescope — skipping its .deb"
           fi
 
@@ -414,6 +422,26 @@ jobs:
           for DEB in dist/*.deb; do
             upsert_asset "$RID" "$DEB"
           done
+
+      # A release must not be able to make a claim its own CI silently dropped: v0.26.0's notes and
+      # docs-site said the patched gamescope was apt-installable while no .deb had ever been built,
+      # because every failure on this path was a `::warning::` that returned 0.
+      #
+      # ⚠ LAST step on purpose. The first version of this gate failed at the build step instead, and
+      # that skipped the host .deb's own publish + attach below — so the release kept the PREVIOUS
+      # tag commit's host .deb, which still carried the CAP_SYS_NICE postinst that breaks KDE. A
+      # gate protecting the release withheld the fix for it. Everything good ships first; the job
+      # goes red afterwards.
+      - name: A stable tag must ship the gamescope .deb
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        run: |
+          shopt -s nullglob
+          built=(dist/punktfunk-gamescope_*.deb)
+          if [ ${#built[@]} -eq 0 ]; then
+            echo "::error::no punktfunk-gamescope .deb was built — a stable tag must not ship without it (the release notes and docs-site say it is apt-installable). Everything else in this job published normally; see the gamescope build step above for the meson error."
+            exit 1
+          fi
+          echo "gamescope .deb present: ${built[*]}"
 
   # ---------------------------------------------------------------------------------------------
   # The aarch64 CLIENT .deb. Cross-compiled on the ordinary amd64 runner in the
