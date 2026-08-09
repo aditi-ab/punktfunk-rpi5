@@ -42,8 +42,10 @@ use windows::Win32::System::Registry::{
 };
 
 /// Marker value in a probe devnode's `Device Parameters` key — how `cleanup` finds what this
-/// devtest minted (and nothing else).
-const PROBE_MARKER: &str = "PunktfunkAudioProbe";
+/// devtest minted (and nothing else). pub(crate): the uninstall sweep
+/// ([`devnode_cleanup`](super::devnode_cleanup)) sweeps this family too, so a devtest run on an
+/// operator's box cannot outlive the product.
+pub(crate) const PROBE_MARKER: &str = "PunktfunkAudioProbe";
 /// DeviceDesc for probe devnodes (visible in Device Manager until the INF install renames it).
 const PROBE_DESC: &str = "Punktfunk Audio Probe";
 /// How long to wait for audiosrv to register a minted endpoint.

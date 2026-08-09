@@ -340,10 +340,17 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: ru
 ; install laid down); `driver uninstall` is best-effort and no-ops when nothing is installed.
 ; A VB-CABLE from an OLDER punktfunk install (bundled until the audio-substrate change) is
 ; deliberately NOT removed: it is a third-party shared component the user may use elsewhere.
-; The host's own minted audio devnodes ("Punktfunk Speakers/Microphone") are likewise left in
-; place - they are plain instances of Steam's streaming drivers, inert without the host.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkVdisplayDriverUninstall"
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkGamepadDriverUninstall"
+; ...and the audio devices the RUNNING HOST mints ("Punktfunk Speakers", "Punktfunk Microphone",
+; the per-pad "Wireless Controller" endpoints). These have no installer payload behind them - the
+; host creates them at runtime and re-resolves them across restarts by design - so nothing else in
+; this uninstall would ever touch them, and the field report was that they sat in Sound settings
+; forever after an uninstall. Marker-matched, so Steam's own streaming-audio devices and drivers
+; (which our instances ride on, and which Remote Play still needs) are left alone. Runs after the
+; two driver legs, and well after `service uninstall`: a live host re-mints them on its next
+; wiring pass.
+Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --audio"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkAudioDeviceUninstall"
 #ifdef WithWeb
 ; Remove the console's firewall rule + any LEGACY PunktfunkWeb task and stray listener (the
 ; service-supervised console itself died with `service uninstall` above, via its kill-on-close job;

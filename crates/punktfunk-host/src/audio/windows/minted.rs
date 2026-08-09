@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Durable role marker in a minted devnode's `Device Parameters` key.
-const ROLE_MARKER: &str = "PunktfunkAudioRole";
+/// Durable role marker in a minted devnode's `Device Parameters` key. pub(crate): the uninstall
+/// sweep ([`devnode_cleanup`](super::devnode_cleanup)) matches devnodes on it.
+pub(crate) const ROLE_MARKER: &str = "PunktfunkAudioRole";
 /// How long to wait for audiosrv to register a freshly minted endpoint.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
 /// Minimum spacing between provisioning retries once the startup attempt failed

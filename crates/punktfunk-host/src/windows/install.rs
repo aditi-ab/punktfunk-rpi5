@@ -46,14 +46,14 @@ fn run_capture(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-// ── `driver install [--gamepad] --dir <stage>` / `driver uninstall [--gamepad]` ────────────────
+// ── `driver install [--gamepad] --dir <stage>` / `driver uninstall [--gamepad|--audio]` ────────
 pub fn driver_main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("install") => driver_install(&args[1..]),
         Some("uninstall") => driver_uninstall(&args[1..]),
         _ => bail!(
             "usage: punktfunk-host driver install --dir <stage> [--gamepad]\n\
-             \x20      punktfunk-host driver uninstall [--gamepad]"
+             \x20      punktfunk-host driver uninstall [--gamepad|--audio]"
         ),
     }
 }
@@ -409,16 +409,25 @@ fn remove_pad_devnodes() {
     }
 }
 
-// ── `driver uninstall [--gamepad]` ──────────────────────────────────────────────────────────────
+// ── `driver uninstall [--gamepad|--audio]` ──────────────────────────────────────────────────────
 // The uninstaller's cleanup counterpart (Inno [UninstallRun]) — the field report was that our
-// virtual-device drivers survived an uninstall. Removes the pf-vdisplay device node(s) + driver
-// package, or (--gamepad) the pf-gamepad/pf-xusb driver packages (their devnodes are per-session
-// SwDeviceCreate'd and are already gone once the service stopped). Locale-safe by construction: we
-// never parse pnputil's localized LABELS — devices are matched on the un-localized VALUE side
-// (instance IDs / device IDs), and driver packages are found by scanning %WINDIR%\INF\oem*.inf
-// CONTENT for our driver names, then passed to pnputil by file name.
+// virtual devices survived an uninstall. Removes the pf-vdisplay device node(s) + driver package,
+// or (--gamepad) the pf-gamepad/pf-xusb driver packages (their devnodes are per-session
+// SwDeviceCreate'd and are already gone once the service stopped), or (--audio) the audio devnodes
+// the HOST mints at runtime — the same complaint one layer up, since those are created by the
+// running host rather than by any driver payload the installer laid down. Locale-safe by
+// construction: we never parse pnputil's localized LABELS — devices are matched on the
+// un-localized VALUE side (instance IDs / device IDs / registry markers), and driver packages are
+// found by scanning %WINDIR%\INF\oem*.inf CONTENT for our driver names, then passed to pnputil by
+// file name.
 
 fn driver_uninstall(args: &[String]) -> Result<()> {
+    // The audio leg touches no driver package and no certificate — it removes devnodes the host
+    // minted on Valve's drivers — so it returns before the cert purge below rather than making
+    // that purge run a third time per uninstall.
+    if flag_present(args, "--audio") {
+        return uninstall_audio_devices();
+    }
     let gamepad = flag_present(args, "--gamepad");
     let (what, res) = if gamepad {
         ("gamepad", uninstall_gamepad())
@@ -434,6 +443,38 @@ fn driver_uninstall(args: &[String]) -> Result<()> {
     // legs back to back. Uninstalling punktfunk must not leave a trusted root CA behind — and this
     // also collects the historical pile from the era when every build signed with a new cert.
     purge_driver_certs();
+    Ok(())
+}
+
+/// Remove the "Punktfunk Speakers"/"Punktfunk Microphone" endpoints and the per-pad DualSense
+/// speaker endpoints the running host minted — the audio half of the surviving-virtual-device
+/// complaint. Must run AFTER `service uninstall`: a live host re-mints them on its next wiring
+/// pass, which would make this sweep look like it did nothing.
+///
+/// Never removes Steam's streaming-audio DRIVERS. Ours are extra devnodes riding on drivers that
+/// belong to Steam and that the user's own Remote Play still needs; the sweep is marker-matched
+/// (see `audio::devnode_cleanup`) precisely so it can tell the two apart.
+fn uninstall_audio_devices() -> Result<()> {
+    match crate::audio::devnode_cleanup::purge() {
+        Ok(r) if r.devnodes == 0 && r.devnode_failures == 0 => {
+            println!("no punktfunk audio devices to remove")
+        }
+        Ok(r) => {
+            println!(
+                "removed {} punktfunk audio device(s), {} endpoint record(s)",
+                r.devnodes, r.endpoint_records
+            );
+            if r.devnode_failures > 0 {
+                eprintln!(
+                    "warning: {} punktfunk audio device(s) could not be removed — they can be \
+                     deleted from Device Manager (View ▸ Show hidden devices)",
+                    r.devnode_failures
+                );
+            }
+        }
+        // Best-effort like every other leg: an enumeration that fails must not fail the uninstall.
+        Err(e) => eprintln!("warning: audio device cleanup: {e:#}"),
+    }
     Ok(())
 }
 

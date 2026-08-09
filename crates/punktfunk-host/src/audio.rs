@@ -199,6 +199,11 @@ pub(crate) mod audio_probe;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/minted.rs"]
 pub(crate) mod minted;
+// The uninstall sweep over every audio devnode the two providers above (and the probe) mint —
+// pub(crate) for `driver uninstall --audio`, the installer's [UninstallRun] leg.
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/devnode_cleanup.rs"]
+pub(crate) mod devnode_cleanup;
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/wasapi_cap.rs"]
 mod wasapi_cap;
