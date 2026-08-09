@@ -406,6 +406,34 @@ fn recover_orphaned_default() {
     });
 }
 
+/// [`recover_orphaned_default`]'s uninstall-time twin: same "put the operator's device back if
+/// the default is still parked on ours" rule, minus the `Once` gate (the uninstaller is a fresh
+/// process that runs it exactly once) — and it always drops the marker file, because there is no
+/// next host run to consume it.
+///
+/// Why the uninstaller needs this at all: the devnode sweep that follows deletes the endpoint the
+/// default may still point at. Windows would then re-pick something on its own, but it re-picks by
+/// its OWN ranking, not the device the operator had before we parked it. Restoring first means
+/// uninstalling gives the box back exactly the default it came with.
+///
+/// Returns whether a device was actually put back — the caller only logs it.
+pub(crate) fn unpark_default_for_uninstall() -> bool {
+    let path = park_marker_path();
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&path);
+    let mut lines = s.lines();
+    let (Some(prev), Some(set)) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    // A default the operator changed by hand since the park wins, exactly as on the recovery path.
+    if default_render_id().as_deref() != Some(set) {
+        return false;
+    }
+    set_default_endpoint(prev).is_ok()
+}
+
 /// Make `id` the default playback device for the duration of the desktop-audio capture,
 /// remembering the operator's current default (in memory + the crash marker) the FIRST time so
 /// [`restore_default_playback`] can put it back. Nothing is remembered when `id` already is the

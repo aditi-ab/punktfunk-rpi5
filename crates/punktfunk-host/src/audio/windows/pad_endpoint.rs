@@ -87,13 +87,15 @@ const DEVNODE_DESC: &str = "Punktfunk Pad Audio";
 /// The multi-instancing Steam Remote Play render driver we ride on.
 const SSS_HWID: &str = "ROOT\\SteamStreamingSpeakers";
 /// Registry value under the devnode's `Device Parameters` key persisting which pad slot the
-/// devnode serves (REG_DWORD).
-const PAD_INDEX_VALUE: &str = "PunktfunkPadIndex";
+/// devnode serves (REG_DWORD). pub(crate): the uninstall sweep
+/// ([`devnode_cleanup`](super::devnode_cleanup)) matches devnodes on it.
+pub(crate) const PAD_INDEX_VALUE: &str = "PunktfunkPadIndex";
 /// The endpoint store for render endpoints (each subkey = one endpoint GUID).
-const MMDEV_RENDER_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
+pub(crate) const MMDEV_RENDER_PATH: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
 /// The capture-direction sibling of [`MMDEV_RENDER_PATH`] — where a paired device's microphone
 /// half registers (the `audio-probe` devtest's S3 lookup).
-const MMDEV_CAPTURE_PATH: &str =
+pub(crate) const MMDEV_CAPTURE_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
 /// WASAPI endpoint-id prefix for render endpoints (`{0.0.0.00000000}.{guid}`).
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
@@ -355,8 +357,9 @@ fn reg_registry_value(v: &StampValue) -> winreg::RegValue<'static> {
 }
 
 /// The per-endpoint GUID portion of a WASAPI endpoint id (`{0.0.0.00000000}.{guid}` →
-/// `{guid}`) — the endpoint's MMDevices registry key name.
-fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
+/// `{guid}`) — the endpoint's MMDevices registry key name. pub(crate): the uninstall sweep
+/// deletes those keys by name.
+pub(crate) fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
     endpoint_id
         .rfind('{')
         .map(|i| &endpoint_id[i..])
