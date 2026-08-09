@@ -237,9 +237,17 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # with real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
 # Pure Rust `ash` (no new lib / no link-time dep); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0 opts
 # back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices degrade gracefully.
+# -p punktfunk-encode-worker: the capability-carrying PyroWave encode worker, shipped next to the
+# host in %%{_bindir} and granted cap_sys_nice=ep via %%caps in %%files. It MUST be a separate file
+# (the host can never carry a capability — KWin identification, see the note in %%files), and it
+# must ship in the SAME package: host and worker version-check each other over their socket and
+# fall back to the in-process encoder on any mismatch. Co-built in this one invocation on purpose —
+# v1 accepts that the worker links the same FFmpeg the host does (same package, same sonames, no
+# new break class), so cargo's feature unification here is harmless.
 %if %{with host}
 cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
+  -p punktfunk-host -p punktfunk-encode-worker \
+  -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
   -p pf-update
 %else
 # Client-only (aarch64): no host crate, so none of the encode features apply. pf-update still
@@ -282,6 +290,10 @@ fi
 %if %{with host}
 # Binary
 install -Dm0755 target/release/punktfunk-host %{buildroot}%{_bindir}/punktfunk-host
+# The PyroWave encode worker — a SEPARATE executable in the same bindir (the host resolves it as a
+# sibling of /proc/self/exe). This is the ONLY binary in this package that carries a capability;
+# see the %%caps note in %%files.
+install -Dm0755 target/release/punktfunk-encode-worker %{buildroot}%{_bindir}/punktfunk-encode-worker
 
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
@@ -499,6 +511,27 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 # rpm applies file capabilities from package metadata, so a package built WITHOUT %caps() installs
 # the binary with none and an upgrade from 0.26.0-1 clears it — no scriptlet needed.
 %{_bindir}/punktfunk-host
+# CAP_SYS_NICE on the ENCODE WORKER — the grant 0.26.0-1 aimed at the wrong binary, on a binary
+# that can carry it. punktfunk-encode-worker is a separate executable (never a hardlink or a host
+# subcommand: a shared inode would share the capability and re-create the breakage above). It is
+# spawned per PyroWave session, speaks one socketpair to its parent and never touches Wayland,
+# D-Bus or the network — so nothing ever resolves ITS /proc/<pid>/exe and the KWin identification
+# path stays clear.
+#
+# Declared with %%caps rather than a %%post setcap because that is the rpm-native form: rpm applies
+# the capability at install, RESTORES it on upgrade (a replaced file is a new inode), and verifies
+# it under `rpm -V`. A scriptlet does none of those. This also covers Bazzite via rpm-ostree
+# layering, which honours file capabilities from package metadata.
+#
+# Why: PyroWave encodes on the GPU shader cores the game saturates, and an elevated
+# VK_KHR_global_priority queue is the preemption lever. Every driver tested (NVIDIA and RADV)
+# refuses EVERY class without CAP_SYS_NICE. Measured on .21 (RTX 5070 Ti): encode p99 6.4 -> 4.4 ms.
+# Narrow — scheduling priority only, no filesystem/network/user-switching privilege, not setuid.
+# Best-effort by construction: an uncapped worker still encodes, at default priority.
+#
+# Debugging the WORKER (not the host): a capability makes it AT_SECURE, so the loader ignores
+# LD_LIBRARY_PATH/LD_PRELOAD for it and core dumps are suppressed by default.
+%caps(cap_sys_nice=ep) %{_bindir}/punktfunk-encode-worker
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %dir %{_libexecdir}/punktfunk

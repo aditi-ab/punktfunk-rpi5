@@ -45,5 +45,23 @@ RUN printf '%s\n' \
 # time (host + console run per-user in the graphical session, enabled after first boot with
 # `systemctl --user enable --now punktfunk-host punktfunk-web`).
 
+# NO `setcap` here — deliberately, in BOTH directions, and this file must stay that way.
+#
+#   /usr/bin/punktfunk-host          must carry NO capability. A capability-carrying process
+#                                    cannot have its /proc/<pid>/exe read, so KWin cannot identify
+#                                    it, never advertises zkde_screencast_unstable_v1, and every
+#                                    KDE desktop session dies. That is the 0.26.0-1 incident; a
+#                                    layered/bootc image is as unrepairable in place as a sysext.
+#   /usr/bin/punktfunk-encode-worker carries cap_sys_nice=ep, declared with %caps in
+#                                    packaging/rpm/punktfunk.spec. rpm applies file capabilities
+#                                    from package metadata during the dnf5 install above and the
+#                                    ostree commit preserves the security.capability xattr — so it
+#                                    arrives correctly without anything to do here, and the
+#                                    capability matrix is asserted on the .rpm in CI
+#                                    (scripts/ci/assert-cap-matrix.sh, .gitea/workflows/rpm.yml).
+#
+# If a capability is ever wanted in this image, change the SPEC, never this file: a setcap here
+# would apply to one channel and drift from the other four.
+
 # bootc image hygiene: the container build must leave a clean ostree commit.
 RUN ostree container commit

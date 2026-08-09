@@ -38,6 +38,16 @@ if [ ! -x "$BIN" ]; then
   echo "==> building $PKG (release)"
   PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p "$PKG" --locked   # stamp --version (build.rs)
 fi
+# The PyroWave encode worker — the capability-carrying half. A SEPARATE executable, never a
+# hardlink or a host subcommand: a shared inode would share the file capability and make the host
+# unidentifiable to KWin all over again (see the postinst note below). It ships in this same .deb
+# because host and worker version-check each other over their socket and fall back to the
+# in-process encoder on any mismatch, so they must move in lockstep.
+WORKER_BIN="target/release/punktfunk-encode-worker"
+if [ ! -x "$WORKER_BIN" ]; then
+  echo "==> building punktfunk-encode-worker (release)"
+  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p punktfunk-encode-worker --locked
+fi
 TRAY_BIN="target/release/punktfunk-tray"
 # ALWAYS built here, in its OWN cargo invocation — load-bearing, not tidiness, and deliberately not
 # skipped when the artifact already exists. Cargo unifies features across everything in one build,
@@ -60,6 +70,9 @@ SHAREDIR="$STAGE/usr/share/$PKG"
 
 # --- file layout (matches the RPM %install) ----------------------------------
 install -Dm0755 "$BIN"                              "$STAGE/usr/bin/$PKG"
+# Next to the host in the SAME bindir — the host resolves the worker as a sibling of
+# /proc/self/exe. postinst grants this one (and only this one) cap_sys_nice=ep.
+install -Dm0755 "$WORKER_BIN"                       "$STAGE/usr/bin/punktfunk-encode-worker"
 # Web-console-triggered updates (host-update-from-web-console.md §7): root helper + its
 # oneshot unit + the polkit rule scoping `systemctl start punktfunk-update.service` to the
 # (shipped-empty) punktfunk-update group. Opt-in = joining the group; postinst creates it.
@@ -195,13 +208,27 @@ if [ "$BUNDLE_FFMPEG" = "1" ]; then
     patchelf --set-rpath '$ORIGIN' "$so"
   done
   patchelf --force-rpath --set-rpath "\$ORIGIN/../lib/$PKG" "$STAGE/usr/bin/$PKG"
+  # The encode worker gets an ABSOLUTE rpath, not the $ORIGIN one the host uses — and this is
+  # load-bearing, not style. postinst grants the worker cap_sys_nice=ep, which makes it AT_SECURE,
+  # and glibc DROPS any $ORIGIN-expanded RPATH entry for a secure binary unless it normalizes into
+  # a system-trusted directory (/lib, /usr/lib — /usr/lib/punktfunk-host is not one). So a capped
+  # worker with `$ORIGIN/../lib/punktfunk-host` would find no libavcodec at all on Ubuntu 24.04 and
+  # fail to exec — the host would fall back inline (never a dead session, by the ladder's design)
+  # but the lever would be silently dead on exactly the channel that bundles FFmpeg. An absolute
+  # DT_RPATH is honoured under AT_SECURE, and because it is DT_RPATH (--force-rpath) it is searched
+  # transitively, so it also resolves libavutil for the bundled libavcodec — whose own $ORIGIN
+  # RUNPATH is subject to the same AT_SECURE rule inside this process.
+  patchelf --force-rpath --set-rpath "/usr/lib/$PKG" "$STAGE/usr/bin/punktfunk-encode-worker"
   BUNDLED_LIBS="$(printf '%s ' "$DEST"/*.so.*)"
   echo "==> bundled FFmpeg from $FFMPEG_PREFIX into /$LIBDIR_REL"
 fi
 
 # --- dependencies ------------------------------------------------------------
-# Auto: the binary's directly-linked shared libs (libcuda ignored, see header). In bundle mode the
-# bundled .so's are appended so their external deps (libva2/libdrm2/…) are captured too.
+# Auto: the binaries' directly-linked shared libs (libcuda ignored, see header). In bundle mode the
+# bundled .so's are appended so their external deps (libva2/libdrm2/…) are captured too. The encode
+# worker is scanned alongside the host: its link set is a subset today, but it is a shipped
+# executable in this package and a future divergence must show up as a Depends, not as a worker
+# that silently fails to exec on a fresh install.
 SHLIB_TMP="$(mktemp -d)"
 mkdir -p "$SHLIB_TMP/debian"
 cat > "$SHLIB_TMP/debian/control" <<EOF
@@ -218,7 +245,7 @@ EOF
 SHDEPS_RAW="$(
   cd "$SHLIB_TMP"
   if [ "$BUNDLE_FFMPEG" = "1" ]; then export LD_LIBRARY_PATH="$FFMPEG_PREFIX/lib"; fi
-  dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$BIN" $BUNDLED_LIBS 2>"$SHLIB_TMP/err" \
+  dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$BIN" "$ROOTDIR/$WORKER_BIN" $BUNDLED_LIBS 2>"$SHLIB_TMP/err" \
     | sed -n 's/^shlibs:Depends=//p'
 )" || { echo "dpkg-shlibdeps failed (exit $?):" >&2; sed 's/^/  /' "$SHLIB_TMP/err" >&2; rm -rf "$SHLIB_TMP"; exit 1; }
 rm -rf "$SHLIB_TMP"
@@ -311,6 +338,30 @@ if [ "$1" = "configure" ]; then
     # postinst runs on upgrade too, so this heals boxes that installed 0.26.0-1. `setcap -r` exits
     # non-zero on a file that has no capability, hence the redirect and `|| true`.
     setcap -r /usr/bin/punktfunk-host 2>/dev/null || true
+    # CAP_SYS_NICE on the ENCODE WORKER — the same grant, on the binary that can carry it.
+    #
+    # punktfunk-encode-worker is a SEPARATE executable (never a hardlink or a host subcommand: a
+    # shared inode shares the capability and re-creates the breakage above). It is spawned per
+    # PyroWave session, speaks one socketpair to its parent, and never connects to Wayland, D-Bus
+    # or the network — so nothing ever resolves ITS /proc/<pid>/exe and the KWin identification
+    # path above stays clear.
+    #
+    # Why it is worth a capability at all: PyroWave encodes on the GPU shader cores the game
+    # saturates, and an elevated VK_KHR_global_priority queue is the preemption lever. Every driver
+    # tested (NVIDIA and RADV) refuses EVERY class without CAP_SYS_NICE. Measured on an RTX 5070
+    # Ti under load: encode p99 6.4 -> 4.4 ms. Narrow — scheduling priority only, no filesystem,
+    # network or user-switching privilege, not setuid.
+    #
+    # Best-effort, always: an uncapped worker still encodes at default priority, so a box without
+    # libcap or a filesystem that cannot store capabilities must not fail this install. postinst
+    # runs on upgrade too, which is what re-applies the grant to the replaced (new-inode) file.
+    #
+    # Debugging the WORKER: a capability makes it AT_SECURE — the loader ignores LD_LIBRARY_PATH
+    # and LD_PRELOAD for it, and core dumps are suppressed. (On a bundled-FFmpeg build the worker
+    # carries an ABSOLUTE rpath for exactly that reason; see build-deb.sh.)
+    if [ -x /usr/bin/punktfunk-encode-worker ]; then
+        setcap 'cap_sys_nice=ep' /usr/bin/punktfunk-encode-worker 2>/dev/null || true
+    fi
     # Pick up the /dev/uinput rule without a reboot (best-effort, no-op in containers).
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=misc 2>/dev/null || true

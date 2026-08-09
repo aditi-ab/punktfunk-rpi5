@@ -106,8 +106,16 @@ build() {
     cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session \
       -p punktfunk-cli -p pf-update
   else
+  # `-p punktfunk-encode-worker`: the capability-carrying PyroWave encode worker, shipped next to
+  # the host in /usr/bin and setcap'd by punktfunk-host.install. It MUST be its own file — the host
+  # can never carry a capability (KWin identification; see the scriptlet) — and it must ship in the
+  # SAME package as the host, because host and worker version-check each other over their socket
+  # and fall back to the in-process encoder on any mismatch. Co-built here on purpose: v1 accepts
+  # that the worker links the same FFmpeg the host does (same package, same sonames, no new break
+  # class), so cargo's feature unification across this one invocation is harmless.
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
+    -p punktfunk-host -p punktfunk-encode-worker \
+    -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli \
     -p pf-update
   # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
   # across everything in one build, so co-building the tray with the host pulls the host's
@@ -183,6 +191,10 @@ package_punktfunk-host() {
   local R; R="$(_repo)"; local T="$srcdir/target/release"
 
   install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
+  # The PyroWave encode worker — a SEPARATE file in the same bindir (the host resolves it as a
+  # sibling of /proc/self/exe). punktfunk-host.install setcaps this one, and only this one; the
+  # host must stay capability-free or KWin cannot identify it and desktop streaming dies.
+  install -Dm0755 "$T/punktfunk-encode-worker"        "$pkgdir/usr/bin/punktfunk-encode-worker"
   # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
   install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
   # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can

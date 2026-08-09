@@ -174,8 +174,11 @@ systemctl --user enable --now punktfunk-host     # the user unit is now under /u
 The udev rule, sysctl, and systemd **user** unit all live under `/usr/lib`, so the merged sysext
 exposes them. `systemd-sysext refresh` re-merges after a reboot. (One HDR nuance of the sysext
 path: the image ships gamescope without `CAP_SYS_NICE`, so its frame pacing is marginally worse —
-everything works. Note the host binary carries no capability on *either* path, deliberately: one
-would make the host unidentifiable to KWin and break desktop streaming, see
+everything works. Capabilities inside the image: `punktfunk-host` carries **none**, on *either*
+path, deliberately — one would make it unidentifiable to KWin and break desktop streaming;
+`punktfunk-encode-worker` carries `cap_sys_nice=ep`, applied by `build-sysext.sh` because pacman
+scriptlets never run for a sysext and a merged `/usr` is read-only. Both are asserted at build
+time. See
 [Running as a service](https://punktfunk.io/docs/running-as-a-service#gpu-scheduling-priority).)
 
 ## Steam Deck — the client (what the Decky plugin launches)

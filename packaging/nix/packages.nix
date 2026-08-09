@@ -141,9 +141,17 @@ in
     commonArgs
     // {
       pname = "punktfunk-host";
-      # HOST ONLY — the tray is a separate derivation (see the note above; co-building crashes it).
+      # HOST + ENCODE WORKER — the tray is a separate derivation (see the note above; co-building
+      # crashes it), but punktfunk-encode-worker belongs here: it is the capability-carrying half of
+      # the PyroWave encode path, it shares the host's dependency graph by design, and host and
+      # worker version-check each other over their socket, so they must be built and shipped
+      # lockstep. It is a SEPARATE executable, never a hardlink or a host subcommand — on
+      # file-capability channels a shared inode would share the capability and make the host
+      # unidentifiable to KWin (see the note in nixos-module.nix). Without `-p` here crane never
+      # builds it and `$out/bin` simply would not contain it.
       cargoExtraArgs =
-        "--locked -p punktfunk-host " + "--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode";
+        "--locked -p punktfunk-host -p punktfunk-encode-worker "
+        + "--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode";
 
       PUNKTFUNK_BUILD_VERSION = buildVersion;
 
@@ -203,6 +211,11 @@ in
       postFixup = ''
         # Only the host dlopens the GPU stack; the tray (its own derivation, copied in above) does not.
         addDriverRunpath "$out/bin/punktfunk-host"
+        # The encode worker owns a Vulkan device of its own (PyroWave encodes through ash, which
+        # dlopens the loader and the vendor ICD), so it needs the same driver runpath. Without it
+        # the worker starts and then finds no usable device — the host falls back to the in-process
+        # encoder, so nothing breaks, but the GPU-priority lever this binary exists for is dead.
+        addDriverRunpath "$out/bin/punktfunk-encode-worker"
       '';
 
       meta = meta // {

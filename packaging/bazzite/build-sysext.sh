@@ -130,9 +130,9 @@ SYSEXT_VERSION_ID=$PF_VR
 EXTENSION_RELOAD_MANAGER=1
 EOF
 
-# NO CAP_SYS_NICE in the image — and an assertion that none crept back in.
+# CAP_SYS_NICE on the ENCODE WORKER, never on the host — and an assertion of BOTH halves.
 #
-# 0.26.0-1 setcap'd the staged binary here for the GPU-priority lever. mksquashfs records
+# 0.26.0-1 setcap'd the staged HOST binary here for the GPU-priority lever. mksquashfs records
 # security.capability, so the capability really did ship: verified by mounting the published
 # punktfunk-0.26.0-1-x86-64.raw, where `getcap usr/bin/punktfunk-host` reports `cap_sys_nice=ep`.
 # That broke desktop streaming on every Bazzite KDE box, field-reported as
@@ -143,22 +143,92 @@ EOF
 # /proc/<pid>/exe and matching it against an installed .desktop's Exec= — the image ships
 # usr/share/applications/io.unom.Punktfunk.Host.desktop for exactly that. The kernel refuses that
 # readlink to any reader whose effective set is not a superset of the target's PERMITTED set
-# (cap_ptrace_access_check), and KWin holds no capabilities. So a capability in this image makes the
-# host unidentifiable and every Desktop-mode session dies. Full matrix, including why neither
-# prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it, in
+# (cap_ptrace_access_check), and KWin holds no capabilities. So a capability on the HOST in this
+# image makes it unidentifiable and every Desktop-mode session dies. Full matrix, including why
+# neither prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it, in
 # packaging/arch/punktfunk-host.install.
 #
-# A merged sysext's /usr is a read-only squashfs, so this cannot be repaired on the box — the image
-# is the only place it can be got right. Assert it rather than trust it: the RPM payload arrives via
-# `rpm2cpio | cpio`, which carries no capabilities today, but the spec is one `%caps()` away from
-# changing that and this build would silently bake it in.
-if [ -f "$STAGE/usr/bin/punktfunk-host" ] && command -v getcap >/dev/null 2>&1; then
-  staged_caps="$(getcap "$STAGE/usr/bin/punktfunk-host" 2>/dev/null || true)"
-  if [ -n "$staged_caps" ]; then
-    echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
-    echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
-    echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
-    exit 1
+# usr/bin/punktfunk-encode-worker is the OTHER binary: a separate executable (never a hardlink or a
+# host subcommand — a shared inode shares the capability and re-creates the above), spawned per
+# PyroWave session, speaking one socketpair to its parent and touching neither Wayland nor D-Bus
+# nor the network. Nothing resolves ITS /proc/<pid>/exe, so it can carry the capability the lever
+# needs. This is the ONLY place the sysext can acquire it: a merged sysext's /usr is a read-only
+# squashfs, and it cannot ride in from the RPM either — the spec declares %caps(cap_sys_nice=ep),
+# but rpm keeps capabilities in its own header and `rpm2cpio | cpio` carries only the payload, so
+# the staged file arrives with none. mksquashfs DOES record security.capability (only
+# security.selinux is excluded below), so a setcap on the staging tree is what lands in the image.
+#
+# Needs CAP_SETFCAP, i.e. root (or fakeroot). A plain-user build simply cannot, and that is NOT
+# fatal: an uncapped worker still encodes, at default priority. Warn and carry on rather than fail
+# a release over a pacing lever.
+#
+# `getcap` on a file with no capability exits 0 and prints nothing, so an empty read is unambiguous.
+# The output form differs across libcap versions ("path cap_sys_nice=ep" since ~2.36, "path =
+# cap_sys_nice+ep" before), hence the normalizer.
+_pf_caps_of() {
+  # -> canonical "cap_sys_nice=ep", or "" when the file carries no capability.
+  local raw; raw="$(getcap "$1" 2>/dev/null || true)"
+  [ -n "$raw" ] || { printf ''; return 0; }
+  printf '%s' "${raw#* }" | sed -e 's/^= *//' -e 's/+/=/' -e 's/[[:space:]]*$//'
+}
+
+# BEFORE granting: refuse a capability that arrived from somewhere else. The setcap below would
+# overwrite it and ship a correct-looking image while the surprise — a stray %caps() in the spec, a
+# payload from an unexpected source — went unreported on every other channel. Order matters: assert
+# first, then grant, or the "anything else" arm can never fire.
+if command -v getcap >/dev/null 2>&1 && [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+  arrived_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
+  case "$arrived_caps" in
+    ''|cap_sys_nice=ep) : ;;
+    *)
+      echo "ERROR: staged usr/bin/punktfunk-encode-worker ARRIVED carrying '$arrived_caps'." >&2
+      echo "       Nothing upstream of this script should grant it anything: rpm keeps capabilities" >&2
+      echo "       in its own header and 'rpm2cpio | cpio' carries only the payload. Find out what" >&2
+      echo "       did — it is granting the same thing on the plain RPM path, unchecked." >&2
+      exit 1 ;;
+  esac
+fi
+
+if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-encode-worker" 2>/dev/null; then
+    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-encode-worker (GPU-priority lever active)"
+  else
+    echo "WARNING: could not setcap CAP_SYS_NICE on usr/bin/punktfunk-encode-worker (need" >&2
+    echo "         root/CAP_SETFCAP) — the image ships without it and PyroWave encodes at" >&2
+    echo "         default GPU priority." >&2
+  fi
+fi
+
+# Assert the final matrix rather than trust it. A merged sysext's /usr is a read-only squashfs, so
+# a bad image cannot be repaired on the box — the image is the only place this can be got right.
+#
+#   host   -> MUST be empty. Hard fail. (The RPM payload carries no capabilities today, but the
+#             spec is one `%caps()` away from changing that and this build would bake it in.)
+#   worker -> MUST be exactly cap_sys_nice=ep if it carries anything at all. MISSING IS NOT AN
+#             ERROR (a plain-user build cannot setcap; best-effort by design), but a DIFFERENT or
+#             WIDER capability is — and a read-only image is not the place to discover it.
+if command -v getcap >/dev/null 2>&1; then
+  if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
+    staged_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-host")"
+    if [ -n "$staged_caps" ]; then
+      echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
+      echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
+      echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
+      echo "       The GPU-priority capability belongs on usr/bin/punktfunk-encode-worker, never here." >&2
+      exit 1
+    fi
+  fi
+  if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+    worker_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
+    case "$worker_caps" in
+      '')             echo "note: usr/bin/punktfunk-encode-worker ships uncapped — PyroWave encodes at default GPU priority" ;;
+      cap_sys_nice=ep) : ;;
+      *)
+        echo "ERROR: staged usr/bin/punktfunk-encode-worker carries '$worker_caps'," >&2
+        echo "       expected exactly 'cap_sys_nice=ep' (or nothing at all)." >&2
+        echo "       Refusing to bake an unexpected capability into a read-only image." >&2
+        exit 1 ;;
+    esac
   fi
 fi
 

@@ -50,10 +50,40 @@ _revoke_sched_capability() {
   setcap -r usr/bin/punktfunk-host 2>/dev/null || true
 }
 
+# CAP_SYS_NICE on the ENCODE WORKER — the same GPU-scheduling grant 0.26.0-1 aimed at the wrong
+# binary, now on a binary that can carry it.
+#
+# punktfunk-encode-worker is a separate executable (never a hardlink or a subcommand of the host —
+# a shared inode would share the file capability and silently re-create the breakage above). It is
+# spawned per PyroWave session, speaks one socketpair to its parent, and never connects to Wayland,
+# D-Bus or the network — so it is not a KWin client, nothing ever resolves its /proc/<pid>/exe, and
+# a capability on it is invisible to the identification path that the host must keep clear.
+#
+# What it buys: PyroWave encodes on the same GPU shader cores the game saturates, and an elevated
+# VK_KHR_global_priority queue is the preemption lever for that. Every driver tested (NVIDIA and
+# RADV alike) refuses EVERY priority class without CAP_SYS_NICE, so without this line the lever is
+# decoration. Measured on .21 (RTX 5070 Ti, GRID 2 loop): encode p99 6.4 -> 4.4 ms.
+#
+# NARROW: CAP_SYS_NICE permits raising scheduling priority only (nice/ioprio/affinity/RT class). No
+# filesystem, network or user-switching privilege, and it is NOT setuid.
+#
+# BEST-EFFORT, always: an uncapped worker still encodes, at default priority. A box without libcap,
+# or a filesystem that cannot store capabilities, must never fail an install over a pacing lever.
+#
+# Two consequences worth knowing before debugging the WORKER (they do not apply to the host):
+#  * a file capability makes the process AT_SECURE, so the loader ignores LD_LIBRARY_PATH and
+#    LD_PRELOAD for it — a library-path shim that rescues the host will NOT reach the worker.
+#  * core dumps are suppressed for capability-carrying binaries by default (fs.suid_dumpable).
+_grant_worker_sched_capability() {
+  [ -f usr/bin/punktfunk-encode-worker ] || return 0
+  setcap 'cap_sys_nice=ep' usr/bin/punktfunk-encode-worker 2>/dev/null || true
+}
+
 post_install() {
   _ensure_update_group
   _ensure_punktfunk_group
   _revoke_sched_capability
+  _grant_worker_sched_capability
   udevadm control --reload-rules 2>/dev/null || true
   udevadm trigger --subsystem-match=misc 2>/dev/null || true
   # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
@@ -114,6 +144,10 @@ post_upgrade() {
   _ensure_punktfunk_group
   # Strip the cap_sys_nice 0.26.0-1 granted: it makes the host unidentifiable to KWin (see above).
   _revoke_sched_capability
+  # And (re-)grant it to the encode worker. On UPGRADE too, and this one is not belt-and-braces:
+  # pacman writes a REPLACED binary as a new inode, file capabilities live on the inode, so the
+  # grant is gone after every single upgrade unless it is re-applied here.
+  _grant_worker_sched_capability
   udevadm control --reload-rules 2>/dev/null || true
   sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
   _warn_stale_firewall_ports

@@ -23,6 +23,11 @@ ensure_group() {
 SRC="${PUNKTFUNK_SRC:-$HOME/punktfunk}"
 BOX="${PUNKTFUNK_BOX:-pf2}"
 TARGET_DIR="$SRC/target-steamos"
+BIN="$TARGET_DIR/release/punktfunk-host"
+# The PyroWave encode worker — a separate executable next to the host, and the only one this
+# script setcaps (see the capability block in the sudo section). Never a hardlink or a mode of
+# $BIN: a shared inode shares the file capability and voids the KWin .desktop grant.
+WORKER="$TARGET_DIR/release/punktfunk-encode-worker"
 [ -d "$SRC/crates/punktfunk-host" ] || die "no punktfunk source at $SRC (set PUNKTFUNK_SRC)"
 WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
@@ -52,8 +57,10 @@ if [ "${1:-}" = "--pull" ]; then
 fi
 
 log "Rebuilding host (release)"
-# vulkan-encode matches the packaged builds (deb/arch) — see install.sh.
-distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR'; cd '$SRC' && cargo build -r -p punktfunk-host --features punktfunk-host/vulkan-encode"
+# vulkan-encode matches the packaged builds (deb/arch) — see install.sh. punktfunk-encode-worker
+# rides along: host and worker version-check each other over their socket and fall back to the
+# in-process encoder on any mismatch, so an update must never move one without the other.
+distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR'; cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker --features punktfunk-host/vulkan-encode"
 ok "host rebuilt"
 if [ "$WEB" = 1 ]; then
     log "Rebuilding web console"
@@ -197,6 +204,31 @@ if [ "$SUDO_OK" = 1 ]; then
     else
         warn "could not create the 'punktfunk' group — the native Steam Deck pad will not attach."
         warn "By hand: sudo groupadd --system punktfunk; sudo usermod -aG punktfunk $USER"
+    fi
+    # Capabilities, re-applied because this script just REBUILT both binaries and a rebuilt file is
+    # a new inode — file capabilities do not follow it.
+    #
+    #   host   -> `setcap -r`. It must carry NO capability, ever: KWin identifies a client by
+    #             resolving /proc/<pid>/exe against a .desktop Exec= (the one refreshed above), and
+    #             the kernel refuses that readlink for a capability-carrying process, so every
+    #             Desktop-mode session dies with "KWin does not expose zkde_screencast_unstable_v1
+    #             to this client". This also heals a Deck that ran 0.26.0-1's installer and has
+    #             only ever updated since — install.sh's removal is not reachable from this path.
+    #   worker -> `cap_sys_nice=ep`. Separate binary, spawned per PyroWave session, no Wayland/
+    #             D-Bus/network, so nothing resolves its /proc/<pid>/exe. Without the capability
+    #             every driver refuses every elevated global-priority class and the lever is inert.
+    #
+    # Both best-effort: `setcap -r` exits non-zero on a file that has no capability, and a failed
+    # grant just means the encode runs at default priority.
+    if [ -x "$BIN" ]; then
+        sudo setcap -r "$BIN" 2>/dev/null || true
+    fi
+    if [ -x "$WORKER" ]; then
+        if sudo setcap 'cap_sys_nice=ep' "$WORKER" 2>/dev/null; then
+            ok "re-granted CAP_SYS_NICE to the encode worker (rebuild = new inode)"
+        else
+            warn "could not grant CAP_SYS_NICE to $WORKER — PyroWave stays at default GPU priority"
+        fi
     fi
     # Register the tuning on Valve's atomic-update preserve list (see install.sh §4): without
     # this, every SteamOS A/B update strips the three files above again (verified live —

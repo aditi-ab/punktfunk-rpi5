@@ -103,7 +103,11 @@ jobs:
           # gamescope`.) Matches packaging/rpm/punktfunk.spec, which dropped its BuildRequires too.
           dnf -y install gtk4-devel libadwaita-devel SDL3-devel
           # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
-          dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted
+          # libcap = setcap/getcap: the sysext is the ONLY place the image can acquire
+          # cap_sys_nice=ep on punktfunk-encode-worker (a merged /usr is read-only squashfs and no
+          # scriptlet ever runs), and it is also what the build's host-must-be-uncapped assertion
+          # and the capability-matrix CI leg read with. Without it the image ships the lever inert.
+          dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted libcap
           # Fedora's own gamescope, for its RUNTIME libraries only — never shipped, never run. The
           # sysext folds in our punktfunk-gamescope and verifies it by executing `--version`, and
           # on a cache hit (the common case) nothing else in this job would have pulled libavif /
@@ -154,6 +158,20 @@ jobs:
           RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
           RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
         run: bash packaging/rpm/sign-rpms.sh
+
+      # Read the file-capability matrix out of the BUILT rpm, before anything is signed or
+      # published. 0.26.0-1 shipped `%caps(cap_sys_nice=ep)` on the host through this very spec —
+      # on Fedora and, via rpm-ostree layering, on Bazzite — and every board was green while every
+      # KDE desktop session died in the field. The lesson recorded then was "verify the PACKAGE,
+      # never the board"; this is that. Host must carry NOTHING; the worker must carry exactly
+      # cap_sys_nice=ep. `--self-test` first, so a guard that has quietly stopped being able to
+      # fail takes the job down instead of waving the release through.
+      - name: Assert the capability matrix (rpm)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          # Only the main host package carries binaries; -debuginfo/-debugsource and the
+          # client/web/scripting subpackages ship neither and are skipped by the script itself.
+          bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-[0-9]*.rpm
 
       - name: Publish to the Gitea RPM registry
         env:
@@ -301,6 +319,19 @@ jobs:
             dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
             dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm
+
+      # Read the capability matrix back OUT of the image that is about to be published — the one
+      # channel where getting it wrong is unrepairable, because a merged sysext's /usr is read-only
+      # squashfs and the only fix is a new image plus a feed republish. 0.26.0-1's Bazzite breakage
+      # was confirmed exactly this way, after the fact, by mounting the published .raw and running
+      # getcap on it. Doing it here means the .raw never reaches the feed.
+      #
+      # The script proves its own reader first (cap a file, squash it, unsquash it, read it back)
+      # so a runner that cannot see file capabilities FAILS the leg instead of blessing the image.
+      - name: Assert the capability matrix (sysext image)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh \
+            "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw"
 
       # The feed's SHA256SUMS is OpenPGP-signed with the same packages@unom.io key as the RPMs, and
       # punktfunk-sysext(8) refuses a feed it can't verify — the checksums alone never proved
