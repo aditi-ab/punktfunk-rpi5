@@ -29,6 +29,9 @@ fn main() {
 }
 
 #[cfg(windows)]
+mod gameinput;
+
+#[cfg(windows)]
 mod imp {
     use std::time::Duration;
 
@@ -486,11 +489,25 @@ mod imp {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut rounds = 0usize;
         let mut rumble_slot: Option<u32> = None;
+        let mut gameinput_report = false;
+        let mut gi_rumble: Option<String> = None;
+        let mut gi_pid: Option<u16> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--watch" => {
                     rounds = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(20);
+                    i += 1;
+                }
+                "--gameinput" => gameinput_report = true,
+                "--gi-pid" => {
+                    gi_pid = args
+                        .get(i + 1)
+                        .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+                    i += 1;
+                }
+                "--gi-rumble" => {
+                    gi_rumble = args.get(i + 1).cloned();
                     i += 1;
                 }
                 "--rumble" => {
@@ -559,6 +576,28 @@ mod imp {
         if let Some(slot) = rumble_slot {
             println!();
             rumble(slot, 3);
+        }
+        if gameinput_report || gi_rumble.is_some() {
+            println!("\n== GameInput ==");
+            match crate::gameinput::GameInput::create() {
+                Err(e) => println!("  unavailable: {e}"),
+                Ok(gi) => {
+                    gi.report();
+                    if let Some(spec) = &gi_rumble {
+                        let v: Vec<f32> = spec
+                            .split(',')
+                            .map(|p| p.trim().parse().unwrap_or(0.0))
+                            .collect();
+                        let p = crate::gameinput::GameInputRumbleParams {
+                            lowFrequency: v.first().copied().unwrap_or(0.0),
+                            highFrequency: v.get(1).copied().unwrap_or(0.0),
+                            leftTrigger: v.get(2).copied().unwrap_or(0.0),
+                            rightTrigger: v.get(3).copied().unwrap_or(0.0),
+                        };
+                        gi.rumble(p, std::time::Duration::from_secs(3), gi_pid);
+                    }
+                }
+            }
         }
     }
 }
