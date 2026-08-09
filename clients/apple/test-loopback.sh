@@ -26,8 +26,11 @@ mkdir -p "$CFG/open" "$CFG/paired" "$CFG/guess"
 trap 'kill "${HOST_PID:-}" "${PAIR_PID:-}" "${GUESS_PID:-}" 2>/dev/null || true' EXIT
 # The open host also scripts a feedback burst (rumble + DualSense hidout) right after the
 # handshake, so the Swift test can assert the host→client feedback planes end to end.
+# The open host outlives the others on purpose: AudioDeviceSwitchTests connects to it and then
+# spends tens of seconds moving the system's output device around, long after the 300 frames the
+# round-trip test needs.
 HOME="$CFG/open" XDG_CONFIG_HOME="$CFG/open/.config" PUNKTFUNK_TEST_FEEDBACK=1 \
-    target/release/punktfunk-host punktfunk1-host --port "$PORT" --source synthetic --frames 300 \
+    target/release/punktfunk-host punktfunk1-host --port "$PORT" --source synthetic --frames 12000 \
     --allow-tofu &
 HOST_PID=$!
 HOME="$CFG/paired" XDG_CONFIG_HOME="$CFG/paired/.config" \
@@ -61,4 +64,4 @@ cd clients/apple
 PUNKTFUNK_LOOPBACK_PORT="$PORT" PUNKTFUNK_PAIRING_PORT="$PAIR_PORT" PUNKTFUNK_PAIRING_PIN="$PIN" \
     PUNKTFUNK_GUESS_PORT="$GUESS_PORT" PUNKTFUNK_GUESS_PIN="$GUESS_PIN" \
     PUNKTFUNK_TEST_FEEDBACK=1 \
-    swift test --filter LoopbackIntegrationTests
+    swift test --filter 'LoopbackIntegrationTests|AudioDeviceSwitchTests'

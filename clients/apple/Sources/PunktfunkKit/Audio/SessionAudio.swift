@@ -21,6 +21,10 @@
 //
 // Devices are chosen by UID ("" = system default: the engine is then never pinned to a
 // concrete device and follows default-device changes).
+//
+// Surviving the hardware. An AVAudioEngine does NOT follow the audio hardware: when the output
+// device changes underneath a running engine, the engine stops itself and stays stopped. The
+// session therefore watches for that and rebuilds its engines — see "Device changes" below.
 
 import AVFoundation
 import os
@@ -79,13 +83,48 @@ public final class SessionAudio {
     /// session's activate.
     private static let sessionQueue = DispatchQueue(label: "io.unom.punktfunk.audio.session")
     #endif
-    #if os(iOS)
-    /// Live only for a `.playAndRecord` session: the token for the route-change observer that
-    /// keeps the BUILT-IN output on the speaker rather than the earpiece (see
-    /// `steerBuiltInOutputToSpeaker`). A `.playback` session already prefers the speaker and
-    /// never needs steering, so the mic-off path installs nothing. Guarded by `stateLock`.
+    #if !os(macOS)
+    /// Token for the route-change observer: it revives an engine the route change stopped, and on
+    /// iOS re-applies the earpiece steer (see `installRouteObserver`). Guarded by `stateLock`.
     private var routeObserver: NSObjectProtocol?
+    /// Token for the media-services-reset observer — the audio server restarting takes the
+    /// session's configuration and every engine with it. Guarded by `stateLock`.
+    private var mediaResetObserver: NSObjectProtocol?
     #endif
+
+    // MARK: - Device changes (see `installDeviceChangeRecovery`)
+
+    /// What `start()` was asked for, so a rebuild can put back the SAME topology the session was
+    /// started with. Main-thread confined, like the start paths that read it.
+    private var startConfig: StartConfig?
+    private struct StartConfig {
+        let speakerUID: String
+        let micUID: String
+        let micChannel: Int
+        let micEnabled: Bool
+        let echoCancel: Bool
+    }
+    /// Watches the hardware for us (see `AudioDeviceWatcher`). Guarded by `stateLock`.
+    private var deviceWatcher: AudioDeviceWatcher?
+    /// Whether the engines have been built at least once. Distinguishes "not started yet" (iOS
+    /// starts asynchronously) from "started and dead", which is what the recovery may act on.
+    /// Main-thread confined.
+    private var enginesAttempted = false
+    /// A rebuild is already on the main queue — one device switch produces a burst of triggers
+    /// and they must collapse into one restart. Main-thread confined.
+    private var rebuildQueued = false
+    /// `systemUptime` of the last rebuild, so a device that renegotiates in a loop cannot spin
+    /// the session. Main-thread confined.
+    private var lastRebuildAt: TimeInterval = 0
+    /// Let the burst of triggers from one switch land before rebuilding.
+    private static let rebuildDebounce: TimeInterval = 0.15
+    /// Floor between two rebuilds.
+    private static let rebuildFloor: TimeInterval = 0.5
+    /// Retries when a rebuild's `start()` loses the race with a device that is still going away
+    /// (0.3 s, 0.6 s, 1.2 s). A failed rebuild leaves no engine to post the next notification,
+    /// so this ladder — and, on macOS, the HAL listener — is all that stands between a mistimed
+    /// switch and a silent session.
+    private static let rebuildAttempts = 3
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -96,10 +135,14 @@ public final class SessionAudio {
     /// Engine teardown still belongs to stop().
     deinit {
         flag.stop()
-        #if os(iOS)
-        // The observer only holds self weakly, so we can be deinited with it still registered;
-        // drop the token here too rather than leaking it when an owner skips stop().
+        // The observers only hold self weakly, so we can be deinited with them still registered;
+        // drop them here too rather than leaking them when an owner skips stop().
+        deviceWatcher?.stop()
+        #if !os(macOS)
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        if let mediaResetObserver {
+            NotificationCenter.default.removeObserver(mediaResetObserver)
+        }
         #endif
     }
 
@@ -120,6 +163,12 @@ public final class SessionAudio {
         videoLatency: LatencyMeter? = nil
     ) {
         self.videoLatency = videoLatency
+        // Before any engine exists: the recovery watches the hardware, not the engines, and the
+        // config it rebuilds from has to be recorded whether or not this start succeeds.
+        startConfig = StartConfig(
+            speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
+            micEnabled: micEnabled, echoCancel: echoCancel)
+        installDeviceChangeRecovery(micEnabled: micEnabled)
         #if os(macOS)
         // No AVAudioSession on macOS — start the engines directly (caller's thread, as before).
         startEngines(
@@ -189,10 +238,10 @@ public final class SessionAudio {
             #if os(iOS)
             // Only the `.playAndRecord` session can land on the earpiece, and only it accepts an
             // output override — so the mic-off (`.playback`) path deliberately does neither.
-            if micEnabled {
-                steerBuiltInOutputToSpeaker(session)
-                installRouteObserver()
-            }
+            // (The route OBSERVER that re-applies this per route is installed by
+            // `installDeviceChangeRecovery`, for every session — a `.playback` session steers
+            // nothing but still has engines a route change can stop.)
+            if micEnabled { steerBuiltInOutputToSpeaker(session) }
             #endif
         } catch {
             log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
@@ -220,11 +269,20 @@ public final class SessionAudio {
         }
     }
 
+    #endif
+
+    #if !os(macOS)
     /// Routes change under a live session: a headset connects mid-stream, or disconnects and hands
-    /// the stream back to the built-in output. iOS drops an output override whenever the route
-    /// changes — which is what lets a newly-connected headset win — so the earpiece steer is a
-    /// property of the CURRENT route and has to be re-applied per route. Without this, dropping
-    /// Bluetooth mid-stream would land the game on the earpiece.
+    /// the stream back to the built-in output. Two things follow from that.
+    ///
+    /// iOS drops an output override whenever the route changes — which is what lets a newly-
+    /// connected headset win — so the earpiece steer is a property of the CURRENT route and has to
+    /// be re-applied per route. Without it, dropping Bluetooth mid-stream lands the game on the
+    /// earpiece.
+    ///
+    /// And on every platform a route change can take the engines down with it (see
+    /// `installDeviceChangeRecovery`), which is why this is installed for `.playback` sessions and
+    /// on tvOS too, where there is no earpiece to steer away from.
     private func installRouteObserver() {
         let observer = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
@@ -235,7 +293,10 @@ public final class SessionAudio {
             // other call into it.
             SessionAudio.sessionQueue.async {
                 guard let self, !self.flag.isStopped else { return }
+                #if os(iOS)
                 self.steerBuiltInOutputToSpeaker(AVAudioSession.sharedInstance())
+                #endif
+                DispatchQueue.main.async { self.reviveStoppedEngines("the audio route changed") }
             }
         }
         stateLock.lock()
@@ -252,6 +313,7 @@ public final class SessionAudio {
     private func startEngines(
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool
     ) {
+        enginesAttempted = true // even if every path below fails — see `reviveStoppedEngines`
         #if os(tvOS)
         // No app-accessible microphone input on tvOS — playback only.
         startPlayback(speakerUID: speakerUID)
@@ -325,33 +387,27 @@ public final class SessionAudio {
     public func stop() {
         flag.stop() // before taking the engines — see stateLock's comment
         stateLock.lock()
-        let capture = captureEngine
-        captureEngine = nil
-        let playback = playbackEngine
-        playbackEngine = nil
-        let combined = combinedEngine
-        combinedEngine = nil
         let wasDraining = drainStarted
         drainStarted = false
-        #if os(iOS)
+        let watcher = deviceWatcher
+        deviceWatcher = nil
+        #if !os(macOS)
         let route = routeObserver
         routeObserver = nil
+        let mediaReset = mediaResetObserver
+        mediaResetObserver = nil
         #endif
         stateLock.unlock()
-        #if os(iOS)
-        // Before the deactivate below, so a route change during teardown can't re-steer a session
-        // we are in the middle of releasing.
+        // Every watcher goes before the engines do: a device change landing during teardown must
+        // not schedule a rebuild of a session we are in the middle of releasing. (`flag` already
+        // guards that, but not arming the trigger is better than catching it.) On iOS this is
+        // also ahead of the deactivate below, so a route change cannot re-steer a dying session.
+        watcher?.stop()
+        #if !os(macOS)
         if let route { NotificationCenter.default.removeObserver(route) }
+        if let mediaReset { NotificationCenter.default.removeObserver(mediaReset) }
         #endif
-        if let capture {
-            capture.inputNode.removeTap(onBus: 0)
-            capture.stop()
-        }
-        playback?.stop()
-        if let combined {
-            combined.inputNode.removeTap(onBus: 0)
-            combined.stop()
-        }
+        tearDownEngines()
         #if !os(macOS)
         // Release the session so audio we interrupted (Music, podcasts) gets its resume cue. Like
         // activation, setActive is synchronous/blocking — run it on the shared serial session queue
@@ -371,6 +427,234 @@ public final class SessionAudio {
             _ = drainDone.wait(timeout: .now() + .milliseconds(400))
         }
     }
+
+    /// Stop and release every engine we own, leaving the ring, the drain thread, the observers and
+    /// the audio session alone — the teardown half shared by `stop()` and a rebuild. Safe from any
+    /// thread; the engines are taken under the lock before any of them is touched.
+    private func tearDownEngines() {
+        stateLock.lock()
+        let capture = captureEngine
+        captureEngine = nil
+        let playback = playbackEngine
+        playbackEngine = nil
+        let combined = combinedEngine
+        combinedEngine = nil
+        stateLock.unlock()
+        if let capture {
+            capture.inputNode.removeTap(onBus: 0)
+            capture.stop()
+        }
+        playback?.stop()
+        if let combined {
+            combined.inputNode.removeTap(onBus: 0)
+            combined.stop()
+        }
+    }
+
+    // MARK: - Device changes
+
+    /// An AVAudioEngine does not follow the audio hardware. When the output device changes under a
+    /// running engine — AirPods taken out of an ear, a headset unplugged, the default switched in
+    /// System Settings — the engine's IO unit sees the new hardware, THE ENGINE STOPS ITSELF, and
+    /// it posts `AVAudioEngineConfigurationChange`. It stays stopped until somebody starts it
+    /// again. Nothing here ever did, so from that moment the session rendered silence: no audio on
+    /// the speakers the stream had just moved to, and none in the AirPods when they went back in
+    /// (that is a second stop, not a recovery), until the whole stream was restarted. Measured on
+    /// this exact topology: render callbacks go from ~94/s to zero the instant the default output
+    /// device changes, and both restarting the same engine and building a fresh one resume them.
+    ///
+    /// Three triggers feed one rebuild, because no single one of them covers the ground:
+    ///
+    ///  - the engine notification, everywhere — the direct signal, but only an engine that still
+    ///    EXISTS can post it, so it cannot report a rebuild that failed to start;
+    ///  - the HAL default-output-device listener, macOS — independent of any engine and of the
+    ///    engine's topology. It is what makes the recovery work for the voice-processing engine
+    ///    (mic + echo cancellation, the DEFAULT macOS configuration) without having to assume that
+    ///    a VPIO engine posts the notification the plain one demonstrably does;
+    ///  - the route-change and media-services-reset notifications, iOS/tvOS, where the session and
+    ///    not the device is what moves.
+    ///
+    /// `micEnabled` only decides whether the mic-bearing session observers are worth installing.
+    /// Main thread.
+    private func installDeviceChangeRecovery(micEnabled: Bool) {
+        stateLock.lock()
+        let already = deviceWatcher != nil
+        stateLock.unlock()
+        guard !already else { return } // a second start() on one SessionAudio: keep the first set
+
+        let watcher = AudioDeviceWatcher(
+            isOurs: { [weak self] posted in self?.ownsEngine(posted) ?? false },
+            onChange: { [weak self] reason in self?.hardwareMoved(reason) })
+        stateLock.lock()
+        deviceWatcher = watcher
+        stateLock.unlock()
+        watcher.start()
+
+        #if !os(macOS)
+        installRouteObserver()
+        installMediaResetObserver(micEnabled: micEnabled)
+        #endif
+    }
+
+    /// Is `posted` one of the engines this session currently owns? A retired engine posts one last
+    /// configuration change as it is torn down, and another AVAudioEngine in the process is none of
+    /// our business — identity only, the object is never resurrected.
+    private func ownsEngine(_ posted: AnyObject?) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return posted === playbackEngine || posted === captureEngine || posted === combinedEngine
+    }
+
+    /// The hardware moved (main queue, from `AudioDeviceWatcher`). Both reasons ask the same
+    /// question — is playback still where it should be — but they answer it differently: an engine
+    /// that told us it stopped is definitive, while the default device moving might not concern us
+    /// at all.
+    private func hardwareMoved(_ reason: AudioDeviceWatcher.Reason) {
+        guard !flag.isStopped else { return }
+        switch reason {
+        case .engineConfiguration:
+            scheduleEngineRebuild(reason: reason.rawValue)
+        case .defaultOutputDevice:
+            #if os(macOS)
+            defaultOutputChanged()
+            #else
+            break // the watcher only raises this one on macOS
+            #endif
+        }
+    }
+
+    /// Restart the engines if — and only if — playback is down. The conservative trigger: it is
+    /// what a route change (iOS/tvOS) and the macOS backstop get to do, since a HEALTHY engine
+    /// that followed the change on its own must not be interrupted for it.
+    ///
+    /// Gated on a start having been ATTEMPTED rather than on an engine existing, which is the
+    /// difference between recovering a session whose very first `startPlayback` failed — no
+    /// output device at the moment it connected — and leaving it silent for good. On iOS the same
+    /// flag keeps this from racing the asynchronous start, where no engine yet is normal.
+    private func reviveStoppedEngines(_ reason: String) {
+        guard !flag.isStopped, enginesAttempted, !playbackIsLive else { return }
+        scheduleEngineRebuild(reason: "playback is stopped and \(reason)")
+    }
+
+    /// Is the render side actually running? Both engines can carry it (`combinedEngine` when the
+    /// voice processor is engaged, `playbackEngine` otherwise). Taken out from under `stateLock`
+    /// before asking AVAudioEngine anything — the lock guards our handles, not the framework.
+    private var playbackIsLive: Bool {
+        stateLock.lock()
+        let playback = playbackEngine
+        let combined = combinedEngine
+        stateLock.unlock()
+        return (playback?.isRunning ?? false) || (combined?.isRunning ?? false)
+    }
+
+    /// Coalesce: one device switch produces a burst — the old device leaving, the default moving,
+    /// the new device settling, and each engine we own posting its own change — and one rebuild
+    /// serves all of it. The floor between rebuilds keeps a device that renegotiates in a loop
+    /// from spinning the session. Main thread.
+    private func scheduleEngineRebuild(reason: String) {
+        guard !rebuildQueued else { return }
+        rebuildQueued = true
+        let since = ProcessInfo.processInfo.systemUptime - lastRebuildAt
+        let delay = max(Self.rebuildDebounce, Self.rebuildFloor - since)
+        log.info("\(reason) — restarting the audio engines in \(Int(delay * 1000)) ms")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.rebuildEngines(attempt: 0)
+        }
+    }
+
+    /// Put back the topology this session was started with, on whatever hardware is there now.
+    ///
+    /// A full rebuild rather than a `start()` on the stopped engine, because the mic side has to
+    /// follow too: `installMicTap` reads the input's live format, and the voice processor
+    /// renegotiates its own. The RING is deliberately not touched — it is the one thing carried
+    /// across (`makePlaybackChain` reuses it, `startDrain` is idempotent), so the drain thread
+    /// keeps decoding right through the switch and its overflow policy has already dropped
+    /// everything that went stale while the engine was down.
+    private func rebuildEngines(attempt: Int) {
+        rebuildQueued = false
+        guard !flag.isStopped, let config = startConfig else { return }
+        lastRebuildAt = ProcessInfo.processInfo.systemUptime
+        tearDownEngines()
+        startEngines(
+            speakerUID: config.speakerUID, micUID: config.micUID, micChannel: config.micChannel,
+            micEnabled: config.micEnabled, echoCancel: config.echoCancel)
+
+        // Did playback actually come back? A device caught mid-transition can refuse to start, and
+        // a rebuild that fails leaves no engine to post the next notification — so this is the one
+        // path that must not just give up. (`startEngines` has logged the reason already.)
+        if playbackIsLive {
+            log.info("audio engines restarted on the current device")
+            return
+        }
+        guard attempt < Self.rebuildAttempts else {
+            #if os(macOS)
+            log.error("""
+                audio did not come back after the device change — the default-output watcher will \
+                try again when a device appears
+                """)
+            #else
+            log.error("audio did not come back after the route change")
+            #endif
+            return
+        }
+        rebuildQueued = true // holds off a trigger that would only race this ladder
+        let delay = Self.rebuildDebounce * Double(1 << (attempt + 1))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.rebuildEngines(attempt: attempt + 1)
+        }
+    }
+
+    #if os(macOS)
+    /// The system's output device moved. Rebuild only when it actually concerns this session: the
+    /// engine is gone or stopped, or it is playing to a device that is no longer the one we should
+    /// be on. Somebody changing the default while we are pinned to a named speaker is none of our
+    /// business, and rebuilding for it would cost an audible gap for nothing. Main queue (the
+    /// listener block is registered against it).
+    private func defaultOutputChanged() {
+        guard !flag.isStopped, let config = startConfig else { return }
+        stateLock.lock()
+        let engine = combinedEngine ?? playbackEngine
+        stateLock.unlock()
+        guard let engine, engine.isRunning, let unit = engine.outputNode.audioUnit,
+              let playingOn = Self.currentDevice(of: unit)
+        else {
+            // Nothing is playing. If an engine was expected at all, this is the backstop firing.
+            reviveStoppedEngines("the default output device moved")
+            return
+        }
+        // Empty UID = follow the system default; a pinned UID only moves if that device itself
+        // came or went, which `deviceID(forUID:)` reports by resolving to a different ID or none.
+        let shouldBeOn = config.speakerUID.isEmpty
+            ? AudioDevices.defaultOutputDevice()
+            : AudioDevices.deviceID(forUID: config.speakerUID)
+        guard let shouldBeOn, shouldBeOn != playingOn else { return }
+        scheduleEngineRebuild(reason: "the output device changed under the session")
+    }
+    #endif
+
+    #if !os(macOS)
+    /// The audio server can die and restart. It takes the session's configuration and every engine
+    /// with it, and the documented recovery is to build all of it again — the same rebuild a route
+    /// change uses, with the session activation back in front of it.
+    private func installMediaResetObserver(micEnabled: Bool) {
+        let observer = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            SessionAudio.sessionQueue.async {
+                guard let self, !self.flag.isStopped else { return }
+                self.activateAudioSession(micEnabled: micEnabled)
+                DispatchQueue.main.async {
+                    self.scheduleEngineRebuild(reason: "the audio services were reset")
+                }
+            }
+        }
+        stateLock.lock()
+        let stale = mediaResetObserver
+        mediaResetObserver = observer
+        stateLock.unlock()
+        if let stale { NotificationCenter.default.removeObserver(stale) }
+    }
+    #endif
 
     /// Silence the mic uplink (no room audio leaves the device) or restore it. THE one muting
     /// mechanism: the owner composes its reasons — the user's in-stream mute and the background
@@ -436,6 +720,21 @@ public final class SessionAudio {
         guard let s = ring?.stats else { return nil }
         return Stats(bufferMS: s.bufferedMS, avOffsetMS: s.avOffsetMS)
     }
+
+    #if os(macOS)
+    /// Whether playback is rendering, and the device it is rendering to. The device-change
+    /// recovery has exactly one observable signature from outside — "running again, on the device
+    /// the system just moved to" — and nothing else here could tell the two halves apart: a
+    /// stopped engine can still name the old device, and a retargeted one can still be stopped.
+    /// Used by `AudioDeviceSwitchTests`.
+    var playbackState: (running: Bool, device: AudioDeviceID?) {
+        stateLock.lock()
+        let engine = combinedEngine ?? playbackEngine
+        stateLock.unlock()
+        guard let engine else { return (false, nil) }
+        return (engine.isRunning, engine.outputNode.audioUnit.flatMap(Self.currentDevice(of:)))
+    }
+    #endif
 
     // MARK: - Playback (host → speaker)
 

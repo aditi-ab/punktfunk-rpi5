@@ -43,8 +43,21 @@ public enum AudioDevices {
     }
 
     private static func defaultInputDevice() -> AudioDeviceID? {
+        systemDevice(kAudioHardwarePropertyDefaultInputDevice)
+    }
+
+    /// The device the system is currently playing to — what an engine with no pinned speaker UID
+    /// follows, and so what `SessionAudio` compares its live output device against when the
+    /// default moves (AirPods in or out, a headset unplugged).
+    static func defaultOutputDevice() -> AudioDeviceID? {
+        systemDevice(kAudioHardwarePropertyDefaultOutputDevice)
+    }
+
+    private static func systemDevice(
+        _ selector: AudioObjectPropertySelector
+    ) -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
         var dev = AudioDeviceID(0)
