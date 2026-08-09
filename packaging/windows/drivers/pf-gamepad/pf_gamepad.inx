@@ -47,7 +47,11 @@ pf_gamepad.dll=1
 %DeviceDescDS4%=pfGamepad, pf_dualshock4
 %DeviceDescEdge%=pfGamepad, pf_dualsenseedge
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
-%DeviceDescXbox%=pfGamepad, root\pf_xboxwireless, pf_xboxwireless
+; ⚠️ The Xbox line installs its OWN section, `pfGamepadXbox`, and must keep doing so. Every other
+; identity shares `pfGamepad`; the Xbox one additionally attaches the `xinputhid` bus filter, and
+; putting that on a DualSense / DualShock 4 / Edge / Steam Deck would hand a PlayStation pad to
+; Microsoft's Xbox translator. The two sections are otherwise identical — keep them in step.
+%DeviceDescXbox%=pfGamepadXbox, root\pf_xboxwireless, pf_xboxwireless
 
 [pfGamepad.NT]
 CopyFiles=UMDriverCopy
@@ -82,6 +86,77 @@ UmdfFsContextUsePolicy=CanUseFsContext2
 ; Each pad gets its OWN WUDFHost so the driver's per-pad statics (incl. the shm index) don't collide
 ; across multiple simultaneous controllers (multi-pad).
 UmdfHostProcessSharing=ProcessSharingDisabled
+
+; ---------------------------------------------------------------------------------------------
+; The Xbox identity: `pfGamepad` plus the two registry values that make Windows PROMOTE the pad.
+;
+; Measured on .173, 2026-08-09. Without these, our HID Xbox pad is invisible to classic XInput and
+; to WGI `Gamepad`, and gets no rumble — the exact field symptom that started this work. With them
+; the HID child gains the `IG_00` token, an XUSB interface appears, XInput reads it (full stick
+; range and buttons) and `XInputSetState` rumble arrives back as HID output report 0x03.
+;
+; ⭐ Both values come straight out of Microsoft's own `xinputhid.inf`, which promotes Xbox pads by
+; an explicit hardware-id ALLOW-LIST (its own comment: "we can not use a Compatability ID … and so
+; rely on individual hardware IDs"). A software-enumerated devnode can never match those ids, so we
+; write what the matching install sections would have written. `045E:0B13`, the PID this identity
+; claims, is on that allow-list — twice.
+;
+; 🛑 THE PAIRING IS LOAD-BEARING AND THE TWO VALUES GO IN DIFFERENT KEYS. An A/B on the live box:
+; removing `DevicePropertyFlags` alone reverts ALL of it — no `IG_00`, no XUSB interface, no XInput,
+; no WGI entry — while `UpperFilters` alone is completely inert. `DevicePropertyFlags = 1` is
+; `BusDevice` in `xinputhid.h`, which Microsoft's comment glosses as "a focused bus filter driver
+; for the IG_ problem". It is not a description of the device; it is the switch that tells the
+; filter what job to do. An earlier session installed the filter WITHOUT it, measured a device that
+; produced nothing, and concluded the filter was broken and must never ship. It was not broken; it
+; had never been switched on.
+;
+; ⚠️ Both go on THIS node — the parent/transport devnode — not on the HID child. That is where a
+; real Xbox pad carries them: the Elite's Bluetooth transport node has `DevicePropertyFlags=1` and
+; the filter, while its HID child has plain `input.inf` and neither.
+[pfGamepadXbox.NT]
+CopyFiles=UMDriverCopy
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT
+; HKR in a DDInstall section is the SOFTWARE (driver) key — Control\Class\{...}\<NNNN>.
+AddReg=pfGamepadXbox_SW_AddReg
+
+[pfGamepadXbox.NT.hw]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.hw
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.hw
+; HKR in a .HW section is the HARDWARE (device) key — Enum\<instance>.
+AddReg=pfGamepadXbox_HW_AddReg
+
+[pfGamepadXbox.NT.Services]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.Services
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Services
+
+[pfGamepadXbox.NT.Filters]
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Filters
+
+[pfGamepadXbox.NT.Wdf]
+UmdfService="pf_gamepad", pf_gamepad_Install
+UmdfServiceOrder=pf_gamepad
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction=Copy
+UmdfFsContextUsePolicy=CanUseFsContext2
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[pfGamepadXbox_SW_AddReg]
+; 1 = BusDevice. See the block above — this is the half that actually does the work.
+HKR,,"DevicePropertyFlags",0x00010001,1
+
+[pfGamepadXbox_HW_AddReg]
+; 0x00010008 = REG_MULTI_SZ | APPEND, matching xinputhid.inf: append rather than replace, so we
+; never clobber a filter someone else put on the stack.
+HKR,,"UpperFilters",0x00010008,"xinputhid"
 
 [pf_gamepad_Install]
 UmdfLibraryVersion=$UMDFVERSION$
