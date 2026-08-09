@@ -260,6 +260,27 @@ pub struct HostConfig {
     /// encode, so this is the knob that decides how bright "white" looks on the client's panel.
     /// `None` = leave gamescope's own default.
     pub gamescope_sdr_nits: Option<u32>,
+    /// `PUNKTFUNK_GAMESCOPE_BIND` — may the host bind the patched gamescope over
+    /// `/usr/bin/gamescope` inside the session unit's mount namespace? That redirect is the ONLY
+    /// lever left on a distro whose `gamescope-session-plus` hardcodes that absolute path and
+    /// reads `GAMESCOPE_BIN` nowhere (Nobara) — see `pf-vdisplay`'s `gamescope.rs`.
+    ///
+    /// **Three-valued**, because the mechanism is not free and the default has to be the careful
+    /// one. A mount namespace in a systemd **user** unit necessarily comes with a **user**
+    /// namespace, which maps only this uid — so every root-owned path the session inspects reads
+    /// as `nobody`, and that is what made gamescope's Xwayland refuse `/tmp/.X11-unix` and killed
+    /// Game Mode outright in 0.26.0-canary.
+    ///
+    /// * `None` (unset — the default): AUTO. The host reads the box's session script and arms the
+    ///   redirect only where nothing else can reach gamescope. Every other distro gets no mount
+    ///   namespace at all.
+    /// * `Some(false)` (`=0`): never. The session runs the distro's stock gamescope — no HDR, no
+    ///   in-node cursor, games see gamescope's 60 Hz headless default — degraded, but it starts.
+    /// * `Some(true)` (`=1`): force. Arm it even where the script looks like it honours
+    ///   `GAMESCOPE_BIN` — for the case that lever is defeated somewhere the host cannot see (a
+    ///   `sessions.d` fragment presetting `GAMESCOPECMD`). It does NOT override the runtime
+    ///   backstop: a session that fails with the redirect armed still disarms it.
+    pub gamescope_bind: Option<bool>,
     /// `PUNKTFUNK_GAMESCOPE_REFRESH_RATES` — extra refresh rates (Hz, comma-separated) a gamescope
     /// session offers its clients on top of the one it runs at, e.g. `60,90,120`.
     ///
@@ -391,6 +412,10 @@ impl HostConfig {
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| (1..=10_000).contains(n)),
+            // Deliberately NOT `unwrap_or`: unset is its own answer here (auto — the host decides
+            // per box), `=0` is the retreat to a stock-gamescope session, and `=1` is the force
+            // for a box whose `GAMESCOPE_BIN` is defeated somewhere the host cannot read.
+            gamescope_bind: env_on("PUNKTFUNK_GAMESCOPE_BIND"),
             // Unparseable entries are DROPPED rather than failing the host: this only ever widens a
             // menu, and the session's own rate is added back unconditionally, so the worst a typo
             // can cost is the extra option the operator wanted — never the session.
