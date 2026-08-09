@@ -527,7 +527,15 @@ run_spike() {
   # NO_COLOR: keep the captured log plain at the source. `log_cat` strips SGR escapes anyway, but a
   # plain log is also the one a human greps by hand when a leg goes red, and `p99_us\e[0m\e[2m=…`
   # defeats the obvious grep just as thoroughly as it defeated this kit's parser.
-  local -a envs=(PUNKTFUNK_PERF=1 NO_COLOR=1)
+  #
+  # PUNKTFUNK_ENCODER=pyrowave is NOT redundant with `--codec pyrowave`, and leaving it out cost a
+  # real V3b run on .21. `--codec` selects the ENCODER; the capture pipeline picks its consumer from
+  # `ZeroCopyPolicy::pyrowave_session`, which on the spike path is fed only by this env (see
+  # punktfunk-host/src/capture.rs — "the global PUNKTFUNK_ENCODER=pyrowave lab lever"). Without it an
+  # NVIDIA host resolves `cuda-import -> nvenc`, imports the dmabuf to CUDA as NV12, and hands the
+  # wavelet encoder a payload it rejects: "unsupported FramePayload (need Dmabuf or Cpu RGB)". AMD
+  # boxes hide this — they have no CUDA arm to pick — so it reproduces only where the A/B lives.
+  local -a envs=(PUNKTFUNK_PERF=1 NO_COLOR=1 PUNKTFUNK_ENCODER=pyrowave)
   for kv in "$@"; do envs+=("$kv"); done
   local -a cmd=("$HOST_BIN" spike --codec pyrowave --source "$SPIKE_SOURCE"
                 --width "$OPT_WIDTH" --height "$OPT_HEIGHT" --fps "$OPT_FPS"
