@@ -14,6 +14,11 @@
 pub mod client;
 pub mod cuda;
 pub mod egl;
+// Worker-subprocess IPC rails (SEQPACKET framing ± `SCM_RIGHTS`, pinned-exe spawn, reaping),
+// generic over the message body so every punktfunk worker shares them — the zerocopy one here,
+// the capability-carrying encode worker in `pf-encode`. Vocabulary stays per-worker (`proto` is
+// only this one's).
+pub mod ipc;
 pub mod proto;
 pub mod vkslot;
 pub mod vulkan;
