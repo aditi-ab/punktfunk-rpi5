@@ -474,6 +474,16 @@ pub mod uhid_abi;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// Transport-independent Xbox Wireless Controller HID codec — the report the `pf-gamepad` UMDF
+/// driver serves under device-type 4, giving an Xbox pad the HID footing `pf-xusb` never had
+/// (Steam / WGI / GameInput / DirectInput cannot see an XUSB-interface-only device).
+///
+/// Deliberately NOT cfg-gated to linux/windows like its siblings: it is pure byte-packing with no
+/// OS surface, so its layout tests compile and run on any host — including the macOS dev machines
+/// where the Windows backends cannot be built at all. That is the only automated check this codec
+/// has until a Windows box is reachable.
+#[path = "inject/proto/xbox_proto.rs"]
+pub mod xbox_proto;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {

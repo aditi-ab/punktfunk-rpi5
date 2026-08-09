@@ -791,6 +791,19 @@ pub mod gamepad {
     /// Steam Input on Windows when the devnode's synthesized USB hardware ids carry `&MI_02`
     /// (the wired controller interface — the N4-spike finding).
     pub const DEVTYPE_STEAMDECK: u8 = 3;
+    /// `device_type` = Xbox Wireless Controller (`VID_045E&PID_0B13` HID identity — a Bluetooth
+    /// Xbox pad, which unlike the wired `045E:028E`/`045E:02EA` ids IS a real HID device).
+    ///
+    /// This exists because the OTHER Windows Xbox backend, `pf-xusb`, registers only
+    /// `GUID_DEVINTERFACE_XUSB` and has no HID collection — so Steam, WGI, GameInput, DirectInput
+    /// and `joy.cpl` cannot enumerate it at all, and only classic `XInputGetState` ever sees it
+    /// (field 2026-08-09). Routing an Xbox pad through this identity instead puts it on the same
+    /// HID footing the PlayStation pads have always had.
+    ///
+    /// ⚠️ Unlike its siblings the Xbox input report is NOT 64 bytes — it is
+    /// `XBOX_INPUT_REPORT_LEN` (16). The driver serves per-identity report lengths because
+    /// hidclass sizes its buffer from the descriptor and refuses an over-long source.
+    pub const DEVTYPE_XBOX: u8 = 4;
 
     /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
     /// the host's positive "driver is alive on this section" signal (health check + version audit).

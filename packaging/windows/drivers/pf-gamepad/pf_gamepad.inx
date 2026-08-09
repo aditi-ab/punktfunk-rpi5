@@ -47,6 +47,7 @@ pf_gamepad.dll=1
 %DeviceDescDS4%=pfGamepad, pf_dualshock4
 %DeviceDescEdge%=pfGamepad, pf_dualsenseedge
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
+%DeviceDescXbox%=pfGamepad, pf_xboxwireless
 
 [pfGamepad.NT]
 CopyFiles=UMDriverCopy
@@ -100,3 +101,4 @@ DeviceDesc         ="Punktfunk Virtual DualSense"
 DeviceDescDS4      ="Punktfunk Virtual DualShock 4"
 DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
 DeviceDescDeck     ="Punktfunk Virtual Steam Deck Controller"
+DeviceDescXbox     ="Punktfunk Virtual Xbox Wireless Controller"
