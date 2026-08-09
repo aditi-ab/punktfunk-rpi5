@@ -13,8 +13,11 @@
 //! So an interactive Plasma session does NOT hand it to a bare client — the host packages ship
 //! `io.unom.Punktfunk.Host.desktop` (`Exec=/usr/bin/punktfunk-host`,
 //! `X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,…`) so it is present before the host first
-//! connects. The headless test path instead exposes it to bare clients via
-//! `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`. The compositor backend must implement
+//! connects. That identification is also why **the host binary must carry no file capability**: a
+//! process holding capabilities KWin lacks is one the kernel will not let KWin resolve
+//! `/proc/<pid>/exe` for, so it can never be matched to a `.desktop` no matter how correctly the
+//! file is installed (see [`capability_denial_hint`]). The headless test path instead exposes it to
+//! bare clients via `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`. The compositor backend must implement
 //! `createVirtualOutput`: the **DRM backend** (any version) or the **VirtualBackend since KWin
 //! 6.5.6** (`kwin_wayland --virtual`); on `--virtual` < 6.5.6 the request fails with
 //! "Could not find output". We talk raw Wayland on `$WAYLAND_DISPLAY`, so the host must run inside
@@ -1071,6 +1074,74 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Extra sentence appended to every "KWin never advertised the screencast global" error when this
+/// process carries capabilities — the one cause that is completely invisible from the Wayland side.
+///
+/// KWin authorizes a restricted interface by resolving the *client's* `/proc/<pid>/exe` and
+/// matching it against an installed `.desktop`. The kernel refuses that readlink to any reader
+/// whose effective set is not a superset of the target's **permitted** set
+/// (`cap_ptrace_access_check`), and KWin has no capabilities at all. So a host binary carrying any
+/// file capability is simply unidentifiable: `executablePath()` comes back empty, no `.desktop` can
+/// match, and the global is never advertised — indistinguishable, from here, from a missing
+/// `.desktop`. Neither half of the obvious workaround helps: `prctl(PR_SET_DUMPABLE, 1)` leaves the
+/// permitted-set check failing, and moving the grant to systemd `AmbientCapabilities=` lands the
+/// capability in the same permitted set. Only an uncapped binary is identifiable.
+///
+/// This is not hypothetical: 0.26.0-1 setcap'd `cap_sys_nice` on the host for the GPU-priority
+/// lever and took out desktop streaming on every KDE box until the capability was removed again.
+fn capability_denial_hint() -> String {
+    let permitted = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| permitted_caps_from_status(&status));
+    match permitted {
+        Some(caps) if caps != 0 => format!(
+            " — NOTE: this process carries capabilities (CapPrm={caps:#018x}), which is enough on \
+             its own to cause this: the kernel then refuses KWin the /proc/<pid>/exe read it \
+             identifies clients by, so no .desktop can match however correctly it is installed. \
+             Clear them with `sudo setcap -r /usr/bin/punktfunk-host` and restart the host"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The permitted-capability mask out of a `/proc/<pid>/status` body, or `None` if the field is
+/// absent/unparseable. The kernel prints it as a tab-separated 16-digit hex word with no `0x`
+/// (`CapPrm:\t0000000000800000` = CAP_SYS_NICE), which is what the split-and-radix-16 parse below
+/// expects — split out from [`capability_denial_hint`] purely so that shape is testable without a
+/// capability-carrying process to point at.
+fn permitted_caps_from_status(status: &str) -> Option<u64> {
+    let field = status.lines().find(|l| l.starts_with("CapPrm:"))?;
+    u64::from_str_radix(field.split_whitespace().nth(1)?, 16).ok()
+}
+
+#[cfg(test)]
+mod capability_hint_tests {
+    use super::*;
+
+    /// Verbatim from a `cap_sys_nice=ep` process on CachyOS — the case that broke 0.26.0-1.
+    const CAPPED: &str = "Name:\tpunktfunk-host\nUid:\t1000\t1000\t1000\t1000\nCapPrm:\t0000000000800000\nCapEff:\t0000000000800000\n";
+    /// ...and from the same binary with no capability, where the hint must stay silent.
+    const CLEAN: &str = "Name:\tpunktfunk-host\nUid:\t1000\t1000\t1000\t1000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n";
+
+    #[test]
+    fn parses_the_kernels_permitted_mask() {
+        assert_eq!(permitted_caps_from_status(CAPPED), Some(0x0080_0000));
+        assert_eq!(permitted_caps_from_status(CLEAN), Some(0));
+        // CapPrm is not guaranteed present (older/again-different kernels): stay quiet, never panic.
+        assert_eq!(permitted_caps_from_status("Name:\tx\n"), None);
+        assert_eq!(permitted_caps_from_status("CapPrm:\tzzzz\n"), None);
+        assert_eq!(permitted_caps_from_status("CapPrm:\n"), None);
+    }
+
+    /// A capability-free host must not append the hint — the message it decorates is also printed
+    /// on genuinely missing `.desktop` files, and a spurious "you have capabilities" line would
+    /// send the reader chasing a setcap that was never there. The test process has no capabilities.
+    #[test]
+    fn silent_without_capabilities() {
+        assert_eq!(capability_denial_hint(), "");
+    }
+}
+
 /// Readiness probe: connect to the KWin Wayland socket, roundtrip the registry, and confirm
 /// the privileged `zkde_screencast` global is actually advertised. This is exactly what
 /// [`run`] needs before it can create a virtual output, so a session-bringup script can poll
@@ -1090,7 +1161,8 @@ pub fn probe() -> Result<()> {
              it on the host's .desktop X-KDE-Wayland-Interfaces (install \
              io.unom.Punktfunk.Host.desktop with Exec=/usr/bin/punktfunk-host, then re-login so KWin \
              re-reads it — the grant is cached per-exe on first connect), or set \
-             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for the headless test; needs KWin ≥ 6.5.6"
+             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for the headless test; needs KWin ≥ 6.5.6{}",
+            capability_denial_hint()
         );
     }
     Ok(())
@@ -1134,7 +1206,9 @@ fn run_existing(
         anyhow!(
             "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
              .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
-             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless test)"
+             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless \
+             test){}",
+            capability_denial_hint()
         )
     })?;
 
@@ -1223,7 +1297,9 @@ fn run(
         anyhow!(
             "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
              .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
-             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless test)"
+             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless \
+             test){}",
+            capability_denial_hint()
         )
     })?;
 
