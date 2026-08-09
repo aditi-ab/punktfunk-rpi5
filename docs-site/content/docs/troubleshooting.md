@@ -198,6 +198,44 @@ Current hosts detect the display-manager flavor and never mask the session unit 
 [gamescope → autologin display managers](/docs/gamescope) for the polkit rule that enables the full
 managed takeover on these boxes (without it the host mirrors Game Mode instead).
 
+## Game Mode: black screen on connect, or the stream is stuck at the box's resolution
+
+You connect to a box that autologins into Steam **Gaming Mode** and get a black picture every time
+— or a picture at the box's own resolution instead of the one your client asked for, with the box's
+monitor still lit. Nothing errors: the client connects, the host logs no failure, no unit is failed.
+
+The managed takeover is being refused and the host is falling back to mirroring the box's own
+session. On a box whose panel is off (a headless appliance, a TV that's been switched away) there
+is nothing to mirror, so the fallback is a black screen. Almost always the cause is **group
+membership**: the takeover stops the display manager through a root helper, and that helper serves
+members of the `punktfunk` group only.
+
+```sh
+id -nG | tr ' ' '\n' | grep -x punktfunk      # are you in it?
+journalctl --user -u punktfunk-host | grep -iE "punktfunk. group|takeover unavailable"
+```
+
+The host also checks at startup on any box that will need the takeover, so a fresh
+`systemctl --user restart punktfunk-host` puts the answer at the top of the log. The fix is one
+command and a fresh login:
+
+```sh
+sudo usermod -aG punktfunk "$USER"   # then log out and back in
+```
+
+> **Read the reason the log quotes before doing anything else.** The takeover has three other ways
+> to be refused — no packaged helper (a tarball or source install), no polkit on the box, and
+> polkit denying the action — and the host now prints which one it hit, verbatim from the
+> privileged path. Hosts up to 0.27.0 printed a fixed guess instead ("reinstall the punktfunk
+> package, or install the display-manager polkit rule from the docs"), and on the group case both
+> of those suggestions were dead ends: neither adds anyone to a group.
+
+Two things this is *not*: it isn't the [pad group problem](#the-pad-works-but-arrives-as-an-xbox-360-controller-instead-of-a-steam-deck)
+(same group, different symptom), and it isn't lingering — though a host with no login session of
+its own enables lingering through the same helper, so an unjoined user often sees "enabling
+lingering failed" first. Both are covered in
+[gamescope → autologin display managers](/docs/gamescope#nobara-and-other-autologin-display-managers).
+
 ## Session fails right after editing host.env
 
 - Keys are **case-sensitive**: `punktfunk_gamescope_attach=1` sets nothing — use the exact
@@ -274,6 +312,10 @@ the reliable way to get one.
 
 Joining the group is optional, and there is a real reason it is not automatic: writing that
 `attach` file materialises an arbitrary emulated USB device. Skip it on a machine you share.
+
+It is not only the pad, though: the same group authorizes the helper that stops the display manager
+for a managed **Gaming Mode** takeover, so on a box that autologins into Game Mode, skipping it also
+costs you [the takeover](#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution).
 
 ## Copy and paste between host and client does nothing
 

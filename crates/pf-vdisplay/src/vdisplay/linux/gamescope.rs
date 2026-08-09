@@ -1571,21 +1571,261 @@ const DM_HELPER_PATHS: &[&str] = &[
     "/usr/lib/punktfunk/pf-dm-helper",
 ];
 
-/// Run the packaged DM helper (`stop` | `restore` | `linger`) via pkexec. `false` when the helper
-/// isn't installed (tarball/old package), pkexec is missing, or polkit denies the action.
-fn dm_helper(verb: &str) -> bool {
-    let Some(helper) = DM_HELPER_PATHS
+/// The group `pf-dm-helper` authorizes on. The polkit action has to stay `allow_any` (the host
+/// commonly runs as a LINGERING user unit, which has no logind session for polkit to classify), so
+/// the helper makes the real decision itself: only a member of this group may run the verbs. Every
+/// package CREATES the group and adds NOBODY to it — writing the usbip `attach` node it also gates
+/// materialises arbitrary emulated USB hardware, so joining stays a deliberate act.
+const DM_HELPER_GROUP: &str = "punktfunk";
+
+/// The packaged helper on this box, if any (see [`DM_HELPER_PATHS`]).
+fn installed_dm_helper() -> Option<&'static str> {
+    DM_HELPER_PATHS
         .iter()
+        .copied()
         .find(|p| std::path::Path::new(p).exists())
-    else {
-        return false;
+}
+
+/// Why the packaged DM helper did not perform a verb.
+///
+/// This used to be a bare `false`, and that is the whole reason a Nobara box spent a release
+/// telling its owner to "reinstall the punktfunk package, or install the display-manager polkit
+/// rule from the docs" while the true cause was **group membership** — which neither remedy
+/// touches (field, Nobara 44 / 0.27.0-0.ci12635, 2026-08-09). The polkit action was installed,
+/// `allow_any`, annotated at the right path, and pkexec DID run the helper; the helper then
+/// printed the exact fix on stderr and `.status()` threw it away, leaving the caller to guess —
+/// and guess wrong, silently, on every connect (the takeover degrades to attach, so nothing fails
+/// loudly).
+///
+/// The four shapes are kept apart because they need four different fixes, and because a helper
+/// that could not even be EXECUTED must never masquerade as one that ran and refused.
+enum DmHelperError {
+    /// Nothing to run: no packaged helper on this box (a tarball/source install, or a package
+    /// older than the helper). The polkit-rule route from the docs applies; the group does not.
+    NotInstalled,
+    /// The helper is installed but `pkexec` could not be spawned at all (no polkit on this box, or
+    /// the spawn failed). Nothing evaluated the request, so nothing refused it.
+    NotExecutable { helper: &'static str, io: String },
+    /// `pkexec` itself refused before the helper's own gate: the action is missing/overridden, or
+    /// the authorization could not be obtained. 126/127 are pkexec's OWN exit codes — the helper
+    /// only ever exits 0, 1 or 2 — so this is distinguishable from a refusal.
+    Denied {
+        helper: &'static str,
+        code: i32,
+        stderr: String,
+    },
+    /// The helper RAN and failed, and said why on stderr. That text is the answer: it names the
+    /// user, the group, and the `usermod` line that fixes it. Pass it through verbatim rather than
+    /// inventing a diagnosis on top of it.
+    Refused {
+        helper: &'static str,
+        code: Option<i32>,
+        stderr: String,
+    },
+}
+
+impl std::fmt::Display for DmHelperError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInstalled => write!(
+                f,
+                "no packaged pf-dm-helper on this box (looked in {}) — install the punktfunk \
+                 package, or add a display-manager polkit rule for your user (see \
+                 https://docs.punktfunk.unom.io/docs/gamescope)",
+                DM_HELPER_PATHS.join(" and ")
+            ),
+            Self::NotExecutable { helper, io } => write!(
+                f,
+                "{helper} is installed but could not be run via pkexec ({io}) — this box appears \
+                 to have no polkit; add a display-manager polkit rule for your user instead (see \
+                 https://docs.punktfunk.unom.io/docs/gamescope)"
+            ),
+            Self::Denied {
+                helper,
+                code,
+                stderr,
+            } => write!(
+                f,
+                "pkexec never ran {helper} (exit {code}{}) — polkit did not authorize \
+                 io.unom.punktfunk.dm-helper, so the action is missing or overridden; reinstall \
+                 the punktfunk package, or add a display-manager polkit rule for your user (see \
+                 https://docs.punktfunk.unom.io/docs/gamescope)",
+                suffix(stderr)
+            ),
+            Self::Refused {
+                helper,
+                code,
+                stderr,
+            } if stderr.is_empty() => write!(
+                f,
+                "{helper} ran and failed (exit {}) without printing a reason",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
+            ),
+            Self::Refused { helper, stderr, .. } => {
+                write!(f, "{helper} ran and refused: {stderr}")
+            }
+        }
+    }
+}
+
+/// `": <text>"`, or nothing at all when there is no text — so a message never ends in a dangling
+/// colon on a helper that said nothing.
+fn suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new() // no dangling ": " when the child was silent
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+/// Run the packaged DM helper (`stop` | `restore` | `linger`) via pkexec.
+///
+/// **Captures stderr and keeps the exit code** ([`DmHelperError`]): the helper's own message is
+/// the only place the actionable cause exists (group membership, a missing
+/// `display-manager.service` alias), and every caller here turns a failure into text an operator
+/// reads. `output()` rather than `status()` also gives the child a NULL stdin, so a pkexec that
+/// decides to prompt gets EOF immediately instead of blocking a stream thread on a tty read it can
+/// never satisfy.
+///
+/// Deliberately unbounded in time: the `stop`/`restore` verbs shell out to `systemctl`, whose stop
+/// job legitimately takes seconds on a busy seat, and a budget here would kill the takeover
+/// mid-flight rather than diagnose it.
+fn dm_helper(verb: &str) -> std::result::Result<(), DmHelperError> {
+    let Some(helper) = installed_dm_helper() else {
+        return Err(DmHelperError::NotInstalled);
     };
-    Command::new("pkexec")
+    let out = Command::new("pkexec")
         .arg(helper)
         .arg(verb)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+        .map_err(|e| DmHelperError::NotExecutable {
+            helper,
+            io: e.to_string(),
+        })?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // One line: these land in a `tracing` field, and the helper's two-line refusal (reason +
+    // `Grant it with: …`) has to survive the trip intact.
+    let stderr = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match out.status.code() {
+        // pkexec's own codes: 127 "not authorized / could not execute the program", 126
+        // "authentication dialog dismissed". The helper only ever exits 0, 1 or 2, so either of
+        // these means the request never reached its group gate.
+        Some(c @ (126 | 127)) => Err(DmHelperError::Denied {
+            helper,
+            code: c,
+            stderr,
+        }),
+        // `None` = killed by a signal, and [`DmHelperError::Refused`] renders that as "signal"
+        // rather than inventing a plausible-looking exit code.
+        code => Err(DmHelperError::Refused {
+            helper,
+            code,
+            stderr,
+        }),
+    }
+}
+
+/// Startup preflight for the takeover's one prerequisite nothing can automate: this user being in
+/// the `punktfunk` group.
+///
+/// The failure it catches is **silent by construction**. Missing membership doesn't fail a unit,
+/// doesn't fail the connect and doesn't fail the stream: the takeover simply degrades to ATTACH
+/// (or, under SDDM, to mask-only), which on a box whose panel is off reads as "a black screen on
+/// every connect" and nothing else. It also only ever surfaces mid-stream, in a warn line nobody
+/// is watching while they're trying to play. So say it once, at startup, where an operator
+/// actually reads the log — and say it with the command that fixes it.
+///
+/// Deliberately **not** unconditional; a box that will never attempt a takeover must not be
+/// nagged. Four gates, each of which alone makes the group irrelevant:
+/// * **root** — the plain system-bus `systemctl` verbs succeed, so the helper is never reached;
+/// * **no display manager** — [`dm_plan`] only stops a DM that exists, and a getty-autologin /
+///   enabled-user-unit box has none;
+/// * **no gamescope session infrastructure** ([`managed_session_available`]) — no
+///   `gamescope-session-plus`/SteamOS means no autologin gaming session to free, so
+///   [`stop_autologin_sessions`] returns before it looks at the DM at all;
+/// * **no packaged helper** — a tarball/source/Nix install has neither the helper nor the group,
+///   and its route is the hand-written polkit rule from the docs, which this group has no part in.
+///
+/// Membership is read from the **user database**, not from our own `getgroups()`, because that is
+/// what the gate we are predicting reads: `pf-dm-helper` runs as root and resolves the caller's
+/// groups with `id -nG <user>`. A `usermod -aG` therefore satisfies the helper immediately — but
+/// the remedy still says to log back in, because the same group gates the usbip nodes the virtual
+/// Steam Deck pad attaches through, and THAT is a credential check against this process, whose
+/// supplementary groups were fixed when its `systemd --user` manager started.
+pub fn preflight_takeover_privilege() {
+    if crate::proc::current_uid() == 0 {
+        return; // root: `systemctl stop <dm>` succeeds outright, the helper is never consulted
+    }
+    let Some(dm) = display_manager_unit() else {
+        return; // no DM drives this box's logins — nothing for the takeover to stop
+    };
+    if !managed_session_available() {
+        return; // no session-plus/SteamOS ⇒ no autologin gaming session ⇒ no takeover
+    }
+    let Some(helper) = installed_dm_helper() else {
+        return; // unpackaged install: no helper, no group, the polkit-rule route applies instead
+    };
+    let Some(user) = current_user_name() else {
+        return; // cannot name the user ⇒ cannot give a usable `usermod` line; stay quiet
+    };
+    let group = DM_HELPER_GROUP;
+    if user_in_group(&user, group) {
+        return;
+    }
+    tracing::warn!(
+        %user,
+        %dm,
+        helper,
+        group,
+        "gamescope: the managed takeover on this box has to stop {dm} for a stream, which runs \
+         through {helper} — and that helper only serves members of the '{group}' group, which \
+         '{user}' is not in. Every takeover will degrade silently: the stream mirrors the box's \
+         own session instead, which with the panel off looks like a black screen on every \
+         connect. Fix it once with `sudo usermod -aG {group} {user}`, then log out and back in — \
+         a `systemd --user` session keeps the group set it started with, and the same group gates \
+         the virtual Steam Deck pad's usbip nodes. It can present arbitrary emulated USB devices, \
+         so join it only on a machine you trust."
+    );
+}
+
+/// This process's login name, for a `usermod` line the operator can paste. From `id -un <uid>`
+/// rather than `$USER`: a `systemd --user` unit's environment is whatever the manager was started
+/// with, and the uid is the thing pkexec will actually resolve.
+fn current_user_name() -> Option<String> {
+    let out = crate::proc::output_within(
+        Command::new("id").args(["-un", &uid_string()]),
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !name.is_empty()).then_some(name)
+}
+
+/// Is `user` in `group` **according to the user database** — the same question, asked the same
+/// way, that `pf-dm-helper` answers as root before it will do anything. Budgeted: `id` resolves
+/// through NSS, which on a box with a remote directory can block, and this runs on the startup
+/// path.
+fn user_in_group(user: &str, group: &str) -> bool {
+    let Ok(out) = crate::proc::output_within(
+        Command::new("id").args(["-nG", user]),
+        Duration::from_secs(5),
+    ) else {
+        return true; // couldn't ask ⇒ don't accuse: a false alarm here sends people down a wrong path
+    };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .any(|g| g == group)
 }
 
 /// `systemctl` on the SYSTEM bus, **never interactively**. Every privileged verb below runs on the
@@ -1618,12 +1858,17 @@ fn systemctl_system(args: &[&str]) -> bool {
 /// what breaks the dependency: logind keeps the user manager up with no session at all. So ensure
 /// it BEFORE touching the DM, and refuse the takeover when it can't be ensured — the caller then
 /// degrades to attach, which mirrors the box's own session and never stops the DM.
-fn ensure_host_survives_dm_stop() -> bool {
+///
+/// `Err` carries **why** it could not be ensured, because the helper path is reached here first:
+/// on a sessionless host the `linger` verb goes through the same [`dm_helper`] gate the `stop`
+/// verb does, so a user outside the `punktfunk` group fails at THIS step and never reaches the
+/// DM-stop one. Dropping the reason here would just move the misdiagnosis one message earlier.
+fn ensure_host_survives_dm_stop() -> std::result::Result<(), String> {
     if !host_is_under_user_manager() {
-        return true; // root / a system unit — the DM stop cannot reach us
+        return Ok(()); // root / a system unit — the DM stop cannot reach us
     }
     if linger_enabled() {
-        return true;
+        return Ok(());
     }
     // `set-self-linger` is `allow_active` in logind's own policy, so a host started inside the
     // user's session can do this itself; a sessionless one (the packaged unit) goes through the
@@ -1632,16 +1877,28 @@ fn ensure_host_survives_dm_stop() -> bool {
     let _ = Command::new("loginctl")
         .args(["--no-ask-password", "enable-linger", &uid])
         .status();
-    if linger_enabled() || (dm_helper("linger") && linger_enabled()) {
-        tracing::info!(
-            uid,
-            "enabled lingering for this user — the managed takeover stops the display manager, \
-             which ends this login session, and without lingering logind would stop the host \
-             along with it (`loginctl disable-linger` reverts it)"
-        );
-        return true;
+    let helper = if linger_enabled() {
+        Ok(()) // the plain verb was enough — the helper was never needed
+    } else {
+        dm_helper("linger").map_err(|e| e.to_string())
+    };
+    match helper {
+        Ok(()) if linger_enabled() => {
+            tracing::info!(
+                uid,
+                "enabled lingering for this user — the managed takeover stops the display manager, \
+                 which ends this login session, and without lingering logind would stop the host \
+                 along with it (`loginctl disable-linger` reverts it)"
+            );
+            Ok(())
+        }
+        // The verb reported success and `loginctl` still says no: not a privilege problem, so say
+        // that instead of blaming the grant the operator would then go and re-check.
+        Ok(()) => Err(format!(
+            "`loginctl enable-linger {uid}` reported success but lingering is still off"
+        )),
+        Err(why) => Err(why),
     }
-    false
 }
 
 /// Is this process's lifetime tied to a `systemd --user` manager (i.e. would logind's user-manager
@@ -1679,20 +1936,29 @@ fn linger_enabled() -> bool {
 /// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
 /// the SYSTEM bus first — succeeds as root or under an operator polkit rule scoped to the DM unit
 /// (see docs); fails cleanly otherwise ("interactive authentication required") — then the
-/// packaged pkexec helper. `false` means no privilege path exists and the caller degrades to
-/// attach.
-fn try_stop_display_manager(dm: &str) -> bool {
-    systemctl_system(&["stop", dm]) || dm_helper("stop")
+/// packaged pkexec helper. The `Err` is the HELPER's reason (the plain verb's failure is expected
+/// and carries no information: an unprivileged host is meant to fail it), and the caller puts it
+/// in front of the operator instead of guessing.
+fn try_stop_display_manager(dm: &str) -> std::result::Result<(), DmHelperError> {
+    if systemctl_system(&["stop", dm]) {
+        return Ok(());
+    }
+    dm_helper("stop")
 }
 
 /// Restore the display manager: `reset-failed` (a relogin loop may have tripped the unit's start
 /// limit, and a plain restart is refused until the accounting clears) + `restart` — its autologin
 /// session Exec brings the box's own session back up. Plain system-bus verbs first (root / an
 /// operator polkit rule), then the packaged pkexec helper, whose `restore` verb performs the same
-/// two steps as root.
-fn restore_display_manager(dm: &str) -> bool {
+/// two steps as root. The `Err` carries the helper's own reason: this is the failure that leaves a
+/// box with **no graphical session at all**, so the log line it produces has to be the one that
+/// solves it.
+fn restore_display_manager(dm: &str) -> std::result::Result<(), DmHelperError> {
     let _ = systemctl_system(&["reset-failed", dm]);
-    systemctl_system(&["restart", dm]) || dm_helper("restore")
+    if systemctl_system(&["restart", dm]) {
+        return Ok(());
+    }
+    dm_helper("restore")
 }
 
 /// The distro's session-switch helper (ChimeraOS/Nobara layout). Its USER pass records the
@@ -1778,9 +2044,10 @@ fn honor_session_select_switch(dm: String) {
     clear_takeover();
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     stop_session(SESSION_UNIT); // dead already (the switch shut its Steam down) — clear the unit
-    if !restore_display_manager(&dm) {
+    if let Err(e) = restore_display_manager(&dm) {
         tracing::warn!(
             %dm,
+            reason = %e,
             "gamescope: display-manager start was denied — the desktop switch may need a manual \
              `systemctl restart` of the DM"
         );
@@ -1913,19 +2180,30 @@ fn stop_autologin_sessions() -> Result<()> {
         // box's display manager down and nobody left to bring it back. On a mask-fragile flavor,
         // degrading to attach is strictly better than a black screen that needs a VT to recover;
         // where masking is safe, mask-only (the storm tax) is strictly better than attach.
-        let dm_stopped = if !ensure_host_survives_dm_stop() {
+        //
+        // Both failure arms below quote the REASON they were handed rather than describing one.
+        // 0.26.0/0.27.0 described one — "the packaged pf-dm-helper polkit action is missing or was
+        // denied (reinstall the punktfunk package, or install the display-manager polkit rule from
+        // the docs)" — and on the box that produced it the action was installed, permissive,
+        // correctly annotated, and pkexec had already RUN the helper; the helper's refusal ("user
+        // 'x' is not in the 'punktfunk' group") was thrown away with its stderr. Both suggested
+        // remedies were dead ends: neither a reinstall nor a polkit rule adds anyone to a group.
+        let dm_stopped = if let Err(why) = ensure_host_survives_dm_stop() {
             if !plan.mask {
+                // The reason goes LAST in both bails: the helper's own refusal ends in a command
+                // to paste, and burying that mid-sentence is how it stops being read.
                 bail!(
                     "stopping {dm} ends this user's last login session, and without lingering \
                      logind would stop the user manager — and this host with it — about 10s \
                      later, leaving the box with no display manager and nothing to restore it; \
-                     enabling lingering failed, so the managed takeover is unavailable (run \
-                     `sudo loginctl enable-linger $USER` once, as the setup docs ask, then \
-                     reconnect)"
+                     lingering could not be enabled, so the managed takeover is unavailable. \
+                     Either run `sudo loginctl enable-linger $USER` once, as the setup docs ask, \
+                     and reconnect — or fix the privileged path: {why}"
                 );
             }
             tracing::warn!(
                 %dm,
+                reason = %why,
                 "cannot stop the display manager for this stream (lingering could not be \
                  enabled, and without it the DM stop would take this host down ~10s later) — \
                  leaving it running: its autologin Relogin loop will churn logind sessions for \
@@ -1933,23 +2211,21 @@ fn stop_autologin_sessions() -> Result<()> {
                  `sudo loginctl enable-linger $USER` once, as the setup docs ask"
             );
             false
-        } else if !try_stop_display_manager(&dm) {
+        } else if let Err(why) = try_stop_display_manager(&dm) {
             if !plan.mask {
                 bail!(
                     "the box's gaming session is driven by {dm}, which does not survive a masked \
-                     session unit, and stopping it needs privilege — the packaged pf-dm-helper \
-                     polkit action is missing or was denied (reinstall the punktfunk package, or \
-                     install the display-manager polkit rule from the docs) so the managed \
-                     takeover is unavailable"
+                     session unit, and stopping it needs privilege, so the managed takeover is \
+                     unavailable — {why}"
                 );
             }
             tracing::warn!(
                 %dm,
-                "stopping the display manager for this stream needs privilege — the packaged \
-                 pf-dm-helper polkit action is missing or was denied — leaving it running: its \
-                 autologin Relogin loop will churn logind sessions for the whole stream, up to a \
-                 fork storm that starves the game and encoder (reinstall the punktfunk package, \
-                 or install the display-manager polkit rule from the docs)"
+                reason = %why,
+                "stopping the display manager for this stream needs privilege and the privileged \
+                 path failed — leaving it running: its autologin Relogin loop will churn logind \
+                 sessions for the whole stream, up to a fork storm that starves the game and \
+                 encoder"
             );
             false
         } else {
@@ -2320,22 +2596,26 @@ fn do_restore_tv_session() {
     // seat, so gamescope never gets DRM master (unit goes `failed`, screen stays black —
     // live-proven on the Nobara repro VM) — and under SDDM the relogin makes it redundant.
     if let Some(dm) = dm {
-        let restart = restore_display_manager(&dm);
-        if restart {
-            tracing::info!(%dm, "restored the display manager (its autologin brings gaming mode back)");
-        } else if crate::try_recover_session() {
-            tracing::warn!(
+        match restore_display_manager(&dm) {
+            Ok(()) => {
+                tracing::info!(%dm, "restored the display manager (its autologin brings gaming mode back)")
+            }
+            Err(why) if crate::try_recover_session() => tracing::warn!(
                 %dm,
+                reason = %why,
                 "display-manager restart lost its privilege — fired PUNKTFUNK_RECOVER_SESSION_CMD \
                  to bring the session back"
-            );
-        } else {
-            tracing::error!(
+            ),
+            // The worst state this code can produce: a box with no graphical session at all. The
+            // helper's own reason rides along, because "run these two commands as root" fixes the
+            // symptom once and the reason is what stops it happening again.
+            Err(why) => tracing::error!(
                 %dm,
+                reason = %why,
                 "could not restart the display manager and no PUNKTFUNK_RECOVER_SESSION_CMD is \
                  configured — the box has no graphical session until someone runs \
                  `systemctl reset-failed {dm} && systemctl restart {dm}` as root"
-            );
+            ),
         }
         return;
     }
@@ -3045,7 +3325,7 @@ mod tests {
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
         display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
         is_steam_launch, missing_flags, mode_mismatch, nested_wrapper_script, sentinel_advanced,
-        shape_dedicated_command,
+        shape_dedicated_command, DmHelperError,
     };
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
@@ -3145,6 +3425,52 @@ mod tests {
         assert!(!dm_survives_masked_unit("plasmalogin.service"));
         assert!(!dm_survives_masked_unit("gdm.service"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The whole point of [`DmHelperError`]: a failure has to say which of the four things went
+    /// wrong, because they need four different fixes. Pins the two properties that were violated
+    /// in the field — the helper's own words survive to the operator, and a helper that never RAN
+    /// never reads as one that ran and refused.
+    #[test]
+    fn dm_helper_failures_stay_distinguishable() {
+        let refusal = "pf-dm-helper: user 'nobara-user' is not in the 'punktfunk' group — \
+                       refusing. Grant it with: sudo usermod -aG punktfunk nobara-user";
+        let ran = DmHelperError::Refused {
+            helper: "/usr/libexec/punktfunk/pf-dm-helper",
+            code: Some(1),
+            stderr: refusal.to_string(),
+        }
+        .to_string();
+        // Verbatim: the helper already names the user, the group and the exact command.
+        assert!(ran.contains(refusal), "{ran}");
+        assert!(ran.contains("ran and refused"), "{ran}");
+
+        // …and none of the three "it never got that far" shapes may claim a refusal, or the
+        // operator goes looking for a group problem that isn't there.
+        for e in [
+            DmHelperError::NotInstalled,
+            DmHelperError::NotExecutable {
+                helper: "/usr/libexec/punktfunk/pf-dm-helper",
+                io: "No such file or directory (os error 2)".into(),
+            },
+            DmHelperError::Denied {
+                helper: "/usr/libexec/punktfunk/pf-dm-helper",
+                code: 127,
+                stderr: "Error executing command as another user: Not authorized".into(),
+            },
+        ] {
+            let s = e.to_string();
+            assert!(!s.contains("ran and refused"), "{s}");
+            // …and none of them may send the operator after group membership, which is only ever
+            // the answer when the helper actually evaluated it.
+            assert!(!s.contains("group"), "{s}");
+            // Every one of them still ends in something the operator can act on.
+            assert!(s.contains("polkit") || s.contains("install"), "{s}");
+        }
+
+        // The remedies the old fixed guess offered — a reinstall and a polkit rule — must appear
+        // ONLY where they can actually help, never on the path that ran and was refused.
+        assert!(!ran.contains("reinstall"), "{ran}");
     }
 
     #[test]

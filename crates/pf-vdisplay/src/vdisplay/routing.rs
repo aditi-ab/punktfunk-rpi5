@@ -371,6 +371,19 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
+/// Warn ONCE, at startup, when this box will need the managed gamescope takeover but its user is
+/// not in the `punktfunk` group the packaged privilege helper gates on — the one takeover
+/// prerequisite that fails silently mid-stream instead of at setup time. Gated so a box that will
+/// never attempt a takeover stays quiet; see [`gamescope::preflight_takeover_privilege`] for the
+/// exact conditions. Call once at `serve` startup, alongside [`restore_takeover_on_startup`].
+#[cfg(target_os = "linux")]
+pub fn preflight_takeover_privilege() {
+    gamescope::preflight_takeover_privilege();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn preflight_takeover_privilege() {}
+
 /// Give the box its own session back **now**, synchronously, because the host is exiting. Blocks
 /// (it shells out to `systemctl`), so call it off the async runtime. Call from the host's shutdown
 /// path — a takeover that outlives the host leaves the box with no display manager and nobody left

@@ -156,11 +156,16 @@ you; on NixOS the module does steps 1 and 2, and [NixOS](#nixos) above has the u
    command differs per distro — see your guide (`usermod -aG input "$USER"`, or `ujust
    add-user-to-input-group` on Bazzite).
 
-   Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro), also join
-   `punktfunk`: `sudo usermod -aG punktfunk "$USER"`. Your package created that group at install
-   time; it gates the usbip nodes that pad attaches through, and it is separate from `input` on
-   purpose, because writing them can present arbitrary emulated USB hardware. Join it only on a
-   machine you trust — skipping it costs you nothing but that one pad type.
+   Also join `punktfunk` — `sudo usermod -aG punktfunk "$USER"`, then log out and back in — if
+   **either** of these is true: you want the **virtual Steam Deck controller** (paddles,
+   trackpads, gyro), or this box autologins into Steam **Gaming Mode** and you want the host to
+   take that session over at your client's resolution
+   ([gamescope](/docs/gamescope#nobara-and-other-autologin-display-managers)). Your package created
+   that group at install time and left it empty. It gates the usbip nodes the pad attaches through
+   *and* the helper that stops the display manager for a takeover, and it is separate from `input`
+   on purpose, because writing those nodes can present arbitrary emulated USB hardware — so join it
+   only on a machine you trust. On a plain desktop host that streams no Gaming Mode, skipping it
+   costs you nothing but that one pad type.
 2. Put your `host.env` in place, then start the host. Every Linux package ships a systemd **user**
    unit, so you don't run the host by hand — but that unit reads `~/.config/punktfunk/host.env` and
    won't start until the file exists. Each package ships a template to copy; your distro and desktop

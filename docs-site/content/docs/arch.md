@@ -57,17 +57,21 @@ sudo pacman -Syu punktfunk-scripting # optional: the plugin/script runner (see b
 sudo usermod -aG input "$USER"       # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
-Only if you want the **virtual Steam Deck controller** (paddles, trackpads, gyro — it reaches games
-as a real USB pad, which is why Steam Input adopts it), also join `punktfunk`:
+Also join `punktfunk` if **either** applies — you want the **virtual Steam Deck controller**
+(paddles, trackpads, gyro — it reaches games as a real USB pad, which is why Steam Input adopts
+it), or this box autologins into Steam **Gaming Mode** and you want the host to take that session
+over at the client's resolution:
 
 ```sh
-sudo usermod -aG punktfunk "$USER"   # usbip/vhci access (re-login to apply)
+sudo usermod -aG punktfunk "$USER"   # usbip/vhci + display-manager takeover (re-login to apply)
 ```
 
 That is a second group on purpose. It grants write access to the usbip `attach` file, which
 materialises an arbitrary emulated USB device — so it stays off the `input` group everyone is
-routinely told to join. Join it only on a machine you trust. Without it, everything else still
-works and the pad simply arrives as an ordinary Xbox 360 controller.
+routinely told to join. Join it only on a machine you trust. On a plain desktop host, everything
+else still works without it and the pad simply arrives as an ordinary Xbox 360 controller; on a
+Gaming Mode box the takeover silently degrades to mirroring the box's own screen — see
+[gamescope](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
 Each install is a **full** `-Syu`, on purpose: our packages are built against current Arch
 sonames, and `pacman -Sy <pkg>` would drop one onto a system whose other packages are still old —

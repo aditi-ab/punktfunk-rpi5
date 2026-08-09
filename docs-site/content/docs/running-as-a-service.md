@@ -133,7 +133,11 @@ disable, and the session unit differ per compositor, so each is documented on it
 - GNOME: [GNOME → Headless session](/docs/gnome#headless-session).
 - KDE Plasma: [KDE → Headless session](/docs/kde#headless-session).
 - Steam / gamescope: [gamescope](/docs/gamescope) — the host launches its own session per client, so
-  there's no separate session unit.
+  there's no separate session unit. A headless box that autologins into **Gaming Mode** needs one
+  more thing: your user in the `punktfunk` group (`sudo usermod -aG punktfunk "$USER"`, then log
+  out and back in). Without it the host cannot stop the display manager to take that session over,
+  so every connect quietly mirrors the box's own screen — which, headless, is a black one. See
+  [gamescope → autologin display managers](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
 Once a session comes up at boot, enable the host user service (section A) and reboot. The host comes up
 on that session.
