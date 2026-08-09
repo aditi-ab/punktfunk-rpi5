@@ -55,7 +55,9 @@ sy5uhYGZD6lMJ4uZAQC7W81H2gHlTDTA2Nq35HKW9IOU+Ll2c9fqa7fAIKf9Bg==
 usage() {
   sed -n 's/^#\( \|$\)//p' "$0" | sed -n '1,20p'
   echo "usage: punktfunk-sysext install [--channel stable|canary] [--from-file X.raw]"
-  echo "       punktfunk-sysext update [--from-file X.raw] | status | remove"
+  echo "       punktfunk-sysext update [--from-file X.raw] | reapply | status | remove"
+  echo "       reapply: re-run the host-state steps a sysext image cannot carry (groups, /etc"
+  echo "                mirrors, udev, sysctl, modules) without reinstalling the image."
   exit "${1:-0}"
 }
 need_root() { [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }; }
@@ -174,6 +176,17 @@ post_merge() {
   # 'input': writing 'attach' materialises an arbitrary emulated USB device (review 2026-08-05 M-4),
   # so it stays a group users join on purpose — see `ujust add-user-to-input-group` for the other one.
   getent group punktfunk >/dev/null 2>&1 || groupadd --system punktfunk 2>/dev/null || :
+  # Creating the group is necessary but NOT sufficient, and the difference is invisible until a
+  # stream fails: `pf-dm-helper` gates on MEMBERSHIP, so a host whose user never joined gets
+  # "stopping the display manager needs privilege" on every managed takeover — sddm's autologin
+  # Relogin loop then churns logind sessions for the whole stream. Joining stays opt-in (writing
+  # vhci `attach` materialises an arbitrary emulated USB device), so say so instead of doing it.
+  local _pf_user="${SUDO_USER:-}"
+  if [ -n "$_pf_user" ] && ! id -nG "$_pf_user" 2>/dev/null | tr ' ' '\n' | grep -qx punktfunk; then
+    echo "!! $_pf_user is not in the 'punktfunk' group — the managed gamescope takeover cannot stop"
+    echo "!! the display manager, and the virtual Steam Deck pad cannot attach. To opt in:"
+    echo "!!     sudo usermod -aG punktfunk $_pf_user"
+  fi
   modprobe vhci-hcd 2>/dev/null || :
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
   # the input-group ownership even when the module's original add event predated the reloaded rule.
@@ -265,7 +278,22 @@ cmd_update() {
   [ -n "$l" ] || { echo "no image in the feed $(feed_url)" >&2; exit 1; }
   ver="${l%% *}"
   if [ "$ver" = "$cur" ] && merged; then
-    echo "already on $cur (channel $(channel)) — nothing to do."
+    # NOT "nothing to do": re-run post_merge. Every step in it is idempotent, and skipping it here
+    # is how host state silently rots one release behind the image.
+    #
+    # The trap, field-proven on a Bazzite host that took 0.25.0 -> 0.26.0 (2026-08-09): an upgrade
+    # is driven by the script from the OLD image — this file is replaced by the very
+    # `systemd-sysext refresh` that runs mid-upgrade — so a post_merge step ADDED in the new
+    # release is executed by nobody. The old script doesn't have it, and the new script never gets
+    # a turn, because from then on `update` matches this branch and returns. The step is then
+    # permanently unreachable on exactly the installs that need it.
+    #
+    # That cost the `punktfunk` group (added to post_merge in 0.26.0): it was never created, so
+    # `pf-dm-helper` refused every caller — it gates on membership — and every managed gamescope
+    # takeover fell back to "stopping the display manager needs privilege", leaving sddm's autologin
+    # Relogin loop churning for the whole stream.
+    echo "already on $cur (channel $(channel)) — re-applying host state."
+    post_merge
     return
   fi
   echo "updating: ${cur:-<none>} -> $ver"
@@ -311,6 +339,7 @@ cmd_remove() {
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   update)  shift; cmd_update "$@" ;;
+  reapply) shift; need_root; post_merge ;;
   status)  shift; cmd_status ;;
   remove)  shift; cmd_remove ;;
   *) usage ;;
