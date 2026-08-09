@@ -172,7 +172,8 @@ public final class GamepadFeedback {
                     while rumbleBurst < 64, !flag.isStopped,
                           let c = try connection.nextRumbleCommand(timeoutMs: 0) {
                         self?.routeRumble(
-                            pad: UInt8(truncatingIfNeeded: c.pad), low: c.low, high: c.high)
+                            pad: UInt8(truncatingIfNeeded: c.pad), low: c.low, high: c.high,
+                            leftTrigger: c.leftTrigger, rightTrigger: c.rightTrigger)
                         rumbleBurst += 1
                     }
                     // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
@@ -225,12 +226,21 @@ public final class GamepadFeedback {
 
     /// Route one engine command to its pad's renderer (drain thread). A command for a pad with no
     /// live renderer — one that just left the forwarded set — is dropped.
-    private func routeRumble(pad: UInt8, low: UInt16, high: UInt16) {
+    private func routeRumble(
+        pad: UInt8, low: UInt16, high: UInt16, leftTrigger: UInt16, rightTrigger: UInt16
+    ) {
         let renderer = withRouting { rumbleByPad[pad] }
-        renderer?.apply(low: low, high: high)
+        renderer?.apply(low: low, high: high, leftTrigger: leftTrigger, rightTrigger: rightTrigger)
         // The opt-in device mirror follows controller 1 unconditionally — the pads it exists for
         // have no motors (their renderer above no-ops), and mirroring deliberately isn't gated on
         // that: capability probing can't see a motor-less MFi pad, and the user opted in.
+        //
+        // HANDLES ONLY, deliberately. A phone body is one actuator with no trigger analogue, so
+        // the trigger levels would have to be folded to arrive at all — and folding continuous
+        // impulse-trigger content (a racing title's engine RPM / tyre slip) onto the one motor
+        // this mirror has would buzz the phone flat-out for the whole race at a level the game
+        // never requested. Dropping them matches the core engine's policy for every pad without
+        // trigger motors.
         if pad == 0 { deviceRumble?.apply(low: low, high: high) }
     }
 

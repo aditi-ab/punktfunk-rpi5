@@ -83,7 +83,18 @@
 // connection was simply lost. Purely a read of state the core already had: no new call is required
 // of an embedder, a client that never calls it is unchanged, and the host sends exactly the same
 // bytes either way, so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 17
+// v18: added `punktfunk_connection_next_rumble_cmd2` — the policy engine's rumble command with the
+// two Xbox impulse-trigger motor levels off the 0xCA v3 tail
+// (`design/trigger-rumble-plane.md`), which the fixed out-params of
+// `punktfunk_connection_next_rumble_cmd` have no room for. A NEW symbol, not a widened one: an
+// exported parameter list is part of the contract, and growing one in place breaks every
+// out-of-tree embedder at once. The old entry point is unchanged in signature AND in the levels
+// it reports — it keeps writing the two handle motors, which is the correct instruction for the
+// actuators it owns, so an embedder that never adopts the new symbol behaves exactly as before.
+// Additive and client-local: the v3 tail has been on the wire (and length-tolerant in both
+// decoders) since it landed, and the host sends the same bytes either way, so [`WIRE_VERSION`] is
+// unchanged.
+#define PUNKTFUNK_ABI_VERSION 18
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -195,7 +206,10 @@
 
 // uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
 // games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
-// impulse-trigger rumble is unreachable through a virtual pad). Useful for glyph-matching a
+// impulse-trigger rumble is unreachable through THIS pad — evdev's `FF_RUMBLE` is two
+// magnitudes and has no third, so a uinput backend can never source it. The Windows HID Xbox
+// backend can, off its output report `0x03`; see
+// [`punktfunk_connection_next_rumble_cmd2`]). Useful for glyph-matching a
 // physical X-Box One/Series controller on the client.
 #define PUNKTFUNK_GAMEPAD_XBOXONE 3
 
@@ -2774,8 +2788,20 @@ PunktfunkStatus punktfunk_connection_next_rumble2(PunktfunkConnection *c,
 // [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
 // every close-drain stop was delivered — silence all actuators on it.
 //
-// An embedder uses EITHER this or `next_rumble`/`next_rumble2` for a connection's lifetime,
-// never both (they consume the same wire plane).
+// **Handle motors only.** A pad also carries two Xbox impulse-trigger levels, which this entry
+// point has no out-params for and never will —
+// [`punktfunk_connection_next_rumble_cmd2`] is the four-motor pull. Staying here is a supported
+// choice, not a deprecation: for a controller with no trigger motors — every pad but an Xbox
+// One/Series/Elite — the two views are identical, and where they differ, "the handles are silent"
+// is exactly the right instruction for the motors this API owns.
+//
+// The one observable difference against a trigger-driving host: a rumble that moves only the
+// triggers still produces commands here, carrying `low == high == 0`. They are idempotent stops
+// for the handles; the engine's redundant-stop suppression cannot fold them away, because the
+// command is not silent — some motor on that pad is running.
+//
+// An embedder uses EITHER this (or its `2` form) or `next_rumble`/`next_rumble2` for a
+// connection's lifetime, never both (they consume the same wire plane).
 //
 // # Safety
 // `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
@@ -2786,6 +2812,52 @@ PunktfunkStatus punktfunk_connection_next_rumble_cmd(PunktfunkConnection *c,
                                                      uint16_t *high,
                                                      uint32_t *backstop_ms,
                                                      uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_connection_next_rumble_cmd`] with the two Xbox impulse-trigger motors: the same
+// command, all four of its levels. `*left_trigger` / `*right_trigger` are on the same
+// `0..=0xFFFF` scale as `low`/`high`, and a stop is all four at zero.
+//
+// A NEW symbol rather than a wider signature on the old one, following the
+// `next_rumble` → `next_rumble2` precedent in this file: an exported entry point's parameter list
+// is part of the contract, and silently growing one breaks every out-of-tree embedder at once,
+// with a stack-corruption signature rather than a link error. Old callers keep the old symbol and
+// simply never see the trigger levels.
+//
+// **Render the trigger levels only on a pad that actually has trigger motors, and drop them
+// otherwise** — do not fold them into the handles. Impulse-trigger content is continuous
+// (a racing title drives engine RPM and tyre slip into the triggers while the handles stay near
+// silent), so folding it produces a handle motor droning flat-out for the whole race at a level
+// the game never asked for. Query the hardware: SDL's
+// `SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN`, Apple's `GCDeviceHaptics.supportedLocalities`
+// (`GCHapticsLocalityLeftTrigger`/`…RightTrigger`). A pad without them is the common case and not
+// an error — do not log per command.
+//
+// **Nothing has driven these levels non-zero end to end yet, and that is structural, not an
+// oversight.** Exactly one producer can ever source them — the Windows HID Xbox pad's output
+// report `0x03` — because classic XInput's `XINPUT_VIBRATION` has two members and evdev's
+// `FF_RUMBLE` has two, so no other host backend on any OS has the channel. That producer is
+// reachable only through GameInput/WGI, and an xinputhid-promoted Xbox pad is not enumerated by
+// GameInput at all (measured against a real Microsoft Elite, which is equally invisible there
+// while XInput reads it live). So this delivery path is deliberately built ahead of its producer:
+// the wire, the engine and this entry point are exercised only by synthetic levels.
+//
+// Same threading, timeout and close semantics as
+// [`punktfunk_connection_next_rumble_cmd`]; the two share one wire plane and one policy engine,
+// so an embedder calls exactly one of them.
+//
+// # Safety
+// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+// thread pulls rumble — it may run concurrently with the video/audio pullers.
+PunktfunkStatus punktfunk_connection_next_rumble_cmd2(PunktfunkConnection *c,
+                                                      uint16_t *pad,
+                                                      uint16_t *low,
+                                                      uint16_t *high,
+                                                      uint16_t *left_trigger,
+                                                      uint16_t *right_trigger,
+                                                      uint32_t *backstop_ms,
+                                                      uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

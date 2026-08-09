@@ -1186,7 +1186,10 @@ pub const PUNKTFUNK_GAMEPAD_XBOX360: u32 = 1;
 pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
 /// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
 /// games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
-/// impulse-trigger rumble is unreachable through a virtual pad). Useful for glyph-matching a
+/// impulse-trigger rumble is unreachable through THIS pad — evdev's `FF_RUMBLE` is two
+/// magnitudes and has no third, so a uinput backend can never source it. The Windows HID Xbox
+/// backend can, off its output report `0x03`; see
+/// [`punktfunk_connection_next_rumble_cmd2`]). Useful for glyph-matching a
 /// physical X-Box One/Series controller on the client.
 pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
 /// UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
@@ -2723,8 +2726,20 @@ pub const PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER: u32 = 1;
 /// [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
 /// every close-drain stop was delivered — silence all actuators on it.
 ///
-/// An embedder uses EITHER this or `next_rumble`/`next_rumble2` for a connection's lifetime,
-/// never both (they consume the same wire plane).
+/// **Handle motors only.** A pad also carries two Xbox impulse-trigger levels, which this entry
+/// point has no out-params for and never will —
+/// [`punktfunk_connection_next_rumble_cmd2`] is the four-motor pull. Staying here is a supported
+/// choice, not a deprecation: for a controller with no trigger motors — every pad but an Xbox
+/// One/Series/Elite — the two views are identical, and where they differ, "the handles are silent"
+/// is exactly the right instruction for the motors this API owns.
+///
+/// The one observable difference against a trigger-driving host: a rumble that moves only the
+/// triggers still produces commands here, carrying `low == high == 0`. They are idempotent stops
+/// for the handles; the engine's redundant-stop suppression cannot fold them away, because the
+/// command is not silent — some motor on that pad is running.
+///
+/// An embedder uses EITHER this (or its `2` form) or `next_rumble`/`next_rumble2` for a
+/// connection's lifetime, never both (they consume the same wire plane).
 ///
 /// # Safety
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
@@ -2763,6 +2778,95 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
                     }
                     if !high.is_null() {
                         *high = cmd.high;
+                    }
+                    if !backstop_ms.is_null() {
+                        *backstop_ms = cmd.backstop_ms;
+                    }
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// [`punktfunk_connection_next_rumble_cmd`] with the two Xbox impulse-trigger motors: the same
+/// command, all four of its levels. `*left_trigger` / `*right_trigger` are on the same
+/// `0..=0xFFFF` scale as `low`/`high`, and a stop is all four at zero.
+///
+/// A NEW symbol rather than a wider signature on the old one, following the
+/// `next_rumble` → `next_rumble2` precedent in this file: an exported entry point's parameter list
+/// is part of the contract, and silently growing one breaks every out-of-tree embedder at once,
+/// with a stack-corruption signature rather than a link error. Old callers keep the old symbol and
+/// simply never see the trigger levels.
+///
+/// **Render the trigger levels only on a pad that actually has trigger motors, and drop them
+/// otherwise** — do not fold them into the handles. Impulse-trigger content is continuous
+/// (a racing title drives engine RPM and tyre slip into the triggers while the handles stay near
+/// silent), so folding it produces a handle motor droning flat-out for the whole race at a level
+/// the game never asked for. Query the hardware: SDL's
+/// `SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN`, Apple's `GCDeviceHaptics.supportedLocalities`
+/// (`GCHapticsLocalityLeftTrigger`/`…RightTrigger`). A pad without them is the common case and not
+/// an error — do not log per command.
+///
+/// **Nothing has driven these levels non-zero end to end yet, and that is structural, not an
+/// oversight.** Exactly one producer can ever source them — the Windows HID Xbox pad's output
+/// report `0x03` — because classic XInput's `XINPUT_VIBRATION` has two members and evdev's
+/// `FF_RUMBLE` has two, so no other host backend on any OS has the channel. That producer is
+/// reachable only through GameInput/WGI, and an xinputhid-promoted Xbox pad is not enumerated by
+/// GameInput at all (measured against a real Microsoft Elite, which is equally invisible there
+/// while XInput reads it live). So this delivery path is deliberately built ahead of its producer:
+/// the wire, the engine and this entry point are exercised only by synthetic levels.
+///
+/// Same threading, timeout and close semantics as
+/// [`punktfunk_connection_next_rumble_cmd`]; the two share one wire plane and one policy engine,
+/// so an embedder calls exactly one of them.
+///
+/// # Safety
+/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
+    c: *mut PunktfunkConnection,
+    pad: *mut u16,
+    low: *mut u16,
+    high: *mut u16,
+    left_trigger: *mut u16,
+    right_trigger: *mut u16,
+    backstop_ms: *mut u32,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c
+            .inner
+            .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(cmd) => {
+                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
+                // checked before it is written; a non-null one is a caller-owned writable slot.
+                unsafe {
+                    if !pad.is_null() {
+                        *pad = cmd.pad;
+                    }
+                    if !low.is_null() {
+                        *low = cmd.low;
+                    }
+                    if !high.is_null() {
+                        *high = cmd.high;
+                    }
+                    if !left_trigger.is_null() {
+                        *left_trigger = cmd.left_trigger;
+                    }
+                    if !right_trigger.is_null() {
+                        *right_trigger = cmd.right_trigger;
                     }
                     if !backstop_ms.is_null() {
                         *backstop_ms = cmd.backstop_ms;
