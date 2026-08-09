@@ -2413,6 +2413,60 @@ fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// The absolute path a session script may hardcode instead of honouring `GAMESCOPE_BIN`.
+///
+/// Nobara's `gamescope-session-plus` builds its command as `GAMESCOPECMD="/usr/bin/gamescope …"`
+/// and reads `GAMESCOPE_BIN` NOWHERE, so all three of our spawn levers miss at once: the env var
+/// is ignored, and an absolute path cannot be redirected by a PATH shim. The session then runs a
+/// stock gamescope, the capability probe rejects it, and every session dies with
+/// "pipeline build failed (out of retries)".
+const DISTRO_GAMESCOPE_PATH: &str = "/usr/bin/gamescope";
+
+/// Bind our wrapper over [`DISTRO_GAMESCOPE_PATH`] **inside the session unit's mount namespace**,
+/// so a script that hardcodes that path still gets the patched build.
+///
+/// Deliberately a bind rather than replacing the distro's binary: `punktfunk-gamescope` ships under
+/// its own name precisely so it sits BESIDE the distro package (a Steam gaming session keeps using
+/// its own gamescope — see packaging/gamescope/README.md). The bind is scoped to this transient
+/// unit, so nothing outside the session sees it and nothing is written to `/usr`.
+///
+/// Skipped when the resolved binary IS the distro path (nothing to redirect) — binding a file over
+/// itself is pointless, and on a box with no `punktfunk-gamescope` we must not pretend otherwise.
+fn session_gamescope_bind(wrapper: &std::path::Path) -> Option<String> {
+    if gamescope_bin() == DISTRO_GAMESCOPE_PATH {
+        return None;
+    }
+    Some(format!(
+        "--property=BindReadOnlyPaths={}:{DISTRO_GAMESCOPE_PATH}",
+        wrapper.display()
+    ))
+}
+
+/// Whether the box's `VkLayer_FROG_gamescope_wsi` can be trusted against the gamescope we run.
+///
+/// The layer ships with the DISTRO's gamescope and speaks its `gamescope_swapchain` protocol; we
+/// run our own build. When the two disagree the compositor rejects the client's
+/// `swapchain_feedback` ("message too short") and **kills every Vulkan client** — Steam never
+/// paints and the stream is a black screen with no error anywhere else.
+///
+/// Measured on Nobara 44 (`vkcube` under each build, layer on):
+/// distro 3.16.23.2 → 0 errors; our 3.16.25 → 1 rejected client. The upstream protocol XML is
+/// byte-identical between those commits, so this is the distro PATCHING gamescope, not a version
+/// bump — which is why the check is "do the version triples differ", not a floor.
+///
+/// `ENABLE_GAMESCOPE_WSI=0` is gamescope's own opt-out and costs only the layer's extras
+/// (present-mode control, client HDR metadata) — far cheaper than a client that cannot start.
+fn wsi_layer_matches_our_gamescope() -> bool {
+    let ours = discovery::gamescope_version_of(std::path::Path::new(gamescope_bin()));
+    let distro = discovery::gamescope_version_of(std::path::Path::new(DISTRO_GAMESCOPE_PATH));
+    match (ours, distro) {
+        // Same upstream triple ⇒ the layer was built from the same protocol. Keep it.
+        (Some(a), Some(b)) => a == b,
+        // Either side unreadable: leave the layer alone rather than degrade a box that works.
+        _ => true,
+    }
+}
+
 /// Launch `gamescope-session-plus <client>` headless at `mode` as a transient `systemd --user`
 /// unit (clean cgroup teardown of the whole Steam tree on stop). Injects `--nested-refresh` (via
 /// the wrapper) + `--generate-drm-mode cvt` so games see exactly `mode` (resolution + refresh) and
@@ -2451,9 +2505,38 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         r.dedup();
         r.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
     };
+    // Redirect a hardcoded `/usr/bin/gamescope` at our wrapper, for session scripts that never
+    // read `GAMESCOPE_BIN` (Nobara). Computed once so the log line below reflects what we did.
+    let bind = session_gamescope_bind(&wrapper);
+    if bind.is_some() {
+        tracing::info!(
+            bin = %gamescope_bin(),
+            "gamescope: binding the patched build over {DISTRO_GAMESCOPE_PATH} inside the session \
+             unit — a session script that hardcodes that path (Nobara) gets the patched build \
+             instead of the distro's stock one. Nothing outside this unit is affected."
+        );
+    }
+    // The distro's Vulkan WSI layer speaks the distro gamescope's protocol; ours may differ, and a
+    // mismatch kills every Vulkan client (Steam included) with no error but a black screen.
+    let wsi_ok = wsi_layer_matches_our_gamescope();
+    if !wsi_ok {
+        tracing::warn!(
+            "gamescope: this box's VkLayer_FROG_gamescope_wsi was built for a different gamescope \
+             than the one we run — disabling it for this session (ENABLE_GAMESCOPE_WSI=0). Left \
+             enabled it rejects the client's swapchain_feedback and every Vulkan client dies, \
+             which shows up as a black screen with no other symptom."
+        );
+    }
     let start_unit = || -> Result<()> {
-        let status = Command::new("systemd-run")
-            .args(["--user", "--collect", &format!("--unit={unit_name}")])
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(["--user", "--collect", &format!("--unit={unit_name}")]);
+        if let Some(b) = bind.as_deref() {
+            cmd.arg(b);
+        }
+        if !wsi_ok {
+            cmd.arg("--setenv=ENABLE_GAMESCOPE_WSI=0");
+        }
+        let status = cmd
             // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
             // user manager env, which can carry a (possibly stale) desktop DISPLAY/WAYLAND_DISPLAY
             // that would abort gamescope at startup.

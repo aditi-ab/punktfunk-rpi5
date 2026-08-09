@@ -524,6 +524,22 @@ fn parse_patch_level(banner: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// The upstream `X.Y.Z` a specific gamescope binary reports, or `None` if it cannot be run/parsed.
+///
+/// Split from [`check_gamescope_version`] (which only ever probes the RESOLVED binary) because the
+/// WSI-layer check has to compare TWO binaries — ours and the distro's — and a `None` there means
+/// "leave the layer alone", not "assume old".
+pub(super) fn gamescope_version_of(bin: &std::path::Path) -> Option<(u32, u32, u32)> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    // Same stdout/stderr split as the version gate: builds disagree on where the banner goes.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parse_version(&text)
+}
+
 /// Minimum gamescope that captures reliably: below 3.16.22, headless PipeWire capture deadlocks
 /// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
 const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
