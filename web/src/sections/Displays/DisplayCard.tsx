@@ -267,13 +267,13 @@ export const DisplayTabs: FC<{
 
 		<TabsContent value="configuration">
 			<Card>
-				<CardContent className="space-y-4 pt-6">{configuration}</CardContent>
+				<CardContent className="space-y-4">{configuration}</CardContent>
 			</Card>
 		</TabsContent>
 
 		<TabsContent value="live">
 			<Card>
-				<CardContent className="pt-6">{live}</CardContent>
+				<CardContent>{live}</CardContent>
 			</Card>
 		</TabsContent>
 	</Tabs>

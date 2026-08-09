@@ -62,7 +62,7 @@ export const DashboardView: FC<{
 								    only the GameStream certs read as "0 paired" on a host every
 								    one of whose clients was in fact paired. */}
 								<Card>
-									<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
+									<CardContent className="flex flex-1 items-center justify-between">
 										<span className="text-sm text-muted-foreground">
 											{m.status_paired_count()}
 										</span>
@@ -72,7 +72,7 @@ export const DashboardView: FC<{
 									</CardContent>
 								</Card>
 								<Card>
-									<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
+									<CardContent className="flex flex-1 items-center justify-between">
 										<span className="text-sm text-muted-foreground">
 											{m.status_pin_pending()}
 										</span>
@@ -206,7 +206,10 @@ export const DashboardView: FC<{
  * else except the host log.
  */
 const AudioWiringCard: FC<{ audio: AudioWiring }> = ({ audio }) => {
-	const badge: { variant: "success" | "secondary" | "destructive"; text: string } =
+	const badge: {
+		variant: "success" | "secondary" | "destructive";
+		text: string;
+	} =
 		audio.readiness === "full"
 			? { variant: "success", text: m.audio_ready() }
 			: audio.readiness === "audio_only"
@@ -257,7 +260,7 @@ const StatCard: FC<{ icon: ReactNode; label: string; on: boolean }> = ({
 	on,
 }) => (
 	<Card>
-		<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
+		<CardContent className="flex flex-1 items-center justify-between">
 			<span className="flex items-center gap-2 text-sm text-muted-foreground">
 				{icon}
 				{label}
