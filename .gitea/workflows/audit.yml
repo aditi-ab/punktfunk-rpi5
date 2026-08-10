@@ -91,8 +91,27 @@ jobs:
       # advisory, the same fail-on-vulnerability stance as cargo-audit above; triage a finding by
       # bumping the dep (or, if genuinely unfixable + inapplicable, pinning a resolution and
       # noting why here).
+      #
+      # web carries two ignores, the ONLY ones in a blocking tree — both image-size advisories
+      # (GHSA-w3rx-r6r6-pgpr ICNS, GHSA-5p2g-fcmc-qvqq JXL/HEIF infinite-loop DoS). They are
+      # unfixable AND unreachable:
+      #   * unfixable — the vulnerable range is `<= 2.0.2` and 2.0.2 IS latest; upstream has
+      #     published no patched release, so no override can clear them.
+      #   * unreachable — image-size rides in under `@unom/ui › @payloadcms/richtext-lexical ›
+      #     … › payload`, and @payloadcms/richtext-lexical is a PEER of @unom/ui that only its
+      #     `./richtext` export needs. The console imports section/toast/button/card/dialog/
+      #     form/*/material/tabs — never `./richtext` — so payload is auto-installed peer weight
+      #     that no bundle, and no request path, ever touches.
+      # Drop these the moment image-size ships a fix, or @unom/ui marks that peer optional
+      # (peerDependenciesMeta) and the chain leaves web/bun.lock entirely — either one makes the
+      # bare `bun audit` green again. Scoped per-tree so sdk/plugin-kit stay strictly fail-on-any.
       - name: bun audit
-        run: bun audit
+        run: |
+          if [ "${{ matrix.tree }}" = "web" ]; then
+            bun audit --ignore=GHSA-w3rx-r6r6-pgpr --ignore=GHSA-5p2g-fcmc-qvqq
+          else
+            bun audit
+          fi
 
   # Kept OUT of the bun-audit matrix so this tree's known-advisory state can't normalize failure
   # in a shipping tree. Non-blocking via a step-level `||` (NOT job-level continue-on-error, which
