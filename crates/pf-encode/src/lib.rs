@@ -1600,7 +1600,41 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
                 };
                 vulkan10 || vaapi::probe_can_encode_10bit(codec)
             } else {
-                linux::probe_can_encode_10bit(codec)
+                // NVIDIA. Same rule the 4:4:4 arm above already follows, and for the same field
+                // bug: on a direct-SDK host the answer comes from the driver's own
+                // `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` over the direct SDK, NOT from opening an
+                // ffmpeg `hevc_nvenc`. One ffmpeg NVENC open in a direct-SDK process wedges every
+                // later open process-wide with `NV_ENC_ERR_INVALID_VERSION` until the host
+                // restarts (LOG-3). This probe was the LAST ffmpeg-NVENC use left on a default
+                // host — it was kept on the reading that "Linux HDR rides the libav P010 path",
+                // which `open_video` contradicts: a CUDA payload goes to the direct backend at
+                // whatever `bit_depth` was resolved, and `is_ten_bit_input` accepts the packed
+                // 10-bit RGB (`X2Bgr10`) a gamescope HDR capture negotiates. Reproduced on
+                // home-nobara-1 2026-08-10: HDR on → probe opens ffmpeg → the live direct-SDK
+                // session's caps probe returns INVALID_VERSION → repeated in-place rebuilds →
+                // "encoder did not recover" and the session dies. With the ffmpeg probe out of the
+                // process the same HDR session streams clean.
+                //
+                // Only a host that will REALLY serve the session over libav keeps the ffmpeg probe
+                // (PUNKTFUNK_NVENC_DIRECT=0, or a build without `--features nvenc`): there it
+                // validates the actual path, and ffmpeg's NVENC client runs in that process anyway.
+                #[cfg(feature = "nvenc")]
+                {
+                    if nvenc_direct_enabled() {
+                        let t = nvenc_cuda::probe_support().ten_bit;
+                        match codec {
+                            Codec::H265 => t.h265,
+                            Codec::Av1 => t.av1,
+                            _ => false,
+                        }
+                    } else {
+                        linux::probe_can_encode_10bit(codec)
+                    }
+                }
+                #[cfg(not(feature = "nvenc"))]
+                {
+                    linux::probe_can_encode_10bit(codec)
+                }
             }
         }
         #[cfg(target_os = "windows")]
