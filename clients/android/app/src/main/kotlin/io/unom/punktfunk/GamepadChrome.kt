@@ -7,7 +7,7 @@ import android.view.InputDevice
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -38,6 +38,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -56,6 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -63,6 +66,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -71,6 +75,15 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -113,8 +126,21 @@ import kotlinx.coroutines.launch
  * is a change owed to the other two.
  */
 object ConsoleMotion {
-    /** The desktop's `ease_out_cubic`, as a Compose easing. */
-    val EaseOutCubic = CubicBezierEasing(0.215f, 0.61f, 0.355f, 1f)
+    /**
+     * The desktop's `ease_out_cubic` — `1 − (1−t)³`, ANALYTICALLY, not as a Bézier approximation
+     * of it (`crates/pf-console-ui/src/anim.rs`).
+     *
+     * ⚠ Two different curves are published under the name "easeOutCubic" and neither is the real
+     * one: the Penner/Ceaser CSS table's `cubic-bezier(0.215, 0.61, 0.355, 1)` and easings.net's
+     * `cubic-bezier(0.33, 1, 0.68, 1)`. At the midpoint the true curve is 0.875, the second bezier
+     * ≈0.87, and the first ≈0.80 — visibly slacker. Compose's `Easing` is a plain function, so
+     * there is no reason to approximate at all; the Apple client uses the second bezier only
+     * because SwiftUI's `timingCurve` cannot take a closure.
+     */
+    val EaseOutCubic = Easing { t ->
+        val u = 1f - t
+        1f - u * u * u
+    }
 
     /** Screen push/pop, ms — the desktop's `TRANSITION_S` (0.26 s). */
     const val TRANSITION_MS = 260
@@ -377,7 +403,11 @@ fun ConsoleTabStrip(
                 },
         ) {
             Row(
-                Modifier.padding(horizontal = ConsoleEdgeInset),
+                // The pills are one mutually-exclusive set, and saying so is the only way a screen
+                // reader can know it: the SELECTION is drawn as an indicator in the parent's
+                // `drawBehind`, which is paint and nothing else — no pill differs from its
+                // neighbours in the tree.
+                Modifier.padding(horizontal = ConsoleEdgeInset).selectableGroup(),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 titles.forEachIndexed { i, title ->
@@ -400,7 +430,10 @@ fun ConsoleTabStrip(
                                 pillW[i] = it.size.width.toFloat()
                             }
                             .clip(ConsoleShape.Pill)
-                            .clickable { onSelect(i) }
+                            // `selectable`, not `clickable`: same ripple and the same click, but it
+                            // also publishes Role.Tab + the selected flag, so "Video, tab, selected"
+                            // reaches a screen reader that cannot see the indicator behind the pill.
+                            .selectable(selected = active, role = Role.Tab) { onSelect(i) }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                     )
                 }
@@ -473,13 +506,56 @@ fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocus
  * same curve as the fill — one focus change, not four independent animations.
  */
 @Composable
-fun Modifier.consoleGlass(shape: Shape, visuals: ConsoleFocusVisuals): Modifier {
+fun Modifier.consoleGlass(
+    shape: Shape,
+    visuals: ConsoleFocusVisuals,
+    /**
+     * Draw the edge DASHED instead of solid — the convention for a surface that is offered but not
+     * yet yours (a host discovered on the network, the Add-Host tile). Dashes need a real stroke
+     * rather than `Modifier.border`, which takes no path effect, so this branch draws the edge
+     * itself; the top-edge highlight comes with it either way.
+     */
+    dashed: Boolean = false,
+): Modifier {
     val ink = LocalGamepadInk.current
     val focus = visuals.focus
     val accent = ink.accent
     val highlight = ink.highlight
     val fill = visuals.background
     val border = visuals.border
+    if (dashed) {
+        return this
+            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
+            // BEFORE the clip, so the full stroke width shows: drawn inside it, the outer half of
+            // the line would be clipped away and the dashes would read as a hairline.
+            .drawWithContent {
+                drawContent()
+                // The console's shapes are all rounded rects; anything else simply gets a square
+                // dashed edge rather than no edge at all.
+                val r = (shape as? RoundedCornerShape)?.topStart?.toPx(size, this) ?: 0f
+                drawRoundRect(
+                    brush = Brush.verticalGradient(
+                        listOf(highlight.copy(alpha = highlight.alpha * 0.7f), border),
+                    ),
+                    cornerRadius = CornerRadius(r),
+                    style = Stroke(
+                        width = 1.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(
+                            floatArrayOf(6.dp.toPx(), 5.dp.toPx()),
+                        ),
+                    ),
+                )
+            }
+            .clip(shape)
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        fill.copy(alpha = (fill.alpha * 1.35f + 0.03f).coerceAtMost(1f)),
+                        fill.copy(alpha = fill.alpha * 0.72f),
+                    ),
+                ),
+            )
+    }
     return this
         .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
         // BEFORE the clip, so the bloom can spill past the row's own rectangle — a glow that stops
@@ -609,6 +685,16 @@ fun ConsoleModal(content: @Composable () -> Unit) {
  *
  * [key] is what the cross-fade keys on — the focused row's id, so stepping between two rows that
  * happen to share a description doesn't flicker.
+ *
+ * ⚠ The band is HIDDEN FROM ACCESSIBILITY, and the row carries the same words in its own
+ * description instead (see `SettingRowView`). Of the two ways to make a floating band speak — hide
+ * it and merge, or leave it and make it a live region — merging wins because the band is a
+ * SIGHTED-ONLY relationship: it is a strip in the bottom-left corner whose only tie to the row it
+ * describes is that they happen to be on screen together. A screen reader walking the list would
+ * meet it as a stray paragraph several nodes away from its subject, and a live region would
+ * additionally interrupt the row announcement it duplicates. `hideFromAccessibility` rather than
+ * `clearAndSetSemantics` deliberately: the node stays in the semantics tree (where the layout tests
+ * assert the description is still rendered), it is only skipped by screen readers.
  */
 @Composable
 fun ConsoleDetailBand(
@@ -624,7 +710,13 @@ fun ConsoleDetailBand(
             fadeIn(ConsoleMotion.ease(ConsoleMotion.FOCUS_MS)) togetherWith
                 fadeOut(ConsoleMotion.ease(ConsoleMotion.FOCUS_MS))
         },
-        modifier = modifier,
+        // Silent to a screen reader, deliberately. The band is a place to LOOK — it sits at the
+        // far bottom of the screen, describing a row that may be anywhere in the list — so read
+        // aloud in layout order it arrives long after, and out of any useful context. The SETTINGS
+        // ROW merges this same string into its own announcement instead, which is where a reader
+        // is when it matters. Sighted focus and screen-reader focus want the text in different
+        // places; this is the one giving each what it needs rather than one of them both.
+        modifier = modifier.semantics { hideFromAccessibility() },
         label = "detail",
     ) { (_, body) ->
         if (body.isBlank()) {
@@ -639,6 +731,7 @@ fun ConsoleDetailBand(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
+                    .semantics { hideFromAccessibility() }
                     .widthIn(max = 560.dp)
                     .clip(ConsoleShape.Band)
                     .then(
@@ -662,6 +755,11 @@ fun ConsoleDetailBand(
  * The knob SQUASHES as it travels (widest at mid-flight, round at either rest) — the elastic cue
  * that makes a slide read as a thrown object rather than a repositioned dot. Taken from the
  * travel itself rather than from a velocity read, so it can't disagree with where the knob is.
+ *
+ * Being hand-drawn, it announces nothing on its own — a `Box` with a gradient is not a switch to
+ * anything but an eye. The semantics here make it one wherever it is used; a caller that MERGES it
+ * into a bigger node (a settings row does) restates them on that node, since `Role` never
+ * propagates from a child.
  */
 @Composable
 fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) {
@@ -687,6 +785,15 @@ fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) 
     val knob = trackH - pad * 2
     Box(
         modifier
+            // A hand-drawn track and knob are two `Box`es to a screen reader — nothing about them
+            // says "switch" or says which way it is thrown. The row that owns this one is the
+            // thing that gets pressed (the pad and a tap both act on the ROW), so the switch is
+            // not itself toggleable here: it only has to REPORT. See the settings row, which
+            // merges this into its own announcement.
+            .semantics {
+                role = Role.Switch
+                toggleableState = if (on) ToggleableState.On else ToggleableState.Off
+            }
             .size(trackW, trackH)
             .clip(ConsoleShape.Pill)
             .background(

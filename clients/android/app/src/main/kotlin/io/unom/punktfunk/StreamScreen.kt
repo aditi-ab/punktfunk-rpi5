@@ -28,6 +28,9 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -53,6 +56,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -152,6 +156,35 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             motionHint = false
         }
     }
+    // Whether this session has a controller — the start banner names pad chords only when there is
+    // a pad to press them on. Seeded from the router the moment it is built (it opens a slot for
+    // every already-connected controller) and latched true by a pad that arrives later; it never
+    // goes back to false. A pad LEAVING inside the banner's six seconds is not worth the write:
+    // teardown closes every slot, and poking Compose state from there is exactly what the nulled
+    // callbacks in onDispose avoid. The latch is also what carries a pad through a USB capture
+    // claiming it — its InputDevice slot closes and reopens as a capture-link one.
+    var padPresent by remember(handle) { mutableStateOf(false) }
+    // The start-of-stream banner: what this session's shortcuts ARE, said once. A stream takes the
+    // whole screen and answers to none of the device's usual gestures, so it has to say how to get
+    // back out — the desktop console draws the same pill for the same reason
+    // (`pf-console-ui/src/skia_overlay.rs`, BANNER_S = 6 s with a BANNER_FADE_S = 0.6 s tail).
+    // Two states because the fade and the removal are different moments: `bannerUp` composes the
+    // pill at all, `bannerFading` runs its alpha down over the last 600 ms.
+    var bannerUp by remember(handle) { mutableStateOf(true) }
+    var bannerFading by remember(handle) { mutableStateOf(false) }
+    val bannerAlpha by animateFloatAsState(
+        targetValue = if (bannerFading) 0f else 1f,
+        // Linear, like the desktop's (BANNER_S - age) / BANNER_FADE_S ramp — Compose's default
+        // easing would hold near-opaque and then drop, which reads as a glitch rather than a fade.
+        animationSpec = tween(600, easing = LinearEasing),
+        label = "streamStartBanner",
+    )
+    LaunchedEffect(handle) {
+        delay(5400) // 6 s − the 0.6 s tail: fully opaque until here, exactly as on the desktop
+        bannerFading = true
+        delay(600)
+        bannerUp = false // stop composing it once it is invisible
+    }
     // The one place mute is toggled — Compose state + the native flag, always together.
     val setMicMuted = { muted: Boolean ->
         micMuted = muted
@@ -161,7 +194,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
     // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
     // frame) AND the 1 s poll loop, which only runs while the overlay is visible. Enabling resets
-    // the native window, so re-showing never renders stale data. A 3-finger tap cycles the
+    // the native window, so re-showing never renders stale data. A 3-finger tap — or the Select + X
+    // pad chord, which is the only route a TV or a passthrough-touch session has — cycles the
     // verbosity tier live (Off → Compact → Normal → Detailed → Off); the default comes from
     // Settings. The tier only changes how many lines `StatsOverlay` draws — switching between the
     // visible tiers keeps sampling running (the effect keys on `statsOn`, not the tier) so it never
@@ -184,6 +218,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
     val isTv = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }
+    // A screen with fingers on it — the start banner may only name the three-finger stats tap on a
+    // device that can perform it. A TV box has no touchscreen at all, and its remote is not one.
+    val hasTouch = remember {
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+    }
     LaunchedEffect(handle, statsOn) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
         if (statsOn) {
@@ -362,6 +401,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             initialSettings.systemButtonsForward(), initialSettings.guideGestureEnabled(),
         )
         activity?.gamepadRouter = router
+        // Every controller that was already connected got a slot in the router's constructor, so
+        // this is the session's pad answer at t=0 — what the start banner's words are chosen from.
+        padPresent = router.forwardedDevices().isNotEmpty()
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
         // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
         // (must be held ~1.5 s) and fires onExitChord on its main-thread timer, so leave the stream
@@ -384,6 +426,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 micHint = if (next) "Microphone muted" else "Microphone live"
             }
         }
+        // Select + X steps the stats overlay one tier — the same live cycle the three-finger tap
+        // performs, and the ONLY route to it on a TV or in a passthrough-touch session. Session-
+        // local on purpose: this mirrors the tap exactly (`onCycleStats` below), and the settings
+        // row calls it a live cycle — the stored default is what the next stream starts from.
+        router.onStatsChord = { statsVerbosity = statsVerbosity.next() }
         // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
         // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
         // The local cursor is hidden over the stream — the host's own cursor, composited into
@@ -505,7 +552,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // The other edge: a controller that arrives (or first speaks) mid-session gets its sensors
         // read too. The pads already connected were swept by PadSensors.start() above — both run
         // on the main thread with nothing between them, so no controller falls through the gap.
-        router.onSlotOpened = { deviceId -> padSensors?.onSlotOpened(deviceId) }
+        router.onSlotOpened = { deviceId ->
+            padSensors?.onSlotOpened(deviceId)
+            // A pad that wakes up a second into the stream still deserves the chord banner — the
+            // desktop rebuilds its banner text every frame for exactly this case.
+            padPresent = true
+        }
         // Steam Controller 2 as-is passthrough (opt-out): capture a wired/Puck USB pad — or an
         // already-paired BLE one — and forward its raw reports; the host mirrors a real
         // 28DE:1302 that its Steam drives directly, and Steam's rumble/settings writes come back
@@ -645,6 +697,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             ds?.stop() // rumble-stop on the physical pad + release the USB link + free the wire slot
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.onMicChord = null // same: no mute toggle on buttons released during teardown
+            router.onStatsChord = null // same: no tier cycle on buttons released during teardown
             router.onMotionUnreachable = null // same: no notice raised by a slot closing at teardown
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
@@ -847,6 +900,42 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         if (remotePointerOn) {
             RemotePointerHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
         }
+        // The start banner (desktop parity), naming ONLY the shortcuts this session actually has:
+        // pad chords when a controller is here, the Back gesture and the three-finger tap when it
+        // is not. Recomputed rather than captured, because both inputs change under it — a pad can
+        // wake mid-banner, and `micRunning` only settles once the capture has actually opened.
+        // Above the video and below the gesture layer: it teaches touches, it must never eat one.
+        //
+        // Bottom-centre is the desktop's placement and the only edge left — TopStart is the HUD,
+        // TopEnd the mic badge, TopCentre the three transient cues — but MotionUnreachableHint
+        // already owns it, and both of these can be up at t≈0. The banner YIELDS rather than
+        // stacking or sliding off-centre: the notice reports something broken about THIS session
+        // and names the setting that fixes it, while the banner repeats shortcuts that will be
+        // there next stream too. Two pills sharing an edge for six seconds would cost the reader
+        // both.
+        if (bannerUp && !motionHint) {
+            StreamStartBanner(
+                text = buildList {
+                    if (padPresent) {
+                        add("Hold Select + Start + L1 + R1 to leave")
+                        // Only while a capture is actually running: the chord itself no-ops
+                        // without one, and offering a mute for a mic nobody has is the lie the
+                        // whole control exists to avoid.
+                        if (micRunning) add("Select + Y mic")
+                        add("Select + X stats")
+                    } else {
+                        // No pad: Back is the deliberate exit (gesture, key, or a TV remote's
+                        // button — all land on the same BackHandler).
+                        add("Back leaves the stream")
+                        // The tap lives in the pointer touch models only — passthrough gives every
+                        // finger to the host verbatim — and needs a screen to put three fingers on.
+                        if (hasTouch && touchMode != TouchMode.TOUCH) add("three-finger tap for stats")
+                    }
+                }.joinToString(" · "),
+                alpha = bannerAlpha,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
+            )
+        }
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up
         // in the mouse modes) AND the pointer-capture grab target — it never draws or takes
         // touches, it just owns IME focus and receives captured-pointer events.
@@ -1046,6 +1135,33 @@ private fun RemotePointerHint(modifier: Modifier = Modifier) {
     Text(
         "Remote pointer — SELECT click · play/pause right-click · hold SELECT to exit",
         modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
+}
+
+/**
+ * The start-of-stream banner: the shortcuts this session actually has, in the same pill as every
+ * other in-stream cue, shown once and then gone. The desktop console draws the identical thing
+ * bottom-centre (`pf-console-ui/src/skia_overlay.rs` — six seconds with a 0.6 s fade), because a
+ * stream owns the whole screen and answers to none of the device's usual gestures: without a line
+ * saying how to get back out, the only discoverable exit is force-quitting the app.
+ *
+ * [text] and [alpha] are the caller's. Only it knows what this session HAS — a pad, a mic, a
+ * touchscreen — and only it owns the timer, which is precisely what a screenshot wants to skip.
+ * Purely visual: it sits below the gesture layer, takes no touches and is never clickable. Internal
+ * so the screenshot scene can shoot the real pill instead of a copy of it that drifts.
+ */
+@Composable
+internal fun StreamStartBanner(text: String, alpha: Float, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        // Alpha FIRST: the fade has to take the pill's backdrop with it, and everything after this
+        // in the chain draws inside the layer it opens.
+        modifier = modifier
+            .alpha(alpha)
             .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
             .padding(horizontal = 14.dp, vertical = 8.dp),
         color = Color.White,

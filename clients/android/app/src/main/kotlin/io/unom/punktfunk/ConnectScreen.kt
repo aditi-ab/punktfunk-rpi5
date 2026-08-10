@@ -792,14 +792,17 @@ fun ConnectScreen(
                     HomeTile(
                         id = "saved-${kh.id}",
                         title = kh.name,
-                        // The binding is what a press will actually do, so the tile says so — the
-                        // console can't edit profiles, but it must never lie about which one it uses.
-                        subtitle = bound?.let { "${kh.address}:${kh.port} · ${it.name}" }
-                            ?: "${kh.address}:${kh.port}",
+                        subtitle = "${kh.address}:${kh.port}",
                         filled = true,
                         online = kh.isOnline(discovered, reachable),
                         paired = kh.paired,
                         knownHost = kh,
+                        // The binding is what a press will actually do, so the tile says so — the
+                        // console can't edit profiles, but it must never lie about which one it
+                        // uses. It rides in the card's own chip now rather than as a "· Name" tail
+                        // on the address, which is where it read as an afterthought.
+                        profileName = bound?.name,
+                        profileAccent = accentColor(bound?.accent),
                         activate = { connect(kh.address, kh.port) },
                     ),
                 )
@@ -810,12 +813,18 @@ fun ConnectScreen(
                         HomeTile(
                             id = "pin-${kh.id}-${p.id}",
                             title = kh.name,
-                            subtitle = p.name,
+                            // The address, like every other card — the PROFILE is what makes this
+                            // card different, and it now says so in the chip instead of standing
+                            // in for the subtitle, which left a pin card unable to say where it
+                            // pointed.
+                            subtitle = "${kh.address}:${kh.port}",
                             filled = true,
                             online = kh.isOnline(discovered, reachable),
                             paired = kh.paired,
                             knownHost = kh,
                             pinnedProfileId = p.id,
+                            profileName = p.name,
+                            profileAccent = accentColor(p.accent),
                             activate = { connect(kh.address, kh.port, oneOffProfile = p.id) },
                         ),
                     )

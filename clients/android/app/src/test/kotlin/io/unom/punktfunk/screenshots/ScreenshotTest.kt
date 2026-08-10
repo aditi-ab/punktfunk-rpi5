@@ -83,6 +83,16 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
+    // Both banner texts, in the stream's own landscape geometry — it is bottom-centre, so the
+    // aspect is load-bearing.
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamBannerPad() = shootRoot("stream-banner-pad") { StreamBannerScene(pad = true) }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamBannerTouch() = shootRoot("stream-banner-touch") { StreamBannerScene(pad = false) }
+
     // The touch flow is a Material dialog over the host grid (a separate window → shootScreen).
     @Test
     fun connecting() = shootScreen("connecting") {

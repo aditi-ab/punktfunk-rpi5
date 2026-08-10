@@ -48,6 +48,14 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -489,6 +497,28 @@ private fun SettingRowView(
                     indication = null,
                     onClick = onClick,
                 )
+                // ONE announcement per row, not five leaves read in layout order. Three things had
+                // to be gathered to make it true:
+                //  * the VALUE of a toggle row existed nowhere in the tree — the switch replaces
+                //    the value text (see below), so `row.value` ("On"/"Off") was drawn by nothing;
+                //  * the DESCRIPTION lives in the floating band at the far bottom of the screen,
+                //    which is the right place to LOOK and the wrong place to be read — so it is
+                //    merged here, where the row it explains is;
+                //  * `enabled` was a colour and nothing else.
+                // A row therefore announces "Refresh rate, 120 Hz, Frame rate the host renders and
+                // streams at" — which is what the screen already means, said once.
+                .semantics(mergeDescendants = true) {
+                    role = if (row.toggled != null) Role.Switch else Role.Button
+                    contentDescription = listOfNotNull(
+                        row.label,
+                        row.value.takeIf { it.isNotBlank() },
+                        row.detail.takeIf { it.isNotBlank() },
+                    ).joinToString(", ")
+                    row.toggled?.let {
+                        toggleableState = if (it) ToggleableState.On else ToggleableState.Off
+                    }
+                    if (!row.enabled) disabled()
+                }
                 .padding(horizontal = 16.dp, vertical = 13.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -518,6 +548,10 @@ private fun SettingRowView(
                         "‹ ",
                         color = ink.fg,
                         modifier = Modifier
+                            // Decoration: it says "this value steps", which the row's Switch/Button
+                            // role already says. Left in the tree it is read out as punctuation on
+                            // every single focused row.
+                            .semantics { hideFromAccessibility() }
                             .graphicsLayer { alpha = chevronAlpha }
                             .offset { IntOffset(minOf(chevronKick.value, 0f).dp.roundToPx(), 0) },
                     )
@@ -563,6 +597,7 @@ private fun SettingRowView(
                         " ›",
                         color = ink.fg,
                         modifier = Modifier
+                            .semantics { hideFromAccessibility() }
                             .graphicsLayer { alpha = chevronAlpha }
                             .offset { IntOffset(maxOf(chevronKick.value, 0f).dp.roundToPx(), 0) },
                     )
@@ -772,7 +807,7 @@ internal fun buildSettingsRows(
         choice(
             "hud", GpTab.INTERFACE, null, "Statistics overlay",
             "How much the overlay shows: Compact (one line) → Normal → Detailed (full HUD). " +
-                "A 3-finger tap cycles the tiers live.",
+                "Select + X on a pad, or a 3-finger tap, cycles the tiers live.",
             STATS_VERBOSITY_OPTIONS, s.statsVerbosity,
         ) { update(s.copy(statsVerbosity = it)) },
         toggle(

@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PageSize
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -89,6 +90,15 @@ class HomeTile(
      * belong to the host's own tile, and this one offers only Unpin.
      */
     val pinnedProfileId: String? = null,
+    /**
+     * The profile a press will actually connect with — the host's binding, or the pin's own
+     * profile. Rendered as a chip on the card rather than appended to the subtitle: on a PIN card
+     * the profile is the entire reason the card exists, and a card that only whispers it in grey
+     * body text can't say that. Matches the Apple client's tile.
+     */
+    val profileName: String? = null,
+    /** The profile's `#RRGGBB` chip colour, if it set one. */
+    val profileAccent: Color? = null,
     val activate: () -> Unit,
 ) {
     // Any SAVED host offers the library (matches Apple) — the fetch itself returns a clear "pair
@@ -309,7 +319,14 @@ private fun GamepadHostTile(tile: HomeTile, centred: Boolean, modifier: Modifier
         modifier = modifier
             .fillMaxWidth()
             // The carousel already drives its own scale; the glass must not fight it with a second.
-            .consoleGlass(ConsoleShape.Tile, ConsoleFocusVisuals(1f, fill, ink.fg(0.16f), visuals.focus))
+            .consoleGlass(
+                ConsoleShape.Tile,
+                ConsoleFocusVisuals(1f, fill, ink.fg(0.16f), visuals.focus),
+                // A DASHED edge on anything not yet saved — a host found on the network, and the
+                // Add tile. It is the touch grid's own convention and the Apple client's, and it
+                // says "not yours yet" before the subtitle has to.
+                dashed = !tile.filled,
+            )
             .padding(22.dp),
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -341,10 +358,62 @@ private fun GamepadHostTile(tile: HomeTile, centred: Boolean, modifier: Modifier
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        if (tile.profileName != null) {
+            ConsoleProfileChip(
+                name = tile.profileName,
+                accent = tile.profileAccent,
+                // On a PIN card the profile is why the card exists; on a bound host's own card it
+                // is a note about what a press will do. Same chip, two weights.
+                prominent = tile.pinnedProfileId != null,
+                modifier = Modifier.padding(top = 5.dp),
+            )
+        }
         Text(
             tile.subtitle,
             style = MaterialTheme.typography.bodyMedium,
             color = ink.fg(0.55f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+    }
+}
+
+/**
+ * The profile a card connects with, worn as a tinted capsule. The console counterpart of the touch
+ * grid's own chip (`HostComponents.kt`) — same shape and the same quiet/prominent split, but inked
+ * from the console palette rather than `MaterialTheme`, since it sits on the aurora.
+ *
+ * A profile that set no accent falls back to the palette's, not to the touch theme's primary: on a
+ * moss or copper field the brand violet would be the one foreign colour on the card.
+ */
+@Composable
+private fun ConsoleProfileChip(
+    name: String,
+    accent: Color?,
+    prominent: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val ink = LocalGamepadInk.current
+    val tint = accent ?: ink.accent
+    Row(
+        modifier = modifier
+            .clip(ConsoleShape.Pill)
+            .background(tint.copy(alpha = if (prominent) 0.24f else 0.12f))
+            .padding(horizontal = 9.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(tint))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            name,
+            style = if (prominent) {
+                MaterialTheme.typography.labelLarge
+            } else {
+                MaterialTheme.typography.labelMedium
+            },
+            fontWeight = if (prominent) FontWeight.Bold else FontWeight.SemiBold,
+            color = tint,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )

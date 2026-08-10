@@ -45,6 +45,7 @@ import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
+import io.unom.punktfunk.StreamStartBanner
 import io.unom.punktfunk.ProfileEditorFields
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
@@ -429,6 +430,36 @@ internal fun ConnectConsoleScene() =
  * stand in for it: this is a different screen with different navigation, and the strip is the part
  * a layout regression would eat first.
  */
+/**
+ * The start-of-stream banner over the same synthetic "streamed frame" — the real
+ * [StreamStartBanner] at full opacity, since the caller owns the 6 s timer and a shot must not race
+ * it. Two variants because the WORDS are the point: the banner names pad chords or touch gestures
+ * depending on what the session actually has, and a screenshot is the only place the two can be
+ * compared side by side.
+ */
+@Composable
+internal fun StreamBannerScene(pad: Boolean) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(
+                Brush.linearGradient(
+                    listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B)),
+                ),
+            ),
+    ) {
+        StreamStartBanner(
+            text = if (pad) {
+                "Hold Select + Start + L1 + R1 to leave · Select + Y mic · Select + X stats"
+            } else {
+                "Back leaves the stream · three-finger tap for stats"
+            },
+            alpha = 1f,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
+        )
+    }
+}
+
 /**
  * The console HOME — the host carousel over the living backdrop, which is the screen the aurora is
  * most of. Worth its own shot for exactly that reason: on API 33+ the field is the real bicubic
