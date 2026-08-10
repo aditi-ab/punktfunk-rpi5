@@ -119,6 +119,22 @@ struct GamepadMenuList<Item: Identifiable, Row: View>: View where Item.ID: Hasha
         .sensoryFeedback(.selection, trigger: adjustTick)
         .sensoryFeedback(.impact(weight: .medium), trigger: activateTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: boundaryTick)
+        #if os(iOS) || os(macOS)
+        // Hardware keyboard: up/down step the focus bar, left/right adjust the focused row's
+        // value (exactly what the stick does), Return activates, Esc backs out.
+        .gamepadKeyNavigation(
+            active: isActive,
+            onMove: { direction in
+                switch direction {
+                case .up: step(by: -1)
+                case .down: step(by: 1)
+                case .left: adjust(by: -1)
+                case .right: adjust(by: 1)
+                }
+            },
+            onConfirm: { activate() },
+            onBack: onBack)
+        #endif
         .onAppear {
             reconcile()
             wire()

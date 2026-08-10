@@ -80,6 +80,17 @@ struct GamepadPromptView: View {
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .medium), trigger: activateTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: boundaryTick)
+        // A prompt is exactly where a keyboard user gets stuck, so it takes arrows/Return/Esc too.
+        .gamepadKeyNavigation(
+            onMove: { direction in
+                switch direction {
+                case .up: step(by: -1)
+                case .down: step(by: 1)
+                case .left, .right: break
+                }
+            },
+            onConfirm: { activate() },
+            onBack: { back() })
         .onAppear {
             cursor = prompt.actions.firstIndex(where: \.isCancel) ?? max(prompt.actions.count - 1, 0)
             wire()

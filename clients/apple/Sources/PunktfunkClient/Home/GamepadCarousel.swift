@@ -191,6 +191,16 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .medium), trigger: activateTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: boundaryTick)
+        #if os(iOS) || os(macOS)
+        // A hardware keyboard drives the same cursor as the pad — arrows step, Return activates,
+        // Esc backs out (iPad on a Magic Keyboard, couch Mac). tvOS routes arrows through the
+        // focus engine instead, which owns navigation there.
+        .gamepadKeyNavigation(
+            active: isActive,
+            onMove: { move($0) },
+            onConfirm: { activate() },
+            onBack: onBack)
+        #endif
         .onAppear {
             reconcile()
             wire()
