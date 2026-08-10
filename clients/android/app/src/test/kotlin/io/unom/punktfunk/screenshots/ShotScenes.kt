@@ -35,6 +35,8 @@ import androidx.compose.runtime.CompositionLocalProvider
 import io.unom.punktfunk.GamepadHome
 import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.GamepadPalette
+import io.unom.punktfunk.ConsoleControllersScreen
+import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.GamepadSettingsScreen
 import io.unom.punktfunk.HomeTile
 import io.unom.punktfunk.LocalGamepadInk
@@ -497,6 +499,43 @@ internal fun ConsoleHomeScene(paletteId: String = "violet") {
             onOpenSettings = {},
         )
     }
+}
+
+/**
+ * The two screens the console could not reach at all until WP8.3 — the open-source notices and the
+ * connected-controllers view — in their console presentation.
+ *
+ * Worth a shot each, and worth a PALE one: both are ordinary Material screens underneath, and the
+ * console shows them through a `ColorScheme` derived from the palette's ink. That derivation is the
+ * whole risk. Their touch presentation is inked by the app theme, which is always dark, so nothing
+ * before this could catch light-grey body text stranded on a pastel field.
+ *
+ * Robolectric enumerates no input devices, so the controllers scene renders its deterministic
+ * "nothing connected" state.
+ */
+@Composable
+internal fun ConsoleLicensesScene(paletteId: String = "violet") =
+    ConsolePalette(paletteId) { ConsoleLicensesScreen(onBack = {}, navActive = false) }
+
+@Composable
+internal fun ConsoleControllersScene(paletteId: String = "violet") =
+    ConsolePalette(paletteId) {
+        ConsoleControllersScreen(gamepadSetting = 0, onBack = {}, navActive = false)
+    }
+
+/**
+ * Publish the palette locals `App` would normally provide. A scene that calls a console screen
+ * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
+ * prove nothing at all.
+ */
+@Composable
+private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
+    val palette = GamepadPalette.named(paletteId)
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+        content = content,
+    )
 }
 
 @Composable

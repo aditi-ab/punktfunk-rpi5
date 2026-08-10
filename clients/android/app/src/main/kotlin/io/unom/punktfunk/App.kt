@@ -11,6 +11,9 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -19,12 +22,16 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.compositionLocalOf
@@ -33,8 +40,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -49,6 +58,7 @@ import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.Tab
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @Composable
 fun App(forceGamepadUi: Boolean = false) {
@@ -252,6 +262,11 @@ private enum class GamepadScreen(val depth: Int) {
     Home(0),
     Settings(1),
     Library(1),
+    // Reached FROM Settings, not from Home, so they sit a level deeper again — which is precisely
+    // what makes Settings → Controllers travel like a push and the way back like a pop. Give one of
+    // these depth 1 and the transition would read as a sideways swap between two peers.
+    Controllers(2),
+    Licenses(2),
 }
 
 /**
@@ -276,6 +291,12 @@ fun GamepadShell(
     val context = LocalContext.current
     var screen by remember { mutableStateOf(GamepadScreen.Home) }
     var libraryHost by remember { mutableStateOf<io.unom.punktfunk.kit.security.KnownHost?>(null) }
+    // Where the settings screen was when a sub-screen took over. The shell's AnimatedContent
+    // discards a screen's `remember`s the moment it stops being the target, so a trip out to the
+    // Controllers view and back would otherwise land on the Stream tab's first row — the couch
+    // equivalent of a browser losing your scroll position on Back. Held here because this is the
+    // only thing that outlives the screen.
+    var settingsPlace by remember { mutableStateOf<GpSettingsPlace?>(null) }
 
     // Consume the "come back to this library" intent once, on entry. Keyed on the id so a second
     // game exit re-fires it; the parent clears it immediately, so a manual Back stays backed out.
@@ -362,7 +383,23 @@ fun GamepadShell(
             GamepadScreen.Settings -> GamepadSettingsScreen(
                 initial = settings,
                 onChange = onSettingsChange,
-                onBack = { screen = GamepadScreen.Home },
+                // Leaving for HOME forgets the place: coming back in from the carousel should start
+                // at the top of the first section, exactly as it always has. Only a sub-screen's
+                // Back is a return.
+                onBack = { screen = GamepadScreen.Home; settingsPlace = null },
+                navActive = s == screen,
+                resume = settingsPlace,
+                onPlace = { settingsPlace = it },
+                onOpenControllers = { screen = GamepadScreen.Controllers },
+                onOpenLicenses = { screen = GamepadScreen.Licenses },
+            )
+            GamepadScreen.Controllers -> ConsoleControllersScreen(
+                gamepadSetting = settings.gamepad,
+                onBack = { screen = GamepadScreen.Settings },
+                navActive = s == screen,
+            )
+            GamepadScreen.Licenses -> ConsoleLicensesScreen(
+                onBack = { screen = GamepadScreen.Settings },
                 navActive = s == screen,
             )
             GamepadScreen.Library -> libraryHost?.let { host ->
@@ -381,3 +418,128 @@ fun GamepadShell(
 
 /** Minimum effective dp width the console UI targets on a TV (bigger → the 10-foot UI shrinks). */
 private const val CONSOLE_TV_MIN_WIDTH_DP = 1180f
+
+// --- Showing a TOUCH-written screen on the console's field -------------------------------------
+//
+// Two screens (Controllers, Licenses) exist once and are shown in both interfaces. They live beside
+// the shell rather than in `GamepadChrome.kt` because they are about the SHELL's job — putting a
+// screen that was written for one interface onto the other's field — rather than about the console's
+// own material.
+
+/**
+ * Re-inks a screen written against the TOUCH theme so it can be shown on the console's field.
+ *
+ * `ControllersScreen` alone pulls `MaterialTheme.colorScheme` at 27 explicit sites, plus implicitly
+ * through every `OutlinedCard`, `Switch`, `OutlinedButton` and `LinearProgressIndicator` it draws.
+ * Dropped into the shell those keep the touch palette — light-grey body text with no background of
+ * its own, which over the six PALE console palettes (`GamepadPalette`, `light = true`) is grey on
+ * pastel: technically painted, in practice unreadable. That is the same class of bug as the console
+ * dialogs that spent a release rendering dark ink on a dark card.
+ *
+ * The fix is deliberately ONE derived colour scheme rather than 27 call-site branches:
+ *  * a call-site branch cannot reach the IMPLICIT pulls at all — a `Switch`'s track and an
+ *    `OutlinedCard`'s border are resolved inside Material, not here;
+ *  * two colours per site is exactly the shape that drifts, and it would leave the touch screen
+ *    carrying console vocabulary it has no use for.
+ *
+ * The alternative — give the console presentation an opaque backdrop and let the touch theme read on
+ * its own ground — was rejected because it splits the screen's material in two: an opaque touch-grey
+ * slab under a palette-inked header and legend, with a visible seam between them, on a field whose
+ * whole point is that one look runs through it.
+ *
+ * The base scheme follows the field's lightness, so anything not overridden here (a container role
+ * some Material component reaches for) still lands on the right side of the contrast line.
+ */
+@Composable
+internal fun ConsoleInkedTheme(content: @Composable () -> Unit) {
+    val ink = LocalGamepadInk.current
+    val scheme = remember(ink) {
+        val base = if (ink.isLight) lightColorScheme() else darkColorScheme()
+        base.copy(
+            primary = ink.accent,
+            onPrimary = ink.onAccent,
+            // A card becomes a PANE over the aurora rather than a slab on top of it: the console's
+            // own glass fill, so an OutlinedCard here is cut from the material the settings rows are.
+            surface = ink.glass,
+            onSurface = ink.fg,
+            surfaceVariant = ink.fg(0.12f),
+            onSurfaceVariant = ink.fg(0.68f),
+            outline = ink.fg(0.30f),
+            outlineVariant = ink.fg(0.16f),
+            // Nothing here paints a background — the aurora is the ground — but a component that
+            // resolves `background` (or the content colour for it) must still land on the palette.
+            background = Color.Transparent,
+            onBackground = ink.fg,
+        )
+    }
+    // The typography and shapes are the app's, not Material's defaults: this swaps the INK, not the
+    // brand typeface. And `LocalContentColor` has to be provided by hand — outside a Surface or a
+    // Scaffold it defaults to BLACK, which is how an unstyled `Text` would vanish into a dark field.
+    MaterialTheme(
+        colorScheme = scheme,
+        typography = MaterialTheme.typography,
+        shapes = MaterialTheme.shapes,
+    ) {
+        CompositionLocalProvider(LocalContentColor provides ink.fg, content = content)
+    }
+}
+
+/**
+ * The console's scroll route for a screen that is a WALL of content rather than a list of focusable
+ * rows.
+ *
+ * Compose only scrolls a container to keep a FOCUSED child visible, so a screen whose body holds no
+ * focusable nodes (the licenses notices are one enormous `Text`) simply cannot be scrolled by a
+ * controller: the D-pad has nothing to move to. These screens therefore drive the scroll state
+ * directly — up/down steps, the shoulders page.
+ *
+ * Returned as a plain function so a screen's nav callbacks read `scroll(-1, page = false)` rather
+ * than each screen minting its own coroutine + viewport arithmetic (which is how the two would end
+ * up scrolling at different speeds).
+ */
+@Composable
+internal fun rememberConsoleScroller(scroll: ScrollState): (dir: Int, page: Boolean) -> Unit {
+    val scope = rememberCoroutineScope()
+    val animated = animationsEnabled()
+    return remember(scroll, animated) {
+        { dir, page ->
+            val delta = consoleScrollDelta(scroll.viewportSize.toFloat(), page, dir)
+            if (delta != 0f) {
+                scope.launch {
+                    // Auto-repeat fires every 150 ms while a direction is held, so each animation is
+                    // short enough to have landed (or nearly) before the next one cancels it —
+                    // otherwise a held D-pad crawls, each step restarting from where the last was
+                    // interrupted.
+                    if (animated) {
+                        scroll.animateScrollBy(
+                            delta,
+                            ConsoleMotion.ease(
+                                if (page) ConsoleMotion.TRANSITION_MS else ConsoleMotion.FOCUS_MS,
+                            ),
+                        )
+                    } else {
+                        scroll.scrollBy(delta)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * How far one console scroll press travels: [dir] is -1 (up/left) or +1 (down/right), [page] picks
+ * the shoulders' full page over a D-pad step. Zero while the viewport is unmeasured — a first press
+ * that arrived before layout must do nothing rather than fling the content by zero-times-nothing.
+ */
+internal fun consoleScrollDelta(viewportPx: Float, page: Boolean, dir: Int): Float =
+    if (viewportPx <= 0f) 0f else viewportPx * (if (page) CONSOLE_PAGE else CONSOLE_STEP) * dir
+
+/**
+ * A page keeps a band of what you were reading on screen rather than jumping a clean screenful — the
+ * overlap every reader has used since the printed page, and the difference between "I moved down"
+ * and "where was I".
+ */
+private const val CONSOLE_PAGE = 0.88f
+
+/** A D-pad step is about a quarter screen, so holding the direction walks the wall rather than flicking it. */
+private const val CONSOLE_STEP = 0.28f

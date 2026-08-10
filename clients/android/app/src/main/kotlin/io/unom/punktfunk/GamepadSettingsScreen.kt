@@ -110,6 +110,12 @@ internal class GpRow(
     val toggled: Boolean? = null, // non-null = a toggle row, drawn as a ConsoleSwitch (not text)
     val adjustable: Boolean = true, // false = the row navigates/acts instead of stepping — no chevrons
     val enabled: Boolean = true,    // dimmed + inert when false (still focusable, for its detail)
+    /**
+     * What A does on a non-adjustable row, for the legend. It was the literal "Pin to hosts" in the
+     * hint bar back when a profile row was the only kind of row that acted rather than stepped; a
+     * row that opens the Controllers view was then advertised as pinning something.
+     */
+    val actionHint: String = "Open",
 )
 
 /**
@@ -121,12 +127,28 @@ internal class GpRow(
 internal fun liveRow(rows: List<GpRow>, index: Int): GpRow? =
     rows.getOrNull(index)?.takeIf { it.enabled }
 
+/**
+ * Where the cursor was when a row opened a SUB-SCREEN. The shell holds it across the trip (this
+ * screen's own state does not outlive it) and hands it back, so Back from the Controllers view lands
+ * on the row that opened it rather than on the first row of the first section.
+ *
+ * The row is remembered by ID, not by index: a tab's length follows the hardware and the profile
+ * catalog, and a remembered index is the stale-pointer bug the tab-switch clamp already exists for.
+ */
+data class GpSettingsPlace(val tab: GpTab, val rowId: String)
+
 @Composable
 fun GamepadSettingsScreen(
     initial: Settings,
     onChange: (Settings) -> Unit,
     onBack: () -> Unit,
     navActive: Boolean = true, // false while this screen is cross-fading out, so it drops the pad
+    /** Open the connected-controllers view / the open-source notices — the shell pushes them. */
+    onOpenControllers: () -> Unit = {},
+    onOpenLicenses: () -> Unit = {},
+    /** Where a return from one of those lands; null = a fresh entry, which starts at the top. */
+    resume: GpSettingsPlace? = null,
+    onPlace: (GpSettingsPlace) -> Unit = {},
 ) {
     var s by remember { mutableStateOf(initial) }
     fun update(next: Settings) { s = next; onChange(next) }
@@ -169,18 +191,35 @@ fun GamepadSettingsScreen(
     // path there is this screen's own Controller-optimized UI toggle, which swaps in the standard
     // interface remote-navigably. The strings branch on it.
     val tv = remember { isTvDevice(context) }
-    val allRows = buildSettingsRows(s, hasBodyVibrator, hasGyroscope, av1Capable, ::update) +
-        buildProfileRows(profiles, savedHosts, tv) { pinProfile = it }
+    // The installed version, for the About row — the console is the ONLY interface on a TV box, so
+    // the identity the touch About page states has to be reachable from here too.
+    val appVersion = remember {
+        runCatching {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty()
+    }
+    val allRows = buildSettingsRows(
+        s, hasBodyVibrator, hasGyroscope, av1Capable,
+        appVersion = appVersion,
+        openControllers = onOpenControllers,
+        openLicenses = onOpenLicenses,
+        update = ::update,
+    ) + buildProfileRows(profiles, savedHosts, tv) { pinProfile = it }
     // Which section is showing, and where each one's focus was when it was last left — a detour
     // into another tab shouldn't lose your place.
-    var tab by remember { mutableStateOf(GpTab.STREAM) }
+    var tab by remember { mutableStateOf(resume?.tab ?: GpTab.STREAM) }
     // True while the STRIP holds the cursor rather than the list. Up from the first row moves
     // here and Down goes back — the only route to the sections on a D-pad remote, which has no
     // shoulder buttons at all (and is exactly what a TV box ships with).
     var tabFocused by remember { mutableStateOf(false) }
     val tabFocus = remember { mutableStateMapOf<GpTab, Int>() }
     val rows = allRows.filter { it.tab == tab }
-    var focus by remember { mutableIntStateOf(0) }
+    // Entry focus: the row a sub-screen was opened from, if we are coming back from one. Resolved
+    // ONCE, against the first row list — after that the cursor belongs to this screen.
+    var focus by remember {
+        mutableIntStateOf(rows.indexOfFirst { it.id == resume?.rowId }.coerceAtLeast(0))
+    }
     if (focus > rows.lastIndex) focus = rows.lastIndex.coerceAtLeast(0)
 
     // Which way the section last moved (+1 forward / -1 back) — the row list slides in from that
@@ -218,6 +257,16 @@ fun GamepadSettingsScreen(
 
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
+    // Act on a row, publishing where the cursor was FIRST. A row that opens a sub-screen unmounts
+    // this one on the spot, so the place has to be out of here before its `activate` runs; every
+    // activation route (pad, tap, the legend's own A cell) goes through this one door so none of
+    // them can be the one that forgets.
+    fun activate(row: GpRow) {
+        onPlace(GpSettingsPlace(tab, row.id))
+        adjustDir = 1
+        row.activate()
+    }
+
     // Step the focused row's value, answering a refusal rather than swallowing it.
     fun step(delta: Int) {
         adjustDir = delta
@@ -248,7 +297,7 @@ fun GamepadSettingsScreen(
         },
         // A on the strip drops into the section you picked, which is what "confirm" means there.
         onActivate = {
-            if (tabFocused) tabFocused = false else { adjustDir = 1; liveRow(rows, focus)?.activate() }
+            if (tabFocused) tabFocused = false else liveRow(rows, focus)?.let { activate(it) }
         },
         // The shoulders work from either place — a real pad never has to visit the strip.
         onShoulder = { delta -> stepTab(delta) },
@@ -341,7 +390,7 @@ fun GamepadSettingsScreen(
                         // (so its detail explains itself) but never flips it.
                         tabFocused = false
                         if (focus != index) focus = index
-                        else if (row.enabled) { adjustDir = 1; row.activate() }
+                        else if (row.enabled) activate(row)
                     },
                 )
             }
@@ -392,14 +441,19 @@ fun GamepadSettingsScreen(
                         focused != null && !focused.enabled -> listOf(
                             PadGlyph.hint('B', "Done", onClick = onBack),
                         )
+                        // What A does here follows the ROW: it opens the pin picker on a profile,
+                        // the connected-controllers view on that one, the notices on the About row.
+                        // It was the literal "Pin to hosts" while profiles were the only such rows.
                         focused != null && !focused.adjustable -> listOf(
-                            PadGlyph.hint('A', "Pin to hosts") { focused.activate() },
+                            PadGlyph.hint('A', focused.actionHint) { activate(focused) },
                             PadGlyph.hint('B', "Done", onClick = onBack),
                         )
                         else -> listOf(
                             GamepadHint('↔', PadGlyph.Arrow, "Adjust"),
                             // Tappable too (touch hatch): Change cycles the focused row, Done leaves.
-                            PadGlyph.hint('A', "Change") { rows.getOrNull(focus)?.activate() },
+                            PadGlyph.hint('A', "Change") {
+                                rows.getOrNull(focus)?.let { activate(it) }
+                            },
                             PadGlyph.hint('B', "Done", onClick = onBack),
                         )
                     },
@@ -610,12 +664,17 @@ private fun SettingRowView(
 /** Build the console settings rows from the current [Settings], writing through [update].
  * [hasBodyVibrator] gates the "Rumble on this phone" row and [hasGyroscope] the "Gyro from this
  * phone" row (both absent on TVs); [av1Capable] gates the AV1 codec entry (see
- * `codecOptionsFor`). Every row declares its [GpTab]; the screen shows one tab at a time. */
+ * `codecOptionsFor`). [appVersion] is the installed version the About row states, and
+ * [openControllers] / [openLicenses] are the two rows that navigate rather than set anything.
+ * Every row declares its [GpTab]; the screen shows one tab at a time. */
 internal fun buildSettingsRows(
     s: Settings,
     hasBodyVibrator: Boolean,
     hasGyroscope: Boolean,
     av1Capable: Boolean,
+    appVersion: String = "",
+    openControllers: () -> Unit = {},
+    openLicenses: () -> Unit = {},
     update: (Settings) -> Unit,
 ): List<GpRow> {
     fun <T> choice(
@@ -793,6 +852,28 @@ internal fun buildSettingsRows(
                 "triggers, lightbar and gyro.",
             s.dsCapture, enabled = s.gamepadForwarding,
         ) { update(s.copy(dsCapture = it)) },
+        // The diagnostics view — same screen the touch settings reach, same words for it. It was
+        // reachable from touch ONLY, which on a TV box means not at all: there is no touch interface
+        // to fall back to there, and "my controller does nothing" is the support case it answers.
+        //
+        // Deliberately NOT gated on the master forwarding switch its neighbours all follow: this is
+        // the row you reach for when forwarding looks broken, and a diagnostic that dims itself when
+        // the thing it diagnoses is off is worse than none.
+        //
+        // No value: this row navigates, it doesn't hold a setting (a count read here would be a
+        // snapshot, and a stale "none detected" is worse than no number at all — the screen it opens
+        // watches hot-plug live).
+        GpRow(
+            id = "controllers",
+            tab = GpTab.CONTROLLER,
+            header = "Diagnostics",
+            label = "Connected controllers",
+            value = "",
+            detail = "What the app detects, with a live input test.",
+            adjust = { false },
+            activate = openControllers,
+            adjustable = false,
+        ),
 
         // The palette leads Interface: it is the one row whose effect you can see while you step
         // it (the backdrop behind this very list recolours), so it wants to be the first thing
@@ -840,6 +921,22 @@ internal fun buildSettingsRows(
         } else {
             null
         },
+    ) + listOf(
+        // About closes the Interface section, the way the touch settings' last category does. The
+        // notices are a licence obligation and were reachable from touch only — on a TV box that is
+        // nowhere. The version rides in the VALUE slot rather than as a second, inert row: it is the
+        // identity half of an About page, and the screen this opens states it again at the top.
+        GpRow(
+            id = "licenses",
+            tab = GpTab.INTERFACE,
+            header = "About",
+            label = "Open-source licenses",
+            value = appVersion,
+            detail = "Third-party notices and credits.",
+            adjust = { false },
+            activate = openLicenses,
+            adjustable = false,
+        ),
     )
 }
 
@@ -854,7 +951,7 @@ internal fun buildSettingsRows(
  * Controller-optimized UI toggle a few rows up, which swaps the standard interface in
  * (d-pad-navigable; the profile editor lives there on every device, unlike tvOS where none exists).
  */
-private fun buildProfileRows(
+internal fun buildProfileRows(
     profiles: List<StreamProfile>,
     savedHosts: List<KnownHost>,
     tv: Boolean,
@@ -901,6 +998,7 @@ private fun buildProfileRows(
             adjust = { false },
             activate = { openPinPicker(p) },
             adjustable = false,
+            actionHint = "Pin to hosts",
         )
     }
 }

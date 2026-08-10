@@ -150,6 +150,23 @@ class ScreenshotTest {
     @Config(sdk = [31], qualifiers = "w360dp-h800dp-xxhdpi")
     fun consoleHomeBlobFallback() = shootRoot("console-home-blobs") { ConsoleHomeScene() }
 
+    // The two screens the console reached for the first time in WP8.3. Each is shot on a dark AND a
+    // pale palette, because the console draws them through a ColorScheme derived from the palette's
+    // ink — and the pale one is the only place a grey-on-pastel slip can show up.
+    @Test
+    fun consoleLicenses() = shootRoot("console-licenses") { ConsoleLicensesScene() }
+
+    @Test
+    fun consoleLicensesLight() =
+        shootRoot("console-licenses-light") { ConsoleLicensesScene(paletteId = "holo") }
+
+    @Test
+    fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
+
+    @Test
+    fun consoleControllersLight() =
+        shootRoot("console-controllers-light") { ConsoleControllersScene(paletteId = "holo") }
+
     @Test
     fun trust() = shootScreen("trust") {
         HostsScene()
