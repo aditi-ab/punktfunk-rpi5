@@ -1,33 +1,43 @@
 package io.unom.punktfunk
 
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.view.InputDevice
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,146 +48,141 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
 import io.unom.punktfunk.kit.Gamepad
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.max
+import io.unom.punktfunk.kit.deviceBodyVibrator
+import kotlin.math.abs
 import kotlin.math.roundToInt
-import kotlin.math.sin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 
 // The console chrome shared by the gamepad-driven screens — the Android mirror of the Apple client's
-// GamepadChrome.swift: a slow-drifting violet aurora backdrop, a bottom button-glyph hint bar, and a
-// connected-controller status chip. One look across every screen is what makes the console UI read
-// as a coherent mode rather than a set of themed pages.
+// GamepadChrome.swift: the motion and shape vocabulary every console screen animates in, the glass
+// every row and card is cut from, the bottom button-glyph legend, the section strip, and the
+// connected-controller chip. One look and one set of timings across every screen is what makes the
+// console UI read as a coherent mode rather than a set of themed pages.
+//
+// The living backdrop itself lives in GamepadAurora.kt (it grew a shader).
+
+// --- The vocabulary -------------------------------------------------------------------------
 
 /**
- * One drifting blob of the aurora field: where it sits, how far it wanders, and how fast. Integer
- * [sx]/[sy] keep the loop seamless at wrap. The COLOUR is the palette's, taken from its ramp at
- * draw time, so the field always shows several of that palette's tones at once.
+ * The console's motion vocabulary: one place for the curves and durations every console screen
+ * animates on, so a screen transition, a focus cross-fade and a stepped value read as one system
+ * rather than as three components that happen to animate.
+ *
+ * The push/pop half is the DESKTOP CONSOLE'S CONTRACT, not a local taste call: `pf-console-ui`'s
+ * `TRANSITION_S = 0.26` (`shell.rs:29`) and the paint geometry in `shell/render.rs:120-151` —
+ * incoming slides up 36 px out of a fade at 0.985→1 scale while the outgoing recedes to 0.96; a pop
+ * runs the other way, the leaving screen sliding DOWN and the revealed one growing back from 0.96
+ * at 0.4 alpha. The Apple client mirrors the same numbers in `GamepadShell.swift`.
+ *
+ * ⚠ That makes this the THIRD hand-copy of those constants (Rust, Swift, here). Design WP9 promotes
+ * them to shared parity vectors consumed by all three clients' tests; until it lands, a change here
+ * is a change owed to the other two.
  */
-private class AuroraBlob(
-    val baseX: Float,
-    val baseY: Float,
-    val driftX: Float,
-    val driftY: Float,
-    val sx: Int,
-    val sy: Int,
-    val phase: Float,
-    val radiusFrac: Float,
-    val alpha: Float,
-)
+object ConsoleMotion {
+    /** The desktop's `ease_out_cubic`, as a Compose easing. */
+    val EaseOutCubic = CubicBezierEasing(0.215f, 0.61f, 0.355f, 1f)
 
-private val auroraBlobs = listOf(
-    AuroraBlob(0.30f, 0.26f, 0.16f, 0.10f, 1, 1, 0.0f, 0.62f, 0.55f),
-    AuroraBlob(0.78f, 0.68f, 0.13f, 0.14f, 1, 2, 2.4f, 0.68f, 0.58f),
-    AuroraBlob(0.16f, 0.82f, 0.12f, 0.09f, 2, 1, 4.1f, 0.52f, 0.42f),
-    AuroraBlob(0.72f, 0.14f, 0.10f, 0.08f, 1, 3, 1.2f, 0.48f, 0.40f),
-)
+    /** Screen push/pop, ms — the desktop's `TRANSITION_S` (0.26 s). */
+    const val TRANSITION_MS = 260
+
+    /**
+     * What push/pop collapses to when the user has asked for less motion: a fast cross-fade with no
+     * travel and no scale, the same courtesy the frozen backdrop pays.
+     */
+    const val REDUCED_MS = 90
+
+    /** How far an incoming screen slides up out of its fade (the desktop's `36.0 * k`). */
+    val PUSH_SLIDE = 36.dp
+
+    /** The scale an incoming screen grows from. */
+    const val ENTER_SCALE = 0.985f
+
+    /** The scale an outgoing screen recedes to — and the one a revealed screen grows back from. */
+    const val EXIT_SCALE = 0.96f
+
+    /** The alpha a revealed (popped-back-to) screen fades up from. */
+    const val REVEAL_ALPHA = 0.4f
+
+    /** Focus arriving on a row/field/pill: background, border, chevrons, label colour. */
+    const val FOCUS_MS = 160
+
+    /** A stepped value sliding in behind the press; [VALUE_OUT_MS] is the outgoing half. */
+    const val VALUE_MS = 180
+    const val VALUE_OUT_MS = 140
+
+    /** The settings strip stepping a section — a short directional slide of the row list. */
+    const val TAB_MS = 200
+    val TAB_SLIDE = 24.dp
+
+    /** A refused press answering anyway: how far the value gives, and how long it takes to spring back. */
+    val REFUSAL_NUDGE = 4.dp
+    const val REFUSAL_MS = 120
+
+    /** Everything eased on the console's own curve. */
+    fun <T> ease(durationMillis: Int = TRANSITION_MS, delayMillis: Int = 0) =
+        tween<T>(durationMillis, delayMillis, EaseOutCubic)
+}
 
 /**
- * The living console backdrop: soft blobs from the palette's ramp drifting over its ground on
- * slow, seamless loops, finished with a centre-pooling vignette and top/bottom legibility scrims.
- * A Compose approximation of the Apple client's MeshGradient aurora — same colour families, same
- * "ambience, never content" role, and the same [GamepadPalette] setting recolours both.
- *
- * [calm] is what the FORM screens wear: the pools dim onto the ground so the glass rows keep real
- * colour and luminance without the launcher's contrast. Motion is identical either way on purpose
- * — only the contrast differs, so moving between screens can't make the field jump.
- *
- * Honours the system's "remove animations" accessibility setting by freezing at a fixed phase, the
- * same courtesy the Apple client pays Reduce Motion.
+ * The console's corner radii. These were four separate literals across as many files, which is how
+ * a settings row and an add-host field — the same object on two screens — drift apart.
  */
-@Composable
-fun GamepadAuroraBackground(modifier: Modifier = Modifier, calm: Boolean = false) {
-    val ink = LocalGamepadInk.current
-    val palette = LocalGamepadPalette.current
-    val animated = animationsEnabled()
-    val transition = rememberInfiniteTransition(label = "aurora")
-    // A full 0..2π sweep over ~96 s; integer per-blob multipliers make sin/cos continuous at the
-    // wrap so the field never visibly jumps when the animation restarts.
-    val swept by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(tween(96_000, easing = LinearEasing), RepeatMode.Restart),
-        label = "angle",
-    )
-    val angle = if (animated) swept else 0f
-    val tones = palette.blobColors
-    val ground = palette.groundColor
-    // Where the scrims tend, and how hard. Mixing a PALE field toward white at the dark field's
-    // strength bleaches the chroma straight out of the gradient, so a pale palette gets under
-    // half — the same scrim strength the desktop console's shader carries.
-    val scrim = if (palette.light) ink.fg else Color.Black
-    val strength = if (palette.light) 0.45f else 1f
-    Canvas(modifier) {
-        drawRect(ground)
-        val span = max(size.width, size.height)
-        for ((i, b) in auroraBlobs.withIndex()) {
-            val cx = (b.baseX + b.driftX * sin(angle * b.sx + b.phase)) * size.width
-            val cy = (b.baseY + b.driftY * cos(angle * b.sy + b.phase)) * size.height
-            val r = span * b.radiusFrac
-            // Calm scales each blob's contribution rather than dimming the whole canvas: the
-            // ground stays put and only the pools come down to meet it, which is the same "lower
-            // the contrast, keep the colour" the desktop console's `calm` uniform does.
-            val alpha = if (calm) b.alpha * 0.62f else b.alpha
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(tones[i].copy(alpha = alpha), Color.Transparent),
-                    center = Offset(cx, cy),
-                    radius = r,
-                ),
-                center = Offset(cx, cy),
-                radius = r,
-                // Additive only works over a DARK ground; over a pale one every blob
-                // saturates to white and the field turns grey. Pale palettes tint instead.
-                blendMode = if (palette.light) BlendMode.SrcOver else BlendMode.Plus,
-            )
-        }
-        // Cinematic vignette: pool light centre, settle the corners toward the scrim. Halved under
-        // calm: a launcher's cards sit in the pooled centre, but a form screen's rows run out
-        // toward the edges, where crushing them just eats the list.
-        drawRect(
-            Brush.radialGradient(
-                colors = listOf(
-                    Color.Transparent,
-                    scrim.copy(alpha = (if (calm) 0.22f else 0.44f) * strength),
-                ),
-                center = Offset(size.width / 2, size.height / 2),
-                radius = span * 0.92f,
-            ),
-        )
-        // Top/bottom legibility scrim for the pinned title + hint bar.
-        drawRect(
-            Brush.verticalGradient(
-                0.0f to scrim.copy(alpha = 0.40f * strength),
-                0.30f to scrim.copy(alpha = 0.05f * strength),
-                0.70f to scrim.copy(alpha = 0.06f * strength),
-                1.0f to scrim.copy(alpha = 0.42f * strength),
-            ),
-        )
-    }
+object ConsoleShape {
+    /** A settings row, an add-host field, a dialog button, a pin row. */
+    val Row = RoundedCornerShape(14.dp)
+
+    /** A pill: the section strip, the legend, a badge. */
+    val Pill = RoundedCornerShape(50)
+
+    /** A modal card. */
+    val Card = RoundedCornerShape(24.dp)
+
+    /** A launcher tile. */
+    val Tile = RoundedCornerShape(26.dp)
+
+    /** A library poster. */
+    val Poster = RoundedCornerShape(16.dp)
+
+    /** The on-screen keyboard's frame, and one of its keycaps. */
+    val Keyboard = RoundedCornerShape(20.dp)
+    val Keycap = RoundedCornerShape(9.dp)
+
+    /** The floating detail band under a settings list. */
+    val Band = RoundedCornerShape(14.dp)
 }
 
 /**
@@ -186,7 +191,7 @@ fun GamepadAuroraBackground(modifier: Modifier = Modifier, calm: Boolean = false
  * per composition — it needs a settings trip to the system, and it changes about never.
  */
 @Composable
-private fun animationsEnabled(): Boolean {
+internal fun animationsEnabled(): Boolean {
     val context = LocalContext.current
     return remember {
         runCatching {
@@ -199,92 +204,55 @@ private fun animationsEnabled(): Boolean {
     }
 }
 
-/**
- * The backdrop for the console FORM screens (settings, add-host). It used to be a STILL deep-indigo
- * base with two soft glows; it is now the launcher's own living field at `calm`, which keeps that
- * colour and luminance under the glass rows, honours the palette setting on every screen rather
- * than only the launcher, and leaves nothing in the console UI backed by a static image. Mirrors
- * the Apple client's GamepadFormBackground, which made the same substitution.
- */
-@Composable
-fun GamepadFormBackground(modifier: Modifier = Modifier) {
-    GamepadAuroraBackground(modifier, calm = true)
-}
+// --- Safe area ------------------------------------------------------------------------------
 
 /**
- * The horizontal section switcher above a console list. Purely presentational — the SCREEN owns
- * which tab is selected and what the shoulders do. Scrollable so a narrow phone in landscape never
- * has to squeeze the pills, and the selected one is always brought into view whether it was reached
- * by shoulder button or tap.
+ * The safe area a console screen's CONTENT keeps clear: the system bars UNION the display cutout.
+ *
+ * `systemBarsPadding()`, which every console screen used to pad with, EXCLUDES
+ * `WindowInsets.displayCutout`. In portrait that mostly hides — a top-centre hole punch sits under
+ * the status-bar inset anyway — but in landscape a cutout is a LEFT or RIGHT edge inset with no bar
+ * behind it (`cutout=[0,162,0,0]` on the Nothing Phone 3, see the dump quoted in MainActivity), so
+ * settings rows and add-host fields ran straight under the camera. Material3's own components lay
+ * out against `systemBars.union(displayCutout)`; this is that rule, applied to the console screens,
+ * which draw their own chrome instead of sitting in a Scaffold.
+ *
+ * The BACKDROP deliberately does not take it: the aurora is ambience, and running full-bleed under
+ * the camera is exactly what ambience should do.
  */
 @Composable
-fun ConsoleTabStrip(
-    titles: List<String>,
-    selected: Int,
-    onSelect: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-    /**
-     * The strip itself holds the cursor (the caller moved focus UP out of its list). Draws a ring
-     * on the selected pill so it's clear left/right now walks sections rather than values — the
-     * route a D-pad remote, which has no shoulder buttons, needs.
-     */
-    focused: Boolean = false,
-) {
-    val ink = LocalGamepadInk.current
-    val listState = rememberLazyListState()
-    LaunchedEffect(selected) {
-        runCatching { listState.animateScrollToItem(selected.coerceAtLeast(0)) }
-    }
-    LazyRow(
-        state = listState,
-        modifier = modifier,
-        contentPadding = PaddingValues(horizontal = ConsoleEdgeInset),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        itemsIndexed(titles) { i, title ->
-            val active = i == selected
-            val background by animateColorAsState(
-                if (active) ink.accent(0.85f) else ink.glass,
-                tween(180),
-                label = "tabBg",
-            )
-            // Not `ink` — that name is the palette's, and shadowing it here cost a compile.
-            val labelColor by animateColorAsState(
-                if (active) ink.onAccent else ink.fg(0.55f),
-                tween(180),
-                label = "tabInk",
-            )
-            val ring by animateColorAsState(
-                ink.fg(if (active && focused) 0.85f else 0f),
-                tween(180),
-                label = "tabRing",
-            )
-            Text(
-                title,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = labelColor,
-                maxLines = 1,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .background(background)
-                    .border(1.5.dp, ring, RoundedCornerShape(50))
-                    .clickable { onSelect(i) }
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
-            )
-        }
-    }
-}
+fun Modifier.consoleSafeArea(): Modifier =
+    windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout))
+
+/**
+ * The insets a FLOATING legend takes. In landscape it deliberately ignores the system bars so it
+ * hugs the corner rather than the nav-bar inset — but it must still clear the CUTOUT: the console
+ * screens are `SENSOR_LANDSCAPE`, so reverse-landscape parks the punch on exactly the corner the
+ * legend lives in.
+ */
+@Composable
+fun Modifier.consoleLegendInsets(landscape: Boolean): Modifier =
+    if (landscape) windowInsetsPadding(WindowInsets.displayCutout) else consoleSafeArea()
 
 /**
  * The exact inset every console screen places its floating legend at (bottom-start), so the legend
- * sits in the SAME spot across Home / Settings / Add-Host and appears pinned while the content behind
- * it cross-fades between screens.
+ * sits in the SAME spot across Home / Settings / Add-Host / Library and appears pinned while the
+ * content behind it transitions.
  */
 val ConsoleLegendInset = PaddingValues(start = 24.dp, end = 24.dp, bottom = 24.dp)
 
 /** The shared horizontal inset for a console screen's heading (matches the legend's left edge). */
 val ConsoleEdgeInset = 24.dp
+
+/**
+ * How much room a scrolling console list leaves at its bottom for the floating legend ZONE to sit
+ * over — the legend pill PLUS the detail band above it (see [ConsoleDetailBand]). One constant so
+ * the list's `contentPadding` and the keep-focus-visible scroll margin cannot drift apart; they
+ * were 104 dp and a bare `96`, and the scroll target moved under the band the moment it grew.
+ */
+val ConsoleLegendClearance = 152.dp
+
+// --- Headings and the section strip ----------------------------------------------------------
 
 /**
  * The heading every console screen uses — one style, one inset, so titles line up across Home /
@@ -306,6 +274,524 @@ fun ConsoleHeader(title: String, modifier: Modifier = Modifier, horizontalInset:
         modifier = modifier.padding(start = h, end = h, top = 18.dp, bottom = 10.dp),
     )
 }
+
+/**
+ * The horizontal section switcher above a console list. Purely presentational — the SCREEN owns
+ * which tab is selected and what the shoulders do.
+ *
+ * ONE indicator pill glides between the sections rather than each pill cross-fading its own fill in
+ * and out: a shared element that travels says "you moved along a strip", where a pair of fades says
+ * "something over there turned off and something here turned on". It is drawn BEHIND the labels
+ * (`drawBehind` on the strip's content node), so it costs no layout and can't push the pills around
+ * as it moves. Scrollable, so a narrow phone in landscape never has to squeeze them.
+ */
+@Composable
+fun ConsoleTabStrip(
+    titles: List<String>,
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    /**
+     * The strip itself holds the cursor (the caller moved focus UP out of its list). Rings the
+     * indicator so it's clear left/right now walks sections rather than values — the route a D-pad
+     * remote, which has no shoulder buttons, needs.
+     */
+    focused: Boolean = false,
+) {
+    val ink = LocalGamepadInk.current
+    val scroll = rememberScrollState()
+    val animated = animationsEnabled()
+    // Pill geometry, measured in ROOT space for both the strip and its pills: the difference is
+    // scroll-invariant (they scroll together) and needs no assumptions about which layout node sits
+    // between them.
+    var stripX by remember { mutableFloatStateOf(0f) }
+    val pillX = remember { mutableStateMapOf<Int, Float>() }
+    val pillW = remember { mutableStateMapOf<Int, Float>() }
+    val target = pillX[selected]?.let { x -> pillW[selected]?.let { w -> x - stripX to w } }
+
+    val indicatorX = remember { Animatable(0f) }
+    val indicatorW = remember { Animatable(0f) }
+    LaunchedEffect(target, animated) {
+        val (x, w) = target ?: return@LaunchedEffect
+        // Width 0 = never placed: the first measurement snaps, or the indicator would fly in from
+        // the left edge every time the strip is composed.
+        if (indicatorW.value == 0f || !animated) {
+            indicatorX.snapTo(x)
+            indicatorW.snapTo(w)
+        } else {
+            val spec = ConsoleMotion.ease<Float>(ConsoleMotion.TAB_MS)
+            coroutineScope {
+                launch { indicatorX.animateTo(x, spec) }
+                launch { indicatorW.animateTo(w, spec) }
+            }
+        }
+    }
+    // The strip scrolls the selected pill into view whether it was reached by shoulder or by tap.
+    LaunchedEffect(selected, target) {
+        val (x, w) = target ?: return@LaunchedEffect
+        val viewport = scroll.viewportSize.toFloat()
+        if (viewport <= 0f) return@LaunchedEffect
+        // A pill's own half-width of lead-in, so the neighbour you are stepping toward is visible
+        // rather than flush against the edge.
+        val lead = (w * 0.5f).coerceAtMost(60f)
+        val left = x - lead
+        val right = x + w
+        val to = when {
+            left < scroll.value -> left
+            right > scroll.value + viewport -> right - viewport
+            else -> return@LaunchedEffect
+        }
+        runCatching { scroll.animateScrollTo(to.roundToInt().coerceAtLeast(0)) }
+    }
+
+    val fill = ink.accent(0.85f)
+    val ringAlpha by animateFloatAsState(
+        if (focused) 0.85f else 0f,
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "tabRing",
+    )
+    val ring = ink.fg(ringAlpha)
+    Box(modifier.horizontalScroll(scroll)) {
+        Box(
+            Modifier
+                .onGloballyPositioned { stripX = it.positionInRoot().x }
+                .drawBehind {
+                    val w = indicatorW.value
+                    if (w <= 0f) return@drawBehind
+                    val r = CornerRadius(size.height / 2f)
+                    drawRoundRect(
+                        color = fill,
+                        topLeft = Offset(indicatorX.value, 0f),
+                        size = Size(w, size.height),
+                        cornerRadius = r,
+                    )
+                    if (ring.alpha > 0f) {
+                        drawRoundRect(
+                            color = ring,
+                            topLeft = Offset(indicatorX.value, 0f),
+                            size = Size(w, size.height),
+                            cornerRadius = r,
+                            style = Stroke(width = 1.5.dp.toPx()),
+                        )
+                    }
+                },
+        ) {
+            Row(
+                Modifier.padding(horizontal = ConsoleEdgeInset),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                titles.forEachIndexed { i, title ->
+                    val active = i == selected
+                    // Not `ink` — that name is the palette's, and shadowing it here cost a compile.
+                    val labelColor by animateColorAsState(
+                        if (active) ink.onAccent else ink.fg(0.55f),
+                        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+                        label = "tabInk",
+                    )
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = labelColor,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .onGloballyPositioned {
+                                pillX[i] = it.positionInRoot().x
+                                pillW[i] = it.size.width.toFloat()
+                            }
+                            .clip(ConsoleShape.Pill)
+                            .clickable { onSelect(i) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+// --- Focus, glass, and the surfaces cut from it ------------------------------------------------
+
+/** The animated focus visuals of one console row/field/button — see [animateConsoleFocus]. */
+class ConsoleFocusVisuals(
+    val scale: Float,
+    val background: Color,
+    val border: Color,
+    /** 0 → 1 as focus arrives; drives the lift and the accent bloom in [consoleGlass]. */
+    val focus: Float,
+)
+
+/**
+ * The focus visuals every console form element shares (settings rows, add-host fields, action
+ * rows), ANIMATED: the background/border cross-fade instead of snapping between the focused and
+ * resting looks, and the scale pops on a soft spring. [editing] draws the brighter violet border
+ * of a field actively receiving keyboard input.
+ */
+@Composable
+fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocusVisuals {
+    val ink = LocalGamepadInk.current
+    val scale by animateFloatAsState(
+        targetValue = if (active) 1f else 0.98f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+        label = "consoleScale",
+    )
+    val focus by animateFloatAsState(
+        targetValue = if (active) 1f else 0f,
+        animationSpec = ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "consoleFocus",
+    )
+    val background by animateColorAsState(
+        if (active) ink.accent(0.20f) else ink.glass,
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "consoleBg",
+    )
+    val border by animateColorAsState(
+        when {
+            editing -> ink.accent(0.70f)
+            active -> ink.fg(0.28f)
+            else -> ink.fg(0.06f)
+        },
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "consoleBorder",
+    )
+    return ConsoleFocusVisuals(scale, background, border, focus)
+}
+
+/**
+ * The console's glass: what every row, field, card and tile is cut from, in one place.
+ *
+ * Four things separate it from the flat translucent fill it replaces, all of them the desktop
+ * console's `theme::panel()` in Compose terms:
+ *  * a vertical LUMINANCE gradient in the fill, so the pane has a lit top and a settled bottom
+ *    instead of one even wash;
+ *  * a 1 px top-edge HIGHLIGHT that fades down into the border — the cue that reads as "this is a
+ *    physical pane catching the light above it";
+ *  * a drop SHADOW that grows with focus, so the focused row genuinely sits above its neighbours;
+ *  * a soft accent BLOOM behind it, drawn outside the clip, so focus reads as a lens over the
+ *    backdrop rather than a recolour of the row.
+ *
+ * The bloom and shadow are driven by [ConsoleFocusVisuals.focus], so they arrive and leave with the
+ * same curve as the fill — one focus change, not four independent animations.
+ */
+@Composable
+fun Modifier.consoleGlass(shape: Shape, visuals: ConsoleFocusVisuals): Modifier {
+    val ink = LocalGamepadInk.current
+    val focus = visuals.focus
+    val accent = ink.accent
+    val highlight = ink.highlight
+    val fill = visuals.background
+    val border = visuals.border
+    return this
+        .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
+        // BEFORE the clip, so the bloom can spill past the row's own rectangle — a glow that stops
+        // at the edge is just a brighter border.
+        .drawBehind {
+            if (focus <= 0.01f) return@drawBehind
+            val r = size.height * 1.35f
+            drawRect(
+                brush = Brush.radialGradient(
+                    colors = listOf(accent.copy(alpha = 0.18f * focus), Color.Transparent),
+                    center = Offset(size.width / 2f, size.height / 2f),
+                    radius = r,
+                ),
+                topLeft = Offset(-r, -r),
+                size = Size(size.width + 2f * r, size.height + 2f * r),
+            )
+        }
+        .shadow(elevation = ConsoleGlassLift * focus, shape = shape, clip = false)
+        .clip(shape)
+        .background(
+            Brush.verticalGradient(
+                listOf(
+                    fill.copy(alpha = (fill.alpha * 1.35f + 0.03f).coerceAtMost(1f)),
+                    fill.copy(alpha = fill.alpha * 0.72f),
+                ),
+            ),
+        )
+        .border(
+            width = 1.dp,
+            brush = Brush.verticalGradient(
+                0f to highlight.copy(alpha = highlight.alpha * (0.55f + 0.45f * focus)),
+                0.45f to border,
+                1f to border,
+            ),
+            shape = shape,
+        )
+}
+
+/** How far a fully focused console surface lifts off the field. */
+private val ConsoleGlassLift = 8.dp
+
+/**
+ * A MODAL card's surface. Unlike [consoleGlass] this one is near-opaque: a dialog's job is to
+ * occlude the screen it covers, and it carries body text that has to stay readable over a moving
+ * backdrop. It keeps the same lit top edge, so it still belongs to the console's material.
+ *
+ * The ground is [GamepadInk.card] — palette-derived, which is the fix for a real bug: the cards
+ * were a hardcoded near-black indigo while their text came from the palette, so on any of the six
+ * PALE palettes a dialog rendered dark ink on a dark card and was unreadable.
+ */
+@Composable
+fun Modifier.consoleCard(): Modifier {
+    val ink = LocalGamepadInk.current
+    val card = ink.card
+    return this
+        .clip(ConsoleShape.Card)
+        .background(
+            Brush.verticalGradient(
+                listOf(
+                    // Lit from above like every other console surface, but gently — a modal is a
+                    // slab, not a pane of glass.
+                    card.copy(alpha = (card.alpha * 1.03f).coerceAtMost(1f)),
+                    card,
+                ),
+            ),
+        )
+        .border(
+            width = 1.dp,
+            brush = Brush.verticalGradient(
+                0f to ink.highlight.copy(alpha = ink.highlight.alpha * 0.8f),
+                0.4f to ink.fg(0.12f),
+                1f to ink.fg(0.12f),
+            ),
+            shape = ConsoleShape.Card,
+        )
+}
+
+/**
+ * The scrim + entrance every console modal shares: the backdrop dims, and the card fades up from
+ * [ConsoleMotion.EXIT_SCALE] on the console's own curve. Deliberately NOT a spring — an overshoot
+ * on a modal reads as bounciness rather than as arrival, which is why the desktop's dialogs don't
+ * have one either. Collapses to a plain fast fade under reduce-motion.
+ */
+@Composable
+fun ConsoleModal(content: @Composable () -> Unit) {
+    val ink = LocalGamepadInk.current
+    val animated = animationsEnabled()
+    val enter = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        enter.animateTo(
+            1f,
+            ConsoleMotion.ease(if (animated) ConsoleMotion.TRANSITION_MS else ConsoleMotion.REDUCED_MS),
+        )
+    }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(ink.modalScrim.copy(alpha = ink.modalScrim.alpha * enter.value)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier.graphicsLayer {
+                alpha = enter.value
+                val s = if (animated) {
+                    ConsoleMotion.EXIT_SCALE + (1f - ConsoleMotion.EXIT_SCALE) * enter.value
+                } else {
+                    1f
+                }
+                scaleX = s
+                scaleY = s
+            },
+        ) {
+            content()
+        }
+    }
+}
+
+/**
+ * The frosted band that carries the FOCUSED row's description, floating above a screen's legend
+ * pill rather than unfolding inside the row itself.
+ *
+ * This is the desktop console's reserved detail band (`screens/settings.rs`) achieved by FLOAT
+ * instead of by subtraction: the band lives in the screen's bottom-start overlay, so it can never
+ * displace the list behind it — which is the whole point. Growing the row instead (what this
+ * replaces) shifted every row below the cursor on every single D-pad step, and fought the
+ * keep-focus-visible scroll, whose target moved out from under it mid-animation.
+ *
+ * [key] is what the cross-fade keys on — the focused row's id, so stepping between two rows that
+ * happen to share a description doesn't flicker.
+ */
+@Composable
+fun ConsoleDetailBand(
+    text: String,
+    key: Any?,
+    modifier: Modifier = Modifier,
+    hazeState: HazeState? = null,
+) {
+    val ink = LocalGamepadInk.current
+    AnimatedContent(
+        targetState = key to text,
+        transitionSpec = {
+            fadeIn(ConsoleMotion.ease(ConsoleMotion.FOCUS_MS)) togetherWith
+                fadeOut(ConsoleMotion.ease(ConsoleMotion.FOCUS_MS))
+        },
+        modifier = modifier,
+        label = "detail",
+    ) { (_, body) ->
+        if (body.isBlank()) {
+            // An empty band still occupies its slot in the AnimatedContent so the pill below it
+            // doesn't hop up and down as focus crosses a row with no description.
+            Spacer(Modifier.height(0.dp))
+        } else {
+            Text(
+                body,
+                style = MaterialTheme.typography.bodySmall,
+                color = ink.fg(0.6f),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .widthIn(max = 560.dp)
+                    .clip(ConsoleShape.Band)
+                    .then(
+                        if (hazeState != null) {
+                            Modifier.hazeEffect(hazeState).background(ink.shade(0.25f))
+                        } else {
+                            Modifier.background(ink.shade(0.55f))
+                        },
+                    )
+                    .padding(horizontal = 14.dp, vertical = 9.dp),
+            )
+        }
+    }
+}
+
+/**
+ * The console-styled switch a toggle row renders in place of an "On"/"Off" value: a brand-violet
+ * track that tints as it engages while the knob slides across on a spring — the state change reads
+ * from across the room, and the motion confirms the press.
+ *
+ * The knob SQUASHES as it travels (widest at mid-flight, round at either rest) — the elastic cue
+ * that makes a slide read as a thrown object rather than a repositioned dot. Taken from the
+ * travel itself rather than from a velocity read, so it can't disagree with where the knob is.
+ */
+@Composable
+fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) {
+    val ink = LocalGamepadInk.current
+    val travel by animateFloatAsState(
+        targetValue = if (on) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.8f, stiffness = 600f),
+        label = "switchKnob",
+    )
+    val track by animateColorAsState(
+        if (on) ink.accent else ink.fg(0.15f),
+        ConsoleMotion.ease(200),
+        label = "switchTrack",
+    )
+    val outline by animateColorAsState(
+        ink.fg(if (focused) 0.45f else 0.15f),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "switchOutline",
+    )
+    val trackW = 44.dp
+    val trackH = 24.dp
+    val pad = 3.dp
+    val knob = trackH - pad * 2
+    Box(
+        modifier
+            .size(trackW, trackH)
+            .clip(ConsoleShape.Pill)
+            .background(
+                Brush.verticalGradient(
+                    listOf(track.copy(alpha = track.alpha * 0.82f), track),
+                ),
+            )
+            .border(1.dp, outline, ConsoleShape.Pill),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        // 1 at either rest, 0 at mid-flight — so the squash peaks exactly where the knob is fastest.
+        val settle = abs(travel * 2f - 1f)
+        Box(
+            Modifier
+                .padding(horizontal = pad)
+                .offset { IntOffset(((trackW - knob - pad * 2).toPx() * travel).roundToInt(), 0) }
+                .graphicsLayer {
+                    scaleX = 1f + 0.15f * (1f - settle)
+                    scaleY = 1f - 0.07f * (1f - settle)
+                }
+                .size(knob)
+                .clip(CircleShape)
+                .background(ink.fg),
+        )
+    }
+}
+
+// --- Menu haptics -----------------------------------------------------------------------------
+
+/**
+ * The console's menu feel: a tick as the cursor moves, a heavier thud when a press is refused at a
+ * boundary, a pulse on confirm. The Apple client's `MenuHaptics` semantics and the desktop's
+ * `menu_rumble(pulse)`, on whatever actuator this device actually has.
+ *
+ * Constructed by [rememberConsoleHaptics], which resolves the actuator in the order that matches
+ * where the player's hands are: the DRIVING controller's own vibrator first, then the phone body
+ * (which is what a clip-on pad without motors leaves you holding), and nothing at all on a TV — a
+ * remote has no motor and a TV box has no body, so both resolve null and every call is a no-op.
+ */
+class ConsoleHaptics internal constructor(private val vibrator: Vibrator?) {
+    /** The cursor moved one step. */
+    fun tick() = play(7, 40)
+
+    /** The press was refused — the list ended, or the value is already at its limit. */
+    fun boundary() = play(18, 95)
+
+    /** Something was confirmed, cycled, or flipped. */
+    fun confirm() = play(12, 70)
+
+    private fun play(durationMs: Long, amplitude: Int) {
+        val v = vibrator ?: return
+        runCatching {
+            v.vibrate(
+                if (v.hasAmplitudeControl()) {
+                    VibrationEffect.createOneShot(durationMs, amplitude)
+                } else {
+                    VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE)
+                },
+            )
+        }
+    }
+}
+
+/** A haptics object that renders nothing — previews, tests, and every device with no actuator. */
+private val SilentHaptics = ConsoleHaptics(null)
+
+/**
+ * Resolve the console's haptics for whatever is driving the UI right now. Re-resolves when the
+ * driving pad changes (a fresh controller may have motors where the last one had none), and honours
+ * the system's own "touch feedback" switch — a user who turned haptics off meant it here too.
+ */
+@Composable
+fun rememberConsoleHaptics(): ConsoleHaptics {
+    val context = LocalContext.current
+    val activity = context as? MainActivity ?: return SilentHaptics
+    val padId = activity.lastPadDeviceId
+    @Suppress("DEPRECATION") // still the canonical read for the user's touch-feedback switch
+    val enabled = remember {
+        runCatching {
+            android.provider.Settings.System.getInt(
+                context.contentResolver,
+                android.provider.Settings.System.HAPTIC_FEEDBACK_ENABLED,
+                1,
+            ) != 0
+        }.getOrDefault(true)
+    }
+    return remember(padId, enabled) {
+        if (!enabled) SilentHaptics
+        else ConsoleHaptics(padVibrator(padId) ?: deviceBodyVibrator(context))
+    }
+}
+
+/** The vibrator of the controller with this device id, or null (no such device / no motors). */
+private fun padVibrator(deviceId: Int): Vibrator? = runCatching {
+    val dev = InputDevice.getDevice(deviceId) ?: return null
+    val v = if (Build.VERSION.SDK_INT >= 31) {
+        dev.vibratorManager.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        dev.vibrator
+    }
+    v?.takeIf { it.hasVibrator() }
+}.getOrNull()
+
+// --- Button glyphs and the legend --------------------------------------------------------------
 
 /**
  * One glyph + label cell of a hint bar. [glyph] is the SEMANTIC face letter (the Android
@@ -338,97 +824,21 @@ object PadGlyph {
     val B = Color(0xFFD14B4B)
     val X = Color(0xFF4B7BD1)
     val Y = Color(0xFFE0B23C)
+
+    /** The tint the DIRECTIONAL hints (↔ ⇄ ↑ ↓) wear — not a face button, so not a face colour. */
+    val Arrow = Color(0xFF9A93C7)
+
     fun hint(glyph: Char, text: String, onClick: (() -> Unit)? = null) = GamepadHint(
-        glyph, when (glyph) { 'A' -> A; 'B' -> B; 'X' -> X; 'Y' -> Y; else -> Color(0xFF9A93C7) }, text, onClick,
+        glyph, when (glyph) { 'A' -> A; 'B' -> B; 'X' -> X; 'Y' -> Y; else -> Arrow }, text, onClick,
     )
 }
 
 /** The dark button-face fill shared by the PlayStation / Nintendo / select-button badges. */
 internal val PadButtonFace = Color(0xFF2A2740)
 
-/** The animated focus visuals of one console row/field/button — see [animateConsoleFocus]. */
-class ConsoleFocusVisuals(val scale: Float, val background: Color, val border: Color)
-
-/**
- * The focus visuals every console form element shares (settings rows, add-host fields, action
- * rows), ANIMATED: the background/border cross-fade instead of snapping between the focused and
- * resting looks, and the scale pops on a soft spring. [editing] draws the brighter violet border
- * of a field actively receiving keyboard input.
- */
-@Composable
-fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocusVisuals {
-    val ink = LocalGamepadInk.current
-    val scale by animateFloatAsState(
-        targetValue = if (active) 1f else 0.98f,
-        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
-        label = "consoleScale",
-    )
-    val background by animateColorAsState(
-        if (active) ink.accent(0.20f) else ink.glass,
-        tween(160),
-        label = "consoleBg",
-    )
-    val border by animateColorAsState(
-        when {
-            editing -> ink.accent(0.70f)
-            active -> ink.fg(0.28f)
-            else -> ink.fg(0.06f)
-        },
-        tween(160),
-        label = "consoleBorder",
-    )
-    return ConsoleFocusVisuals(scale, background, border)
-}
-
-/**
- * The console-styled switch a toggle row renders in place of an "On"/"Off" value: a brand-violet
- * track that tints as it engages while the knob slides across on a spring — the state change reads
- * from across the room, and the motion confirms the press.
- */
-@Composable
-fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) {
-    val ink = LocalGamepadInk.current
-    val travel by animateFloatAsState(
-        targetValue = if (on) 1f else 0f,
-        animationSpec = spring(dampingRatio = 0.8f, stiffness = 600f),
-        label = "switchKnob",
-    )
-    val track by animateColorAsState(
-        if (on) ink.accent else Color(0x26FFFFFF),
-        tween(200),
-        label = "switchTrack",
-    )
-    val outline by animateColorAsState(
-        ink.fg(if (focused) 0.45f else 0.15f),
-        tween(160),
-        label = "switchOutline",
-    )
-    val trackW = 44.dp
-    val trackH = 24.dp
-    val pad = 3.dp
-    val knob = trackH - pad * 2
-    Box(
-        modifier
-            .size(trackW, trackH)
-            .clip(RoundedCornerShape(50))
-            .background(track)
-            .border(1.dp, outline, RoundedCornerShape(50)),
-        contentAlignment = Alignment.CenterStart,
-    ) {
-        Box(
-            Modifier
-                .padding(horizontal = pad)
-                .offset { IntOffset(((trackW - knob - pad * 2).toPx() * travel).roundToInt(), 0) }
-                .size(knob)
-                .clip(CircleShape)
-                .background(ink.fg),
-        )
-    }
-}
-
 /** A round face-button badge: a coloured disc with the button letter, like a controller's face. */
 @Composable
-fun GamepadButtonGlyph(glyph: Char, color: Color, size: androidx.compose.ui.unit.Dp = 26.dp) {
+fun GamepadButtonGlyph(glyph: Char, color: Color, size: Dp = 26.dp) {
     val ink = LocalGamepadInk.current
     Box(
         modifier = Modifier
@@ -449,7 +859,7 @@ fun GamepadButtonGlyph(glyph: Char, color: Color, size: androidx.compose.ui.unit
 
 /** The D-pad-centre "select" button — a green (confirm) disc with a ring; the TV-remote glyph for A. */
 @Composable
-private fun SelectGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
+private fun SelectGlyph(size: Dp = 26.dp) {
     val ink = LocalGamepadInk.current
     Box(
         modifier = Modifier.size(size).clip(CircleShape).background(PadGlyph.A),
@@ -461,7 +871,7 @@ private fun SelectGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
 
 /** The remote's "Back" button — a back-arrow disc; the TV-remote glyph for B (back / cancel / done). */
 @Composable
-private fun BackGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
+private fun BackGlyph(size: Dp = 26.dp) {
     GamepadButtonGlyph('↩', PadGlyph.B, size)
 }
 
@@ -472,7 +882,7 @@ private fun BackGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
  * DualShock colours.
  */
 @Composable
-internal fun PsFaceGlyph(glyph: Char, size: androidx.compose.ui.unit.Dp = 26.dp) {
+internal fun PsFaceGlyph(glyph: Char, size: Dp = 26.dp) {
     val color = when (glyph) {
         'A' -> Color(0xFF7C9CE8) // cross — light blue
         'B' -> Color(0xFFE0736F) // circle — red
@@ -519,7 +929,7 @@ internal fun PsFaceGlyph(glyph: Char, size: androidx.compose.ui.unit.Dp = 26.dp)
  * fallback wears the capsule too (the near-universal select shape).
  */
 @Composable
-internal fun SelectButtonGlyph(style: Gamepad.PadStyle, size: androidx.compose.ui.unit.Dp = 26.dp) {
+internal fun SelectButtonGlyph(style: Gamepad.PadStyle, size: Dp = 26.dp) {
     val ink = LocalGamepadInk.current
     Box(
         Modifier.size(size).clip(CircleShape).background(PadButtonFace),
@@ -550,8 +960,8 @@ internal fun SelectButtonGlyph(style: Gamepad.PadStyle, size: androidx.compose.u
             else -> Box(
                 Modifier
                     .size(width = size * 0.58f, height = size * 0.30f)
-                    .clip(RoundedCornerShape(50))
-                    .border(1.6.dp, ink.fg(0.9f), RoundedCornerShape(50)),
+                    .clip(ConsoleShape.Pill)
+                    .border(1.6.dp, ink.fg(0.9f), ConsoleShape.Pill),
             )
         }
     }
@@ -572,7 +982,7 @@ fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, haze
     val activity = LocalContext.current as? MainActivity
     val padIsGamepad = activity?.lastPadIsGamepad ?: true
     val padStyle = activity?.lastPadStyle ?: Gamepad.PadStyle.GENERIC
-    val shape = RoundedCornerShape(50)
+    val shape = ConsoleShape.Pill
     // With a haze source, blur the content behind the pill (real backdrop blur, API 31+; a translucent
     // scrim below) + a light tint; otherwise fall back to a solid frosted fill.
     val frosted = if (hazeState != null) {
@@ -582,7 +992,17 @@ fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, haze
     }
     Row(
         modifier = frosted
-            .border(1.dp, ink.fg(0.14f), shape)
+            .border(
+                width = 1.dp,
+                // The same top-edge highlight the glass rows carry, so the legend belongs to the
+                // same material rather than reading as a flat sticker over it.
+                brush = Brush.verticalGradient(
+                    0f to ink.highlight.copy(alpha = ink.highlight.alpha * 0.7f),
+                    0.5f to ink.fg(0.14f),
+                    1f to ink.fg(0.14f),
+                ),
+                shape = shape,
+            )
             .padding(horizontal = 16.dp, vertical = 10.dp)
             // The pill still hugs its content when it fits; when it doesn't (a narrow phone, or a
             // screen whose legend grew a cell) it scrolls rather than running off the edge and
@@ -595,7 +1015,7 @@ fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, haze
         for (h in hints) {
             val cb = h.onClick
             val cell = if (cb != null) {
-                Modifier.clip(RoundedCornerShape(50)).clickable(onClick = cb).padding(horizontal = 4.dp, vertical = 5.dp)
+                Modifier.clip(ConsoleShape.Pill).clickable(onClick = cb).padding(horizontal = 4.dp, vertical = 5.dp)
             } else {
                 Modifier
             }
@@ -629,7 +1049,7 @@ fun ControllerStatusChip(name: String, modifier: Modifier = Modifier) {
     val ink = LocalGamepadInk.current
     Row(
         modifier = modifier
-            .clip(RoundedCornerShape(50))
+            .clip(ConsoleShape.Pill)
             .background(ink.fg(0.08f))
             .padding(horizontal = 12.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -646,6 +1066,8 @@ fun ControllerStatusChip(name: String, modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.labelMedium,
             color = ink.fg(0.75f),
             maxLines = 1,
+            // The chip yields to the screen title on a narrow phone — see GamepadHome's header row.
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

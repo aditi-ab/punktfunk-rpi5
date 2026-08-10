@@ -6,7 +6,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -18,7 +17,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -45,7 +43,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -107,18 +104,13 @@ fun GamepadDialog(
     // the focused button pulls itself into view (see DialogButton), so D-pad navigation always shows
     // the current action even when the stack scrolls.
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(
-        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
-        contentAlignment = Alignment.Center,
-    ) {
+    ConsoleModal {
         Column(
             Modifier
                 .padding(24.dp)
                 .widthIn(max = 520.dp)
                 .heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730))
-                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -150,7 +142,11 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
     // that's scrolled out of a short window, pull it into view (no-op when already visible).
     val intoView = remember { BringIntoViewRequester() }
     LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
-    val shape = RoundedCornerShape(14.dp)
+    val focus by animateFloatAsState(
+        if (focused) 1f else 0f,
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "btnFocus",
+    )
     // Focus sweeps up/down the stack — cross-fade the fills so it glides instead of snapping.
     val bg by animateColorAsState(
         when {
@@ -158,32 +154,30 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
             primary -> ink.accent(0.20f)
             else -> ink.glass
         },
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnBg",
     )
     val fg by animateColorAsState(
         when {
             !enabled -> ink.fg(0.35f)
-            focused -> ink.fg
+            // On the accent, not on the field — a pale palette's accent decides this, not the ink.
+            focused -> ink.onAccent
             primary -> ink.accent
             else -> ink.fg(0.85f)
         },
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnFg",
     )
     val borderColor by animateColorAsState(
-        Color.White.copy(alpha = if (focused) 0.3f else 0.08f),
-        tween(160),
+        ink.fg(if (focused) 0.3f else 0.08f),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnBorder",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .bringIntoViewRequester(intoView)
-            .graphicsLayer { scaleX = scale; scaleY = scale }
-            .clip(shape)
-            .background(bg)
-            .border(1.dp, borderColor, shape)
+            .consoleGlass(ConsoleShape.Row, ConsoleFocusVisuals(scale, bg, borderColor, focus))
             .clickable(
                 enabled = enabled,
                 interactionSource = remember { MutableInteractionSource() },
@@ -305,18 +299,13 @@ fun GamepadPinHostsDialog(
         },
     )
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(
-        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
-        contentAlignment = Alignment.Center,
-    ) {
+    ConsoleModal {
         Column(
             Modifier
                 .padding(24.dp)
                 .widthIn(max = 520.dp)
                 .heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730))
-                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -368,15 +357,11 @@ private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: ()
     // landscape window pulls itself into view.
     val intoView = remember { BringIntoViewRequester() }
     LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
-    val shape = RoundedCornerShape(14.dp)
     Row(
         Modifier
             .fillMaxWidth()
             .bringIntoViewRequester(intoView)
-            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-            .clip(shape)
-            .background(visuals.background)
-            .border(1.dp, visuals.border, shape)
+            .consoleGlass(ConsoleShape.Row, visuals)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -598,11 +583,10 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
     )
 
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)), contentAlignment = Alignment.Center) {
+    ConsoleModal {
         Column(
             Modifier.padding(24.dp).widthIn(max = 460.dp).heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730)).border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .verticalScroll(rememberScrollState())
                 .padding(28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -616,7 +600,7 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 repeat(4) { i -> PinSlot(digits[i], focused = slot == i && !pairing) }
             }
-            err?.let { Text(it, color = Color(0xFFE0736F), style = MaterialTheme.typography.bodyMedium) }
+            err?.let { Text(it, color = ink.danger, style = MaterialTheme.typography.bodyMedium) }
             DialogButton(
                 label = if (pairing) "Pairing…" else "Pair",
                 focused = slot == 4 && !pairing,
@@ -638,6 +622,12 @@ private fun PinSlot(value: Int, focused: Boolean) {
             .border(if (focused) 2.dp else 1.dp, if (focused) ink.accent else ink.fg(0.1f), shape),
         contentAlignment = Alignment.Center,
     ) {
-        Text(value.toString(), fontSize = 30.sp, fontWeight = FontWeight.Bold, color = ink.fg, fontFamily = FontFamily.Monospace)
+        Text(
+            value.toString(),
+            fontSize = 30.sp,
+            fontWeight = FontWeight.Bold,
+            color = ink.fg,
+            fontFamily = FontFamily.Monospace,
+        )
     }
 }

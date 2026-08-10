@@ -3,6 +3,7 @@ package io.unom.punktfunk
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -18,10 +19,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -47,7 +46,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -214,7 +212,7 @@ fun GamepadAddHostScreen(
                 // visible (stacked, the keyboard covered the whole short screen). The legend is NOT put
                 // under the keyboard here — it floats at the same fixed bottom-left spot as everywhere.
                 Row(
-                    Modifier.fillMaxSize().systemBarsPadding().padding(start = ConsoleEdgeInset, end = 20.dp, top = 8.dp, bottom = 8.dp),
+                    Modifier.fillMaxSize().consoleSafeArea().padding(start = ConsoleEdgeInset, end = 20.dp, top = 8.dp, bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(18.dp),
                 ) {
                     Column(
@@ -236,7 +234,7 @@ fun GamepadAddHostScreen(
             } else {
                 // Portrait (or landscape not typing): the FORM SCROLLS so the Add button is never
                 // compressed by the keyboard; the keyboard sits below it; the legend floats (fixed).
-                Column(Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = ConsoleEdgeInset)) {
+                Column(Modifier.fillMaxSize().consoleSafeArea().padding(horizontal = ConsoleEdgeInset)) {
                     Column(
                         Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -268,7 +266,7 @@ fun GamepadAddHostScreen(
         // open or not), so opening the keyboard never relocates it below the keys. Backdrop-blurred.
         Box(
             Modifier.align(Alignment.BottomStart)
-                .then(if (landscape) Modifier else Modifier.systemBarsPadding())
+                .consoleLegendInsets(landscape)
                 .padding(ConsoleLegendInset),
         ) {
             GamepadHintBar(
@@ -315,7 +313,7 @@ private fun TvAddHostForm(
         Column(
             Modifier
                 .fillMaxSize()
-                .systemBarsPadding()
+                .consoleSafeArea()
                 .padding(horizontal = 56.dp, vertical = 36.dp)
                 .widthIn(max = 720.dp)
                 .verticalScroll(rememberScrollState()),
@@ -366,14 +364,18 @@ private fun rowCols(row: Int): Int = if (row < KB_ACTIONS_ROW) KB_CHAR_ROWS[row]
 private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -> Unit) {
     val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused || editing, editing = editing)
-    val shape = RoundedCornerShape(14.dp)
+    // The caret keeps its slot and only fades, like the settings rows' chevrons. Appending it on
+    // `editing` shoved the whole value left the instant the keyboard opened — the same
+    // layout-moves-under-focus bug the settings detail line had, one screen over.
+    val caretAlpha by animateFloatAsState(
+        if (editing) 1f else 0f,
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "caret",
+    )
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-            .clip(shape)
-            .background(visuals.background)
-            .border(1.dp, visuals.border, shape)
+            .consoleGlass(ConsoleShape.Row, visuals)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -387,7 +389,7 @@ private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        if (editing) Text(" |", color = ink.accent)
+        Text(" |", color = ink.accent, modifier = Modifier.graphicsLayer { alpha = caretAlpha })
     }
 }
 
@@ -395,19 +397,15 @@ private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -
 private fun AddActionRow(label: String, enabled: Boolean, focused: Boolean, onClick: () -> Unit) {
     val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused)
-    val shape = RoundedCornerShape(14.dp)
     val labelColor by animateColorAsState(
         if (enabled) ink.accent else ink.fg(0.35f),
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "addLabel",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-            .clip(shape)
-            .background(visuals.background)
-            .border(1.dp, visuals.border, shape)
+            .consoleGlass(ConsoleShape.Row, visuals)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
             .padding(vertical = 14.dp),
         contentAlignment = Alignment.Center,
@@ -430,14 +428,16 @@ private fun KeyboardGrid(
     onKey: (Int, Int) -> Unit,
 ) {
     val ink = LocalGamepadInk.current
-    val shape = RoundedCornerShape(20.dp)
+    val shape = ConsoleShape.Keyboard
     val gap = if (compact) 5.dp else 7.dp
     Column(
         Modifier
             .fillMaxWidth()
             .widthIn(max = 640.dp)
             .clip(shape)
-            .background(Color(0x1FFFFFFF))
+            // Palette glass, lifted a touch above a row's: the keyboard is a slab the keys sit on,
+            // and a hardcoded white wash was the one surface a pale palette couldn't recolour.
+            .background(ink.glass.copy(alpha = (ink.glass.alpha * 1.5f).coerceAtMost(1f)))
             .border(1.dp, ink.fg(0.12f), shape)
             .padding(start = 12.dp, end = 12.dp, top = if (compact) 8.dp else 12.dp, bottom = 12.dp + bottomInset),
         verticalArrangement = Arrangement.spacedBy(gap),
@@ -467,11 +467,13 @@ private fun Keycap(label: String, focused: Boolean, compact: Boolean, modifier: 
         tween(90),
         label = "keyBg",
     )
-    val fg by animateColorAsState(if (focused) Color.Black else ink.fg, tween(90), label = "keyFg")
+    // `onAccent`, not black: a pale palette's accent can be light enough that black-on-it is the
+    // unreadable combination, and the palette already resolved which way that goes.
+    val fg by animateColorAsState(if (focused) ink.onAccent else ink.fg, tween(90), label = "keyFg")
     Box(
         modifier = modifier
             .height(if (compact) 34.dp else 44.dp)
-            .clip(RoundedCornerShape(9.dp))
+            .clip(ConsoleShape.Keycap)
             .background(bg)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick),
         contentAlignment = Alignment.Center,

@@ -65,6 +65,10 @@ fun GamepadNavEffect(
 ) {
     val activity = LocalContext.current as? MainActivity ?: return
     val state = remember { NavInputState() }
+    // Menu feel, inherited by every console screen that navigates through here rather than wired
+    // per screen: a tick as the cursor steps, a pulse on confirm. Renders on the driving pad's own
+    // motors, the phone body if it has none, and nothing at all on a TV.
+    val haptics by rememberUpdatedState(rememberConsoleHaptics())
     // The effects below are keyed on `active` only (they must NOT restart on every recomposition), so
     // they'd otherwise capture the FIRST callbacks — closing over a stale `tiles` (fewer hosts than are
     // discovered later, which clamped navigation to that old count). rememberUpdatedState keeps the
@@ -98,7 +102,10 @@ fun GamepadNavEffect(
                 KeyEvent.KEYCODE_DPAD_UP -> { if (edge) currentOnUp(); true }
                 KeyEvent.KEYCODE_DPAD_DOWN -> { if (edge) currentOnDown(); true }
                 KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
-                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (edge) currentOnActivate(); true }
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                    if (edge) { haptics.confirm(); currentOnActivate() }
+                    true
+                }
                 // The gamepad Select / View / Share button → context options (a remote uses Down).
                 KeyEvent.KEYCODE_BUTTON_SELECT -> { if (edge) currentOnOptions(); true }
                 KeyEvent.KEYCODE_BUTTON_X -> { if (edge) currentOnTertiary(); true }
@@ -139,8 +146,10 @@ fun GamepadNavEffect(
             }
             when {
                 dir == 0 -> committed = 0
-                dir != committed -> { currentOnMove(dir); committed = dir; fireAt = now + INITIAL_DELAY_MS }
-                now >= fireAt -> { currentOnMove(dir); fireAt = now + REPEAT_MS }
+                dir != committed -> {
+                    haptics.tick(); currentOnMove(dir); committed = dir; fireAt = now + INITIAL_DELAY_MS
+                }
+                now >= fireAt -> { haptics.tick(); currentOnMove(dir); fireAt = now + REPEAT_MS }
             }
             delay(16)
         }
@@ -167,6 +176,9 @@ fun GamepadNavEffect2D(
 ) {
     val activity = LocalContext.current as? MainActivity ?: return
     val state = remember { NavInputState() }
+    // See [GamepadNavEffect] — the same menu feel, so a form screen and a carousel answer a press
+    // identically.
+    val haptics by rememberUpdatedState(rememberConsoleHaptics())
     val currentOnDirection by rememberUpdatedState(onDirection)
     val currentOnActivate by rememberUpdatedState(onActivate)
     val currentOnTertiary by rememberUpdatedState(onTertiary)
@@ -196,12 +208,15 @@ fun GamepadNavEffect2D(
                 KeyEvent.KEYCODE_DPAD_UP -> { state.dpadY = if (down) -1 else 0; true }
                 KeyEvent.KEYCODE_DPAD_DOWN -> { state.dpadY = if (down) 1 else 0; true }
                 KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
-                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (edge) currentOnActivate(); true }
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                    if (edge) { haptics.confirm(); currentOnActivate() }
+                    true
+                }
                 KeyEvent.KEYCODE_BUTTON_X -> { if (edge) currentOnTertiary(); true }
                 KeyEvent.KEYCODE_BUTTON_Y -> { if (edge) currentOnSecondary(); true }
                 // Edge-only, no auto-repeat: a held shoulder shouldn't spin through the tabs.
-                KeyEvent.KEYCODE_BUTTON_L1 -> { if (edge) currentOnShoulder(-1); true }
-                KeyEvent.KEYCODE_BUTTON_R1 -> { if (edge) currentOnShoulder(1); true }
+                KeyEvent.KEYCODE_BUTTON_L1 -> { if (edge) { haptics.tick(); currentOnShoulder(-1) }; true }
+                KeyEvent.KEYCODE_BUTTON_R1 -> { if (edge) { haptics.tick(); currentOnShoulder(1) }; true }
                 else -> false // B → MainActivity (remapped to BACK → BackHandler)
             }
         }
@@ -229,8 +244,10 @@ fun GamepadNavEffect2D(
             when {
                 raw == null && nearCentre -> committed = null
                 raw == null -> { /* in the hysteresis band → hold, don't fire */ }
-                raw != committed -> { currentOnDirection(raw); committed = raw; fireAt = now + INITIAL_DELAY_MS }
-                now >= fireAt -> { currentOnDirection(raw); fireAt = now + REPEAT_MS }
+                raw != committed -> {
+                    haptics.tick(); currentOnDirection(raw); committed = raw; fireAt = now + INITIAL_DELAY_MS
+                }
+                now >= fireAt -> { haptics.tick(); currentOnDirection(raw); fireAt = now + REPEAT_MS }
             }
             delay(16)
         }

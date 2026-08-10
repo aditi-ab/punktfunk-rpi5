@@ -3,20 +3,18 @@ package io.unom.punktfunk
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -27,13 +25,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -46,13 +44,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
@@ -176,10 +175,15 @@ fun GamepadSettingsScreen(
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex.coerceAtLeast(0)
 
+    // Which way the section last moved (+1 forward / -1 back) — the row list slides in from that
+    // side, so stepping sections reads as travelling along a strip rather than teleporting.
+    var tabDir by remember { mutableIntStateOf(1) }
+
     // L1/R1 — one section along, wrapping (the strip is a ring, like A's value cycle).
     fun selectTab(next: GpTab) {
         if (next == tab) return
         tabFocus[tab] = focus
+        tabDir = if (next.ordinal > tab.ordinal) 1 else -1
         tab = next
         // Clamp: a tab's length follows the hardware and the catalog, so a remembered index can
         // outlive the row it pointed at.
@@ -188,14 +192,35 @@ fun GamepadSettingsScreen(
     }
     fun stepTab(delta: Int) {
         val all = GpTab.entries
-        selectTab(all[((all.indexOf(tab) + delta) % all.size + all.size) % all.size])
+        val next = all[((all.indexOf(tab) + delta) % all.size + all.size) % all.size]
+        selectTab(next)
+        // A wrap (last → first) is still a step in the direction you pressed, whatever the ordinals
+        // say — selectTab's ordinal compare would read it backwards.
+        tabDir = delta
     }
     // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
     // value text slides in its AnimatedContent, so the motion matches the button press.
     var adjustDir by remember { mutableIntStateOf(1) }
+    // Bumped on every ACCEPTED step of the focused row (the chevron ticks) and every REFUSED one
+    // (the value gives a little and springs back). A press always gets an answer, even "no".
+    var stepToken by remember { mutableIntStateOf(0) }
+    var refusalToken by remember { mutableIntStateOf(0) }
     val listState = rememberLazyListState()
+    val haptics = rememberConsoleHaptics()
 
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    // Step the focused row's value, answering a refusal rather than swallowing it.
+    fun step(delta: Int) {
+        adjustDir = delta
+        val row = liveRow(rows, focus)
+        if (row != null && row.adjust(delta)) {
+            stepToken++
+        } else {
+            refusalToken++
+            haptics.boundary()
+        }
+    }
 
     BackHandler(onBack = onBack)
     GamepadNavEffect2D(
@@ -209,10 +234,8 @@ fun GamepadSettingsScreen(
                 // On the strip, left/right walks sections; on a row it steps the value. A disabled
                 // row is INERT, not just dim — the step is refused instead of writing a setting
                 // that has nothing to act on (see `liveRow`).
-                NavDir.LEFT ->
-                    if (tabFocused) stepTab(-1) else { adjustDir = -1; liveRow(rows, focus)?.adjust(-1) }
-                NavDir.RIGHT ->
-                    if (tabFocused) stepTab(1) else { adjustDir = 1; liveRow(rows, focus)?.adjust(1) }
+                NavDir.LEFT -> if (tabFocused) stepTab(-1) else step(-1)
+                NavDir.RIGHT -> if (tabFocused) stepTab(1) else step(1)
             }
         },
         // A on the strip drops into the section you picked, which is what "confirm" means there.
@@ -225,6 +248,7 @@ fun GamepadSettingsScreen(
     // Keep the focused row on screen, but only SCROLL when it's actually off-screen — so entering the
     // screen (focus on the first row) leaves the "Settings" heading visible instead of jumping past it.
     // +1 accounts for the heading being item 0.
+    val legendClearancePx = with(LocalDensity.current) { ConsoleLegendClearance.roundToPx() }
     LaunchedEffect(focus, tab) {
         runCatching {
             val itemIndex = focus + 1
@@ -232,10 +256,24 @@ fun GamepadSettingsScreen(
             val item = info.visibleItemsInfo.firstOrNull { it.index == itemIndex }
             val offScreen = item == null ||
                 item.offset < info.viewportStartOffset ||
-                item.offset + item.size > info.viewportEndOffset - 96 // keep clear of the floating legend
+                // The SAME constant the list pads its bottom with, rather than a literal that has
+                // to be remembered when the legend zone grows — which is exactly how a row ended up
+                // scrolling to a position the legend then covered.
+                item.offset + item.size > info.viewportEndOffset - legendClearancePx
             if (offScreen) listState.animateScrollToItem(itemIndex)
         }
     }
+
+    // The section slide: one shared list whose CONTENT slides, rather than an AnimatedContent
+    // holding two LazyColumns — two lists would mean two scroll states fighting over one cursor.
+    val animated = animationsEnabled()
+    val tabSlide = remember { Animatable(0f) }
+    LaunchedEffect(tab, animated) {
+        if (!animated) { tabSlide.snapTo(0f); return@LaunchedEffect }
+        tabSlide.snapTo(1f)
+        tabSlide.animateTo(0f, ConsoleMotion.ease(ConsoleMotion.TAB_MS))
+    }
+    val tabSlidePx = with(LocalDensity.current) { ConsoleMotion.TAB_SLIDE.toPx() }
 
     val hazeState = remember { HazeState() }
 
@@ -243,8 +281,10 @@ fun GamepadSettingsScreen(
         // Everything scrolls — including the heading — so nothing is pinned. Vital in landscape,
         // where a fixed title + a fixed detail/legend strip ate most of the (short) height.
         Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
+            // The backdrop stays full-bleed under the cutout and the bars — it is ambience. Only
+            // the CONTENT column takes the safe area.
             GamepadFormBackground(Modifier.fillMaxSize())
-            Column(Modifier.fillMaxSize().systemBarsPadding()) {
+            Column(Modifier.fillMaxSize().consoleSafeArea()) {
             // The strip is PINNED while the rows scroll under it: it is this screen's primary
             // navigation now, and a switcher you have to scroll back up to find isn't one. The
             // title stays in the scrolling list (landscape has no height to spare, and the
@@ -258,8 +298,19 @@ fun GamepadSettingsScreen(
             )
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 8.dp, bottom = 104.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        translationX = tabSlidePx * tabSlide.value * tabDir
+                        alpha = 1f - 0.85f * tabSlide.value
+                    },
+                contentPadding = PaddingValues(
+                    start = ConsoleEdgeInset,
+                    end = ConsoleEdgeInset,
+                    top = 8.dp,
+                    // Clears the whole floating legend ZONE — the detail band as well as the pill.
+                    bottom = ConsoleLegendClearance,
+                ),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
             item(key = "__title") {
@@ -269,10 +320,14 @@ fun GamepadSettingsScreen(
                 ConsoleHeader("Default settings", horizontalInset = false)
             }
             itemsIndexed(rows, key = { _, r -> r.id }) { index, row ->
+                val rowFocused = index == focus && !tabFocused
                 SettingRowView(
                     row,
-                    focused = index == focus && !tabFocused,
+                    focused = rowFocused,
                     adjustDir = adjustDir,
+                    // Only the focused row can be stepped, so only it needs to answer one.
+                    stepToken = if (rowFocused) stepToken else 0,
+                    refusalToken = if (rowFocused) refusalToken else 0,
                     onClick = {
                         // Same inertness as the pad path above — tapping a dimmed row focuses it
                         // (so its detail explains itself) but never flips it.
@@ -286,12 +341,15 @@ fun GamepadSettingsScreen(
             }
         }
 
-        // Floating frosted legend — a real backdrop blur of the rows scrolling behind it (no dedicated
-        // strip). In landscape it ignores the safe area so it hugs the corner instead of the nav-bar inset.
+        // The floating legend ZONE: the focused row's description above, the controls pill below,
+        // both frosted over whatever scrolls behind them. It is an OVERLAY, so nothing in it can
+        // ever displace the list — which is the whole reason the detail moved here out of the row.
+        // In landscape it ignores the system bars so it hugs the corner instead of the nav-bar
+        // inset, but it still takes the display cutout (reverse-landscape parks the punch here).
         Box(
             Modifier
                 .align(Alignment.BottomStart)
-                .then(if (landscape) Modifier else Modifier.systemBarsPadding())
+                .consoleLegendInsets(landscape)
                 .padding(ConsoleLegendInset),
         ) {
             // The legend follows the focused row (the desktop console's hints() does the same):
@@ -306,31 +364,40 @@ fun GamepadSettingsScreen(
             // Activity (preview/tests), like GamepadHintBar's own glyph choice.
             val padIsGamepad = (LocalContext.current as? MainActivity)?.lastPadIsGamepad ?: true
             val sections = listOfNotNull(
-                GamepadHint('⇄', Color(0xFF9A93C7), "Section", onClick = { stepTab(1) })
+                GamepadHint('⇄', PadGlyph.Arrow, "Section", onClick = { stepTab(1) })
                     .takeIf { padIsGamepad },
             )
-            GamepadHintBar(
-                if (tabFocused) listOf(
-                    GamepadHint('↔', Color(0xFF9A93C7), "Section"),
-                    PadGlyph.hint('A', "Open") { tabFocused = false },
-                    PadGlyph.hint('B', "Done", onClick = onBack),
-                ) else sections + when {
-                    focused != null && !focused.enabled -> listOf(
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                ConsoleDetailBand(
+                    // On the strip there is no row to describe, and the pills already name the
+                    // sections — a stale row's description there would describe the wrong thing.
+                    text = if (tabFocused) "" else focused?.detail.orEmpty(),
+                    key = if (tabFocused) "__strip" else focused?.id,
+                    hazeState = hazeState,
+                )
+                GamepadHintBar(
+                    if (tabFocused) listOf(
+                        GamepadHint('↔', PadGlyph.Arrow, "Section"),
+                        PadGlyph.hint('A', "Open") { tabFocused = false },
                         PadGlyph.hint('B', "Done", onClick = onBack),
-                    )
-                    focused != null && !focused.adjustable -> listOf(
-                        PadGlyph.hint('A', "Pin to hosts") { focused.activate() },
-                        PadGlyph.hint('B', "Done", onClick = onBack),
-                    )
-                    else -> listOf(
-                        GamepadHint('↔', Color(0xFF9A93C7), "Adjust"),
-                        // Tappable too (touch escape hatch): Change cycles the focused row, Done leaves.
-                        PadGlyph.hint('A', "Change") { rows.getOrNull(focus)?.activate() },
-                        PadGlyph.hint('B', "Done", onClick = onBack),
-                    )
-                },
-                hazeState = hazeState,
-            )
+                    ) else sections + when {
+                        focused != null && !focused.enabled -> listOf(
+                            PadGlyph.hint('B', "Done", onClick = onBack),
+                        )
+                        focused != null && !focused.adjustable -> listOf(
+                            PadGlyph.hint('A', "Pin to hosts") { focused.activate() },
+                            PadGlyph.hint('B', "Done", onClick = onBack),
+                        )
+                        else -> listOf(
+                            GamepadHint('↔', PadGlyph.Arrow, "Adjust"),
+                            // Tappable too (touch hatch): Change cycles the focused row, Done leaves.
+                            PadGlyph.hint('A', "Change") { rows.getOrNull(focus)?.activate() },
+                            PadGlyph.hint('B', "Done", onClick = onBack),
+                        )
+                    },
+                    hazeState = hazeState,
+                )
+            }
         }
 
         // The pin-to-hosts picker for the activated profile row — the console counterpart of the
@@ -347,24 +414,62 @@ fun GamepadSettingsScreen(
     }
 }
 
+/**
+ * One settings row. Its geometry NEVER changes with focus — that is the whole design of it.
+ *
+ * It used to unfold its description in place, which meant every D-pad step shrank one row and grew
+ * another, shifting the entire list under the cursor and moving the keep-focus-visible scroll's
+ * target out from under it mid-animation. The description now lives in the screen's floating
+ * [ConsoleDetailBand], which is an overlay and cannot displace anything. Focus changes colour,
+ * lift and bloom here; it does not change size.
+ *
+ * The value gets the same treatment sideways: a fixed minimum slot, end-aligned, with the size
+ * transform snapped so the slot's WIDTH never animates. Stepping a choice used to widen and narrow
+ * that slot on every press, walking the ‹ chevron back and forth. Tabular figures finish the job —
+ * without them `1920 × 1080 → 2560 × 1440` changes width on the digits alone.
+ */
 @Composable
-private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick: () -> Unit) {
+private fun SettingRowView(
+    row: GpRow,
+    focused: Boolean,
+    adjustDir: Int,
+    stepToken: Int,
+    refusalToken: Int,
+    onClick: () -> Unit,
+) {
     val ink = LocalGamepadInk.current
     val visuals = animateConsoleFocus(active = focused)
-    val shape = RoundedCornerShape(14.dp)
     // The chevrons keep their layout slot and only fade, so the value never jumps sideways when
     // focus arrives; the value colour cross-fades with them. A non-adjustable row (a profile row
     // navigates, the empty-catalog placeholder does nothing) never shows them at all.
     val chevronAlpha by animateFloatAsState(
         if (focused && row.adjustable) 0.6f else 0f,
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "chevrons",
     )
     val valueColor by animateColorAsState(
         ink.fg(if (focused) 1f else 0.6f),
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "valueColor",
     )
+    // A press always gets an answer. Accepted: the chevron on the pressed side ticks outward and
+    // springs back. Refused: the whole value slot gives 4 dp toward the press and springs back —
+    // the "door is locked" motion, so a limit reads as a limit instead of as a dropped input.
+    val chevronKick = remember { Animatable(0f) }
+    LaunchedEffect(stepToken) {
+        if (stepToken == 0) return@LaunchedEffect
+        chevronKick.snapTo(2f * adjustDir)
+        chevronKick.animateTo(0f, spring(dampingRatio = 0.45f, stiffness = 900f))
+    }
+    val refusal = remember { Animatable(0f) }
+    LaunchedEffect(refusalToken) {
+        if (refusalToken == 0) return@LaunchedEffect
+        refusal.animateTo(
+            ConsoleMotion.REFUSAL_NUDGE.value * adjustDir,
+            ConsoleMotion.ease(ConsoleMotion.REFUSAL_MS / 2),
+        )
+        refusal.animateTo(0f, spring(dampingRatio = 0.5f, stiffness = Spring.StiffnessMedium))
+    }
     Column {
         if (row.header != null) {
             Text(
@@ -375,73 +480,93 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
                 modifier = Modifier.padding(start = 16.dp, top = 14.dp, bottom = 4.dp),
             )
         }
-        Column(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-                .clip(shape)
-                .background(visuals.background)
-                .border(1.dp, visuals.border, shape)
+                .consoleGlass(ConsoleShape.Row, visuals)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     onClick = onClick,
                 )
                 .padding(horizontal = 16.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    row.label,
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    // A disabled row (the "No profiles yet" placeholder) dims but stays focusable,
-                    // so its detail line can still explain what would go here.
-                    color = ink.fg(if (row.enabled) 1f else 0.45f),
-                    maxLines = 1,
-                )
-                Spacer(Modifier.weight(1f))
+            Text(
+                row.label,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold,
+                // A disabled row (the "No profiles yet" placeholder) dims but stays focusable, so
+                // the detail band can still explain what would go here.
+                color = ink.fg(if (row.enabled) 1f else 0.45f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // Takes the slack rather than a Spacer doing it, so a long label ellipsizes into
+                // the room it actually has instead of shoving the value slot off the row.
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Row(
+                modifier = Modifier.offset { IntOffset(refusal.value.dp.roundToPx(), 0) },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 if (row.toggled != null) {
                     // A toggle is a switch, not text — the sliding knob + tinting track IS the value.
                     ConsoleSwitch(on = row.toggled, focused = focused)
                 } else {
-                    Text("‹ ", color = ink.fg, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
-                    // The value slides in the direction it was stepped and its width animates, so
-                    // cycling a choice reads as motion through a list rather than a text swap.
-                    AnimatedContent(
-                        targetState = row.value,
-                        transitionSpec = {
-                            val dir = adjustDir
-                            (slideInHorizontally(tween(180)) { w -> w / 2 * dir } + fadeIn(tween(180))) togetherWith
-                                (slideOutHorizontally(tween(140)) { w -> -w / 2 * dir } + fadeOut(tween(100))) using
-                                SizeTransform(clip = false)
-                        },
-                        label = "value",
-                    ) { value ->
-                        Text(
-                            value,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = valueColor,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                    Text(
+                        "‹ ",
+                        color = ink.fg,
+                        modifier = Modifier
+                            .graphicsLayer { alpha = chevronAlpha }
+                            .offset { IntOffset(minOf(chevronKick.value, 0f).dp.roundToPx(), 0) },
+                    )
+                    Box(
+                        Modifier.widthIn(min = 96.dp),
+                        contentAlignment = Alignment.CenterEnd,
+                    ) {
+                        // The value slides in the direction it was stepped, so cycling a choice
+                        // reads as motion through a list rather than a text swap — but its slot
+                        // does NOT resize with it (`snap`), which is what used to jiggle the row.
+                        AnimatedContent(
+                            targetState = row.value,
+                            transitionSpec = {
+                                val dir = adjustDir
+                                (
+                                    slideInHorizontally(
+                                        ConsoleMotion.ease(ConsoleMotion.VALUE_MS),
+                                    ) { w -> w / 2 * dir } +
+                                        fadeIn(ConsoleMotion.ease(ConsoleMotion.VALUE_MS))
+                                    ) togetherWith (
+                                    slideOutHorizontally(
+                                        ConsoleMotion.ease(ConsoleMotion.VALUE_OUT_MS),
+                                    ) { w -> -w / 2 * dir } +
+                                        fadeOut(ConsoleMotion.ease(100))
+                                    ) using SizeTransform(clip = false) { _, _ -> snap() }
+                            },
+                            label = "value",
+                        ) { value ->
+                            Text(
+                                value,
+                                // Tabular figures: every digit the same width, so stepping a
+                                // resolution or a bitrate cannot change the text's width.
+                                style = MaterialTheme.typography.bodyMedium
+                                    .copy(fontFeatureSettings = "tnum"),
+                                color = valueColor,
+                                textAlign = TextAlign.End,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
-                    Text(" ›", color = ink.fg, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
+                    Text(
+                        " ›",
+                        color = ink.fg,
+                        modifier = Modifier
+                            .graphicsLayer { alpha = chevronAlpha }
+                            .offset { IntOffset(maxOf(chevronKick.value, 0f).dp.roundToPx(), 0) },
+                    )
                 }
-            }
-            // The focused row carries its own one-line description — no dedicated (space-eating)
-            // detail strip. It unfolds right where you're looking, and the row grows to fit.
-            AnimatedVisibility(
-                visible = focused && row.detail.isNotBlank(),
-                enter = fadeIn(tween(180, delayMillis = 60)) + expandVertically(tween(180)),
-                exit = fadeOut(tween(90)) + shrinkVertically(tween(150)),
-            ) {
-                Text(
-                    row.detail,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = ink.fg(0.6f),
-                    maxLines = 2,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
             }
         }
     }

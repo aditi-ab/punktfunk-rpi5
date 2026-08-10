@@ -1,9 +1,6 @@
 package io.unom.punktfunk
 
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.Crossfade
-import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -21,7 +18,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -52,6 +48,7 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.Tab
+import kotlin.math.roundToInt
 
 @Composable
 fun App(forceGamepadUi: Boolean = false) {
@@ -211,8 +208,9 @@ fun App(forceGamepadUi: Boolean = false) {
                             Spacer(Modifier.weight(1f))
                         }
                         // The rail handles its own insets; the content pane insets itself (the screens
-                        // don't, since they used to rely on the Scaffold's padding).
-                        Box(Modifier.weight(1f).fillMaxHeight().systemBarsPadding()) { tabContent(true) }
+                        // don't, since they used to rely on the Scaffold's padding). Cutout included:
+                        // a tablet in landscape puts its punch on exactly this pane's leading edge.
+                        Box(Modifier.weight(1f).fillMaxHeight().consoleSafeArea()) { tabContent(true) }
                     }
                 } else {
                     Scaffold(
@@ -245,8 +243,16 @@ fun App(forceGamepadUi: Boolean = false) {
  */
 val LocalGamepadPalette = compositionLocalOf { GamepadPalette.named("violet") }
 
-/** Which console screen the gamepad shell is showing. */
-private enum class GamepadScreen { Home, Settings, Library }
+/**
+ * Which console screen the gamepad shell is showing, and how deep it sits — Home is the root, and
+ * everything reachable from it is one level in. The DEPTH is what decides whether a change is a
+ * push or a pop, and therefore which way the screens travel.
+ */
+private enum class GamepadScreen(val depth: Int) {
+    Home(0),
+    Settings(1),
+    Library(1),
+}
 
 /**
  * The console (gamepad) shell — the Android mirror of the Apple client's ContentView gamepad branch:
@@ -297,12 +303,50 @@ fun GamepadShell(
     val fitDensity = screenWidthPx / CONSOLE_TV_MIN_WIDTH_DP
     val consoleDensity = if (isTv && fitDensity < baseDensity.density) fitDensity else baseDensity.density
 
+    // The console's screen transition, and the desktop console's contract rather than a plain
+    // cross-fade (see ConsoleMotion for the numbers and where they come from): a PUSH slides the
+    // incoming screen up out of a fade while the outgoing one recedes; a POP runs it backwards, the
+    // leaving screen sliding down and the revealed one growing back. Direction comes from the
+    // screens' nav DEPTH, so Settings → Home pops even though nothing tracks a stack.
+    //
+    // Each slot's controller nav is gated on being the CURRENT target (`s == screen`), so mid-
+    // transition only the incoming screen drives the pad. All screens pin their legend at the same
+    // ConsoleLegendInset, so it reads as fixed while the content behind it moves.
+    val animated = animationsEnabled()
     CompositionLocalProvider(LocalDensity provides Density(consoleDensity, baseDensity.fontScale)) {
-    // Cross-fade between console screens so switches are smooth. Each slot's controller nav is gated
-    // on being the CURRENT target (`s == screen`), so during the fade only the incoming screen drives
-    // the pad. All screens pin their legend at the same ConsoleLegendInset, so it reads as fixed while
-    // the content behind it fades.
-    Crossfade(targetState = screen, animationSpec = tween(240), label = "consoleScreen") { s ->
+    // Measured INSIDE the console's own density, not the device's: on a TV the console UI runs at a
+    // reduced density to shrink the 10-foot layout, and a slide sized in device pixels would travel
+    // further than every other dp in the same animation.
+    val slidePx = with(LocalDensity.current) { ConsoleMotion.PUSH_SLIDE.toPx() }.roundToInt()
+    AnimatedContent(
+        targetState = screen,
+        transitionSpec = {
+            if (!animated) {
+                // Reduce-motion: no travel, no scale — just a fast cross-fade, the same courtesy
+                // the frozen backdrop pays.
+                fadeIn(tween(ConsoleMotion.REDUCED_MS)) togetherWith
+                    fadeOut(tween(ConsoleMotion.REDUCED_MS))
+            } else if (targetState.depth > initialState.depth) {
+                (
+                    fadeIn(ConsoleMotion.ease()) +
+                        slideInVertically(ConsoleMotion.ease()) { slidePx } +
+                        scaleIn(ConsoleMotion.ease(), initialScale = ConsoleMotion.ENTER_SCALE)
+                    ) togetherWith (
+                    fadeOut(ConsoleMotion.ease()) +
+                        scaleOut(ConsoleMotion.ease(), targetScale = ConsoleMotion.EXIT_SCALE)
+                    )
+            } else {
+                (
+                    fadeIn(ConsoleMotion.ease(), initialAlpha = ConsoleMotion.REVEAL_ALPHA) +
+                        scaleIn(ConsoleMotion.ease(), initialScale = ConsoleMotion.EXIT_SCALE)
+                    ) togetherWith (
+                    fadeOut(ConsoleMotion.ease()) +
+                        slideOutVertically(ConsoleMotion.ease()) { slidePx }
+                    )
+            }
+        },
+        label = "consoleScreen",
+    ) { s ->
         when (s) {
             GamepadScreen.Home -> ConnectScreen(
                 settings = settings,

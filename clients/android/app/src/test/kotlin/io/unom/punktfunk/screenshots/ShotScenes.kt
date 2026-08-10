@@ -32,9 +32,11 @@ import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
 import androidx.compose.runtime.CompositionLocalProvider
+import io.unom.punktfunk.GamepadHome
 import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.GamepadPalette
 import io.unom.punktfunk.GamepadSettingsScreen
+import io.unom.punktfunk.HomeTile
 import io.unom.punktfunk.LocalGamepadInk
 import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
@@ -427,6 +429,44 @@ internal fun ConnectConsoleScene() =
  * stand in for it: this is a different screen with different navigation, and the strip is the part
  * a layout regression would eat first.
  */
+/**
+ * The console HOME — the host carousel over the living backdrop, which is the screen the aurora is
+ * most of. Worth its own shot for exactly that reason: on API 33+ the field is the real bicubic
+ * MESH (`GamepadAurora`'s AGSL port of the desktop console's shader) and below it the four-blob
+ * fallback, and the two are only comparable side by side. The scene composes [GamepadHome]
+ * directly with mock tiles — it needs no JNI core and no session, unlike the ConnectScreen that
+ * normally feeds it.
+ */
+@Composable
+internal fun ConsoleHomeScene(paletteId: String = "violet") {
+    val palette = GamepadPalette.named(paletteId)
+    val tiles = listOf(
+        HomeTile(
+            id = "living", title = "Living Room PC", subtitle = "192.168.1.42 · Paired",
+            filled = true, online = true, paired = true, activate = {},
+        ),
+        HomeTile(
+            id = "studio", title = "studio-deck", subtitle = "192.168.1.61 · Discovered",
+            online = true, activate = {},
+        ),
+        HomeTile(id = "add", title = "Add Host", subtitle = "By address", isAdd = true, activate = {}),
+    )
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+    ) {
+        GamepadHome(
+            tiles = tiles,
+            libraryEnabled = true,
+            controllerName = "Xbox Wireless Controller",
+            navActive = false,
+            onActivate = {},
+            onOpenLibrary = {},
+            onOpenSettings = {},
+        )
+    }
+}
+
 @Composable
 internal fun ConsoleSettingsScene(paletteId: String = "violet") {
     // The scene calls the screen directly, so it has to publish the palette locals `App` would

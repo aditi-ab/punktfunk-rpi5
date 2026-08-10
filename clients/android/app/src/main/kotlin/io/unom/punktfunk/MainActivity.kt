@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.systemBars
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -140,6 +141,16 @@ class MainActivity : ComponentActivity() {
      * button glyphs from it so a DualSense user isn't shown Xbox lettering.
      */
     var lastPadStyle by mutableStateOf(Gamepad.PadStyle.GENERIC)
+        private set
+
+    /**
+     * The `InputDevice.id` of the controller driving the console UI, or 0 for none. Kept beside
+     * [lastPadStyle] because the console's menu haptics render on the DRIVING pad's own motors when
+     * it has any — a rumble that comes out of the device you are not holding is worse than none.
+     * Falls back to the phone body (see `rememberConsoleHaptics`), and to silence on a TV, where
+     * neither a remote nor the box has an actuator.
+     */
+    var lastPadDeviceId by mutableIntStateOf(0)
         private set
 
     /**
@@ -606,7 +617,10 @@ class MainActivity : ComponentActivity() {
             // pad, WHICH pad family, so the glyphs wear its lettering/shapes.
             if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode)) {
                 lastPadIsGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD)
-                if (lastPadIsGamepad) lastPadStyle = Gamepad.styleFor(event.device)
+                if (lastPadIsGamepad) {
+                    lastPadStyle = Gamepad.styleFor(event.device)
+                    lastPadDeviceId = event.deviceId
+                }
             }
             // The Controllers debug screen sees pad events before the navigation remap below.
             padKeyProbe?.let { if (it(event)) return true }
@@ -695,6 +709,7 @@ class MainActivity : ComponentActivity() {
                 if (dir != 0) {
                     lastPadIsGamepad = true // a stick/HAT push can only come from a real gamepad
                     lastPadStyle = Gamepad.styleFor(event.device)
+                    lastPadDeviceId = event.deviceId
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, dir))
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, dir))
                     return true

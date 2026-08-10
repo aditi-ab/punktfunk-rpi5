@@ -114,6 +114,32 @@ class ScreenshotTest {
     fun consoleSettingsLight() =
         shootRoot("console-settings-light") { ConsoleSettingsScene(paletteId = "holo") }
 
+    // The console home, the screen the living backdrop is most of. The default sdk (36) draws the
+    // real AGSL MESH field; the paired API-31 shot below draws the blob fallback, so the two
+    // renderings of the same palette can be compared rather than assumed equivalent.
+    @Test
+    fun consoleHome() = shootRoot("console-home") { ConsoleHomeScene() }
+
+    @Test
+    fun consoleHomeLight() = shootRoot("console-home-light") { ConsoleHomeScene(paletteId = "holo") }
+
+    /**
+     * Landscape — the orientation the console UI actually runs in, and the only one wide enough to
+     * show the carousel's NEIGHBOURS, which is where the projected turn (`CARD_TURN_RAD`) lives.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun consoleHomeLandscape() = shootRoot("console-home-landscape") { ConsoleHomeScene() }
+
+    /**
+     * The API 31/32 field. `RuntimeShader` is API 33+, so everything below it keeps the four
+     * drifting blobs — an honest approximation rather than an emulation, and the thing this shot
+     * exists to keep honest.
+     */
+    @Test
+    @Config(sdk = [31], qualifiers = "w360dp-h800dp-xxhdpi")
+    fun consoleHomeBlobFallback() = shootRoot("console-home-blobs") { ConsoleHomeScene() }
+
     @Test
     fun trust() = shootScreen("trust") {
         HostsScene()
