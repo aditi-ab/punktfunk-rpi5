@@ -84,6 +84,11 @@ struct GamepadHomeView: View {
     /// Launch a library title on a host — the in-place library layer's activate path (iOS; the
     /// cover/sheet presentations wire ContentView's `launchTitle` into LibraryView themselves).
     let launchTitle: (StoredHost, String) -> Void
+    /// A console prompt (GamepadPromptView) is up over the home — it polls the same controller, so
+    /// this screen must stand down for as long as it is. Same handoff contract as the connect
+    /// takeover and the shell's own layers; without it the carousel keeps scrolling underneath the
+    /// modal and a single A press reaches both.
+    var promptActive = false
 
     /// The profile catalog — pinned host+profile combos render as their own tiles here, which is
     /// how a controller picks a profile: one focus-and-press instead of a menu (design §5.4).
@@ -311,14 +316,14 @@ struct GamepadHomeView: View {
     /// transition's input drop, during which NOBODY polls.
     private var homeOwnsController: Bool {
         #if os(iOS)
-        topScreen == nil && !transitioning
+        topScreen == nil && !transitioning && !promptActive
             && waker.waking == nil && model.phase != .connecting
         #else
         // `pairingTarget` too: macOS presents the pair screen as a sheet and tvOS as a cover, and
         // either way the launcher underneath must stop consuming the pad — the pair screen's own
         // list is polling the same controller.
         libraryTarget == nil && pairingTarget == nil && !showSettings && !showAddHost
-            && waker.waking == nil && model.phase != .connecting
+            && !promptActive && waker.waking == nil && model.phase != .connecting
         #endif
     }
 

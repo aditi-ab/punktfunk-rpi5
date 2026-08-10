@@ -200,6 +200,22 @@ struct ContentView: View {
     private var driven: some View {
         drivenBase
             .environment(\.gamepadMetrics, gamepadMetrics)
+            #if os(iOS) || os(macOS)
+            // The console's own modal, over WHICHEVER screen is up. Not attached to `home`, which
+            // renders only while `model.connection == nil`: a connection exists through the
+            // pair-required and approval handshakes, which is precisely when these prompts fire.
+            // It sits above the connect takeover too — the delegated-approval wait is raised
+            // DURING a dial and owns the only Cancel for it. (The takeover draws nothing in that
+            // state: `connectingOverlayName` is nil while `awaitingApproval` is set, so the two
+            // never poll the pad at once.)
+            .overlay {
+                if let prompt = consolePrompt {
+                    GamepadPromptView(prompt: prompt)
+                        .gamepadPaletteInk()
+                        .transition(.opacity)
+                }
+            }
+            #endif
     }
 
     private var drivenBase: some View {
@@ -444,8 +460,101 @@ struct ContentView: View {
     // budget (inline, they tip SwiftUI's per-expression limit — see the split sections idiom).
 
     private var deepLinkNoticePresented: Binding<Bool> {
-        Binding(get: { deepLinkNotice != nil }, set: { if !$0 { deepLinkNotice = nil } })
+        Binding(
+            get: { deepLinkNotice != nil && !consolePromptShowing },
+            set: { if !$0 { deepLinkNotice = nil } })
     }
+
+    /// True while the console prompt owns the modal state (see `consolePrompt`). Always false on
+    /// tvOS, whose alerts the focus engine drives natively.
+    private var consolePromptShowing: Bool {
+        #if os(iOS) || os(macOS)
+        consolePrompt != nil
+        #else
+        false
+        #endif
+    }
+
+    #if os(iOS) || os(macOS)
+    /// The modal state the console UI should present ITSELF, as a pad-navigable prompt, instead of
+    /// letting a system alert take it. `.alert`/`.confirmationDialog` are UIKit/AppKit surfaces a
+    /// controller cannot navigate, and these are not incidental prompts: "Pairing required" is the
+    /// FIRST thing an unpaired host shows, "Connection failed" strands the console UI behind a
+    /// modal only a finger can dismiss, and "Waiting for approval" owns the only Cancel for a
+    /// connect that may never complete. One at a time, most-urgent first — a system alert stack
+    /// would layer these, but a console shows one screen.
+    ///
+    /// Gated on not STREAMING, not on `model.connection == nil`: a connection object exists well
+    /// before a stream does, through exactly the handshakes these prompts belong to. Streaming is
+    /// the one case that must stay with the system alert — there the pad belongs to
+    /// `GamepadCapture` and is being forwarded to the host.
+    private var consolePrompt: GamepadPrompt? {
+        guard gamepadUIActive, model.phase != .streaming else { return nil }
+        if let req = approvalChoice {
+            return GamepadPrompt(
+                id: "pairing-required",
+                title: "Pairing required",
+                message: "\(req.host.displayName) requires pairing. Request access and approve "
+                    + "this device in the host's web console (port 47992 → Pairing) — no PIN "
+                    + "needed. Or pair with the 4-digit PIN it can display.",
+                actions: [
+                    // The follow-on presentation is deferred a tick exactly as the system dialog
+                    // does it, so this prompt is fully torn down before the next screen mounts —
+                    // two controller pollers overlapping for a frame is how one A press reaches
+                    // both.
+                    GamepadPromptAction(id: "request", title: "Request Access", isPrimary: true) {
+                        approvalChoice = nil
+                        DispatchQueue.main.async { requestAccess(req) }
+                    },
+                    GamepadPromptAction(id: "pin", title: "Pair with PIN…") {
+                        approvalChoice = nil
+                        DispatchQueue.main.async { pairingTarget = req.host }
+                    },
+                    GamepadPromptAction(id: "cancel", title: "Cancel", isCancel: true) {
+                        approvalChoice = nil
+                    },
+                ])
+        }
+        if let req = awaitingApproval {
+            return GamepadPrompt(
+                id: "awaiting-approval",
+                title: "Waiting for approval",
+                message: "Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s "
+                    + "web console (port 47992 → Pairing). This device connects automatically "
+                    + "once you approve it — no need to reconnect.",
+                actions: [
+                    GamepadPromptAction(id: "cancel", title: "Cancel", isCancel: true) {
+                        awaitingApproval = nil
+                        model.disconnect()
+                    },
+                ],
+                busy: true)
+        }
+        if connectionErrorReady {
+            return GamepadPrompt(
+                id: "connection-failed",
+                title: "Connection failed",
+                message: model.errorMessage ?? "",
+                actions: [
+                    GamepadPromptAction(id: "ok", title: "OK", isCancel: true) {
+                        model.errorMessage = nil
+                    },
+                ])
+        }
+        if let notice = deepLinkNotice {
+            return GamepadPrompt(
+                id: "cant-open",
+                title: "Can't open",
+                message: notice,
+                actions: [
+                    GamepadPromptAction(id: "ok", title: "OK", isCancel: true) {
+                        deepLinkNotice = nil
+                    },
+                ])
+        }
+        return nil
+    }
+    #endif
 
     /// The iOS library cover's item: `libraryTarget`, hidden while the gamepad shell presents
     /// the library in place (see the cover's comment).
@@ -470,18 +579,22 @@ struct ContentView: View {
     }
 
     private var approvalChoicePresented: Binding<Bool> {
-        Binding(get: { approvalChoice != nil }, set: { if !$0 { approvalChoice = nil } })
+        Binding(
+            get: { approvalChoice != nil && !consolePromptShowing },
+            set: { if !$0 { approvalChoice = nil } })
     }
 
     private var awaitingApprovalPresented: Binding<Bool> {
-        Binding(get: { awaitingApproval != nil }, set: { if !$0 { awaitingApproval = nil } })
+        Binding(
+            get: { awaitingApproval != nil && !consolePromptShowing },
+            set: { if !$0 { awaitingApproval = nil } })
     }
 
-    private var connectionErrorPresented: Binding<Bool> {
-        Binding(
-            get: {
-                guard model.errorMessage != nil else { return false }
-                #if os(macOS)
+    /// Whether the "Connection failed" state is ready to be shown at all — shared by the system
+    /// alert and the console prompt so the two can never disagree about the macOS deferral below.
+    private var connectionErrorReady: Bool {
+        guard model.errorMessage != nil else { return false }
+        #if os(macOS)
                 // Defer the alert while a forced-fullscreen exit is still pending: a sheet
                 // attached to a fullscreen window makes AppKit drop `-toggleFullScreen:`, so
                 // presenting it now strands the window fullscreen on the home screen after a
@@ -490,10 +603,14 @@ struct ContentView: View {
                 // once the window leaves fullscreen and `isFullscreen` flips, the alert shows
                 // over the windowed home UI. Not gated when fullscreen is the user's own manual
                 // choice (opt-out setting) — nothing is auto-exiting there to conflict with.
-                if fullscreenForSession && isFullscreen { return false }
-                #endif
-                return true
-            },
+        if fullscreenForSession && isFullscreen { return false }
+        #endif
+        return true
+    }
+
+    private var connectionErrorPresented: Binding<Bool> {
+        Binding(
+            get: { connectionErrorReady && !consolePromptShowing },
             set: { if !$0 { model.errorMessage = nil } })
     }
 
@@ -628,7 +745,8 @@ struct ContentView: View {
                     libraryTarget: $libraryTarget, pairingTarget: $pairingTarget,
                     onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
-                    launchTitle: launchTitle)
+                    launchTitle: launchTitle,
+                    promptActive: consolePromptShowing)
             } else {
                 HomeView(
                     store: store, model: model, discovery: discovery,
@@ -646,7 +764,8 @@ struct ContentView: View {
                     libraryTarget: $libraryTarget, pairingTarget: $pairingTarget,
                     onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
-                    launchTitle: launchTitle)
+                    launchTitle: launchTitle,
+                    promptActive: consolePromptShowing)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations
                 // — which aren't mounted while the gamepad launcher is up. Give the launcher its
                 // own presenters (exactly one of the two homes is mounted at a time, so these can
