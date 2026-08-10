@@ -79,7 +79,13 @@ public struct GamepadPalette: Identifiable, Equatable, Sendable {
             // too: the calm mix on the form screens lifts toward nothing. What is left is a
             // faint indigo→violet ember in the bright corner. The accent stays the brand violet
             // — focus has to be findable on black.
-            id: "oled", name: "OLED",
+            //
+            // Named for the look, not the panel technology: black with a thin violet corona is an
+            // eclipse, and it belongs beside Nebula and Abyss rather than reading as a spec sheet.
+            // ⚠ The ID stays "oled" — it is the stored `ui_palette` value AND the cross-client key
+            // (pf-console-ui's library.rs, the Android GamepadPalette.kt), so renaming it would
+            // orphan every saved choice and desync the three clients. Only the label moved.
+            id: "oled", name: "Eclipse",
             stops: [SIMD3(0.000, 0.000, 0.000), SIMD3(0.000, 0.000, 0.000),
                     SIMD3(0.010, 0.020, 0.100), SIMD3(0.045, 0.016, 0.115),
                     SIMD3(0.120, 0.024, 0.130)],

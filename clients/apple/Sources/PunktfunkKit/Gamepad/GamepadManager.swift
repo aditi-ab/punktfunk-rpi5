@@ -87,6 +87,17 @@ public final class GamepadManager: ObservableObject {
     /// `lowest_free_index`). Recomputed by `assignPadIndices` whenever `forwarded` changes.
     private var padIndexByController: [ObjectIdentifier: UInt8] = [:]
 
+    /// The kind of the last controller that was actually attached — persisted under
+    /// `DefaultsKey.lastGamepadKind` and deliberately NEVER cleared on disconnect. The gamepad
+    /// UI's legends read it (through `GamepadGlyphs`) whenever `active` is nil, so a DualSense
+    /// user's ✕/◯ hints don't turn into A/B the moment the pad sleeps, and so the legends are
+    /// right at all under `gamepadUIMode == "always"`, which puts the console UI up with no pad
+    /// attached by design. `.auto` = nothing has ever been seen on this device (⇒ neutral glyphs).
+    ///
+    /// @Published so the legends re-render when a pad of a different family arrives; the screens
+    /// already observe this object for `active`.
+    @Published public private(set) var lastKnownKind: PunktfunkConnection.GamepadType
+
     /// The user's pinned controller fingerprint ("" = automatic). Persisted; updating it
     /// reselects immediately, so a Settings Picker can bind straight to this.
     @Published public var preferredID: String {
@@ -97,12 +108,19 @@ public final class GamepadManager: ObservableObject {
     }
 
     private static let preferredKey = DefaultsKey.gamepadID
+    private static let lastKindKey = DefaultsKey.lastGamepadKind
     /// Connect order (identity-keyed) — drives both twin de-dup suffixes and auto-pick.
     private var connectOrder: [ObjectIdentifier] = []
     private var observers: [NSObjectProtocol] = []
 
     private init() {
         preferredID = UserDefaults.standard.string(forKey: Self.preferredKey) ?? ""
+        // Stored as an Int (what UserDefaults round-trips losslessly) and validated back into a
+        // real case: a value written by a NEWER client — a pad family this build has no case for
+        // — must fall back to the neutral glyphs, not trap on an invalid raw value.
+        lastKnownKind = (UserDefaults.standard.object(forKey: Self.lastKindKey) as? Int)
+            .flatMap { UInt32(exactly: $0) }
+            .flatMap(PunktfunkConnection.GamepadType.init(rawValue:)) ?? .auto
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCControllerDidConnect, object: nil, queue: .main
         ) { [weak self] n in
@@ -212,6 +230,13 @@ public final class GamepadManager: ObservableObject {
         // (list is in connect order). A stale pin falls back to automatic.
         let pinned = candidates.last { $0.id == preferredID }
         active = pinned ?? candidates.last
+        // Remember the family for the legends (see `lastKnownKind`). Only ever WRITTEN, never
+        // cleared: `active` going nil is precisely the moment the memory has to survive, and a
+        // pad whose `kind` is genuinely unknown never becomes active in the first place.
+        if let active, active.kind != lastKnownKind {
+            lastKnownKind = active.kind
+            UserDefaults.standard.set(Int(active.kind.rawValue), forKey: Self.lastKindKey)
+        }
         // Forwarded set (pf-client-core's `forwarded_ids`): a pin forwards ONLY the pinned pad
         // (explicit single-player); Automatic forwards every extended controller in connect order
         // (oldest→newest), so a game's player numbers are stable across hot-plug churn.

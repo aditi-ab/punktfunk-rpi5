@@ -65,10 +65,24 @@ private struct HomeTile: Identifiable {
 
 struct GamepadHomeView: View {
     @Environment(\.gamepadInk) private var ink
+    /// Published by ContentView at the app ROOT, so this reads its own window's tier — this screen
+    /// applies `gamepadPaletteInk` itself and so sits above its own copy of the environment.
+    @Environment(\.gamepadMetrics) private var metrics
+    /// The home-indicator strip's height, measured by DisplayBottomInsetProbe and published from
+    /// ContentView — an environment READ is safe in body; asking UIKit for it here is not (see
+    /// the probe's comment: a key-window walk mid-render severed this very view's updates).
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @ObservedObject var store: HostStore
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
     @Binding var libraryTarget: StoredHost?
+    /// The host awaiting a PIN ceremony, if any. Owned by ContentView (a connect attempt sets it,
+    /// as does the trust card's "Pair with PIN instead"), presented here as a shell screen —
+    /// PairSheet's `Form` is unreachable with a controller on iOS/macOS, which made pairing the
+    /// one thing a console-UI user simply could not do. See GamepadPairView.
+    @Binding var pairingTarget: StoredHost?
+    /// Pin the verified fingerprint and connect — ContentView's `handlePaired`.
+    let onPaired: (StoredHost, Data) -> Void
     /// Wake-and-wait driver — gates the carousel while its overlay is up, and the carousel's
     /// activate routes an offline+wakeable host through it (see ContentView.startSession).
     @ObservedObject var waker: HostWaker
@@ -77,6 +91,11 @@ struct GamepadHomeView: View {
     /// Launch a library title on a host — the in-place library layer's activate path (iOS; the
     /// cover/sheet presentations wire ContentView's `launchTitle` into LibraryView themselves).
     let launchTitle: (StoredHost, String) -> Void
+    /// A console prompt (GamepadPromptView) is up over the home — it polls the same controller, so
+    /// this screen must stand down for as long as it is. Same handoff contract as the connect
+    /// takeover and the shell's own layers; without it the carousel keeps scrolling underneath the
+    /// modal and a single A press reaches both.
+    var promptActive = false
 
     /// The profile catalog — pinned host+profile combos render as their own tiles here, which is
     /// how a controller picks a profile: one focus-and-press instead of a menu (design §5.4).
@@ -213,19 +232,35 @@ struct GamepadHomeView: View {
                 .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: hints)
-                // Equal distance from the left and bottom edges — the pill's corner inset was the
-                // real asymmetry (leading 22 vs bottom 10), not its internal padding.
-                .padding(.leading, compact ? 12 : 18)
-                .padding(.bottom, compact ? 12 : 18)
-                .padding(.top, compact ? 4 : 8)
+            legend
         }
     }
+
+    /// The pinned controls legend, sitting the SAME distance from the leading and bottom edges of
+    /// the DISPLAY — see `gamepadLegendBottomPadding` for why the bottom number is not simply the
+    /// margin, and why measuring the inset (rather than trying to opt out of it) is what finally
+    /// worked.
+    private var legend: some View {
+        GamepadHintBar(hints: hints)
+            .padding(.leading, legendMargin)
+            .padding(
+                .bottom,
+                gamepadLegendBottomPadding(
+                    legendMargin, tier: metrics.tier, displayBottom: displayBottomInset))
+            .padding(.top, compact ? 4 : 8)
+    }
+
+    /// The legend pill's distance from the screen's leading and bottom edges.
+    private var legendMargin: CGFloat { compact ? 12 : 18 }
 
     #if os(iOS)
     /// The screen the shell shows over the launcher — derived from the same triggers every
     /// platform sets, so `returnToLibrary`, the tiles, X and Y all keep writing what they wrote.
     private var topScreen: GamepadScreen? {
+        // Pairing leads: it is a ceremony blocking a connect the user already asked for, and it
+        // can be raised from ON TOP of the library (launching a title on an unpaired host), where
+        // it has to win. Backing out of it reveals whatever it interrupted.
+        if let host = pairingTarget { return .pair(host) }
         if showSettings { return .settings }
         if showAddHost { return .addHost }
         if let host = libraryTarget { return .library(host) }
@@ -247,6 +282,12 @@ struct GamepadHomeView: View {
                 GamepadAddHostView(
                     onAdd: { store.add($0) },
                     close: { if !transitioning { showAddHost = false } },
+                    controllerActive: active)
+            case .pair(let host):
+                GamepadPairView(
+                    host: host,
+                    onPaired: { onPaired(host, $0) },
+                    close: { if !transitioning { pairingTarget = nil } },
                     controllerActive: active)
             case .library(let host):
                 GamepadLibraryScreen(
@@ -294,11 +335,14 @@ struct GamepadHomeView: View {
     /// transition's input drop, during which NOBODY polls.
     private var homeOwnsController: Bool {
         #if os(iOS)
-        topScreen == nil && !transitioning
+        topScreen == nil && !transitioning && !promptActive
             && waker.waking == nil && model.phase != .connecting
         #else
-        libraryTarget == nil && !showSettings && !showAddHost
-            && waker.waking == nil && model.phase != .connecting
+        // `pairingTarget` too: macOS presents the pair screen as a sheet and tvOS as a cover, and
+        // either way the launcher underneath must stop consuming the pad — the pair screen's own
+        // list is polling the same controller.
+        libraryTarget == nil && pairingTarget == nil && !showSettings && !showAddHost
+            && !promptActive && waker.waking == nil && model.phase != .connecting
         #endif
     }
 
@@ -412,13 +456,22 @@ struct GamepadHomeView: View {
         case .rescan: "Rescan"
         default: nil
         }
+        // Every cell's action re-resolves the selection when it FIRES rather than closing over the
+        // one this render saw: the legend is rebuilt on selection changes, but a tap landing in
+        // the same frame as a carousel move would otherwise activate the tile that was selected a
+        // moment ago — the one failure mode a launcher cannot afford.
         var hints = [GamepadHint(
             glyph: buttonGlyph(\.buttonA, fallback: "a.circle"),
-            text: action ?? (selected?.canWake == true ? "Wake & Connect" : "Connect"))]
+            text: action ?? (selected?.canWake == true ? "Wake & Connect" : "Connect"),
+            action: { tiles.first { $0.id == selection }?.activate() })]
         if libraryEnabled, selected?.hasLibrary == true {
-            hints.append(.init(glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library"))
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library",
+                action: { openLibraryForSelected() }))
         }
-        hints.append(.init(glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Settings"))
+        hints.append(.init(
+            glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Settings",
+            action: { showSettings = true }))
         return hints
     }
 
@@ -573,11 +626,21 @@ private struct GamepadHostTile: View {
         }
         .padding(Self.pad)
         .frame(width: size.width, height: size.height, alignment: .leading)
-        // Liquid Glass console tile — a brand wash marks a saved host as primary; discovered /
-        // Add-Host tiles stay neutral glass with a dashed edge. Glass clips to the shape itself.
+        // Console tile — a brand wash marks a saved host as primary; discovered / Add-Host tiles
+        // stay neutral with a dashed edge. The surface clips to the shape itself.
+        //
+        // `forceMaterial`: these tiles are the one console surface that gets TRANSFORMED while it
+        // animates — `CardEntrance` swings each card in on a `rotation3DEffect` under an opacity
+        // ramp, and the carousel's `.scrollTransition` keeps scaling and rotating the neighbours
+        // forever after. Liquid Glass samples the backdrop through its own layer and cannot do
+        // that under a 3D transform, so it drew one way through the swing and snapped to another
+        // as the card landed — on glass it read as the tiles being swapped out for different ones
+        // at the end of their entrance. A material composites flat, so the card looks the same at
+        // every frame of the travel. (tvOS already takes this path for its own reasons.)
         .consoleGlass(
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous),
-            tint: tile.filled ? ink.accent(0.20) : nil)
+            tint: tile.filled ? ink.accent(0.20) : nil,
+            forceMaterial: true)
         .overlay {
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
                 .strokeBorder(

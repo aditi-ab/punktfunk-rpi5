@@ -85,6 +85,12 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     let shape: S
     var tint: Color?
     var interactive = false
+    /// Take the MATERIAL path even where real Liquid Glass is available. For surfaces that get
+    /// transformed while they animate: glass samples the backdrop through its own layer, and under
+    /// a `rotation3DEffect` / `opacity` it cannot, so it renders one way mid-animation and snaps to
+    /// another the instant the transform ends — on glass that reads as the tile being SWAPPED for a
+    /// different one as it lands. A material is a flat composite and looks identical throughout.
+    var forceMaterial = false
     /// The console surface follows the background palette: a PALE field needs the material to
     /// frost light and the glass to read as white, or the dark ink on top of it disappears.
     /// Defaults to the dark ink, so every non-gamepad caller is unchanged.
@@ -117,8 +123,18 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
             }
             .environment(\.colorScheme, scheme)
         #else
-        if #available(iOS 26, macOS 26, *) {
-            content.glassEffect(glass, in: shape).environment(\.colorScheme, scheme)
+        if #available(iOS 26, macOS 26, *), !forceMaterial {
+            content
+                // The caller's tint rides HERE, not in `Glass.tint`, so it can ANIMATE. A Glass
+                // value is opaque to SwiftUI's animation system: changing its tint swaps one
+                // effect for another, which is why a focused row's accent used to appear (and,
+                // worse, disappear a beat late) as a hard jump while the row's scale animated
+                // smoothly beside it. A plain fill interpolates, so `.animation(value: focused)`
+                // at the call site now covers the whole row. Sits between the glass and the
+                // content: `.background` is behind the label, `glassEffect` behind both.
+                .background { shape.fill(tint ?? .clear) }
+                .glassEffect(glass, in: shape)
+                .environment(\.colorScheme, scheme)
         } else {
             content
                 .background {
@@ -137,13 +153,21 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     #if !os(tvOS)
     @available(iOS 26, macOS 26, *)
     private var glass: Glass {
-        // Liquid Glass has ONE tint channel, so the palette wash and the caller's tint share
-        // it: mixed 60 % toward the caller's (the focused row must still read accented on
-        // every palette) over the palette base. If device QA finds the mixed focus wash too
-        // weak, the escape hatch is `tint ?? wash` — today's focused look, bit for bit.
-        let wash = ink.glass(ink.isLight ? 0.60 : 0.45)
-        var g: Glass = .regular.tint(
-            tint.map { wash.mix(with: $0, by: 0.6) } ?? wash)
+        // The glass carries the PALETTE wash only — the caller's focus tint is an animatable fill
+        // above it now (see `body`).
+        //
+        // A pale palette gets `.clear` glass, not `.regular`. Its `ink.glass` is literal white, so
+        // over `.regular` — which is already a bright, high-body material — even a light white
+        // wash lands as a flat white slab: the refraction and the blurred field behind stop
+        // reading entirely, which is the "opaque fully white bg" on every row, pill and legend.
+        // Lowering the tint alone did NOT fix it, because the opacity was coming from the glass
+        // BODY rather than from the tint. `.clear` is the variant meant for exactly this — a
+        // surface over content that must stay visible through it — and a small white wash on top
+        // of it is enough to keep the dark ink legible without closing the surface up.
+        let wash = ink.glass(ink.isLight ? 0.18 : 0.45)
+        // Spelled out rather than `.clear`/`.regular`: a ternary between two leading-dot members
+        // gives the compiler no base type to infer from.
+        var g: Glass = (ink.isLight ? Glass.clear : Glass.regular).tint(wash)
         if interactive { g = g.interactive() }
         return g
     }
@@ -154,8 +178,13 @@ extension View {
     /// Liquid Glass for a console surface (a host tile / settings row), or `.ultraThinMaterial`
     /// pre-26 — both washed with the palette's own glass colour, both frosting to the palette's
     /// scheme. Pass the surface's shape explicitly — glass defaults to a Capsule.
-    func consoleGlass<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
-        modifier(ConsoleGlass(shape: shape, tint: tint, interactive: interactive))
+    ///
+    /// `forceMaterial` opts a TRANSFORMED surface out of live glass; see the property.
+    func consoleGlass<S: Shape>(
+        _ shape: S, tint: Color? = nil, interactive: Bool = false, forceMaterial: Bool = false
+    ) -> some View {
+        modifier(ConsoleGlass(
+            shape: shape, tint: tint, interactive: interactive, forceMaterial: forceMaterial))
     }
 }
 

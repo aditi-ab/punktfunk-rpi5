@@ -191,6 +191,16 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .medium), trigger: activateTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: boundaryTick)
+        #if os(iOS) || os(macOS)
+        // A hardware keyboard drives the same cursor as the pad — arrows step, Return activates,
+        // Esc backs out (iPad on a Magic Keyboard, couch Mac). tvOS routes arrows through the
+        // focus engine instead, which owns navigation there.
+        .gamepadKeyNavigation(
+            active: isActive,
+            onMove: { move($0) },
+            onConfirm: { activate() },
+            onBack: onBack)
+        #endif
         .onAppear {
             reconcile()
             wire()
@@ -432,8 +442,8 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 /// one, so the strip FANS OPEN from the cursor rather than sweeping past it; the anchor card
 /// itself only grows, since it is already facing you. Each card carries its own delay (see
 /// `entrance(_:)`) — that stagger is what makes the strip read as one gesture instead of a
-/// simultaneous flash, and it is the same hinge/perspective language the coverflow's own recede
-/// speaks, so the arrival and the scrolling feel like one object.
+/// simultaneous flash, and it is the same hinge language the coverflow's own recede speaks, so the
+/// arrival and the scrolling feel like one object.
 ///
 /// ⚠️ APPLY THIS UNDERNEATH THE CARD'S OWN `.scrollTransition`, never around it. A scroll
 /// transition derives its phase from the geometry of the view it wraps, so an entrance layered
@@ -441,6 +451,23 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 /// centre for the whole travel, its phase pinned at fully-receded, and the centred card only
 /// collapsed into its focused look as the entrance ended — arriving as a jump. Underneath, the
 /// transition measures a card that never moves and simply composes its own scale/rotation on top.
+///
+/// ⚠️ NO `rotation3DEffect` HERE, however much the drum language invites one. It was the cause of
+/// the strip's "flash as the cards settle": a real 3D transform renders the card through an
+/// offscreen layer, and a card carries translucent glass, which resolves differently in there —
+/// so every card sat at the wrong fill for as long as the master animation ran and then snapped
+/// to its true one in a SINGLE frame the moment SwiftUI dropped that layer.
+///
+/// Measured on an iPad Pro 13": the centred tile held #4a3d87 for twelve frames in which nothing
+/// moved, then stepped to #423970 (−23 blue) in one. It is the ANIMATION ending, not the motion:
+/// stretching the timeline from 1.02 s to 2.82 s moved the step from 0.70 s to 2.50 s after the
+/// launcher appeared — the same 0.32 s before the end both times. Removing the rotation removed
+/// the step outright; `compositingGroup()` above or below the transforms did nothing.
+///
+/// So the turn is PROJECTED instead: `cos(angle)` as a horizontal squeeze is exactly the
+/// orthographic projection of a Y-axis rotation, hinged on the edge the card fans from. Affine,
+/// so no offscreen pass and no layer to drop — and it reads as the same gesture, losing only the
+/// perspective trapezoid, which at these card sizes was never what sold the motion.
 ///
 /// Transforms only — nothing here touches layout, so the scroll view's snapping and the tvOS
 /// focus engine are untouched either. Reduce Motion drops every bit of travel for a plain,
@@ -485,14 +512,15 @@ struct CardEntrance: ViewModifier, Animatable {
         // leading edge), so the arrival deepens the turn the card wears at rest and unwinds into
         // it instead of swinging the opposite way.
         let away = reduceMotion ? 0 : 1 - travel
+        // The turn, projected rather than rendered in 3D — see the type's note on the flash.
+        // `cos` of the angle IS the orthographic projection of a Y-axis rotation, and hinging it
+        // on the edge the card fans from restores the direction that the rotation's sign carried
+        // (cos is even, so the sign alone would read the same both ways).
+        let turn = cos(Angle.degrees(64 * away).radians)
         return content
             .opacity(reduceMotion ? raw : fade)
             .scaleEffect(1 - 0.26 * away)
-            .rotation3DEffect(
-                .degrees(side * -64 * away),
-                axis: (x: 0, y: 1, z: 0),
-                anchor: .center,
-                perspective: 0.65)
+            .scaleEffect(x: turn, y: 1, anchor: side < 0 ? .trailing : .leading)
             .offset(y: 34 * away)
     }
 

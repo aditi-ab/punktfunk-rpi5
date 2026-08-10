@@ -46,6 +46,8 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 
 struct GamepadSettingsView: View {
     @Environment(\.gamepadInk) private var ink
+    @Environment(\.gamepadMetrics) private var metrics
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
@@ -142,7 +144,7 @@ struct GamepadSettingsView: View {
             isActive: controllerActive
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
+                .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
@@ -161,12 +163,12 @@ struct GamepadSettingsView: View {
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
-            .background { GamepadTrayScrim(edge: .top) }
+            .background { GamepadTrayBlur(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(focusedDetail)
-                    .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
+                    .font(.geist(metrics.detailFont, relativeTo: .caption))
                     .foregroundStyle(ink.fg(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
@@ -175,10 +177,13 @@ struct GamepadSettingsView: View {
             // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
             .padding(.leading, compact ? 12 : 18)
             .padding(.trailing, 22)
-            .padding(.bottom, compact ? 12 : 18)
+            .padding(
+                .bottom,
+                gamepadLegendBottomPadding(
+                    compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
             .padding(.top, compact ? 6 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background { GamepadTrayScrim(edge: .bottom) }
+            .background { GamepadTrayBlur(edge: .bottom) }
         }
         // The launcher's living field, calmed (GamepadFormBackground) — the glass rows keep real
         // colour and luminance to lens without the launcher's contrast, and the palette setting
@@ -254,10 +259,18 @@ struct GamepadSettingsView: View {
     private func pill(_ t: GpSettingsTab) -> some View {
         let selected = t == tab
         return Text(t.rawValue)
-            .font(.geist(compact ? 12 : 13, .semibold, relativeTo: .footnote))
-            .foregroundStyle(selected ? ink.fg : ink.fg(0.55))
-            .padding(.horizontal, 13)
-            .padding(.vertical, 7)
+            .font(.geist(compact ? 12 : metrics.tabFont, .semibold, relativeTo: .footnote))
+            // `onAccent`, not `fg` — the selected pill is FILLED with the palette accent, and
+            // `onAccent` is the colour picked (by the accent's own luminance) to read on top of
+            // it; its doc calls out "a filled pill's label" for exactly this surface. Using the
+            // foreground meant white-on-white wherever a palette's accent is pale: Graphite's is
+            // a light grey (luma ≈ 0.80), so its selected tab was unreadable.
+            .foregroundStyle(selected ? ink.onAccent : ink.fg(0.55))
+            // Proportional to the row metrics rather than fixed, so the strip grows with the
+            // fields under it — a tab bar at phone scale above iPad-scale rows was half the
+            // "does not adapt to larger screens" complaint.
+            .padding(.horizontal, metrics.rowHPad * 0.8)
+            .padding(.vertical, metrics.rowVPad * 0.55)
             .background {
                 // One shared capsule that MOVES between pills, rather than one per pill fading
                 // in and out — the highlight travels the way the press did. A Liquid Glass
@@ -328,26 +341,39 @@ struct GamepadSettingsView: View {
             // shoulders exist at all (see `showsSectionHint`).
             let sections: [GamepadHint] = showsSectionHint
                 ? [.init(glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
-                         text: "Section")]
+                         text: "Section", action: { step(tabBy: 1) })]
                 : []
             // A dimmed row takes neither, so offering them would be the same lie the row itself
             // used to tell — only Done remains, and the detail line says what to turn on first.
             guard rows.first(where: { $0.id == focusID })?.enabled ?? true else {
                 return sections
-                    + [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done")]
+                    + [.init(
+                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                        action: { back() })]
             }
             return sections + [
+                // The stick itself, not an action — nothing to tap (see GamepadHint.action).
                 .init(glyph: "arrow.left.and.right", text: "Adjust"),
-                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
-                .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
+                .init(
+                    glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change",
+                    action: { if let focusID { activate(id: focusID) } }),
+                .init(
+                    glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                    action: { back() }),
             ]
         }
         guard !store.hosts.isEmpty else {
-            return [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back")]
+            return [.init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+                action: { back() })]
         }
         return [
-            .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Pin / Unpin"),
-            .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back"),
+            .init(
+                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Pin / Unpin",
+                action: { if let focusID { activate(id: focusID) } }),
+            .init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+                action: { back() }),
         ]
     }
 
@@ -365,7 +391,7 @@ struct GamepadSettingsView: View {
     // MARK: - Row rendering
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        let m = GamepadFormMetrics.self
+        let m = metrics
         // No section header: the tab strip names the section now, and repeating it above the
         // first row of every tab was just a second label saying the same word.
         return VStack(alignment: .leading, spacing: 6) {
@@ -443,9 +469,9 @@ struct GamepadSettingsView: View {
     /// narrows the stage.
     private var bandWidth: CGFloat {
         #if os(iOS)
-        hSizeClass == .compact && vSizeClass == .regular ? 170 : GamepadFormMetrics.bandWidth
+        hSizeClass == .compact && vSizeClass == .regular ? 170 : metrics.bandWidth
         #else
-        GamepadFormMetrics.bandWidth
+        metrics.bandWidth
         #endif
     }
 

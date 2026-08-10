@@ -13,6 +13,8 @@ import SwiftUI
 
 struct GamepadAddHostView: View {
     @Environment(\.gamepadInk) private var ink
+    @Environment(\.gamepadMetrics) private var metrics
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     let onAdd: (StoredHost) -> Void
@@ -48,7 +50,7 @@ struct GamepadAddHostView: View {
             isActive: controllerActive && editing == nil
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
+                .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
@@ -61,25 +63,28 @@ struct GamepadAddHostView: View {
                 if !compact {
                     Text("Hosts on this network appear automatically — add one by address "
                         + "for everything else.")
-                        .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
+                        .font(.geist(metrics.detailFont, relativeTo: .caption))
                         .foregroundStyle(ink.fg(0.55))
                         .multilineTextAlignment(.leading)
-                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72, alignment: .leading)
+                        .frame(maxWidth: metrics.rowMaxWidth * 0.72, alignment: .leading)
                 }
             }
             .padding(.horizontal, 24)
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background { GamepadTrayScrim(edge: .top) }
+            .background { GamepadTrayBlur(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomTray
                 // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
                 .padding(.horizontal, compact ? 12 : 18)
-                .padding(.bottom, compact ? 12 : 18)
+                .padding(
+                    .bottom,
+                    gamepadLegendBottomPadding(
+                        compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
                 .padding(.top, compact ? 6 : 10)
-                .background { GamepadTrayScrim(edge: .bottom) }
+                .background { GamepadTrayBlur(edge: .bottom) }
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
         // Hosted in the shell, the field is the shell's (see GamepadSettingsView's twin).
@@ -148,17 +153,28 @@ struct GamepadAddHostView: View {
                     // binding on appear — new identity forces a rewire to the new field.
                     .id(editing)
                 GamepadHintBar(hints: [
+                    // "Type" names what A does to the key under the keyboard's cursor. There is
+                    // no tap equivalent — a touch user types by tapping the keycap itself — so
+                    // this one cell stays a label.
                     .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
-                    .init(glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete"),
-                    .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
+                    .init(
+                        glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
+                        action: { backspace(editing) }),
+                    .init(
+                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                        action: { closeKeyboard() }),
                 ])
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             GamepadHintBar(hints: [
-                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select"),
-                .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel"),
+                .init(
+                    glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select",
+                    action: { if let focusID { activate(id: focusID) } }),
+                .init(
+                    glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel",
+                    action: { performClose() }),
             ])
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -191,7 +207,7 @@ struct GamepadAddHostView: View {
     }
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        let m = GamepadFormMetrics.self
+        let m = metrics
         return HStack(spacing: 14) {
             if row.isAction {
                 Label("Add Host", systemImage: "plus.circle.fill")
@@ -266,6 +282,15 @@ struct GamepadAddHostView: View {
 
     private func closeKeyboard() {
         withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { editing = nil }
+    }
+
+    /// The legend's Delete cell (iOS/macOS). Applied to the field's binding rather than routed
+    /// into `GamepadKeyboard`: the keyboard's X does exactly this to the same binding, and
+    /// reaching into its state to trigger it would need a whole callback channel for one edit.
+    private func backspace(_ id: String) {
+        let binding = editingBinding(id)
+        guard !binding.wrappedValue.isEmpty else { return }
+        binding.wrappedValue.removeLast()
     }
 
     private func editingBinding(_ id: String) -> Binding<String> {

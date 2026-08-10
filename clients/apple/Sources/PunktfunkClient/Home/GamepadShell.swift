@@ -21,12 +21,14 @@ import SwiftUI
 enum GamepadScreen: Identifiable {
     case settings
     case addHost
+    case pair(StoredHost)
     case library(StoredHost)
 
     var id: String {
         switch self {
         case .settings: return "settings"
         case .addHost: return "addHost"
+        case .pair(let host): return "pair-\(host.id.uuidString)"
         case .library(let host): return "library-\(host.id.uuidString)"
         }
     }
@@ -35,7 +37,7 @@ enum GamepadScreen: Identifiable {
     /// (`Bg::Form` in the console); the library keeps the launcher's full aurora.
     var isForm: Bool {
         switch self {
-        case .settings, .addHost: return true
+        case .settings, .addHost, .pair: return true
         case .library: return false
         }
     }

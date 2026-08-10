@@ -5,20 +5,36 @@
 // iOS/iPadOS, macOS (the couch Mac-mini case), and tvOS — where the same screens are driven by
 // the native focus engine instead of the controller poll (see GamepadCarousel/GamepadMenuList).
 
+import Glur
+import GlurBackdrop
 import PunktfunkKit
 import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
-/// The active controller's real glyph for a button (Xbox "A", DualSense ✕, …) via
-/// `sfSymbolsName`; a generic fallback before a controller profile resolves.
+/// The glyph a button wears in a legend: the ACTIVE controller's own (Xbox "A", DualSense ✕, …)
+/// via `sfSymbolsName` while one is attached, else the glyph of the last pad this device ever saw
+/// (`GamepadManager.lastKnownKind` → `GamepadGlyphs`), else the caller's generic fallback.
+///
+/// The middle rung is the whole point. `active` is nil whenever the pad sleeps, disconnects or
+/// runs flat — and permanently under `gamepadUIMode == "always"`, which puts the console UI up
+/// with no pad by design — and the fallbacks are letter glyphs, so a DualSense user's ✕/◯ legends
+/// used to turn into A/B the moment the controller dozed off. The remembered kind keeps the
+/// legends speaking the pad the user actually owns. The `fallback` still covers the genuinely
+/// unknown case: a fresh install that has never seen a controller, and any button outside the six
+/// `GamepadButtonRole` names.
+///
 /// @MainActor: GamepadManager is main-actor-bound (inside a View body this was implicit).
 @MainActor
 func buttonGlyph(
     _ button: KeyPath<GCExtendedGamepad, GCControllerButtonInput>, fallback: String
 ) -> String {
-    GamepadManager.shared.active?.controller.extendedGamepad?[keyPath: button].sfSymbolsName
-        ?? fallback
+    let manager = GamepadManager.shared
+    if let live = manager.active?.controller.extendedGamepad?[keyPath: button].sfSymbolsName {
+        return live
+    }
+    guard let role = GamepadButtonRole(keyPath: button) else { return fallback }
+    return GamepadGlyphs.symbol(role, for: manager.lastKnownKind)
 }
 
 /// Top padding for a gamepad screen's pinned title. macOS gets extra clearance — the launcher
@@ -68,43 +84,251 @@ func gamepadTitleSize(compact: Bool) -> CGFloat {
 }
 
 /// Metrics shared by the gamepad form screens' glass rows (GamepadSettingsView,
-/// GamepadAddHostView) — one set of numbers so the two screens read as the same surface,
-/// sized for the couch on tvOS and for the hand elsewhere.
-enum GamepadFormMetrics {
-    #if os(tvOS)
-    static let headerFont: CGFloat = 17
-    static let labelFont: CGFloat = 23
-    static let valueFont: CGFloat = 21
-    static let iconFont: CGFloat = 24
-    static let iconWidth: CGFloat = 40
-    static let chevronFont: CGFloat = 16
-    static let rowHPad: CGFloat = 24
-    static let rowVPad: CGFloat = 19
-    static let rowCorner: CGFloat = 18
-    static let rowMaxWidth: CGFloat = 920
-    static let detailFont: CGFloat = 19
-    static let bandWidth: CGFloat = 380
-    #else
-    static let headerFont: CGFloat = 12
-    static let labelFont: CGFloat = 16
-    static let valueFont: CGFloat = 15
-    static let iconFont: CGFloat = 17
-    static let iconWidth: CGFloat = 28
-    static let chevronFont: CGFloat = 12
-    static let rowHPad: CGFloat = 16
-    static let rowVPad: CGFloat = 13
-    static let rowCorner: CGFloat = 14
-    static let rowMaxWidth: CGFloat = 620
-    static let detailFont: CGFloat = 13
+/// GamepadAddHostView) — one set of numbers so the screens read as the same surface, at the size
+/// the screen they are on calls for.
+///
+/// Three tiers, not two. The phone numbers used to serve every non-TV device, so an iPad Pro drew
+/// a settings list at iPhone scale in the middle of a 13" display — the field verdict was that the
+/// sizing "does not adapt to larger screens". `pad` sits between the in-hand and 10-foot sets.
+///
+/// Chosen from the SIZE CLASSES rather than the device idiom, so an iPad running a narrow Stage
+/// Manager or Split View window correctly gets the in-hand numbers — the window is what the user
+/// is reading, not the panel it sits on.
+struct GamepadFormMetrics {
+    /// Which set this is, for the few things that are a KIND of layout rather than a number.
+    enum Tier { case phone, pad, tv }
+
+    let tier: Tier
+    let headerFont: CGFloat
+    let labelFont: CGFloat
+    let valueFont: CGFloat
+    let iconFont: CGFloat
+    let iconWidth: CGFloat
+    let chevronFont: CGFloat
+    let rowHPad: CGFloat
+    let rowVPad: CGFloat
+    let rowCorner: CGFloat
+    let rowMaxWidth: CGFloat
+    let detailFont: CGFloat
     /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
-    static let bandWidth: CGFloat = 240
+    let bandWidth: CGFloat
+    /// The settings screen's section-tab pills.
+    let tabFont: CGFloat
+    /// The pinned controls legend (GamepadHintBar).
+    let hintGlyphFont: CGFloat
+    let hintTextFont: CGFloat
+    let hintPad: CGFloat
+
+    /// In-hand: a phone, or any window narrow enough to read like one.
+    static let phone = GamepadFormMetrics(
+        tier: .phone,
+        headerFont: 12, labelFont: 16, valueFont: 15, iconFont: 17, iconWidth: 28,
+        chevronFont: 12, rowHPad: 16, rowVPad: 13, rowCorner: 14, rowMaxWidth: 620,
+        detailFont: 13, bandWidth: 240,
+        tabFont: 13, hintGlyphFont: 19, hintTextFont: 14, hintPad: 13)
+
+    /// A tablet-sized window — an arm's length away rather than in the palm.
+    static let pad = GamepadFormMetrics(
+        tier: .pad,
+        headerFont: 14, labelFont: 20, valueFont: 19, iconFont: 21, iconWidth: 34,
+        chevronFont: 14, rowHPad: 20, rowVPad: 16, rowCorner: 16, rowMaxWidth: 820,
+        detailFont: 16, bandWidth: 320,
+        tabFont: 16, hintGlyphFont: 23, hintTextFont: 17, hintPad: 15)
+
+    /// 10-foot.
+    static let tv = GamepadFormMetrics(
+        tier: .tv,
+        headerFont: 17, labelFont: 23, valueFont: 21, iconFont: 24, iconWidth: 40,
+        chevronFont: 16, rowHPad: 24, rowVPad: 19, rowCorner: 18, rowMaxWidth: 920,
+        detailFont: 19, bandWidth: 380,
+        tabFont: 17, hintGlyphFont: 27, hintTextFont: 20, hintPad: 18)
+
+    /// What a screen gets before anything publishes a tier — and the only tier tvOS and macOS ever
+    /// use (an Apple TV is always 10-foot; a Mac window is read at desk distance).
+    static var platformDefault: GamepadFormMetrics {
+        #if os(tvOS)
+        tv
+        #else
+        phone
+        #endif
+    }
+
+    #if os(iOS)
+    /// The tier a window's size classes call for. REGULAR on both axes is the tablet case.
+    static func forWindow(
+        h: UserInterfaceSizeClass?, v: UserInterfaceSizeClass?
+    ) -> GamepadFormMetrics {
+        h == .regular && v == .regular ? .pad : .phone
+    }
     #endif
+}
+
+private struct GamepadMetricsKey: EnvironmentKey {
+    static let defaultValue = GamepadFormMetrics.platformDefault
+}
+
+extension EnvironmentValues {
+    /// The form metrics for the screen currently drawing. Published from ContentView — the app
+    /// ROOT — rather than only from `gamepadPaletteInk`, because a screen that applies that
+    /// modifier itself sits ABOVE its own copy: its `@Environment` resolves against its parent, so
+    /// it would read the bare default instead of its own window's tier.
+    var gamepadMetrics: GamepadFormMetrics {
+        get { self[GamepadMetricsKey.self] }
+        set { self[GamepadMetricsKey.self] = newValue }
+    }
+}
+
+private struct DisplayBottomInsetKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    /// The display's bottom safe-area inset — the home-indicator strip — measured by
+    /// `DisplayBottomInsetProbe` and published from ContentView. 0 until UIKit's first callback
+    /// lands (the legend keeps its plain margin for that first frame) and always 0 on
+    /// macOS/tvOS, where nothing publishes it.
+    var displayBottomInset: CGFloat {
+        get { self[DisplayBottomInsetKey.self] }
+        set { self[DisplayBottomInsetKey.self] = newValue }
+    }
+}
+
+#if os(iOS)
+/// Reports the hosting window's bottom safe-area inset from UIKit's OWN callbacks — never
+/// during a SwiftUI render.
+///
+/// This number has a history of wrong spellings, each failing silently:
+///   - a `GeometryReader` carrying `.ignoresSafeArea()` — a proxy reports NO insets for an edge it
+///     has been told to ignore, so that spelling can only ever answer 0;
+///   - `.ignoresSafeArea(.container, edges: .bottom)` on `safeAreaInset` CONTENT, which does not
+///     move content the inset mechanism itself placed; and
+///   - asking UIKit for the key window (`UIApplication.shared.connectedScenes…`) DURING body,
+///     which answered correctly and then KILLED the calling view: on an iPad (never the
+///     simulator) the walk re-enters UIKit layout mid-render and the view's update graph is
+///     silently severed — every later `@State` write lands in storage without ever re-running
+///     `body` again, which is how Settings and Add Host stopped opening while their triggers
+///     kept firing. No AttributeGraph warning, no log line; found by bisecting builds on glass.
+/// So: UIKit tells THIS view when the window or its insets change, on UIKit's schedule, and the
+/// answer hops out of the current update before anyone in SwiftUI reads it.
+struct DisplayBottomInsetProbe: UIViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onChange = onChange
+        // Mounted as a full-size `.background`; it must never eat a touch meant for the UI.
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {
+        view.onChange = onChange
+    }
+
+    final class ProbeView: UIView {
+        var onChange: ((CGFloat) -> Void)?
+        private var last: CGFloat?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            report()
+        }
+
+        override func safeAreaInsetsDidChange() {
+            super.safeAreaInsetsDidChange()
+            report()
+        }
+
+        // Rotation reshuffles the window's insets without necessarily touching this view's own.
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            report()
+        }
+
+        private func report() {
+            // The WINDOW's inset, not this view's: the probe sits inside the safe area, so its
+            // own inset is 0 — the number the legend needs is the strip the window reserves.
+            guard let bottom = window?.safeAreaInsets.bottom, bottom != last else { return }
+            last = bottom
+            let onChange = onChange
+            // Out of the current UIKit/SwiftUI update before any state write.
+            DispatchQueue.main.async { onChange?(bottom) }
+        }
+    }
+}
+#endif
+
+/// The bottom padding that puts a pinned legend the same distance from the bottom of the DISPLAY
+/// as it sits from the leading edge — so it lands on the diagonal of the display's rounded corner,
+/// which is what the corner asks for.
+///
+/// A `safeAreaInset` places its content INSIDE the safe area, so a plain margin stacks on top of
+/// the device's own bottom inset and the pill ends up two to three times further from the bottom
+/// than from the left. On a tablet this therefore goes NEGATIVE, pulling the pill back down
+/// through the home-indicator strip; the pill is left-aligned and an iPad's indicator is a short
+/// bar in the middle, so the two never meet.
+///
+/// Phones keep the plain margin. Their inset is the taller indicator bar and their legend runs
+/// most of the width, so sitting it that low would cross the indicator rather than tuck beside it.
+///
+/// `displayBottom` is `\.displayBottomInset` — measured by `DisplayBottomInsetProbe`, NEVER asked
+/// of UIKit here: this runs during body, and a key-window walk mid-render severs the calling
+/// view's updates (see the probe's comment). Pure arithmetic only.
+func gamepadLegendBottomPadding(
+    _ margin: CGFloat, tier: GamepadFormMetrics.Tier, displayBottom: CGFloat
+) -> CGFloat {
+    guard tier == .pad else { return margin }
+    // Floored at -inset: at worst the pill sits flush with the physical edge, never past it.
+    return max(-displayBottom, margin - displayBottom)
+}
+
+/// The tray gradient blur, back — as a real progressive BACKDROP blur this time.
+///
+/// GamepadTrayScrim did this with `.ultraThinMaterial`, and a material by definition lifts and
+/// tints whatever it blurs: it read grey over the aurora, and washed with the palette's ground it
+/// read coloured, which is why 2590238b deleted it. Glur's `GlurView` blurs the backdrop through
+/// a gradient with NO material stage on top, so the rows soften as they slide under the pinned
+/// title and legend and nothing carries a colour. It is the library's PRIVATE-API product
+/// (`GlurBackdrop`) — the public `.glur()` modifier is a shader on a view's own content and
+/// silently no-ops over platform-backed views like ScrollView, so it cannot reach a backdrop at
+/// all. Hit testing is disabled inside GlurView; the band never eats a touch.
+///
+/// Mounted exactly where the scrim was: `.background` of each form screen's safe-area tray.
+struct GamepadTrayBlur: View {
+    let edge: VerticalEdge
+
+    var body: some View {
+        // offset 0 puts the ramp's LITERAL ZERO exactly at the band's content edge, so nothing
+        // in the open field is touched — which is why, unlike the scrim, this band takes NO
+        // content-side overhang. The scrim's -44/-72 runway existed because a material carries
+        // body at every alpha and had to dissolve OUTSIDE the tray; carrying those numbers over
+        // here blurred fully-visible rows at rest (field verdict on the first cut). Full
+        // strength lands at 60% of the band, so the tray's own text always sits on the strong
+        // region while the ramp still reads as a gradient, not an edge.
+        GlurView(
+            radius: 14, offset: 0, interpolation: 0.6,
+            direction: edge == .top ? .up : .down)
+            // Full-bleed by LAYOUT, not `.ignoresSafeArea()`: safe-area expansion resolves a
+            // beat after insertion (outside any geometry group and outside this view's own
+            // transaction), which reads as a visible pop. 80 pt clears every inset on every
+            // device, and backgrounds never clip — the overhang simply draws.
+            .padding(edge == .top ? .top : .bottom, -80)
+            .padding(.horizontal, -80)
+            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
+            // geometry would ride the push's transaction and visibly grow into place. The
+            // layer's own fade/slide still carries the band; only its SHAPE is pinned.
+            .transaction { $0.animation = nil }
+    }
 }
 
 /// One glyph + label cell in a hint bar.
 struct GamepadHint: Identifiable {
     let glyph: String
     let text: String
+    /// What tapping/clicking this cell does — the same thing its button does. Optional because a
+    /// few legend cells NAME an input rather than an action ("↔ Adjust" is the stick itself;
+    /// there is no single thing a tap on it could mean), and those stay inert labels.
+    var action: (() -> Void)? = nil
     var id: String { glyph + text }
 }
 
@@ -114,38 +338,74 @@ struct GamepadHint: Identifiable {
 /// the backdrop instead of dissolving into it.
 struct GamepadHintBar: View {
     @Environment(\.gamepadInk) private var ink
+    /// Sized with the screen it pins to — a legend at phone scale on a 13" iPad is the same
+    /// mismatch the form rows had (see GamepadFormMetrics).
+    @Environment(\.gamepadMetrics) private var metrics
     let hints: [GamepadHint]
-
-    // 10-foot legend on tvOS, in-hand sizes elsewhere.
-    #if os(tvOS)
-    private static let glyphFont: CGFloat = 27
-    private static let textFont: CGFloat = 20
-    private static let pad: CGFloat = 18
-    #else
-    private static let glyphFont: CGFloat = 19
-    private static let textFont: CGFloat = 14
-    private static let pad: CGFloat = 13
-    #endif
 
     var body: some View {
         HStack(spacing: 18) {
             ForEach(hints) { hint in
-                HStack(spacing: 7) {
-                    Image(systemName: hint.glyph)
-                        .font(.system(size: Self.glyphFont))
-                        .foregroundStyle(ink.fg)
-                    Text(hint.text)
-                }
-                .fixedSize() // keep glyph + label together; never truncate a hint mid-word
+                cell(hint)
             }
         }
-        .font(.geist(Self.textFont, .semibold, relativeTo: .subheadline))
+        .font(.geist(metrics.hintTextFont, .semibold, relativeTo: .subheadline))
         .foregroundStyle(ink.fg(0.85))
-        .padding(Self.pad)
+        .padding(metrics.hintPad)
         .consoleGlass(Capsule())
-        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1))
+        // The hairline is DECORATION and sits on top of the cells, so it must never take a touch.
+        // Spelled out rather than left to defaults, because a swallowed touch in this bar is
+        // invisible — the legend simply stops doing anything.
+        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1).allowsHitTesting(false))
+    }
+
+    /// A cell is a button where it has somewhere to go, and a plain label otherwise (see the type
+    /// comment for why tvOS is always the latter).
+    @ViewBuilder private func cell(_ hint: GamepadHint) -> some View {
+        #if os(tvOS)
+        label(hint)
+        #else
+        if let action = hint.action {
+            Button(action: action) { label(hint) }
+                .buttonStyle(HintCellStyle())
+                .accessibilityLabel(hint.text)
+        } else {
+            label(hint)
+        }
+        #endif
+    }
+
+    private func label(_ hint: GamepadHint) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: hint.glyph)
+                .font(.system(size: metrics.hintGlyphFont))
+                .foregroundStyle(ink.fg)
+            Text(hint.text)
+        }
+        .fixedSize() // keep glyph + label together; never truncate a hint mid-word
+        // The tappable area covers the gap between glyph and label, not just their painted
+        // pixels — a legend cell is small enough already.
+        .contentShape(Rectangle())
     }
 }
+
+#if !os(tvOS)
+/// Press feedback for a legend cell. Deliberately quiet — the bar is chrome, and a cell that lit
+/// up like a primary button would pull the eye off the content it describes.
+///
+/// `contentShape` sits BELOW the scale so the hit region stays the unscaled layout bounds: a press
+/// animation that shrinks the artwork must never move the target out from under a resting finger,
+/// or the touch-up lands outside and SwiftUI discards the tap.
+private struct HintCellStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.55 : 1)
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.smooth(duration: 0.14), value: configuration.isPressed)
+            .contentShape(Rectangle())
+    }
+}
+#endif
 
 /// The console backdrop: a living aurora drifting slowly over black so it reads as ambience behind
 /// the cards, never as content. On iOS 18 / macOS 15+ it's an animated `MeshGradient` — a continuous
@@ -220,14 +480,20 @@ struct GamepadScreenBackground: View {
             colorField(at: t, palette: palette)
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
-                // Calm = col·0.6 + ground·0.4: over the ground, `.opacity` IS the multiply…
+                // Calm = col·0.6 + ground·0.4. Over the OPAQUE ground beneath, `.opacity` already
+                // lerps toward it, so this layer alone IS the whole calm mix.
                 .opacity(1 - 0.4 * calmMix)
-            // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
-            // ground lands exactly where it was and the bright pools come down to meet it.
-            // Mounted unconditionally — at opacity 0 a plusLighter layer contributes nothing,
-            // and an always-present layer is what lets the mix animate instead of popping.
+            // A further plusLighter wash of the ground, which lets a DARK palette's bright pools
+            // come down to meet its ground rather than merely fading toward it.
+            //
+            // Suppressed on a pale palette (the factor goes to 0), because there it was destroying
+            // the setting: a pale ground is near-white, so ADDING 0.4 of it on top of a field
+            // already mixed 0.4 toward that same ground saturated the form screens to flat white —
+            // the field ask was "in bright mode the sub-screens are basically just white". Written
+            // as a factor rather than an `if` so the layer stays mounted and the calm chase keeps
+            // animating instead of popping when a screen is pushed.
             Self.color(palette.ground)
-                .opacity(0.4 * calmMix)
+                .opacity(0.4 * calmMix * (palette.light ? 0 : 1))
                 .blendMode(.plusLighter)
             // Cinematic vignette: the edges settle toward the scrim so the cards sit in the
             // pooled light. Soft (extends past the frame) so the corners deepen rather than
@@ -360,59 +626,6 @@ private struct LegacyBlobField: View {
             // Additive only works over a DARK ground; over a pale one every blob saturates to
             // white and the field turns grey. Pale palettes tint instead.
             .blendMode(palette.light ? .normal : .plusLighter)
-    }
-}
-
-/// A blur gradient behind a pinned tray (a screen title, the hints/detail bar, the keyboard tray):
-/// scrollable rows pass beneath those insets, so without this the tray text and the row underneath
-/// render interleaved. Pure blur — a dark material faded out by a gradient mask, no dark tint — so
-/// the tray's text sits on a softly blurred backdrop that dissolves into the rows.
-struct GamepadTrayScrim: View {
-    let edge: VerticalEdge
-    @Environment(\.gamepadInk) private var ink
-
-    var body: some View {
-        let fromEdge: UnitPoint = edge == .top ? .top : .bottom
-        let toContent: UnitPoint = edge == .top ? .bottom : .top
-        Rectangle()
-            .fill(.ultraThinMaterial)
-            // Force the frost to match the PALETTE, not the system appearance: the tray exists
-            // to keep the pinned title legible, so it has to frost dark under white ink and
-            // light under dark ink.
-            .environment(\.colorScheme, ink.isLight ? .light : .dark)
-            // Sink the material's grey luminance lift toward the palette's shade (black on a
-            // dark field — field ask: the frost read GREY over the aurora). Inside the mask, so
-            // the tint dissolves with the blur.
-            .overlay(ink.shade(0.35))
-            // Fade the whole blur out toward the content so it dissolves rather than ending on a
-            // line. The strong region sits deep (0.65) because the first stretch of the gradient
-            // now runs over the fixed 80 pt outer overhang below.
-            .mask {
-                LinearGradient(
-                    stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.92), location: 0.65),
-                        .init(color: .clear, location: 1),
-                    ],
-                    startPoint: fromEdge, endPoint: toContent)
-            }
-            // Grow past the tray so the fade-to-clear happens OUTSIDE its bounds — the tray's own
-            // text always sits on the strong part, rows blur out before they reach it. The bottom
-            // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
-            // the field verdict on the short reach was rows colliding visibly with the legend.
-            .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
-            // Full-bleed by LAYOUT, not by `.ignoresSafeArea()`: safe-area expansion resolves a
-            // beat after insertion (outside any geometry group and outside this view's own
-            // transaction), which is exactly the pop the field kept seeing — vertically first,
-            // then, once the vertical runway became padding, on the X axis alone (the landscape
-            // side insets). 80 pt clears every inset on every device; backgrounds never clip,
-            // so the overhang simply draws.
-            .padding(edge == .top ? .top : .bottom, -80)
-            .padding(.horizontal, -80)
-            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
-            // geometry would ride the push's transaction and visibly grow into place. The
-            // layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
-            .transaction { $0.animation = nil }
     }
 }
 

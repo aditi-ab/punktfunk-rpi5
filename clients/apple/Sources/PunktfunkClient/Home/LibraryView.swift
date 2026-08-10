@@ -27,6 +27,13 @@ struct LibraryView: View {
     /// Cover-art loader (the same paired identity + host pinning as the list fetch, reused across
     /// every poster in the grid). Built alongside `games` in `load()`; dropped on disappear.
     @State private var artLoader: LibraryArtLoader?
+    #if os(iOS) || os(macOS)
+    /// The plain grid's hardware-keyboard cursor (a game id), and the grid width the column count
+    /// is derived from. nil until the first arrow press, so a touch user never sees a selection
+    /// they didn't ask for.
+    @State private var keyCursor: String?
+    @State private var gridWidth: CGFloat = 0
+    #endif
     #if os(iOS) || os(macOS) || os(tvOS)
     // Gamepad-driven browsing — see ContentView's identical gate. With no controller (or the
     // setting off) every platform keeps the plain-grid presentation of this same view.
@@ -120,32 +127,101 @@ struct LibraryView: View {
         let launchers = games.filter(\.isLauncher)
         let titles = games.filter { !$0.isLauncher }
         let both = !launchers.isEmpty && !titles.isEmpty
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if !launchers.isEmpty {
-                    if both { sectionHeader("Launchers") }
-                    tiles(launchers)
+        return ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if !launchers.isEmpty {
+                        if both { sectionHeader("Launchers") }
+                        tiles(launchers)
+                    }
+                    if !titles.isEmpty {
+                        if both { sectionHeader("Games") }
+                        tiles(titles)
+                    }
                 }
-                if !titles.isEmpty {
-                    if both { sectionHeader("Games") }
-                    tiles(titles)
+                .padding()
+                #if os(iOS) || os(macOS)
+                // The grid's own width, reported without affecting layout — a GeometryReader
+                // SIBLING inside a ScrollView would claim the whole viewport. It's what tells the
+                // keyboard cursor how many columns `.adaptive` actually produced, so it is only
+                // measured where that cursor exists.
+                .background {
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { gridWidth = geo.size.width }
+                            .onChange(of: geo.size.width) { _, w in gridWidth = w }
+                    }
                 }
+                #endif
             }
-            .padding()
+            #if os(iOS) || os(macOS)
+            // Hardware keyboard: arrows pick a title, Return launches it — a field ask from an
+            // iPad user on a Magic Keyboard. The gamepad UI's coverflow has had this via the
+            // controller all along; this is the same thing for the plain grid, which is what an
+            // iPad with a keyboard and NO pad actually sees.
+            .gamepadKeyNavigation(
+                active: onLaunch != nil,
+                onMove: { direction in
+                    guard let next = gridNav(launchers: launchers, titles: titles)
+                        .move(from: keyCursor, direction) else { return }
+                    keyCursor = next
+                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(next, anchor: .center) }
+                },
+                onConfirm: {
+                    guard let onLaunch, let id = keyCursor else { return }
+                    onLaunch(id)
+                })
+            #endif
         }
     }
+
+    #if os(iOS) || os(macOS)
+    /// The keyboard cursor's model over the two grid sections. Rebuilt per press from the live
+    /// sections so it can never point into a stale list.
+    private func gridNav(launchers: [GameEntry], titles: [GameEntry]) -> LibraryGridNav {
+        LibraryGridNav(
+            sections: [launchers, titles].filter { !$0.isEmpty }.map { $0.map(\.id) },
+            columns: columnCount)
+    }
+
+    /// How many columns `.adaptive(minimum:spacing:)` fits into the measured width — the same
+    /// arithmetic the layout does, so up/down move exactly one visual row rather than a guess.
+    /// Falls back to one column before the first measurement lands.
+    private var columnCount: Int {
+        let minimum: CGFloat = 130 // matches `columns` below on iOS/macOS
+        let spacing: CGFloat = 18
+        // The VStack's `.padding()` is inside the measured width, so take it back off.
+        let usable = gridWidth - 32
+        guard usable > 0 else { return 1 }
+        return max(1, Int((usable + spacing) / (minimum + spacing)))
+    }
+    #endif
 
     private func tiles(_ entries: [GameEntry]) -> some View {
         LazyVGrid(columns: columns, spacing: 18) {
             ForEach(entries) { game in
                 if let onLaunch {
-                    Button { onLaunch(game.id) } label: { GameCard(game: game, artLoader: artLoader) }
-                        .buttonStyle(.plain)
+                    Button { onLaunch(game.id) } label: {
+                        GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
+                    }
+                    .buttonStyle(.plain)
+                    .id(game.id)
                 } else {
-                    GameCard(game: game, artLoader: artLoader)
+                    GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
+                        .id(game.id)
                 }
             }
         }
+    }
+
+    /// Whether the keyboard cursor is on this tile (always false where there is no keyboard
+    /// navigation to have moved it).
+    private func isKeyCursor(_ game: GameEntry) -> Bool {
+        #if os(iOS) || os(macOS)
+        keyCursor == game.id
+        #else
+        false
+        #endif
     }
 
     private func sectionHeader(_ text: String) -> some View {
@@ -264,6 +340,9 @@ private struct LibraryBackCatcher: View {
 private struct GameCard: View {
     let game: GameEntry
     let artLoader: LibraryArtLoader?
+    /// The hardware-keyboard cursor is on this tile — drawn as an accent ring, since the plain
+    /// grid has no other way to say "Return launches THIS one".
+    var selected = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -271,6 +350,12 @@ private struct GameCard: View {
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .frame(maxWidth: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(.tint, lineWidth: 3)
+                    }
+                }
                 .overlay(alignment: .topLeading) {
                     StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
                 }

@@ -1,6 +1,12 @@
 // Trust-on-first-use prompt: shown over the live-but-blurred stream when connecting to an
 // unpinned host. The user compares the fingerprint with the one the host logged at startup,
 // or drops this and runs the PIN pairing ceremony instead.
+//
+// Controller-drivable on iOS/macOS (A trust, B cancel, X pair instead). It had no controller
+// wiring at all, which made it a dead end for a pad-only user at the worst possible moment: the
+// card appears mid-connect with capture disabled (ContentView blurs the stream and stops
+// forwarding), so the pad in their hands genuinely did nothing and the only way past was to reach
+// for the screen. tvOS needs none of this — the focus engine drives the buttons natively.
 
 import Foundation
 import PunktfunkKit
@@ -12,6 +18,12 @@ struct TrustCardView: View {
     let onCancel: () -> Void
     let onTrust: () -> Void
     let onPairInstead: () -> Void
+
+    #if os(iOS) || os(macOS)
+    /// Observed so the legend appears the moment a pad wakes up mid-prompt — and so it stays
+    /// absent for the mouse/touch users this card is otherwise for.
+    @ObservedObject private var gamepads = GamepadManager.shared
+    #endif
 
     var body: some View {
         VStack(spacing: 14) {
@@ -60,12 +72,35 @@ struct TrustCardView: View {
                 .buttonStyle(.borderless)
                 #endif
                 .font(.geist(16, relativeTo: .callout))
+            #if os(iOS) || os(macOS)
+            // Only with a pad attached: controller glyphs in front of a trackpad user would be
+            // naming buttons they don't have.
+            if gamepads.active != nil {
+                GamepadHintBar(hints: [
+                    .init(
+                        glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Trust",
+                        action: onTrust),
+                    .init(
+                        glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Pair with PIN",
+                        action: onPairInstead),
+                    .init(
+                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel",
+                        action: onCancel),
+                ])
+                .padding(.top, 2)
+            }
+            #endif
         }
         .padding(28)
         .frame(maxWidth: 440)
         // Floating trust card over the blurred stream — Liquid Glass on 26+, .regularMaterial
         // fallback below. The inner fingerprint box stays .quaternary (content, not glass).
         .glassBackground(RoundedRectangle(cornerRadius: 18))
+        #if os(iOS) || os(macOS)
+        .background {
+            TrustControllerInput(onTrust: onTrust, onCancel: onCancel, onPairInstead: onPairInstead)
+        }
+        #endif
     }
 
     /// 64 hex chars → four groups per line, two lines — easy to eyeball against the log.
@@ -79,6 +114,35 @@ struct TrustCardView: View {
         return groups.chunks(of: 4).map { $0.joined(separator: " ") }.joined(separator: "\n")
     }
 }
+
+#if os(iOS) || os(macOS)
+/// Controller binding for the trust prompt: A trusts, B cancels, X runs the PIN ceremony instead.
+/// The same zero-size-backing-view shape as `ConnectOverlay`'s `ConnectControllerInput` — mounted
+/// for exactly as long as the card is up, and `GamepadMenuInput`'s snapshot-on-start swallows
+/// whatever button was still held when it appeared (the A press that started the connect is
+/// usually still down).
+///
+/// Nothing else is polling the pad here: capture is off for the duration of the prompt, and the
+/// home screens are unmounted behind the session view.
+private struct TrustControllerInput: View {
+    let onTrust: () -> Void
+    let onCancel: () -> Void
+    let onPairInstead: () -> Void
+    @State private var input = GamepadMenuInput(manager: .shared)
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                input.onConfirm = onTrust
+                input.onBack = onCancel
+                input.onTertiary = onPairInstead
+                input.start()
+            }
+            .onDisappear { input.stop() }
+    }
+}
+#endif
 
 private extension Array {
     func chunks(of size: Int) -> [[Element]] {
