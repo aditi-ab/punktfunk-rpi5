@@ -508,6 +508,15 @@ in
         ];
         wants = [ "punktfunk-web-init.service" ];
         wantedBy = optional cfg.web.autoStart "default.target";
+        # Retry INDEFINITELY while the host is still writing the mgmt token + identity cert. The
+        # EnvironmentFile below is mandatory on purpose, so the unit genuinely fails until those
+        # exist — and systemd's default rate limit (5 starts / 10 s) against `RestartSec = 2` gives
+        # up permanently after ~10 s, which on an appliance is exactly the window before the host's
+        # first `serve` completes. A console enabled before the host's first run then stayed dead
+        # until someone restarted it by hand. The shipped unit (scripts/punktfunk-web.service) has
+        # carried this since that defect was found; it was missed in the port, while the comment
+        # below went on promising the behaviour it removes.
+        unitConfig.StartLimitIntervalSec = 0;
         environment = {
           PUNKTFUNK_MGMT_URL = "https://127.0.0.1:47990";
           PORT = "47992";
@@ -525,7 +534,11 @@ in
             "-%h/.config/punktfunk/web-password"
           ];
           ExecStart = "${cfg.web.package}/bin/punktfunk-web-server";
-          Restart = "on-failure";
+          # `always`, not `on-failure`: a console that exits 0 has still stopped serving, and
+          # `on-failure` would leave it down. An explicit `systemctl --user stop` is still honoured
+          # (Restart= never fights that). Matches scripts/punktfunk-web.service and the Windows
+          # web-run.cmd, both of which relaunch bun on ANY exit.
+          Restart = "always";
           RestartSec = 2;
         };
       };
@@ -554,6 +567,38 @@ in
           KillMode = "mixed";
           KillSignal = "SIGTERM";
           TimeoutStopSec = 30;
+
+          # Sandbox — the same confinement scripts/punktfunk-scripting.service gives the deb/rpm
+          # installs. The runner `import()`s the operator's own `.ts` files, so this is the one unit
+          # here that executes arbitrary code by design; without these it ran strictly LESS confined
+          # on NixOS than on every other channel. Read-only outside $HOME, no setuid re-escalation,
+          # and only the address families automation actually uses (loopback mgmt API, LAN/IPv6
+          # webhooks, unix sockets).
+          NoNewPrivileges = true;
+          # PrivateTmp deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A
+          # plugin's whole job is integrating with things already running on this box, and on Linux
+          # those talk over /tmp: VirtualHere's client IPC is the FIFO pair /tmp/vhclient +
+          # /tmp/vhclient_response, X11 is /tmp/.X11-unix. A private /tmp hides all of it — the
+          # plugin launches the vendor binary fine and then cannot reach the daemon behind it,
+          # which presents as an error no amount of config fixes.
+          PrivateTmp = false;
+          ProtectSystem = "strict";
+          # ReadWritePaths puts back the write bit ProtectSystem=strict takes away: plugin state and
+          # ~/.config/punktfunk under $HOME, plus the /tmp above. A plugin that must write OUTSIDE
+          # $HOME (a game library on another mount) gets it with
+          #   systemctl --user edit punktfunk-scripting  →  [Service] ReadWritePaths=/mnt/games
+          # ⚠ ProtectSystem is a MOUNT-NAMESPACE option, and for a *user* unit that needs
+          # unprivileged user namespaces. On a kernel/config that restricts those it fails the unit
+          # rather than degrading — drop it via the same drop-in if this box is one of them.
+          ReadWritePaths = [
+            "%h"
+            "/tmp"
+          ];
+          RestrictAddressFamilies = [
+            "AF_UNIX"
+            "AF_INET"
+            "AF_INET6"
+          ];
         };
       };
     })
