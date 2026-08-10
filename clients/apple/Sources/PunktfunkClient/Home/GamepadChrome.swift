@@ -10,15 +10,29 @@ import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
-/// The active controller's real glyph for a button (Xbox "A", DualSense ✕, …) via
-/// `sfSymbolsName`; a generic fallback before a controller profile resolves.
+/// The glyph a button wears in a legend: the ACTIVE controller's own (Xbox "A", DualSense ✕, …)
+/// via `sfSymbolsName` while one is attached, else the glyph of the last pad this device ever saw
+/// (`GamepadManager.lastKnownKind` → `GamepadGlyphs`), else the caller's generic fallback.
+///
+/// The middle rung is the whole point. `active` is nil whenever the pad sleeps, disconnects or
+/// runs flat — and permanently under `gamepadUIMode == "always"`, which puts the console UI up
+/// with no pad by design — and the fallbacks are letter glyphs, so a DualSense user's ✕/◯ legends
+/// used to turn into A/B the moment the controller dozed off. The remembered kind keeps the
+/// legends speaking the pad the user actually owns. The `fallback` still covers the genuinely
+/// unknown case: a fresh install that has never seen a controller, and any button outside the six
+/// `GamepadButtonRole` names.
+///
 /// @MainActor: GamepadManager is main-actor-bound (inside a View body this was implicit).
 @MainActor
 func buttonGlyph(
     _ button: KeyPath<GCExtendedGamepad, GCControllerButtonInput>, fallback: String
 ) -> String {
-    GamepadManager.shared.active?.controller.extendedGamepad?[keyPath: button].sfSymbolsName
-        ?? fallback
+    let manager = GamepadManager.shared
+    if let live = manager.active?.controller.extendedGamepad?[keyPath: button].sfSymbolsName {
+        return live
+    }
+    guard let role = GamepadButtonRole(keyPath: button) else { return fallback }
+    return GamepadGlyphs.symbol(role, for: manager.lastKnownKind)
 }
 
 /// Top padding for a gamepad screen's pinned title. macOS gets extra clearance — the launcher

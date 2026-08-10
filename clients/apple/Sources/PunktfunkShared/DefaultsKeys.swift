@@ -32,6 +32,15 @@ public enum DefaultsKey {
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
+    /// The `PunktfunkConnection.GamepadType` raw value of the last controller that was actually
+    /// attached — written by `GamepadManager` whenever one becomes active, never cleared on
+    /// disconnect. It exists so the gamepad UI's button legends keep speaking the pad the user
+    /// owns: the live controller's own `sfSymbolsName` is authoritative while it's connected, but
+    /// the moment it sleeps or disconnects there is nothing left to ask, and the legends used to
+    /// snap back to generic letter glyphs (i.e. Xbox) under a DualSense user's hands. Also what
+    /// makes the legends right at all under `gamepadUIMode == "always"`, where the console UI is
+    /// up with no pad attached by design. See `GamepadGlyphs`.
+    public static let lastGamepadKind = "punktfunk.lastGamepadKind"
     /// Forward this device's controllers to the host at all (default true). Off is for a
     /// couch whose controller reaches the host another way — USB passthrough such as
     /// VirtualHere, or a pad plugged into the host — where forwarding as well would give the
