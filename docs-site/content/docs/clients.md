@@ -28,8 +28,10 @@ protocol — the lowest-latency, most resilient path, with the full feature set:
   launch one straight into the stream.
 - A live **stats overlay** (resolution, fps, bitrate, latency) and a built-in **network speed test**
   to pick a bitrate for your link.
-- **Widgets, Live Activities and Shortcuts** — a hosts widget for the home screen, a Live Activity
-  while a session runs, and App Intents so Siri and the Shortcuts app can start a stream.
+- **Widgets, Live Activities and Shortcuts** — a hosts widget and a game-library widget for the
+  home screen (the library one opens a host you pick straight into its library), a Live Activity
+  while a session runs, and App Intents so Siri and the Shortcuts app can start a stream or jump
+  into a host's game library.
 
 Open the app, pick your host, [pair](/docs/pairing) once, and stream. It builds from the
 `clients/apple` directory in the repo (Swift / VideoToolbox / Metal).

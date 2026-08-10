@@ -15,6 +15,7 @@ import WidgetKit
 struct PunktfunkWidgetBundle: WidgetBundle {
     var body: some Widget {
         HostsWidget()
+        LibraryWidget()
         PunktfunkSessionLiveActivity()
     }
 }
