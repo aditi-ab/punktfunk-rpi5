@@ -65,6 +65,13 @@ private struct HomeTile: Identifiable {
 
 struct GamepadHomeView: View {
     @Environment(\.gamepadInk) private var ink
+    /// Published by ContentView at the app ROOT, so this reads its own window's tier — this screen
+    /// applies `gamepadPaletteInk` itself and so sits above its own copy of the environment.
+    @Environment(\.gamepadMetrics) private var metrics
+    /// The home-indicator strip's height, measured by DisplayBottomInsetProbe and published from
+    /// ContentView — an environment READ is safe in body; asking UIKit for it here is not (see
+    /// the probe's comment: a key-window walk mid-render severed this very view's updates).
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @ObservedObject var store: HostStore
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
@@ -225,14 +232,26 @@ struct GamepadHomeView: View {
                 .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: hints)
-                // Equal distance from the left and bottom edges — the pill's corner inset was the
-                // real asymmetry (leading 22 vs bottom 10), not its internal padding.
-                .padding(.leading, compact ? 12 : 18)
-                .padding(.bottom, compact ? 12 : 18)
-                .padding(.top, compact ? 4 : 8)
+            legend
         }
     }
+
+    /// The pinned controls legend, sitting the SAME distance from the leading and bottom edges of
+    /// the DISPLAY — see `gamepadLegendBottomPadding` for why the bottom number is not simply the
+    /// margin, and why measuring the inset (rather than trying to opt out of it) is what finally
+    /// worked.
+    private var legend: some View {
+        GamepadHintBar(hints: hints)
+            .padding(.leading, legendMargin)
+            .padding(
+                .bottom,
+                gamepadLegendBottomPadding(
+                    legendMargin, tier: metrics.tier, displayBottom: displayBottomInset))
+            .padding(.top, compact ? 4 : 8)
+    }
+
+    /// The legend pill's distance from the screen's leading and bottom edges.
+    private var legendMargin: CGFloat { compact ? 12 : 18 }
 
     #if os(iOS)
     /// The screen the shell shows over the launcher — derived from the same triggers every

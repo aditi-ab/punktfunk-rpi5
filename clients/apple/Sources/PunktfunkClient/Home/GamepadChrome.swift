@@ -176,6 +176,110 @@ extension EnvironmentValues {
     }
 }
 
+private struct DisplayBottomInsetKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+    /// The display's bottom safe-area inset — the home-indicator strip — measured by
+    /// `DisplayBottomInsetProbe` and published from ContentView. 0 until UIKit's first callback
+    /// lands (the legend keeps its plain margin for that first frame) and always 0 on
+    /// macOS/tvOS, where nothing publishes it.
+    var displayBottomInset: CGFloat {
+        get { self[DisplayBottomInsetKey.self] }
+        set { self[DisplayBottomInsetKey.self] = newValue }
+    }
+}
+
+#if os(iOS)
+/// Reports the hosting window's bottom safe-area inset from UIKit's OWN callbacks — never
+/// during a SwiftUI render.
+///
+/// This number has a history of wrong spellings, each failing silently:
+///   - a `GeometryReader` carrying `.ignoresSafeArea()` — a proxy reports NO insets for an edge it
+///     has been told to ignore, so that spelling can only ever answer 0;
+///   - `.ignoresSafeArea(.container, edges: .bottom)` on `safeAreaInset` CONTENT, which does not
+///     move content the inset mechanism itself placed; and
+///   - asking UIKit for the key window (`UIApplication.shared.connectedScenes…`) DURING body,
+///     which answered correctly and then KILLED the calling view: on an iPad (never the
+///     simulator) the walk re-enters UIKit layout mid-render and the view's update graph is
+///     silently severed — every later `@State` write lands in storage without ever re-running
+///     `body` again, which is how Settings and Add Host stopped opening while their triggers
+///     kept firing. No AttributeGraph warning, no log line; found by bisecting builds on glass.
+/// So: UIKit tells THIS view when the window or its insets change, on UIKit's schedule, and the
+/// answer hops out of the current update before anyone in SwiftUI reads it.
+struct DisplayBottomInsetProbe: UIViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onChange = onChange
+        // Mounted as a full-size `.background`; it must never eat a touch meant for the UI.
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {
+        view.onChange = onChange
+    }
+
+    final class ProbeView: UIView {
+        var onChange: ((CGFloat) -> Void)?
+        private var last: CGFloat?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            report()
+        }
+
+        override func safeAreaInsetsDidChange() {
+            super.safeAreaInsetsDidChange()
+            report()
+        }
+
+        // Rotation reshuffles the window's insets without necessarily touching this view's own.
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            report()
+        }
+
+        private func report() {
+            // The WINDOW's inset, not this view's: the probe sits inside the safe area, so its
+            // own inset is 0 — the number the legend needs is the strip the window reserves.
+            guard let bottom = window?.safeAreaInsets.bottom, bottom != last else { return }
+            last = bottom
+            let onChange = onChange
+            // Out of the current UIKit/SwiftUI update before any state write.
+            DispatchQueue.main.async { onChange?(bottom) }
+        }
+    }
+}
+#endif
+
+/// The bottom padding that puts a pinned legend the same distance from the bottom of the DISPLAY
+/// as it sits from the leading edge — so it lands on the diagonal of the display's rounded corner,
+/// which is what the corner asks for.
+///
+/// A `safeAreaInset` places its content INSIDE the safe area, so a plain margin stacks on top of
+/// the device's own bottom inset and the pill ends up two to three times further from the bottom
+/// than from the left. On a tablet this therefore goes NEGATIVE, pulling the pill back down
+/// through the home-indicator strip; the pill is left-aligned and an iPad's indicator is a short
+/// bar in the middle, so the two never meet.
+///
+/// Phones keep the plain margin. Their inset is the taller indicator bar and their legend runs
+/// most of the width, so sitting it that low would cross the indicator rather than tuck beside it.
+///
+/// `displayBottom` is `\.displayBottomInset` — measured by `DisplayBottomInsetProbe`, NEVER asked
+/// of UIKit here: this runs during body, and a key-window walk mid-render severs the calling
+/// view's updates (see the probe's comment). Pure arithmetic only.
+func gamepadLegendBottomPadding(
+    _ margin: CGFloat, tier: GamepadFormMetrics.Tier, displayBottom: CGFloat
+) -> CGFloat {
+    guard tier == .pad else { return margin }
+    // Floored at -inset: at worst the pill sits flush with the physical edge, never past it.
+    return max(-displayBottom, margin - displayBottom)
+}
+
 /// One glyph + label cell in a hint bar.
 struct GamepadHint: Identifiable {
     let glyph: String

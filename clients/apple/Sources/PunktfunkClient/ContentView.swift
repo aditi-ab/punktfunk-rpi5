@@ -56,6 +56,12 @@ struct ContentView: View {
     /// Owns the Live Activity for the running session (Lock Screen / Dynamic Island). Driven from
     /// the session model's published state below; iPhone/iPad only.
     @State private var liveActivity = SessionActivityController()
+    /// The window's bottom safe-area inset (the home-indicator strip), reported by
+    /// DisplayBottomInsetProbe from UIKit's own callbacks and published as
+    /// `\.displayBottomInset` for the screens that pin a legend to the display's corner. Held
+    /// HERE and read through the environment because asking UIKit for it during a body severs
+    /// the asking view's updates on device (see the probe).
+    @State private var displayBottomInset: CGFloat = 0
     #endif
     @State private var pairingTarget: StoredHost?
     /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
@@ -200,6 +206,15 @@ struct ContentView: View {
     private var driven: some View {
         drivenBase
             .environment(\.gamepadMetrics, gamepadMetrics)
+            #if os(iOS)
+            .environment(\.displayBottomInset, displayBottomInset)
+            // The probe is UIKit's, not any screen's: mounted once here as a background so the
+            // legend-pinning screens can READ the inset from the environment without ever asking
+            // UIKit during their own body (which severs their updates — see the probe).
+            .background {
+                DisplayBottomInsetProbe { displayBottomInset = $0 }
+            }
+            #endif
             #if os(iOS) || os(macOS)
             // The console's own modal, over WHICHEVER screen is up. Not attached to `home`, which
             // renders only while `model.connection == nil`: a connection exists through the
