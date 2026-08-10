@@ -90,6 +90,10 @@ public final class SessionAudio {
     /// Token for the media-services-reset observer — the audio server restarting takes the
     /// session's configuration and every engine with it. Guarded by `stateLock`.
     private var mediaResetObserver: NSObjectProtocol?
+    /// Token for the interruption observer — a phone call or a non-mixable app stops the engines,
+    /// and ending the interruption restarts nothing by itself (see
+    /// `installInterruptionObserver`). Guarded by `stateLock`.
+    private var interruptionObserver: NSObjectProtocol?
     #endif
 
     // MARK: - Device changes (see `installDeviceChangeRecovery`)
@@ -219,9 +223,17 @@ public final class SessionAudio {
                 // make a headset's MIC usable, but it buys that by dragging the whole route onto
                 // HFP/SCO and collapsing game audio to narrowband. High-quality A2DP output plus
                 // the built-in mic is the better trade for a game-streaming client.
+                // `.mixWithOthers`, both branches: without it this session is EXCLUSIVE — merely
+                // activating it paused the user's Music at connect, and Music's RESUME took the
+                // session right back, which read as "stream audio stops when I resume Music"
+                // (field report; the interruption observer below is the other half of that fix).
+                // A game stream mixing over someone's playlist is the behavior a console has,
+                // and what this client's peers do. The trade is real but right: a mixable
+                // session is nobody's Now Playing app, so the lock screen shows the music, not
+                // the stream — which is exactly how it should read.
                 try session.setCategory(
                     .playAndRecord, mode: .default,
-                    options: [.allowBluetoothA2DP])
+                    options: [.allowBluetoothA2DP, .mixWithOthers])
                 // Uplink latency: ask for 5 ms IO quanta at the wire rate (the default ~10-23 ms
                 // quantum is most of the mic path's burst latency). Best-effort — the hardware
                 // has the final word (a Bluetooth route will ignore both), and whatever quantum
@@ -229,10 +241,10 @@ public final class SessionAudio {
                 try? session.setPreferredIOBufferDuration(0.005)
                 try? session.setPreferredSampleRate(48_000)
             } else {
-                try session.setCategory(.playback, mode: .default)
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             }
             #else // tvOS — no app-accessible mic
-            try session.setCategory(.playback, mode: .default)
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             #endif
             try session.setActive(true)
             #if os(iOS)
@@ -396,6 +408,8 @@ public final class SessionAudio {
         routeObserver = nil
         let mediaReset = mediaResetObserver
         mediaResetObserver = nil
+        let interruption = interruptionObserver
+        interruptionObserver = nil
         #endif
         stateLock.unlock()
         // Every watcher goes before the engines do: a device change landing during teardown must
@@ -406,10 +420,13 @@ public final class SessionAudio {
         #if !os(macOS)
         if let route { NotificationCenter.default.removeObserver(route) }
         if let mediaReset { NotificationCenter.default.removeObserver(mediaReset) }
+        if let interruption { NotificationCenter.default.removeObserver(interruption) }
         #endif
         tearDownEngines()
         #if !os(macOS)
-        // Release the session so audio we interrupted (Music, podcasts) gets its resume cue. Like
+        // Release the session. (A mixable session interrupts nobody, so the resume cue below is
+        // now a courtesy for the edge where an OLD non-mixable install interrupted something —
+        // harmless either way, and deactivating promptly is still what orders a reconnect.) Like
         // activation, setActive is synchronous/blocking — run it on the shared serial session queue
         // (off the main thread). Enqueued HERE — engines already stopped, and BEFORE the drain wait
         // below — so across a reconnect it lands ahead of the next session's activate on the shared
@@ -493,6 +510,7 @@ public final class SessionAudio {
         #if !os(macOS)
         installRouteObserver()
         installMediaResetObserver(micEnabled: micEnabled)
+        installInterruptionObserver(micEnabled: micEnabled)
         #endif
     }
 
@@ -651,6 +669,38 @@ public final class SessionAudio {
         stateLock.lock()
         let stale = mediaResetObserver
         mediaResetObserver = observer
+        stateLock.unlock()
+        if let stale { NotificationCenter.default.removeObserver(stale) }
+    }
+
+    /// Interruptions still happen to a mixable session — a phone call, Siri, an app that claims
+    /// a NON-mixable session of its own. iOS stops the engines, and when the interruption ends it
+    /// restarts NOTHING by itself; before this observer the stream just stayed silent (under the
+    /// old exclusive category, Music itself was such an interrupter, which is how "resume Music,
+    /// lose the stream" was ever possible). Reactivate and revive on `.ended` — unconditionally,
+    /// not only when iOS hints `.shouldResume`: a live stream is the one case where the user's
+    /// intent to keep hearing it is not in doubt, and `reviveStoppedEngines` already declines
+    /// when playback never went down.
+    private func installInterruptionObserver(micEnabled: Bool) {
+        let observer = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(), queue: nil
+        ) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            SessionAudio.sessionQueue.async {
+                guard let self, !self.flag.isStopped else { return }
+                // The full activation, not a bare `setActive`: an interruption can drop the
+                // category configuration too, and on iOS the earpiece steer is per-route.
+                self.activateAudioSession(micEnabled: micEnabled)
+                DispatchQueue.main.async {
+                    self.reviveStoppedEngines("an audio interruption ended")
+                }
+            }
+        }
+        stateLock.lock()
+        let stale = interruptionObserver
+        interruptionObserver = observer
         stateLock.unlock()
         if let stale { NotificationCenter.default.removeObserver(stale) }
     }
