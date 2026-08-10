@@ -253,7 +253,12 @@ struct GamepadSettingsView: View {
         let selected = t == tab
         return Text(t.rawValue)
             .font(.geist(compact ? 12 : 13, .semibold, relativeTo: .footnote))
-            .foregroundStyle(selected ? ink.fg : ink.fg(0.55))
+            // `onAccent`, not `fg` — the selected pill is FILLED with the palette accent, and
+            // `onAccent` is the colour picked (by the accent's own luminance) to read on top of
+            // it; its doc calls out "a filled pill's label" for exactly this surface. Using the
+            // foreground meant white-on-white wherever a palette's accent is pale: Graphite's is
+            // a light grey (luma ≈ 0.80), so its selected tab was unreadable.
+            .foregroundStyle(selected ? ink.onAccent : ink.fg(0.55))
             .padding(.horizontal, 13)
             .padding(.vertical, 7)
             .background {
