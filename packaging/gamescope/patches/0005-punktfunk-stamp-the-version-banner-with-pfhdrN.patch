@@ -17,18 +17,19 @@ The number is a monotonic patch-set revision, so one probe answers all of them:
   +pfhdr2  …and --pipewire-composite-cursor
   +pfhdr3  …and the headless connector advertises its mode + --custom-refresh-rates
   +pfhdr4  …and --pipewire-composite-external-overlay
+  +pfhdr5  …and the PipeWire buffer use-after-free is fixed (no new capability)
 
 NOT for upstream: drop this once the functional patches land there and plain
 version floors answer the same questions.
 ---
- src/meson.build | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
+ src/meson.build | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
 
 diff --git a/src/meson.build b/src/meson.build
 index 662f752..12fd38a 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -177,7 +177,14 @@ compiler_version = cc.version()
+@@ -177,7 +177,15 @@ compiler_version = cc.version()
  
  vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
  vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
@@ -40,7 +41,8 @@ index 662f752..12fd38a 100644
 +#   +pfhdr2 — …and `--pipewire-composite-cursor`
 +#   +pfhdr3 — …and the headless connector advertises its mode + `--custom-refresh-rates`
 +#   +pfhdr4 — …and `--pipewire-composite-external-overlay`
-+version_tag = vcs_tag + '+pfhdr4' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr5 — …and the PipeWire buffer use-after-free is fixed (no new capability)
++version_tag = vcs_tag + '+pfhdr5' + ' (' + compiler_name + ' ' + compiler_version + ')'
  
  gamescope_version_conf = configuration_data()
  gamescope_version_conf.set('VCS_TAG', version_tag)

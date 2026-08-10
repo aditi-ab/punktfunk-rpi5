@@ -1,0 +1,132 @@
+From d3a1c36bf871aaaa4ad9c2baf7170bba69742189 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Mon, 10 Aug 2026 01:55:00 +0200
+Subject: [PATCH] pipewire: never leave pw_buffer->user_data pointing at a
+ freed buffer
+
+A gamescope session driving a PipeWire capture consumer dies as soon as the
+stream renegotiates:
+
+  gamescope: ../src/pipewire.cpp:88: void destroy_buffer(pipewire_buffer*):
+    Assertion `false' failed.
+  #4  __assert_fail
+  #5  destroy_buffer(pipewire_buffer*).cold
+  #13 destroy_buffer(pipewire_buffer*)
+
+with a SIGSEGV variant of the same fault when the slot happens to be zeroed
+instead of stale. On a streaming host this reproduces on essentially every
+client connect, because the host sets the session to the client's mode and the
+mode change is what renegotiates the stream.
+
+pw_buffer->user_data and the pipewire_buffer behind it are associated in
+exactly one place - the bottom of stream_handle_add_buffer - but that
+assignment sits AFTER all four `goto error` paths, and the `error:` label is a
+bare `delete buffer`. Any failing add therefore leaves the slot holding either
+nothing or the previous generation's freed pointer.
+
+The teardown path leaks the same association even when nothing fails.
+stream_handle_remove_buffer clears buffer->buffer, which is the only route from
+the pipewire_buffer back to its pw_buffer. If the buffer is still `copying` it
+is not deleted here at all - the steamcompmgr thread deletes it later, by which
+point the pw_buffer can no longer be reached to be cleared. The slot is then a
+dangling pointer for the rest of its life.
+
+PipeWire recycles struct pw_buffer slots across renegotiations, so the next
+remove_buffer on a recycled slot dereferences freed memory. buffer->type reads
+as garbage, falls off the end of the switch, and hits the default:
+assert(false). The assert(buffer->buffer == nullptr) at the top passes on the
+way in, which is what makes this look like an "unreachable" assert rather than
+the use-after-free it is.
+
+Fix the association rather than the symptom:
+
+  - set pw_buffer->user_data immediately after the allocation, so it is valid
+    for every path out of add_buffer, and clear it on the error path;
+  - clear it in remove_buffer, the last moment at which both halves are still
+    known, whether or not the buffer is deleted there;
+  - null-check the two places that consume it.
+
+With user_data non-null iff a live pipewire_buffer exists for that slot, the
+default: case is genuinely unreachable - so it logs and returns instead of
+aborting, since losing a capture buffer should not take the session down.
+
+Upstream: yes - a plain use-after-free in the PipeWire buffer lifecycle, with
+nothing punktfunk-specific about it.
+---
+ src/pipewire.cpp | 33 +++++++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index 76b3ea8..faecf04 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -51,8 +51,13 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
+ 	case SPA_DATA_DmaBuf:
+ 		break; // nothing to do
+ 	default:
+-		assert(false); // unreachable
+-	}	
++		// A buffer that never reached the point of choosing a type owns nothing to
++		// release. The association fixes above should make this unreachable, but a
++		// capture stream is not worth aborting a whole session over.
++		pwr_log.errorf("destroy_buffer: buffer has no data type (%d); nothing to release",
++			(int) buffer->type);
++		break;
++	}
+ 
+ 	// If out_buffer == buffer, then set it to nullptr.
+ 	// We don't care about the result.
+@@ -179,6 +184,13 @@ static void request_buffer(struct pipewire_state *state)
+ 	}
+ 
+ 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
++	if (buffer == nullptr) {
++		// add_buffer bailed for this slot, so it carries no state. Hand it back
++		// rather than dereferencing nothing.
++		pwr_log.errorf("dequeued a buffer with no state; requeuing");
++		pw_stream_queue_buffer(state->stream, pw_buffer);
++		return;
++	}
+ 	buffer->copying = true;
+ 
+ 	// Past this exchange, the PipeWire thread shares the buffer with the
+@@ -464,6 +476,10 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 
+ 	struct pipewire_buffer *buffer = new pipewire_buffer();
+ 	buffer->buffer = pw_buffer;
++	// Associate the two halves NOW, not after the last `goto error` below: every error
++	// path deletes this buffer, and a slot left holding a stale pointer is one the next
++	// remove_buffer dereferences.
++	pw_buffer->user_data = buffer;
+ 	buffer->video_info = state->video_info;
+ 	buffer->gamescope_info = state->gamescope_info;
+ 
+@@ -583,17 +599,26 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
+ 		goto error;
+ 	}
+ 
+-	pw_buffer->user_data = buffer;
+-
+ 	return;
+ 
+ error:
++	pw_buffer->user_data = nullptr;
+ 	delete buffer;
+ }
+ 
+ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
+ {
+ 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
++	if (buffer == nullptr) {
++		return;
++	}
++
++	// The LAST point at which both halves of the association are still known. Clearing
++	// buffer->buffer below makes the pw_buffer unreachable from the pipewire_buffer, and
++	// a buffer that is still `copying` is deleted later, on the steamcompmgr thread —
++	// with no way to reach back here. Sever the link now or the slot is left pointing at
++	// memory that is about to be freed.
++	pw_buffer->user_data = nullptr;
+ 
+ 	buffer->buffer = nullptr;
+ 
