@@ -65,6 +65,64 @@ code. `PYROWAVE_QUEUE_PRIORITY` keeps its 0.26.0 grammar and is now forwarded **
 handshake rather than read from the worker's environment, which is sanitized at spawn; one env var
 still means one thing on both platforms.
 
+### NixOS — session detection, module defaults, and a CI gate that was never running
+
+🛑 **The host could not detect any graphical session on NixOS, at all.** The live-session probe
+matched `/proc/<pid>/comm` exactly against `kwin_wayland` / `gamescope` / `gnome-shell` /
+`Hyprland`. `comm` is the kernel's name for the **executed file**, truncated to 15 bytes — not
+`argv[0]` — and nixpkgs wraps essentially every graphical binary: `wrapProgram` moves the real ELF
+aside to `.<name>-wrapped` and installs a wrapper that `exec -a "$0"`s it. So the kernel reports
+`.kwin_wayland-w` while `ps` and `pgrep -a` show a perfectly ordinary `kwin_wayland`, because they
+read argv. Every probe answered `ActiveKind::None` on a running desktop, and nothing downstream
+could recover: `wayland` logged as `-`, a correct `WAYLAND_DISPLAY` changed nothing, `Auto` returned
+the *detected* backend so a live KWin already in `available()` was never chosen, and a
+`PUNKTFUNK_COMPOSITOR` pin turned the miss into a hard error through `pinned_at_a_dead_session`.
+sway and river survived by accident — nixpkgs' wrapper execs a binary still called `sway`.
+
+Names are now resolved through `/proc/<pid>/exe`, whose file name is untruncated, with the nixpkgs
+decoration stripped. Stripping requires **both** the leading `.` and a trailing `-wrapped`, so
+KWin's own real `kwin_wayland_wrapper` binary keeps its name instead of collapsing into
+`kwin_wayland` and handing the probe the parent's PID. The `comm` fast path is unchanged for every
+ordinary distro — one read, no readlink — and no name that matched before can stop matching. Also
+applied to the foreign-gamescope probe, which had the same defect.
+
+**Module changes** (`services.punktfunk`):
+
+- **`host.desktopSession`** *(new, default `false`)* — binds the host to `graphical-session.target`,
+  the declarative form of the `punktfunk-host-desktop-session.conf` drop-in. Without it a
+  Plasma/GNOME restart leaves the host holding a Wayland socket and portal D-Bus connection that
+  died with the old compositor: it still listens, still answers, and every session after that fails
+  at capture. Off by default because an appliance may never reach that target and would be left
+  permanently stopped.
+- ⚠ **`scripting.autoStart` now defaults ON** *(behaviour change)*, matching the deb `postinst` and
+  RPM `%post`, which both `systemctl --global enable` the runner, and the sysext's baked-in
+  `default.target.wants` symlink. It was opt-in here on the reasoning that the runner is inert until
+  you add automation — untrue since the game-library scanners became plugins, so a NixOS host came
+  up with an empty library and no obvious cause. Opt out with `scripting.autoStart = false` or
+  `systemctl --user mask punktfunk-scripting`.
+- **Three divergences from the shipped units, ported.** `punktfunk-web` gains
+  `StartLimitIntervalSec=0` (without it, 5 starts / 10 s against `RestartSec=2` gives up permanently
+  after ~10 s — exactly the window before the host's first `serve` writes the mgmt token, so a
+  console enabled before the host's first run stayed dead) and `Restart=always` rather than
+  `on-failure`. `punktfunk-scripting` gains the sandbox the deb/rpm unit has all along
+  (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=%h /tmp`, restricted address families,
+  `PrivateTmp=no`) — it is the one unit that runs arbitrary operator TypeScript by design, and it
+  had been running strictly less confined on NixOS than anywhere else.
+- A **warning** when the host is enabled and `xdg.portal.enable` is not.
+
+🛑 **`nix flake check` does not check `nixosModules`** — worth knowing for anyone maintaining a
+flake. It forces the value and asserts it is a lambda taking an open attribute set, and stops;
+nix's source still carries `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`
+Measured: a module with a nonexistent option, a nonexistent `pkgs` attribute **and** a nonexistent
+`lib` function passes, printing `checking NixOS module ... all checks passed!`. `nix.yml`'s header
+claimed that leg covered the module; it never had. `checks.<system>.nixos-module`
+(`packaging/nix/module-check.nix`) now evaluates it against real nixpkgs across four scenarios and
+asserts on the rendered units, including a guard that the host's `ExecStart` stays on the plain
+store path while the encode worker points at the wrapper. Its assertions are pure Nix, so
+instantiation runs them and the existing `--no-build` leg is enough. `punktfunk-gamescope` gains a
+`build-gamescope` dispatch input — it is on the critical path of every host build yet nothing
+compiled it, and it tracks nixpkgs' gamescope, so a `flake.lock` bump is what breaks it.
+
 ### Host and client environment variables
 
 - **`PUNKTFUNK_ENCODE_WORKER`** *(new, host, Linux)* — where to find the encode worker. Resolution
@@ -87,6 +145,16 @@ still means one thing on both platforms.
 - The 0.26.0 user-facing notes describe a privilege that is deliberately not granted. That is the
   record of what 0.26.0 shipped and is **not** rewritten; the new phrasing — granted to the worker,
   never to the host — lives in `docs/releases/v0.27.0.md`.
+- `install.md` **NixOS** documents `desktopSession`, and its `punktfunk-scripting` bullet no longer
+  claims the runner "ships disabled": that was true only of Arch and source installs — apt, dnf, the
+  Bazzite sysext and now the NixOS module all start it, because the library scanners are plugins.
+  `bazzite.md` carried the same stale claim and is corrected. **Running as a service → Restart the
+  host with your desktop** gains the NixOS one-liner beside the drop-in.
+- `packaging/nix/README.md`: `desktopSession`, `gamescopeHdr`/`gamescopePackage` and the
+  `punktfunk` group added to the option tables; the "what the module configures" list gains the
+  `security.wrappers` entry, with the KWin-identification reasoning for why the capability is on the
+  worker and not the host; and a caveat recording that `nix flake check` does not check the module,
+  plus the two rules for editing `module-check.nix`.
 
 ---
 

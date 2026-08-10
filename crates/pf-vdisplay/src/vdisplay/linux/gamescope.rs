@@ -658,10 +658,12 @@ pub fn foreign_gamescope_running() -> bool {
         if md.uid() != uid {
             continue;
         }
-        let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else {
+        // Resolved, not a raw `comm` read: nixpkgs wraps gamescope too, so on NixOS the kernel
+        // reports `.gamescope-wrap` and this probe saw no foreign session at all.
+        let Some(comm) = crate::proc::match_name(&e.path()) else {
             continue;
         };
-        if !matches!(comm.trim(), "gamescope" | "gamescope-wl") {
+        if !matches!(comm.as_str(), "gamescope" | "gamescope-wl") {
             continue;
         }
         if !descends_from(pid, our_pid) {

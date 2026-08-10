@@ -108,6 +108,12 @@ the host running against a compositor that no longer exists. It keeps listening 
 every session after that fails at capture, which is a confusing way to find out. The drop-in makes a
 compositor restart a host restart.
 
+On **NixOS** don't copy anything — the module has the option:
+
+```nix
+services.punktfunk.host.desktopSession = true;
+```
+
 Skip it on the headless/appliance route below (which has its own session unit), and on **Sway or
 Hyprland**, which don't hand their session to systemd: they never reach `graphical-session.target`, so
 the drop-in is harmless there but does nothing. To make the host come and go with the session on
