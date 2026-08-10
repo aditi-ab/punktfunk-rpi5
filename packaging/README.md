@@ -26,8 +26,8 @@ The other packaging targets have their own READMEs: [`debian/`](debian/README.md
 [`arch/`](arch/README.md) (pacman binary repo + PKGBUILD + SteamOS sysext),
 [`flatpak/`](flatpak/README.md) (the client), [`windows/`](windows/README.md) (host installer +
 drivers), plus `kde/` and `linux/` helpers. **NixOS / Nix** users get a flake (`flake.nix` at the
-repo root) with reproducible host + client packages and a `services.punktfunk` NixOS module —
-see [`nix/README.md`](nix/README.md).
+repo root) with reproducible `punktfunk-host`, `-client`, `-web`, `-scripting` and `-gamescope`
+packages plus a `services.punktfunk` NixOS module — see [`nix/README.md`](nix/README.md).
 
 ## What's needed beyond base Fedora
 

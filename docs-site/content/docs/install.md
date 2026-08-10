@@ -101,6 +101,7 @@ services.punktfunk.host = {
   enable = true;
   users = [ "alice" ];     # added to the `input` group, for virtual gamepads
   openFirewall = true;
+  desktopSession = true;   # on a machine you log into — see below
   settings = { RUST_LOG = "info"; };   # these become host.env
 };
 ```
@@ -108,12 +109,26 @@ services.punktfunk.host = {
 The module does declaratively what the deb/RPM scriptlets do — the systemd user service, udev rules,
 kernel modules, sysctl tuning, the firewall ports and `input` group membership — and brings in the
 web console alongside the host. Because `settings` writes the environment file for you, skip the
-`host.env` step in [After installing](#after-installing). The user services are defined but not
-started, so from your graphical session enable the host and the console:
+`host.env` step in [After installing](#after-installing).
+
+**Set `desktopSession = true` on any machine somebody logs into.** It ties the host to
+`graphical-session.target`, so restarting Plasma or GNOME restarts the host with it. Without it the
+host keeps running against a compositor that no longer exists — still listening, still answering,
+and failing at capture on every session after that. Leave it off for the headless appliance route
+(a pinned compositor or a gamescope box), which may never reach that target. Same reasoning, and
+the same caveats for Sway and Hyprland, as [Restart the host with your
+desktop](/docs/running-as-a-service#restart-the-host-with-your-desktop).
+
+The host and console user services are defined but not started (set `autoStart = true` for an
+appliance), so from your graphical session enable them:
 
 ```sh
 systemctl --user enable --now punktfunk-host punktfunk-web
 ```
+
+The plugin runner needs no such step — like the deb and RPM, the module starts it for you, because
+the game-library scanners ship as plugins. Opt out with
+`services.punktfunk.scripting.autoStart = false;`.
 
 The full option reference (client, console and scripting options, GPU driver notes, headless
 appliance setup) is in
@@ -138,13 +153,19 @@ update, run `nix flake update punktfunk` in your flake directory, then `sudo nix
   For Gaming Mode, add the [Decky plugin](/docs/steam-deck) on top of it. Full client instructions
   for every device: [Install a Client](/docs/install-client).
 
-- **`punktfunk-scripting`** — the plugin/script runner. Install it if you want
-  [plugins](/docs/plugins) or [automation](/docs/automation). It's inert until you add something to
-  run, so its user unit ships **disabled** — enable it once you have:
+- **`punktfunk-scripting`** — the plugin/script runner, behind [plugins](/docs/plugins) and
+  [automation](/docs/automation). The game-library scanners ship as plugins, so a host without the
+  runner can come up with an empty library — which is why **apt, dnf, the Bazzite sysext and the
+  NixOS module all start it for you**. On **Arch** and source installs it is not started, so enable
+  it yourself:
 
   ```sh
   systemctl --user enable --now punktfunk-scripting
   ```
+
+  To opt out where it *is* on: `systemctl --user mask punktfunk-scripting` (`mask`, not `disable` —
+  a plain disable cannot remove a symlink that lives in `/etc` or `/usr`), or on NixOS
+  `services.punktfunk.scripting.autoStart = false;`.
 
 ## After installing
 

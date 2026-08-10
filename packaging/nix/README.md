@@ -66,6 +66,7 @@ Add the flake and enable the host and/or client:
             enable = true;
             users = [ "alice" ];        # → added to the `input` group for virtual gamepads
             openFirewall = true;        # native + GameStream ports
+            desktopSession = true;      # a machine you log into — restart the host with the desktop
             settings = {
               PUNKTFUNK_VIDEO_SOURCE = "virtual";
               RUST_LOG = "info";
@@ -85,10 +86,11 @@ Add the flake and enable the host and/or client:
 }
 ```
 
-Then, in your graphical session:
+Then, in your graphical session (the console follows with `punktfunk-web`; the plugin runner is
+already started for you — see `scripting.autoStart` below):
 
 ```sh
-systemctl --user enable --now punktfunk-host
+systemctl --user enable --now punktfunk-host punktfunk-web
 ```
 
 ### Options
@@ -101,10 +103,12 @@ systemctl --user enable --now punktfunk-host
 | `gamestream` | `true` | `serve --gamestream` (Moonlight-compatible). `false` = native-only, more secure. |
 | `autoStart` | `false` | Add the user service to `default.target` (appliance mode — pair with lingering). |
 | `desktopSession` | `false` | Bind the host to `graphical-session.target` — **turn this on for a machine somebody logs into** (see below). |
-| `users` | `[ ]` | Users added to the `input` group (virtual gamepads). |
+| `users` | `[ ]` | Users added to the `input` **and `punktfunk`** groups (virtual gamepads; the second covers the usbip/vhci nodes the virtual Steam Deck pad attaches through — it can emulate arbitrary USB hardware, so list only users you'd trust with that). |
 | `settings` | `{ }` | `host.env` key/values (see `${package}/share/punktfunk-host/host.env.example`). |
 | `environmentFile` | `null` | Extra `EnvironmentFile` for secrets (e.g. `PUNKTFUNK_MGMT_TOKEN`); loaded optionally. |
 | `openFirewall` | `false` | Open the inbound ports (see below). |
+| `gamescopeHdr` | `true` | Put `punktfunk-gamescope` (gamescope + our `pipewire-hdr` patches) on the service PATH, so a 10-bit client can stream true HDR10 off a gamescope output. Costs a gamescope build from source — set `false` to skip it and stay SDR on that backend. |
+| `gamescopePackage` | flake's | The patched gamescope used when `gamescopeHdr = true`. |
 | `package` | flake's | Override the package. |
 
 **`desktopSession` — set it on a desktop, leave it off on an appliance.** On a machine somebody logs
@@ -178,19 +182,36 @@ on a *user* unit needs unprivileged user namespaces; drop it with
 Everything the RPM's `%install` + `%post` do, declaratively:
 
 - **systemd `--user` service** `punktfunk-host` → `serve [--gamestream]`, `EnvironmentFile` from
-  `settings` (+ optional secret file), `Restart=on-failure`.
+  `settings` (+ optional secret file), `Restart=on-failure`, and — with `desktopSession` —
+  `PartOf=graphical-session.target`.
 - **udev rules** (`60-punktfunk.rules`): `/dev/uinput` + `/dev/uhid` group access and the vhci
   sysfs perms for the virtual Steam Deck.
 - **kernel modules**: `uinput`, `uhid`, `vhci-hcd` (usbip transport so Steam Input adopts the
   virtual Deck).
 - **sysctl**: `net.core.{r,w}mem_max = 32 MB` (high-bitrate UDP headroom; `mkDefault`).
-- **`input` group** membership for `users`.
+- **`input` and `punktfunk` groups**, declared and joined for `users`. Both are required: the udev
+  rule `chgrp punktfunk`s the vhci nodes and fails outright if nothing ever created that group.
+- **A `security.wrappers` entry for `punktfunk-encode-worker`** carrying `cap_sys_nice=ep`, with
+  `PUNKTFUNK_ENCODE_WORKER` pointed at it. A file capability cannot live on a read-only store path,
+  so a wrapper is the only mechanism NixOS has. The capability is deliberately **not** on the host
+  itself — see the caveat below.
 - **`hardware.graphics.enable = true`** (`mkDefault`) so `/run/opengl-driver/lib` has the driver
   libs the binaries `dlopen`.
 - **firewall** (when `openFirewall`): native UDP 9777/5353 + TCP 47990; with `gamestream` also TCP
-  47984/47989/48010 + UDP 47998/47999/48000. The media data plane is an ephemeral, hole-punched
-  UDP port — nothing fixed to open.
+  47984/47989/48010 + UDP 47998/47999/48000; with the console, TCP 47992 + 47993. The media data
+  plane is an ephemeral, hole-punched UDP port — nothing fixed to open.
 - **tray autostart** entry (`--autostart`; self-gates to users who actually run a host).
+- **A warning** if `xdg.portal.enable` is off (see the portal note above).
+
+> **Why the capability is on the worker and not the host.** KWin only advertises its restricted
+> protocols (`zkde_screencast_unstable_v1` for the virtual output, `org_kde_kwin_fake_input` for
+> input) to a client it can *identify*, by resolving that client's `/proc/<pid>/exe` and matching an
+> installed `.desktop`'s `Exec=`. The kernel refuses that readlink to any reader whose effective set
+> is not a superset of the target's permitted set, and KWin holds no capabilities. A NixOS wrapper
+> does not dodge this — it raises the capability into the ambient set before exec'ing, which lands
+> it in the permitted set and fails the readlink identically. Giving the host `cap_sys_nice` broke
+> desktop streaming on every KDE box in 0.26.0-1. The encode worker is a separate binary that
+> nothing ever has to identify, so the grant is safe there.
 
 ### GPU drivers (out of scope of the module — set these yourself)
 
@@ -213,8 +234,15 @@ services.punktfunk.host = {
   settings = { PUNKTFUNK_COMPOSITOR = "gamescope"; };  # appliance-only; omit to auto-detect
 };
 users.users.streamer.linger = true;
-# For the gamescope/KWin backends extend the service PATH, e.g.:
-# systemd.user.services.punktfunk-host.path = [ pkgs.gamescope ];
+```
+
+Leave `desktopSession` off here — an appliance starts its own compositor and may never reach
+`graphical-session.target`, which would leave the host permanently stopped. `gamescopeHdr` (on by
+default) already puts the patched `punktfunk-gamescope` on the service PATH, so the gamescope
+backend needs no PATH surgery; extend it only for a helper the module doesn't know about:
+
+```nix
+# systemd.user.services.punktfunk-host.path = [ pkgs.some-helper ];
 ```
 
 The `${package}/share/punktfunk-host/headless/` helpers (KDE/Sway session scripts, example
@@ -311,10 +339,30 @@ The shell exports an
   to consume a prebuilt Skia offline (a fixed-output derivation of the rust-skia tarball) or a
   vendored from-source Skia build — a tracked follow-up.
 
+- **⚠ `nix flake check` does NOT check the NixOS module — that is why `module-check.nix` exists.**
+  For `nixosModules`, nix forces the value and asserts it is a lambda taking an open attribute set,
+  and stops there (its source still carries `// FIXME: if we have a 'nixpkgs' input, use it to check
+  the module.`). Measured: a module setting a nonexistent *option*, referencing a nonexistent
+  `pkgs` attribute **and** calling a nonexistent `lib` function passes clean, printing
+  `checking NixOS module 'nixosModules.default'... all checks passed!`. So the reassuring line means
+  nothing. `checks.<system>.nixos-module` (`packaging/nix/module-check.nix`) closes it: it evaluates
+  the module against real nixpkgs in four scenarios and asserts on the rendered systemd units.
+  Two rules if you edit it — **keep every assertion pure Nix** (instantiating the derivation is what
+  runs them, which is what lets the cheap `--no-build` CI leg cover it; a shell script in the
+  `runCommand` body would only run under a full `nix flake check`, i.e. an hour of Rust), and
+  **assert list-valued unit fields on the evaluated lists**, not the rendered text — systemd renders
+  `After=` as one space-separated line, so an `hasInfix` on it silently depends on ordering.
+
 ## Verified
 
-Both packages build, install, and run on real Nix hardware (NixOS-equivalent: CachyOS + Nix,
+The packages build, install, and run on real Nix hardware (NixOS-equivalent: CachyOS + Nix,
 RTX 5070 Ti, driver 610). `punktfunk-host --version` and `punktfunk-session` run; the driver
 RUNPATH (`/run/opengl-driver/lib`) and the GTK GApps wrapper (GSettings schemas + pixbuf loaders)
 are present. Fixes discovered during that bring-up: `CMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake ≥ 4),
 system `libopus` (audiopus_sys), and the session Skia note above.
+
+In CI (`.gitea/workflows/nix.yml`): `nix flake check --no-build` evaluates every output *including*
+the module check above, and `punktfunk-web` + `punktfunk-scripting` are built for real. The Rust
+packages and `punktfunk-gamescope` are `workflow_dispatch` opt-ins (`build-rust`,
+`build-gamescope`) — run the latter after a `flake.lock` bump, since it patches whatever gamescope
+the pinned nixpkgs carries.
