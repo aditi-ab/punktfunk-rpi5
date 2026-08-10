@@ -101,6 +101,7 @@ fn epic_entry(
     Some(GameEntry {
         provider: None,
         role: GameRole::Game,
+        icon: None,
         meta: GameMeta::pc(),
         id: format!("epic:{app_name}"),
         store: "epic".into(),

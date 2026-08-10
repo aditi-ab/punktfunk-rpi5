@@ -346,7 +346,9 @@ private struct GameCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            PosterImage(candidates: game.art.posterCandidates, title: game.title, loader: artLoader)
+            PosterImage(
+                candidates: game.art.posterCandidates, title: game.title, loader: artLoader,
+                icon: game.iconToken)
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .frame(maxWidth: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))

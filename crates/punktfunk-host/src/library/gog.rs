@@ -58,6 +58,7 @@ fn gog_games() -> Vec<GameEntry> {
         out.push(GameEntry {
             provider: None,
             role: GameRole::Game,
+            icon: None,
             meta: GameMeta::pc(),
             id,
             store: "gog".into(),

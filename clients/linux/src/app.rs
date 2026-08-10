@@ -66,6 +66,9 @@ const CSS: &str = "
    named instead of a title monogram, and an accent badge. */
 .pf-poster.pf-launcher { background: alpha(@accent_color, 0.18); }
 .pf-poster-launcher-name { font-size: 1.15em; font-weight: bold; color: alpha(currentColor, 0.85); }
+/* The brand mark when we ship one for this launcher — same ink as the name it replaces, so the
+   two fallback rungs read as one design rather than two. */
+.pf-poster-launcher-mark { color: alpha(currentColor, 0.85); }
 .pf-store-badge.pf-launcher { color: white; background: @accent_color; }
 .pf-group-heading { font-size: 0.8em; font-weight: bold; color: alpha(currentColor, 0.55); }
 ";

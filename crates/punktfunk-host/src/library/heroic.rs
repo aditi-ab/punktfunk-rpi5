@@ -110,6 +110,7 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
         games.push(GameEntry {
             provider: None,
             role: GameRole::Game,
+            icon: None,
             meta: GameMeta::pc(),
             id: format!("heroic:{runner}:{app_name}"),
             store: "heroic".into(),

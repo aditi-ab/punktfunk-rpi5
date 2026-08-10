@@ -60,6 +60,26 @@ export type LaunchSpec = typeof LaunchSpec.Type;
 export const GameRole = Schema.Literals(["game", "launcher"]);
 export type GameRole = typeof GameRole.Type;
 
+/**
+ * The brand marks the shipped clients draw for a launcher tile. A plugin puts one of these in an
+ * entry's `icon` and every client resolves it against the art it bundles
+ * (`assets/launcher-icons` — provenance and licensing in that directory's README).
+ *
+ * Not a union type on purpose, exactly like {@link LaunchSpec}'s `kind`: a client that has never
+ * heard of a token falls back to naming the launcher on an accent face — which is what every
+ * launcher tile looked like before icons existed — so a plugin naming a mark a *newer* client
+ * ships must not fail to typecheck against an older kit.
+ */
+export const LAUNCHER_ICONS = [
+	"steam",
+	"lutris",
+	"heroic",
+	"playnite",
+	"epic",
+	"gog",
+	"xbox",
+] as const;
+
 export const PrepStep = Schema.Struct({
 	do: Schema.String,
 	undo: Schema.optionalKey(Schema.NullOr(Schema.String)),
@@ -142,6 +162,27 @@ export const ProviderEntry = Schema.Struct({
 	detect: Schema.optionalKey(DetectHint),
 	/** `"game"` (default) or `"launcher"` — see {@link GameRole}. */
 	role: Schema.optionalKey(GameRole),
+	/**
+	 * Which brand mark a client should draw for this entry — a **token** ({@link LAUNCHER_ICONS}),
+	 * never image bytes and never a URL. `[a-z][a-z0-9-]{0,31}`; the host rejects anything else.
+	 *
+	 * This is what makes a launcher tile look like its launcher. Launcher entries ship no cover art
+	 * by design — a launcher's own icon is square, clients cover-crop a 2:3 poster, and the crop
+	 * turns a mark into a strip — so before this they were the launcher's name on a flat accent
+	 * face. Naming the mark instead of sending it keeps the glyph vector at any tile size, lets it
+	 * take the tile's ink, and adds nothing to a reconcile payload that is already body-limited.
+	 *
+	 * Sending art instead is not an option the host leaves open: its art proxy serves raster
+	 * containers only and refuses SVG outright, because SVG is script-capable XML and the web
+	 * console renders library art in a browser.
+	 *
+	 * A token no client bundles is not an error — that tile just falls back to its name. To get a
+	 * new launcher's mark shipped, open a PR adding the master to `assets/launcher-icons`.
+	 *
+	 * Set it on your `launchers(cfg)` entries. Ordinary titles may carry one, but shouldn't: a game
+	 * has real cover art, which beats a brand mark every time.
+	 */
+	icon: Schema.optionalKey(Schema.String),
 	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;

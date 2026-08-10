@@ -50,6 +50,10 @@ let package = Package(
                 // licensing in that README). `.process` compiles the catalog; loaded via
                 // OsIcon.swift.
                 .process("Resources/OsIcons.xcassets"),
+                // The launcher tiles' brand marks (template vector imagesets generated from the
+                // assets/launcher-icons masters by scripts/gen-launcher-icons.sh — per-mark
+                // provenance and licensing in that README). Loaded via LauncherIcon.swift.
+                .process("Resources/LauncherIcons.xcassets"),
             ],
             linkerSettings: [
                 // Rust staticlib system deps.

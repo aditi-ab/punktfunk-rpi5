@@ -1,6 +1,7 @@
 import { Eye, EyeOff, Pencil, Trash2 } from "lucide-react";
 import { type FC, useState } from "react";
 import type { OperatorGameEntry } from "@/api/gen/model/operatorGameEntry";
+import { LauncherIcon } from "@/components/launcher-icon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -63,6 +64,10 @@ export const GameCard: FC<GameCardProps> = ({
 		(u): u is string => !!u && !failed[u],
 	);
 	const src = candidates[0];
+	// A launcher tile ships no cover art by design (its own icon is square and this frame is 2:3),
+	// so the brand mark IS its poster. Only when there is no artwork at all: a plugin that does send
+	// a cover has out-voted the token.
+	const mark = !src && game.icon ? <LauncherIcon icon={game.icon} /> : null;
 
 	return (
 		<Card className="group relative overflow-hidden">
@@ -78,6 +83,16 @@ export const GameCard: FC<GameCardProps> = ({
 						className={`size-full object-cover${hidden ? " opacity-30" : ""}`}
 						onError={() => setFailed((prev) => ({ ...prev, [src]: true }))}
 					/>
+				) : mark ? (
+					// The mark carries the tile on its own — the launcher's name is already
+					// directly below the frame, so repeating it here would just crowd the glyph.
+					<div
+						className={`flex size-full items-center justify-center p-8 text-muted-foreground${
+							hidden ? " opacity-30" : ""
+						}`}
+					>
+						<div className="w-full max-w-24 [&>svg]:size-full">{mark}</div>
+					</div>
 				) : (
 					<div
 						className={`flex size-full items-center justify-center p-3 text-center text-sm font-medium text-muted-foreground${
