@@ -242,7 +242,8 @@ private struct ShotGamepadHome: View {
     var body: some View {
         GamepadHomeView(
             store: store, model: model, discovery: discovery,
-            libraryTarget: .constant(nil), waker: waker,
+            libraryTarget: .constant(nil), pairingTarget: .constant(nil),
+            onPaired: { _, _ in }, waker: waker,
             connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in })
     }
 }
@@ -300,7 +301,8 @@ private struct ShotConnect: View {
         if gamepadUI {
             GamepadHomeView(
                 store: store, model: model, discovery: discovery,
-                libraryTarget: .constant(nil), waker: waker,
+                libraryTarget: .constant(nil), pairingTarget: .constant(nil),
+            onPaired: { _, _ in }, waker: waker,
                 connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in })
         } else {
             ShotHome()

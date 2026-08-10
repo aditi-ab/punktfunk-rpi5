@@ -69,6 +69,13 @@ struct GamepadHomeView: View {
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
     @Binding var libraryTarget: StoredHost?
+    /// The host awaiting a PIN ceremony, if any. Owned by ContentView (a connect attempt sets it,
+    /// as does the trust card's "Pair with PIN instead"), presented here as a shell screen —
+    /// PairSheet's `Form` is unreachable with a controller on iOS/macOS, which made pairing the
+    /// one thing a console-UI user simply could not do. See GamepadPairView.
+    @Binding var pairingTarget: StoredHost?
+    /// Pin the verified fingerprint and connect — ContentView's `handlePaired`.
+    let onPaired: (StoredHost, Data) -> Void
     /// Wake-and-wait driver — gates the carousel while its overlay is up, and the carousel's
     /// activate routes an offline+wakeable host through it (see ContentView.startSession).
     @ObservedObject var waker: HostWaker
@@ -234,6 +241,10 @@ struct GamepadHomeView: View {
     /// The screen the shell shows over the launcher — derived from the same triggers every
     /// platform sets, so `returnToLibrary`, the tiles, X and Y all keep writing what they wrote.
     private var topScreen: GamepadScreen? {
+        // Pairing leads: it is a ceremony blocking a connect the user already asked for, and it
+        // can be raised from ON TOP of the library (launching a title on an unpaired host), where
+        // it has to win. Backing out of it reveals whatever it interrupted.
+        if let host = pairingTarget { return .pair(host) }
         if showSettings { return .settings }
         if showAddHost { return .addHost }
         if let host = libraryTarget { return .library(host) }
@@ -255,6 +266,12 @@ struct GamepadHomeView: View {
                 GamepadAddHostView(
                     onAdd: { store.add($0) },
                     close: { if !transitioning { showAddHost = false } },
+                    controllerActive: active)
+            case .pair(let host):
+                GamepadPairView(
+                    host: host,
+                    onPaired: { onPaired(host, $0) },
+                    close: { if !transitioning { pairingTarget = nil } },
                     controllerActive: active)
             case .library(let host):
                 GamepadLibraryScreen(
@@ -305,7 +322,10 @@ struct GamepadHomeView: View {
         topScreen == nil && !transitioning
             && waker.waking == nil && model.phase != .connecting
         #else
-        libraryTarget == nil && !showSettings && !showAddHost
+        // `pairingTarget` too: macOS presents the pair screen as a sheet and tvOS as a cover, and
+        // either way the launcher underneath must stop consuming the pad — the pair screen's own
+        // list is polling the same controller.
+        libraryTarget == nil && pairingTarget == nil && !showSettings && !showAddHost
             && waker.waking == nil && model.phase != .connecting
         #endif
     }

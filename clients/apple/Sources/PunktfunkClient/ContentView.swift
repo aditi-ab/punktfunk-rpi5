@@ -390,8 +390,21 @@ struct ContentView: View {
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
         #if !os(tvOS)
-        .sheet(item: $pairingTarget) { host in
+        // macOS presents BOTH pairing UIs from here, picking by mode (the console UI's screen is
+        // gamepad-navigable; PairSheet's Form is not). iOS hides this sheet in gamepad mode
+        // instead — there the pair screen is one of the shell's in-place layers, exactly like
+        // settings and add-host (see `touchPairingTarget`).
+        .sheet(item: touchPairingTarget) { host in
+            #if os(macOS)
+            if gamepadUIActive {
+                GamepadPairView(host: host, onPaired: { handlePaired(host, fingerprint: $0) })
+                    .frame(width: 660, height: 620)
+            } else {
+                PairSheet(host: host) { fingerprint in handlePaired(host, fingerprint: fingerprint) }
+            }
+            #else
             PairSheet(host: host) { fingerprint in handlePaired(host, fingerprint: fingerprint) }
+            #endif
         }
         .sheet(item: $speedTestTarget) { host in
             SpeedTestSheet(host: host)
@@ -440,6 +453,20 @@ struct ContentView: View {
         Binding(
             get: { gamepadUIActive ? nil : libraryTarget },
             set: { libraryTarget = $0 })
+    }
+
+    /// The pairing sheet's item. On iOS it hides while the gamepad shell presents the pair screen
+    /// in place — the same proxy the library uses, and for the same reason: every writer keeps
+    /// writing `pairingTarget`, and whichever presentation the current mode owns picks it up.
+    /// macOS has no shell, so the sheet stays and switches its CONTENT by mode instead.
+    private var touchPairingTarget: Binding<StoredHost?> {
+        #if os(macOS)
+        Binding(get: { pairingTarget }, set: { pairingTarget = $0 })
+        #else
+        Binding(
+            get: { gamepadUIActive ? nil : pairingTarget },
+            set: { pairingTarget = $0 })
+        #endif
     }
 
     private var approvalChoicePresented: Binding<Bool> {
@@ -598,7 +625,8 @@ struct ContentView: View {
             if gamepadUIActive {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
-                    libraryTarget: $libraryTarget, waker: waker,
+                    libraryTarget: $libraryTarget, pairingTarget: $pairingTarget,
+                    onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     launchTitle: launchTitle)
             } else {
@@ -615,7 +643,8 @@ struct ContentView: View {
             if gamepadUIActive {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
-                    libraryTarget: $libraryTarget, waker: waker,
+                    libraryTarget: $libraryTarget, pairingTarget: $pairingTarget,
+                    onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     launchTitle: launchTitle)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations

@@ -5,18 +5,14 @@
 // host rate-limits ceremonies to one per 2 s). Success returns the host's now-VERIFIED
 // fingerprint: the caller pins it, no manual comparison needed, and the host stores this
 // client's identity in return.
+//
+// This is the TOUCH/desktop presentation (and tvOS's, where the focus engine drives the same
+// fields). A controller can't reach a `Form`'s text fields on iOS/macOS, so the console UI
+// presents `GamepadPairView` instead — same ceremony, via the shared `PairCeremony`.
 
 import Foundation
 import PunktfunkKit
 import SwiftUI
-
-/// Dismissing the sheet must abandon an in-flight ceremony: the blocking pair() call
-/// can't be interrupted, so its completion checks this flag and self-discards — a late
-/// success must NOT pin and auto-connect to a host the user cancelled out of. Only
-/// touched on the main actor.
-private final class CeremonyToken: @unchecked Sendable {
-    var cancelled = false
-}
 
 struct PairSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -30,9 +26,10 @@ struct PairSheet: View {
     #else
     @State private var clientName = UIDevice.current.name
     #endif
-    @State private var busy = false
-    @State private var errorText: String?
-    @State private var token = CeremonyToken()
+    @StateObject private var ceremony = PairCeremony()
+
+    private var busy: Bool { ceremony.busy }
+    private var errorText: String? { ceremony.errorText }
     #if os(tvOS)
     private enum EditField: String, Identifiable {
         case pin, clientName
@@ -64,7 +61,7 @@ struct PairSheet: View {
             }
             HStack(spacing: 32) {
                 Button("Cancel", role: .cancel) {
-                    token.cancelled = true
+                    ceremony.abandon()
                     dismiss()
                 }
                 if busy {
@@ -78,7 +75,7 @@ struct PairSheet: View {
         .frame(maxWidth: 1000)
         .padding(60)
         .navigationTitle("Pair with \(host.displayName)")
-        .onDisappear { token.cancelled = true }
+        .onDisappear { ceremony.abandon() }
         .fullScreenCover(item: $editing) { field in
             switch field {
             case .pin:
@@ -142,7 +139,7 @@ struct PairSheet: View {
         #endif
             HStack {
                 Button("Cancel", role: .cancel) {
-                    token.cancelled = true
+                    ceremony.abandon()
                     dismiss()
                 }
                 #if !os(tvOS)
@@ -180,7 +177,7 @@ struct PairSheet: View {
         .presentationDragIndicator(busy ? .hidden : .visible)
         #endif
         .interactiveDismissDisabled(busy)
-        .onDisappear { token.cancelled = true } // any other dismissal path
+        .onDisappear { ceremony.abandon() } // any other dismissal path
         #endif
     }
 
@@ -195,47 +192,11 @@ struct PairSheet: View {
     }
 
     private func runCeremony() {
-        busy = true
-        errorText = nil
-        let pin = pin.trimmingCharacters(in: .whitespaces)
-        let name = clientName.trimmingCharacters(in: .whitespaces)
-        let address = host.address
-        let port = host.port
-        let token = token
-        Task.detached(priority: .userInitiated) {
-            // Identity load + the ceremony both block — keep them off the main actor.
-            // loadForPairing is the strict variant: the host durably trusts this
-            // identity, so it must have made it into the Keychain.
-            let result = Result {
-                let identity = try ClientIdentityStore.shared.loadForPairing()
-                return try PunktfunkKit.pair(
-                    host: address, port: port, identity: identity,
-                    pin: pin, name: name.isEmpty ? "Mac" : name)
-            }
-            await MainActor.run {
-                guard !token.cancelled else { return } // sheet dismissed mid-ceremony
-                busy = false
-                switch result {
-                case .success(let fingerprint):
-                    onPaired(fingerprint)
-                    dismiss()
-                case .failure(PunktfunkClientError.wrongPIN):
-                    errorText = "Wrong PIN — check the host's web console (port 47992) "
-                        + "and try again."
-                case .failure(PunktfunkClientError.rejected(let rejection)):
-                    // The host answered and said why (not armed / rate-limited / armed for
-                    // another device) — show that instead of the guessing-game fallback.
-                    errorText = rejection.userMessage
-                case .failure(is ClientIdentityStore.IdentityError):
-                    errorText = "Can't store this Mac's identity in the Keychain, so the "
-                        + "pairing would not survive a relaunch. Unlock the login "
-                        + "keychain and try again."
-                case .failure:
-                    errorText = "Pairing failed — the host didn't answer. Is it running, "
-                        + "and is this device on the same network (no VPN, no guest-Wi-Fi "
-                        + "isolation)?"
-                }
-            }
+        ceremony.run(
+            host: host.address, port: host.port, pin: pin, clientName: clientName
+        ) { fingerprint in
+            onPaired(fingerprint)
+            dismiss()
         }
     }
 }
