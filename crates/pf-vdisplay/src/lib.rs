@@ -88,7 +88,7 @@ pub use session::{session_epoch, try_recover_session};
 pub(crate) mod routing;
 pub use routing::{
     apply_input_env, managed_session_available, preflight_takeover_privilege,
-    resolve_gamescope_route, restore_managed_session, restore_takeover_now,
+    release_autologin_mask, resolve_gamescope_route, restore_managed_session, restore_takeover_now,
     restore_takeover_on_startup, start_restore_worker, wants_dedicated_game_session,
     GamescopeRoute,
 };

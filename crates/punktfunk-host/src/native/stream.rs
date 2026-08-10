@@ -1144,6 +1144,13 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
         match pending {
             // Stable at the new kind for the debounce window — the switch is real, signal it.
             Some((k, since)) if k == cur && since.elapsed() >= DEBOUNCE => {
+                // Before anything about capture: a managed takeover runtime-masks the box's own
+                // autologin gaming unit, and a switch to a desktop session ends the window where
+                // that mask is sound. Left on, it silently bars the way back — the user's "Return
+                // to Gaming Mode" cannot start a masked unit, so Steam sits on its "Switch to
+                // Desktop…" modal until a reboot clears it. Ahead of the `compositor_for_kind`
+                // arm below on purpose: a switch we cannot follow still has to unbar the return.
+                vdisplay::release_autologin_mask(cur);
                 match vdisplay::compositor_for_kind(cur) {
                     Some(comp) => {
                         tracing::info!(from = ?current, to = ?cur, compositor = comp.id(),
