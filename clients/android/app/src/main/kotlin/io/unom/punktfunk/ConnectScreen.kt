@@ -1254,6 +1254,9 @@ fun ConnectScreen(
                 editHost = kh,
                 suggestedMacs = suggested,
                 onSave = onSaveHost,
+                // Shared clipboard and the profile binding — the two host decisions that used to
+                // exist only in the touch edit sheet, which a TV box has no way to reach.
+                profiles = profiles,
             )
         } else {
             EditHostDialog(

@@ -40,6 +40,11 @@ import androidx.compose.ui.layout.ContentScale
 import android.content.res.Configuration
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.zIndex
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
@@ -265,7 +270,13 @@ private fun Coverflow(
                     color = ink.fg(0.45f),
                     letterSpacing = 2.sp,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // A live region: this heading is the ONLY signal that the cursor has
+                        // crossed from the launchers into the games, and a coverflow gives a
+                        // reader no other way to notice — it is one strip, not two lists.
+                        .semantics { liveRegion = LiveRegionMode.Polite }
+                        .padding(bottom = 8.dp),
                 )
             }
             HorizontalPager(
@@ -287,9 +298,21 @@ private fun Coverflow(
                         .width(coverWidth)
                         .height(coverHeight)
                         // Touch: tap the centred cover to launch it; tap a neighbour to bring it centre.
-                        .clickable {
+                        // The label says which of the two a press does, because from the poster
+                        // alone they are indistinguishable — and the CENTRED one is the only one A
+                        // acts on, which nothing else in the tree says.
+                        .clickable(
+                            onClickLabel = if (page == pagerState.currentPage) {
+                                "Launch ${games[page].title}"
+                            } else {
+                                "Bring ${games[page].title} to the centre"
+                            },
+                        ) {
                             if (page == pagerState.currentPage) onLaunch(games[page])
                             else scope.launch { pagerState.animateScrollToPage(page) }
+                        }
+                        .semantics {
+                            if (page == pagerState.currentPage) selected = true
                         }
                         .graphicsLayer {
                             // Centre at full size; EVERY neighbour settles to one size, so an even pitch
@@ -390,6 +413,15 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
                 // a plain dark wash over its own art.
                 color = if (game.isLauncher) ink.onAccent else Color.White,
                 modifier = Modifier
+                    // A bare store name read out after the title says nothing about WHY it is
+                    // there; the poster's own description already carries the title.
+                    .semantics {
+                        contentDescription = if (game.isLauncher) {
+                            "Opens ${game.storeLabel}"
+                        } else {
+                            "From ${game.storeLabel}"
+                        }
+                    }
                     .clip(ConsoleShape.Pill)
                     .background(
                         // The console's palette accent, not `MaterialTheme.colorScheme.primary` —
