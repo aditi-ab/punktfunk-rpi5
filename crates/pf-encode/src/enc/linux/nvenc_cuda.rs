@@ -747,8 +747,15 @@ pub struct NvencCudaEncoder {
     fps: u32,
     bitrate_bps: u64,
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
-    /// Encoded bit depth (8 on Linux until Phase 5.1 lands a P010 capture path). Kept for parity with
-    /// the Windows Main10 config, which is ported but inert until a 10-bit input exists.
+    /// Encoded bit depth. **10 is live on Linux** — this used to say "8 until Phase 5.1 lands a P010
+    /// capture path", which the code has since outrun: the gamescope HDR capture patches offer
+    /// 10-bit BT.2020/PQ formats, `nvenc_fmt` maps `X2Rgb10`/`X2Bgr10` to `ARGB10`/`ABGR10`, and
+    /// [`is_ten_bit_input`] flips this field and `hdr` from the negotiated input. A 10-bit frame
+    /// deliberately takes NEITHER the NV12 nor the YUV444 convert (both compute CSCs write 8-bit
+    /// planes) and rides packed RGB to the encoder, which does its own BT.2020 CSC —
+    /// `pf-capture/src/linux/pipewire.rs` owns that gate. So Main10 needed no P010 path to arrive.
+    /// P010 remains worth having later purely as a perf win (pre-convert so NVENC skips its internal
+    /// RGB→YUV CSC, as NV12 already does for SDR) — it is not what makes 10-bit work.
     bit_depth: u8,
     /// Full-chroma 4:4:4 (HEVC Range Extensions) — set when the capturer delivers a planar-YUV444
     /// `DeviceBuffer` on an HEVC session and the GPU supports YUV444 encode.
