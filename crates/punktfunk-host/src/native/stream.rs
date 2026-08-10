@@ -1899,10 +1899,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // a stats capture armed after a resize registers the real mode. Seeded with the refresh the
     // initial build actually achieved (`interval_hz`), not the request — KWin may cap a virtual
     // output at 60 Hz.
+    // …and seeded with the SIZE the build actually delivered too, not just the refresh. Attach is
+    // what made the asymmetry visible: `gamescope: box drives a physical display — attaching at its
+    // own mode (no re-mode)` streams the panel's size, so a client that asked for 5120x1440 is
+    // really watching 1920x1080 while `/api/v1/local/summary` echoed the request straight back and
+    // the console reported a resolution nobody was looking at. The rebuild path below already
+    // publishes `delivered_mode`; bring-up simply never did, so only a mid-stream resize ever
+    // corrected it. This publishes the stats slot ONLY — it deliberately does not send the client a
+    // corrective `Reconfigured`, which stays owed exactly where it already was (`adopted_at_bringup`
+    // above): an ordinary connect's mode came from the Welcome, not from an accept the client has
+    // acted on, so it is not owed one.
+    let delivered = delivered_mode(frame.width, frame.height, interval);
     let live_mode = Arc::new(AtomicU64::new(pack_mode(
-        mode.width,
-        mode.height,
-        interval_hz(interval),
+        delivered.width,
+        delivered.height,
+        delivered.refresh_hz,
     )));
     // One-shot force-keyframe flag driven by the management API (`POST /session/idr`, the web-console
     // Dashboard's "Request IDR" button) — drained in the encode loop below exactly like a client
