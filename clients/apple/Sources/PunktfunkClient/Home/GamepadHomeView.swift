@@ -156,15 +156,7 @@ struct GamepadHomeView: View {
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
-        .onAppear {
-            discovery.start()
-            // TEMPORARY verification hook (PUNKTFUNK_DIAG_OPEN=settings). Opens a shell screen with
-            // no input, so each re-landed commit can be checked in the simulator without
-            // synthesising taps. Removed before this work is committed.
-            if ProcessInfo.processInfo.environment["PUNKTFUNK_DIAG_OPEN"] == "settings" {
-                showSettings = true
-            }
-        }
+        .onAppear { discovery.start() }
         .onDisappear { discovery.stop() }
         // Reachability sweep (mDNS-independent) so routed/VPN hosts that never advertise still show
         // Online — the console mirror of HomeView's `.task`; cancelled on disappear.
