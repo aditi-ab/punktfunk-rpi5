@@ -1118,6 +1118,21 @@ leg_v4() {
   fi
 }
 
+# Median of a space-separated integer list. Used by v5 instead of a raw min/max spread: an fd count
+# legitimately jitters by one (a dmabuf fd in flight at the sampling instant), and a median over a
+# third of the run is immune to that while still moving under a real leak.
+_median() {
+  local -a s
+  # shellcheck disable=SC2206  # deliberate word-splitting: the argument IS a list of integers
+  s=( $(printf '%s\n' $1 | sort -n) )
+  local n=${#s[@]}
+  [ "$n" -eq 0 ] && return 1
+  printf '%s' "${s[$(( n / 2 ))]}"
+}
+# First / last third of a space-separated list (at least one element each).
+_first_third() { set -- $1; local k=$(( ($# + 2) / 3 )); [ "$k" -lt 1 ] && k=1; printf '%s' "${*:1:$k}"; }
+_last_third()  { set -- $1; local k=$(( ($# + 2) / 3 )); [ "$k" -lt 1 ] && k=1; printf '%s' "${*: -$k}"; }
+
 leg_v5() {
   head2 "V5 — fd hygiene over a long session"
   info "The fd-identity cache passes a dmabuf's fds only on FIRST sight of its buffer key, and the"
@@ -1171,6 +1186,7 @@ leg_v5() {
   info "warm-up ${warm}s, then sampling every 15 s for $(( wall - warm ))s (host pid $spike_pid, worker pid $wpid)"
   sleep "$warm"
   local hmin='' hmax='' wmin='' wmax='' hlast='' wlast='' n=0 elapsed="$warm"
+  local hseries='' wseries=''
   while [ "$elapsed" -lt "$wall" ]; do
     kill -0 "$spike_pid" 2>/dev/null || break
     kill -0 "$wpid" 2>/dev/null || { info "the worker exited at t=${elapsed}s"; break; }
@@ -1178,6 +1194,7 @@ leg_v5() {
     h="$(fd_count "$spike_pid")"; w="$(fd_count "$wpid")"
     if [ -n "$h" ] && [ -n "$w" ]; then
       n=$((n+1)); hlast="$h"; wlast="$w"
+      hseries="$hseries $h"; wseries="$wseries $w"
       [ -z "$hmin" ] && { hmin="$h"; hmax="$h"; wmin="$w"; wmax="$w"; }
       [ "$h" -lt "$hmin" ] && hmin="$h"; [ "$h" -gt "$hmax" ] && hmax="$h"
       [ "$w" -lt "$wmin" ] && wmin="$w"; [ "$w" -gt "$wmax" ] && wmax="$w"
@@ -1191,13 +1208,30 @@ leg_v5() {
     skip V5 "only $n samples — the session did not stay up long enough to say anything"
     return 0
   fi
-  local hg=$((hmax - hmin)) wg=$((wmax - wmin))
-  info "host   fd min=$hmin max=$hmax last=$hlast  growth=$hg"
-  info "worker fd min=$wmin max=$wmax last=$wlast  growth=$wg"
+  # A LEAK IS A TREND, NOT A SPREAD. The earlier verdict here was `max - min`, which cannot tell a
+  # leak from jitter: the worker's count legitimately moves by one when a dmabuf fd happens to be in
+  # flight at the sampling instant, so `max - min` was permanently 1 and the leg failed forever on a
+  # healthy box. Measured on home-nobara-1 2026-08-10, 33 samples over 480 s: the worker oscillated
+  # 54↔55 and ENDED on 54, exactly where it started — no trend at all.
+  #
+  # Median-of-thirds is strictly MORE sensitive to the thing R2 is about: a steady leak moves the
+  # trend just as much as it moves the spread, while bounded jitter moves only the spread. The
+  # warm-up window above already covers the one-off first-sight-of-each-buffer cost, so a plateau
+  # inside it is by design not a leak.
+  local hfirst hlastm wfirst wlastm
+  hfirst="$(_median "$(_first_third "$hseries")")"; hlastm="$(_median "$(_last_third "$hseries")")"
+  wfirst="$(_median "$(_first_third "$wseries")")"; wlastm="$(_median "$(_last_third "$wseries")")"
+  local hg=$(( hlastm - hfirst )) wg=$(( wlastm - wfirst ))
+  info "host   fd min=$hmin max=$hmax last=$hlast  median first/last third=$hfirst/$hlastm  trend=$hg"
+  info "worker fd min=$wmin max=$wmax last=$wlast  median first/last third=$wfirst/$wlastm  trend=$wg"
+  if [ "$(( hmax - hmin ))" -gt 0 ] || [ "$(( wmax - wmin ))" -gt 0 ]; then
+    info "(spread host $(( hmax - hmin )) / worker $(( wmax - wmin )) with a flat trend is in-flight"
+    info "jitter — one dmabuf fd caught mid-handover — not accumulation)"
+  fi
   if [ "$hg" -le "$OPT_FD_TOLERANCE" ] && [ "$wg" -le "$OPT_FD_TOLERANCE" ]; then
-    pass V5 "fd counts stable across ${n} samples over $(( wall - warm ))s (tolerance $OPT_FD_TOLERANCE)"
+    pass V5 "fd counts show no upward trend across ${n} samples (tolerance $OPT_FD_TOLERANCE)"
   else
-    fail V5 "fd count grew (host +$hg, worker +$wg) beyond the tolerance $OPT_FD_TOLERANCE — R2."
+    fail V5 "fd count TRENDS up (host +$hg, worker +$wg) beyond the tolerance $OPT_FD_TOLERANCE — R2."
     info "Compare \`ls -l /proc/$wpid/fd\` at both ends of a run to see WHAT is accumulating."
   fi
 }
@@ -1297,6 +1331,27 @@ leg_selftest() {
   printf 'log matchers:\n'
   _t 'the shared fallback clause is found'      ok logs_have "$il" "$L_FALLBACK"
   _t 'the INERT wordings are distinguishable'   no logs_have "$wl" "$L_INERT_WORKER"
+
+  # v5's leak verdict. The series below are the shapes that actually matter: the real measured
+  # oscillation (which the old max-min verdict called a leak), and a real leak (which a spread-blind
+  # reader would miss). A trend reader has to get BOTH right or it is not worth having.
+  printf 'v5 fd trend (a leak is a trend, not a spread):\n'
+  local jitter='54 54 54 54 55 55 54 54 55 54 54 54 55 54 54 54 54 54'
+  local leak='54 54 55 55 56 57 57 58 59 60 61 61 62 63 64 65 66 67'
+  local flat='31 31 31 31 31 31 31 31 31 31 31 31'
+  local plateau='54 54 54 54 54 54 58 58 58 58 58 58'
+  _eq 'median of a sorted-odd list'              "$(_median '3 1 2')"            '2'
+  _eq 'median ignores a single outlier'          "$(_median '54 54 54 99 54')"   '54'
+  _eq 'first third of 18 samples'                "$(_first_third "$jitter")"     '54 54 54 54 55 55'
+  _eq 'last third of 18 samples'                 "$(_last_third "$jitter")"      '55 54 54 54 54 54'
+  _eq 'MEASURED oscillation trends to zero'      \
+      "$(( $(_median "$(_last_third "$jitter")") - $(_median "$(_first_third "$jitter")") ))" '0'
+  _eq 'a real leak still trends up'              \
+      "$(( $(_median "$(_last_third "$leak")") - $(_median "$(_first_third "$leak")") ))"    '10'
+  _eq 'a flat series trends to zero'             \
+      "$(( $(_median "$(_last_third "$flat")") - $(_median "$(_first_third "$flat")") ))"     '0'
+  _eq 'a step that never comes back is caught'   \
+      "$(( $(_median "$(_last_third "$plateau")") - $(_median "$(_first_third "$plateau")") ))" '4'
 
   rm -rf "$d"
   if [ "$fails" != 0 ]; then
