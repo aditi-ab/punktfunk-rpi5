@@ -1141,16 +1141,27 @@ fun ConnectScreen(
             pendingTrust = null
             doConnect(pt.host, pt.port, pt.name, fp, pt.profile, pt.launch)
         }
+        // Three of the four say the same thing in both interfaces, so they are ONE prompt that
+        // knows which one is running. Only the PIN ceremony genuinely differs — a keyboard field
+        // against four D-pad digit slots is a different input model, not a different skin.
         when (pt.kind) {
-            PendingTrust.Kind.TRUST_NEW ->
-                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
-                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
+            PendingTrust.Kind.TRUST_NEW -> TrustNewHostPrompt(
+                gamepadUi, pt,
+                onTrust = {
+                    pendingTrust = null
+                    doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch)
+                },
+                onPairInstead = onPair,
+                onDismiss = { pendingTrust = null },
+            )
             PendingTrust.Kind.FP_CHANGED ->
-                if (gamepadUi) GamepadFingerprintChangedDialog(pt, onPair, { pendingTrust = null })
-                else FingerprintChangedDialog(pt, onPair, { pendingTrust = null })
-            PendingTrust.Kind.REQUEST_ACCESS ->
-                if (gamepadUi) GamepadRequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
-                else RequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
+                FingerprintChangedPrompt(gamepadUi, pt, onPair) { pendingTrust = null }
+            PendingTrust.Kind.REQUEST_ACCESS -> RequestAccessPrompt(
+                gamepadUi, pt,
+                onRequestAccess = { pendingTrust = null; requestAccess(pt) },
+                onUsePin = onPair,
+                onDismiss = { pendingTrust = null },
+            )
             PendingTrust.Kind.PAIR ->
                 if (gamepadUi) GamepadPairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
                 else PairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
@@ -1164,8 +1175,7 @@ fun ConnectScreen(
             connecting = false
             discovery.start() // the request may still be pending on the host; keep scanning
         }
-        if (gamepadUi) GamepadAwaitingApprovalDialog(req.target.name, onCancel)
-        else AwaitingApprovalDialog(hostLabel = req.target.name, onCancel = onCancel)
+        AwaitingApprovalPrompt(gamepadUi, hostLabel = req.target.name, onCancel = onCancel)
     }
 
     // Console host options (Up on a saved carousel tile): Wake / Edit / Forget.
@@ -1229,11 +1239,7 @@ fun ConnectScreen(
             }
             speedTest = null
         }
-        if (gamepadUi) {
-            GamepadSpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
-        } else {
-            SpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
-        }
+        SpeedTestPrompt(gamepadUi, entry.host.name, target, speedTestPhase, apply, dismiss)
     }
 
     editTarget?.let { kh ->
@@ -1285,11 +1291,12 @@ fun ConnectScreen(
                 ),
             )
         }
-        if (gamepadUi) {
-            GamepadLocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
-        } else {
-            LocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
-        }
+        LocalNetworkPrompt(
+            gamepadUi,
+            onAllow = onAllow,
+            onSettings = onSettings,
+            onDismiss = { lnpPrompt = false },
+        )
     }
 
     // Topmost: the full-screen connect takeover — instant "Connecting…" feedback on any dial, flowing

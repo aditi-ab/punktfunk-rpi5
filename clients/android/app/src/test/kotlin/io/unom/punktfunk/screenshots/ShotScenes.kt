@@ -49,7 +49,7 @@ import io.unom.punktfunk.StreamStartBanner
 import io.unom.punktfunk.ProfileEditorFields
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
-import io.unom.punktfunk.SpeedTestDialog
+import io.unom.punktfunk.SpeedTestPrompt
 import io.unom.punktfunk.SpeedTestPhase
 import io.unom.punktfunk.SpeedTestTarget
 import io.unom.punktfunk.components.HostCard
@@ -245,7 +245,8 @@ internal fun SettingsProfileScene() {
  */
 @Composable
 internal fun SpeedTestScene() {
-    SpeedTestDialog(
+    SpeedTestPrompt(
+        gamepadUi = false,
         hostName = "Living Room PC",
         target = SpeedTestTarget.Ask(newProfile("Game")),
         phase = SpeedTestPhase.Done(throughputKbps = 412_000, lossPct = 0.3, recommendedKbps = 288_400),
