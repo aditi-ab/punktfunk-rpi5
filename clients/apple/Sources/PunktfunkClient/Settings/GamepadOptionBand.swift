@@ -66,22 +66,20 @@ struct GamepadOptionBand: View {
                     rotation: drumPosition,
                     target: drumPosition,
                     // Puts the ±1 neighbour ~40 % of the band off-centre, curling to the edge.
-                    radius: width * 0.72)
+                    radius: width * 0.72,
+                    width: width)
             }
         }
         .frame(width: width)
         .clipped()
-        // Soft edges: the drum dissolves before it reaches the chevrons instead of ending on a cut.
-        .mask {
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black, location: 0.12),
-                    .init(color: .black, location: 0.88),
-                    .init(color: .clear, location: 1),
-                ],
-                startPoint: .leading, endPoint: .trailing)
-        }
+        // NO `.mask` here. The soft edges used to be a gradient mask over the whole band, and a
+        // mask RASTERISES what it covers — which flattens `rotation3DEffect`'s perspective, so the
+        // drum was being composited as a flat sideways slide rather than a turning cylinder. That
+        // is the "3D effect isn't what it should be" the field kept seeing: the geometry was
+        // always right, and the mask was throwing the projection away every frame.
+        //
+        // The same soft edge is folded into each option's own opacity instead (see `Drum.option`),
+        // which costs nothing and leaves the projection intact.
         .onChange(of: selection) { old, new in step(from: old, to: new) }
         // The options list itself can mutate under the drum (a custom resolution appears, a
         // controller connects, the buffer options re-derive from a new refresh rate) — re-seat
@@ -131,6 +129,9 @@ private struct Drum: View, Animatable {
     let target: Double
     /// Drum radius in points (from the band width — see the caller).
     let radius: Double
+    /// The band's own width — the stage the options turn on, and what the edge fade is measured
+    /// against now that the container no longer carries a mask.
+    let width: Double
 
     var animatableData: Double {
         get { rotation }
@@ -140,6 +141,17 @@ private struct Drum: View, Animatable {
     /// Angular pitch between adjacent options on the drum.
     private static let stepAngle = 34.0 * .pi / 180.0
 
+    // Neighbours exist only while the drum is MOVING, and that is not a compromise — it is the
+    // documented field fix this file was written around. Showing them at rest was tried (to make a
+    // settled row look more like a cylinder) and immediately reproduced the original defect: on the
+    // simulator, "This device · 2752 × 2064" rendered with "280 ×" sitting on top of it, and
+    // "Automatic" with "10 Mbps" through it. A long value and its neighbour occupy the same
+    // pixels, and no opacity low enough to fix that is high enough to be worth drawing.
+    //
+    // The cylinder is meant to be READ WHILE IT TURNS. What was actually broken is fixed above:
+    // the band used to mask itself, and the mask rasterised the drum and threw its perspective
+    // away every frame, so the turn never looked like a turn.
+
     var body: some View {
         let flight = min(1, abs(rotation - target) * 3)
         let content = ZStack {
@@ -147,14 +159,18 @@ private struct Drum: View, Animatable {
                 // Plain signed distance — the band is linear, so option i has ONE home and the
                 // ends are the ends (nothing waits beyond the last option).
                 let d = Double(i) - rotation
+                // Only the facing option at rest; its neighbours join it for the travel (see the
+                // note on `restingNeighbour`'s removal above).
                 if abs(d) < 0.5 || (flight > 0.001 && abs(d) <= 2.5) {
                     option(i, distance: d, gate: flight)
                 }
             }
         }
         #if os(tvOS)
-        // Flatten the transform stack while travelling — the 10-foot GPU already made these
-        // rows drop Liquid Glass, and five projected texts per step is the same class of cost.
+        // Flatten the transform stack — the 10-foot GPU already made these rows drop Liquid
+        // Glass, and several projected texts per step is the same class of cost. It costs the
+        // projection (a rasterised layer has no perspective), which is the trade tvOS already
+        // makes elsewhere on this screen.
         content.drawingGroup()
         #else
         content
@@ -164,16 +180,29 @@ private struct Drum: View, Animatable {
     @ViewBuilder private func option(_ i: Int, distance d: Double, gate: Double) -> some View {
         let angle = d * Self.stepAngle
         let depth = cos(angle)
+        let x = radius * sin(angle)
         // The facing option never gates: a resting row still shows its value.
-        let alpha = pow(max(depth, 0), 3) * (abs(d) < 0.5 ? 1 : gate)
+        let alpha = pow(max(depth, 0), 3) * (abs(d) < 0.5 ? 1 : gate) * edgeFade(x)
         Text(options[i])
             .lineLimit(1)
+            .fixedSize() // never let a turning label re-wrap to the band's width mid-flight
             .scaleEffect(0.70 + 0.30 * depth)
             // Foreshorten the label as it turns away — this is what sells the cylinder.
-            .rotation3DEffect(.radians(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
-            .offset(x: radius * sin(angle))
+            .rotation3DEffect(.radians(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.55)
+            .offset(x: x)
             .opacity(alpha)
             .zIndex(depth)
+    }
+
+    /// The soft edge, per option, replacing the container mask that used to flatten the
+    /// projection: full strength through the middle of the band, dissolving to nothing by the
+    /// time an option reaches its rim, so the drum never ends on a cut.
+    private func edgeFade(_ x: Double) -> Double {
+        let halfWidth = width / 2
+        guard halfWidth > 0 else { return 1 }
+        let fadeStart = halfWidth * 0.55
+        guard abs(x) > fadeStart else { return 1 }
+        return max(0, min(1, (halfWidth - abs(x)) / (halfWidth - fadeStart)))
     }
 }
 

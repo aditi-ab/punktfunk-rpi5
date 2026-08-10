@@ -234,14 +234,20 @@ struct GamepadScreenBackground: View {
             colorField(at: t, palette: palette)
                 // ±8° over ~5 min — the whole field very slowly warms and cools.
                 .hueRotation(.degrees(sin(t * 0.021) * 8))
-                // Calm = col·0.6 + ground·0.4: over the ground, `.opacity` IS the multiply…
+                // Calm = col·0.6 + ground·0.4. Over the OPAQUE ground beneath, `.opacity` already
+                // lerps toward it, so this layer alone IS the whole calm mix.
                 .opacity(1 - 0.4 * calmMix)
-            // …and a plusLighter wash of the palette's own ground IS the add. Chosen so the
-            // ground lands exactly where it was and the bright pools come down to meet it.
-            // Mounted unconditionally — at opacity 0 a plusLighter layer contributes nothing,
-            // and an always-present layer is what lets the mix animate instead of popping.
+            // A further plusLighter wash of the ground, which lets a DARK palette's bright pools
+            // come down to meet its ground rather than merely fading toward it.
+            //
+            // Suppressed on a pale palette (the factor goes to 0), because there it was destroying
+            // the setting: a pale ground is near-white, so ADDING 0.4 of it on top of a field
+            // already mixed 0.4 toward that same ground saturated the form screens to flat white —
+            // the field ask was "in bright mode the sub-screens are basically just white". Written
+            // as a factor rather than an `if` so the layer stays mounted and the calm chase keeps
+            // animating instead of popping when a screen is pushed.
             Self.color(palette.ground)
-                .opacity(0.4 * calmMix)
+                .opacity(0.4 * calmMix * (palette.light ? 0 : 1))
                 .blendMode(.plusLighter)
             // Cinematic vignette: the edges settle toward the scrim so the cards sit in the
             // pooled light. Soft (extends past the frame) so the corners deepen rather than
@@ -374,59 +380,6 @@ private struct LegacyBlobField: View {
             // Additive only works over a DARK ground; over a pale one every blob saturates to
             // white and the field turns grey. Pale palettes tint instead.
             .blendMode(palette.light ? .normal : .plusLighter)
-    }
-}
-
-/// A blur gradient behind a pinned tray (a screen title, the hints/detail bar, the keyboard tray):
-/// scrollable rows pass beneath those insets, so without this the tray text and the row underneath
-/// render interleaved. Pure blur — a dark material faded out by a gradient mask, no dark tint — so
-/// the tray's text sits on a softly blurred backdrop that dissolves into the rows.
-struct GamepadTrayScrim: View {
-    let edge: VerticalEdge
-    @Environment(\.gamepadInk) private var ink
-
-    var body: some View {
-        let fromEdge: UnitPoint = edge == .top ? .top : .bottom
-        let toContent: UnitPoint = edge == .top ? .bottom : .top
-        Rectangle()
-            .fill(.ultraThinMaterial)
-            // Force the frost to match the PALETTE, not the system appearance: the tray exists
-            // to keep the pinned title legible, so it has to frost dark under white ink and
-            // light under dark ink.
-            .environment(\.colorScheme, ink.isLight ? .light : .dark)
-            // Sink the material's grey luminance lift toward the palette's shade (black on a
-            // dark field — field ask: the frost read GREY over the aurora). Inside the mask, so
-            // the tint dissolves with the blur.
-            .overlay(ink.shade(0.35))
-            // Fade the whole blur out toward the content so it dissolves rather than ending on a
-            // line. The strong region sits deep (0.65) because the first stretch of the gradient
-            // now runs over the fixed 80 pt outer overhang below.
-            .mask {
-                LinearGradient(
-                    stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black.opacity(0.92), location: 0.65),
-                        .init(color: .clear, location: 1),
-                    ],
-                    startPoint: fromEdge, endPoint: toContent)
-            }
-            // Grow past the tray so the fade-to-clear happens OUTSIDE its bounds — the tray's own
-            // text always sits on the strong part, rows blur out before they reach it. The bottom
-            // gets the longer runway: its tray sits over SCROLLING rows plus the detail line, and
-            // the field verdict on the short reach was rows colliding visibly with the legend.
-            .padding(edge == .top ? .bottom : .top, edge == .top ? -44 : -72)
-            // Full-bleed by LAYOUT, not by `.ignoresSafeArea()`: safe-area expansion resolves a
-            // beat after insertion (outside any geometry group and outside this view's own
-            // transaction), which is exactly the pop the field kept seeing — vertically first,
-            // then, once the vertical runway became padding, on the X axis alone (the landscape
-            // side insets). 80 pt clears every inset on every device; backgrounds never clip,
-            // so the overhang simply draws.
-            .padding(edge == .top ? .top : .bottom, -80)
-            .padding(.horizontal, -80)
-            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
-            // geometry would ride the push's transaction and visibly grow into place. The
-            // layer's own fade/slide still carries the scrim; only its SHAPE is pinned.
-            .transaction { $0.animation = nil }
     }
 }
 

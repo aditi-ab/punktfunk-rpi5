@@ -161,7 +161,6 @@ struct GamepadSettingsView: View {
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
-            .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
@@ -178,7 +177,6 @@ struct GamepadSettingsView: View {
             .padding(.bottom, compact ? 12 : 18)
             .padding(.top, compact ? 6 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background { GamepadTrayScrim(edge: .bottom) }
         }
         // The launcher's living field, calmed (GamepadFormBackground) — the glass rows keep real
         // colour and luminance to lens without the launcher's contrast, and the palette setting

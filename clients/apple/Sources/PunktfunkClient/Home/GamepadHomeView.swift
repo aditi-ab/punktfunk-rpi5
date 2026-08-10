@@ -149,7 +149,15 @@ struct GamepadHomeView: View {
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
         // pale palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
-        .onAppear { discovery.start() }
+        .onAppear {
+            discovery.start()
+            // TEMPORARY verification hook (PUNKTFUNK_DIAG_OPEN=settings). Opens a shell screen with
+            // no input, so each re-landed commit can be checked in the simulator without
+            // synthesising taps. Removed before this work is committed.
+            if ProcessInfo.processInfo.environment["PUNKTFUNK_DIAG_OPEN"] == "settings" {
+                showSettings = true
+            }
+        }
         .onDisappear { discovery.stop() }
         // Reachability sweep (mDNS-independent) so routed/VPN hosts that never advertise still show
         // Online — the console mirror of HomeView's `.task`; cancelled on disappear.
@@ -573,11 +581,21 @@ private struct GamepadHostTile: View {
         }
         .padding(Self.pad)
         .frame(width: size.width, height: size.height, alignment: .leading)
-        // Liquid Glass console tile — a brand wash marks a saved host as primary; discovered /
-        // Add-Host tiles stay neutral glass with a dashed edge. Glass clips to the shape itself.
+        // Console tile — a brand wash marks a saved host as primary; discovered / Add-Host tiles
+        // stay neutral with a dashed edge. The surface clips to the shape itself.
+        //
+        // `forceMaterial`: these tiles are the one console surface that gets TRANSFORMED while it
+        // animates — `CardEntrance` swings each card in on a `rotation3DEffect` under an opacity
+        // ramp, and the carousel's `.scrollTransition` keeps scaling and rotating the neighbours
+        // forever after. Liquid Glass samples the backdrop through its own layer and cannot do
+        // that under a 3D transform, so it drew one way through the swing and snapped to another
+        // as the card landed — on glass it read as the tiles being swapped out for different ones
+        // at the end of their entrance. A material composites flat, so the card looks the same at
+        // every frame of the travel. (tvOS already takes this path for its own reasons.)
         .consoleGlass(
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous),
-            tint: tile.filled ? ink.accent(0.20) : nil)
+            tint: tile.filled ? ink.accent(0.20) : nil,
+            forceMaterial: true)
         .overlay {
             RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
                 .strokeBorder(
