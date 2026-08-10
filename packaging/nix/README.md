@@ -21,6 +21,7 @@ and the native Linux **client**, a **NixOS module** that wires up everything the
 | `packages.x86_64-linux.default` | = `punktfunk-host` |
 | `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` |
 | `devShells.x86_64-linux.default` | pinned Rust (from `rust-toolchain.toml`) + all build deps |
+| `checks.x86_64-linux.nixos-module` | evaluates the NixOS module against real nixpkgs and asserts on the rendered systemd units |
 | `apps` / `checks` / `formatter` | `nix run`, `nix flake check`, `nix fmt` |
 
 One binary per GPU vendor: NVENC/CUDA entry points are `dlopen`'d at runtime, so the host runs on
@@ -99,11 +100,32 @@ systemctl --user enable --now punktfunk-host
 | `enable` | `false` | Install the host + wire udev/sysctl/kernel-modules/firewall and the user service. |
 | `gamestream` | `true` | `serve --gamestream` (Moonlight-compatible). `false` = native-only, more secure. |
 | `autoStart` | `false` | Add the user service to `default.target` (appliance mode — pair with lingering). |
+| `desktopSession` | `false` | Bind the host to `graphical-session.target` — **turn this on for a machine somebody logs into** (see below). |
 | `users` | `[ ]` | Users added to the `input` group (virtual gamepads). |
 | `settings` | `{ }` | `host.env` key/values (see `${package}/share/punktfunk-host/host.env.example`). |
 | `environmentFile` | `null` | Extra `EnvironmentFile` for secrets (e.g. `PUNKTFUNK_MGMT_TOKEN`); loaded optionally. |
 | `openFirewall` | `false` | Open the inbound ports (see below). |
 | `package` | flake's | Override the package. |
+
+**`desktopSession` — set it on a desktop, leave it off on an appliance.** On a machine somebody logs
+into, a compositor restart (a crash, a logout/login, "restart the shell") otherwise leaves the host
+running while it holds a Wayland socket and a portal D-Bus connection that both died with the old
+compositor. It cannot recover either in-process, and the failure is *silent*: the host still
+listens, still answers, and every session it then serves fails at capture. `desktopSession = true`
+adds `PartOf=`/`WantedBy=graphical-session.target` (in addition to `default.target`), so the host
+restarts with the session. Leave it `false` for an appliance — a pinned `PUNKTFUNK_COMPOSITOR`, a
+headless KWin or a gamescope box — which may never reach that target and would be left permanently
+stopped. sway/Hyprland and anything else not under systemd session management never reach it
+either; there, start the host from the compositor's config after `systemctl --user
+import-environment`.
+
+**Portals.** The host reaches the desktop through `xdg-desktop-portal` on several backends (Mutter's
+ScreenCast/RemoteDesktop, and the libei input path), so a hand-assembled machine wants
+`xdg.portal.enable = true` plus the backend for its compositor
+(`xdg-desktop-portal-kde` / `-gnome` / `-hyprland` / `-wlr`). The KDE and GNOME desktop-manager
+modules already do this. The module emits a warning if the host is enabled and portals are not —
+the KWin backend's own virtual output uses the privileged `zkde_screencast` protocol and needs no
+portal, so KDE-only setups are unaffected in practice.
 
 `services.punktfunk.client`: `enable`, `openFirewall` (UDP 5353), `package`.
 
@@ -125,20 +147,31 @@ with `journalctl --user -u punktfunk-web-init` (or `~/.config/punktfunk/web-pass
 `https://<host-ip>:47992` and trust the self-signed host cert once. Enable it (with the host) via
 `systemctl --user enable --now punktfunk-web`.
 
-`services.punktfunk.scripting` (the plugin/script runner — installed with the host, but **opt-in to
-run**):
+`services.punktfunk.scripting` (the plugin/script runner — installed **and started** with the host,
+matching the deb/rpm, which `systemctl --global enable` it):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `enable` | `host.enable` | Install the runner + define its `systemd --user` unit `punktfunk-scripting`. |
-| `autoStart` | `false` | Add the unit to `default.target`. Off even on an auto-start host — running operator scripts/plugins is a deliberate opt-in. |
+| `autoStart` | `scripting.enable` | Add the unit to `default.target`. **On by default** — the game-library scanners are plugins, so a host without the runner has an empty library. |
 | `package` | flake's | Override the package. |
 
 The runner discovers loose scripts under `~/.config/punktfunk/scripts` and installed
 `punktfunk-plugin-*` packages under `~/.config/punktfunk/plugins`, and supervises each as an Effect
 fiber (SIGTERM shuts the tree down structurally so plugin finalizers run). A plugin auto-wires to
-the host's mgmt token + identity cert. It's inert until you add automation, so the unit ships
-un-started; turn it on with `systemctl --user enable --now punktfunk-scripting`.
+the host's mgmt token + identity cert.
+
+It used to ship un-started here, on the reasoning that the runner is inert until you add
+automation. That stopped being true when the library scanners became plugins — a host with the
+runner off comes up with an empty library and no obvious reason why — so it now runs by default,
+as it already did on every other channel. Opt out with `scripting.autoStart = false`, or per user
+`systemctl --user mask punktfunk-scripting` (`mask`, not `disable`).
+
+The runner is sandboxed exactly as the deb/rpm unit is (`NoNewPrivileges`, `ProtectSystem=strict`,
+`ReadWritePaths=%h /tmp`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`) — with `PrivateTmp`
+deliberately **off**, because plugins integrate with things that talk over `/tmp`. `ProtectSystem`
+on a *user* unit needs unprivileged user namespaces; drop it with
+`systemctl --user edit punktfunk-scripting` on a kernel that restricts them.
 
 ### What the host module configures for you
 

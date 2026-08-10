@@ -7,10 +7,24 @@
 # Two tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
 # run for an hour on every push:
 #
-#   * eval  — `nix flake check --no-build`: instantiates every package, app, check, devShell and
-#             the NixOS module without building them. Catches the failures that actually happen to
-#             this flake — a renamed file, a callPackage argument that no longer exists, a syntax
-#             error, a package attribute dropped from packages.nix.
+#   * eval  — `nix flake check --no-build`: instantiates every package, app, check and devShell
+#             without building them. Catches the failures that actually happen to this flake — a
+#             renamed file, a callPackage argument that no longer exists, a syntax error, a package
+#             attribute dropped from packages.nix.
+#
+#             ⚠ It does NOT, on its own, check the NixOS module. `nix flake check` handles
+#             `nixosModules` by forcing the value and asserting it is a lambda taking an open
+#             attribute set — nothing more (nix's own source: `// FIXME: if we have a 'nixpkgs'
+#             input, use it to check the module.`). MEASURED: a module setting a nonexistent
+#             OPTION, referencing a nonexistent `pkgs` attribute AND calling a nonexistent `lib`
+#             function passes clean, printing `checking NixOS module ... all checks passed!`. This
+#             header used to claim the module was covered here; it was not, for the module's whole
+#             life. It is covered NOW because `checks.<system>.nixos-module`
+#             (packaging/nix/module-check.nix) evaluates it against real nixpkgs and asserts on the
+#             rendered systemd units — and because those assertions are pure Nix, INSTANTIATING
+#             that check runs them, so `--no-build` is enough. Keep them pure: a shell script in
+#             the derivation body would only run under a full `nix flake check`, which builds the
+#             hour-long Rust packages.
 #   * bun   — actually BUILDS punktfunk-web + punktfunk-scripting. These are the two derivations
 #             whose inputs churn constantly (every dependency bump moves a lockfile) and they cost
 #             minutes, not hours, because neither compiles Rust. This is the end-to-end proof that
@@ -21,6 +35,12 @@
 # The Rust packages (punktfunk-host, punktfunk-client) and punktfunk-gamescope are NOT built here.
 # They are the expensive ones and their inputs are already gated by the `rust` job in ci.yml; build
 # them by hand on a Nix box, or with the `build-rust` dispatch input below.
+#
+# ⚠ punktfunk-gamescope deserves the dispatch run more than it looks: `host.gamescopeHdr` DEFAULTS
+# TRUE, so it is on the critical path of every `services.punktfunk.host.enable = true` build, while
+# being the one package nothing here compiles. It patches whatever gamescope the pinned nixpkgs
+# carries, so a nixpkgs bump — not a change of ours — is what breaks it, and the first person to
+# find out would be an operator whose system rebuild fails. Run the dispatch after a flake.lock bump.
 #
 # ⚠ pull_request is deliberately present. flatpak.yml shipped with push-only triggers and manifest
 # breakage reached main invisibly for weeks — do not "simplify" this workflow by dropping it.
@@ -64,6 +84,10 @@ on:
     inputs:
       build-rust:
         description: "Also build punktfunk-host + punktfunk-client (slow: full Rust workspace)"
+        type: boolean
+        default: false
+      build-gamescope:
+        description: "Also build punktfunk-gamescope (patched gamescope from source; run after a flake.lock bump)"
         type: boolean
         default: false
 
@@ -165,3 +189,13 @@ jobs:
         if: ${{ github.event.inputs.build-rust == 'true' }}
         run: |
           "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client
+
+      # The patched compositor. Separate from build-rust because its failure mode is different: it
+      # tracks nixpkgs' gamescope, not our Rust, so it wants a run after a flake.lock bump rather
+      # than after a code change. `gamescope.nix` fails loudly (an eval-time `throw` if nixpkgs no
+      # longer exposes a patchable derivation, a `+pfhdr` grep in installCheckPhase) — but only if
+      # something actually builds it.
+      - name: Build the patched gamescope (dispatch opt-in)
+        if: ${{ github.event.inputs.build-gamescope == 'true' }}
+        run: |
+          "$NIX" build --print-build-logs .#punktfunk-gamescope
