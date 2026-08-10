@@ -200,15 +200,16 @@ final class HostStore: ObservableObject {
         if let data = try? JSONEncoder().encode(hosts) {
             defaults.set(data, forKey: Self.key)
         }
-        reloadHostsWidget() // the widget reads this store; any change refreshes its timeline
+        reloadHostsWidget() // the widgets read this store; any change refreshes their timelines
     }
 
-    /// Ask WidgetKit to rebuild the hosts widget's timeline after any store change (add/remove/pin/
-    /// last-connected). iOS-only and a no-op where WidgetKit is absent; the widget uses
-    /// `.never`-refresh entries and relies on this push.
+    /// Ask WidgetKit to rebuild the launcher widgets' timelines after any store change (add/remove/
+    /// pin/last-connected). iOS-only and a no-op where WidgetKit is absent; both widgets use
+    /// `.never`-refresh entries and rely on this push.
     private func reloadHostsWidget() {
         #if canImport(WidgetKit) && os(iOS)
         WidgetCenter.shared.reloadTimelines(ofKind: "PunktfunkHosts")
+        WidgetCenter.shared.reloadTimelines(ofKind: "PunktfunkLibrary")
         #endif
     }
 }

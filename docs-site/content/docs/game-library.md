@@ -142,7 +142,10 @@ and runs what it already knows about the title, so a client can never hand the h
   See [Moonlight](/docs/moonlight).
 - **A link** — a [`punktfunk://` link](/docs/profiles-and-links) carries the id in a `launch=`
   parameter, so a desktop shortcut, a browser bookmark or a home-automation rule starts the stream
-  with the title already launching: `punktfunk://connect/couch-pc?launch=steam:570`.
+  with the title already launching: `punktfunk://connect/couch-pc?launch=steam:570`. On the Apple
+  apps, `punktfunk://browse/couch-pc` opens the library itself instead — that route backs their
+  home-screen library widget and the **Open Game Library** shortcut, so a tap lands you in a
+  picked host's library with nothing streaming yet.
 - **The command line** — the client's own [`punktfunk`](/docs/host-cli#punktfunk-on-the-client-machine)
   command, which ships with the Linux and Windows clients. `punktfunk library <host-ref>` prints `id`,
   `store` and `title` as tab-separated lines, then a count (`--json` for tools);

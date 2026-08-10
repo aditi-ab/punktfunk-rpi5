@@ -487,10 +487,20 @@ struct ContentView: View {
                 ?? "That link is malformed and was ignored."
             return
         }
-        guard link.route == .connect else {
-            // `wake` and `browse` are reserved in the grammar and parse today; this build routes
-            // neither, and saying so beats silently connecting instead.
-            deepLinkNotice = "Punktfunk links can't do “\(link.route.rawValue)” yet."
+        switch link.route {
+        case .connect:
+            break
+        case .browse:
+            // The reserved library route, now real: open the host's game library without starting
+            // a session. `launch=`/`profile=` are meaningless on a browse (nothing streams until a
+            // title is picked, and that connect resolves its own profile) — ignored, not refused,
+            // per the unknown-parameter rule.
+            openLibrary(from: link)
+            return
+        case .wake:
+            // Still reserved: saying so beats silently connecting instead. (Shortcuts users have
+            // the Wake Host intent, which never round-trips through a URL.)
+            deepLinkNotice = "Punktfunk links can't do “wake” yet."
             return
         }
         // Resolve the one-off profile BEFORE anything happens: an unknown or ambiguous reference
@@ -536,6 +546,38 @@ struct ContentView: View {
             deepLinkNotice = "\(name ?? address) isn't saved on this device yet. "
                 + "Add it with the + button — the link points at \(address):\(String(port))"
                 + (fp == nil ? "." : ", and carries a fingerprint to verify it against.")
+        case .ambiguous:
+            deepLinkNotice = "More than one saved host is called “\(link.hostRef)”. "
+                + "Rename one, or link to it by its address."
+        case .unresolvable:
+            deepLinkNotice = "That host isn't saved on this device."
+        }
+    }
+
+    /// `punktfunk://browse/<host-ref>` — jump into a host's game library. Drives the SAME
+    /// `libraryTarget` every internal surface writes, so the link lands in whichever presentation
+    /// the current mode owns: the gamepad console's in-place library screen, the touch cover, the
+    /// macOS sheet, or tvOS's cover. Connect's posture minus the connect itself: a pin conflict
+    /// refuses, a live session is never preempted, and an unsaved host can't be browsed — the
+    /// library fetch rides the paired mTLS identity, so there is nothing to show before the host
+    /// is saved (the notice says what to do instead).
+    private func openLibrary(from link: DeepLink) {
+        switch link.resolveHost(in: store.hosts) {
+        case .known(let host):
+            guard !link.pinConflict(with: host) else {
+                deepLinkNotice = "That link's fingerprint doesn't match the identity saved for "
+                    + "\(host.displayName). It's out of date, or it isn't pointing where it says."
+                return
+            }
+            guard model.phase == .idle else {
+                let current = model.activeHost?.displayName ?? "a host"
+                deepLinkNotice = "Already streaming \(current). End that session first."
+                return
+            }
+            libraryTarget = host
+        case .unknown(let address, _, let name, _):
+            deepLinkNotice = "\(name ?? address) isn't saved on this device yet. "
+                + "Add it with the + button first — a library can only be browsed on a saved host."
         case .ambiguous:
             deepLinkNotice = "More than one saved host is called “\(link.hostRef)”. "
                 + "Rename one, or link to it by its address."

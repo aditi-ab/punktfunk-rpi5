@@ -1,7 +1,8 @@
 // Siri / Shortcuts / Spotlight surface (design §M4, extended by client-deep-links.md §6).
 // Deliberately thin: every action already has an internal entry point — the deep-link router
-// (connect / connect-and-launch / connect-with-a-profile), the in-process end-session hook, and
-// the existing Wake-on-LAN path — so these intents only wrap them.
+// (connect / connect-and-launch / connect-with-a-profile, and the `browse` route into a host's
+// library), the in-process end-session hook, and the existing Wake-on-LAN path — so these
+// intents only wrap them.
 //
 // Connect and Wake compile on macOS and tvOS too: AppIntents is genuinely available there
 // (macOS 13+ / tvOS 16+), and "Stream Desktop with Work" from Spotlight on a Mac is part of the
@@ -44,6 +45,28 @@ struct ConnectToHostIntent: AppIntent {
 
     func perform() async throws -> some IntentResult {
         let url = DeepLink.connect(host: host.id, launchID: launchID, profile: profile?.id).url
+        await MainActor.run {
+            NotificationCenter.default.post(name: .punktfunkOpenDeepLink, object: url)
+        }
+        return .result()
+    }
+}
+
+/// Jump straight into a host's game library — no session. Foregrounds the app and routes the
+/// `browse` route through the same `.onOpenURL` path a widget tap uses, which drives the one
+/// `libraryTarget` every surface shares — so the shortcut lands in whichever library presentation
+/// the current mode owns: the gamepad console's library screen when the gamepad UI is active, the
+/// touch/desktop library otherwise. A session starts only when a title is picked there.
+struct OpenLibraryIntent: AppIntent {
+    static let title: LocalizedStringResource = "Open Game Library"
+    static let description = IntentDescription(
+        "Open a host's game library in Punktfunk, without starting a stream.")
+    static let openAppWhenRun = true
+
+    @Parameter(title: "Host") var host: HostEntity
+
+    func perform() async throws -> some IntentResult {
+        let url = DeepLink.browse(host: host.id).url
         await MainActor.run {
             NotificationCenter.default.post(name: .punktfunkOpenDeepLink, object: url)
         }
@@ -97,6 +120,13 @@ struct PunktfunkShortcuts: AppShortcutsProvider {
                 "Stream \(\.$host) with \(.applicationName)",
             ],
             shortTitle: "Connect", systemImageName: "play.tv.fill")
+        AppShortcut(
+            intent: OpenLibraryIntent(),
+            phrases: [
+                "Open \(\.$host) library in \(.applicationName)",
+                "Show \(\.$host) games in \(.applicationName)",
+            ],
+            shortTitle: "Game Library", systemImageName: "square.grid.2x2.fill")
         AppShortcut(
             intent: WakeHostIntent(),
             phrases: [
