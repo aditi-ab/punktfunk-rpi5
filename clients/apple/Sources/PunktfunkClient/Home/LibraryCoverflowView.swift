@@ -204,13 +204,19 @@ struct LibraryCoverflowView: View {
 
     private var hints: [GamepadHint] {
         var hints: [GamepadHint] = []
-        if onLaunch != nil {
+        if let onLaunch {
             // You *open* a launcher and *launch* a game — the hint follows the focused entry.
             let opens = games.first { $0.id == selection }?.isLauncher == true
-            hints.append(
-                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: opens ? "Open" : "Launch"))
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: opens ? "Open" : "Launch",
+                // Reads `selection` when it fires, not when the legend was built (see the
+                // launcher's twin) — and does nothing with no title centred, which is exactly
+                // what A does.
+                action: { if let id = selection { onLaunch(id) } }))
         }
-        hints.append(.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close"))
+        hints.append(.init(
+            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close",
+            action: { onDismiss?() }))
         return hints
     }
 }

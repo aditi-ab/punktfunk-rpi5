@@ -147,17 +147,28 @@ struct GamepadAddHostView: View {
                     // binding on appear — new identity forces a rewire to the new field.
                     .id(editing)
                 GamepadHintBar(hints: [
+                    // "Type" names what A does to the key under the keyboard's cursor. There is
+                    // no tap equivalent — a touch user types by tapping the keycap itself — so
+                    // this one cell stays a label.
                     .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
-                    .init(glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete"),
-                    .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
+                    .init(
+                        glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
+                        action: { backspace(editing) }),
+                    .init(
+                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                        action: { closeKeyboard() }),
                 ])
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             GamepadHintBar(hints: [
-                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select"),
-                .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel"),
+                .init(
+                    glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select",
+                    action: { if let focusID { activate(id: focusID) } }),
+                .init(
+                    glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel",
+                    action: { performClose() }),
             ])
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -265,6 +276,15 @@ struct GamepadAddHostView: View {
 
     private func closeKeyboard() {
         withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { editing = nil }
+    }
+
+    /// The legend's Delete cell (iOS/macOS). Applied to the field's binding rather than routed
+    /// into `GamepadKeyboard`: the keyboard's X does exactly this to the same binding, and
+    /// reaching into its state to trigger it would need a whole callback channel for one edit.
+    private func backspace(_ id: String) {
+        let binding = editingBinding(id)
+        guard !binding.wrappedValue.isEmpty else { return }
+        binding.wrappedValue.removeLast()
     }
 
     private func editingBinding(_ id: String) -> Binding<String> {

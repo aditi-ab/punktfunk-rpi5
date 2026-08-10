@@ -332,26 +332,39 @@ struct GamepadSettingsView: View {
             // shoulders exist at all (see `showsSectionHint`).
             let sections: [GamepadHint] = showsSectionHint
                 ? [.init(glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
-                         text: "Section")]
+                         text: "Section", action: { step(tabBy: 1) })]
                 : []
             // A dimmed row takes neither, so offering them would be the same lie the row itself
             // used to tell — only Done remains, and the detail line says what to turn on first.
             guard rows.first(where: { $0.id == focusID })?.enabled ?? true else {
                 return sections
-                    + [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done")]
+                    + [.init(
+                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                        action: { back() })]
             }
             return sections + [
+                // The stick itself, not an action — nothing to tap (see GamepadHint.action).
                 .init(glyph: "arrow.left.and.right", text: "Adjust"),
-                .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change"),
-                .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
+                .init(
+                    glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Change",
+                    action: { if let focusID { activate(id: focusID) } }),
+                .init(
+                    glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                    action: { back() }),
             ]
         }
         guard !store.hosts.isEmpty else {
-            return [.init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back")]
+            return [.init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+                action: { back() })]
         }
         return [
-            .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Pin / Unpin"),
-            .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back"),
+            .init(
+                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Pin / Unpin",
+                action: { if let focusID { activate(id: focusID) } }),
+            .init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+                action: { back() }),
         ]
     }
 

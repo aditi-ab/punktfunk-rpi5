@@ -420,13 +420,22 @@ struct GamepadHomeView: View {
         case .rescan: "Rescan"
         default: nil
         }
+        // Every cell's action re-resolves the selection when it FIRES rather than closing over the
+        // one this render saw: the legend is rebuilt on selection changes, but a tap landing in
+        // the same frame as a carousel move would otherwise activate the tile that was selected a
+        // moment ago — the one failure mode a launcher cannot afford.
         var hints = [GamepadHint(
             glyph: buttonGlyph(\.buttonA, fallback: "a.circle"),
-            text: action ?? (selected?.canWake == true ? "Wake & Connect" : "Connect"))]
+            text: action ?? (selected?.canWake == true ? "Wake & Connect" : "Connect"),
+            action: { tiles.first { $0.id == selection }?.activate() })]
         if libraryEnabled, selected?.hasLibrary == true {
-            hints.append(.init(glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library"))
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library",
+                action: { openLibraryForSelected() }))
         }
-        hints.append(.init(glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Settings"))
+        hints.append(.init(
+            glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Settings",
+            action: { showSettings = true }))
         return hints
     }
 

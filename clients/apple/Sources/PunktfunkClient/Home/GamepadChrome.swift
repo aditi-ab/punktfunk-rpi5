@@ -180,6 +180,10 @@ extension EnvironmentValues {
 struct GamepadHint: Identifiable {
     let glyph: String
     let text: String
+    /// What tapping/clicking this cell does — the same thing its button does. Optional because a
+    /// few legend cells NAME an input rather than an action ("↔ Adjust" is the stick itself;
+    /// there is no single thing a tap on it could mean), and those stay inert labels.
+    var action: (() -> Void)? = nil
     var id: String { glyph + text }
 }
 
@@ -197,22 +201,66 @@ struct GamepadHintBar: View {
     var body: some View {
         HStack(spacing: 18) {
             ForEach(hints) { hint in
-                HStack(spacing: 7) {
-                    Image(systemName: hint.glyph)
-                        .font(.system(size: metrics.hintGlyphFont))
-                        .foregroundStyle(ink.fg)
-                    Text(hint.text)
-                }
-                .fixedSize() // keep glyph + label together; never truncate a hint mid-word
+                cell(hint)
             }
         }
         .font(.geist(metrics.hintTextFont, .semibold, relativeTo: .subheadline))
         .foregroundStyle(ink.fg(0.85))
         .padding(metrics.hintPad)
         .consoleGlass(Capsule())
-        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1))
+        // The hairline is DECORATION and sits on top of the cells, so it must never take a touch.
+        // Spelled out rather than left to defaults, because a swallowed touch in this bar is
+        // invisible — the legend simply stops doing anything.
+        .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1).allowsHitTesting(false))
+    }
+
+    /// A cell is a button where it has somewhere to go, and a plain label otherwise (see the type
+    /// comment for why tvOS is always the latter).
+    @ViewBuilder private func cell(_ hint: GamepadHint) -> some View {
+        #if os(tvOS)
+        label(hint)
+        #else
+        if let action = hint.action {
+            Button(action: action) { label(hint) }
+                .buttonStyle(HintCellStyle())
+                .accessibilityLabel(hint.text)
+        } else {
+            label(hint)
+        }
+        #endif
+    }
+
+    private func label(_ hint: GamepadHint) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: hint.glyph)
+                .font(.system(size: metrics.hintGlyphFont))
+                .foregroundStyle(ink.fg)
+            Text(hint.text)
+        }
+        .fixedSize() // keep glyph + label together; never truncate a hint mid-word
+        // The tappable area covers the gap between glyph and label, not just their painted
+        // pixels — a legend cell is small enough already.
+        .contentShape(Rectangle())
     }
 }
+
+#if !os(tvOS)
+/// Press feedback for a legend cell. Deliberately quiet — the bar is chrome, and a cell that lit
+/// up like a primary button would pull the eye off the content it describes.
+///
+/// `contentShape` sits BELOW the scale so the hit region stays the unscaled layout bounds: a press
+/// animation that shrinks the artwork must never move the target out from under a resting finger,
+/// or the touch-up lands outside and SwiftUI discards the tap.
+private struct HintCellStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.55 : 1)
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.smooth(duration: 0.14), value: configuration.isPressed)
+            .contentShape(Rectangle())
+    }
+}
+#endif
 
 /// The console backdrop: a living aurora drifting slowly over black so it reads as ambience behind
 /// the cards, never as content. On iOS 18 / macOS 15+ it's an animated `MeshGradient` — a continuous
