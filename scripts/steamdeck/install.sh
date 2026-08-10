@@ -52,6 +52,10 @@ for arg in "$@"; do
 done
 TARGET_DIR="$SRC/target-steamos"
 BIN="$TARGET_DIR/release/punktfunk-host"
+# The PyroWave encode worker — a separate executable next to the host, and the ONLY binary this
+# installer setcaps. Never a hardlink or a mode of $BIN: a shared inode shares the file capability
+# and would void the KWin .desktop grant written below.
+WORKER="$TARGET_DIR/release/punktfunk-encode-worker"
 CONFIG="$HOME/.config/punktfunk"
 UNITS="$HOME/.config/systemd/user"
 XRD="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -141,13 +145,25 @@ log "Building punktfunk-host (release) — first build is slow (~10-15 min)"
 # vulkan-encode matches the packaged builds (deb/arch): the raw Vulkan Video HEVC/AV1 backend
 # (real RFI loss recovery). Pure-Rust ash — no extra system dep. A featureless hand build would
 # silently fall back to libav VAAPI.
+#
+# punktfunk-encode-worker is built alongside: the capability-carrying PyroWave encode worker, a
+# SEPARATE binary that lands next to the host in $TARGET_DIR/release (which is how the host finds
+# it — sibling of /proc/self/exe). The sudo block further down setcaps that one and only that one;
+# the host must stay capability-free or KWin cannot identify it and Desktop mode dies.
 distrobox enter "$BOX" -- bash -lc "
 set -e
 export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR'
-cd '$SRC' && cargo build -r -p punktfunk-host --features punktfunk-host/vulkan-encode
+cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker --features punktfunk-host/vulkan-encode
 "
 [ -x "$BIN" ] || die "build did not produce $BIN"
 ok "host binary: $BIN"
+# Not fatal if it is missing — an absent worker just means the in-process encoder at default GPU
+# priority, which is what every 0.26.x Deck already runs.
+if [ -x "$WORKER" ]; then
+    ok "encode worker: $WORKER"
+else
+    warn "no punktfunk-encode-worker at $WORKER — PyroWave will encode at default GPU priority"
+fi
 
 if [ "$WITH_WEB" = 1 ]; then
     log "Building the management web console (bun)"
@@ -361,6 +377,26 @@ if [ "$SUDO_OK" = 1 ]; then
     # `setcap -r` exits non-zero on a file that has no capability, hence the redirect.
     if [ -x "$BIN" ]; then
         sudo setcap -r "$BIN" 2>/dev/null || true
+    fi
+    # CAP_SYS_NICE on the ENCODE WORKER — the same grant, on the binary that can hold it, and the
+    # Deck is the box that wants it most: one small Van Gogh GPU shared between the game and
+    # PyroWave's compute-shader encode. punktfunk-encode-worker is a separate executable spawned
+    # per session that speaks one socketpair to the host and never touches Wayland, D-Bus or the
+    # network — nothing resolves ITS /proc/<pid>/exe, so the .desktop grant written above stays
+    # valid. Every driver tested (RADV included) refuses EVERY elevated global-priority class
+    # without this capability, so without it the lever is decoration.
+    #
+    # Like $BIN it lives under $HOME, so it survives a SteamOS A/B update on its own — but a
+    # REBUILD is a new inode and file capabilities do not follow, so it must be re-applied after
+    # every rebuild. Re-running this installer does that, and so does update.sh.
+    #
+    # Best-effort: a failure just means the encode runs at default priority, as it does today.
+    if [ -x "$WORKER" ]; then
+        if sudo setcap 'cap_sys_nice=ep' "$WORKER" 2>/dev/null; then
+            ok "granted CAP_SYS_NICE to the encode worker (PyroWave can outrank a GPU-bound game)"
+        else
+            warn "could not grant CAP_SYS_NICE to $WORKER — PyroWave stays at default GPU priority"
+        fi
     fi
     # SteamOS A/B updates rebuild /etc and DROP everything not on Valve's keep list — verified
     # live: an OS update stripped the udev rule + vhci autoload + UDP sysctl (gamepads silently

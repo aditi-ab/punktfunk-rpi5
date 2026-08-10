@@ -194,6 +194,16 @@ pub(crate) struct ProbedSupport {
     /// full-chroma 4:4:4 HEVC. `false` when unanswered (fail CLOSED, unlike `codecs`: the honest
     /// downgrade is a 4:2:0 session, not a dead one).
     pub hevc_444: bool,
+    /// `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` per listed codec — HEVC Main10 / AV1 10-bit. Rides this
+    /// same session for exactly the reason 4:4:4 does: the alternative, `linux::probe_can_encode_10bit`,
+    /// answers by opening an ffmpeg `hevc_nvenc`, and one ffmpeg NVENC open in a direct-SDK process
+    /// is the LOG-3 field bug that wedges every later open process-wide with
+    /// `NV_ENC_ERR_INVALID_VERSION`. That probe was left on ffmpeg when the 4:4:4 one was moved off
+    /// it, on the reading that "Linux HDR rides the libav P010 path" — no longer true for a CUDA
+    /// capture, which `open_video` sends to the direct backend (`bit_depth` passes straight through,
+    /// and `is_ten_bit_input` accepts packed 10-bit RGB). `false` when unanswered — fail CLOSED, an
+    /// 8-bit session beats a wedged one.
+    pub ten_bit: crate::CodecSupport,
 }
 
 /// The cached [`probe_support_uncached`] answer — one throwaway session per process lifetime.
@@ -234,6 +244,11 @@ fn probe_support_uncached() -> ProbedSupport {
             av1: false,
         },
         hevc_444: false,
+        ten_bit: crate::CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        },
     };
     let Ok(api) = try_api() else {
         return unknown;
@@ -299,6 +314,33 @@ fn probe_support_uncached() -> ProbedSupport {
                 .is_ok()
                 && val != 0;
         }
+        // The 10-bit cap, per codec, on the SAME still-open session — same reason 4:4:4 rides it.
+        // Only queried against a listed GUID (a cap query for an absent codec is undefined).
+        let mut ten_bit = crate::CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        };
+        if listed {
+            for (guid, slot) in [
+                (nv::NV_ENC_CODEC_HEVC_GUID, &mut ten_bit.h265),
+                (nv::NV_ENC_CODEC_AV1_GUID, &mut ten_bit.av1),
+            ] {
+                if !guids.contains(&guid) {
+                    continue;
+                }
+                let mut param = nv::NV_ENC_CAPS_PARAM {
+                    version: nv::NV_ENC_CAPS_PARAM_VER,
+                    capsToQuery: nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE,
+                    reserved: [0; 62],
+                };
+                let mut val: core::ffi::c_int = 0;
+                *slot = (api.get_encode_caps)(enc, guid, &mut param, &mut val)
+                    .nv_ok()
+                    .is_ok()
+                    && val != 0;
+            }
+        }
         let _ = (api.destroy_encoder)(enc);
         if !listed {
             tracing::warn!(
@@ -313,6 +355,7 @@ fn probe_support_uncached() -> ProbedSupport {
                 av1: guids.contains(&nv::NV_ENC_CODEC_AV1_GUID),
             },
             hevc_444,
+            ten_bit,
         }
     }
 }
@@ -704,8 +747,15 @@ pub struct NvencCudaEncoder {
     fps: u32,
     bitrate_bps: u64,
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
-    /// Encoded bit depth (8 on Linux until Phase 5.1 lands a P010 capture path). Kept for parity with
-    /// the Windows Main10 config, which is ported but inert until a 10-bit input exists.
+    /// Encoded bit depth. **10 is live on Linux** — this used to say "8 until Phase 5.1 lands a P010
+    /// capture path", which the code has since outrun: the gamescope HDR capture patches offer
+    /// 10-bit BT.2020/PQ formats, `nvenc_fmt` maps `X2Rgb10`/`X2Bgr10` to `ARGB10`/`ABGR10`, and
+    /// [`is_ten_bit_input`] flips this field and `hdr` from the negotiated input. A 10-bit frame
+    /// deliberately takes NEITHER the NV12 nor the YUV444 convert (both compute CSCs write 8-bit
+    /// planes) and rides packed RGB to the encoder, which does its own BT.2020 CSC —
+    /// `pf-capture/src/linux/pipewire.rs` owns that gate. So Main10 needed no P010 path to arrive.
+    /// P010 remains worth having later purely as a perf win (pre-convert so NVENC skips its internal
+    /// RGB→YUV CSC, as NV12 already does for SDR) — it is not what makes 10-bit work.
     bit_depth: u8,
     /// Full-chroma 4:4:4 (HEVC Range Extensions) — set when the capturer delivers a planar-YUV444
     /// `DeviceBuffer` on an HEVC session and the GPU supports YUV444 encode.

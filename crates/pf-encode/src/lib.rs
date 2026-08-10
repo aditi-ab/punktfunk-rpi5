@@ -358,8 +358,17 @@ fn open_video_backend_linux(
     if codec == Codec::PyroWave {
         #[cfg(feature = "pyrowave")]
         {
-            return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
-                .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
+            // Through the worker seam, not straight at the encoder: PyroWave's GPU-priority lever
+            // needs CAP_SYS_NICE, which only `punktfunk-encode-worker` may carry. Every rung of
+            // that ladder ends at this exact in-process open — see `pyrowave_remote`.
+            return pyrowave_remote::open_preferring_worker(
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                chroma,
+            )
+            .map(|e| (e, "pyrowave"));
         }
         #[cfg(not(feature = "pyrowave"))]
         anyhow::bail!(
@@ -517,14 +526,16 @@ fn open_video_backend_linux(
                 // The lab override forces the wavelet stream onto a session negotiated for
                 // another codec — that session's chroma may be HEVC-4:4:4, which the
                 // pyrowave encoder doesn't do yet, so pin the override to 4:2:0.
-                pyrowave::PyroWaveEncoder::open(
+                // Same worker seam as the negotiated arm above: the lab override is where the
+                // A/B is measured, so it must not be the one path that skips the worker.
+                pyrowave_remote::open_preferring_worker(
                     width,
                     height,
                     fps,
                     bitrate_bps,
                     ChromaFormat::Yuv420,
                 )
-                .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
+                .map(|e| (e, "pyrowave"))
             }
             #[cfg(not(feature = "pyrowave"))]
             {
@@ -1589,7 +1600,41 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
                 };
                 vulkan10 || vaapi::probe_can_encode_10bit(codec)
             } else {
-                linux::probe_can_encode_10bit(codec)
+                // NVIDIA. Same rule the 4:4:4 arm above already follows, and for the same field
+                // bug: on a direct-SDK host the answer comes from the driver's own
+                // `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` over the direct SDK, NOT from opening an
+                // ffmpeg `hevc_nvenc`. One ffmpeg NVENC open in a direct-SDK process wedges every
+                // later open process-wide with `NV_ENC_ERR_INVALID_VERSION` until the host
+                // restarts (LOG-3). This probe was the LAST ffmpeg-NVENC use left on a default
+                // host — it was kept on the reading that "Linux HDR rides the libav P010 path",
+                // which `open_video` contradicts: a CUDA payload goes to the direct backend at
+                // whatever `bit_depth` was resolved, and `is_ten_bit_input` accepts the packed
+                // 10-bit RGB (`X2Bgr10`) a gamescope HDR capture negotiates. Reproduced on
+                // home-nobara-1 2026-08-10: HDR on → probe opens ffmpeg → the live direct-SDK
+                // session's caps probe returns INVALID_VERSION → repeated in-place rebuilds →
+                // "encoder did not recover" and the session dies. With the ffmpeg probe out of the
+                // process the same HDR session streams clean.
+                //
+                // Only a host that will REALLY serve the session over libav keeps the ffmpeg probe
+                // (PUNKTFUNK_NVENC_DIRECT=0, or a build without `--features nvenc`): there it
+                // validates the actual path, and ffmpeg's NVENC client runs in that process anyway.
+                #[cfg(feature = "nvenc")]
+                {
+                    if nvenc_direct_enabled() {
+                        let t = nvenc_cuda::probe_support().ten_bit;
+                        match codec {
+                            Codec::H265 => t.h265,
+                            Codec::Av1 => t.av1,
+                            _ => false,
+                        }
+                    } else {
+                        linux::probe_can_encode_10bit(codec)
+                    }
+                }
+                #[cfg(not(feature = "nvenc"))]
+                {
+                    linux::probe_can_encode_10bit(codec)
+                }
             }
         }
         #[cfg(target_os = "windows")]
@@ -2035,6 +2080,18 @@ mod vk_util;
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 #[path = "enc/linux/pyrowave.rs"]
 mod pyrowave;
+// `punktfunk-encode-worker` (design/gpu-priority-capability-worker.md): the capability-carrying
+// process that owns the priority-elevated PyroWave device, because `punktfunk-host` may never hold
+// a file capability (0.26.0-1 — a capped host is unidentifiable to KWin and loses desktop
+// streaming). `worker` is the vocabulary plus the worker's own run loop, and it is `pub` for
+// exactly one caller: the ~30-line `main` of the separate `punktfunk-encode-worker` binary.
+// `pyrowave_remote` is the host-side proxy and its fallback ladder.
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[path = "enc/linux/pyrowave_remote.rs"]
+mod pyrowave_remote;
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[path = "enc/linux/worker.rs"]
+pub mod worker;
 // The Windows PyroWave encoder — NV12 zero-copy D3D11→Vulkan via pyrowave's own compat device
 // (design/pyrowave-windows-host-zerocopy.md). Same module name as the Linux one (per-platform
 // `#[path]`, mutually-exclusive cfg) so `crate::pyrowave::*` is flat on both.

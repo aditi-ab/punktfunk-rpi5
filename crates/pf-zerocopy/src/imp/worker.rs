@@ -14,7 +14,8 @@
 
 use super::cuda::{self, CUdeviceptr, DeviceBuffer};
 use super::egl::{DmabufPlane, EglImporter};
-use super::proto::{self, BufferDesc, ImportKind, Reply, Request};
+use super::ipc;
+use super::proto::{BufferDesc, ImportKind, Reply, Request, PROTO_VERSION};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -27,7 +28,7 @@ const FD_CACHE_CAP: usize = 64;
 /// Entry point for the hidden `zerocopy-worker` subcommand. `args` are the subcommand's own
 /// arguments (`--fd N`, default 3 — the socket end the spawning host `dup2`'d in).
 pub fn run_from_args(args: &[String]) -> Result<()> {
-    // The host execs this worker through its pinned exe fd (`client::self_exe`), so the kernel
+    // The host execs this worker through its pinned exe fd (`ipc::self_exe`), so the kernel
     // derives our comm from the exec path's basename — a meaningless fd number. Rename so
     // `top`/`pkill` see the worker.
     // SAFETY: `PR_SET_NAME` copies at most 16 bytes from the given pointer; the C-string literal
@@ -72,7 +73,7 @@ fn run(sock: OwnedFd) -> Result<()> {
         Err(e) => {
             // Init failure is an ANSWER, not a crash: the host falls back to the CPU path,
             // exactly like an in-process `EglImporter::new()` failure.
-            let _ = proto::send(
+            let _ = ipc::send(
                 sock.as_fd(),
                 &Reply::InitErr {
                     message: format!("{e:#}"),
@@ -82,10 +83,10 @@ fn run(sock: OwnedFd) -> Result<()> {
             return Ok(());
         }
     };
-    proto::send(
+    ipc::send(
         sock.as_fd(),
         &Reply::Ready {
-            version: proto::PROTO_VERSION,
+            version: PROTO_VERSION,
         },
         None,
     )
@@ -124,7 +125,7 @@ pub(crate) struct ImportReq {
 pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<()> {
     let mut buf = Vec::new();
     loop {
-        let (req, fd) = match proto::recv::<Request>(sock.as_fd(), &mut buf) {
+        let (req, fd) = match ipc::recv::<Request>(sock.as_fd(), &mut buf) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e).context("worker recv"),
@@ -173,7 +174,7 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
 
 /// Send a reply; `Ok(true)` means the host is gone (EPIPE) and the loop should end quietly.
 fn send_or_eof(sock: &OwnedFd, reply: &Reply) -> Result<bool> {
-    match proto::send(sock.as_fd(), reply, None) {
+    match ipc::send(sock.as_fd(), reply, None) {
         Ok(()) => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(true),
         Err(e) => Err(e).context("worker send"),
@@ -434,7 +435,7 @@ mod tests {
         mpsc::Receiver<String>,
         std::thread::JoinHandle<Result<()>>,
     ) {
-        let (host, worker) = proto::socketpair_seqpacket().unwrap();
+        let (host, worker) = ipc::socketpair_seqpacket().unwrap();
         let (tx, rx) = mpsc::channel();
         let join = std::thread::spawn(move || {
             let mut backend = MockBackend { calls: tx, next: 0 };
@@ -462,8 +463,8 @@ mod tests {
         let (host, rx, join) = start_server();
         let mut buf = Vec::new();
 
-        proto::send(host.as_fd(), &Request::Modifiers { fourcc: 42 }, None).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &Request::Modifiers { fourcc: 42 }, None).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(
             reply,
             Reply::Modifiers {
@@ -472,8 +473,8 @@ mod tests {
         );
 
         // First import delivers the desc; the second (same mock id sequence continues) doesn't.
-        proto::send(host.as_fd(), &import_req(1, false), None).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &import_req(1, false), None).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         match reply {
             Reply::Frame {
                 id: 0,
@@ -481,8 +482,8 @@ mod tests {
             } => {}
             other => panic!("unexpected reply {other:?}"),
         }
-        proto::send(host.as_fd(), &import_req(1, false), None).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &import_req(1, false), None).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 1, desc: None });
 
         // The descriptor itself must cross the socket: an import WITH an fd rides SCM_RIGHTS and
@@ -490,26 +491,26 @@ mod tests {
         // received fd (e.g. `backend.import(&req, None)`) would only be caught here.
         let (pr, _pw) = std::io::pipe().unwrap();
         let sent_ino = fd_ino(pr.as_fd().as_raw_fd());
-        proto::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 2, desc: None });
 
         // A missing worker-side fd is a NeedFd reply (host resends), not a failure.
-        proto::send(host.as_fd(), &import_req(0xfeed, false), None).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &import_req(0xfeed, false), None).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::NeedFd);
 
         // A failed import is an Err reply, not a dead worker.
-        proto::send(host.as_fd(), &import_req(0xbad, false), None).unwrap();
-        let (reply, _) = proto::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
+        ipc::send(host.as_fd(), &import_req(0xbad, false), None).unwrap();
+        let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         match reply {
             Reply::Err { message } => assert!(message.contains("scripted failure")),
             other => panic!("unexpected reply {other:?}"),
         }
 
         // Fire-and-forget ops reach the backend without replies.
-        proto::send(host.as_fd(), &Request::Release { id: 0 }, None).unwrap();
-        proto::send(host.as_fd(), &Request::ClearCache, None).unwrap();
+        ipc::send(host.as_fd(), &Request::Release { id: 0 }, None).unwrap();
+        ipc::send(host.as_fd(), &Request::ClearCache, None).unwrap();
 
         // Closing the host end terminates serve() cleanly.
         drop(host);

@@ -525,7 +525,32 @@ impl NvencEncoder {
             None => {}
         }
 
-        let enc = match video.open_with(opts) {
+        // libav's OWN failure path can take the whole host down with it. When NVENC init fails,
+        // `ff_nvenc_encode_init` calls `ff_cuda_check`, which hands `av_log` an `err_name`/
+        // `err_string` pair it did not initialize when the CUDA error lookup does not fill them —
+        // and glibc then walks that pointer in `strlen` inside `av_vbprintf`. Measured twice on
+        // home-nobara-1 (fc44, libavcodec 62), identical stack both times:
+        //
+        //     __strlen_evex <- av_vbprintf <- format_line <- av_log_default_callback
+        //       <- ff_cuda_check <- ff_nvenc_encode_init <- avcodec_open2 <- NvencEncoder::open
+        //
+        // once as an outright SIGSEGV mid-session, and once as a thread wedged in that stack so
+        // the service never answered SIGTERM and systemd SIGABRT'd it. Either way one encoder
+        // open failure kills every session on the box.
+        //
+        // We cannot fix the distro's FFmpeg, so deny it the chance to format: these messages are
+        // AV_LOG_ERROR, and `av_log_default_callback` returns on the level check before
+        // `format_line` when the level is AV_LOG_FATAL. The failure is NOT swallowed — it comes
+        // back as `Err(e)` below and is reported with our own context.
+        //
+        // Scoped to the call ALONE, deliberately: the ENOSYS arm below recurses into `Self::open`,
+        // and `QuietLibavLog` takes a non-reentrant global mutex — holding it across the match
+        // would deadlock the retry.
+        let opened = {
+            let _quiet = QuietLibavLog::new();
+            video.open_with(opts)
+        };
+        let enc = match opened {
             Ok(enc) => enc,
             // The GPU lacks NV_ENC_CAPS_SUPPORT_INTRA_REFRESH — ffmpeg fails the open with
             // ENOSYS ("Function not implemented"). Latch it (skip the doomed attempt on later
@@ -560,9 +585,21 @@ impl NvencEncoder {
                 );
             }
             Err(e) => {
+                // libav's own message for this failure was suppressed on purpose (see above), so
+                // say so — otherwise the next person debugging an NVENC open wonders why the
+                // journal has our error and none of FFmpeg's. There is no env switch to get it
+                // back (the guard is unconditional, and it outranks PUNKTFUNK_FFMPEG_DEBUG for the
+                // duration of the call): to read libav's text, drop the guard in a local build.
+                // What it costs is one line of the shape
+                //   [hevc_nvenc @ ..] cuInit(0) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable ..
+                // and the AVERROR itself still travels in `e`.
                 return Err(e).with_context(|| {
-                    format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)")
-                })
+                    format!(
+                        "open {name} ({width}x{height}@{fps}, {bitrate_bps} bps) — libav's own \
+                         diagnostic is silenced across this call because its CUDA error formatter \
+                         can fault the process"
+                    )
+                });
             }
         };
         if intra_refresh {

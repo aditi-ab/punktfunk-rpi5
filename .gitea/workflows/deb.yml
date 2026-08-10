@@ -310,8 +310,14 @@ jobs:
           # with "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
           # It WAS listed here, which is why only the .deb shipped a crashing tray while the RPM and
           # Arch packages — which already split it — were fine.
+          #
+          # punktfunk-encode-worker IS in this invocation: it is the capability-carrying PyroWave
+          # encode worker that ships next to the host in /usr/bin, and build-deb.sh only builds it
+          # if the artifact is missing — building it here keeps it on the same sccache pass as the
+          # host. Unlike the tray it shares the host's dependency graph by design (v1 accepts that
+          # the worker links the same FFmpeg), so feature unification here is harmless.
           cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-            -p punktfunk-host
+            -p punktfunk-host -p punktfunk-encode-worker
 
       - name: Build host .deb (FFmpeg bundled)
         # BUNDLE_FFMPEG=1 copies the image's /opt/ffmpeg libav* into the package and repoints the
@@ -319,6 +325,17 @@ jobs:
         # defaults to /opt/ffmpeg (the image's ENV also sets it).
         run: |
           VERSION="$VERSION" BUNDLE_FFMPEG=1 bash packaging/debian/build-deb.sh
+
+      # Read the capability matrix out of the BUILT .deb before it is published. dpkg carries no
+      # capability metadata — the postinst applies them — so this reads the postinst that will
+      # actually run on a user's box, plus the payload. 0.26.0-1 granted the host cap_sys_nice=ep
+      # from exactly that postinst and killed every KDE desktop session while every board stayed
+      # green: host must carry NOTHING, worker exactly cap_sys_nice=ep. `--self-test` first so a
+      # guard that can no longer fail takes the job down instead of waving the release through.
+      - name: Assert the capability matrix (host .deb)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-host_*.deb
 
       # punktfunk-gamescope for apt. Same reasoning as the RPM leg in rpm.yml: without a packaged
       # build, a Debian/Ubuntu box has no route to the patched gamescope except compiling it, and a

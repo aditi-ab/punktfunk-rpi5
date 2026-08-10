@@ -356,7 +356,8 @@ in
         allowedUDPPorts = nativeUDP ++ optionals cfg.host.gamestream gamestreamUDP;
       };
 
-      # NO CAP_SYS_NICE wrapper here — deliberately. 0.26.0-1 gave the host a
+      # NO CAP_SYS_NICE wrapper for the HOST — deliberately, and note there is deliberately one for
+      # the WORKER just below; the difference is the whole point. 0.26.0-1 gave the host a
       # `security.wrappers.punktfunk-host` carrying `cap_sys_nice=ep` for the GPU-priority lever,
       # and that broke desktop streaming on every KDE box.
       #
@@ -373,8 +374,36 @@ in
       # ambient-only grant (dumpable=1, CapPrm set) is refused exactly like a file capability. See
       # packaging/arch/punktfunk-host.install for the full matrix.
       #
-      # Costs pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a priority class is
-      # refused, and pf-frame's thread nice is a best-effort no-op — 0.25.0's behaviour exactly.
+      # The capability lives on the ENCODE WORKER instead — a different binary, and one nothing
+      # ever has to identify.
+      #
+      # punktfunk-encode-worker is spawned per PyroWave session, speaks one socketpair to its
+      # parent, and never connects to Wayland, D-Bus or the network. Nothing resolves ITS
+      # /proc/<pid>/exe, so the ambient grant a NixOS wrapper performs — the very thing that makes
+      # a wrapper useless for the host — is exactly right here. (It must also stay a SEPARATE file:
+      # a hardlink or a host subcommand would share the inode, hence the capability, and re-create
+      # the breakage above on every file-capability channel.)
+      #
+      # A file capability cannot live on a store path (read-only, and shared by every generation),
+      # so `security.wrappers` is the only mechanism NixOS has — which is why the unit below points
+      # PUNKTFUNK_ENCODE_WORKER at `config.security.wrapperDir` rather than the store path. The
+      # host's own ExecStart stays on the store path and must never move.
+      #
+      # Best-effort by construction: if the wrapper is absent or the operator overrides the env,
+      # the host falls back to its in-process encoder at default GPU priority — one warn, never a
+      # dead session. What the capability buys: PyroWave encodes on the GPU shader cores a game
+      # saturates, and every driver tested (NVIDIA and RADV) refuses EVERY elevated
+      # VK_KHR_global_priority class without CAP_SYS_NICE. Measured on an RTX 5070 Ti under load:
+      # encode p99 6.4 -> 4.4 ms.
+      #
+      # Narrow: CAP_SYS_NICE permits raising scheduling priority only — no filesystem, network or
+      # user-switching privilege, and the wrapper is capability-based, NOT setuid.
+      security.wrappers.punktfunk-encode-worker = {
+        source = "${cfg.host.package}/bin/punktfunk-encode-worker";
+        capabilities = "cap_sys_nice=ep";
+        owner = "root";
+        group = "root";
+      };
 
       systemd.user.services.punktfunk-host = {
         description = "punktfunk GameStream + punktfunk/1 streaming host";
@@ -393,6 +422,17 @@ in
         # The HDR-capable gamescope, if enabled. On PATH rather than pinned through
         # PUNKTFUNK_GAMESCOPE_BIN so an operator's own override of that env still wins.
         ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
+        # Point the host at the WRAPPED encode worker (see `security.wrappers` above). The host's
+        # own resolution order is PUNKTFUNK_ENCODE_WORKER -> alongside /proc/self/exe -> PATH, and
+        # on NixOS the sibling of the store binary is the UNCAPPED store copy — it would run, and
+        # be refused every priority class, silently. This env is the whole reason the override
+        # exists. `config.security.wrapperDir` rather than a hard-coded /run/wrappers/bin so an
+        # operator who has moved it is still correct.
+        #
+        # NixOS renders `Environment=` before `EnvironmentFile=`, so `settings`/`environmentFile`
+        # can still override this (or set it to `off` to force the in-process encoder) — the same
+        # "an operator's own override still wins" posture as PUNKTFUNK_GAMESCOPE_BIN above.
+        environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
         serviceConfig = {
           # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
           # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is

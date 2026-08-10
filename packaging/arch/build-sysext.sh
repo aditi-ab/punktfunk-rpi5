@@ -16,15 +16,23 @@
 # its `+pfhdr` banner, never trusted by filename. Omit it and the image is exactly what it was —
 # the host then stays SDR on that backend, by design.
 #
-# No CAP_SYS_NICE inside the image, for either binary. ⚠ NOT because capabilities are lost on the
-# way in — that was this comment's earlier claim and it is false: mksquashfs records
-# security.capability, and the published Bazzite 0.26.0-1 image really did carry `cap_sys_nice=ep`
-# on usr/bin/punktfunk-host. It is left out on purpose. A capability on the HOST binary makes it
-# unidentifiable to KWin (which resolves a client's /proc/<pid>/exe to match it against a .desktop,
-# and cannot read it for a capability-carrying process) and kills every Desktop-mode session — see
-# packaging/bazzite/build-sysext.sh, which now hard-fails if one is staged. `punktfunk-gamescope`
-# is a compositor, not a KWin client, so it is unaffected by that rule and simply runs without the
-# capability here, pacing slightly worse.
+# Capabilities in the image: NEVER on usr/bin/punktfunk-host, `cap_sys_nice=ep` on
+# usr/bin/punktfunk-encode-worker (best-effort), and none on punktfunk-gamescope.
+#
+# ⚠ Capabilities are NOT lost on the way in — that was this comment's earlier claim and it is
+# false: mksquashfs records security.capability, and the published Bazzite 0.26.0-1 image really
+# did carry `cap_sys_nice=ep` on usr/bin/punktfunk-host. The host is left uncapped on purpose. A
+# capability on the HOST binary makes it unidentifiable to KWin (which resolves a client's
+# /proc/<pid>/exe to match it against a .desktop, and cannot read it for a capability-carrying
+# process) and kills every Desktop-mode session.
+#
+# ⚠ And it is NOT enough to leave it out here: pacman scriptlets never run for a sysext, so the
+# `setcap` in punktfunk-host.install cannot reach this image either way. The encode worker is
+# therefore capped on the staging tree below — this is the only place a sysext can acquire it — and
+# both halves of the matrix are asserted before mksquashfs, exactly as
+# packaging/bazzite/build-sysext.sh does. `punktfunk-gamescope` is a compositor, not a KWin client,
+# so it is unaffected by the host rule and simply runs without a capability here, pacing slightly
+# worse.
 set -euo pipefail
 
 GAMESCOPE=""
@@ -79,6 +87,72 @@ cat > "$STAGE/usr/lib/extension-release.d/extension-release.$NAME" <<EOF
 ID=_any
 ARCHITECTURE=x86-64
 EOF
+
+# CAP_SYS_NICE on the encode worker (see the header). A pacman payload carries no capabilities and
+# no scriptlet ever runs for a sysext, so without this the SteamOS image ships the lever inert —
+# on the box with the smallest GPU shared between game and encode. Needs CAP_SETFCAP, i.e. root or
+# fakeroot; a plain-user build simply ships without it, which is a pacing loss and nothing more.
+#
+# `getcap` on an uncapped file exits 0 and prints nothing, so an empty read is unambiguous; the
+# output form differs across libcap versions ("path cap_sys_nice=ep" since ~2.36, "path =
+# cap_sys_nice+ep" before), hence the normalizer.
+_pf_caps_of() {
+  local raw; raw="$(getcap "$1" 2>/dev/null || true)"
+  [ -n "$raw" ] || { printf ''; return 0; }
+  printf '%s' "${raw#* }" | sed -e 's/^= *//' -e 's/+/=/' -e 's/[[:space:]]*$//'
+}
+
+# BEFORE granting: refuse a capability that arrived from somewhere else. The setcap below would
+# overwrite it and ship a correct-looking image while the surprise went unreported everywhere else.
+# Order matters: assert first, then grant, or the "anything else" arm can never fire.
+if command -v getcap >/dev/null 2>&1 && [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+  arrived_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
+  case "$arrived_caps" in
+    ''|cap_sys_nice=ep) : ;;
+    *)
+      echo "ERROR: staged usr/bin/punktfunk-encode-worker ARRIVED carrying '$arrived_caps'." >&2
+      echo "       A pacman payload carries no capabilities, so something else granted it — find" >&2
+      echo "       out what, because it is doing the same on the plain package path, unchecked." >&2
+      exit 1 ;;
+  esac
+fi
+
+if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-encode-worker" 2>/dev/null; then
+    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-encode-worker (GPU-priority lever active)"
+  else
+    echo "WARNING: could not setcap CAP_SYS_NICE on usr/bin/punktfunk-encode-worker (need" >&2
+    echo "         root/CAP_SETFCAP) — the image ships without it and PyroWave encodes at" >&2
+    echo "         default GPU priority." >&2
+  fi
+fi
+
+# Assert the final matrix before it is sealed into a read-only squashfs: host EMPTY (hard fail),
+# worker exactly cap_sys_nice=ep or nothing at all (missing is fine — the grant is best-effort).
+if command -v getcap >/dev/null 2>&1; then
+  if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
+    staged_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-host")"
+    if [ -n "$staged_caps" ]; then
+      echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
+      echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
+      echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
+      echo "       The GPU-priority capability belongs on usr/bin/punktfunk-encode-worker, never here." >&2
+      exit 1
+    fi
+  fi
+  if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
+    worker_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
+    case "$worker_caps" in
+      '')              echo "note: usr/bin/punktfunk-encode-worker ships uncapped — PyroWave encodes at default GPU priority" ;;
+      cap_sys_nice=ep) : ;;
+      *)
+        echo "ERROR: staged usr/bin/punktfunk-encode-worker carries '$worker_caps'," >&2
+        echo "       expected exactly 'cap_sys_nice=ep' (or nothing at all)." >&2
+        echo "       Refusing to bake an unexpected capability into a read-only image." >&2
+        exit 1 ;;
+    esac
+  fi
+fi
 
 OUT="$NAME.raw"
 rm -f "$OUT"

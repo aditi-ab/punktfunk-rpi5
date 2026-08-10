@@ -280,6 +280,21 @@ jobs:
           done
           echo "OK: $(echo "$DEPS" | grep -E '^libav|^libsw' | tr '\n' ' ')"
 
+      # 0.26.0-1 setcap'd `cap_sys_nice=ep` on the host from this package's .INSTALL scriptlet and
+      # killed desktop streaming on every KDE box — with a green board, because nothing here ever
+      # looked at what the built package would DO. The lesson recorded then was "verify the
+      # PACKAGE, never the board"; this is that, and pacman is the channel where it matters most,
+      # since capabilities live in the scriptlet rather than in package metadata.
+      #
+      # Host must carry NOTHING, the worker exactly cap_sys_nice=ep. `--self-test` runs first so a
+      # guard that has quietly lost the ability to fail takes the job down rather than approving a
+      # release. (Only the host package is checked: the client/web/scripting packages ship neither
+      # binary and the script skips them by itself.)
+      - name: Assert the capability matrix (Arch package)
+        run: |
+          bash scripts/ci/assert-cap-matrix.sh --self-test
+          bash scripts/ci/assert-cap-matrix.sh "$GITHUB_WORKSPACE"/dist/punktfunk-host-*.pkg.tar.zst
+
       # The optional HDR gamescope companion (packaging/gamescope) — a separate pkgbase with a
       # completely different dependency set, published into the same repo so `pacman -S
       # punktfunk-gamescope` is all an Arch/SteamOS box needs for 10-bit BT.2020 PQ.

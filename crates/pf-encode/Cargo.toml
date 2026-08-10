@@ -34,7 +34,15 @@ pf-capture = { path = "../pf-capture" }
 # Software H.264 (openh264, BSD-2) — the GPU-less encode path on both platforms.
 openh264 = "0.9"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The encode-worker protocol tests measure what an AU costs as a serde_json body — the reason the
+# access units ride a memfd instead (enc/linux/worker.rs).
+serde_json = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
+# The `punktfunk-encode-worker` protocol (enc/linux/worker.rs). The framing is pf-zerocopy's
+# `ipc`, which is generic over the serde body; the message enums live here and version separately.
+serde = { version = "1", features = ["derive"] }
 # libavcodec (NVENC libav + VAAPI backends). `ffmpeg-sys-next` auto-detects the FFmpeg version, so
 # this pin tracks the crate's own major (which shadows FFmpeg's): 9 = FFmpeg 9 (libavcodec 63,
 # libavutil 61). Arch shipped FFmpeg 9 on 2026-08-08 and every soname moved with it; the packaged
