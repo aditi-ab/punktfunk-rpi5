@@ -82,37 +82,98 @@ func gamepadTitleSize(compact: Bool) -> CGFloat {
 }
 
 /// Metrics shared by the gamepad form screens' glass rows (GamepadSettingsView,
-/// GamepadAddHostView) — one set of numbers so the two screens read as the same surface,
-/// sized for the couch on tvOS and for the hand elsewhere.
-enum GamepadFormMetrics {
-    #if os(tvOS)
-    static let headerFont: CGFloat = 17
-    static let labelFont: CGFloat = 23
-    static let valueFont: CGFloat = 21
-    static let iconFont: CGFloat = 24
-    static let iconWidth: CGFloat = 40
-    static let chevronFont: CGFloat = 16
-    static let rowHPad: CGFloat = 24
-    static let rowVPad: CGFloat = 19
-    static let rowCorner: CGFloat = 18
-    static let rowMaxWidth: CGFloat = 920
-    static let detailFont: CGFloat = 19
-    static let bandWidth: CGFloat = 380
-    #else
-    static let headerFont: CGFloat = 12
-    static let labelFont: CGFloat = 16
-    static let valueFont: CGFloat = 15
-    static let iconFont: CGFloat = 17
-    static let iconWidth: CGFloat = 28
-    static let chevronFont: CGFloat = 12
-    static let rowHPad: CGFloat = 16
-    static let rowVPad: CGFloat = 13
-    static let rowCorner: CGFloat = 14
-    static let rowMaxWidth: CGFloat = 620
-    static let detailFont: CGFloat = 13
+/// GamepadAddHostView) — one set of numbers so the screens read as the same surface, at the size
+/// the screen they are on calls for.
+///
+/// Three tiers, not two. The phone numbers used to serve every non-TV device, so an iPad Pro drew
+/// a settings list at iPhone scale in the middle of a 13" display — the field verdict was that the
+/// sizing "does not adapt to larger screens". `pad` sits between the in-hand and 10-foot sets.
+///
+/// Chosen from the SIZE CLASSES rather than the device idiom, so an iPad running a narrow Stage
+/// Manager or Split View window correctly gets the in-hand numbers — the window is what the user
+/// is reading, not the panel it sits on.
+struct GamepadFormMetrics {
+    /// Which set this is, for the few things that are a KIND of layout rather than a number.
+    enum Tier { case phone, pad, tv }
+
+    let tier: Tier
+    let headerFont: CGFloat
+    let labelFont: CGFloat
+    let valueFont: CGFloat
+    let iconFont: CGFloat
+    let iconWidth: CGFloat
+    let chevronFont: CGFloat
+    let rowHPad: CGFloat
+    let rowVPad: CGFloat
+    let rowCorner: CGFloat
+    let rowMaxWidth: CGFloat
+    let detailFont: CGFloat
     /// The option band's (GamepadOptionBand) fixed stage inside a choice row.
-    static let bandWidth: CGFloat = 240
+    let bandWidth: CGFloat
+    /// The settings screen's section-tab pills.
+    let tabFont: CGFloat
+    /// The pinned controls legend (GamepadHintBar).
+    let hintGlyphFont: CGFloat
+    let hintTextFont: CGFloat
+    let hintPad: CGFloat
+
+    /// In-hand: a phone, or any window narrow enough to read like one.
+    static let phone = GamepadFormMetrics(
+        tier: .phone,
+        headerFont: 12, labelFont: 16, valueFont: 15, iconFont: 17, iconWidth: 28,
+        chevronFont: 12, rowHPad: 16, rowVPad: 13, rowCorner: 14, rowMaxWidth: 620,
+        detailFont: 13, bandWidth: 240,
+        tabFont: 13, hintGlyphFont: 19, hintTextFont: 14, hintPad: 13)
+
+    /// A tablet-sized window — an arm's length away rather than in the palm.
+    static let pad = GamepadFormMetrics(
+        tier: .pad,
+        headerFont: 14, labelFont: 20, valueFont: 19, iconFont: 21, iconWidth: 34,
+        chevronFont: 14, rowHPad: 20, rowVPad: 16, rowCorner: 16, rowMaxWidth: 820,
+        detailFont: 16, bandWidth: 320,
+        tabFont: 16, hintGlyphFont: 23, hintTextFont: 17, hintPad: 15)
+
+    /// 10-foot.
+    static let tv = GamepadFormMetrics(
+        tier: .tv,
+        headerFont: 17, labelFont: 23, valueFont: 21, iconFont: 24, iconWidth: 40,
+        chevronFont: 16, rowHPad: 24, rowVPad: 19, rowCorner: 18, rowMaxWidth: 920,
+        detailFont: 19, bandWidth: 380,
+        tabFont: 17, hintGlyphFont: 27, hintTextFont: 20, hintPad: 18)
+
+    /// What a screen gets before anything publishes a tier — and the only tier tvOS and macOS ever
+    /// use (an Apple TV is always 10-foot; a Mac window is read at desk distance).
+    static var platformDefault: GamepadFormMetrics {
+        #if os(tvOS)
+        tv
+        #else
+        phone
+        #endif
+    }
+
+    #if os(iOS)
+    /// The tier a window's size classes call for. REGULAR on both axes is the tablet case.
+    static func forWindow(
+        h: UserInterfaceSizeClass?, v: UserInterfaceSizeClass?
+    ) -> GamepadFormMetrics {
+        h == .regular && v == .regular ? .pad : .phone
+    }
     #endif
+}
+
+private struct GamepadMetricsKey: EnvironmentKey {
+    static let defaultValue = GamepadFormMetrics.platformDefault
+}
+
+extension EnvironmentValues {
+    /// The form metrics for the screen currently drawing. Published from ContentView — the app
+    /// ROOT — rather than only from `gamepadPaletteInk`, because a screen that applies that
+    /// modifier itself sits ABOVE its own copy: its `@Environment` resolves against its parent, so
+    /// it would read the bare default instead of its own window's tier.
+    var gamepadMetrics: GamepadFormMetrics {
+        get { self[GamepadMetricsKey.self] }
+        set { self[GamepadMetricsKey.self] = newValue }
+    }
 }
 
 /// One glyph + label cell in a hint bar.
@@ -128,34 +189,26 @@ struct GamepadHint: Identifiable {
 /// the backdrop instead of dissolving into it.
 struct GamepadHintBar: View {
     @Environment(\.gamepadInk) private var ink
+    /// Sized with the screen it pins to — a legend at phone scale on a 13" iPad is the same
+    /// mismatch the form rows had (see GamepadFormMetrics).
+    @Environment(\.gamepadMetrics) private var metrics
     let hints: [GamepadHint]
-
-    // 10-foot legend on tvOS, in-hand sizes elsewhere.
-    #if os(tvOS)
-    private static let glyphFont: CGFloat = 27
-    private static let textFont: CGFloat = 20
-    private static let pad: CGFloat = 18
-    #else
-    private static let glyphFont: CGFloat = 19
-    private static let textFont: CGFloat = 14
-    private static let pad: CGFloat = 13
-    #endif
 
     var body: some View {
         HStack(spacing: 18) {
             ForEach(hints) { hint in
                 HStack(spacing: 7) {
                     Image(systemName: hint.glyph)
-                        .font(.system(size: Self.glyphFont))
+                        .font(.system(size: metrics.hintGlyphFont))
                         .foregroundStyle(ink.fg)
                     Text(hint.text)
                 }
                 .fixedSize() // keep glyph + label together; never truncate a hint mid-word
             }
         }
-        .font(.geist(Self.textFont, .semibold, relativeTo: .subheadline))
+        .font(.geist(metrics.hintTextFont, .semibold, relativeTo: .subheadline))
         .foregroundStyle(ink.fg(0.85))
-        .padding(Self.pad)
+        .padding(metrics.hintPad)
         .consoleGlass(Capsule())
         .overlay(Capsule().strokeBorder(ink.fg(0.12), lineWidth: 1))
     }

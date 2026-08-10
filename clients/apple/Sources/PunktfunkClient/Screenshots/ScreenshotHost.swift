@@ -43,10 +43,27 @@ enum ScreenshotMode {
 /// readiness ping for the capture script.
 struct ScreenshotHostView: View {
     let scene: ShotScene
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+    @Environment(\.verticalSizeClass) private var vSizeClass
+    #endif
+
+    /// The gamepad UI's form-metric tier, published here for the same reason ContentView does it:
+    /// this harness mounts those screens DIRECTLY, with no ContentView in the tree, so without it
+    /// an iPad capture renders every gamepad screen at iPhone scale — a capture that doesn't look
+    /// like the app.
+    private var gamepadMetrics: GamepadFormMetrics {
+        #if os(iOS)
+        .forWindow(h: hSizeClass, v: vSizeClass)
+        #else
+        .platformDefault
+        #endif
+    }
 
     var body: some View {
         scene.make()
             .environment(\.colorScheme, scene.colorScheme)
+            .environment(\.gamepadMetrics, gamepadMetrics)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             // Black fills the display, but the SCENE keeps its safe area. Ignoring it wholesale
             // here pushed the stream hero's HUD under the Dynamic Island (the resolution/bitrate

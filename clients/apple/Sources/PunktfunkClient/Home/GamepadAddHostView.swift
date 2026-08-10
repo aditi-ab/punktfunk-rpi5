@@ -13,6 +13,7 @@ import SwiftUI
 
 struct GamepadAddHostView: View {
     @Environment(\.gamepadInk) private var ink
+    @Environment(\.gamepadMetrics) private var metrics
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     let onAdd: (StoredHost) -> Void
@@ -48,7 +49,7 @@ struct GamepadAddHostView: View {
             isActive: controllerActive && editing == nil
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
+                .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
@@ -61,10 +62,10 @@ struct GamepadAddHostView: View {
                 if !compact {
                     Text("Hosts on this network appear automatically — add one by address "
                         + "for everything else.")
-                        .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
+                        .font(.geist(metrics.detailFont, relativeTo: .caption))
                         .foregroundStyle(ink.fg(0.55))
                         .multilineTextAlignment(.leading)
-                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72, alignment: .leading)
+                        .frame(maxWidth: metrics.rowMaxWidth * 0.72, alignment: .leading)
                 }
             }
             .padding(.horizontal, 24)
@@ -189,7 +190,7 @@ struct GamepadAddHostView: View {
     }
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        let m = GamepadFormMetrics.self
+        let m = metrics
         return HStack(spacing: 14) {
             if row.isAction {
                 Label("Add Host", systemImage: "plus.circle.fill")

@@ -46,6 +46,7 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 
 struct GamepadSettingsView: View {
     @Environment(\.gamepadInk) private var ink
+    @Environment(\.gamepadMetrics) private var metrics
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
@@ -142,7 +143,7 @@ struct GamepadSettingsView: View {
             isActive: controllerActive
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
+                .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
@@ -165,7 +166,7 @@ struct GamepadSettingsView: View {
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(focusedDetail)
-                    .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
+                    .font(.geist(metrics.detailFont, relativeTo: .caption))
                     .foregroundStyle(ink.fg(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
@@ -252,7 +253,7 @@ struct GamepadSettingsView: View {
     private func pill(_ t: GpSettingsTab) -> some View {
         let selected = t == tab
         return Text(t.rawValue)
-            .font(.geist(compact ? 12 : 13, .semibold, relativeTo: .footnote))
+            .font(.geist(compact ? 12 : metrics.tabFont, .semibold, relativeTo: .footnote))
             // `onAccent`, not `fg` — the selected pill is FILLED with the palette accent, and
             // `onAccent` is the colour picked (by the accent's own luminance) to read on top of
             // it; its doc calls out "a filled pill's label" for exactly this surface. Using the
@@ -368,7 +369,7 @@ struct GamepadSettingsView: View {
     // MARK: - Row rendering
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        let m = GamepadFormMetrics.self
+        let m = metrics
         // No section header: the tab strip names the section now, and repeating it above the
         // first row of every tab was just a second label saying the same word.
         return VStack(alignment: .leading, spacing: 6) {
@@ -446,9 +447,9 @@ struct GamepadSettingsView: View {
     /// narrows the stage.
     private var bandWidth: CGFloat {
         #if os(iOS)
-        hSizeClass == .compact && vSizeClass == .regular ? 170 : GamepadFormMetrics.bandWidth
+        hSizeClass == .compact && vSizeClass == .regular ? 170 : metrics.bandWidth
         #else
-        GamepadFormMetrics.bandWidth
+        metrics.bandWidth
         #endif
     }
 

@@ -115,6 +115,23 @@ struct ContentView: View {
     /// scenePhase drives the keep-alive: use THIS, not the willResignActive observers — resign-active
     /// also fires for Control Center / app-switcher peeks, where the disconnect timer must not start.
     @Environment(\.scenePhase) private var scenePhase
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var hSizeClass
+    @Environment(\.verticalSizeClass) private var vSizeClass
+    #endif
+
+    /// The gamepad UI's form-metric tier for this window, published from HERE — the app's root.
+    /// A screen that applies `gamepadPaletteInk` itself sits ABOVE its own copy of the environment,
+    /// so its `@Environment` resolves against its parent; publishing at the root is what makes
+    /// every one of them (including the ones presented as sheets and covers, which inherit the
+    /// environment) read its own window's tier instead of the bare default.
+    private var gamepadMetrics: GamepadFormMetrics {
+        #if os(iOS)
+        .forWindow(h: hSizeClass, v: vSizeClass)
+        #else
+        .platformDefault
+        #endif
+    }
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled,
@@ -181,6 +198,11 @@ struct ContentView: View {
     }
 
     private var driven: some View {
+        drivenBase
+            .environment(\.gamepadMetrics, gamepadMetrics)
+    }
+
+    private var drivenBase: some View {
         Group {
             // The stream view's structural identity MUST be stable across the
             // awaiting-trust → streaming transition: recreating it restarts the pump,
