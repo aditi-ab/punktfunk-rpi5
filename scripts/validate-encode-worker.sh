@@ -106,6 +106,11 @@ L_LEAVING='pyrowave: leaving the encode worker'
 L_DIED='the encode worker died mid-session'
 L_RESPAWNED='respawned the encode worker after a mid-session death'
 L_NORESPAWN='the encode worker would not respawn'
+# The proxy's attributable "my peer went away" errors. `spike` has NO encoder-recovery loop — it does
+# `encoder.submit(..)?` and exits — so under the spike a killed worker surfaces as one of these and
+# never reaches `Encoder::reset`, which is where L_DIED/L_RESPAWNED are emitted. See v4.e.
+L_PEERGONE='no reply from the encode worker'
+L_PEERPIPE='send to the encode worker'
 L_WORKER_READY='punktfunk-encode-worker ready'
 L_PERF='pyrowave encode, submit->AU'
 L_CAPTURE='capture pipeline resolved:'
@@ -1072,7 +1077,32 @@ leg_v4() {
       local total after
       total="$(perf_windows "$wlog")"; after="$(perf_windows_after "$wlog" "$L_DIED")"
       if ! logs_have "$wlog" "$L_DIED"; then
-        fail V4.e "no '$L_DIED' line after killing pid $wpid — see $wlog"
+        # THE VEHICLE, NOT THE LADDER. L_DIED/L_RESPAWNED are emitted by `RemotePyroWave::reset`,
+        # and the only caller of `Encoder::reset` is the real session's `reset_stalled_encoder`
+        # loop (native/stream.rs). `spike` is a dev tool with no recovery loop at all — it does
+        # `encoder.submit(&frame).context("encoder submit")?` and exits — so a worker killed under
+        # the spike can never reach reset, and demanding L_DIED here is a FALSE NEGATIVE that
+        # reports a shipping blocker for a rung the product implements correctly.
+        #
+        # What the spike CAN prove, and what is asserted instead: the worker's death is surfaced as
+        # an ATTRIBUTABLE proxy error naming the worker — not a hang, not an unexplained failure,
+        # and never the host process dying with it. Anything else still fails.
+        if { logs_have "$wlog" "$L_PEERGONE" || logs_have "$wlog" "$L_PEERPIPE"; } \
+           && [ "${total:-0}" -ge 1 ]; then
+          pass V4.e "kill -9 under the spike: the death surfaces as an attributable worker-IPC error"
+          info "after $total encode window(s), and the host process did not die with it."
+          info "⚠ THE RESPAWN RUNG IS NOT OBSERVABLE HERE. \`spike\` has no encoder-recovery loop"
+          info "(submit errors propagate and it exits), so \`Encoder::reset\` — the only emitter of"
+          info "'$L_DIED' — is never called. Verify that half against a REAL session:"
+          info "    1. connect a client, then:  pkill -f punktfunk-encode-worker"
+          info "    2. journalctl --user -u punktfunk-host -b | grep -E 'died mid-session|respawned'"
+          info "  Confirmed on glass 2026-08-10 (home-nobara-1, KDE, RTX 5070 Ti): stream never"
+          info "  dropped, 'respawned the encode worker after a mid-session death"
+          info "  priority=Granted(Realtime)', 'encoder rebuilt in place, forcing an IDR reset=1'."
+        else
+          fail V4.e "killing pid $wpid produced neither '$L_DIED' nor an attributable worker-IPC"
+          info "error — the death was not surfaced at all. See $wlog"
+        fi
       elif [ "${after:-0}" -lt 1 ]; then
         fail V4.e "the death was logged but NOTHING encoded afterwards ($total window(s), all before"
         info "the kill) — the session did not actually survive. See $wlog"
@@ -1332,6 +1362,20 @@ No KDE at all (sway only), so V1 cannot run there and will SKIP with that reason
 a capability nor KDE, which is the point of splitting it out.
 
          scripts/validate-encode-worker.sh inspect v3a v4 v5 --source portal
+
+--- V4.e's second half: the respawn rung needs a REAL session -------------------------------------
+v4.e kills the worker under `spike`, and `spike` has no encoder-recovery loop — submit errors
+propagate and it exits. `Encoder::reset` is therefore never called, and reset is the ONLY emitter of
+"the encode worker died mid-session" / "respawned the encode worker". So the leg asserts the half it
+can see (the death is surfaced as an attributable worker-IPC error, host still alive) and leaves the
+respawn to a real session. To close it, with a client connected and streaming:
+
+         pkill -f punktfunk-encode-worker
+         journalctl --user -u punktfunk-host -b | grep -E 'died mid-session|respawned|rebuilt in place'
+
+Expect the stream never to drop, plus "respawned the encode worker after a mid-session death
+priority=Granted(Realtime)" and "encoder submit failed — encoder rebuilt in place, forcing an IDR
+reset=1 max=5". Confirmed on home-nobara-1 (KDE, RTX 5070 Ti) 2026-08-10.
 
 --- the one step this script will never do --------------------------------------------------------
 It never calls setcap. If a leg says the worker is uncapped and you want the lever:
