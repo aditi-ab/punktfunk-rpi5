@@ -47,6 +47,7 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 struct GamepadSettingsView: View {
     @Environment(\.gamepadInk) private var ink
     @Environment(\.gamepadMetrics) private var metrics
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
@@ -175,7 +176,10 @@ struct GamepadSettingsView: View {
             // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
             .padding(.leading, compact ? 12 : 18)
             .padding(.trailing, 22)
-            .padding(.bottom, compact ? 12 : 18)
+            .padding(
+                .bottom,
+                gamepadLegendBottomPadding(
+                    compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
             .padding(.top, compact ? 6 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -260,8 +264,11 @@ struct GamepadSettingsView: View {
             // foreground meant white-on-white wherever a palette's accent is pale: Graphite's is
             // a light grey (luma ≈ 0.80), so its selected tab was unreadable.
             .foregroundStyle(selected ? ink.onAccent : ink.fg(0.55))
-            .padding(.horizontal, 13)
-            .padding(.vertical, 7)
+            // Proportional to the row metrics rather than fixed, so the strip grows with the
+            // fields under it — a tab bar at phone scale above iPad-scale rows was half the
+            // "does not adapt to larger screens" complaint.
+            .padding(.horizontal, metrics.rowHPad * 0.8)
+            .padding(.vertical, metrics.rowVPad * 0.55)
             .background {
                 // One shared capsule that MOVES between pills, rather than one per pill fading
                 // in and out — the highlight travels the way the press did. A Liquid Glass

@@ -14,6 +14,7 @@ import SwiftUI
 struct GamepadAddHostView: View {
     @Environment(\.gamepadInk) private var ink
     @Environment(\.gamepadMetrics) private var metrics
+    @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     let onAdd: (StoredHost) -> Void
@@ -77,7 +78,10 @@ struct GamepadAddHostView: View {
             bottomTray
                 // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
                 .padding(.horizontal, compact ? 12 : 18)
-                .padding(.bottom, compact ? 12 : 18)
+                .padding(
+                    .bottom,
+                    gamepadLegendBottomPadding(
+                        compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
                 .padding(.top, compact ? 6 : 10)
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
