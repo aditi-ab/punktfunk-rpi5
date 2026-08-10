@@ -267,7 +267,10 @@ pub const PALETTES: [Palette; 13] = [
         // luminance while keeping the backdrop a field with somewhere to go rather than a
         // dead rectangle. The accent stays the brand violet — focus has to be findable on
         // black.
-        id: "oled", name: "OLED",
+        // Named for the look, not the panel technology — black with a thin violet corona belongs
+        // beside Nebula and Abyss. ⚠ The ID stays "oled": it is the stored `ui_palette` value and
+        // the cross-client key, so renaming it would orphan saved choices and desync the clients.
+        id: "oled", name: "Eclipse",
         stops: Some(&[
             (0.000, 0.000, 0.000), (0.000, 0.000, 0.000), (0.010, 0.020, 0.100),
             (0.045, 0.016, 0.115), (0.120, 0.024, 0.130),
