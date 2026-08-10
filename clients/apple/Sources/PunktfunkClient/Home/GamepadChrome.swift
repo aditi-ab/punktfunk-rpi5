@@ -5,6 +5,8 @@
 // iOS/iPadOS, macOS (the couch Mac-mini case), and tvOS — where the same screens are driven by
 // the native focus engine instead of the controller poll (see GamepadCarousel/GamepadMenuList).
 
+import Glur
+import GlurBackdrop
 import PunktfunkKit
 import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
@@ -278,6 +280,45 @@ func gamepadLegendBottomPadding(
     guard tier == .pad else { return margin }
     // Floored at -inset: at worst the pill sits flush with the physical edge, never past it.
     return max(-displayBottom, margin - displayBottom)
+}
+
+/// The tray gradient blur, back — as a real progressive BACKDROP blur this time.
+///
+/// GamepadTrayScrim did this with `.ultraThinMaterial`, and a material by definition lifts and
+/// tints whatever it blurs: it read grey over the aurora, and washed with the palette's ground it
+/// read coloured, which is why 2590238b deleted it. Glur's `GlurView` blurs the backdrop through
+/// a gradient with NO material stage on top, so the rows soften as they slide under the pinned
+/// title and legend and nothing carries a colour. It is the library's PRIVATE-API product
+/// (`GlurBackdrop`) — the public `.glur()` modifier is a shader on a view's own content and
+/// silently no-ops over platform-backed views like ScrollView, so it cannot reach a backdrop at
+/// all. Hit testing is disabled inside GlurView; the band never eats a touch.
+///
+/// Mounted exactly where the scrim was: `.background` of each form screen's safe-area tray.
+struct GamepadTrayBlur: View {
+    let edge: VerticalEdge
+
+    var body: some View {
+        // offset 0 puts the ramp's LITERAL ZERO exactly at the band's content edge, so nothing
+        // in the open field is touched — which is why, unlike the scrim, this band takes NO
+        // content-side overhang. The scrim's -44/-72 runway existed because a material carries
+        // body at every alpha and had to dissolve OUTSIDE the tray; carrying those numbers over
+        // here blurred fully-visible rows at rest (field verdict on the first cut). Full
+        // strength lands at 60% of the band, so the tray's own text always sits on the strong
+        // region while the ramp still reads as a gradient, not an edge.
+        GlurView(
+            radius: 14, offset: 0, interpolation: 0.6,
+            direction: edge == .top ? .up : .down)
+            // Full-bleed by LAYOUT, not `.ignoresSafeArea()`: safe-area expansion resolves a
+            // beat after insertion (outside any geometry group and outside this view's own
+            // transaction), which reads as a visible pop. 80 pt clears every inset on every
+            // device, and backgrounds never clip — the overhang simply draws.
+            .padding(edge == .top ? .top : .bottom, -80)
+            .padding(.horizontal, -80)
+            // And the shape must NEVER animate: mounted inside a pushed shell layer, any late
+            // geometry would ride the push's transaction and visibly grow into place. The
+            // layer's own fade/slide still carries the band; only its SHAPE is pinned.
+            .transaction { $0.animation = nil }
+    }
 }
 
 /// One glyph + label cell in a hint bar.

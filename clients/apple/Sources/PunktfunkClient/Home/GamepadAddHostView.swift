@@ -73,6 +73,7 @@ struct GamepadAddHostView: View {
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background { GamepadTrayBlur(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomTray
@@ -83,6 +84,7 @@ struct GamepadAddHostView: View {
                     gamepadLegendBottomPadding(
                         compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
                 .padding(.top, compact ? 6 : 10)
+                .background { GamepadTrayBlur(edge: .bottom) }
         }
         // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
         // Hosted in the shell, the field is the shell's (see GamepadSettingsView's twin).

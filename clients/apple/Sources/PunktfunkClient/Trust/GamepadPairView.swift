@@ -76,6 +76,7 @@ struct GamepadPairView: View {
                 .padding(.top, gamepadTitleTopPadding(compact: compact))
                 .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background { GamepadTrayBlur(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomTray
@@ -87,6 +88,7 @@ struct GamepadPairView: View {
                     gamepadLegendBottomPadding(
                         compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
                 .padding(.top, compact ? 6 : 10)
+                .background { GamepadTrayBlur(edge: .bottom) }
         }
         // Hosted in the shell, the field is the shell's own (see GamepadAddHostView's twin).
         .background {

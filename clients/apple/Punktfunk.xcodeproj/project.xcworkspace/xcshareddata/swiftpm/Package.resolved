@@ -1,6 +1,14 @@
 {
-  "originHash" : "5d17a752eb57d190a90cbd663718ff44034b24fe0ae1baafea7677db2d49da6f",
+  "originHash" : "bb1ce9bc6042f166bd0aad78a15081e673781d3a90fa52fd8ec8a08875878ef6",
   "pins" : [
+    {
+      "identity" : "glur",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/joogps/Glur.git",
+      "state" : {
+        "revision" : "ba4f05d3c9a608ec773b9305f2af6089390de68a"
+      }
+    },
     {
       "identity" : "objc-runtime-tools",
       "kind" : "remoteSourceControl",

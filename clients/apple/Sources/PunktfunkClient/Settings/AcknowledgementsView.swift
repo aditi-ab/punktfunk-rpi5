@@ -54,6 +54,15 @@ struct AcknowledgementsView: View {
 
                     Divider()
 
+                    Text("Swift packages")
+                        .font(.geist(Self.headlineFont, .semibold, relativeTo: .headline))
+                    Text("Punktfunk uses Glur (progressive backdrop blur), "
+                        + "© 2023 João Gabriel, under the MIT License.")
+                        .font(.geist(Self.captionFont, relativeTo: .caption))
+                        .foregroundStyle(.secondary)
+
+                    Divider()
+
                     Text("Third-party software")
                         .font(.geist(Self.headlineFont, .semibold, relativeTo: .headline))
                     Text(

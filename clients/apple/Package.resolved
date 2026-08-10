@@ -1,0 +1,13 @@
+{
+  "pins" : [
+    {
+      "identity" : "glur",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/joogps/Glur.git",
+      "state" : {
+        "revision" : "ba4f05d3c9a608ec773b9305f2af6089390de68a"
+      }
+    }
+  ],
+  "version" : 2
+}

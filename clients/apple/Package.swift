@@ -16,6 +16,17 @@ let package = Package(
         .library(name: "PunktfunkShared", targets: ["PunktfunkShared"]),
         .executable(name: "PunktfunkClient", targets: ["PunktfunkClient"]),
     ],
+    dependencies: [
+        // Progressive (gradient) backdrop blur for the form screens' trays — a real blur with no
+        // material tint stage (see GamepadTrayBlur). Pinned by REVISION, not `from:`: the
+        // GlurBackdrop product exists only on main — no release carries it (the newest tag,
+        // `1.1`, predates it, and is not three-component semver anyway, so version-based
+        // resolution stops at 1.0.4). The revision is main's head at adoption time; a revision
+        // pin stays reproducible when the branch moves.
+        .package(
+            url: "https://github.com/joogps/Glur.git",
+            revision: "ba4f05d3c9a608ec773b9305f2af6089390de68a"),
+    ],
     targets: [
         .binaryTarget(name: "PunktfunkCore", path: "PunktfunkCore.xcframework"),
         // No dependencies by design — an extension process links this alone.
@@ -51,7 +62,12 @@ let package = Package(
         // (The tvOS slide-transition package is referenced by the Xcode PROJECT only —
         // its manifest breaks SwiftPM whole-graph validation on macOS, and only the
         // Punktfunk-tvOS target links it; the #if os(tvOS) import never compiles here.)
-        .executableTarget(name: "PunktfunkClient", dependencies: ["PunktfunkKit"]),
+        .executableTarget(
+            name: "PunktfunkClient",
+            dependencies: [
+                "PunktfunkKit",
+                .product(name: "GlurBackdrop", package: "Glur"),
+            ]),
         // PunktfunkCore is a direct dep too so the wire tests can name the C ABI's
         // `PunktfunkInputEvent` / `PUNKTFUNK_INPUT_KIND_*` when asserting the gamepad byte layout.
         .testTarget(

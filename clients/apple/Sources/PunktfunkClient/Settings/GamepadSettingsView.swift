@@ -163,6 +163,7 @@ struct GamepadSettingsView: View {
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+            .background { GamepadTrayBlur(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
@@ -182,6 +183,7 @@ struct GamepadSettingsView: View {
                     compact ? 12 : 18, tier: metrics.tier, displayBottom: displayBottomInset))
             .padding(.top, compact ? 6 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background { GamepadTrayBlur(edge: .bottom) }
         }
         // The launcher's living field, calmed (GamepadFormBackground) — the glass rows keep real
         // colour and luminance to lens without the launcher's contrast, and the palette setting

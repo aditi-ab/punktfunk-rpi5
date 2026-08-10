@@ -38,6 +38,7 @@ struct GamepadLibraryScreen: View {
                     .padding(.horizontal, 24)
                     .padding(.top, gamepadTitleTopPadding(compact: compact))
                     .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
+                    .background { GamepadTrayBlur(edge: .top) }
             }
             // A hardware keyboard's Esc still closes, without chrome.
             .background {
