@@ -17,6 +17,7 @@ The patches here add the missing half, and nothing else. See
 | `0004-pipewire-optionally-composite-the-external-overlay-i.patch` | `--pipewire-composite-external-overlay` (off by default): paint the external overlay layer (mangoapp — the fps/stats readout) into the capture stream | **Yes** — same shape as the cursor patch, same argument |
 | `0005-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the functional patches above land upstream |
 | `0006-punktfunk-never-destroy-the-Vulkan-device-or-output-.patch` | Give `g_device` and `g_output` storage that is never destroyed, so their destructors cannot call a Vulkan driver glibc has already unloaded at `exit()` | **Yes** — a plain static-destruction-order bug, not punktfunk-specific |
+| `0007-pipewire-never-leave-pw_buffer-user_data-pointing-at.patch` | Associate `pw_buffer->user_data` with its `pipewire_buffer` for every path out of `add_buffer`, clear it in `remove_buffer` (the last point both halves are known), and null-check the consumers — killing the use-after-free that aborted the session on every capture renegotiation | **Yes** — a plain use-after-free in the PipeWire buffer lifecycle |
 
 ### Why the headless patch matters
 
@@ -39,6 +40,32 @@ RGB-direct encode source (`VK_VALVE_video_encode_rgb_conversion`) hands the capt
 fixed-function front end with no blend stage. Painting the cursor into the node removes the reason
 for the blend, and with it a full-frame pass per frame — a gamescope session becomes the first one
 that can be genuinely zero-copy end to end.
+
+### Why the buffer-lifetime patch is the one that made sessions unusable
+
+Patch 0007 is not a refinement — without it a managed gamescope session dies on essentially every
+client connect. The host sets the session to the client's mode, the mode change renegotiates the
+PipeWire stream, and the renegotiation is exactly what trips upstream's dangling
+`pw_buffer->user_data`. The signature to recognise:
+
+```
+punktfunk-gamescope: ../src/pipewire.cpp:88: void destroy_buffer(pipewire_buffer*):
+  Assertion `false' failed.
+#5  destroy_buffer(pipewire_buffer*).cold
+```
+
+It is a use-after-free wearing an `assert(false); // unreachable` as a disguise — `buffer->type`
+is read out of freed memory and falls off the end of the `switch`. A zeroed slot gives the SIGSEGV
+variant of the same fault instead. Two traps when triaging it:
+
+* **It is not HDR-specific.** The abort was first seen right after a 10-bit stream negotiated, so
+  it looked like the HDR path and `PUNKTFUNK_GAMESCOPE_HDR=0` looked like a workaround. It is not
+  — the same abort reproduces on an SDR session with no `--hdr-enabled` in the command line.
+  Check the failing process's actual argv before believing an HDR association.
+* **`gamescope-session-plus` hides it.** When our binary crash-loops, the session script retries
+  and eventually comes up on the *stock* `/usr/bin/gamescope` at its default 1920×1080. So the box
+  lands in a working-looking game mode at the wrong resolution and without any of these patches.
+  Read the banner in `~/.gamescope-stdout.log`, not the fact that a session exists.
 
 ## Why the marker exists
 
@@ -130,6 +157,7 @@ They are gamescope's, not ours, and they vary by distro. Two shortcuts that work
 sudo dnf install -y dnf-plugins-core meson ninja-build glslc
 sudo dnf builddep -y gamescope
 sudo dnf install -y xorg-x11-server-Xwayland-devel      # NOT pulled by builddep; wlroots needs it
+sudo dnf install -y libstdc++-static                    # NOT pulled by builddep; see below
 
 # Arch / SteamOS — see the makedepends in ./PKGBUILD
 ```
@@ -139,6 +167,19 @@ we pin, so it can come up short. `xorg-x11-server-Xwayland-devel` is the one tha
 (2026-07-28, Fedora 43): without it wlroots' configure fails with `Neither a subproject directory
 nor a xserver.wrap file was found`, several minutes into an otherwise clean run. If a different
 one surfaces, meson names it — install and re-run with `--srcdir` so the clone is not repeated.
+
+⚠️ `libstdc++-static` is a **punktfunk** requirement, not gamescope's, so no builddep will ever pull
+it: the build script links the C++ runtime statically on purpose (see the long comment beside
+`LDFLAGS` in `build-punktfunk-gamescope.sh`). Without it meson fails at configure with a message
+that names neither the flag nor the package (2026-08-10, Fedora 44):
+
+```
+ERROR: Compiler c++ cannot compile programs.
+  /usr/bin/ld.bfd: cannot find -lstdc++
+```
+
+The cleanup trap deletes the temp checkout on failure, taking `meson-logs/meson-log.txt` with it —
+so build with `--srcdir` when diagnosing, or the evidence is gone before you can read it.
 
 `gamescope` needs `CAP_SYS_NICE` for its realtime priority; the distro packages set it on their
 own binary. Mirror it if you install ours system-wide:
