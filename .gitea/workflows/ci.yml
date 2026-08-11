@@ -146,8 +146,8 @@ jobs:
       # `nvenc` gates enc/linux/nvenc_cuda.rs (+ nvenc_core/nvenc_status) and `vulkan-encode` gates
       # enc/linux/vulkan_video.rs (+ the vendored vk_av1_encode/vk_valve_rgb bindings) — ~8,150
       # lines carrying ~70 `unsafe` blocks. Their ONLY prior CI coverage was deb.yml's
-      # `cargo build`, where warnings are not errors, so pf-encode's own
-      # `#![deny(clippy::undocumented_unsafe_blocks)]` — the crate's stated unsafe-proof gate —
+      # `cargo build`, where warnings are not errors, so the `undocumented_unsafe_blocks` deny
+      # (now hoisted into [workspace.lints]) — pf-encode's stated unsafe-proof gate —
       # was never actually enforced on them. (`pyrowave` needs no extra step: punktfunk-host has
       # `default = ["pyrowave"]`, so the steps above already cover it.)
       #

@@ -9,6 +9,11 @@
 #![allow(non_snake_case)]
 // Bindgen output for a C API: u128 layout warnings and the like are upstream's concern.
 #![allow(improper_ctypes)]
+// The workspace-wide undocumented_unsafe_blocks deny cannot apply to GENERATED code: bindgen
+// emits `unsafe {}` in layout tests/accessors and nobody hand-writes proofs into OUT_DIR. This
+// crate is bindings-only by charter (the safe wrapper lives with the consumer), so the allow is
+// crate-wide; the hand-written link-sanity test below still carries its proof by convention.
+#![allow(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

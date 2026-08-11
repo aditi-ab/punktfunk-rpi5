@@ -10,6 +10,11 @@
 #![allow(non_snake_case)]
 // Bindgen output for a C API: u128 layout warnings and the like are upstream's concern.
 #![allow(improper_ctypes)]
+// The workspace-wide undocumented_unsafe_blocks deny cannot apply to GENERATED code: bindgen
+// emits `unsafe {}` in layout tests/accessors and nobody hand-writes proofs into OUT_DIR. This
+// crate is bindings-only by charter (the safe wrapper lives with the consumer), so the allow is
+// crate-wide; the hand-written link-sanity test below still carries its proof by convention.
+#![allow(clippy::undocumented_unsafe_blocks)]
 // Generated code — clippy findings in it (missing safety docs on generated unsafe fns, style
 // nits across 14k lines) are bindgen's shape, not ours; the safe wrapper in pf-encode is the
 // linted surface.
