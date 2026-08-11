@@ -674,6 +674,84 @@ pub fn initials(title: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The shared console parity vectors — `clients/shared/console-vectors.json`, the sibling of
+    /// `deeplink-vectors.json` and read the same way (`include_str!`, so a missing file is a
+    /// compile error rather than a skipped test).
+    ///
+    /// This table lives in THREE hand-written copies — here, `GamepadPalette.kt` and
+    /// `GamepadPalette.swift` — and until now nothing but prose held them together. What the file
+    /// pins is not only the 13 palette definitions but the DERIVED 16-cell mesh each one produces,
+    /// which is the half that actually reaches the screen and the half a transcription slip would
+    /// change invisibly.
+    #[test]
+    fn shared_console_vectors() {
+        let raw = include_str!("../../../clients/shared/console-vectors.json");
+        let file: serde_json::Value =
+            serde_json::from_str(raw).expect("console-vectors.json must parse");
+        let nums = |v: &serde_json::Value| -> Vec<f64> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|n| n.as_f64().expect("number"))
+                .collect()
+        };
+        let close = |what: &str, a: f64, b: f64| {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "{what}: vectors say {b}, this client computes {a}"
+            );
+        };
+
+        assert_eq!(nums(&file["cell_ramp"]), CELL_RAMP.to_vec(), "CELL_RAMP");
+
+        let interior = file["mesh_interior"].as_array().expect("mesh_interior");
+        assert_eq!(interior.len(), MESH_INTERIOR.len(), "mesh interior count");
+        for (w, p) in interior.iter().zip(MESH_INTERIOR.iter()) {
+            let w = nums(w);
+            let got = [p.0, p.1, p.2, p.3, p.4, p.5];
+            for (i, (a, b)) in got.iter().zip(w.iter()).enumerate() {
+                close(&format!("mesh_interior[{i}]"), *a, *b);
+            }
+        }
+
+        let want = file["palettes"].as_array().expect("palettes");
+        assert_eq!(want.len(), PALETTES.len(), "palette count");
+        for (w, p) in want.iter().zip(PALETTES.iter()) {
+            let id = w["id"].as_str().expect("id");
+            assert_eq!(id, p.id, "palette order");
+            assert_eq!(w["name"].as_str().expect("name"), p.name, "{id} name");
+            assert_eq!(w["light"].as_bool().expect("light"), p.light, "{id} light");
+            let g = nums(&w["ground"]);
+            close(&format!("{id} ground.r"), p.ground.0, g[0]);
+            close(&format!("{id} ground.g"), p.ground.1, g[1]);
+            close(&format!("{id} ground.b"), p.ground.2, g[2]);
+            let a = nums(&w["accent"]);
+            close(&format!("{id} accent.r"), p.accent.0, a[0]);
+            close(&format!("{id} accent.g"), p.accent.1, a[1]);
+            close(&format!("{id} accent.b"), p.accent.2, a[2]);
+
+            // The derived tables — the ones that reach the shader and the fallback field.
+            let mesh = p.mesh_colors();
+            let wm = w["mesh"].as_array().expect("mesh");
+            assert_eq!(wm.len(), mesh.len(), "{id} mesh cells");
+            for (i, (c, wc)) in mesh.iter().zip(wm.iter()).enumerate() {
+                let wc = nums(wc);
+                close(&format!("{id} mesh[{i}].r"), c.0, wc[0]);
+                close(&format!("{id} mesh[{i}].g"), c.1, wc[1]);
+                close(&format!("{id} mesh[{i}].b"), c.2, wc[2]);
+            }
+            let blobs = p.blob_colors();
+            let wb = w["blobs"].as_array().expect("blobs");
+            assert_eq!(wb.len(), blobs.len(), "{id} blob count");
+            for (i, (c, wc)) in blobs.iter().zip(wb.iter()).enumerate() {
+                let wc = nums(wc);
+                close(&format!("{id} blob[{i}].r"), c.0, wc[0]);
+                close(&format!("{id} blob[{i}].g"), c.1, wc[1]);
+                close(&format!("{id} blob[{i}].b"), c.2, wc[2]);
+            }
+        }
+    }
+
     /// The GTK launcher's cursor tests, ported with the math.
     #[test]
     fn step_refuses_the_ends() {

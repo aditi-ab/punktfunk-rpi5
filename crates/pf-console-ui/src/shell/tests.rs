@@ -4,6 +4,46 @@ use crate::screens::home::HomeScreen;
 use crate::screens::library::LibraryScreen;
 use punktfunk_core::config::GamepadPref;
 
+/// The screen-transition contract, against the shared vectors. Every client re-implements this
+/// motion in its own animation system, so the numbers exist in three places and drifted in two of
+/// them before this test.
+///
+/// The EASING is sampled rather than compared as control points, and that is the point of it:
+/// this side is the analytic `1 − (1−t)³`, Android reproduces it exactly, and SwiftUI can only
+/// approximate it with a Bézier. Worse, two different Béziers are published under the name
+/// "easeOutCubic" — `(0.215, 0.61, 0.355, 1)` and `(0.33, 1, 0.68, 1)` — and neither IS this
+/// curve; they differ from it by up to ~0.08 at the midpoint, which is visible on a 260 ms
+/// transition. Samples with a tolerance are the only form all three runtimes can meet.
+#[test]
+fn motion_matches_the_shared_vectors() {
+    let raw = include_str!("../../../../clients/shared/console-vectors.json");
+    let file: serde_json::Value =
+        serde_json::from_str(raw).expect("console-vectors.json must parse");
+    let motion = &file["motion"];
+    let want_s = motion["transition_s"].as_f64().expect("transition_s");
+    assert!(
+        (TRANSITION_S - want_s).abs() < 1e-9,
+        "TRANSITION_S is {TRANSITION_S}, vectors say {want_s}"
+    );
+
+    let curve = &motion["ease_out_cubic"];
+    let tol = curve["tolerance"].as_f64().expect("tolerance");
+    let samples = curve["samples"].as_array().expect("samples");
+    assert!(
+        samples.len() >= 5,
+        "the curve needs enough samples to pin it"
+    );
+    for s in samples {
+        let t = s["t"].as_f64().expect("t");
+        let want = s["p"].as_f64().expect("p");
+        let got = crate::anim::ease_out_cubic(t);
+        assert!(
+            (got - want).abs() <= tol,
+            "ease_out_cubic({t}) is {got}, vectors say {want} (±{tol})"
+        );
+    }
+}
+
 /// Point the settings/known-hosts stores at a throwaway HOME — the settings screen
 /// SAVES on adjust, and a test must never write the developer's real config.
 fn fake_home() {

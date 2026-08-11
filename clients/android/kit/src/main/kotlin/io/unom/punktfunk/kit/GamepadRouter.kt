@@ -46,8 +46,8 @@ class GamepadRouter(
      * as well would give the host two pads for one pair of hands.
      *
      * Off still opens slots and tracks held state; it only stops the wire sends. That is
-     * deliberate: the exit and mic chords are read off the same slots, and a couch that lost its
-     * quit shortcut because a forwarding preference was off would be the worse bug. Nothing is
+     * deliberate: the exit, mic and stats chords are read off the same slots, and a couch that lost
+     * its quit shortcut because a forwarding preference was off would be the worse bug. Nothing is
      * claimed by keeping a slot — the Android input stack shares controllers — unlike the USB
      * capture links, which `StreamScreen` does not start at all while this is off.
      */
@@ -150,6 +150,20 @@ class GamepadRouter(
     var onMicChord: (() -> Unit)? = null
 
     /**
+     * Invoked (main thread) each time the stats chord ([STATS_CHORD], Select + X) is COMPLETED on a
+     * pad — one verbosity tier of the in-stream statistics overlay per completion. It exists
+     * because a controller in both hands has no other way to the numbers: the three-finger tap
+     * needs a touchscreen AND one of the pointer touch models, so a TV or a gamepad-only session
+     * has none. `StreamScreen` wires it to the live tier cycle.
+     *
+     * Fires immediately and once per chord like [onMicChord], and like it the buttons still go to
+     * the host — the chord adds a local meaning to them rather than swallowing them. The Apple
+     * client's `GamepadCapture.statsChord` is the same two buttons; a shortcut that differs per
+     * platform is worse than no shortcut.
+     */
+    var onStatsChord: (() -> Unit)? = null
+
+    /**
      * Invoked (main thread) once per pad when a captured controller WITH a gyro turns out to be in
      * a session whose virtual pad has no motion plane — its motion is not being sent, because every
      * sample would be decoded and dropped host-side.
@@ -204,7 +218,7 @@ class GamepadRouter(
     /**
      * One button transition on [slot] — the shared body behind [onButton] and an [ExternalPad]'s
      * transitions: forward the wire event, track held state, arm/disarm the exit chord, and fire
-     * the mic-mute chord ([MIC_CHORD]).
+     * the instant chords ([MIC_CHORD], [STATS_CHORD]).
      */
     private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
         // Raw system buttons stay local under the "local" policy — no wire send and no held
@@ -232,13 +246,11 @@ class GamepadRouter(
             slot.held = slot.held or bit
             // Full chord now held on this pad → start the hold countdown (idempotent while held).
             if (slot.held and EXIT_CHORD == EXIT_CHORD) armExit()
-            // Mic mute, edge-triggered on the button that COMPLETES the chord: a genuine press
-            // (`wasHeld` lacks the bit, so an auto-repeat DOWN can't re-fire it) of a chord member
-            // that leaves the whole chord held. Any other button pressed while Select + Y are down
-            // fails the middle test, so the toggle happens once per chord, not once per press.
-            if (wasHeld and bit == 0 && bit and MIC_CHORD != 0 && slot.held and MIC_CHORD == MIC_CHORD) {
-                onMicChord?.invoke()
-            }
+            // Mic mute and the stats-tier cycle, each edge-triggered on the button that COMPLETES
+            // its chord (see [completesChord]) — the two meanings this client gives Select plus a
+            // face button. Both leave the press on the wire: the game still gets its buttons.
+            if (completesChord(wasHeld, bit, MIC_CHORD)) onMicChord?.invoke()
+            if (completesChord(wasHeld, bit, STATS_CHORD)) onStatsChord?.invoke()
         } else {
             val owned = guideGesture && bit == Gamepad.BTN_BACK && consumeSelectRelease(slot)
             if (!owned && send && forwarding) {
@@ -628,7 +640,11 @@ class GamepadRouter(
         return null
     }
 
-    private companion object {
+    // `internal` rather than private: the chord masks and [completesChord] are the only part of
+    // this router a JVM unit test can reach — everything else needs an InputManager, a main Looper
+    // and live InputDevices behind it — and until `GamepadChordTest` there was nothing pinning the
+    // chords at all. Still invisible to :app, which is what private bought.
+    internal companion object {
         /** Mirror of `punktfunk-core::input::MAX_PADS` — wire pad indices 0..15. */
         const val MAX_PADS = 16
 
@@ -649,6 +665,28 @@ class GamepadRouter(
          * to occur inside real play.
          */
         const val MIC_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_Y
+
+        /**
+         * Stats-overlay chord: Select + X, one verbosity tier per completion. X keeps both
+         * properties [MIC_CHORD]'s Y has — it is none of [EXIT_CHORD]'s four buttons, so no way of
+         * reaching the exit chord passes through this one on the way (and vice versa), and Select
+         * is a menu button rather than a twitch action. Byte-for-byte the Apple client's
+         * `GamepadCapture.statsChord`, which was modelled on [MIC_CHORD] in the first place and
+         * leaves Y free for the mic chord to land there in turn — the two clients converge on one
+         * pad vocabulary from both ends.
+         */
+        const val STATS_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_X
+
+        /**
+         * Whether pressing [bit] on a pad that held [wasHeld] beforehand COMPLETED [chord]: a
+         * genuine press (`wasHeld` lacks the bit, so an auto-repeat DOWN can't re-fire it) of a
+         * chord member that leaves the whole chord held (`wasHeld or bit` is the slot's held set
+         * the instant after the press). Any other button pressed while the chord is already down
+         * fails the middle test, so a chord fires once per chord, not once per press — and lifting
+         * any member re-arms it, since the next press of that member is a fresh completion.
+         */
+        internal fun completesChord(wasHeld: Int, bit: Int, chord: Int): Boolean =
+            wasHeld and bit == 0 && bit and chord != 0 && (wasHeld or bit) and chord == chord
 
         /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
         const val EXTERNAL_ID_BASE = -1000

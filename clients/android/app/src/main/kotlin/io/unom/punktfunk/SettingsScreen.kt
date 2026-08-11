@@ -577,7 +577,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
             selected = s.statsVerbosity,
             field = "stats_verbosity",
             caption = "Compact is one line; Detailed adds the decoder and latency breakdown. " +
-                "A 3-finger tap cycles the tiers in-stream.",
+                "A 3-finger tap, or Select + X on a pad, cycles the tiers in-stream.",
         ) { v -> update(s.copy(statsVerbosity = v)) }
     }
     DeviceScopeOnly {

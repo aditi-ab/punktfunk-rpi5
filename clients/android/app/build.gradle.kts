@@ -144,6 +144,10 @@ dependencies {
     testImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest") // the ComponentActivity test host
     testImplementation("junit:junit:4.13.2")
+    // Real `org.json` for the shared-vectors test: the `org.json` inside `android.jar` is a stub
+    // set whose every method throws "Stub!", so a plain JVM unit test cannot parse with it. Same
+    // dependency, same reason, as the kit module's deeplink-vectors test.
+    testImplementation("org.json:json:20250107")
     testImplementation("org.robolectric:robolectric:4.16.1")
     testImplementation("io.github.takahirom.roborazzi:roborazzi:1.64.0")
     testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.64.0")

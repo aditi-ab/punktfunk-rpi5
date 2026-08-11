@@ -184,6 +184,26 @@ jobs:
         working-directory: clients/android
         run: ./gradlew :kit:testDebugUnitTest --stacktrace
 
+      # The cross-client contract in `clients/shared/console-vectors.json` — the console palette
+      # table, the settings section names and the screen-transition motion, each of which exists in
+      # three hand-written copies (here, pf-console-ui, the Apple client). The other two check it
+      # from their own suites; this is Android's side.
+      #
+      # FILTERED, not a plain `:app:testDebugUnitTest`: that task also runs the ~20 Roborazzi
+      # screenshot scenes, which are a release-artifact job (android-screenshots.yml, gated to v*
+      # tags) and have no business adding a minute to every push. The filter is what lets the
+      # contract gate here without dragging the rest of the app suite in with it.
+      - name: console parity vectors + app-module logic tests
+        working-directory: clients/android
+        run: >-
+          ./gradlew :app:testDebugUnitTest
+          --tests 'io.unom.punktfunk.ConsoleVectorsTest'
+          --tests 'io.unom.punktfunk.HomeTilesTest'
+          --tests 'io.unom.punktfunk.GamepadSettingsLayoutTest'
+          --tests 'io.unom.punktfunk.ConsoleSubScreenRowsTest'
+          --tests 'io.unom.punktfunk.ConsoleSubScreenRoutesTest'
+          --stacktrace
+
       - name: assembleDebug (cargo-ndk → jniLibs → APK)
         working-directory: clients/android
         env:

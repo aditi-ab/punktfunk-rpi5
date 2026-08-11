@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.content.Context
+import android.content.res.Configuration
 import android.hardware.input.InputManager
 import android.os.Build
 import android.os.CombinedVibration
@@ -11,12 +12,15 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -39,11 +43,15 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.Sc2Capture
@@ -55,10 +63,145 @@ import kotlinx.coroutines.delay
  * case where a pad "doesn't work" — adapters and BT-to-USB dongles often enumerate with a different
  * identity than the physical pad, or not as a gamepad at all, and punktfunk only forwards devices
  * Android classifies as gamepad/joystick. This screen makes that visible on the device itself.
+ *
+ * This is the TOUCH entry point; [ConsoleControllersScreen] shows the same body on the console's
+ * field. Both drive [ControllersBody] — the screen exists once, and the support answer it gives has
+ * to be the same one whichever interface asked.
  */
 @Composable
 fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
+    var testing by remember { mutableStateOf(false) }
+    ControllersBody(
+        gamepadSetting = gamepadSetting,
+        scroll = rememberScrollState(),
+        testing = testing,
+        onTestingChange = { testing = it },
+        // The touch screen holds the probes for its whole life: events are OBSERVED (not consumed)
+        // while the test is off, which is what keeps the "Last input" line live while browsing.
+        // Nothing else here wants the pad, so there is no one to hand them to.
+        observeInput = true,
+        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
+    ) {
+        Text("Controllers", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+/**
+ * The same screen on the console's field — the couch route to it, which a TV box has no other way to
+ * reach (there is no touch interface to fall back to there, which is exactly why this matters).
+ *
+ * Navigation, and how the pad is shared with the test:
+ *  * up/down scrolls, the shoulders page — the body is cards and prose with no focusable rows, and
+ *    Compose only scrolls to keep a FOCUSED child visible (see [rememberConsoleScroller]);
+ *  * A starts the input test, which is the one thing on this screen a controller can act on;
+ *  * while the test runs it OWNS the pad — that is the whole point of it — so this screen's nav
+ *    drops out of the probe slots and B is a HOLD (below). Everything reverts the moment it ends.
+ */
+@Composable
+fun ConsoleControllersScreen(gamepadSetting: Int, onBack: () -> Unit, navActive: Boolean = true) {
+    BackHandler(onBack = onBack)
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val hazeState = remember { HazeState() }
+    val scroll = rememberScrollState()
+    val scrollBy = rememberConsoleScroller(scroll)
+    var testing by remember { mutableStateOf(false) }
+    val padIsGamepad = (LocalContext.current as? MainActivity)?.lastPadIsGamepad ?: true
+
+    GamepadNavEffect2D(
+        // Off while the test runs: both want the same single probe slot, and the test is the one
+        // the user just asked for. The identity check in each teardown (here and in the body) is
+        // what makes the handover safe in either direction.
+        active = navActive && !testing,
+        onDirection = { dir ->
+            when (dir) {
+                NavDir.UP -> scrollBy(-1, false)
+                NavDir.DOWN -> scrollBy(1, false)
+                // Nothing on this screen steps sideways; paging is the shoulders' job.
+                NavDir.LEFT, NavDir.RIGHT -> {}
+            }
+        },
+        onActivate = { testing = true },
+        onShoulder = { delta -> scrollBy(delta, true) },
+    )
+
+    Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
+            // The calm backdrop, full-bleed under the bars and the cutout: this is a screen to READ,
+            // and the aurora is ambience. Only the content takes the safe area.
+            GamepadFormBackground(Modifier.fillMaxSize())
+            // The body is written against the touch theme; on the console field it has to be inked
+            // from the palette or it is grey-on-pastel over the six pale palettes.
+            ConsoleInkedTheme {
+                Column(Modifier.fillMaxSize().consoleSafeArea()) {
+                    ControllersBody(
+                        gamepadSetting = gamepadSetting,
+                        scroll = scroll,
+                        testing = testing,
+                        onTestingChange = { testing = it },
+                        // Only while testing: the rest of the time the screen's own nav holds the
+                        // probes, so the "Last input" line is a test-time readout here rather than
+                        // an always-on one. A pad that reaches this screen at all has already
+                        // proved it is seen — by moving the cursor here.
+                        observeInput = testing,
+                        contentPadding = PaddingValues(
+                            start = ConsoleEdgeInset,
+                            end = ConsoleEdgeInset,
+                            // Clears the floating legend zone, like every other console list.
+                            bottom = ConsoleLegendClearance,
+                        ),
+                    ) {
+                        ConsoleHeader("Connected controllers", horizontalInset = false)
+                    }
+                }
+            }
+        }
+        Box(
+            Modifier
+                .align(Alignment.BottomStart)
+                .consoleLegendInsets(landscape)
+                .padding(ConsoleLegendInset),
+        ) {
+            GamepadHintBar(
+                if (testing) {
+                    // The rule, stated at the moment it applies: while the test runs, B is a BUTTON
+                    // UNDER TEST like any other — it lights its own chip — so only a hold ends the
+                    // test, after which B is the universal Back again. Tappable as the touch hatch.
+                    listOf(PadGlyph.hint('B', "Hold to finish") { testing = false })
+                } else {
+                    listOfNotNull(
+                        GamepadHint('↕', PadGlyph.Arrow, "Scroll"),
+                        // Advertised only where they exist — a TV remote has no shoulders, and
+                        // claiming otherwise is both a lie and the reason a narrow legend overflows.
+                        GamepadHint('⇄', PadGlyph.Arrow, "Page").takeIf { padIsGamepad },
+                        PadGlyph.hint('A', "Test inputs") { testing = true },
+                        PadGlyph.hint('B', "Done", onClick = onBack),
+                    )
+                },
+                hazeState = hazeState,
+            )
+        }
+    }
+}
+
+/**
+ * The screen itself, shared by both interfaces. [contentPadding] and [heading] are where they
+ * differ: the touch screen pads for a thumb and titles with the Material headline, the console pads
+ * to the shared edge inset, clears its floating legend, and titles with [ConsoleHeader].
+ *
+ * [observeInput] decides whether this body installs the shared MainActivity probes at all — see the
+ * two call sites, and [ConsoleControllersScreen] for why they cannot both be on at once.
+ */
+@Composable
+private fun ControllersBody(
+    gamepadSetting: Int,
+    scroll: ScrollState,
+    testing: Boolean,
+    onTestingChange: (Boolean) -> Unit,
+    observeInput: Boolean,
+    contentPadding: PaddingValues,
+    heading: @Composable () -> Unit,
+) {
     val context = LocalContext.current
     val activity = context as? MainActivity
 
@@ -84,17 +227,31 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
 
     // Live input test. While `testing`, the MainActivity probes consume pad events (so they show up
     // here instead of driving focus navigation); holding B releases, since the pad can no longer
-    // reach the Switch. Events are observed (not consumed) even when the test is off, so the
-    // "last input" line works while browsing.
-    var testing by remember { mutableStateOf(false) }
+    // reach the Switch.
     val held = remember { mutableStateMapOf<Int, Boolean>() }
     val axes = remember { mutableStateMapOf<String, Float>() }
     var lastInput by remember { mutableStateOf<String?>(null) }
     var bHeld by remember { mutableStateOf(false) }
+    // The hold has lasted long enough; the test ends when B is let go (see the probe).
+    var holdSatisfied by remember { mutableStateOf(false) }
+    // The probes below are built ONCE per `observeInput` and then read these for the life of that
+    // installation. `testing` and the callback arrive as parameters now, so capturing them plainly
+    // would freeze the values they had when the probe was made — the test would consume nothing.
+    val consuming by rememberUpdatedState(testing)
+    // The console's refusal thud, on whatever actuator the driving pad or this device has.
+    val haptics by rememberUpdatedState(rememberConsoleHaptics())
 
-    DisposableEffect(Unit) {
-        activity?.padKeyProbe = probe@{ event ->
+    DisposableEffect(observeInput) {
+        // Stable probe refs, and a teardown that releases the slot only if WE still hold it — the
+        // rule GamepadNavEffect2D follows. Without it this screen's dispose nulls whatever is in the
+        // slot: during the console shell's push/pop BOTH screens are briefly composed, so leaving
+        // here would kill the pad navigation the arriving screen had just installed. The same
+        // teardown also runs when this screen hands the pad to its own input test and back.
+        val keyProbe: (KeyEvent) -> Boolean = probe@{ event ->
             if (!Gamepad.isPad(event.device)) return@probe false
+            // Read ONCE, up front: the test can end inside this very event, and the release that
+            // ended it still has to be swallowed here — see the B branch below.
+            val consume = consuming
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> {
                     held[event.keyCode] = true
@@ -102,13 +259,34 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
                 }
                 KeyEvent.ACTION_UP -> {
                     held[event.keyCode] = false
-                    if (event.keyCode == KeyEvent.KEYCODE_BUTTON_B) bHeld = false
+                    if (event.keyCode == KeyEvent.KEYCODE_BUTTON_B) {
+                        bHeld = false
+                        if (consume) {
+                            if (event.eventTime - event.downTime >= HOLD_TO_FINISH_MS) {
+                                // The hold ends the test HERE, on the release, and NOT the moment
+                                // the 1.2 s elapsed: end it a moment earlier and this release falls
+                                // through unconsumed to the activity's B→BACK remap, which takes the
+                                // whole screen with it. Finishing the test and leaving the screen on
+                                // one press is not what "hold B to finish" says.
+                                onTestingChange(false)
+                                held.clear()
+                            } else {
+                                // A short B is not swallowed either. While the test owns the pad, B
+                                // is a BUTTON UNDER TEST — it lights its chip like every other — so
+                                // a tap can't also mean "leave", and in the console B is otherwise
+                                // the universal back. The press gets the boundary thud instead, the
+                                // same answer a refused step gets on the settings screen: heard, and
+                                // it means something else here.
+                                haptics.boundary()
+                            }
+                        }
+                    }
                 }
             }
             lastInput = "${event.device?.name}: ${KeyEvent.keyCodeToString(event.keyCode)}"
-            testing
+            consume
         }
-        activity?.padMotionProbe = probe@{ event ->
+        val motionProbe: (MotionEvent) -> Boolean = probe@{ event ->
             if (!Gamepad.isPad(event.device)) return@probe false
             axes["LX"] = event.getAxisValue(MotionEvent.AXIS_X)
             axes["LY"] = event.getAxisValue(MotionEvent.AXIS_Y)
@@ -124,31 +302,43 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
             )
             axes["HX"] = event.getAxisValue(MotionEvent.AXIS_HAT_X)
             axes["HY"] = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-            testing
+            consuming
+        }
+        if (observeInput) {
+            activity?.padKeyProbe = keyProbe
+            activity?.padMotionProbe = motionProbe
         }
         onDispose {
-            activity?.padKeyProbe = null
-            activity?.padMotionProbe = null
+            activity?.let { a ->
+                if (a.padKeyProbe === keyProbe) a.padKeyProbe = null
+                if (a.padMotionProbe === motionProbe) a.padMotionProbe = null
+            }
         }
     }
     // Hold-B-to-exit: with events consumed, the pad can't reach the Switch — a 1.2 s hold ends the
-    // test instead (touch still works). A short tap cancels the effect before the delay fires.
-    LaunchedEffect(bHeld) {
+    // test instead (touch still works). This half only ANSWERS the hold once it is long enough; the
+    // release is what ends the test (see the probe). Letting go early cancels the effect before the
+    // delay fires, so nothing is announced.
+    LaunchedEffect(bHeld, testing) {
         if (bHeld && testing) {
-            delay(1_200)
-            testing = false
-            held.clear()
+            delay(HOLD_TO_FINISH_MS)
+            holdSatisfied = true
+            // A hold with no answer at the moment it lands is a hold you keep holding. Say it in
+            // both channels a couch user has: a pulse in the hands, a changed line on the screen.
+            haptics.confirm()
+        } else {
+            holdSatisfied = false
         }
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 24.dp),
+            .verticalScroll(scroll)
+            .padding(contentPadding),
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        Text("Controllers", style = MaterialTheme.typography.headlineMedium)
+        heading()
 
         // Capture-side detection, re-checked on USB hot-plug. The SC2 is never an InputDevice
         // (lizard mode is kb/mouse; the capture claims even those away) so it's enumerated from
@@ -212,13 +402,19 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
                 Column(Modifier.weight(1f)) {
                     Text("Test inputs", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        if (testing) "Controller input stays on this screen — hold B to finish"
-                        else "Show button presses and stick motion live",
+                        when {
+                            holdSatisfied -> "Release B to finish"
+                            testing -> "Controller input stays on this screen — hold B to finish"
+                            else -> "Show button presses and stick motion live"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                Switch(checked = testing, onCheckedChange = { testing = it; if (!it) held.clear() })
+                Switch(
+                    checked = testing,
+                    onCheckedChange = { on -> onTestingChange(on); if (!on) held.clear() },
+                )
             }
             if (testing) {
                 ButtonGrid(held)
@@ -680,3 +876,11 @@ private val TEST_BUTTONS = listOf(
 
 /** Axis bars shown in the test view, in display order. */
 private val AXIS_LABELS = listOf("LX", "LY", "RX", "RY", "LT", "RT", "HX", "HY")
+
+/**
+ * How long B must be held to end the input test — and, below that, how long a press still counts as
+ * a tap that gets answered rather than ignored. One constant, because a hold that ends at 1.2 s
+ * while the "you tapped" answer stops at some other number leaves a window where a press does
+ * nothing at all.
+ */
+private const val HOLD_TO_FINISH_MS = 1_200L

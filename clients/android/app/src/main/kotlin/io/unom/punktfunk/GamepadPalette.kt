@@ -17,6 +17,21 @@ import androidx.compose.ui.graphics.Color
 // on every client. Keep the three copies in step: a palette added here without the others is a
 // value the other clients silently render as Violet.
 
+/**
+ * One wandering interior control point of the mesh: [x]/[y] its resting place in unit UV, [amp] how
+ * far it strays, [sx]/[sy] its per-axis rates in rad·s⁻¹ and [phase] its offset. Its live
+ * displacement `(amp·sin(t·sx+ph), amp·cos(t·sy+ph·1.3))` drives a bounded domain warp, so the
+ * bright colour pools drift with it.
+ */
+class MeshWarpPoint(
+    val x: Double,
+    val y: Double,
+    val amp: Double,
+    val sx: Double,
+    val sy: Double,
+    val phase: Double,
+)
+
 /** One background colour family. */
 class GamepadPalette(
     /** The stored `ui_palette` value ([Settings.uiPalette]). */
@@ -47,17 +62,63 @@ class GamepadPalette(
     /** The accent as a Compose colour. */
     val accentColor: Color by lazy { color(accent) }
 
+    /**
+     * The 16 mesh colours this palette's field is woven from: the ramp sampled per cell (see
+     * [CELL_RAMP]), or [MESH_COLORS] verbatim for the brand default — the exact rule
+     * `pf-console-ui`'s `Palette::mesh_colors` follows, so one `ui_palette` value is one field on
+     * every client. Consumed by the AGSL backdrop on API 33+; the blob field
+     * ([blobColors]) approximates the same table below that.
+     */
+    val meshColors: List<Triple<Double, Double, Double>> by lazy {
+        if (stops.isEmpty()) {
+            MESH_COLORS
+        } else {
+            (0..15).map { i ->
+                ramp(stops, 0.5 * ((i % 4) / 3.0 + (i / 4) / 3.0) + CELL_RAMP[i])
+            }
+        }
+    }
+
     companion object {
         /**
-         * Where each of the 16 mesh cells samples the ramp on the clients that draw a mesh. Kept
-         * here so the three ports stay one table even though this client approximates the field
-         * with blobs.
+         * Where each of the 16 mesh cells samples the ramp. The base is the diagonal
+         * `0.5·(x + y)` — top-left the ramp's dark end, bottom-right its bright one — and the
+         * per-cell nudges break the banding a pure diagonal would show. Mirrored from
+         * `pf-console-ui`'s `CELL_RAMP`.
          */
         val CELL_RAMP = listOf(
             0.10, -0.06, 0.04, -0.12,
             -0.08, 0.14, -0.10, 0.06,
             0.06, -0.12, 0.16, -0.04,
             -0.10, 0.08, -0.06, 0.12,
+        )
+
+        /**
+         * The brand default's 16 mesh colours, used verbatim (rather than sampled from a ramp) so
+         * `violet` stays bit-identical to what every install already sees. Mirrors
+         * `pf-console-ui`'s `MESH_COLORS`.
+         */
+        val MESH_COLORS = listOf(
+            Triple(0.075, 0.060, 0.160), Triple(0.34, 0.27, 0.72),
+            Triple(0.30, 0.26, 0.74), Triple(0.075, 0.060, 0.160),
+            Triple(0.42, 0.20, 0.54), Triple(0.49, 0.39, 0.95),
+            Triple(0.28, 0.31, 0.84), Triple(0.16, 0.26, 0.64),
+            Triple(0.45, 0.23, 0.60), Triple(0.53, 0.31, 0.75),
+            Triple(0.35, 0.35, 0.91), Triple(0.19, 0.28, 0.70),
+            Triple(0.075, 0.060, 0.160), Triple(0.22, 0.18, 0.54),
+            Triple(0.24, 0.20, 0.58), Triple(0.075, 0.060, 0.160),
+        )
+
+        /**
+         * The four interior points that wander; the 12 boundary points stay pinned to the frame (a
+         * drifting edge point would shrink the field and expose the ground behind it). Periods
+         * ~90–130 s, out of phase, so the field never visibly loops. Mirrors `MESH_INTERIOR`.
+         */
+        val MESH_INTERIOR = listOf(
+            MeshWarpPoint(0.333, 0.333, 0.11, 0.049, 0.063, 0.4),
+            MeshWarpPoint(0.667, 0.333, 0.10, 0.055, 0.052, 2.1),
+            MeshWarpPoint(0.333, 0.667, 0.10, 0.058, 0.049, 3.6),
+            MeshWarpPoint(0.667, 0.667, 0.12, 0.047, 0.061, 5.0),
         )
 
         /** The brand default's blob ramp — the colours the pre-palette field used. */

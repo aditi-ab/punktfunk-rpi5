@@ -1021,6 +1021,29 @@ mod tests {
     use super::*;
     use pf_client_core::trust::Settings;
 
+    /// The section names, against the shared vectors. The comment above [`TABS`] claims a setting
+    /// is found under the same word on every client; this is what makes that claim checkable.
+    ///
+    /// The desktop has one tab the mobile clients do not — Input, holding touch mode, mouse,
+    /// invert-scroll and shortcuts, which are desktop-host settings with nothing to set on a phone
+    /// or a TV. The vectors model it with a `desktop_only` flag rather than omitting it, because a
+    /// flat six-name list would red this test on day one and a seven-name list would red both
+    /// mobile clients: the disagreement is real and belongs in the contract, not in prose.
+    #[test]
+    fn tab_names_match_the_shared_vectors() {
+        let raw = include_str!("../../../../clients/shared/console-vectors.json");
+        let file: serde_json::Value =
+            serde_json::from_str(raw).expect("console-vectors.json must parse");
+        let want: Vec<&str> = file["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tab name"))
+            .collect();
+        let got: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(got, want, "the desktop console's tab names and order");
+    }
+
     fn ctx_parts() -> (Settings, Vec<pf_client_core::gamepad::PadInfo>) {
         (Settings::default(), Vec::new())
     }

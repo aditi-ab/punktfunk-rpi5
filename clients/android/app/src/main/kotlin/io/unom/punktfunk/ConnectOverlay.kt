@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -29,8 +30,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -204,7 +205,10 @@ internal fun ConnectTakeover(
     ) {
         GamepadAuroraBackground(Modifier.fillMaxSize())
         Column(
-            Modifier.padding(horizontal = 40.dp).widthIn(max = 460.dp),
+            // The backdrop runs full-bleed; the COPY keeps clear of the bars and the cutout. In
+            // landscape a hole punch is a side inset deeper than this 40 dp gutter, so centred text
+            // would otherwise sit under the camera.
+            Modifier.consoleSafeArea().padding(horizontal = 40.dp).widthIn(max = 460.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
@@ -239,7 +243,19 @@ internal fun ConnectTakeover(
             add(PadGlyph.hint('B', copy.cancelLabel, onClick = onCancel))
             if (timedOut) add(PadGlyph.hint('A', "Try Again", onClick = onRetry))
         }
-        GamepadHintBar(hints, Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp))
+        // The SAME bottom-start spot every console screen pins its legend at — this takeover sat
+        // its pill at bottom-CENTRE, so pressing Connect made the one piece of chrome that is
+        // supposed to read as fixed jump halfway across the screen (second on-glass verdict).
+        val landscape =
+            LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+        Box(
+            Modifier
+                .align(Alignment.BottomStart)
+                .consoleLegendInsets(landscape)
+                .padding(ConsoleLegendInset),
+        ) {
+            GamepadHintBar(hints)
+        }
     }
 }
 
