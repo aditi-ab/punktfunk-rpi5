@@ -429,7 +429,7 @@ pub fn preset_fields(preset: Preset) -> Option<EffectivePolicy> {
 }
 
 /// The persisted policy store: the loaded file value (or `None` when no file exists) behind its
-/// JSON path. Mirrors [`pf_gpu::GpuPrefStore`] — private dir, temp-write + atomic rename,
+/// JSON path. Mirrors `pf_gpu::GpuPrefStore` — private dir, temp-write + atomic rename,
 /// in-memory rollback if the disk write fails.
 pub struct DisplayPolicyStore {
     path: PathBuf,
@@ -513,7 +513,7 @@ impl DisplayPolicyStore {
 }
 
 /// The process-wide display-policy store (config-dir file), loaded once on first access — the same
-/// global-accessor shape as [`pf_gpu::prefs`], because display setup happens deep in the
+/// global-accessor shape as `pf_gpu::prefs`, because display setup happens deep in the
 /// capture/vdisplay path where no app state is threaded.
 pub fn prefs() -> &'static DisplayPolicyStore {
     static STORE: OnceLock<DisplayPolicyStore> = OnceLock::new();

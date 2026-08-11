@@ -27,6 +27,7 @@ const POLL: Duration = Duration::from_millis(20);
 /// Stdout/stderr are left as the caller configured them (inherited by default), so this is for
 /// commands run for their exit status alone — see [`output_within`] when the output is read.
 pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitStatus> {
+    tree::prepare(cmd);
     let mut child = cmd.spawn()?;
     let tree = tree::Guard::attach(&child);
     let deadline = Instant::now() + budget;
@@ -51,35 +52,65 @@ pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitS
 
 /// Run `cmd` to completion and capture its stdout/stderr, killing it if it outlives `budget`.
 ///
-/// The output is read only after the child has exited, so a helper that fills the pipe buffer and
-/// stalls is caught by the budget rather than deadlocking the reader (these helpers emit at most a
-/// few hundred KiB, well under any real pipe pressure).
+/// Both pipes are drained **concurrently with the wait**, on their own threads. Reading them only
+/// after exit — the obvious shape, and what this did originally — deadlocks on any helper that
+/// outtalks the pipe buffer: a pipe holds **64 KiB** on Linux (`/proc/sys/fs/pipe-max-size`'s page
+/// default), not the "few hundred KiB" the old comment claimed, so a chatty helper blocks in
+/// `write()`, never reaches exit, is killed at the budget, and its output is discarded as a
+/// timeout. `pw-dump` on a populated PipeWire graph clears 64 KiB routinely, and it is polled from
+/// the 45 s gamescope loops — so the failure was not hypothetical, it was the busiest caller.
 pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Output> {
+    tree::prepare(cmd);
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let tree = tree::Guard::attach(&child);
+    // Taken off the `Child` so the reader threads own them outright: `wait_with_output` must not
+    // also be reading these, and `try_wait` below needs `&mut child` while they run.
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (out_rx, err_rx) = (drain(stdout), drain(stderr));
+
     let deadline = Instant::now() + budget;
-    loop {
+    let status = loop {
         match child.try_wait()? {
-            Some(_) => {
-                // Exited: `wait_with_output` now only drains already-buffered pipes — but only if
-                // nothing else still holds their WRITE end. A grandchild that outlived the helper
-                // does, and `wait_with_output` reads to an EOF that would then never arrive, which
-                // is the one way this "bounded" helper could still hang forever. End the tree first.
+            Some(status) => {
+                // The helper is gone, but a grandchild it left behind still holds the pipes' WRITE
+                // ends, so the readers below would wait for an EOF that never arrives. Ending the
+                // tree closes them — this is what makes the joins bounded.
                 tree.terminate();
-                return child.wait_with_output();
+                break status;
             }
             None if Instant::now() >= deadline => {
                 tree.terminate();
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.wait(); // reap it — never leave a zombie behind
                 return Err(timed_out(cmd, budget));
             }
             None => std::thread::sleep(POLL),
         }
-    }
+    };
+    // A panicking reader thread cannot lose the call, only its half of the output.
+    let stdout = out_rx.join().unwrap_or_default();
+    let stderr = err_rx.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read one of a child's pipes to EOF on its own thread, so the child never blocks in `write()`
+/// waiting for us to catch up. Returns whatever was read; a read error yields the partial buffer,
+/// because the caller's failure signal is the budget, not a short pipe.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 fn timed_out(cmd: &Command, budget: Duration) -> Error {
@@ -215,6 +246,10 @@ mod tree {
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
+    /// Nothing to arrange before the spawn: job membership is assigned to the live process, so
+    /// [`Guard::attach`] does all of it. The Unix twin has to act here instead.
+    pub(super) fn prepare(_cmd: &mut std::process::Command) {}
+
     /// Owns a Job object holding the spawned helper and everything it spawns. `None` when the job
     /// could not be set up (see the module doc: degrade, don't fail).
     pub(super) struct Guard(Option<HANDLE>);
@@ -294,18 +329,54 @@ mod tree {
     }
 }
 
-/// The Unix half: `Child::kill` already ends the only process there is (see the Windows module doc
-/// for why that is not true there). Kept as a real type rather than `cfg`ing the call sites, so the
-/// two platforms read as one flow.
+/// The Unix half — a **process group**, which is what Unix offers in place of a Job object.
+///
+/// This used to be an empty stub whose doc said `Child::kill` "already ends the only process there
+/// is". That was never true of this crate's Linux helpers, which are the ones the module header is
+/// about: `pkexec`, `systemd-run`, `systemctl --user` and the `sh -c` wrappers all fork, so the
+/// process that hangs is routinely a grandchild `Child::kill` cannot reach — and with the reader
+/// threads in [`output_within`] blocking until every write end of the pipe closes, a surviving
+/// grandchild is exactly what would keep a "bounded" call waiting forever.
+///
+/// [`prepare`] puts the child in a new process group (it becomes the leader, so the group id is its
+/// pid) and [`Guard::terminate`] `killpg`s that group, reaching every descendant that has not
+/// deliberately left it. `process_group` changes only the group — not the session — so the helper
+/// keeps its controlling terminal and login session, which `pkexec`'s polkit session lookup needs.
+///
+/// Best-effort in the same way as the Windows half: a failed `killpg` is ignored, and the
+/// single-process `Child::kill` on the timeout path still runs.
 #[cfg(not(windows))]
 mod tree {
-    pub(super) struct Guard;
+    use std::os::unix::process::CommandExt;
+
+    /// The child's process-group id, captured while the child is still ours to reap.
+    pub(super) struct Guard(Option<i32>);
+
+    /// Make the child the leader of its own process group, so its descendants are reachable as one.
+    pub(super) fn prepare(cmd: &mut std::process::Command) {
+        cmd.process_group(0);
+    }
 
     impl Guard {
-        pub(super) fn attach(_child: &std::process::Child) -> Self {
-            Self
+        pub(super) fn attach(child: &std::process::Child) -> Self {
+            // `prepare` asked for `process_group(0)`, so the group id IS the child's pid.
+            Self(i32::try_from(child.id()).ok())
         }
-        pub(super) fn terminate(&self) {}
+
+        /// End every process still in the group. A no-op once they have all exited, so this is safe
+        /// to call on the success path as well as the timeout one.
+        pub(super) fn terminate(&self) {
+            let Some(pgid) = self.0 else { return };
+            // `killpg` is a signal to a group we created and whose leader is the child we spawned;
+            // it cannot name a process we did not start. The one theoretical hazard is pid reuse
+            // between the leader's reap and this call, which needs a brand-new process to land on
+            // exactly that pid AND be a group leader — Linux hands out pids sequentially to
+            // `pid_max`, so there is no window to speak of, and the alternative (not killing) is
+            // the unbounded wait this module exists to prevent.
+            // SAFETY: a plain signal send by group id. No pointer is passed, nothing is aliased,
+            // and the result is deliberately ignored — ESRCH just means the group is already gone.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
     }
 }
 
@@ -330,6 +401,24 @@ mod tests {
             "must return at its budget, not the child's lifetime (took {:?})",
             started.elapsed()
         );
+    }
+
+    /// A helper whose output exceeds one pipe buffer must still be captured IN FULL.
+    ///
+    /// This is the case that fails against a `wait_with_output`-after-exit implementation: the
+    /// child blocks in `write()` with the pipe full, never exits, and the budget turns a perfectly
+    /// successful query into a `TimedOut` with its output thrown away. 1 MiB is ~16× a Linux pipe
+    /// (64 KiB) and ~64× the smallest macOS one, so it cannot be absorbed by a buffer on either.
+    #[test]
+    fn a_child_that_outruns_the_pipe_buffer_is_captured_in_full() {
+        const BYTES: usize = 1024 * 1024;
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("yes punktfunk | head -c {BYTES}; echo done >&2"));
+        let out = output_within(&mut cmd, Duration::from_secs(20)).expect("must not time out");
+        assert!(out.status.success(), "helper failed: {:?}", out.status);
+        assert_eq!(out.stdout.len(), BYTES, "stdout was truncated");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
     }
 
     /// The normal path is unaffected: a quick command still yields its status and its output.
