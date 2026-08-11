@@ -18,6 +18,7 @@ The patches here add the missing half, and nothing else. See
 | `0005-punktfunk-stamp-the-version-banner-with-pfhdrN.patch` | Append `+pfhdr<N>` to the `--version` banner | **No** — ours only, retired when the functional patches above land upstream |
 | `0006-punktfunk-never-destroy-the-Vulkan-device-or-output-.patch` | Give `g_device` and `g_output` storage that is never destroyed, so their destructors cannot call a Vulkan driver glibc has already unloaded at `exit()` | **Yes** — a plain static-destruction-order bug, not punktfunk-specific |
 | `0007-pipewire-never-leave-pw_buffer-user_data-pointing-at.patch` | Associate `pw_buffer->user_data` with its `pipewire_buffer` for every path out of `add_buffer`, clear it in `remove_buffer` (the last point both halves are known), and null-check the consumers — killing the use-after-free that aborted the session on every capture renegotiation | **Yes** — a plain use-after-free in the PipeWire buffer lifecycle |
+| `0008-steamcompmgr-honor-GAMESCOPE_NO_FOCUS-never-a-focus-.patch` | Honor `GAMESCOPE_NO_FOCUS` (set by hhd-ui and MangoHud, consumed by nobody): such windows are skipped by both focus-candidate collectors, so a mapped-but-unpainted overlay app can no longer win focus and turn the composite black. Compositing is untouched — only focus SELECTION is barred | **Yes** — the atom's setters already exist in the wild; some compositor has to keep the promise |
 
 ### Why the headless patch matters
 
@@ -84,14 +85,18 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr2` | …and `--pipewire-composite-cursor` |
 | `+pfhdr3` | …and the headless connector advertises its mode + `--custom-refresh-rates` |
 | `+pfhdr4` | …and `--pipewire-composite-external-overlay` |
+| `+pfhdr5` | …and the PipeWire buffer use-after-free is fixed (no new capability) |
+| `+pfhdr6` | …and `GAMESCOPE_NO_FOCUS` windows are never focus candidates (no new capability) |
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
 
-A patch that only fixes a crash does **not** bump it: `0006` (the exit-time Vulkan teardown fix)
-changes nothing the host probes for, so the level stays `+pfhdr4` and the rebuild ships as a
-`pkgrel` bump instead — exactly the split the PKGBUILD's own comment describes. Bumping the level
-for a bugfix would be worse than useless: it would advertise a capability tier that does not exist
-and strand hosts that gate on it.
+A patch that only fixes a crash does **not** automatically bump it: `0006` (the exit-time Vulkan
+teardown fix) changes nothing the host probes for, so it shipped as a `pkgrel` bump at `+pfhdr4` —
+exactly the split the PKGBUILD's own comment describes. Since every host probe is `>=`, a bump for
+a bugfix is safe but must earn its place: `0007` and `0008` moved the level anyway because their
+absence is invisible until a stream fails (a crash-loop per connect; a composite lost to a
+NO_FOCUS window), so field triage has to be able to read the difference off a box's banner.
+Bumping without either reason would advertise a capability tier that does not exist.
 
 ⚠️ The two indirect spawn modes (the `GAMESCOPE_BIN` wrapper for gamescope-session-plus, and the
 SteamOS PATH shim) pass these flags through `PF_HDR_ARGS`, so they share one dependency: if the
