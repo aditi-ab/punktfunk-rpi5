@@ -53,7 +53,7 @@
           "clients"
         ],
         "summary": "Unpair a client",
-        "description": "Removes the client's certificate from the pairing store (persisted — the removal survives a\nhost restart). Removing the last pairing also closes the GameStream ENet control port\n(UDP 47999), which is only bound while at least one pairing exists. Caveat: the nvhttp TLS\nlayer does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed\nclient cert — a planned hardening step), so until that lands this removes the client\nfrom the listing without severing its ability to reconnect.",
+        "description": "Removes the client's certificate from the pairing store (persisted — the removal survives a\nhost restart). Revocation is complete: a LIVE GameStream session owned by this certificate is\nended (the client gets the standard TERMINATION+disconnect), and removing the last pairing\nalso closes the ENet control port (UDP 47999), which is only bound while at least one pairing\nexists. The nvhttp TLS layer still completes a handshake with any well-formed client cert BY\nDESIGN (authorization is per-request via the paired-fingerprint check) — an unpaired client\nthat reconnects is rejected at every post-pair endpoint.",
         "operationId": "unpairClient",
         "parameters": [
           {
