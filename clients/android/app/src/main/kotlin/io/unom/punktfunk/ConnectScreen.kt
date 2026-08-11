@@ -100,7 +100,9 @@ fun ConnectScreen(
     // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
     gamepadUi: Boolean = false,
     onOpenSettings: () -> Unit = {},
-    onOpenLibrary: (KnownHost) -> Unit = {},
+    // (host, pinned profile id) — a pinned host+profile card opens ITS shelf, and the id is the
+    // one-off every launch off that shelf runs with (design §5.2a). Null = the host's own tile.
+    onOpenLibrary: (KnownHost, String?) -> Unit = { _, _ -> },
     navGate: Boolean = true, // false while the console home is cross-fading out
     // A `punktfunk://` URL to route (design/client-deep-links.md §3). This screen owns it because
     // it owns the connect path — trust decisions, the local-network grant, wake-and-retry — and a
@@ -772,7 +774,7 @@ fun ConnectScreen(
                 awaiting == null && editTarget == null && optionsTarget == null &&
                 speedTest == null && waker.waking == null && !lnpPrompt,
             onActivate = { it.activate() },
-            onOpenLibrary = { it.knownHost?.let(onOpenLibrary) },
+            onOpenLibrary = { tile -> tile.knownHost?.let { onOpenLibrary(it, tile.pinnedProfileId) } },
             onOpenSettings = onOpenSettings,
             onOptions = { tile ->
                 tile.knownHost?.let { kh ->

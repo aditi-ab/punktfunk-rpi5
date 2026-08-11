@@ -56,6 +56,7 @@ import io.unom.punktfunk.kit.link.HostResolution
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
+import io.unom.punktfunk.models.LibraryReturn
 import io.unom.punktfunk.models.Tab
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
@@ -74,7 +75,7 @@ fun App(forceGamepadUi: Boolean = false) {
     // whose library the console shell should come back to. Held HERE because the shell's own
     // navigation state does not outlive the stream. Cleared once the shell has consumed it, so a
     // later manual Back out of the library is not undone by a stale value.
-    var reopenLibraryHostId by remember { mutableStateOf<String?>(null) }
+    var reopenLibrary by remember { mutableStateOf<LibraryReturn?>(null) }
 
     // Console (gamepad) mode mirrors the Apple client: the setting AND (its mode says Always OR a
     // pad is attached OR this is a TV OR the dev force flag). Flips live as controllers
@@ -139,9 +140,9 @@ fun App(forceGamepadUi: Boolean = false) {
                 // than all the way out to host selection. The console shell's own screen state does
                 // not survive the stream (StreamScreen replaces it in the composition, discarding
                 // its `remember`s), so the intent is hoisted here and handed back on the way in.
-                reopenLibraryHostId =
+                reopenLibrary =
                     if (reason == SessionEndReason.GAME_EXITED && active.launchedFromLibrary) {
-                        active.hostId
+                        active.hostId?.let { LibraryReturn(it, active.libraryProfileId) }
                     } else {
                         null
                     }
@@ -154,8 +155,8 @@ fun App(forceGamepadUi: Boolean = false) {
                 onConnected = { session = it },
                 deepLink = pendingLink,
                 onDeepLinkHandled = { activity?.pendingDeepLink = null },
-                reopenLibraryHostId = reopenLibraryHostId,
-                onReopenLibraryHandled = { reopenLibraryHostId = null },
+                reopenLibrary = reopenLibrary,
+                onReopenLibraryHandled = { reopenLibrary = null },
             )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
@@ -282,15 +283,19 @@ fun GamepadShell(
     deepLink: String? = null,
     onDeepLinkHandled: () -> Unit = {},
     /**
-     * Open this saved host's library instead of Home on the way in — set when a game launched from
-     * it has just exited. Null (the default) starts on Home exactly as before.
+     * Open this library shelf instead of Home on the way in — set when a game launched from it has
+     * just exited. Null (the default) starts on Home exactly as before.
      */
-    reopenLibraryHostId: String? = null,
+    reopenLibrary: LibraryReturn? = null,
     onReopenLibraryHandled: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var screen by remember { mutableStateOf(GamepadScreen.Home) }
     var libraryHost by remember { mutableStateOf<io.unom.punktfunk.kit.security.KnownHost?>(null) }
+    // Which of that host's shelves is open: the pinned card's profile id, or null for the host's
+    // own tile (design §5.2a). Held beside `libraryHost` because it is the same navigation fact —
+    // a pinned card and its host are two tiles, and the library belongs to whichever you pressed.
+    var libraryPinId by remember { mutableStateOf<String?>(null) }
     // Where the settings screen was when a sub-screen took over. The shell's AnimatedContent
     // discards a screen's `remember`s the moment it stops being the target, so a trip out to the
     // Controllers view and back would otherwise land on the Stream tab's first row — the couch
@@ -301,15 +306,21 @@ fun GamepadShell(
     // Consume the "come back to this library" intent once, on entry. Keyed on the id so a second
     // game exit re-fires it; the parent clears it immediately, so a manual Back stays backed out.
     // A host that has since been forgotten simply leaves us on Home rather than failing.
-    LaunchedEffect(reopenLibraryHostId) {
-        val id = reopenLibraryHostId ?: return@LaunchedEffect
+    LaunchedEffect(reopenLibrary) {
+        val (id, pinId) = reopenLibrary ?: return@LaunchedEffect
         // Navigate BEFORE acknowledging: acknowledging clears the parent's state, which re-keys
         // this effect and cancels the coroutine running it. Nothing suspends in between today, so
         // either order happens to work — but this one cannot be broken by a later edit that adds a
         // suspending call. A host that has since been forgotten just leaves us on Home.
         KnownHostStore(context).all()
             .firstOrNull { it.id == id }
-            ?.let { libraryHost = it; screen = GamepadScreen.Library }
+            // A pin unpinned while the game was running is no longer a shelf: fall back to the
+            // host's own, rather than a card that no longer exists.
+            ?.let { kh ->
+                libraryHost = kh
+                libraryPinId = pinId?.takeIf { it in kh.pinnedProfileIds }
+                screen = GamepadScreen.Library
+            }
         onReopenLibraryHandled()
     }
 
@@ -377,7 +388,11 @@ fun GamepadShell(
                 onDeepLinkHandled = onDeepLinkHandled,
                 gamepadUi = true,
                 onOpenSettings = { screen = GamepadScreen.Settings },
-                onOpenLibrary = { host -> libraryHost = host; screen = GamepadScreen.Library },
+                onOpenLibrary = { host, pinId ->
+                    libraryHost = host
+                    libraryPinId = pinId
+                    screen = GamepadScreen.Library
+                },
                 navGate = s == screen,
             )
             GamepadScreen.Settings -> GamepadSettingsScreen(
@@ -407,8 +422,9 @@ fun GamepadShell(
                     host = host,
                     settings = settings,
                     onLaunched = onConnected,
-                    onBack = { screen = GamepadScreen.Home; libraryHost = null },
+                    onBack = { screen = GamepadScreen.Home; libraryHost = null; libraryPinId = null },
                     navActive = s == screen,
+                    pinnedProfileId = libraryPinId,
                 )
             } ?: run { screen = GamepadScreen.Home }
         }

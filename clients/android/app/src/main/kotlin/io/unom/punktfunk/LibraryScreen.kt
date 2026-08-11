@@ -94,6 +94,13 @@ fun LibraryScreen(
     onLaunched: (ActiveSession) -> Unit,
     onBack: () -> Unit,
     navActive: Boolean = true,
+    /**
+     * The profile this shelf launches with, when it was opened from a PINNED host+profile card
+     * (design §5.2a) rather than the host's own tile: a one-off, exactly like the card's plain
+     * connect. Null = the host's tile, and the host's binding decides — the same rule
+     * [ProfileStore.resolveFor] applies to every other connect.
+     */
+    pinnedProfileId: String? = null,
 ) {
     val ink = LocalGamepadInk.current
     BackHandler(onBack = onBack)
@@ -104,6 +111,14 @@ fun LibraryScreen(
     var state by remember { mutableStateOf<LibState>(LibState.Loading) }
     // A launch (connect) in flight: shows an overlay + gates the pad so a second press can't dial twice.
     var launching by remember { mutableStateOf(false) }
+    // The profile every launch off this shelf runs with, resolved ONCE per shelf by the same rule
+    // the host-list connect uses: this card's pin as the one-off, else the host's binding, else the
+    // globals. Resolved here rather than per launch so a profile edited mid-browse cannot make two
+    // titles on one shelf stream differently.
+    val profile = remember(host.id, pinnedProfileId) {
+        ProfileStore(context).resolveFor(host, pinnedProfileId)
+    }
+    val streamSettings = remember(settings, profile) { settings.effectiveFor(profile) }
 
     LaunchedEffect(host.address, host.port, host.fpHex) {
         state = LibState.Loading
@@ -133,7 +148,16 @@ fun LibraryScreen(
         Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
             GamepadAuroraBackground(Modifier.fillMaxSize())
             Column(Modifier.fillMaxSize().consoleSafeArea()) {
-                ConsoleHeader("${host.name} — Library")
+                // A pinned card's shelf says so, in the card's own `host · profile` shape: what a
+                // launch here will use is a property of the shelf, not something to remember from
+                // the tile two screens back.
+                ConsoleHeader(
+                    if (pinnedProfileId != null && profile != null) {
+                        "${host.name} · ${profile.name} — Library"
+                    } else {
+                        "${host.name} — Library"
+                    },
+                )
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     when (val s = state) {
                         is LibState.Loading -> LoadingState()
@@ -145,7 +169,7 @@ fun LibraryScreen(
                                     // Dial the host over the same pinned mTLS trust, booting straight
                                     // into this title (the host resolves `launch` = its library id).
                                     val handle = connectToHost(
-                                        context, settings, s.identity,
+                                        context, streamSettings, s.identity,
                                         host.address, host.port, host.fpHex, launch = game.id,
                                     )
                                     launching = false
@@ -153,11 +177,14 @@ fun LibraryScreen(
                                         onLaunched(
                                             ActiveSession(
                                                 handle,
-                                                settings,
+                                                streamSettings,
                                                 host.clipboardSync,
+                                                profileName = profile?.name,
                                                 hostId = host.id,
-                                                // Where to come back to when this game exits.
+                                                // Where to come back to when this game exits —
+                                                // this shelf, pin and all, not the host's default one.
                                                 launchedFromLibrary = true,
+                                                libraryProfileId = pinnedProfileId,
                                             ),
                                         )
                                     }
