@@ -71,7 +71,23 @@ data class ActiveSession(
      * [io.unom.punktfunk.kit.SessionEndReason.GAME_EXITED] ending.
      */
     val launchedFromLibrary: Boolean = false,
+    /**
+     * Which of [hostId]'s shelves that library launch came off: the pinned host+profile card's
+     * profile id (design §5.2a), or null for the host's own tile. Carried purely so the return
+     * trip above lands back on the SAME shelf — a player who launched from a pinned card is still
+     * on that card when the game exits, and coming back to the host's default shelf would silently
+     * change what the next title streams with.
+     */
+    val libraryProfileId: String? = null,
 )
+
+/**
+ * The library shelf a finished game launch should return to: the saved host's id, and the pinned
+ * profile card it was opened from (null = the host's own tile). One value rather than two parallel
+ * ones, because a hostId that arrives without its profile is not "the same shelf" — it is the
+ * default one wearing the same name.
+ */
+data class LibraryReturn(val hostId: String, val profileId: String? = null)
 
 /** Trust state of a host, shown as a colored pill on its card. */
 enum class HostStatus(val label: String) {

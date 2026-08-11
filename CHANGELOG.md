@@ -134,6 +134,56 @@ availability probe. The `comm` fast path is still one read for every ordinary di
 Also reached by the same rung: `gamescope` carries `cap_sys_nice` on a number of distros, so a
 *wrapped and capped* gamescope was equally invisible to the foreign-gamescope probe.
 
+### Game Mode on Nobara — the WSI opt-out never reached the games
+
+🛑 **v0.27.0's fix for the distro Vulkan WSI layer was clobbered by the session script, so games ran
+on a black screen** while the host's own log claimed the layer had been disabled. Steam Big Picture
+came up, showed the right mode, showed the perf overlay — and then every game played sound and took
+input over a black picture, with no error on either side.
+
+The layer (`VkLayer_FROG_gamescope_wsi`) ships with the *distro's* gamescope and speaks its
+`gamescope_swapchain` protocol; ours disagrees, so the compositor rejects the client's
+`swapchain_feedback` and kills it. v0.27.0 turned the layer off with `ENABLE_GAMESCOPE_WSI=0` on the
+session unit. `gamescope-session-plus` then runs an unconditional `export ENABLE_GAMESCOPE_WSI=1`
+near the top of the script — before it launches anything — so the opt-out survived exactly as long
+as it took the script to start, and every process the session spawned got the layer back. Nothing
+looked wrong because the casualty is Vulkan clients specifically: Steam's own UI is not one.
+
+The opt-out is now `DISABLE_GAMESCOPE_WSI=1` as well. The Vulkan loader reads an implicit layer's
+two manifest knobs in a fixed order: `enable_environment` must equal `"1"` to switch the layer on,
+and `disable_environment` is then consulted last and wins on **presence alone**, at any value. The
+session script never mentions that second variable, so it is the one that survives. Both spellings
+go out, on the transient unit and on the box's own session drop-in.
+
+### punktfunk-gamescope `+pfhdr6` — a NO_FOCUS window can no longer steal the composite
+
+🛑 **A mapped-but-unpainted window carrying `GAMESCOPE_NO_FOCUS=1` could win gamescope's focus
+selection and turn the composite — and the stream fed from it — black while every health signal
+stayed green.** Bazzite's hhd-ui (Handheld Daemon overlay) sets that atom once at init, stamps
+Steam's appid, and crash-loops under a headless takeover; each respawn remapped a fullscreen black
+window that steamcompmgr then chose over Big Picture (observed on a Bazzite box: client stats
+happily decoding 60 fps at 0.1 Mb/s of black; killing hhd-ui restored the picture instantly). No
+gamescope — upstream or Bazzite's fork — ever consumed the atom; its setters (hhd-ui, MangoHud)
+show and hide via the `STEAM_OVERLAY` protocol and rely on never being focusable. Patch 0008 wires
+`GAMESCOPE_NO_FOCUS` exactly like `GAMESCOPE_EXTERNAL_OVERLAY` (read at map, PropertyNotify-tracked,
+skipped by both focus-candidate collectors) without touching compositing or `appID`. Banner
+`+pfhdr5` → `+pfhdr6`; no new capability — the bump is so a field box's banner tells the two
+behaviors apart.
+
+### Linux capture — the truncated first attempt no longer latches sticky downgrades
+
+🛑 **The pipeline retry loop's deliberately short (2.5 s) first-frame attempt could permanently
+downgrade the whole host process.** On expiry, the portal capturer's timeout diagnosis latched
+whichever offer it implicated — HDR capture off (per source), the raw-dmabuf offer off, the
+EGL→CUDA offer off — as if the compositor had refused it, when the budget was truncated by design
+and a gamescope cold start routinely needs longer before delivering anything. One lost race at
+connect then pinned every later session to SDR and/or CPU capture until the host restarted. The
+truncated attempt is now declared provisional end to end
+(`Capturer::next_frame_within_provisional`): its expiry names the same suspect in the error text
+but latches nothing; only the full-length attempts that follow hand down negotiation verdicts. The
+classification is a pure function with tests
+(`pf_capture::linux::first_frame_timeout_tests`).
+
 ## v0.27.0
 
 87 commits since v0.26.0.

@@ -11,31 +11,6 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -45,19 +20,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
-import io.unom.punktfunk.components.EmptyHostsState
-import io.unom.punktfunk.components.HostCard
-import io.unom.punktfunk.components.HostMenuItem
-import io.unom.punktfunk.components.SectionLabel
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
@@ -73,7 +40,6 @@ import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
-import io.unom.punktfunk.models.HostStatus
 import io.unom.punktfunk.models.PendingTrust
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
@@ -108,6 +74,20 @@ private class ConnectAttempt(val hostName: String) {
     val cancelled = AtomicBoolean(false)
 }
 
+/**
+ * The connect screen — discovery, trust and the dial itself, under either interface.
+ *
+ * What is left in this file is the STATE and the engine: the mDNS browse and the permission that
+ * gates it, the identity, the host and profile stores, the trust decision, the dial and its wake
+ * fallback, and the `punktfunk://` router. What was drawn from that state now lives beside it —
+ * `buildHomeTiles` (the console carousel's contents), `ConnectGrid` (the touch home) and
+ * `ConnectPrompts` (everything modal, plus the connect takeover). They hold no state of their own,
+ * which is why they could leave: each one takes what it displays and hands back what was pressed.
+ *
+ * The engine did NOT leave, and shouldn't until it has somewhere to live: it closes over ~20 locals
+ * that a dozen callbacks read and write, and hoisting it means inventing a state holder — a second
+ * refactor, and a second thing to get wrong.
+ */
 @Composable
 fun ConnectScreen(
     settings: Settings,
@@ -120,7 +100,9 @@ fun ConnectScreen(
     // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
     gamepadUi: Boolean = false,
     onOpenSettings: () -> Unit = {},
-    onOpenLibrary: (KnownHost) -> Unit = {},
+    // (host, pinned profile id) — a pinned host+profile card opens ITS shelf, and the id is the
+    // one-off every launch off that shelf runs with (design §5.2a). Null = the host's own tile.
+    onOpenLibrary: (KnownHost, String?) -> Unit = { _, _ -> },
     navGate: Boolean = true, // false while the console home is cross-fading out
     // A `punktfunk://` URL to route (design/client-deep-links.md §3). This screen owns it because
     // it owns the connect path — trust decisions, the local-network grant, wake-and-retry — and a
@@ -651,52 +633,6 @@ fun ConnectScreen(
         }
     }
 
-    // The profile rows a card's overflow menu grows. With no profiles at all it stays empty — a
-    // user who never wants this feature sees no new clutter anywhere but the settings scope chips.
-    // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
-    // lives in the Edit sheet instead.
-    fun hostMenu(kh: KnownHost, pin: StreamProfile?): List<HostMenuItem> = buildList {
-        if (pin == null) {
-            add(HostMenuItem("Network speed test") { startSpeedTest(HostCardEntry(kh, null)) })
-        }
-        add(HostMenuItem("Copy link") { copyLink(kh, pin) })
-        if (profiles.isEmpty()) return@buildList
-        if (pin != null) {
-            add(HostMenuItem("Unpin card", startsSection = true) { togglePin(kh, pin) })
-        }
-        add(
-            HostMenuItem("Connect with: Default settings", startsSection = true) {
-                // The empty reference is "force the defaults", not "unset" — on a bound host that
-                // is a real, different action from a plain tap.
-                connect(kh.address, kh.port, oneOffProfile = "")
-            },
-        )
-        profiles.forEach { p ->
-            add(HostMenuItem("Connect with: ${p.name}") { connect(kh.address, kh.port, oneOffProfile = p.id) })
-        }
-        if (pin == null) {
-            profiles.forEachIndexed { i, p ->
-                val pinned = p.id in kh.pinnedProfileIds
-                add(
-                    HostMenuItem(
-                        if (pinned) "Unpin card: ${p.name}" else "Pin as card: ${p.name}",
-                        startsSection = i == 0,
-                    ) { togglePin(kh, p) },
-                )
-            }
-        }
-    }
-
-    // The saved-hosts grid: each host's own card, then one card per profile it has pinned, so a
-    // pinned combination is a plain one-click connect instead of a trip through a menu.
-    val savedCards = savedHosts.flatMap { kh ->
-        listOf(HostCardEntry(kh, null)) + profileStore.pinsFor(kh).map { HostCardEntry(kh, it) }
-    }
-    // Cards in one grid row must be the same height (the grid won't stretch them), so as soon as
-    // ANY saved card carries a profile chip, they all reserve its space. Nobody who doesn't use
-    // profiles ever sees the gap.
-    val anyProfileChip = savedCards.any { it.pin != null || it.host.profileId != null }
-
     // ---- punktfunk:// routing (design/client-deep-links.md §3) --------------------------------
     //
     // The invariant: a URL may only ever do what a click on an existing card could do, MINUS trust
@@ -782,79 +718,63 @@ fun ConnectScreen(
 
     var showManualSheet by remember { mutableStateOf(false) }
 
+    // Wake a saved host on demand — the touch card's Wake item and the console options dialog run
+    // the same action. Through the WakeController, so it shows the "Waking…" overlay and waits for
+    // the host to come back rather than firing one silent packet at it.
+    fun wakeHost(kh: KnownHost) {
+        // The magic packet is UDP broadcast — LNP-blocked like everything else.
+        if (!lnpGranted) {
+            lnpPrompt = true
+            return
+        }
+        waker.start(
+            hostName = kh.name,
+            connectsAfter = false,
+            macs = kh.mac,
+            lastIp = kh.address,
+            // "Back up" is mDNS presence ONLY — narrower than the [isOnline] that decides whether to
+            // OFFER Wake, which also counts a QUIC probe answer. Matched through `matches`, so a
+            // cold boot onto a new DHCP address still ends the wait.
+            isOnline = { discovered.any { kh.matches(it) } },
+            onOnline = {},
+        )
+    }
+
+    fun forgetHost(kh: KnownHost) {
+        knownHostStore.remove(kh)
+        savedHosts = knownHostStore.all()
+    }
+
     if (gamepadUi) {
         // Console mode: the host carousel (saved → discovered → Add Host), driven by the pad. Shares
         // every action above; the trailing Add Host tile opens the same manual-entry sheet.
-        val tiles = buildList {
-            savedHosts.forEach { kh ->
-                val bound = kh.profileId?.let { id -> profiles.firstOrNull { it.id == id } }
-                add(
-                    HomeTile(
-                        id = "saved-${kh.id}",
-                        title = kh.name,
-                        // The binding is what a press will actually do, so the tile says so — the
-                        // console can't edit profiles, but it must never lie about which one it uses.
-                        subtitle = bound?.let { "${kh.address}:${kh.port} · ${it.name}" }
-                            ?: "${kh.address}:${kh.port}",
-                        filled = true,
-                        online = kh.isOnline(discovered, reachable),
-                        paired = kh.paired,
-                        knownHost = kh,
-                        activate = { connect(kh.address, kh.port) },
-                    ),
-                )
-                // Pinned host+profile combinations, right after their host: one focus-and-press
-                // each, which is the affordance a controller surface does well (menus are not).
-                profileStore.pinsFor(kh).forEach { p ->
-                    add(
-                        HomeTile(
-                            id = "pin-${kh.id}-${p.id}",
-                            title = kh.name,
-                            subtitle = p.name,
-                            filled = true,
-                            online = kh.isOnline(discovered, reachable),
-                            paired = kh.paired,
-                            knownHost = kh,
-                            pinnedProfileId = p.id,
-                            activate = { connect(kh.address, kh.port, oneOffProfile = p.id) },
-                        ),
-                    )
-                }
-            }
-            discoveredUnsaved.forEach { dh ->
-                add(
-                    HomeTile(
-                        id = "disc-${dh.host}:${dh.port}",
-                        title = dh.name,
-                        subtitle = "${dh.host}:${dh.port}",
-                        online = true,
-                        activate = { connect(dh.host, dh.port, dh) },
-                    ),
-                )
-            }
-            add(
-                HomeTile(
-                    id = "add",
-                    title = "Add Host",
-                    subtitle = "Register a host by address",
-                    isAdd = true,
-                    activate = { showManualSheet = true },
-                ),
-            )
-        }
         GamepadHome(
-            tiles = tiles,
+            tiles = buildHomeTiles(
+                savedHosts = savedHosts,
+                profiles = profiles,
+                pinsFor = profileStore::pinsFor,
+                discoveredUnsaved = discoveredUnsaved,
+                isOnline = { it.isOnline(discovered, reachable) },
+                onConnect = { kh, oneOff -> connect(kh.address, kh.port, oneOffProfile = oneOff) },
+                onConnectDiscovered = { dh -> connect(dh.host, dh.port, dh) },
+                onAddHost = { showManualSheet = true },
+            ),
             libraryEnabled = settings.libraryEnabled,
             controllerName = io.unom.punktfunk.kit.Gamepad.firstPad()?.name,
             // Stop the carousel from consuming the pad while a sheet/dialog/overlay owns the screen,
             // while a connect is in flight (else a second A launches a concurrent connect that leaks a
             // handle — the touch grid guards the same way with enabled=!connecting), or while the whole
             // console home is cross-fading out.
+            // ⚠ `speedTest` belongs in this list and was missing. It LOOKED covered by `!connecting`,
+            // and is — right up until the measurement finishes: `startSpeedTest` clears `connecting`
+            // before its Done/Failed card is dismissed, so from that moment the card AND the
+            // carousel underneath both consumed the pad. One A then dismissed the card and started
+            // a connect. Every other modal on this screen is named here for exactly this reason.
             navActive = navGate && !connecting && !showManualSheet && pendingTrust == null &&
                 awaiting == null && editTarget == null && optionsTarget == null &&
-                waker.waking == null && !lnpPrompt,
+                speedTest == null && waker.waking == null && !lnpPrompt,
             onActivate = { it.activate() },
-            onOpenLibrary = { it.knownHost?.let(onOpenLibrary) },
+            onOpenLibrary = { tile -> tile.knownHost?.let { onOpenLibrary(it, tile.pinnedProfileId) } },
             onOpenSettings = onOpenSettings,
             onOptions = { tile ->
                 tile.knownHost?.let { kh ->
@@ -863,239 +783,35 @@ fun ConnectScreen(
             },
         )
     } else {
-        Box(Modifier.fillMaxSize()) {
-        LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 160.dp),
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Spacer(Modifier.height(8.dp))
-                    Text("Punktfunk", style = MaterialTheme.typography.headlineLarge)
-                    Text(
-                        "stream a remote desktop",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(24.dp))
-
-                    notice?.let {
-                        Surface(
-                            color = MaterialTheme.colorScheme.secondaryContainer,
-                            shape = MaterialTheme.shapes.medium,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text(
-                                it,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                            )
-                        }
-                        Spacer(Modifier.height(16.dp))
-                    }
-
-                    status?.let {
-                        // In-flight progress (connecting / waking) is the full-screen ConnectOverlay's
-                        // job now, so `status` only ever carries a result/error here — a filled error
-                        // container reads as a real failure banner, not just red text lost in the layout.
-                        Surface(
-                            color = MaterialTheme.colorScheme.errorContainer,
-                            shape = MaterialTheme.shapes.medium,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text(
-                                it,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                            )
-                        }
-                        Spacer(Modifier.height(16.dp))
-                    }
-                }
-            }
-
-            if (!lnpGranted) {
-                // Local network access denied: discovery can't ever find anything and every connect
-                // would time out — say so at the top, with the fix one tap away, instead of letting
-                // the screen look idle/broken.
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        shape = MaterialTheme.shapes.medium,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Column(
-                            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text(
-                                "Local network access is off",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                            )
-                            Text(
-                                "Android blocks Punktfunk from finding or reaching hosts until you allow it.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                textAlign = TextAlign.Center,
-                            )
-                            TextButton(onClick = { lnpPrompt = true }) { Text("Allow…") }
-                        }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                }
-            }
-
-            if (savedHosts.isEmpty() && discoveredUnsaved.isEmpty()) {
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    EmptyHostsState()
-                }
-            }
-
-            if (savedHosts.isNotEmpty()) {
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    SectionLabel("Saved hosts")
-                }
-                items(savedCards, key = { it.key }) { entry ->
-                    val kh = entry.host
-                    val pin = entry.pin
-                    val bound = kh.profileId?.let { id -> profiles.firstOrNull { it.id == id } }
-                    HostCard(
-                        name = kh.name,
-                        address = "${kh.address}:${kh.port}",
-                        status = if (kh.paired) HostStatus.PAIRED else HostStatus.TOFU,
-                        online = kh.isOnline(discovered, reachable),
-                        // Live advert preferred (the store lags a discovery tick), else stored.
-                        os = discovered.firstOrNull { kh.matches(it) && it.os.isNotEmpty() }?.os
-                            ?: kh.os,
-                        enabled = !connecting,
-                        // A pinned card connects with ITS profile; the host's own card follows the
-                        // binding, which is exactly what its chip says it will do.
-                        onConnect = {
-                            if (pin != null) {
-                                connect(kh.address, kh.port, oneOffProfile = pin.id)
-                            } else {
-                                connect(kh.address, kh.port)
-                            }
-                        },
-                        // Edit / Forget / Wake live on the host's own card only: a pinned card is a
-                        // shortcut, not a second host, and offering destructive host actions on it
-                        // would blur exactly that.
-                        onForget = if (pin != null) {
-                            null
-                        } else {
-                            {
-                                knownHostStore.remove(kh)
-                                savedHosts = knownHostStore.all()
-                            }
-                        },
-                        onEdit = if (pin != null) null else ({ editTarget = kh }),
-                        // Explicit wake-only: offered when the host is offline and we have a MAC. Runs
-                        // through the WakeController so it shows the "Waking…" overlay and waits for
-                        // the host to come online (matched by fingerprint, so a new DHCP address on a
-                        // cold boot still counts as "up") rather than firing a single silent packet.
-                        onWake = if (pin == null && kh.mac.isNotEmpty() && !kh.isOnline(discovered, reachable)) {
-                            {
-                                // The magic packet is UDP broadcast — LNP-blocked like everything else.
-                                if (!lnpGranted) {
-                                    lnpPrompt = true
-                                } else {
-                                    waker.start(
-                                        hostName = kh.name,
-                                        connectsAfter = false,
-                                        macs = kh.mac,
-                                        lastIp = kh.address,
-                                        isOnline = { discovered.any { kh.matches(it) } },
-                                        onOnline = {},
-                                    )
-                                }
-                            }
-                        } else {
-                            null
-                        },
-                        profileLabel = pin?.name ?: bound?.name,
-                        profileProminent = pin != null,
-                        accent = accentColor(pin?.accent ?: bound?.accent),
-                        menuItems = hostMenu(kh, pin),
-                        reserveProfileSlot = anyProfileChip,
-                    )
-                }
-            }
-
-            if (discoveredUnsaved.isNotEmpty()) {
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    Spacer(Modifier.height(12.dp))
-                    SectionLabel("Discovered on the network")
-                }
-                items(discoveredUnsaved, key = { "disc-${it.host}-${it.port}" }) { dh ->
-                    HostCard(
-                        name = dh.name,
-                        address = "${dh.host}:${dh.port}",
-                        status = if (dh.pairingRequired) HostStatus.PAIRING else HostStatus.TOFU,
-                        online = true, // in the discovered list ⇒ live on mDNS right now
-                        os = dh.os,
-                        enabled = !connecting,
-                        onConnect = { connect(dh.host, dh.port, dh) },
-                        onForget = null,
-                    )
-                }
-            }
-
-            // Active-discovery hint: discovery runs whenever this screen is up, so while it's
-            // scanning but nothing's turned up yet (and we're not mid-connect), show it's working
-            // rather than looking idle/empty. Suppressed while local network access is denied —
-            // a spinner would be a lie there (the browse can't receive anything); the banner above
-            // owns that state.
-            // Scan again is offered whether or not anything turned up: the case that sends people
-            // here is ONE expected host missing, not an empty list, and a browse that quietly went
-            // deaf (blocked when it started, or backed off to its hour-long re-query) looks
-            // exactly like a network without that host on it.
-            if (lnpGranted && !connecting) {
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (discovered.isEmpty()) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "Searching the local network…",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                        }
-                        TextButton(onClick = { discovery.restart() }) { Text("Scan again") }
-                    }
-                }
-            }
-
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Spacer(Modifier.height(96.dp))
-            }
-        }
-
-        ExtendedFloatingActionButton(
-            onClick = { showManualSheet = true },
-            icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-            text = { Text("Add host") },
-            expanded = !connecting,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp),
+        ConnectGrid(
+            savedHosts = savedHosts,
+            discovered = discovered,
+            discoveredUnsaved = discoveredUnsaved,
+            reachable = reachable,
+            profiles = profiles,
+            pinsFor = profileStore::pinsFor,
+            connecting = connecting,
+            notice = notice,
+            status = status,
+            lnpGranted = lnpGranted,
+            onAskLocalNetwork = { lnpPrompt = true },
+            onConnect = { kh, oneOff -> connect(kh.address, kh.port, oneOffProfile = oneOff) },
+            onConnectDiscovered = { dh -> connect(dh.host, dh.port, dh) },
+            onForget = { kh -> forgetHost(kh) },
+            onEdit = { kh -> editTarget = kh },
+            onWake = { kh -> wakeHost(kh) },
+            onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
+            onCopyLink = { kh, pin -> copyLink(kh, pin) },
+            onTogglePin = { kh, p -> togglePin(kh, p) },
+            onRescan = { discovery.restart() },
+            onAddHost = { showManualSheet = true },
         )
-        }
     }
 
+    // Add Host stayed behind while the other modals moved into ConnectPrompts: its form fields are
+    // remembered HERE, on purpose, so a half-typed address survives the sheet being dismissed and
+    // reopened. Moving the block without moving that state would quietly change what a dismiss
+    // costs; moving both is a separate decision from this one.
     if (showManualSheet) {
         if (gamepadUi) {
             // Console add-host: field list + on-screen controller keyboard. "Add" connects (which
@@ -1123,148 +839,81 @@ fun ConnectScreen(
         }
     }
 
-    pendingTrust?.let { pt ->
-        // Same trust/pairing logic, console-styled + controller-navigable in gamepad mode.
-        val onPair = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }
-        val onSavePaired = { fp: String ->
+    // Which layer a measurement would land in. Resolved here, not in the prompt: it is a question
+    // for the profile store, and the Apply button and the caption above it must agree on the answer.
+    val speedTestTarget = speedTest?.let { SpeedTestTarget.resolve(it.host, it.pin?.id, profileStore) }
+    // Prefill a not-yet-learned MAC from the host's live advert, mirroring Apple's
+    // `discovery.hosts.first { host.matches($0) }?.macAddresses`.
+    val editSuggestedMacs =
+        editTarget?.let { kh -> discovered.firstOrNull { kh.matches(it) }?.mac } ?: emptyList()
+
+    // Everything that floats above whichever home was drawn, in one place and in one order — see
+    // ConnectPrompts.kt. It decides nothing: each action below lands right back in the engine above.
+    ConnectPrompts(
+        gamepadUi = gamepadUi,
+        identity = identity,
+        profiles = profiles,
+        isOnline = { it.isOnline(discovered, reachable) },
+        pendingTrust = pendingTrust,
+        onPendingTrustChange = { pendingTrust = it },
+        onTrustNew = { pt ->
+            pendingTrust = null
+            doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch)
+        },
+        onPaired = { pt, fp ->
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
             savedHosts = knownHostStore.all()
             pendingTrust = null
             doConnect(pt.host, pt.port, pt.name, fp, pt.profile, pt.launch)
-        }
-        when (pt.kind) {
-            PendingTrust.Kind.TRUST_NEW ->
-                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
-                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null, pt.profile, pt.launch) }, onPair, { pendingTrust = null })
-            PendingTrust.Kind.FP_CHANGED ->
-                if (gamepadUi) GamepadFingerprintChangedDialog(pt, onPair, { pendingTrust = null })
-                else FingerprintChangedDialog(pt, onPair, { pendingTrust = null })
-            PendingTrust.Kind.REQUEST_ACCESS ->
-                if (gamepadUi) GamepadRequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
-                else RequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
-            PendingTrust.Kind.PAIR ->
-                if (gamepadUi) GamepadPairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
-                else PairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
-        }
-    }
-
-    awaiting?.let { req ->
-        val onCancel = {
-            req.cancelled.set(true)
+        },
+        onRequestAccess = { pt -> pendingTrust = null; requestAccess(pt) },
+        awaitingHostName = awaiting?.target?.name,
+        onCancelApproval = {
+            awaiting?.cancelled?.set(true)
             awaiting = null
             connecting = false
             discovery.start() // the request may still be pending on the host; keep scanning
-        }
-        if (gamepadUi) GamepadAwaitingApprovalDialog(req.target.name, onCancel)
-        else AwaitingApprovalDialog(hostLabel = req.target.name, onCancel = onCancel)
-    }
-
-    // Console host options (Up on a saved carousel tile): Wake / Edit / Forget.
-    optionsTarget?.let { entry ->
-        val kh = entry.host
-        val pin = entry.pin
-        val offline = !kh.isOnline(discovered, reachable)
-        GamepadHostOptionsDialog(
-            hostName = kh.name,
-            canWake = kh.mac.isNotEmpty() && offline,
-            onWake = {
-                optionsTarget = null
-                // The magic packet is UDP broadcast — LNP-blocked like everything else.
-                if (!lnpGranted) {
-                    lnpPrompt = true
-                } else {
-                    waker.start(
-                        hostName = kh.name, connectsAfter = false, macs = kh.mac, lastIp = kh.address,
-                        isOnline = { discovered.any { kh.matches(it) } },
-                        onOnline = {},
-                    )
-                }
-            },
-            // A saved host always has a library (it's a knownHost) → offer it when the setting's on,
-            // so a TV remote reaches the library here instead of via the Y face button.
-            onLibrary = if (settings.libraryEnabled && pin == null) {
-                { optionsTarget = null; onOpenLibrary(kh) }
-            } else {
-                null
-            },
-            onSpeedTest = if (pin == null) {
-                { optionsTarget = null; startSpeedTest(HostCardEntry(kh, null)) }
-            } else {
-                null
-            },
-            onCopyLink = { optionsTarget = null; copyLink(kh, pin) },
-            onEdit = { optionsTarget = null; editTarget = kh },
-            onForget = {
-                knownHostStore.remove(kh)
-                savedHosts = knownHostStore.all()
-                optionsTarget = null
-            },
-            onDismiss = { optionsTarget = null },
-            // A pin's only action: unpinning touches neither the host nor the profile.
-            onUnpin = pin?.let { p -> { togglePin(kh, p); optionsTarget = null } },
-            profileName = pin?.name,
-        )
-    }
-
-    speedTest?.let { entry ->
-        val target = SpeedTestTarget.resolve(entry.host, entry.pin?.id, profileStore)
-        val dismiss = { speedTest = null }
-        val apply: (Boolean) -> Unit = { toProfile ->
+        },
+        optionsTarget = optionsTarget,
+        onDismissOptions = { optionsTarget = null },
+        libraryEnabled = settings.libraryEnabled,
+        onOpenLibrary = onOpenLibrary,
+        onWake = { kh -> wakeHost(kh) },
+        onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
+        onCopyLink = { kh, pin -> copyLink(kh, pin) },
+        onEditHost = { kh -> editTarget = kh },
+        onForgetHost = { kh -> forgetHost(kh) },
+        onTogglePin = { kh, p -> togglePin(kh, p) },
+        speedTest = speedTest,
+        speedTestTarget = speedTestTarget,
+        speedTestPhase = speedTestPhase,
+        onApplySpeedTest = { toProfile ->
             val done = speedTestPhase as? SpeedTestPhase.Done
-            if (done != null) {
+            if (done != null && speedTestTarget != null) {
                 val where = applySpeedTestResult(
-                    done.recommendedKbps, target, toProfile, profileStore, settings, onSettingsChange,
+                    done.recommendedKbps, speedTestTarget, toProfile, profileStore, settings,
+                    onSettingsChange,
                 )
                 profiles = profileStore.all()
                 notice = "%.0f Mbit/s set in %s".format(done.recommendedMbps, where)
             }
             speedTest = null
-        }
-        if (gamepadUi) {
-            GamepadSpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
-        } else {
-            SpeedTestDialog(entry.host.name, target, speedTestPhase, apply, dismiss)
-        }
-    }
-
-    editTarget?.let { kh ->
-        // Prefill a not-yet-learned MAC from the host's live advert, mirroring Apple's
-        // `discovery.hosts.first { host.matches($0) }?.macAddresses`.
-        val suggested = discovered.firstOrNull { kh.matches(it) }?.mac ?: emptyList()
-        val onSaveHost: (KnownHost) -> Unit = { updated ->
+        },
+        onDismissSpeedTest = { speedTest = null },
+        editTarget = editTarget,
+        editSuggestedMacs = editSuggestedMacs,
+        onSaveHost = { updated ->
             knownHostStore.save(updated)
             savedHosts = knownHostStore.all()
             editTarget = null
-        }
-        if (gamepadUi) {
-            // Console edit: the same field list + on-screen keyboard as Add-Host, seeded from the
-            // host with an extra MAC row; the action SAVES instead of connecting.
-            GamepadAddHostScreen(
-                onAdd = { _, _, _ -> },
-                onDismiss = { editTarget = null },
-                editHost = kh,
-                suggestedMacs = suggested,
-                onSave = onSaveHost,
-            )
-        } else {
-            EditHostDialog(
-                target = kh,
-                suggestedMacs = suggested,
-                profiles = profiles,
-                onSave = onSaveHost,
-                onDismiss = { editTarget = null },
-            )
-        }
-    }
-
-    if (lnpPrompt) {
-        // Android 17+ local-network-permission rationale: re-request (a permanently-denied request
-        // returns instantly without a system prompt — hence the settings deep link alongside).
-        val onAllow = {
+        },
+        onDismissEdit = { editTarget = null },
+        lnpPrompt = lnpPrompt,
+        onAllowLocalNetwork = {
             lnpPrompt = false
             localNetLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
-        }
-        val onSettings = {
+        },
+        onOpenSystemSettings = {
             lnpPrompt = false
             context.startActivity(
                 Intent(
@@ -1272,21 +921,10 @@ fun ConnectScreen(
                     Uri.fromParts("package", context.packageName, null),
                 ),
             )
-        }
-        if (gamepadUi) {
-            GamepadLocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
-        } else {
-            LocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
-        }
-    }
-
-    // Topmost: the full-screen connect takeover — instant "Connecting…" feedback on any dial, flowing
-    // seamlessly into the "Waking…" wait if the host turns out to be asleep. Rides over both the touch
-    // grid and the console home.
-    ConnectOverlay(
+        },
+        onDismissLnpPrompt = { lnpPrompt = false },
         connectingHostName = attempt?.hostName,
         waker = waker,
-        gamepadUi = gamepadUi,
         onCancelConnect = { cancelConnect() },
     )
 }
@@ -1295,8 +933,11 @@ fun ConnectScreen(
  * One entry in the saved-hosts grid: a host's own card ([pin] null), or one of its pinned
  * host+profile cards. Pins are additive presentation state on the host record — never duplicated
  * host entries, which would fork pairing, trust and renames (design §5.2a).
+ *
+ * The console reuses it deliberately: its options dialog acts on a host-or-pin exactly as the touch
+ * card's overflow menu does, and one currency for "which card is this" keeps the two from drifting.
  */
-private data class HostCardEntry(val host: KnownHost, val pin: StreamProfile?) {
+internal data class HostCardEntry(val host: KnownHost, val pin: StreamProfile?) {
     val key: String get() = "card-${host.id}-${pin?.id ?: "primary"}"
 }
 
@@ -1305,7 +946,7 @@ private data class HostCardEntry(val host: KnownHost, val pin: StreamProfile?) {
  * as a multicast-reception hedge on OEMs that filter multicast without it, but discovery (raw mDNS via
  * the native core + MulticastLock) does not depend on it.
  */
-fun hasNearbyPermission(context: Context): Boolean =
+internal fun hasNearbyPermission(context: Context): Boolean =
     Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) ==
         PackageManager.PERMISSION_GRANTED
@@ -1317,7 +958,7 @@ fun hasNearbyPermission(context: Context): Boolean =
  * QUIC dial surfaces as a silent handshake timeout and the mDNS browse receives nothing. Unlike
  * [hasNearbyPermission] this is load-bearing — nothing on the connect screen works without it.
  */
-fun hasLocalNetworkPermission(context: Context): Boolean =
+internal fun hasLocalNetworkPermission(context: Context): Boolean =
     Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_LOCAL_NETWORK) ==
         PackageManager.PERMISSION_GRANTED
@@ -1327,7 +968,7 @@ fun hasLocalNetworkPermission(context: Context): Boolean =
  * fingerprint when both carry it (so it survives a DHCP address change), else by address:port.
  * Mirrors the Apple client's `StoredHost.matches`; de-dupes "Discovered" against "Saved hosts".
  */
-private fun KnownHost.matches(dh: DiscoveredHost): Boolean {
+internal fun KnownHost.matches(dh: DiscoveredHost): Boolean {
     val advFp = dh.fingerprint?.lowercase()
     if (!advFp.isNullOrEmpty() && fpHex.isNotEmpty() && fpHex.lowercase() == advFp) return true
     return address == dh.host && port == dh.port
@@ -1337,6 +978,9 @@ private fun KnownHost.matches(dh: DiscoveredHost): Boolean {
  * True when a saved host is reachable RIGHT NOW: advertising on mDNS OR answering the QUIC probe
  * (a host reached over a routed network — Tailscale/VPN — never advertises but is reachable). The
  * display-side companion to dial-first: presence no longer means "on this LAN".
+ *
+ * `internal`, not private: the touch grid draws the same pip in its own file now, and the console's
+ * tile builder is handed this as a lambda so it never has to know what "reachable" is made of.
  */
-private fun KnownHost.isOnline(discovered: List<DiscoveredHost>, reachable: Set<String>): Boolean =
+internal fun KnownHost.isOnline(discovered: List<DiscoveredHost>, reachable: Set<String>): Boolean =
     discovered.any { matches(it) } || reachable.contains("$address:$port")

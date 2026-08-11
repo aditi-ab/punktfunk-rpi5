@@ -229,7 +229,7 @@ public struct EffectiveSettings: Equatable, Sendable {
 /// through to the binding. Collapsing the two would make the menu item that says "Default
 /// settings" silently connect with the host's profile. It is the same distinction the session
 /// binary's `--profile ""` reserves on the desktop clients.
-public enum ProfileSelection: Equatable, Sendable {
+public enum ProfileSelection: Hashable, Sendable {
     /// No pick — the host's default binding applies (a plain click/tap).
     case inherit
     /// Force the global defaults for this one connect, whatever the host is bound to.

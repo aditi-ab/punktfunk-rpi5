@@ -15,12 +15,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PageSize
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -43,6 +41,11 @@ import androidx.compose.ui.layout.ContentScale
 import android.content.res.Configuration
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.zIndex
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
@@ -91,6 +94,13 @@ fun LibraryScreen(
     onLaunched: (ActiveSession) -> Unit,
     onBack: () -> Unit,
     navActive: Boolean = true,
+    /**
+     * The profile this shelf launches with, when it was opened from a PINNED host+profile card
+     * (design §5.2a) rather than the host's own tile: a one-off, exactly like the card's plain
+     * connect. Null = the host's tile, and the host's binding decides — the same rule
+     * [ProfileStore.resolveFor] applies to every other connect.
+     */
+    pinnedProfileId: String? = null,
 ) {
     val ink = LocalGamepadInk.current
     BackHandler(onBack = onBack)
@@ -101,6 +111,14 @@ fun LibraryScreen(
     var state by remember { mutableStateOf<LibState>(LibState.Loading) }
     // A launch (connect) in flight: shows an overlay + gates the pad so a second press can't dial twice.
     var launching by remember { mutableStateOf(false) }
+    // The profile every launch off this shelf runs with, resolved ONCE per shelf by the same rule
+    // the host-list connect uses: this card's pin as the one-off, else the host's binding, else the
+    // globals. Resolved here rather than per launch so a profile edited mid-browse cannot make two
+    // titles on one shelf stream differently.
+    val profile = remember(host.id, pinnedProfileId) {
+        ProfileStore(context).resolveFor(host, pinnedProfileId)
+    }
+    val streamSettings = remember(settings, profile) { settings.effectiveFor(profile) }
 
     LaunchedEffect(host.address, host.port, host.fpHex) {
         state = LibState.Loading
@@ -129,8 +147,17 @@ fun LibraryScreen(
     Box(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
             GamepadAuroraBackground(Modifier.fillMaxSize())
-            Column(Modifier.fillMaxSize().systemBarsPadding()) {
-                ConsoleHeader("${host.name} — Library")
+            Column(Modifier.fillMaxSize().consoleSafeArea()) {
+                // A pinned card's shelf says so, in the card's own `host · profile` shape: what a
+                // launch here will use is a property of the shelf, not something to remember from
+                // the tile two screens back.
+                ConsoleHeader(
+                    if (pinnedProfileId != null && profile != null) {
+                        "${host.name} · ${profile.name} — Library"
+                    } else {
+                        "${host.name} — Library"
+                    },
+                )
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     when (val s = state) {
                         is LibState.Loading -> LoadingState()
@@ -142,7 +169,7 @@ fun LibraryScreen(
                                     // Dial the host over the same pinned mTLS trust, booting straight
                                     // into this title (the host resolves `launch` = its library id).
                                     val handle = connectToHost(
-                                        context, settings, s.identity,
+                                        context, streamSettings, s.identity,
                                         host.address, host.port, host.fpHex, launch = game.id,
                                     )
                                     launching = false
@@ -150,11 +177,14 @@ fun LibraryScreen(
                                         onLaunched(
                                             ActiveSession(
                                                 handle,
-                                                settings,
+                                                streamSettings,
                                                 host.clipboardSync,
+                                                profileName = profile?.name,
                                                 hostId = host.id,
-                                                // Where to come back to when this game exits.
+                                                // Where to come back to when this game exits —
+                                                // this shelf, pin and all, not the host's default one.
                                                 launchedFromLibrary = true,
+                                                libraryProfileId = pinnedProfileId,
                                             ),
                                         )
                                     }
@@ -173,7 +203,7 @@ fun LibraryScreen(
         // Launching overlay — the connect + host-side game boot takes a moment; block the pad while it runs.
         if (launching) {
             Box(
-                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)),
+                Modifier.fillMaxSize().background(ink.modalScrim),
                 contentAlignment = Alignment.Center,
             ) {
                 Column(
@@ -189,7 +219,7 @@ fun LibraryScreen(
         // screen (ignore the safe area in landscape, where the bottom edge isn't a tap target).
         Box(
             Modifier.align(Alignment.BottomStart)
-                .then(if (landscape) Modifier else Modifier.systemBarsPadding())
+                .consoleLegendInsets(landscape)
                 .padding(ConsoleLegendInset),
         ) {
             GamepadHintBar(
@@ -264,10 +294,18 @@ private fun Coverflow(
                 Text(
                     if (current?.isLauncher == true) "LAUNCHERS" else "GAMES",
                     style = MaterialTheme.typography.labelSmall,
-                    color = Color.White.copy(alpha = 0.45f),
+                    // The palette's ink, not white: on a pale field this heading was white on
+                    // near-white and simply wasn't there.
+                    color = ink.fg(0.45f),
                     letterSpacing = 2.sp,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // A live region: this heading is the ONLY signal that the cursor has
+                        // crossed from the launchers into the games, and a coverflow gives a
+                        // reader no other way to notice — it is one strip, not two lists.
+                        .semantics { liveRegion = LiveRegionMode.Polite }
+                        .padding(bottom = 8.dp),
                 )
             }
             HorizontalPager(
@@ -289,9 +327,21 @@ private fun Coverflow(
                         .width(coverWidth)
                         .height(coverHeight)
                         // Touch: tap the centred cover to launch it; tap a neighbour to bring it centre.
-                        .clickable {
+                        // The label says which of the two a press does, because from the poster
+                        // alone they are indistinguishable — and the CENTRED one is the only one A
+                        // acts on, which nothing else in the tree says.
+                        .clickable(
+                            onClickLabel = if (page == pagerState.currentPage) {
+                                "Launch ${games[page].title}"
+                            } else {
+                                "Bring ${games[page].title} to the centre"
+                            },
+                        ) {
                             if (page == pagerState.currentPage) onLaunch(games[page])
                             else scope.launch { pagerState.animateScrollToPage(page) }
+                        }
+                        .semantics {
+                            if (page == pagerState.currentPage) selected = true
                         }
                         .graphicsLayer {
                             // Centre at full size; EVERY neighbour settles to one size, so an even pitch
@@ -351,11 +401,14 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
     val ink = LocalGamepadInk.current
     val candidates = game.art.posterCandidates
     var idx by remember(game.id) { mutableStateOf(0) }
-    val shape = RoundedCornerShape(16.dp)
+    val shape = ConsoleShape.Poster
     Box(
         modifier = modifier
             .clip(shape)
-            .background(Color(0xFF241F3D))
+            // The ground a cover sits on while its art loads (and the permanent one for a launcher
+            // entry, which rarely has art). Palette-derived rather than a fixed indigo, so a poster
+            // wall on a pale field isn't a grid of dark holes.
+            .background(LocalGamepadPalette.current.groundColor)
             .border(1.dp, ink.fg(0.12f), shape),
         contentAlignment = Alignment.Center,
     ) {
@@ -397,11 +450,25 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
             Text(
                 game.storeLabel,
                 style = MaterialTheme.typography.labelSmall,
-                color = ink.fg,
+                // A launcher's badge is brand-filled, so it reads on the ACCENT; a game's sits on
+                // a plain dark wash over its own art.
+                color = if (game.isLauncher) ink.onAccent else Color.White,
                 modifier = Modifier
-                    .clip(RoundedCornerShape(50))
+                    // A bare store name read out after the title says nothing about WHY it is
+                    // there; the poster's own description already carries the title.
+                    .semantics {
+                        contentDescription = if (game.isLauncher) {
+                            "Opens ${game.storeLabel}"
+                        } else {
+                            "From ${game.storeLabel}"
+                        }
+                    }
+                    .clip(ConsoleShape.Pill)
                     .background(
-                        if (game.isLauncher) MaterialTheme.colorScheme.primary
+                        // The console's palette accent, not `MaterialTheme.colorScheme.primary` —
+                        // that is the TOUCH theme's colour (Material You, seeded from the user's
+                        // wallpaper), which had nothing to do with the field this poster sits on.
+                        if (game.isLauncher) ink.accent
                         else Color.Black.copy(alpha = 0.5f),
                     )
                     .padding(horizontal = 8.dp, vertical = 3.dp),

@@ -4,6 +4,46 @@ use crate::screens::home::HomeScreen;
 use crate::screens::library::LibraryScreen;
 use punktfunk_core::config::GamepadPref;
 
+/// The screen-transition contract, against the shared vectors. Every client re-implements this
+/// motion in its own animation system, so the numbers exist in three places and drifted in two of
+/// them before this test.
+///
+/// The EASING is sampled rather than compared as control points, and that is the point of it:
+/// this side is the analytic `1 − (1−t)³`, Android reproduces it exactly, and SwiftUI can only
+/// approximate it with a Bézier. Worse, two different Béziers are published under the name
+/// "easeOutCubic" — `(0.215, 0.61, 0.355, 1)` and `(0.33, 1, 0.68, 1)` — and neither IS this
+/// curve; they differ from it by up to ~0.08 at the midpoint, which is visible on a 260 ms
+/// transition. Samples with a tolerance are the only form all three runtimes can meet.
+#[test]
+fn motion_matches_the_shared_vectors() {
+    let raw = include_str!("../../../../clients/shared/console-vectors.json");
+    let file: serde_json::Value =
+        serde_json::from_str(raw).expect("console-vectors.json must parse");
+    let motion = &file["motion"];
+    let want_s = motion["transition_s"].as_f64().expect("transition_s");
+    assert!(
+        (TRANSITION_S - want_s).abs() < 1e-9,
+        "TRANSITION_S is {TRANSITION_S}, vectors say {want_s}"
+    );
+
+    let curve = &motion["ease_out_cubic"];
+    let tol = curve["tolerance"].as_f64().expect("tolerance");
+    let samples = curve["samples"].as_array().expect("samples");
+    assert!(
+        samples.len() >= 5,
+        "the curve needs enough samples to pin it"
+    );
+    for s in samples {
+        let t = s["t"].as_f64().expect("t");
+        let want = s["p"].as_f64().expect("p");
+        let got = crate::anim::ease_out_cubic(t);
+        assert!(
+            (got - want).abs() <= tol,
+            "ease_out_cubic({t}) is {got}, vectors say {want} (±{tol})"
+        );
+    }
+}
+
 /// Point the settings/known-hosts stores at a throwaway HOME — the settings screen
 /// SAVES on adjust, and a test must never write the developer's real config.
 fn fake_home() {
@@ -138,6 +178,87 @@ fn connect_flow_raises_launch_and_cancel() {
 fn finish_motion(s: &mut Shell) {
     // Transitions block input; tests fast-forward them.
     s.motion = Motion::None;
+}
+
+/// A pinned host+profile card's library launches with THAT profile (design §5.2a).
+///
+/// The card's plain A-press always carried its profile; Y — which the card offers, being
+/// paired and saved — opened a library screen that knew only the host, so every title
+/// launched off it silently fell back to the host's default binding. The profile a user
+/// pinned is the whole reason they pressed that card.
+#[test]
+fn a_pinned_cards_library_launches_with_its_profile() {
+    let mut rows = hosts();
+    let card = HostRow {
+        key: "aa11\u{0}hdr".into(),
+        pin: Some(crate::model::ProfileChip {
+            id: "hdr".into(),
+            name: "HDR".into(),
+            accent: None,
+        }),
+        ..rows[0].clone()
+    };
+    rows.insert(1, card);
+    let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    console.set_hosts(rows);
+    s.sync();
+
+    // Focus the pinned card (it sits right after its host's primary tile), then Y.
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    match s.stack.last() {
+        Some(Screen::Library(l)) => assert_eq!(
+            l.title(),
+            "Living Room PC \u{b7} HDR",
+            "the shelf names the profile it will launch with"
+        ),
+        _ => panic!("Y on a pinned card opens its library"),
+    }
+
+    library.set_games(vec![crate::library::LibraryGame {
+        id: "steam:570".into(),
+        title: "Dota 2".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+    }]);
+    s.handle_menu(MenuEvent::Confirm);
+    match s.take_action() {
+        Some(OverlayAction::Launch {
+            launch, profile, ..
+        }) => {
+            assert_eq!(launch.as_deref(), Some("steam:570"));
+            assert_eq!(
+                profile.as_deref(),
+                Some("hdr"),
+                "the launch carries the pinned card's profile"
+            );
+        }
+        _ => panic!("A on a title raises a launch"),
+    }
+}
+
+/// …and off the host's PRIMARY tile there is no one-off: the host's binding decides,
+/// which is what the resolver sees as `None`.
+#[test]
+fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Secondary); // paired+online host focused first
+    finish_motion(&mut s);
+    library.set_games(vec![crate::library::LibraryGame {
+        id: "steam:570".into(),
+        title: "Dota 2".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+    }]);
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(matches!(
+        s.take_action(),
+        Some(OverlayAction::Launch { profile: None, .. })
+    ));
 }
 
 #[test]

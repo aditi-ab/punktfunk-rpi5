@@ -32,9 +32,13 @@ import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
 import androidx.compose.runtime.CompositionLocalProvider
+import io.unom.punktfunk.GamepadHome
 import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.GamepadPalette
+import io.unom.punktfunk.ConsoleControllersScreen
+import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.GamepadSettingsScreen
+import io.unom.punktfunk.HomeTile
 import io.unom.punktfunk.LocalGamepadInk
 import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
@@ -43,10 +47,11 @@ import io.unom.punktfunk.SettingsCategory
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.StatsVerbosity
+import io.unom.punktfunk.StreamStartBanner
 import io.unom.punktfunk.ProfileEditorFields
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.SettingsOverlay
-import io.unom.punktfunk.SpeedTestDialog
+import io.unom.punktfunk.SpeedTestPrompt
 import io.unom.punktfunk.SpeedTestPhase
 import io.unom.punktfunk.SpeedTestTarget
 import io.unom.punktfunk.components.HostCard
@@ -242,7 +247,8 @@ internal fun SettingsProfileScene() {
  */
 @Composable
 internal fun SpeedTestScene() {
-    SpeedTestDialog(
+    SpeedTestPrompt(
+        gamepadUi = false,
         hostName = "Living Room PC",
         target = SpeedTestTarget.Ask(newProfile("Game")),
         phase = SpeedTestPhase.Done(throughputKbps = 412_000, lossPct = 0.3, recommendedKbps = 288_400),
@@ -427,6 +433,111 @@ internal fun ConnectConsoleScene() =
  * stand in for it: this is a different screen with different navigation, and the strip is the part
  * a layout regression would eat first.
  */
+/**
+ * The start-of-stream banner over the same synthetic "streamed frame" — the real
+ * [StreamStartBanner] at full opacity, since the caller owns the 6 s timer and a shot must not race
+ * it. Two variants because the WORDS are the point: the banner names pad chords or touch gestures
+ * depending on what the session actually has, and a screenshot is the only place the two can be
+ * compared side by side.
+ */
+@Composable
+internal fun StreamBannerScene(pad: Boolean) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(
+                Brush.linearGradient(
+                    listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B)),
+                ),
+            ),
+    ) {
+        StreamStartBanner(
+            text = if (pad) {
+                "Hold Select + Start + L1 + R1 to leave · Select + Y mic · Select + X stats"
+            } else {
+                "Back leaves the stream · three-finger tap for stats"
+            },
+            alpha = 1f,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
+        )
+    }
+}
+
+/**
+ * The console HOME — the host carousel over the living backdrop, which is the screen the aurora is
+ * most of. Worth its own shot for exactly that reason: on API 33+ the field is the real bicubic
+ * MESH (`GamepadAurora`'s AGSL port of the desktop console's shader) and below it the four-blob
+ * fallback, and the two are only comparable side by side. The scene composes [GamepadHome]
+ * directly with mock tiles — it needs no JNI core and no session, unlike the ConnectScreen that
+ * normally feeds it.
+ */
+@Composable
+internal fun ConsoleHomeScene(paletteId: String = "violet") {
+    val palette = GamepadPalette.named(paletteId)
+    val tiles = listOf(
+        HomeTile(
+            id = "living", title = "Living Room PC", subtitle = "192.168.1.42 · Paired",
+            filled = true, online = true, paired = true, activate = {},
+        ),
+        HomeTile(
+            id = "studio", title = "studio-deck", subtitle = "192.168.1.61 · Discovered",
+            online = true, activate = {},
+        ),
+        HomeTile(id = "add", title = "Add Host", subtitle = "By address", isAdd = true, activate = {}),
+    )
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+    ) {
+        GamepadHome(
+            tiles = tiles,
+            libraryEnabled = true,
+            controllerName = "Xbox Wireless Controller",
+            navActive = false,
+            onActivate = {},
+            onOpenLibrary = {},
+            onOpenSettings = {},
+        )
+    }
+}
+
+/**
+ * The two screens the console could not reach at all until WP8.3 — the open-source notices and the
+ * connected-controllers view — in their console presentation.
+ *
+ * Worth a shot each, and worth a PALE one: both are ordinary Material screens underneath, and the
+ * console shows them through a `ColorScheme` derived from the palette's ink. That derivation is the
+ * whole risk. Their touch presentation is inked by the app theme, which is always dark, so nothing
+ * before this could catch light-grey body text stranded on a pastel field.
+ *
+ * Robolectric enumerates no input devices, so the controllers scene renders its deterministic
+ * "nothing connected" state.
+ */
+@Composable
+internal fun ConsoleLicensesScene(paletteId: String = "violet") =
+    ConsolePalette(paletteId) { ConsoleLicensesScreen(onBack = {}, navActive = false) }
+
+@Composable
+internal fun ConsoleControllersScene(paletteId: String = "violet") =
+    ConsolePalette(paletteId) {
+        ConsoleControllersScreen(gamepadSetting = 0, onBack = {}, navActive = false)
+    }
+
+/**
+ * Publish the palette locals `App` would normally provide. A scene that calls a console screen
+ * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
+ * prove nothing at all.
+ */
+@Composable
+private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
+    val palette = GamepadPalette.named(paletteId)
+    CompositionLocalProvider(
+        LocalGamepadPalette provides palette,
+        LocalGamepadInk provides GamepadInk.of(palette),
+        content = content,
+    )
+}
+
 @Composable
 internal fun ConsoleSettingsScene(paletteId: String = "violet") {
     // The scene calls the screen directly, so it has to publish the palette locals `App` would

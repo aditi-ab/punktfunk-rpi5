@@ -3078,6 +3078,7 @@ dependencies = [
  "pf-presenter",
  "punktfunk-core",
  "sdl3",
+ "serde_json",
  "skia-safe",
  "tracing",
 ]

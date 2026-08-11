@@ -43,6 +43,21 @@ pub trait Capturer: Send {
         self.next_frame()
     }
 
+    /// [`next_frame_within`](Self::next_frame_within), but the caller declares the budget
+    /// PROVISIONAL: its expiry is the retry schedule firing (the deliberately truncated first
+    /// attempt), not a verdict on anything this capture offered. The portal backend must NOT
+    /// latch its sticky process-wide downgrades (HDR capture, either dmabuf-only offer) from a
+    /// provisional expiry — a gamescope cold start routinely outlives the short window while it
+    /// would have accepted every offer, and one latched race used to pin the whole host process
+    /// to SDR/CPU capture. The full-length attempt that follows delivers the honest verdict.
+    /// Backends that latch nothing from a timeout just delegate.
+    fn next_frame_within_provisional(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Result<CapturedFrame> {
+        self.next_frame_within(budget)
+    }
+
     /// Non-blocking: the freshest frame available since the last call, or `None` if none has
     /// arrived (the caller reuses its last frame to hold a steady output rate). The default
     /// just produces a frame each call — fine for instant synthetic sources; the portal

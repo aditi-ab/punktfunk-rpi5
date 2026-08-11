@@ -6,7 +6,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -18,7 +17,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -45,7 +43,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -107,18 +104,13 @@ fun GamepadDialog(
     // the focused button pulls itself into view (see DialogButton), so D-pad navigation always shows
     // the current action even when the stack scrolls.
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(
-        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
-        contentAlignment = Alignment.Center,
-    ) {
+    ConsoleModal {
         Column(
             Modifier
                 .padding(24.dp)
                 .widthIn(max = 520.dp)
                 .heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730))
-                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -150,7 +142,11 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
     // that's scrolled out of a short window, pull it into view (no-op when already visible).
     val intoView = remember { BringIntoViewRequester() }
     LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
-    val shape = RoundedCornerShape(14.dp)
+    val focus by animateFloatAsState(
+        if (focused) 1f else 0f,
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
+        label = "btnFocus",
+    )
     // Focus sweeps up/down the stack — cross-fade the fills so it glides instead of snapping.
     val bg by animateColorAsState(
         when {
@@ -158,32 +154,30 @@ private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enab
             primary -> ink.accent(0.20f)
             else -> ink.glass
         },
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnBg",
     )
     val fg by animateColorAsState(
         when {
             !enabled -> ink.fg(0.35f)
-            focused -> ink.fg
+            // On the accent, not on the field — a pale palette's accent decides this, not the ink.
+            focused -> ink.onAccent
             primary -> ink.accent
             else -> ink.fg(0.85f)
         },
-        tween(160),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnFg",
     )
     val borderColor by animateColorAsState(
-        Color.White.copy(alpha = if (focused) 0.3f else 0.08f),
-        tween(160),
+        ink.fg(if (focused) 0.3f else 0.08f),
+        ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "btnBorder",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .bringIntoViewRequester(intoView)
-            .graphicsLayer { scaleX = scale; scaleY = scale }
-            .clip(shape)
-            .background(bg)
-            .border(1.dp, borderColor, shape)
+            .consoleGlass(ConsoleShape.Row, ConsoleFocusVisuals(scale, bg, borderColor, focus))
             .clickable(
                 enabled = enabled,
                 interactionSource = remember { MutableInteractionSource() },
@@ -305,18 +299,13 @@ fun GamepadPinHostsDialog(
         },
     )
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(
-        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
-        contentAlignment = Alignment.Center,
-    ) {
+    ConsoleModal {
         Column(
             Modifier
                 .padding(24.dp)
                 .widthIn(max = 520.dp)
                 .heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730))
-                .border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -368,15 +357,11 @@ private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: ()
     // landscape window pulls itself into view.
     val intoView = remember { BringIntoViewRequester() }
     LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
-    val shape = RoundedCornerShape(14.dp)
     Row(
         Modifier
             .fillMaxWidth()
             .bringIntoViewRequester(intoView)
-            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-            .clip(shape)
-            .background(visuals.background)
-            .border(1.dp, visuals.border, shape)
+            .consoleGlass(ConsoleShape.Row, visuals)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -395,157 +380,6 @@ private fun PinHostRow(label: String, on: Boolean, focused: Boolean, onClick: ()
         )
         Spacer(Modifier.weight(1f))
         ConsoleSwitch(on = on, focused = focused)
-    }
-}
-
-/**
- * Console counterpart of [SpeedTestDialog]. Same measurement, same targeting rule — a TV box on a
- * powerline adapter is exactly the machine whose link is worth measuring, so this belongs on the
- * couch surface too, even though profile EDITING doesn't.
- */
-@Composable
-fun GamepadSpeedTestDialog(
-    hostName: String,
-    target: SpeedTestTarget,
-    phase: SpeedTestPhase,
-    onApply: (toProfile: Boolean) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val done = phase as? SpeedTestPhase.Done
-    GamepadDialog(
-        title = "Network speed test",
-        onDismiss = onDismiss,
-        actions = buildList {
-            if (done != null) {
-                add(
-                    DialogAction(
-                        when (target) {
-                            SpeedTestTarget.Global -> "Apply"
-                            is SpeedTestTarget.Profile -> "Apply to “${target.profile.name}”"
-                            is SpeedTestTarget.Ask -> "Set in “${target.profile.name}”"
-                        },
-                        primary = true,
-                    ) { onApply(true) },
-                )
-                if (target is SpeedTestTarget.Ask) {
-                    add(DialogAction("Set as default") { onApply(false) })
-                }
-            }
-            add(DialogAction("Close", primary = done == null, onClick = onDismiss))
-        },
-    ) {
-        DialogText(hostName)
-        when (phase) {
-            SpeedTestPhase.Connecting -> DialogText("Connecting…")
-            SpeedTestPhase.Measuring ->
-                DialogText("Measuring — the host is bursting test traffic for two seconds.")
-            is SpeedTestPhase.Failed -> DialogText(phase.message)
-            is SpeedTestPhase.Done -> {
-                DialogText(
-                    "%.0f Mbit/s measured · %.1f %% loss".format(phase.measuredMbps, phase.lossPct),
-                )
-                DialogText("Recommended bitrate: %.0f Mbit/s".format(phase.recommendedMbps))
-            }
-        }
-    }
-}
-
-/** Console counterpart of [LocalNetworkDialog] — the Android 17+ ACCESS_LOCAL_NETWORK rationale. */
-@Composable
-fun GamepadLocalNetworkDialog(onAllow: () -> Unit, onSettings: () -> Unit, onDismiss: () -> Unit) {
-    GamepadDialog(
-        title = "Allow local network access",
-        onDismiss = onDismiss,
-        actions = listOf(
-            DialogAction("Allow", primary = true, onClick = onAllow),
-            DialogAction("Open settings", onClick = onSettings),
-            DialogAction("Not now", onClick = onDismiss),
-        ),
-    ) {
-        DialogText(
-            "Android blocks Punktfunk from talking to devices on your network, so it can't find " +
-                "or reach any host until you allow it.",
-        )
-        DialogText(
-            "If no prompt appears after Allow, enable “Nearby devices” for Punktfunk in " +
-                "system settings.",
-        )
-    }
-}
-
-@Composable
-fun GamepadTrustNewDialog(pt: PendingTrust, onTrust: () -> Unit, onPairInstead: () -> Unit, onDismiss: () -> Unit) {
-    GamepadDialog(
-        title = "Trust this host?",
-        onDismiss = onDismiss,
-        actions = listOf(
-            DialogAction("Cancel", onClick = onDismiss),
-            DialogAction("Pair with PIN", onClick = onPairInstead),
-            DialogAction("Trust (TOFU)", primary = true, onClick = onTrust),
-        ),
-    ) {
-        DialogText("First connection to ${pt.host}:${pt.port}.")
-        pt.advertisedFp?.let { DialogText("Fingerprint ${it.take(16)}…") }
-        DialogText(
-            "This host allows trust-on-first-use, but that can't tell an impostor from the real host. " +
-                "Pairing with a PIN is stronger — it proves both sides.",
-        )
-    }
-}
-
-@Composable
-fun GamepadFingerprintChangedDialog(pt: PendingTrust, onRepair: () -> Unit, onDismiss: () -> Unit) {
-    GamepadDialog(
-        title = "Host identity changed",
-        onDismiss = onDismiss,
-        actions = listOf(
-            DialogAction("Cancel", onClick = onDismiss),
-            DialogAction("Re-pair", primary = true, onClick = onRepair),
-        ),
-    ) {
-        DialogText(
-            "The pinned fingerprint for ${pt.host} no longer matches what it now advertises. This can " +
-                "mean a host reinstall — or an impostor. Re-pair with the host's PIN to continue.",
-        )
-    }
-}
-
-@Composable
-fun GamepadRequestAccessDialog(pt: PendingTrust, onRequestAccess: () -> Unit, onUsePin: () -> Unit, onDismiss: () -> Unit) {
-    GamepadDialog(
-        title = "Pairing required",
-        onDismiss = onDismiss,
-        actions = listOf(
-            DialogAction("Cancel", onClick = onDismiss),
-            DialogAction("Use a PIN", onClick = onUsePin),
-            DialogAction("Request access", primary = true, onClick = onRequestAccess),
-        ),
-    ) {
-        DialogText("${pt.host}:${pt.port} requires pairing before it will stream.")
-        DialogText(
-            "Request access and approve this device in the host's console (or web UI) — no PIN needed. " +
-                "Or pair with the 4-digit PIN the host displays.",
-        )
-    }
-}
-
-@Composable
-fun GamepadAwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
-    val ink = LocalGamepadInk.current
-    GamepadDialog(
-        title = "Waiting for approval",
-        onDismiss = onCancel,
-        actions = listOf(DialogAction("Cancel", primary = true, onClick = onCancel)),
-    ) {
-        val deviceName = Build.MODEL ?: "this device"
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = ink.fg)
-            Text("Approve this device on $hostLabel.", color = ink.fg)
-        }
-        DialogText(
-            "Open the host's console (or web UI) and approve “$deviceName”. It connects automatically " +
-                "once you approve — no PIN needed.",
-        )
     }
 }
 
@@ -598,11 +432,10 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
     )
 
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
-    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)), contentAlignment = Alignment.Center) {
+    ConsoleModal {
         Column(
             Modifier.padding(24.dp).widthIn(max = 460.dp).heightIn(max = maxCardHeight)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xF01A1730)).border(1.dp, ink.fg(0.12f), RoundedCornerShape(24.dp))
+                .consoleCard()
                 .verticalScroll(rememberScrollState())
                 .padding(28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -616,7 +449,7 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 repeat(4) { i -> PinSlot(digits[i], focused = slot == i && !pairing) }
             }
-            err?.let { Text(it, color = Color(0xFFE0736F), style = MaterialTheme.typography.bodyMedium) }
+            err?.let { Text(it, color = ink.danger, style = MaterialTheme.typography.bodyMedium) }
             DialogButton(
                 label = if (pairing) "Pairing…" else "Pair",
                 focused = slot == 4 && !pairing,
@@ -638,6 +471,12 @@ private fun PinSlot(value: Int, focused: Boolean) {
             .border(if (focused) 2.dp else 1.dp, if (focused) ink.accent else ink.fg(0.1f), shape),
         contentAlignment = Alignment.Center,
     ) {
-        Text(value.toString(), fontSize = 30.sp, fontWeight = FontWeight.Bold, color = ink.fg, fontFamily = FontFamily.Monospace)
+        Text(
+            value.toString(),
+            fontSize = 30.sp,
+            fontWeight = FontWeight.Bold,
+            color = ink.fg,
+            fontFamily = FontFamily.Monospace,
+        )
     }
 }

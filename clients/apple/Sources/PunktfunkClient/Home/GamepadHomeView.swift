@@ -75,7 +75,7 @@ struct GamepadHomeView: View {
     @ObservedObject var store: HostStore
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
-    @Binding var libraryTarget: StoredHost?
+    @Binding var libraryTarget: LibraryTarget?
     /// The host awaiting a PIN ceremony, if any. Owned by ContentView (a connect attempt sets it,
     /// as does the trust card's "Pair with PIN instead"), presented here as a shell screen —
     /// PairSheet's `Form` is unreachable with a controller on iOS/macOS, which made pairing the
@@ -90,7 +90,7 @@ struct GamepadHomeView: View {
     let connectDiscovered: (DiscoveredHost) -> Void
     /// Launch a library title on a host — the in-place library layer's activate path (iOS; the
     /// cover/sheet presentations wire ContentView's `launchTitle` into LibraryView themselves).
-    let launchTitle: (StoredHost, String) -> Void
+    let launchTitle: (LibraryTarget, String) -> Void
     /// A console prompt (GamepadPromptView) is up over the home — it polls the same controller, so
     /// this screen must stand down for as long as it is. Same handoff contract as the connect
     /// takeover and the shell's own layers; without it the carousel keeps scrolling underneath the
@@ -263,7 +263,7 @@ struct GamepadHomeView: View {
         if let host = pairingTarget { return .pair(host) }
         if showSettings { return .settings }
         if showAddHost { return .addHost }
-        if let host = libraryTarget { return .library(host) }
+        if let shelf = libraryTarget { return .library(shelf) }
         return nil
     }
 
@@ -289,10 +289,10 @@ struct GamepadHomeView: View {
                     onPaired: { onPaired(host, $0) },
                     close: { if !transitioning { pairingTarget = nil } },
                     controllerActive: active)
-            case .library(let host):
+            case .library(let shelf):
                 GamepadLibraryScreen(
-                    store: store, host: host,
-                    onLaunch: { launchTitle(host, $0) },
+                    store: store, target: shelf,
+                    onLaunch: { launchTitle(shelf, $0) },
                     close: { if !transitioning { libraryTarget = nil } },
                     controllerActive: active)
             }
@@ -501,9 +501,10 @@ struct GamepadHomeView: View {
                     isPaired: host.pinnedSHA256 != nil,
                     isConnecting: connecting,
                     filled: true,
-                    // A pinned card is a shortcut, not a second host — Y (library) stays on the
-                    // host's own tile, where the host-level actions live.
-                    hasLibrary: profile == nil,
+                    // A pinned card reaches the library too, and gets its OWN shelf: browsing is
+                    // this card's connect with a title picked first, not a host-level action like
+                    // wake or forget.
+                    hasLibrary: true,
                     osChain: host.osChain,
                     canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
                         && !online && !host.wakeMacs.isEmpty,
@@ -539,12 +540,14 @@ struct GamepadHomeView: View {
     }
 
     /// Only saved hosts have a library — matches the touch grid, where "Browse Library…" is a
-    /// `HostCardView`-only action never offered on `DiscoveredCardView`.
+    /// `HostCardView`-only action never offered on `DiscoveredCardView`. A pinned card opens its
+    /// own shelf: the selection already names which card Y was pressed on, and that card's profile
+    /// is what its launches run with.
     private func openLibraryForSelected() {
-        guard libraryEnabled, case .saved(let id, let profile) = selection, profile == nil,
+        guard libraryEnabled, case .saved(let id, let profileID) = selection,
               let host = store.hosts.first(where: { $0.id == id })
         else { return }
-        libraryTarget = host
+        libraryTarget = LibraryTarget(host: host, profile: ProfileSelection(profileID: profileID))
     }
 }
 

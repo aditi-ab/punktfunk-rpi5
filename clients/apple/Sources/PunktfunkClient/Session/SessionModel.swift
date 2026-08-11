@@ -70,9 +70,14 @@ final class SessionModel: ObservableObject {
     /// session ends depends on where it came FROM: a title launched out of the library belongs back
     /// in that library when its game exits, not on the host-selection screen.
     private var launchedTitleID: String?
-    /// Set when a session ended because its game exited and it began as a library launch: the host
-    /// whose library to reopen. The view layer consumes it and sets it back to nil.
-    @Published var returnToLibrary: StoredHost?
+    /// WHICH library shelf that title was launched from — a host's own, or one of its pinned
+    /// host+profile cards (§5.2a). The host alone would not answer it: a pinned card's shelf
+    /// launches with that card's profile, so returning to the host's default shelf would quietly
+    /// change what the next title streams with.
+    private var launchedShelf: LibraryTarget?
+    /// Set when a session ended because its game exited and it began as a library launch: the
+    /// shelf to reopen. The view layer consumes it and sets it back to nil.
+    @Published var returnToLibrary: LibraryTarget?
     /// The settings THIS session runs on — the globals with its profile overlaid, resolved once at
     /// connect (design/client-settings-profiles.md §4.2). Also mirrored into `SessionSettings` for
     /// the readers that live in PunktfunkKit and can't see this model.
@@ -275,6 +280,9 @@ final class SessionModel: ObservableObject {
     func connect(to host: StoredHost, effective: EffectiveSettings,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  launchID: String? = nil,
+                 /// The library shelf `launchID` was picked on, so a game exit can return to it.
+                 /// Only meaningful alongside a `launchID`; nil for a plain desktop connect.
+                 shelf: LibraryTarget? = nil,
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
                  requestAccess: Bool = false,
@@ -283,6 +291,7 @@ final class SessionModel: ObservableObject {
         phase = .connecting
         activeHost = host
         launchedTitleID = launchID
+        launchedShelf = shelf
         errorMessage = nil
         settings = effective
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
@@ -663,6 +672,7 @@ final class SessionModel: ObservableObject {
         activeHost = nil
         // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
         launchedTitleID = nil
+        launchedShelf = nil
         phase = .idle
         fps = 0
         mbps = 0
@@ -692,13 +702,16 @@ final class SessionModel: ObservableObject {
         // a plain desktop session has no library to return to.
         let host = activeHost
         let cameFromLibrary = launchedTitleID != nil
+        // The shelf it came off — falling back to the host's own if a caller launched a title
+        // without naming one, which is what that launch effectively browsed.
+        let shelf = launchedShelf ?? activeHost.map { LibraryTarget(host: $0) }
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
         switch reason {
         case .gameExited:
             // The player quit their own game. Not a failure, and they are probably after the next
             // title — so no banner, and back to the library it came from.
-            if cameFromLibrary, let host {
-                returnToLibrary = host
+            if cameFromLibrary, host != nil, let shelf {
+                returnToLibrary = shelf
             }
         case .hostEnded, .local:
             // Someone asked for this: an operator "End" on the host, or our own close racing in.

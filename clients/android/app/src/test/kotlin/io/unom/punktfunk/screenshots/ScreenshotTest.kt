@@ -83,6 +83,16 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
+    // Both banner texts, in the stream's own landscape geometry — it is bottom-centre, so the
+    // aspect is load-bearing.
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamBannerPad() = shootRoot("stream-banner-pad") { StreamBannerScene(pad = true) }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamBannerTouch() = shootRoot("stream-banner-touch") { StreamBannerScene(pad = false) }
+
     // The touch flow is a Material dialog over the host grid (a separate window → shootScreen).
     @Test
     fun connecting() = shootScreen("connecting") {
@@ -113,6 +123,59 @@ class ScreenshotTest {
     @Test
     fun consoleSettingsLight() =
         shootRoot("console-settings-light") { ConsoleSettingsScene(paletteId = "holo") }
+
+    /**
+     * Landscape — the orientation the console actually runs in, and a DIFFERENT layout since the
+     * on-glass review: rows capped and left-aligned, the focused row's description in a side pane
+     * on the right instead of the floating band.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun consoleSettingsLandscape() =
+        shootRoot("console-settings-landscape") { ConsoleSettingsScene() }
+
+    // The console home, the screen the living backdrop is most of. The default sdk (36) draws the
+    // real AGSL MESH field; the paired API-31 shot below draws the blob fallback, so the two
+    // renderings of the same palette can be compared rather than assumed equivalent.
+    @Test
+    fun consoleHome() = shootRoot("console-home") { ConsoleHomeScene() }
+
+    @Test
+    fun consoleHomeLight() = shootRoot("console-home-light") { ConsoleHomeScene(paletteId = "holo") }
+
+    /**
+     * Landscape — the orientation the console UI actually runs in, and the only one wide enough to
+     * show the carousel's NEIGHBOURS, which is where the projected turn (`CARD_TURN_RAD`) lives.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun consoleHomeLandscape() = shootRoot("console-home-landscape") { ConsoleHomeScene() }
+
+    /**
+     * The API 31/32 field. `RuntimeShader` is API 33+, so everything below it keeps the four
+     * drifting blobs — an honest approximation rather than an emulation, and the thing this shot
+     * exists to keep honest.
+     */
+    @Test
+    @Config(sdk = [31], qualifiers = "w360dp-h800dp-xxhdpi")
+    fun consoleHomeBlobFallback() = shootRoot("console-home-blobs") { ConsoleHomeScene() }
+
+    // The two screens the console reached for the first time in WP8.3. Each is shot on a dark AND a
+    // pale palette, because the console draws them through a ColorScheme derived from the palette's
+    // ink — and the pale one is the only place a grey-on-pastel slip can show up.
+    @Test
+    fun consoleLicenses() = shootRoot("console-licenses") { ConsoleLicensesScene() }
+
+    @Test
+    fun consoleLicensesLight() =
+        shootRoot("console-licenses-light") { ConsoleLicensesScene(paletteId = "holo") }
+
+    @Test
+    fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
+
+    @Test
+    fun consoleControllersLight() =
+        shootRoot("console-controllers-light") { ConsoleControllersScene(paletteId = "holo") }
 
     @Test
     fun trust() = shootScreen("trust") {
