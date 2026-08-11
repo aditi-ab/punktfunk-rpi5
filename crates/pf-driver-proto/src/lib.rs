@@ -1712,7 +1712,13 @@ mod tests {
         let mut legacy = [0u8; 40];
         legacy[..control::ADD_REQUEST_LEGACY_SIZE]
             .copy_from_slice(&bytes[..control::ADD_REQUEST_LEGACY_SIZE]);
-        let old = *bytemuck::from_bytes::<control::AddRequest>(&legacy);
+        // `pod_read_unaligned`, NOT `from_bytes` — same rule as `ChannelProof::parse` above, and
+        // for the same reason. `legacy` is a `[u8; 40]` (align 1) but `AddRequest` opens with a
+        // `u64`, so it is align 8; `from_bytes` takes a REFERENCE into the buffer and panics
+        // unless the buffer happens to be 8-aligned. A stack `[u8; 40]` usually is, which is why
+        // this passed everywhere for so long — Miri caught it because Miri does not let an
+        // accidentally-favourable stack slot stand in for a guarantee.
+        let old = bytemuck::pod_read_unaligned::<control::AddRequest>(&legacy);
         assert_eq!(old.preferred_monitor_id, 7);
         assert_eq!(
             (
