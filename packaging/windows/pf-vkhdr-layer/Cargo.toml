@@ -13,6 +13,14 @@ crate-type = ["cdylib"]
 [dependencies]
 ash = "=0.38.0+1.3.281"
 
+# This package is its own workspace (see below), so the main workspace's lint tables never reach
+# it — the unsafe discipline has to be restated here or it silently doesn't apply.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 [profile.release]
 opt-level = 2
 panic = "abort"

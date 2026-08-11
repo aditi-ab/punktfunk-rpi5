@@ -17,8 +17,8 @@
 //! (`PostMessage` is the documented thread-safe way to poke a message loop). Per-window state hangs
 //! off `GWLP_USERDATA`, so multiple concurrent sessions each get their own window + state.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; the deny enforcing it sits at
+// the crate root (lib.rs), covering every backend.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};

@@ -10,6 +10,10 @@
 //! [`spawn_decline_loop`] — so its control loop compiles unchanged on every host platform; the
 //! platform split lives entirely behind [`start`].
 
+// Crate-wide: every `unsafe` block in any backend carries a `// SAFETY:` proof (unsafe-proof
+// program). At the root — not per-module — so a new backend under `host/` is covered on creation.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 

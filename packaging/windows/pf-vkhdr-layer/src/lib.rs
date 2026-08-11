@@ -23,9 +23,17 @@
 //! Off-switches: the loader-standard `DISABLE_PF_VKHDR=1` (disables the whole layer), and
 //! `PF_VKHDR_EXCLUDE` (comma/semicolon list of exe basenames to skip — defaults include known
 //! kernel-anti-cheat titles). `PF_VKHDR_LOG=1` enables a debug log in `%TEMP%\pf_vkhdr_layer.log`.
+//!
+//! ## Safety model
+//! This cdylib runs inside someone else's process, called by the Vulkan loader. Two contract
+//! sources cover every unsafe operation here: the **loader layer protocol** (negotiate struct,
+//! per-layer chain links, dispatchable handles whose first word is the loader's dispatch-table
+//! pointer) and **Vulkan valid-usage rules** the application must already uphold for the ICD
+//! (NUL-terminated command names, valid create-info chains, count/array pairs in the two-call
+//! idiom). Every `unsafe` block cites the specific clause it leans on. The layer targets x86_64
+//! only (the two hand-computed struct offsets below say so explicitly).
 
 #![allow(non_snake_case)]
-#![allow(clippy::missing_safety_doc)]
 #![allow(clippy::too_many_arguments)]
 // HWND / HMONITOR etc. deliberately mirror the Win32 names.
 #![allow(clippy::upper_case_acronyms)]
@@ -97,6 +105,14 @@ struct SurfaceFormat2Raw {
     p_next: *mut c_void,
     surface_format: vk::SurfaceFormatKHR,
 }
+// Layout proof for the mirror: arrays of it are handed to the ICD and stamped over the caller's
+// VkSurfaceFormat2KHR array, so a size or alignment drift would corrupt either side.
+const _: () = assert!(
+    std::mem::size_of::<SurfaceFormat2Raw>() == std::mem::size_of::<vk::SurfaceFormat2KHR>()
+);
+const _: () = assert!(
+    std::mem::align_of::<SurfaceFormat2Raw>() == std::mem::align_of::<vk::SurfaceFormat2KHR>()
+);
 
 // ---- ICD function-pointer typedefs we call down to (raw pointers, no lifetimes) ----
 type FnCreateInstance =
@@ -128,6 +144,9 @@ type FnCreateWin32Surface = unsafe extern "system" fn(
 ) -> vk::Result;
 type FnDestroySurface = unsafe extern "system" fn(vk::Instance, vk::SurfaceKHR, *const c_void);
 
+// Both maps' values are raw `extern "system"` fn pointers plus plain handles; fn pointers are
+// process-global code addresses and implement Send/Sync intrinsically, so the auto traits hold
+// and no `unsafe impl Send` is needed (two used to sit here as unproven markers).
 struct InstanceData {
     instance: vk::Instance,
     next_gipa: PfnGipa,
@@ -138,12 +157,10 @@ struct InstanceData {
     create_win32_surface: Option<FnCreateWin32Surface>,
     destroy_surface: Option<FnDestroySurface>,
 }
-unsafe impl Send for InstanceData {}
 
 struct DeviceData {
     next_gdpa: PfnGdpa,
 }
-unsafe impl Send for DeviceData {}
 
 fn instances() -> &'static Mutex<HashMap<usize, InstanceData>> {
     static M: OnceLock<Mutex<HashMap<usize, InstanceData>>> = OnceLock::new();
@@ -159,21 +176,47 @@ fn surface_hwnds() -> &'static Mutex<HashMap<u64, isize>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// dispatch key = first pointer word of a dispatchable handle (loader dispatch table ptr).
+/// Dispatch key of a dispatchable handle.
+///
+/// # Safety
+/// `raw` must be the value of a **live dispatchable** Vulkan handle (`VkInstance`,
+/// `VkPhysicalDevice`, `VkDevice`). The loader ABI mandates that every dispatchable object's
+/// first pointer-sized word is the loader's dispatch-table pointer, which is what makes the read
+/// in-bounds and initialized — and what makes it a stable per-chain key.
 #[inline]
 unsafe fn key(raw: u64) -> usize {
-    *(raw as usize as *const usize)
+    // SAFETY: per this function's contract, `raw` points at a live dispatchable object whose
+    // first pointer-sized word exists and is initialized (the loader wrote it at creation).
+    unsafe { *(raw as usize as *const usize) }
 }
+
+/// Reinterpret a function address as the loader's type-erased void-function pointer.
+///
+/// # Safety
+/// `p` must be the address of an `extern "system"` function. Whoever receives the returned PFN
+/// must cast it back to the exact prototype of the command it was queried under before calling —
+/// which is precisely what the Vulkan `*ProcAddr` contract obliges callers to do.
 #[inline]
 unsafe fn as_pfn(p: *const c_void) -> vk::PFN_vkVoidFunction {
-    Some(std::mem::transmute::<
-        *const c_void,
-        unsafe extern "system" fn(),
-    >(p))
+    // SAFETY: data and function pointers have identical size and representation on all Windows
+    // targets, and per this function's contract `p` is a real `extern "system"` fn address.
+    Some(unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn()>(p) })
 }
+
+/// Resolve `name` down-chain and reinterpret the result as fn-pointer type `T`.
+///
+/// # Safety
+/// `gipa` must be a valid `vkGetInstanceProcAddr` for `inst` (or for the null instance when
+/// resolving global commands), and `T` must be the exact fn-pointer prototype of the Vulkan
+/// command named by `name` — `transmute_copy` erases all type checking between them.
 #[inline]
 unsafe fn resolve<T: Copy>(gipa: PfnGipa, inst: vk::Instance, name: &CStr) -> Option<T> {
-    gipa(inst, name.as_ptr()).map(|f| std::mem::transmute_copy::<_, T>(&f))
+    // SAFETY: per this function's contract `gipa` is a valid loader/ICD GetInstanceProcAddr for
+    // `inst`, and `name` is a live NUL-terminated string for the duration of the call.
+    let f = unsafe { gipa(inst, name.as_ptr()) };
+    // SAFETY: `f` was returned for `name`, and per this function's contract `T` is that
+    // command's exact prototype; both sides are fn pointers of identical size.
+    f.map(|f| unsafe { std::mem::transmute_copy::<_, T>(&f) })
 }
 
 fn log(msg: &str) {
@@ -356,21 +399,34 @@ mod hdr {
     const GET_ADVANCED_COLOR_INFO: i32 = 9;
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
-    unsafe fn active_paths() -> Vec<PathInfo> {
+    // Safe fn: every invariant below is local (out-params point at live locals / exact-length
+    // Vecs); callers carry no obligations.
+    fn active_paths() -> Vec<PathInfo> {
         let (mut np, mut nm) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 || np == 0 {
+        // SAFETY: both out-pointers come from live local `u32`s that outlive the call.
+        if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) } != 0
+            || np == 0
+        {
             return Vec::new();
         }
-        let mut pa: Vec<PathInfo> = vec![std::mem::zeroed(); np as usize];
-        let mut ma: Vec<ModeInfo> = vec![std::mem::zeroed(); nm as usize];
-        if QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            pa.as_mut_ptr(),
-            &mut nm,
-            ma.as_mut_ptr(),
-            std::ptr::null_mut(),
-        ) != 0
+        // SAFETY: PathInfo is a #[repr(C)] aggregate of integers — all-zero is a valid value.
+        let mut pa: Vec<PathInfo> = vec![unsafe { std::mem::zeroed() }; np as usize];
+        // SAFETY: ModeInfo is an opaque byte blob — all-zero is a valid value.
+        let mut ma: Vec<ModeInfo> = vec![unsafe { std::mem::zeroed() }; nm as usize];
+        // SAFETY: `pa`/`ma` hold exactly `np`/`nm` elements and those counts are passed by
+        // pointer as the in/out capacities: QueryDisplayConfig writes at most that many entries
+        // (if the topology grew between the two calls it returns ERROR_INSUFFICIENT_BUFFER
+        // rather than writing past the end) and shrinks np/nm to what it actually wrote.
+        if unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut np,
+                pa.as_mut_ptr(),
+                &mut nm,
+                ma.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        } != 0
         {
             return Vec::new();
         }
@@ -378,38 +434,52 @@ mod hdr {
         pa
     }
 
-    unsafe fn target_hdr_enabled(p: &PathInfo) -> bool {
-        let mut ai: AdvInfo = std::mem::zeroed();
+    fn target_hdr_enabled(p: &PathInfo) -> bool {
+        // SAFETY: AdvInfo is a #[repr(C)] aggregate of integers — all-zero is a valid value.
+        let mut ai: AdvInfo = unsafe { std::mem::zeroed() };
         ai.header.typ = GET_ADVANCED_COLOR_INFO;
         ai.header.size = std::mem::size_of::<AdvInfo>() as u32;
         ai.header.adapter = p.tgt.adapter;
         ai.header.id = p.tgt.id;
-        if DisplayConfigGetDeviceInfo(&mut ai as *mut _ as *mut c_void) != 0 {
+        // SAFETY: the request header carries this struct's exact size, which is the documented
+        // bound for DisplayConfigGetDeviceInfo's write; `ai` is a live local across the call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut ai as *mut _ as *mut c_void) } != 0 {
             return false;
         }
         // value bitfield: bit0 advancedColorSupported, bit1 advancedColorEnabled.
         (ai.value & 0b10) != 0
     }
 
-    unsafe fn source_gdi(p: &PathInfo) -> [u16; 32] {
-        let mut sn: SourceName = std::mem::zeroed();
+    fn source_gdi(p: &PathInfo) -> [u16; 32] {
+        // SAFETY: SourceName is a #[repr(C)] aggregate of integers — all-zero is a valid value.
+        let mut sn: SourceName = unsafe { std::mem::zeroed() };
         sn.header.typ = GET_SOURCE_NAME;
         sn.header.size = std::mem::size_of::<SourceName>() as u32;
         sn.header.adapter = p.src.adapter;
         sn.header.id = p.src.id;
-        let _ = DisplayConfigGetDeviceInfo(&mut sn as *mut _ as *mut c_void);
+        // SAFETY: the request header carries this struct's exact size, which is the documented
+        // bound for DisplayConfigGetDeviceInfo's write; `sn` is a live local across the call.
+        let _ = unsafe { DisplayConfigGetDeviceInfo(&mut sn as *mut _ as *mut c_void) };
         sn.gdi
     }
 
     /// Is HDR (Windows advanced color) currently enabled on the display this surface lives on?
     /// `hwnd == 0`/unknown falls back to "any active display has HDR enabled".
-    pub unsafe fn enabled_for(hwnd: HWND) -> bool {
+    ///
+    /// Safe fn: `MonitorFromWindow` with `DEFAULTTONEAREST` tolerates any HWND value — including
+    /// a destroyed or foreign one (our map can be stale) — so callers carry no obligations.
+    pub fn enabled_for(hwnd: HWND) -> bool {
         let paths = active_paths();
         if hwnd != 0 {
-            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut mi: MonitorInfoExW = std::mem::zeroed();
+            // SAFETY: MonitorFromWindow accepts arbitrary HWND values with DEFAULTTONEAREST
+            // (falling back to the nearest/primary monitor) and takes nothing by pointer.
+            let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            // SAFETY: MonitorInfoExW is a #[repr(C)] aggregate of integers — all-zero is valid.
+            let mut mi: MonitorInfoExW = unsafe { std::mem::zeroed() };
             mi.cb = std::mem::size_of::<MonitorInfoExW>() as u32;
-            if GetMonitorInfoW(mon, &mut mi) != 0 {
+            // SAFETY: `mi.cb` carries the struct's exact size, which is the documented bound for
+            // GetMonitorInfoW's write; `mi` is a live local across the call.
+            if unsafe { GetMonitorInfoW(mon, &mut mi) } != 0 {
                 for p in &paths {
                     if source_gdi(p) == mi.sz_device {
                         return target_hdr_enabled(p);
@@ -417,12 +487,13 @@ mod hdr {
                 }
             }
         }
-        paths.iter().any(|p| target_hdr_enabled(p))
+        paths.iter().any(target_hdr_enabled)
     }
 }
 
-/// Should we inject HDR formats for this surface right now?
-unsafe fn should_inject(surface: vk::SurfaceKHR) -> bool {
+/// Should we inject HDR formats for this surface right now? Safe fn — the surface handle is only
+/// used as a map key, and a stale/unknown HWND degrades to the any-display fallback.
+fn should_inject(surface: vk::SurfaceKHR) -> bool {
     if !injection_allowed_for_process() {
         return false;
     }
@@ -436,6 +507,12 @@ unsafe fn should_inject(surface: vk::SurfaceKHR) -> bool {
 
 // ---- entry point ----
 
+/// Layer negotiation entry point; the loader calls this export when it loads the DLL.
+///
+/// # Safety
+/// `p` must be null or point to a live `NegotiateLayerInterface` the caller has exclusive access
+/// to for the duration of the call. The Vulkan loader — the only intended caller of this
+/// export — guarantees exactly that for the negotiate handshake.
 #[no_mangle]
 pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
     p: *mut NegotiateLayerInterface,
@@ -443,7 +520,9 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
     if p.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let s = &mut *p;
+    // SAFETY: `p` is non-null, and per this export's contract the loader hands us exclusive
+    // access to a live NegotiateLayerInterface for the duration of the call.
+    let s = unsafe { &mut *p };
     if s.s_type != LAYER_NEGOTIATE_INTERFACE_STRUCT {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
@@ -466,27 +545,46 @@ unsafe extern "system" fn layer_gipa(
     if p_name.is_null() {
         return None;
     }
-    match CStr::from_ptr(p_name).to_bytes() {
-        b"vkGetInstanceProcAddr" => as_pfn(layer_gipa as *const c_void),
-        b"vkGetDeviceProcAddr" => as_pfn(layer_gdpa as *const c_void),
-        b"vkCreateInstance" => as_pfn(create_instance as *const c_void),
-        b"vkDestroyInstance" => as_pfn(destroy_instance as *const c_void),
-        b"vkCreateDevice" => as_pfn(create_device as *const c_void),
-        b"vkGetPhysicalDeviceSurfaceFormatsKHR" => as_pfn(get_surface_formats as *const c_void),
-        b"vkGetPhysicalDeviceSurfaceFormats2KHR" => as_pfn(get_surface_formats2 as *const c_void),
-        b"vkCreateWin32SurfaceKHR" => as_pfn(create_win32_surface as *const c_void),
-        b"vkDestroySurfaceKHR" => as_pfn(destroy_surface as *const c_void),
-        _ => {
-            if instance == vk::Instance::null() {
-                return None;
+    // SAFETY: `p_name` is non-null, and vkGetInstanceProcAddr's valid-usage rules require pName
+    // to be a valid NUL-terminated string for the duration of the call.
+    let name = unsafe { CStr::from_ptr(p_name) }.to_bytes();
+    // SAFETY: every arm hands `as_pfn` the address of the `extern "system"` hook this layer
+    // substitutes for exactly that command name; the *ProcAddr contract obliges the caller to
+    // cast the returned PFN back to the named command's prototype before invoking it, which is
+    // what makes the type-erased transmute inside `as_pfn` sound for each arm.
+    let hook = unsafe {
+        match name {
+            b"vkGetInstanceProcAddr" => as_pfn(layer_gipa as *const c_void),
+            b"vkGetDeviceProcAddr" => as_pfn(layer_gdpa as *const c_void),
+            b"vkCreateInstance" => as_pfn(create_instance as *const c_void),
+            b"vkDestroyInstance" => as_pfn(destroy_instance as *const c_void),
+            b"vkCreateDevice" => as_pfn(create_device as *const c_void),
+            b"vkGetPhysicalDeviceSurfaceFormatsKHR" => as_pfn(get_surface_formats as *const c_void),
+            b"vkGetPhysicalDeviceSurfaceFormats2KHR" => {
+                as_pfn(get_surface_formats2 as *const c_void)
             }
-            let next = {
-                let g = instances().lock().ok()?;
-                g.get(&key(instance.as_raw())).map(|d| d.next_gipa)
-            };
-            next.and_then(|gipa| gipa(instance, p_name))
+            b"vkCreateWin32SurfaceKHR" => as_pfn(create_win32_surface as *const c_void),
+            b"vkDestroySurfaceKHR" => as_pfn(destroy_surface as *const c_void),
+            _ => None,
         }
+    };
+    if hook.is_some() {
+        return hook;
     }
+    if instance == vk::Instance::null() {
+        return None;
+    }
+    let next = {
+        let g = instances().lock().ok()?;
+        // SAFETY: `instance` is non-null, and vkGetInstanceProcAddr's valid-usage rules make a
+        // non-null instance argument a live instance handle — a dispatchable object whose first
+        // word is the dispatch key.
+        g.get(&unsafe { key(instance.as_raw()) })
+            .map(|d| d.next_gipa)
+    };
+    // SAFETY: `next` is the down-chain GetInstanceProcAddr captured from the loader's link at
+    // create_instance for this very chain; `p_name` is still valid NUL-terminated.
+    next.and_then(|gipa| unsafe { gipa(instance, p_name) })
 }
 
 unsafe extern "system" fn layer_gpdpa(
@@ -496,20 +594,37 @@ unsafe extern "system" fn layer_gpdpa(
     if p_name.is_null() {
         return None;
     }
-    match CStr::from_ptr(p_name).to_bytes() {
-        b"vkGetPhysicalDeviceSurfaceFormatsKHR" => as_pfn(get_surface_formats as *const c_void),
-        b"vkGetPhysicalDeviceSurfaceFormats2KHR" => as_pfn(get_surface_formats2 as *const c_void),
-        _ => {
-            if instance == vk::Instance::null() {
-                return None;
+    // SAFETY: `p_name` is non-null, and the GetPhysicalDeviceProcAddr contract mirrors
+    // vkGetInstanceProcAddr's: pName is a valid NUL-terminated string for the call.
+    let name = unsafe { CStr::from_ptr(p_name) }.to_bytes();
+    // SAFETY: both arms hand `as_pfn` the address of the `extern "system"` hook this layer
+    // substitutes for exactly that command name; the *ProcAddr contract obliges the caller to
+    // cast the returned PFN back to that command's prototype before invoking it.
+    let hook = unsafe {
+        match name {
+            b"vkGetPhysicalDeviceSurfaceFormatsKHR" => as_pfn(get_surface_formats as *const c_void),
+            b"vkGetPhysicalDeviceSurfaceFormats2KHR" => {
+                as_pfn(get_surface_formats2 as *const c_void)
             }
-            let next = {
-                let g = instances().lock().ok()?;
-                g.get(&key(instance.as_raw())).and_then(|d| d.next_gpdpa)
-            };
-            next.and_then(|gpdpa| gpdpa(instance, p_name))
+            _ => None,
         }
+    };
+    if hook.is_some() {
+        return hook;
     }
+    if instance == vk::Instance::null() {
+        return None;
+    }
+    let next = {
+        let g = instances().lock().ok()?;
+        // SAFETY: `instance` is non-null and (per the caller's contract) a live instance
+        // handle — a dispatchable object whose first word is the dispatch key.
+        g.get(&unsafe { key(instance.as_raw()) })
+            .and_then(|d| d.next_gpdpa)
+    };
+    // SAFETY: `next` is the down-chain GPDPA captured from the loader's link at create_instance
+    // for this very chain; `p_name` is still valid NUL-terminated.
+    next.and_then(|gpdpa| unsafe { gpdpa(instance, p_name) })
 }
 
 unsafe extern "system" fn layer_gdpa(
@@ -519,8 +634,13 @@ unsafe extern "system" fn layer_gdpa(
     if p_name.is_null() {
         return None;
     }
-    if CStr::from_ptr(p_name).to_bytes() == b"vkGetDeviceProcAddr" {
-        return as_pfn(layer_gdpa as *const c_void);
+    // SAFETY: `p_name` is non-null, and vkGetDeviceProcAddr's valid-usage rules require pName to
+    // be a valid NUL-terminated string for the duration of the call.
+    let name = unsafe { CStr::from_ptr(p_name) }.to_bytes();
+    if name == b"vkGetDeviceProcAddr" {
+        // SAFETY: `layer_gdpa` is an `extern "system"` fn whose prototype is exactly what the
+        // caller will cast the returned PFN back to for this name (*ProcAddr contract).
+        return unsafe { as_pfn(layer_gdpa as *const c_void) };
     }
     if device == vk::Device::null() {
         return None;
@@ -530,23 +650,38 @@ unsafe extern "system" fn layer_gdpa(
             Ok(g) => g,
             Err(_) => return None,
         };
-        g.get(&key(device.as_raw())).map(|d| d.next_gdpa)
+        // SAFETY: `device` is non-null, and vkGetDeviceProcAddr's valid-usage rules make it a
+        // live device handle — a dispatchable object whose first word is the dispatch key.
+        g.get(&unsafe { key(device.as_raw()) }).map(|d| d.next_gdpa)
     };
-    next.and_then(|gdpa| gdpa(device, p_name))
+    // SAFETY: `next` is the down-chain GetDeviceProcAddr captured from the loader's link at
+    // create_device for this very chain; `p_name` is still valid NUL-terminated.
+    next.and_then(|gdpa| unsafe { gdpa(device, p_name) })
 }
 
 // ---- instance chain ----
 
+/// Walk `p_ci`'s pNext chain for the loader's layer-link node.
+///
+/// # Safety
+/// `p_ci` must point to a valid create-info struct whose `pNext` chain is a well-formed list in
+/// which every node begins with the `{sType, pNext}` header — the loader builds exactly that
+/// chain for the create call that invokes us.
 unsafe fn find_instance_link(p_ci: *const c_void) -> *mut LayerInstanceCreateInfo {
-    let mut node = (*(p_ci as *const BaseIn)).p_next as *const BaseIn;
-    while !node.is_null() {
-        if (*node).s_type.as_raw() == LOADER_INSTANCE_CREATE_INFO {
-            let lci = node as *mut LayerInstanceCreateInfo;
-            if (*lci).function == VK_LAYER_LINK_INFO {
-                return lci;
+    // SAFETY: per this function's contract, `p_ci` and every non-null `pNext` reached from it
+    // point at nodes beginning with a {sType, pNext} header; a node whose sType says it is the
+    // loader's instance create-info really is a LayerInstanceCreateInfo (the loader wrote it).
+    unsafe {
+        let mut node = (*(p_ci as *const BaseIn)).p_next as *const BaseIn;
+        while !node.is_null() {
+            if (*node).s_type.as_raw() == LOADER_INSTANCE_CREATE_INFO {
+                let lci = node as *mut LayerInstanceCreateInfo;
+                if (*lci).function == VK_LAYER_LINK_INFO {
+                    return lci;
+                }
             }
+            node = (*node).p_next as *const BaseIn;
         }
-        node = (*node).p_next as *const BaseIn;
     }
     ptr::null_mut()
 }
@@ -556,40 +691,67 @@ unsafe extern "system" fn create_instance(
     p_alloc: *const c_void,
     p_inst: *mut vk::Instance,
 ) -> vk::Result {
-    let lci = find_instance_link(p_ci);
+    // SAFETY: the loader invokes this hook with a valid VkInstanceCreateInfo whose pNext chain
+    // it built — the chain find_instance_link's contract requires.
+    let lci = unsafe { find_instance_link(p_ci) };
     if lci.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let link = (*lci).u;
-    if link.is_null() {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    }
-    let next_gipa = (*link).next_gipa;
-    let next_gpdpa = (*link).next_gpdpa;
-    (*lci).u = (*link).p_next;
+    // SAFETY: `lci` is non-null and points into the loader's live chain. Its `u` link (checked
+    // non-null before use) is this layer's link entry; reading the down-chain pointers out of it
+    // and advancing `(*lci).u` to the next link is the layer protocol every layer must follow
+    // before calling down.
+    let (next_gipa, next_gpdpa) = unsafe {
+        let link = (*lci).u;
+        if link.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        let gipa = (*link).next_gipa;
+        let gpdpa = (*link).next_gpdpa;
+        (*lci).u = (*link).p_next;
+        (gipa, gpdpa)
+    };
 
+    // SAFETY: `next_gipa` is the loader-supplied down-chain GIPA; vkCreateInstance is a global
+    // command resolvable from the null instance, and FnCreateInstance mirrors its prototype.
     let create: FnCreateInstance =
-        match resolve(next_gipa, vk::Instance::null(), c"vkCreateInstance") {
+        match unsafe { resolve(next_gipa, vk::Instance::null(), c"vkCreateInstance") } {
             Some(f) => f,
             None => return vk::Result::ERROR_INITIALIZATION_FAILED,
         };
-    let res = create(p_ci, p_alloc, p_inst);
+    // SAFETY: forwarding the loader's own arguments unchanged to the down-chain create, which
+    // expects exactly this (p_ci with the link advanced, the caller's allocator, the caller's
+    // out-pointer).
+    let res = unsafe { create(p_ci, p_alloc, p_inst) };
     if res != vk::Result::SUCCESS {
         return res;
     }
-    let inst = *p_inst;
-    let data = InstanceData {
-        instance: inst,
-        next_gipa,
-        next_gpdpa,
-        destroy_instance: resolve(next_gipa, inst, c"vkDestroyInstance"),
-        get_surface_formats: resolve(next_gipa, inst, c"vkGetPhysicalDeviceSurfaceFormatsKHR"),
-        get_surface_formats2: resolve(next_gipa, inst, c"vkGetPhysicalDeviceSurfaceFormats2KHR"),
-        create_win32_surface: resolve(next_gipa, inst, c"vkCreateWin32SurfaceKHR"),
-        destroy_surface: resolve(next_gipa, inst, c"vkDestroySurfaceKHR"),
+    // SAFETY: vkCreateInstance requires pInstance to be a valid pointer, and on SUCCESS the
+    // down-chain just wrote the new instance handle through it.
+    let inst = unsafe { *p_inst };
+    // SAFETY: `inst` is the live instance created above; `next_gipa` resolves its
+    // instance-level commands, and every Fn* typedef used here mirrors the prototype of the
+    // exact command name it is resolved from.
+    let data = unsafe {
+        InstanceData {
+            instance: inst,
+            next_gipa,
+            next_gpdpa,
+            destroy_instance: resolve(next_gipa, inst, c"vkDestroyInstance"),
+            get_surface_formats: resolve(next_gipa, inst, c"vkGetPhysicalDeviceSurfaceFormatsKHR"),
+            get_surface_formats2: resolve(
+                next_gipa,
+                inst,
+                c"vkGetPhysicalDeviceSurfaceFormats2KHR",
+            ),
+            create_win32_surface: resolve(next_gipa, inst, c"vkCreateWin32SurfaceKHR"),
+            destroy_surface: resolve(next_gipa, inst, c"vkDestroySurfaceKHR"),
+        }
     };
     if let Ok(mut g) = instances().lock() {
-        g.insert(key(inst.as_raw()), data);
+        // SAFETY: `inst` is the live dispatchable handle created above — its first word is the
+        // dispatch key.
+        g.insert(unsafe { key(inst.as_raw()) }, data);
     }
     log("create_instance: hooked");
     vk::Result::SUCCESS
@@ -602,26 +764,40 @@ unsafe extern "system" fn destroy_instance(inst: vk::Instance, p_alloc: *const c
     let data = instances()
         .lock()
         .ok()
-        .and_then(|mut g| g.remove(&key(inst.as_raw())));
+        // SAFETY: `inst` is non-null, and vkDestroyInstance requires a live instance handle —
+        // still live during this call — whose first word is the dispatch key.
+        .and_then(|mut g| g.remove(&unsafe { key(inst.as_raw()) }));
     if let Some(d) = data {
         if let Some(f) = d.destroy_instance {
-            f(inst, p_alloc);
+            // SAFETY: `f` is the down-chain vkDestroyInstance resolved for this very instance at
+            // create time; forwarding the caller's own arguments unchanged.
+            unsafe { f(inst, p_alloc) };
         }
     }
 }
 
 // ---- device chain (pass-through; keeps device-level dispatch working) ----
 
+/// Walk `p_ci`'s pNext chain for the loader's device layer-link node.
+///
+/// # Safety
+/// Same contract as [`find_instance_link`]: `p_ci` must point to a valid create-info struct
+/// whose `pNext` chain is a well-formed list of `{sType, pNext}`-headed nodes.
 unsafe fn find_device_link(p_ci: *const c_void) -> *mut LayerDeviceCreateInfo {
-    let mut node = (*(p_ci as *const BaseIn)).p_next as *const BaseIn;
-    while !node.is_null() {
-        if (*node).s_type.as_raw() == LOADER_DEVICE_CREATE_INFO {
-            let lci = node as *mut LayerDeviceCreateInfo;
-            if (*lci).function == VK_LAYER_LINK_INFO {
-                return lci;
+    // SAFETY: per this function's contract, `p_ci` and every non-null `pNext` reached from it
+    // point at nodes beginning with a {sType, pNext} header; a node whose sType says it is the
+    // loader's device create-info really is a LayerDeviceCreateInfo (the loader wrote it).
+    unsafe {
+        let mut node = (*(p_ci as *const BaseIn)).p_next as *const BaseIn;
+        while !node.is_null() {
+            if (*node).s_type.as_raw() == LOADER_DEVICE_CREATE_INFO {
+                let lci = node as *mut LayerDeviceCreateInfo;
+                if (*lci).function == VK_LAYER_LINK_INFO {
+                    return lci;
+                }
             }
+            node = (*node).p_next as *const BaseIn;
         }
-        node = (*node).p_next as *const BaseIn;
     }
     ptr::null_mut()
 }
@@ -632,35 +808,54 @@ unsafe extern "system" fn create_device(
     p_alloc: *const c_void,
     p_dev: *mut vk::Device,
 ) -> vk::Result {
-    let lci = find_device_link(p_ci);
+    // SAFETY: the loader invokes this hook with a valid VkDeviceCreateInfo whose pNext chain it
+    // built — the chain find_device_link's contract requires.
+    let lci = unsafe { find_device_link(p_ci) };
     if lci.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let link = (*lci).u;
-    if link.is_null() {
-        return vk::Result::ERROR_INITIALIZATION_FAILED;
-    }
-    let next_gipa = (*link).next_gipa;
-    let next_gdpa = (*link).next_gdpa;
-    (*lci).u = (*link).p_next;
+    // SAFETY: `lci` is non-null and points into the loader's live chain. Its `u` link (checked
+    // non-null before use) is this layer's link entry; reading the down-chain pointers and
+    // advancing `(*lci).u` is the layer protocol, exactly as in create_instance.
+    let (next_gipa, next_gdpa) = unsafe {
+        let link = (*lci).u;
+        if link.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        let gipa = (*link).next_gipa;
+        let gdpa = (*link).next_gdpa;
+        (*lci).u = (*link).p_next;
+        (gipa, gdpa)
+    };
 
     let inst = instances()
         .lock()
         .ok()
-        .and_then(|g| g.get(&key(pdev.as_raw())).map(|d| d.instance))
+        // SAFETY: vkCreateDevice requires `pdev` to be a live physical-device handle — a
+        // dispatchable object sharing its instance's dispatch table, so its first word is the
+        // same dispatch key create_instance stored.
+        .and_then(|g| g.get(&unsafe { key(pdev.as_raw()) }).map(|d| d.instance))
         .unwrap_or(vk::Instance::null());
 
-    let create: FnCreateDevice = match resolve(next_gipa, inst, c"vkCreateDevice") {
+    // SAFETY: `next_gipa` is the loader-supplied down-chain GIPA for this create call, `inst` is
+    // the (possibly null) instance owning `pdev`, and FnCreateDevice mirrors vkCreateDevice's
+    // prototype.
+    let create: FnCreateDevice = match unsafe { resolve(next_gipa, inst, c"vkCreateDevice") } {
         Some(f) => f,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };
-    let res = create(pdev, p_ci, p_alloc, p_dev);
+    // SAFETY: forwarding the loader's own arguments unchanged to the down-chain create.
+    let res = unsafe { create(pdev, p_ci, p_alloc, p_dev) };
     if res != vk::Result::SUCCESS {
         return res;
     }
-    let dev = *p_dev;
+    // SAFETY: vkCreateDevice requires pDevice to be a valid pointer, and on SUCCESS the
+    // down-chain just wrote the new device handle through it.
+    let dev = unsafe { *p_dev };
     if let Ok(mut g) = devices().lock() {
-        g.insert(key(dev.as_raw()), DeviceData { next_gdpa });
+        // SAFETY: `dev` is the live dispatchable handle created above — its first word is the
+        // dispatch key.
+        g.insert(unsafe { key(dev.as_raw()) }, DeviceData { next_gdpa });
     }
     vk::Result::SUCCESS
 }
@@ -674,19 +869,28 @@ unsafe extern "system" fn create_win32_surface(
     p_surface: *mut vk::SurfaceKHR,
 ) -> vk::Result {
     let down = instances().lock().ok().and_then(|g| {
-        g.get(&key(inst.as_raw()))
+        // SAFETY: vkCreateWin32SurfaceKHR requires `inst` to be a live instance handle — a
+        // dispatchable object whose first word is the dispatch key.
+        g.get(&unsafe { key(inst.as_raw()) })
             .and_then(|d| d.create_win32_surface)
     });
     let down = match down {
         Some(f) => f,
         None => return vk::Result::ERROR_EXTENSION_NOT_PRESENT,
     };
-    let res = down(inst, p_ci, p_alloc, p_surface);
+    // SAFETY: `down` is the down-chain vkCreateWin32SurfaceKHR resolved for this instance at
+    // create time; forwarding the caller's own arguments unchanged.
+    let res = unsafe { down(inst, p_ci, p_alloc, p_surface) };
     if res == vk::Result::SUCCESS {
-        // VkWin32SurfaceCreateInfoKHR: sType@0, pNext@8, flags@16, hinstance@24, hwnd@32
-        let hwnd = *((p_ci as *const u8).add(32) as *const isize);
+        // SAFETY: the down-chain call succeeded, so `p_ci` pointed at a valid
+        // VkWin32SurfaceCreateInfoKHR for the whole call (the ICD just consumed it). On x86_64
+        // its layout is sType(4+4 pad)@0, pNext@8, flags(4+4 pad)@16, hinstance@24, hwnd@32 —
+        // so `p_ci + 32` is an in-bounds, 8-aligned read of the HWND field.
+        let hwnd = unsafe { *((p_ci as *const u8).add(32) as *const isize) };
         if let Ok(mut m) = surface_hwnds().lock() {
-            m.insert((*p_surface).as_raw(), hwnd);
+            // SAFETY: vkCreateWin32SurfaceKHR requires pSurface to be a valid pointer, and on
+            // SUCCESS the down-chain just wrote the new surface handle through it.
+            m.insert(unsafe { *p_surface }.as_raw(), hwnd);
         }
     }
     res
@@ -703,9 +907,16 @@ unsafe extern "system" fn destroy_surface(
     let down = instances()
         .lock()
         .ok()
-        .and_then(|g| g.get(&key(inst.as_raw())).and_then(|d| d.destroy_surface));
+        // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle — a
+        // dispatchable object whose first word is the dispatch key.
+        .and_then(|g| {
+            g.get(&unsafe { key(inst.as_raw()) })
+                .and_then(|d| d.destroy_surface)
+        });
     if let Some(f) = down {
-        f(inst, surface, p_alloc);
+        // SAFETY: `f` is the down-chain vkDestroySurfaceKHR resolved for this instance at
+        // create time; forwarding the caller's own arguments unchanged.
+        unsafe { f(inst, surface, p_alloc) };
     }
 }
 
@@ -718,7 +929,9 @@ unsafe extern "system" fn get_surface_formats(
     p_formats: *mut vk::SurfaceFormatKHR,
 ) -> vk::Result {
     let down = instances().lock().ok().and_then(|g| {
-        g.get(&key(pdev.as_raw()))
+        // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live
+        // physical-device handle — a dispatchable object whose first word is the dispatch key.
+        g.get(&unsafe { key(pdev.as_raw()) })
             .and_then(|d| d.get_surface_formats)
     });
     let down = match down {
@@ -727,13 +940,17 @@ unsafe extern "system" fn get_surface_formats(
     };
 
     let mut n = 0u32;
-    let r = down(pdev, surface, &mut n, ptr::null_mut());
+    // SAFETY: count-query form of the two-call idiom — null pFormats plus a count out-pointer
+    // backed by the live local `n`; the caller's pdev/surface are forwarded unchanged.
+    let r = unsafe { down(pdev, surface, &mut n, ptr::null_mut()) };
     if r != vk::Result::SUCCESS {
         return r;
     }
     let mut real = vec![vk::SurfaceFormatKHR::default(); n as usize];
     if n > 0 {
-        let r = down(pdev, surface, &mut n, real.as_mut_ptr());
+        // SAFETY: `real` holds exactly `n` elements and `n` is passed as the in/out capacity, so
+        // the down-chain writes at most `n` entries and shrinks `n` to what it wrote.
+        let r = unsafe { down(pdev, surface, &mut n, real.as_mut_ptr()) };
         if r != vk::Result::SUCCESS {
             return r;
         }
@@ -753,16 +970,24 @@ unsafe extern "system" fn get_surface_formats(
     }
 
     if p_formats.is_null() {
-        *p_count = aug.len() as u32;
+        // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires pSurfaceFormatCount to be a
+        // valid u32 pointer in both call forms.
+        unsafe { *p_count = aug.len() as u32 };
         return vk::Result::SUCCESS;
     }
-    let m = (*p_count as usize).min(aug.len());
-    ptr::copy_nonoverlapping(aug.as_ptr(), p_formats, m);
-    *p_count = m as u32;
-    if m < aug.len() {
-        vk::Result::INCOMPLETE
-    } else {
-        vk::Result::SUCCESS
+    // SAFETY: with a non-null pSurfaceFormats the spec requires *pSurfaceFormatCount to be
+    // readable and pSurfaceFormats to point at at least that many elements; `m` is clamped to
+    // both that capacity and our own length, and the caller's buffer cannot overlap the
+    // freshly-allocated `aug`.
+    unsafe {
+        let m = (*p_count as usize).min(aug.len());
+        ptr::copy_nonoverlapping(aug.as_ptr(), p_formats, m);
+        *p_count = m as u32;
+        if m < aug.len() {
+            vk::Result::INCOMPLETE
+        } else {
+            vk::Result::SUCCESS
+        }
     }
 }
 
@@ -773,7 +998,9 @@ unsafe extern "system" fn get_surface_formats2(
     p_formats: *mut c_void,
 ) -> vk::Result {
     let down = instances().lock().ok().and_then(|g| {
-        g.get(&key(pdev.as_raw()))
+        // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live
+        // physical-device handle — a dispatchable object whose first word is the dispatch key.
+        g.get(&unsafe { key(pdev.as_raw()) })
             .and_then(|d| d.get_surface_formats2)
     });
     let down = match down {
@@ -782,7 +1009,10 @@ unsafe extern "system" fn get_surface_formats2(
     };
 
     let mut n = 0u32;
-    let r = down(pdev, p_info, &mut n, ptr::null_mut());
+    // SAFETY: count-query form of the two-call idiom — null pSurfaceFormats plus a count
+    // out-pointer backed by the live local `n`; the caller's pdev/pSurfaceInfo are forwarded
+    // unchanged (the spec requires pSurfaceInfo to stay valid for the call).
+    let r = unsafe { down(pdev, p_info, &mut n, ptr::null_mut()) };
     if r != vk::Result::SUCCESS {
         return r;
     }
@@ -794,15 +1024,21 @@ unsafe extern "system" fn get_surface_formats2(
         })
         .collect();
     if n > 0 {
-        let r = down(pdev, p_info, &mut n, real.as_mut_ptr() as *mut c_void);
+        // SAFETY: `real` holds exactly `n` properly-stamped VkSurfaceFormat2KHR mirrors
+        // (SurfaceFormat2Raw layout-asserted at the type), and `n` is passed as the in/out
+        // capacity, so the down-chain writes at most `n` entries.
+        let r = unsafe { down(pdev, p_info, &mut n, real.as_mut_ptr() as *mut c_void) };
         if r != vk::Result::SUCCESS {
             return r;
         }
     }
     real.truncate(n as usize);
 
-    // VkPhysicalDeviceSurfaceInfo2KHR: sType@0, pNext@8, surface@16
-    let surface = vk::SurfaceKHR::from_raw(*((p_info as *const u8).add(16) as *const u64));
+    // SAFETY: the spec requires pSurfaceInfo to point at a valid VkPhysicalDeviceSurfaceInfo2KHR
+    // for the whole call. On x86_64 its layout is sType(4+4 pad)@0, pNext@8, surface(u64)@16 —
+    // so `p_info + 16` is an in-bounds, 8-aligned read of the non-dispatchable surface handle.
+    let surface =
+        vk::SurfaceKHR::from_raw(unsafe { *((p_info as *const u8).add(16) as *const u64) });
 
     let mut extras: Vec<vk::SurfaceFormatKHR> = Vec::new();
     if !real.is_empty() && should_inject(surface) {
@@ -817,25 +1053,34 @@ unsafe extern "system" fn get_surface_formats2(
     let total = real.len() + extras.len();
 
     if p_formats.is_null() {
-        *p_count = total as u32;
+        // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires pSurfaceFormatCount to be a
+        // valid u32 pointer in both call forms.
+        unsafe { *p_count = total as u32 };
         return vk::Result::SUCCESS;
     }
-    let m = (*p_count as usize).min(total);
-    let out = p_formats as *mut SurfaceFormat2Raw;
-    for i in 0..m {
-        let sf = if i < real.len() {
-            real[i].surface_format
+    // SAFETY: with a non-null pSurfaceFormats the spec requires *pSurfaceFormatCount to be
+    // readable and pSurfaceFormats to point at at least that many VkSurfaceFormat2KHR — whose
+    // layout SurfaceFormat2Raw mirrors (asserted at the type). `m` is clamped to both bounds.
+    // Only sType and surfaceFormat are stamped per element; each element's pNext chain is left
+    // exactly as the caller built it.
+    unsafe {
+        let m = (*p_count as usize).min(total);
+        let out = p_formats as *mut SurfaceFormat2Raw;
+        for i in 0..m {
+            let sf = if i < real.len() {
+                real[i].surface_format
+            } else {
+                extras[i - real.len()]
+            };
+            let dst = out.add(i);
+            (*dst).s_type = vk::StructureType::SURFACE_FORMAT_2_KHR;
+            (*dst).surface_format = sf;
+        }
+        *p_count = m as u32;
+        if m < total {
+            vk::Result::INCOMPLETE
         } else {
-            extras[i - real.len()]
-        };
-        let dst = out.add(i);
-        (*dst).s_type = vk::StructureType::SURFACE_FORMAT_2_KHR;
-        (*dst).surface_format = sf;
-    }
-    *p_count = m as u32;
-    if m < total {
-        vk::Result::INCOMPLETE
-    } else {
-        vk::Result::SUCCESS
+            vk::Result::SUCCESS
+        }
     }
 }
