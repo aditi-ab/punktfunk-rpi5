@@ -64,16 +64,27 @@ fn acquire_single_instance() -> Result<OwnedHandle> {
     unsafe {
         let h = match CreateMutexW(Some(&sa), false, w!("Global\\punktfunk-vdisplay-manager")) {
             Ok(h) => h,
-            // The name exists but its creator's DACL denies this token the implicit OPEN (the SCM
-            // service creates it as SYSTEM; a second elevated-admin host lands here instead of in
-            // the ALREADY_EXISTS branch — validated on-glass). Legitimately that means an instance
-            // is live; it is ALSO exactly what a squat looks like, so say both.
+            // ACCESS_DENIED has THREE causes here and the handle alone cannot tell them apart, so
+            // name all three rather than assert one. (1) The name exists but its creator's DACL
+            // denies this token the implicit OPEN — the SCM service creates it as SYSTEM, so a
+            // second elevated-admin host lands here instead of in the ALREADY_EXISTS branch
+            // (validated on-glass); that is a live instance. (2) The same shape is exactly what a
+            // SQUAT looks like. (3) `CreateMutexW` also fails ACCESS_DENIED when the caller holds no
+            // SeCreateGlobalPrivilege at all — granted by default to Administrators, SYSTEM and the
+            // SERVICE groups but NOT to an ordinary interactive user, so an un-elevated
+            // `punktfunk-host serve` reaches this arm with no such object existing anywhere. Naming
+            // only (1)+(2) sent that operator hunting a process that does not exist and a
+            // `handle.exe` that finds nothing — the same misdiagnosis family as 2026-08-05 L-16,
+            // which this block exists to remove.
             Err(e) if e.code().0 == 0x8007_0005u32 as i32 => anyhow::bail!(
-                "{IN_USE}\n\nIf no other punktfunk-host is running, the name \
-                 `Global\\punktfunk-vdisplay-manager` has been SQUATTED by another process — any \
-                 account with SeCreateGlobalPrivilege can create it first and deny us access, \
-                 which disables virtual-display streaming until that process exits. Find the \
-                 holder with Sysinternals `handle.exe -a punktfunk-vdisplay-manager`."
+                "{IN_USE}\n\nIf no other punktfunk-host is running, either this process cannot \
+                 create a `Global\\` kernel object at all (it needs SeCreateGlobalPrivilege — run \
+                 the host ELEVATED or as the installed service account; an ordinary interactive \
+                 user does not hold it), or the name `Global\\punktfunk-vdisplay-manager` has been \
+                 SQUATTED by another process — any account with that privilege can create it first \
+                 and deny us access, which disables virtual-display streaming until that process \
+                 exits. Sysinternals `handle.exe -a punktfunk-vdisplay-manager` tells the two \
+                 apart: a holder means a squat, NOTHING means the privilege."
             ),
             Err(e) => {
                 return Err(e).context("CreateMutexW(punktfunk-vdisplay single-instance guard)");
@@ -190,6 +201,48 @@ fn object_owner_sid(h: HANDLE) -> Option<String> {
 
 /// SYSTEM, BUILTIN\Administrators, or a member of the Administrators-owned set — the principals a
 /// legitimate pf-vdisplay manager runs as.
+///
+/// Deliberately NARROW, and the narrowness is the security property: this predicate is what decides
+/// whether an existing single-instance name is reported as "another punktfunk-host" (benign, wait it
+/// out) or as a SQUAT (an attack on virtual-display availability). Widening it — `S-1-5-32-` as a
+/// prefix, or any `S-1-5-21-…` domain account — silently reclassifies a non-administrative squatter
+/// as one of ours and restores the exact misdiagnosis the 2026-08-05 L-16 fix removed. LocalService
+/// (`S-1-5-19`) and NetworkService (`S-1-5-20`) are excluded ON PURPOSE: the plugin runner is forced
+/// to LocalService, so a name owned by it is a plugin, not a host.
 fn is_privileged_sid(sid: &str) -> bool {
     matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid.starts_with("S-1-5-80-") // service SIDs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_privileged_sid;
+
+    /// Pins the classification above — the only pure decision in this module, and the one whose
+    /// widening is silent (nothing fails; a squat merely starts reading as a sibling host).
+    #[test]
+    fn is_privileged_sid_accepts_system_admins_and_service_sids_only() {
+        assert!(is_privileged_sid("S-1-5-18"), "SYSTEM");
+        assert!(is_privileged_sid("S-1-5-32-544"), "BUILTIN\\Administrators");
+        assert!(
+            is_privileged_sid("S-1-5-80-3139157870-2983391045-3678747466-658725712-1809340420"),
+            "an NT SERVICE\\… per-service SID"
+        );
+
+        assert!(!is_privileged_sid("S-1-5-32-545"), "BUILTIN\\Users");
+        assert!(
+            !is_privileged_sid("S-1-5-21-1004336348-1177238915-682003330-1001"),
+            "a local/domain user account"
+        );
+        // LocalService / NetworkService: the plugin runner's accounts, deliberately NOT ours.
+        assert!(!is_privileged_sid("S-1-5-19"), "LocalService");
+        assert!(!is_privileged_sid("S-1-5-20"), "NetworkService");
+        assert!(
+            !is_privileged_sid(""),
+            "an unreadable owner is never 'fine'"
+        );
+        // Prefix discipline: `S-1-5-80` without the trailing dash is a different SID string, and
+        // `S-1-5-8` (Proxy) must not slip in under a loosened prefix.
+        assert!(!is_privileged_sid("S-1-5-8"), "Proxy");
+        assert!(!is_privileged_sid("S-1-5-800-1"), "not a service SID");
+    }
 }

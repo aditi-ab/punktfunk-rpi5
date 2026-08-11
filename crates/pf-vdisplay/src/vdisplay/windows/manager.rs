@@ -1,15 +1,16 @@
 //! Host-lifetime virtual-display **ownership model** (Goal-1 §2.5). One reference-counted monitor
-//! lifecycle, shared by both Windows backends (SudoVDA + pf-vdisplay) instead of the two verbatim-
-//! duplicated `MGR: Mutex<Mgr>` globals each backend used to carry.
+//! lifecycle, born as the shared half of two Windows backends (SudoVDA + pf-vdisplay) so the two
+//! verbatim-duplicated `MGR: Mutex<Mgr>` globals could go; the SudoVDA backend has since been
+//! removed, so pf-vdisplay is the sole driver behind the seam.
 //!
 //! [`VirtualDisplayManager`] owns the earned Idle/Active/Lingering refcount machine + the linger timer +
 //! a **typed** [`OwnedHandle`] control device (no more raw `isize` smuggled across the pinger/linger
-//! threads). The backend differences — the IOCTL protocol and the per-monitor REMOVE key — are the only
+//! threads). The driver-specific part — the IOCTL protocol and the per-monitor REMOVE key — is the only
 //! thing behind the [`VdisplayDriver`] seam; the state machine, the render-adapter pin decision, the
-//! GDI/CCD glue (`pf_win_display::win_display`), and the generation-stamped [`MonitorLease`] are backend-neutral.
+//! GDI/CCD glue (`pf_win_display::win_display`), and the generation-stamped [`MonitorLease`] are driver-neutral.
 //!
-//! It's a process-wide singleton ([`vdm`]) initialised once with the chosen backend's driver — the
-//! host runs exactly one virtual-display backend per process. The session holds a [`MonitorLease`];
+//! It's a process-wide singleton ([`vdm`]) initialised once with the driver — the host runs exactly
+//! one virtual-display backend per process. The session holds a [`MonitorLease`];
 //! its `Drop` releases the refcount (a *stale* lease — its monitor was preempted + recreated under it —
 //! is a no-op, so it can never tear down the live monitor).
 
@@ -86,6 +87,12 @@ struct Monitor {
     /// is why WUDFHost death is ALL-slot shared fate.
     wudf_pid: u32,
     gdi_name: Option<String>,
+    /// The mode the OS actually COMMITTED for this monitor, not the one the client asked for — all
+    /// three paths that write it (create, re-arrival, in-place resize) read it back through
+    /// [`committed_mode_or`]. It is what `output_for` hands the capturer as `preferred_mode`, what
+    /// `/display/state` reports, and what the next mid-stream Reconfigure diffs against, so a
+    /// requested-but-never-committed refresh here mis-paces the encoder AND suppresses the resize
+    /// that would fix it.
     mode: Mode,
     /// The monitor id the driver actually resolved (the EDID serial / ConnectorIndex) — equals the
     /// slot key when the per-client preference was honored, or the auto-allocated id (diagnostics).
@@ -165,7 +172,7 @@ struct GroupState {
     ccd_exclusive: bool,
 }
 
-/// How a mid-stream re-arrival ([`ManagerInner::re_add`]) ended.
+/// How a mid-stream re-arrival ([`VirtualDisplayManager::re_add`]) ended.
 ///
 /// Three-way on purpose. `re_add` REMOVEs the old driver monitor before it ADDs the new one, so
 /// once the ADD fails the old monitor is GONE — and the caller used to answer that by putting its
@@ -188,7 +195,7 @@ enum ReAdd {
 
 /// What a NON-LAST-member teardown owes the group's topology.
 ///
-/// Split out of [`ManagerInner::teardown_removed`] so the gate is testable without a driver, a CCD
+/// Split out of [`VirtualDisplayManager::teardown_removed`] so the gate is testable without a driver, a CCD
 /// device or a desktop — the Windows half of this crate has no other way to pin a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShrinkAction {
@@ -200,11 +207,7 @@ enum ShrinkAction {
     Nothing,
 }
 
-/// `ccd_exclusive` is the discriminator, NOT `ccd_saved.is_some()`: `Topology::Primary` stores a
-/// snapshot too (from `set_virtual_primary_ccd`), so keying on the snapshot ran the EXCLUSIVE
-/// isolate on a Primary group — clearing `DISPLAYCONFIG_PATH_ACTIVE` on every non-kept path, i.e.
-/// blanking the very physical displays `Primary` exists to keep lit.
-/// One stage of [`ManagerInner::resolve_target_gdi`]'s ladder: poll for the target's GDI name until
+/// One stage of [`VirtualDisplayManager::resolve_target_gdi`]'s ladder: poll for the target's GDI name until
 /// the 3 s ceiling. 50 ms sampling (latency plan P0.5) — a typical activation resolves on an early
 /// poll, so finer sampling shaves ~150 ms off every stage crossing.
 ///
@@ -257,6 +260,15 @@ fn isolate_displays_ccd_seam(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     isolate_displays_ccd(keep_target_ids)
 }
 
+/// Decide the [`ShrinkAction`] a NON-LAST-member teardown owes the group.
+///
+/// `ccd_exclusive` is the discriminator, NOT `has_saved`: `Topology::Primary` stores a `ccd_saved`
+/// snapshot too (from `set_virtual_primary_ccd`), so keying on the snapshot ran the EXCLUSIVE
+/// isolate on a Primary group — clearing `DISPLAYCONFIG_PATH_ACTIVE` on every non-kept path, i.e.
+/// blanking the very physical displays `Primary` exists to keep lit. (This paragraph had been
+/// concatenated onto `poll_gdi_name`'s doc with no blank line between them, so the only written
+/// record of the Phase-3.3 gate documented an unrelated polling helper and this fn read as
+/// undocumented — a maintainer's invitation to "simplify" it back to the broken predicate.)
 fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
     if ccd_exclusive {
         ShrinkAction::Reisolate
@@ -264,6 +276,53 @@ fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
         ShrinkAction::RepromotePrimary
     } else {
         ShrinkAction::Nothing
+    }
+}
+
+/// The mode `target_id` is ACTUALLY running, for a caller about to RECORD it, with `requested` as
+/// the fallback whenever the read-back cannot be trusted.
+///
+/// Every path that stores a `Monitor.mode` owes this call: `set_active_mode` deliberately commits
+/// the highest advertised refresh <= the requested one rather than lose the client's resolution, and
+/// the `wait_mode_settled` that precedes every store verifies the RESOLUTION only — so a `true`
+/// settle is no evidence at all about the refresh. `active_mode`'s own doc states the contract:
+/// "Callers that RECORD a mode must record this, or they claim a refresh the display is not
+/// running."
+///
+/// Deliberately narrowed to the REFRESH. A read-back that FAILS, or that reports a different
+/// RESOLUTION, keeps `requested`: the create path proceeds even when its settle timed out, so the
+/// OS may still be sitting on its own default there, and recording that would hand the capturer +
+/// the client a size nobody negotiated. The capturer already re-resolves the live size on its own
+/// (`active_resolution` poll, game-capture GB1); the refresh is the field only this read-back can
+/// answer.
+fn committed_mode_or(target_id: u32, requested: Mode) -> Mode {
+    let Some((width, height, refresh_hz)) = pf_win_display::win_display::active_mode(target_id)
+    else {
+        return requested;
+    };
+    if (width, height) != (requested.width, requested.height) {
+        tracing::warn!(
+            target_id,
+            requested = format!("{}x{}", requested.width, requested.height),
+            active = format!("{width}x{height}"),
+            "the OS is not running the requested resolution after the settle — recording the \
+             requested mode (the capturer re-resolves the live size itself)"
+        );
+        return requested;
+    }
+    if refresh_hz != requested.refresh_hz {
+        tracing::info!(
+            target_id,
+            requested_hz = requested.refresh_hz,
+            committed_hz = refresh_hz,
+            "the OS committed a different refresh than requested (the driver does not advertise \
+             it) — recording what the display actually runs"
+        );
+    }
+    Mode {
+        width,
+        height,
+        refresh_hz,
     }
 }
 
@@ -528,11 +587,11 @@ impl VirtualDisplayManager {
         }
         let reap = !slot.opened_once;
         claim_instance()?;
-        // SAFETY: `VdisplayDriver::open` is `unsafe` only because it issues SetupAPI + `DeviceIoControl`
-        // FFI in the caller's apartment; the `device` mutex (held here) serializes it, so there is no
-        // concurrent open. `open` has no handle precondition to uphold, and the `OwnedHandle` it
-        // returns is the sole owner of the device.
-        let (handle, watchdog_s, driver_proto) = unsafe { self.driver.open(reap)? };
+        // `open` is a SAFE fn: it discharges every FFI precondition inside its own body (it opens the
+        // handle it then IOCTLs) and returns an `OwnedHandle` that is the sole owner of the device.
+        // The `device` mutex held here serializes racing opens — a *serialization* requirement, not
+        // a soundness one, which is exactly why it is not expressed as `unsafe`.
+        let (handle, watchdog_s, driver_proto) = self.driver.open(reap)?;
         slot.opened_once = true;
         self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
         self.driver_proto.store(driver_proto, Ordering::Relaxed);
@@ -909,36 +968,57 @@ impl VirtualDisplayManager {
         let interval =
             Duration::from_millis(self.watchdog_s.load(Ordering::Relaxed) as u64 * 1000 / 3);
         let stop_t = stop.clone();
-        let thread = thread::spawn(move || {
-            let mut warned = false;
-            while !stop_t.load(Ordering::Relaxed) {
-                if let Some(h) = vdm().device_handle() {
-                    // SAFETY: `ping` requires `dev` to be a valid control handle. The `h` Arc from
-                    // `device_handle()` is held across this call, so the handle stays open even if
-                    // it is retired concurrently — at worst the IOCTL fails (the retire drops only
-                    // the manager's reference; see `DeviceSlot`). The pinger thread only spins
-                    // while the `&'static` manager singleton lives.
-                    match unsafe { vdm().driver.ping(dev_raw(&h)) } {
-                        Ok(()) => warned = false,
-                        Err(e) if is_device_gone(&e) => {
-                            // The device itself is gone (driver upgrade / WUDFHost restart) — pings
-                            // can only keep failing on this handle. Retire it so the next session's
-                            // `ensure_device` reopens; the monitors are already dead driver-side.
-                            vdm().invalidate_device(&e);
-                        }
-                        Err(e) => {
-                            if !warned {
-                                tracing::warn!(
-                                    "virtual-display keepalive PING failed (control handle lost?): {e:#}"
-                                );
-                                warned = true;
+        let thread = thread::Builder::new()
+            .name("vdisplay-pinger".into())
+            .spawn(move || {
+                let mut warned = false;
+                while !stop_t.load(Ordering::Relaxed) {
+                    if let Some(h) = vdm().device_handle() {
+                        // SAFETY: `ping` requires `dev` to be a valid control handle. The `h` Arc
+                        // from `device_handle()` is held across this call, so the handle stays open
+                        // even if it is retired concurrently — at worst the IOCTL fails (the retire
+                        // drops only the manager's reference; see `DeviceSlot`). The pinger thread
+                        // only spins while the `&'static` manager singleton lives.
+                        match unsafe { vdm().driver.ping(dev_raw(&h)) } {
+                            Ok(()) => warned = false,
+                            Err(e) if is_device_gone(&e) => {
+                                // The device itself is gone (driver upgrade / WUDFHost restart) —
+                                // pings can only keep failing on this handle. Retire it so the next
+                                // session's `ensure_device` reopens; the monitors are already dead
+                                // driver-side.
+                                vdm().invalidate_device(&e);
+                            }
+                            Err(e) => {
+                                if !warned {
+                                    tracing::warn!(
+                                        "virtual-display keepalive PING failed (control handle lost?): {e:#}"
+                                    );
+                                    warned = true;
+                                }
                             }
                         }
                     }
+                    thread::sleep(interval);
                 }
-                thread::sleep(interval);
+            });
+        // NOT `thread::spawn` (which PANICS when the OS refuses the thread), for the same reason
+        // `ensure_exclusive_watch` was moved off it: this runs holding `pinger` and — via
+        // `create_monitor` ← `acquire` — the manager `state` guard, so an unwind here poisons the
+        // two locks the whole manager runs on, and every later `acquire`/`release`/`snapshot`
+        // `.lock().unwrap()` panics for the rest of the process. A missing pinger degrades to the
+        // driver's watchdog tearing the displays down (recoverable, and loud); a poisoned manager is
+        // neither. It also gains the thread name its two siblings already have.
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not spawn the virtual-display keepalive pinger — the driver's host-gone \
+                     watchdog will tear this monitor down when it expires"
+                );
+                return;
             }
-        });
+        };
         *guard = Some(Pinger { stop, thread });
     }
 
@@ -1167,9 +1247,14 @@ impl VirtualDisplayManager {
     /// commits the target's path directly (supplied-config apply, the same thing display Settings
     /// does), which doesn't consult the lid policy at all.
     ///
-    /// # Safety
-    /// Runs the CCD (QueryDisplayConfig / SetDisplayConfig) FFI; call under the `state` lock.
-    unsafe fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
+    /// Call under the `state` lock: this mutates the LIVE CCD topology (force-EXTEND, explicit path
+    /// activation), and the manager's sole-topology-mutator contract is what keeps two acquires from
+    /// interleaving path commits. A *serialization* requirement, not a soundness one — every CCD
+    /// helper it calls is a safe fn in `pf_win_display::win_display`, so this function performs no
+    /// unsafe operation at all. It was an `unsafe fn` back when the FFI was inline here, and stayed
+    /// one after the FFI moved out: three call sites then carried `unsafe {}` blocks whose SAFETY
+    /// proofs asserted things about FFI that is no longer in the body.
+    fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
         // 50 ms sampling (latency plan P0.5): the SAME 3 s per-stage ceilings — the 3-stage ladder
         // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
         // lid-closed path activation) and is untouched — but a typical activation resolves on an
@@ -1194,12 +1279,15 @@ impl VirtualDisplayManager {
     /// (first member isolates and captures the restore; a later member re-issues the isolate with
     /// the grown managed set — a sibling slot is never deactivated).
     ///
+    /// The returned `Monitor.mode` is what the OS COMMITTED, which need not be `mode` — see the
+    /// read-back after the settle.
+    ///
     /// # Safety
     /// `dev` must be the live control handle.
     unsafe fn create_monitor(
         &'static self,
         dev: HANDLE,
-        mode: Mode,
+        mut mode: Mode,
         slot: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
         hw_cursor: bool,
@@ -1230,9 +1318,8 @@ impl VirtualDisplayManager {
 
         // Resolve the capture target — wait for Windows to auto-activate the freshly-ADDed IDD into its
         // OWN display path, with the integrated-screen clone fallback (shared by the re-arrival path).
-        // SAFETY: `resolve_target_gdi` runs the CCD FFI (a `Copy` `u32` target by value, owned return),
-        // under the `state` lock.
-        let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
+        // Its `state`-lock discipline is satisfied: `acquire` holds the lock across this whole call.
+        let gdi_name = self.resolve_target_gdi(added.target_id);
         match &gdi_name {
             Some(n) => {
                 tracing::info!(
@@ -1368,6 +1455,17 @@ impl VirtualDisplayManager {
                     verified = settled,
                     "topology settle (verified-state wait)"
                 );
+                // Record what actually COMMITTED, not what was asked for — the same read-back
+                // `resize_in_place` does, for the same reason. `set_active_mode` deliberately falls
+                // back to the highest advertised refresh <= requested rather than lose the client's
+                // resolution, and `wait_mode_settled` verifies the RESOLUTION only, so `settled`
+                // says nothing about the refresh. Storing the request would make `mon.mode` claim a
+                // rate the display is not running: `output_for` hands the capturer that as
+                // `preferred_mode` (the encoder then paces to a rate the output never reaches),
+                // `/display/state` reports it, and the next Reconfigure diffs against it — a client
+                // re-requesting the rate it actually has would pay a needless resize, while one
+                // re-requesting the phantom rate takes the plain JOIN branch and never tries again.
+                mode = committed_mode_or(added.target_id, mode);
 
                 // EXPERIMENTAL `pnp_disable_monitors`, second selector (ANY topology): monitors
                 // that are connected but NOT part of the desktop — the standby TV/monitor the
@@ -1507,29 +1605,10 @@ impl VirtualDisplayManager {
                 "in-place mode set did not commit within 1.5s (advertised after {advertised_ms} ms)"
             );
         }
-        // Record what actually COMMITTED, not what was asked for. `set_active_mode` deliberately
-        // falls back to the highest advertised refresh <= requested rather than lose the client's
-        // resolution, so `mon.mode = mode` claimed a rate the display might not be running — and
-        // `mon.mode` is what the next resize diffs against and what `/display/state` reports.
-        let committed = pf_win_display::win_display::active_mode(mon.target_id);
-        let landed = match committed {
-            Some((w, h, hz)) => Mode {
-                width: w,
-                height: h,
-                refresh_hz: hz,
-            },
-            // The settle above already verified the resolution; if the read-back races we still
-            // know the size took, so trust the request rather than leaving `mon.mode` stale.
-            None => mode,
-        };
-        if landed.refresh_hz != mode.refresh_hz {
-            tracing::info!(
-                requested_hz = mode.refresh_hz,
-                committed_hz = landed.refresh_hz,
-                "in-place resize: the OS committed a different refresh than requested (the driver \
-                 does not advertise it) — recording what it actually runs"
-            );
-        }
+        // Record what actually COMMITTED, not what was asked for — see [`committed_mode_or`], which
+        // the fresh-create and re-arrival paths share with this one so all three store the same
+        // truth: `mon.mode` is what the next resize diffs against and what `/display/state` reports.
+        let landed = committed_mode_or(mon.target_id, mode);
         tracing::info!(
             advertised_ms,
             settle_ms = settle_start.elapsed().as_millis() as u64,
@@ -1607,7 +1686,7 @@ impl VirtualDisplayManager {
         // values passed by value — no borrow crosses the call.
         // SAFETY (both ADDs): `dev` is the live control handle; `render_pin`/`client_hdr` are owned
         // `Copy`/`Option` values passed by value — no borrow crosses the call.
-        let (added, mode, rollback_err) = match unsafe {
+        let (added, mut mode, rollback_err) = match unsafe {
             self.driver
                 .add_monitor(dev, mode, render_pin, slot, client_hdr, old.hw_cursor)
         } {
@@ -1646,9 +1725,9 @@ impl VirtualDisplayManager {
             }
         };
         self.ensure_pinger();
-        // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival).
-        // SAFETY: CCD FFI over a `Copy` target id, under the `state` lock.
-        let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
+        // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival). Under the
+        //    `state` lock, as its topology-mutator discipline requires.
+        let gdi_name = self.resolve_target_gdi(added.target_id);
         match &gdi_name {
             Some(n) => {
                 tracing::info!(
@@ -1659,9 +1738,9 @@ impl VirtualDisplayManager {
                 // ADD only advertises the mode; force it active so DXGI/IDD captures the new size.
                 set_active_mode(n, mode);
                 // 4. Re-isolate the composited set with the NEW target replacing the old — preserving
-                //    the group's first-member restore snapshot.
-                // SAFETY: CCD FFI over borrowed Copy target ids, under the `state` lock.
-                unsafe { self.reisolate_after_swap(inner, added.target_id) };
+                //    the group's first-member restore snapshot. Under the `state` lock (the caller
+                //    holds it and lent us `inner`), as its topology-mutator discipline requires.
+                self.reisolate_after_swap(inner, added.target_id);
                 // Topology settle before capture reopens: verified-state wait, ceiling = the old
                 // fixed 1500 ms sleep (latency plan P0.2 — the re-arrival twin).
                 let settle_start = std::time::Instant::now();
@@ -1671,6 +1750,12 @@ impl VirtualDisplayManager {
                     verified = settled,
                     "re-arrival topology settle (verified-state wait)"
                 );
+                // Store what COMMITTED, not what was asked for — the settle above verifies the
+                // resolution only, so it is no evidence about the refresh (see
+                // [`committed_mode_or`]). Doing this here rather than at the `Monitor` construction
+                // below keeps it on the arm where a path actually exists: with no GDI name there is
+                // no committed mode to read, and the request stands.
+                mode = committed_mode_or(added.target_id, mode);
             }
             None => tracing::warn!(
                 "re-arrival target {} not yet an active display path (auto-activate, EXTEND preset \
@@ -1708,9 +1793,11 @@ impl VirtualDisplayManager {
     /// old slot has already been removed from the map by the caller, so `inner.target_ids()` is the
     /// surviving siblings; the new target joins them.
     ///
-    /// # Safety
-    /// Drives the CCD topology FFI; call under the `state` lock.
-    unsafe fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: u32) {
+    /// Call under the `state` lock — it commits a new CCD topology, so it must not interleave with
+    /// another slot transition's commit. A *serialization* requirement, not a soundness one: every
+    /// helper it reaches (`isolate_displays_ccd_seam`, `set_virtual_primary_ccd`) is a safe fn, so
+    /// this body performs no unsafe operation. (`&mut MgrInner` already proves the lock is held.)
+    fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: u32) {
         use crate::policy::Topology;
         match topology_action() {
             Topology::Exclusive => {
