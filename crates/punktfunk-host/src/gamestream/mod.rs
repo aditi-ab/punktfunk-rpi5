@@ -174,6 +174,9 @@ pub struct AppState {
     pub pairing: pairing::Pairing,
     /// Pinned (paired) client certificate DERs — the post-pair allow-list.
     pub paired: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The ENet control port's lifecycle gate (rust-safety WP0): 47999 is bound only while
+    /// `paired` is non-empty — see [`control::sync`] / [`sync_control`].
+    pub(crate) control_gate: control::Gate,
     /// The active launch session (set by `/launch`, consumed by RTSP/media).
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
     /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
@@ -282,6 +285,7 @@ impl AppState {
             identity,
             pairing: pairing::Pairing::new(),
             paired: std::sync::Mutex::new(load_paired()),
+            control_gate: control::Gate::new(),
             launch: std::sync::Mutex::new(None),
             stream: std::sync::Mutex::new(None),
             audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
@@ -295,6 +299,14 @@ impl AppState {
             stats,
         }
     }
+}
+
+/// Reconcile the ENet control port to the paired-client list — bound iff at least one pairing
+/// exists (rust-safety WP0; see [`control::sync`]). A crate-visible wrapper so callers outside
+/// `gamestream` (the management API's unpair) can reach it past the private `control` module.
+/// A no-op unless `serve` armed the gate (`--gamestream`).
+pub(crate) fn sync_control(state: &Arc<AppState>) -> Result<()> {
+    control::sync(state)
 }
 
 /// Run the host (blocks): mDNS, the nvhttp servers, and the management REST API.
@@ -392,7 +404,13 @@ pub fn serve(
                 None
             };
             rtsp::spawn(state.clone()).context("start RTSP server")?;
-            control::spawn(state.clone()).context("start ENet control server")?;
+            // WP0 (rust-safety): the ENet control port is the host's one pre-auth-reachable
+            // unsafe surface (`rusty_enet` is a transpiled C stack), so it binds only while a
+            // pairing exists — a never-paired host on a hostile LAN exposes no ENet at all.
+            // Pairing is HTTPS on nvhttp and never touches 47999; phase 4 re-syncs the port the
+            // moment the first client pins, so it is up before that client can `/launch`.
+            state.control_gate.enable();
+            sync_control(&state).context("start ENet control server")?;
             tracing::info!(
                 port = native.port,
                 "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"

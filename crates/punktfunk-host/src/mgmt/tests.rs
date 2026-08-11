@@ -763,6 +763,22 @@ async fn status_reflects_runtime_state() {
 
 #[tokio::test]
 async fn paired_clients_list_and_unpair() {
+    // Unpair PERSISTS (save_paired → paired.json in the config dir), so point the config dir
+    // at a throwaway tempdir — this test must never rewrite the dev box's real pairing store.
+    // The guard restores the previous value even if an assertion below panics.
+    struct EnvGuard(Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PUNKTFUNK_CONFIG_DIR", v),
+                None => std::env::remove_var("PUNKTFUNK_CONFIG_DIR"),
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
+    std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path());
+
     let state = test_state();
     let app = test_app(state.clone(), None);
 
@@ -803,6 +819,15 @@ async fn paired_clients_list_and_unpair() {
     let (_, body) = send(&app, get_req("/api/v1/clients")).await;
     assert_eq!(body, serde_json::json!([]));
     assert_eq!(send(&app, del(fingerprint)).await.0, StatusCode::NOT_FOUND);
+
+    // The unpair persisted: paired.json in the (test-scoped) config dir holds the emptied
+    // list — a restart must not resurrect the pairing (it would re-open the control port).
+    // (`PUNKTFUNK_CONFIG_DIR` is used verbatim — no `punktfunk` subdirectory appended.)
+    let disk = std::fs::read(tmp.path().join("paired.json")).expect("unpair persisted paired.json");
+    assert_eq!(
+        serde_json::from_slice::<Vec<Vec<u8>>>(&disk).unwrap(),
+        Vec::<Vec<u8>>::new()
+    );
 }
 
 #[tokio::test]

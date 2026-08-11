@@ -76,8 +76,10 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
 
 /// Unpair a client
 ///
-/// Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer
-/// does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
+/// Removes the client's certificate from the pairing store (persisted — the removal survives a
+/// host restart). Removing the last pairing also closes the GameStream ENet control port
+/// (UDP 47999), which is only bound while at least one pairing exists. Caveat: the nvhttp TLS
+/// layer does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
 /// client cert — a planned hardening step), so until that lands this removes the client
 /// from the listing without severing its ability to reconnect.
 #[utoipa::path(
@@ -110,6 +112,17 @@ pub(crate) async fn unpair_client(
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {
+        // Persist the removal — without this the unpair lasted only until the next host
+        // restart, which now also matters below: a resurrected pairing would silently
+        // re-open the control port.
+        crate::gamestream::save_paired(&paired);
+        drop(paired);
+        // The last pairing going away closes the ENet control port (rust-safety WP0). A
+        // no-op while other pairings remain — or on a native-only host, where the gate is
+        // never armed.
+        if let Err(e) = crate::gamestream::sync_control(&st.app) {
+            tracing::warn!(error = %format!("{e:#}"), "control port sync after unpair failed");
+        }
         tracing::info!(fingerprint, "management API: client unpaired");
         StatusCode::NO_CONTENT.into_response()
     } else {

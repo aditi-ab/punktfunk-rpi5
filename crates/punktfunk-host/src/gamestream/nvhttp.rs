@@ -389,7 +389,15 @@ async fn h_pair(
     } else if let Some(v) = q.get("serverchallengeresp") {
         st.pairing.serverchallengeresp(&st.identity, &uniqueid, v)
     } else if let Some(v) = q.get("clientpairingsecret") {
-        st.pairing.clientpairingsecret(&uniqueid, v, &st.paired)
+        let r = st.pairing.clientpairingsecret(&uniqueid, v, &st.paired);
+        // Phase 4 may just have pinned the FIRST pairing — bring the ENet control port up now
+        // (idempotent; rust-safety WP0) so this client's imminent /launch finds the control
+        // stream listening. Moonlight connects control before video, so "eventually up" would
+        // be an aborted session.
+        if let Err(e) = super::sync_control(&st) {
+            tracing::warn!(error = %format!("{e:#}"), "control port sync after pairing failed");
+        }
+        r
     } else {
         Ok(pair_error_xml())
     };

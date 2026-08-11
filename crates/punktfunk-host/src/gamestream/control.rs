@@ -20,7 +20,12 @@
 //! `hex::decode(rikey)`. We auto-detect the exact scheme via [`decrypt_control`] on the first
 //! packet that authenticates, since GCM gives no partial credit.
 //!
-//! Runs on its own native thread for the host's lifetime.
+//! Runs on its own native thread — but only while at least one client is paired. `rusty_enet`
+//! is a c2rust-style transpile of C ENet (raw-pointer arithmetic, manual allocation), and its
+//! fragment reassembly / peer state machine run BEFORE the AES-GCM decrypt below — the host's
+//! only pre-authentication unsafe surface (rust-safety WP0). Pairing itself never touches
+//! 47999 (the PIN ceremony is HTTPS on nvhttp), so [`sync`] keeps the port closed until the
+//! first pairing lands and tears it down when the last one is removed.
 
 use super::{AppState, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
@@ -29,12 +34,93 @@ use punktfunk_core::input::InputEvent;
 use punktfunk_core::quic::HdrMeta;
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Bind the ENet control host on 47999 and service it forever on a dedicated thread.
-pub fn spawn(state: Arc<AppState>) -> Result<()> {
+/// Lifecycle gate for the control port (rust-safety WP0): binds 47999 only while the
+/// paired-client list is non-empty, so a never-paired host exposes no ENet at all.
+pub(crate) struct Gate {
+    /// Set once by `serve` when the GameStream planes are enabled (`--gamestream`). Without it
+    /// [`sync`] is a no-op — the management API's unpair endpoint also runs on native-only
+    /// hosts, and those must never bind a GameStream port.
+    enabled: AtomicBool,
+    /// The live listener; `None` = port closed. The mutex serializes concurrent reconciles
+    /// (two pairings in quick succession must not double-bind), and the bind/teardown
+    /// decision re-reads the paired list inside it so a pair racing an unpair cannot leave
+    /// the port in the wrong state.
+    running: Mutex<Option<Running>>,
+}
+
+impl Gate {
+    pub(crate) fn new() -> Gate {
+        Gate {
+            enabled: AtomicBool::new(false),
+            running: Mutex::new(None),
+        }
+    }
+
+    /// Arm the gate — [`sync`] stays a no-op until this is called (from `serve`'s
+    /// GameStream branch, the single existing source of truth for "compat planes on").
+    pub(crate) fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A bound control port being serviced: the stop signal plus the thread observing it.
+struct Running {
+    /// Tells the service thread to say goodbye to a connected peer and exit (closing the
+    /// socket with it).
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Reconcile the control port to the paired-client list: bound while at least one pairing
+/// exists, closed when none remain. Idempotent and race-free (see [`Gate::running`]); call it
+/// wherever the paired list changes — startup, pairing phase 4, unpair.
+pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
+    let gate = &state.control_gate;
+    if !gate.enabled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut slot = gate.running.lock().unwrap_or_else(|e| e.into_inner());
+    // Reap a listener whose thread died (a panic would otherwise leave a Running that
+    // serves nobody and blocks every future rebind).
+    if slot.as_ref().is_some_and(|r| r.thread.is_finished()) {
+        if let Some(r) = slot.take() {
+            let _ = r.thread.join();
+        }
+    }
+    let want = !state
+        .paired
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    match (slot.is_some(), want) {
+        (false, true) => {
+            *slot = Some(spawn(state.clone())?);
+            Ok(())
+        }
+        (true, false) => {
+            let r = slot.take().expect("slot checked non-empty");
+            r.stop.store(true, Ordering::SeqCst);
+            // Join before returning: it guarantees the socket is closed before a re-pair can
+            // ask for a rebind. Bounded — the loop ticks every 2 ms, plus a ~100 ms farewell
+            // flush when a client was connected — and unpair-all is a rare operator action.
+            let _ = r.thread.join();
+            tracing::info!(
+                port = CONTROL_PORT,
+                "ENet control torn down — no paired clients remain"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Bind the ENet control host on 47999 and service it on a dedicated thread until `stop`.
+fn spawn(state: Arc<AppState>) -> Result<Running> {
     let socket = UdpSocket::bind(("0.0.0.0", CONTROL_PORT)).context("bind control UDP")?;
     socket
         .set_nonblocking(true)
@@ -52,7 +138,9 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
     .map_err(|e| anyhow!("ENet host init: {e:?}"))?;
     tracing::info!(port = CONTROL_PORT, "ENet control listening");
 
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_seen = stop.clone();
+    let thread = std::thread::Builder::new()
         .name("punktfunk-control".into())
         .spawn(move || {
             // GCM scheme detected from the first authenticating packet; reused thereafter.
@@ -83,6 +171,33 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             // has to go out *because* the session ended could no longer be sealed.
             let mut last_key: Option<[u8; 16]> = None;
             loop {
+                // WP0 teardown: the last pairing was removed while we were live. Tell a
+                // connected client the session is over — termination + disconnect, the same
+                // farewell the host-side session end below uses — rather than vanish on it,
+                // flush briefly so the disconnect actually reaches the wire, then end the
+                // session and exit. Dropping `host` closes the socket.
+                if stop_seen.load(Ordering::SeqCst) {
+                    if let Some(pid) = peer {
+                        if let (Some(scheme), Some(key)) = (detected, last_key) {
+                            let pt = termination_plaintext();
+                            let wire = encrypt_control(&key, &scheme, host_seq, &pt);
+                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
+                            {
+                                tracing::warn!(error = ?e, "control: termination send failed");
+                            }
+                        }
+                        host.peer_mut(pid).disconnect_later(0);
+                        // Bounded flush: enough ticks for ENet to emit the termination and
+                        // the disconnect handshake; we are exiting either way.
+                        for _ in 0..50 {
+                            while matches!(host.service(), Ok(Some(_))) {}
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    state.end_session("control stream stopped — last pairing removed");
+                    tracing::info!(port = CONTROL_PORT, "control: stopped (no paired clients)");
+                    return;
+                }
                 loop {
                     match host.service() {
                         Ok(Some(event)) => match event {
@@ -282,7 +397,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             }
         })
         .context("spawn control thread")?;
-    Ok(())
+    Ok(Running { stop, thread })
 }
 
 /// Decode the lost-frame range from an invalidate-reference-frames (0x0301) control message: two

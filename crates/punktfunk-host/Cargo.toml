@@ -105,7 +105,12 @@ futures-util = "0.3"
 # Webhook signing (X-Punktfunk-Signature: sha256=<hex HMAC>) for operator hooks; pairs with
 # the existing sha2. Already in the lockfile transitively.
 hmac = "0.12"
-rusty_enet = "0.4"
+# GameStream control-stream ENet — a c2rust-style transpile of C ENet (158 unsafe sites; raw
+# pointer arithmetic, manual allocation). Its port binds only while a pairing exists (rust-safety
+# WP0, gamestream/control.rs), but the crate stays a transpiled C stack on the paired-client path:
+# pinned EXACTLY so a bump is a deliberate, reviewed act rather than a lockfile refresh, and left
+# to the cargo-audit job (audit.yml) to flag advisories against it.
+rusty_enet = "=0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Management/control-plane REST API + OpenAPI (control pane, M2). `axum_extras` wires

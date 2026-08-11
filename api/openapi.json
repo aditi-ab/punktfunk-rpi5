@@ -53,7 +53,7 @@
           "clients"
         ],
         "summary": "Unpair a client",
-        "description": "Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer\ndoes not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed\nclient cert — a planned hardening step), so until that lands this removes the client\nfrom the listing without severing its ability to reconnect.",
+        "description": "Removes the client's certificate from the pairing store (persisted — the removal survives a\nhost restart). Removing the last pairing also closes the GameStream ENet control port\n(UDP 47999), which is only bound while at least one pairing exists. Caveat: the nvhttp TLS\nlayer does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed\nclient cert — a planned hardening step), so until that lands this removes the client\nfrom the listing without severing its ability to reconnect.",
         "operationId": "unpairClient",
         "parameters": [
           {
