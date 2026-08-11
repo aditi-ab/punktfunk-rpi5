@@ -337,6 +337,24 @@ pub fn stop_all() {
 /// end-game-on-session-end policy sees an intent rather than a network drop. (Before this, a
 /// management stop was indistinguishable from a client vanishing, which left the display lingering
 /// for a session nobody was coming back to.)
+/// Signals the live native sessions belonging to `fp_hex` (lowercase hex cert SHA-256) to tear
+/// down **deliberately** — the unpair path's revocation reaching a mid-stream client, which must
+/// not keep streaming just because it was already connected when its pairing was removed.
+/// Matching is by the registry's client label, which for every pairable client is the
+/// fingerprint's 12-hex-char prefix (an anonymous/TOFU session carries an IP label and never
+/// matches — it has no pairing to revoke). Returns how many sessions were signalled.
+pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
+    let mut n = 0;
+    for s in registry().lock().unwrap().iter() {
+        if s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()) {
+            s.quit.store(true, Ordering::SeqCst);
+            s.stop.store(true, Ordering::SeqCst);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn stop_all_quit() {
     for s in registry().lock().unwrap().iter() {
         s.quit.store(true, Ordering::SeqCst);
@@ -355,6 +373,42 @@ pub fn force_idr_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let guard = register(Registration {
+            mode: Arc::new(AtomicU64::new(0)),
+            bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
+            codec: Codec::H265,
+            stop: stop.clone(),
+            quit: quit.clone(),
+            force_idr: Arc::new(AtomicBool::new(false)),
+            client: client.into(),
+            client_name: None,
+            hdr: false,
+            ttff_ms: Arc::new(AtomicU32::new(0)),
+            last_resize_ms: Arc::new(AtomicU32::new(0)),
+            game: None,
+        });
+        (guard, stop, quit)
+    }
+
+    /// Unpair must revoke a LIVE session — matched by the client label (the fingerprint's
+    /// 12-hex-char prefix), deliberately (quit + stop), and precisely: another client's session
+    /// and an anonymous (IP-labelled) session stay untouched.
+    #[test]
+    fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
+        let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let (_g1, stop1, quit1) = fake_session(&fp[..12]);
+        let (_g2, stop2, _q2) = fake_session("112233445566"); // a different paired client
+        let (_g3, stop3, _q3) = fake_session("192.168.1.50"); // anonymous: IP label, never matches
+
+        assert_eq!(stop_by_fingerprint(fp), 1);
+        assert!(stop1.load(Ordering::SeqCst) && quit1.load(Ordering::SeqCst));
+        assert!(!stop2.load(Ordering::SeqCst));
+        assert!(!stop3.load(Ordering::SeqCst));
+    }
 
     /// A Moonlight client's game has no live-session entry to hang off, so without the compat-plane
     /// slot it would be missing from `/status` entirely — the Dashboard would show a stream with no

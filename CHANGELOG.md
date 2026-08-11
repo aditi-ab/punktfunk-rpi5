@@ -42,6 +42,17 @@ never touches the port, so a never-paired `--gamestream` host exposes no ENet at
 the management API's unpair endpoint never persisted (`save_paired` was missing), so an unpair
 lasted only until the next restart — fixed. `rusty_enet` is now pinned `=0.4.0`.
 
+**Unpair is now a complete revocation, on both planes.** Beyond the persistence fix above, an
+unpair used to leave the revoked client's LIVE session streaming until the client chose to
+leave. Now: unpairing a GameStream client whose certificate owns the active launch ends that
+session (the client gets the standard TERMINATION+disconnect, and unpair-all still closes the
+ENet port); unpairing a native client deliberately stops its live punktfunk/1 session(s)
+(matched by certificate fingerprint — anonymous/TOFU sessions are unaffected, they have no
+pairing to revoke). The unpair endpoint's long-standing docstring caveat ("removes the client
+from the listing without severing its ability to reconnect") is retired: TLS-level handshakes
+still complete by design, but authorization is per-request and a live session no longer
+survives its own revocation.
+
 ### GameStream is now a cargo feature (compile-time isolation — packager-visible)
 
 The Moonlight-compat planes (nvhttp pairing, RTSP, the ENet control stream, `_nvstream` mDNS,

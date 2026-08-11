@@ -79,11 +79,12 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
 /// Unpair a client
 ///
 /// Removes the client's certificate from the pairing store (persisted — the removal survives a
-/// host restart). Removing the last pairing also closes the GameStream ENet control port
-/// (UDP 47999), which is only bound while at least one pairing exists. Caveat: the nvhttp TLS
-/// layer does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
-/// client cert — a planned hardening step), so until that lands this removes the client
-/// from the listing without severing its ability to reconnect.
+/// host restart). Revocation is complete: a LIVE GameStream session owned by this certificate is
+/// ended (the client gets the standard TERMINATION+disconnect), and removing the last pairing
+/// also closes the ENet control port (UDP 47999), which is only bound while at least one pairing
+/// exists. The nvhttp TLS layer still completes a handshake with any well-formed client cert BY
+/// DESIGN (authorization is per-request via the paired-fingerprint check) — an unpaired client
+/// that reconnects is rejected at every post-pair endpoint.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",
@@ -119,6 +120,23 @@ pub(crate) async fn unpair_client(
         // re-open the control port.
         crate::gamestream::save_paired(&paired);
         drop(paired);
+        // Revocation reaches a LIVE session too: a mid-stream client whose pairing was just
+        // removed must not keep streaming until it chooses to leave. Clearing the launch makes
+        // the ENet control thread give it the standard TERMINATION+disconnect farewell. (An
+        // owner-less launch — the cert was unreadable at /launch — cannot be attributed and is
+        // left to the port teardown below when this was the last pairing.)
+        let removed_fp: Option<[u8; 32]> = hex::decode(&fingerprint)
+            .ok()
+            .and_then(|v| v.try_into().ok());
+        let live_owner = st
+            .app
+            .launch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .and_then(|l| l.owner_fp);
+        if removed_fp.is_some() && removed_fp == live_owner {
+            st.app.quit_session("client unpaired");
+        }
         // The last pairing going away closes the ENet control port (rust-safety WP0). A
         // no-op while other pairings remain — or on a native-only host, where the gate is
         // never armed.

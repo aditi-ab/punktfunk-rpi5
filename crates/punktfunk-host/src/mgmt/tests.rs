@@ -828,6 +828,27 @@ async fn paired_clients_list_and_unpair() {
         .unwrap();
     assert_eq!(send(&app, bad).await.0, StatusCode::BAD_REQUEST);
 
+    // A LIVE session owned by this client: unpair is a revocation, so it must END the session,
+    // not just delist the cert — before this, a mid-stream client kept streaming after unpair
+    // until it chose to leave.
+    {
+        use std::sync::atomic::Ordering;
+        // owner_fp is the sha256 of the cert DER — exactly the bytes `fingerprint` encodes.
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&hex::decode(&fingerprint).unwrap());
+        state.streaming.store(true, Ordering::SeqCst);
+        *state.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: Some(owner),
+        });
+    }
+
     // Unpair (uppercase hex must match too) → 204, list empties, second delete → 404.
     let del = |fp: String| {
         axum::http::Request::delete(format!("/api/v1/clients/{fp}"))
@@ -838,6 +859,18 @@ async fn paired_clients_list_and_unpair() {
         send(&app, del(fingerprint.to_uppercase())).await.0,
         StatusCode::NO_CONTENT
     );
+    {
+        use std::sync::atomic::Ordering;
+        assert!(
+            state.launch.lock().unwrap().is_none(),
+            "unpair must end the revoked client's live session"
+        );
+        assert!(!state.streaming.load(Ordering::SeqCst));
+        assert!(
+            state.quit.load(Ordering::SeqCst),
+            "the teardown is deliberate (quit), not a drop"
+        );
+    }
     let (_, body) = send(&app, get_req("/api/v1/clients")).await;
     assert_eq!(body, serde_json::json!([]));
     assert_eq!(send(&app, del(fingerprint)).await.0, StatusCode::NOT_FOUND);
