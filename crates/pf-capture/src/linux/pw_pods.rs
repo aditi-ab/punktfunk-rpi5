@@ -377,7 +377,8 @@ pub(super) fn build_dmabuf_buffers() -> Result<Vec<u8>> {
 /// Request the compositor attach `SPA_META_Cursor` to each buffer, so the pointer travels as
 /// metadata (position + an occasional bitmap) instead of being burned into the frame. Paired
 /// with the portal's `CursorMode::Metadata`; producers that don't support it simply don't
-/// attach it (harmless). Size is a range up to a 256×256 bitmap — bigger than any real cursor.
+/// attach it (harmless). Size is a range up to a 1024×1024 bitmap — see the note on `max` below for
+/// why this is not the "bigger than any real cursor" 256² it used to be.
 pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
     fn meta_size(w: u32, h: u32) -> i32 {
         (std::mem::size_of::<spa::sys::spa_meta_cursor>()

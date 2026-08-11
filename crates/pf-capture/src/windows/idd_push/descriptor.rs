@@ -6,7 +6,6 @@
 
 use super::*;
 
-/// Creates + owns the shared ring; yields the driver's frames as [`FramePayload::D3d11`].
 /// The display descriptor the capture loop follows: live HDR state + active resolution of the
 /// virtual target.
 #[derive(Clone, Copy, PartialEq, Eq)]

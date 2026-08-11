@@ -55,8 +55,10 @@ struct Shape {
     serial: u64,
 }
 
-/// Off-thread GDI cursor poller. Samples `GetCursorInfo` at ~60 Hz, rasterises the `HCURSOR` only
-/// when its handle value changes, and publishes a ready [`pf_frame::CursorOverlay`] snapshot; the
+/// Off-thread GDI cursor poller. Samples `GetCursorInfo` every [`Self::INTERVAL`] (4 ms, ~250 Hz —
+/// see that constant for why 16 ms was the bug), rasterises the `HCURSOR` when its handle value
+/// changes and when [`Self::EXTENT_PROBE`] catches a resize under a STABLE handle, and publishes a
+/// ready [`pf_frame::CursorOverlay`] snapshot; the
 /// capture thread's per-tick cost is one uncontended mutex read + an `Arc` clone
 /// (same split as [`DescriptorPoller`], and for the same reason: user32/gdi32 calls have no place
 /// on the capture/encode thread).
@@ -186,7 +188,6 @@ fn run(
             // against, and this poller outlives all of them. `None` keeps the last good value — a
             // transient CCD failure must not park the pointer at a `(0, 0, 0, 0)` rect, which would
             // report every position invisible.
-            //
             let fresh = pf_win_display::win_display::source_desktop_rect(target_id);
             if let Some(fresh) = fresh {
                 if fresh != rect {
@@ -302,7 +303,14 @@ fn run(
                 serial: s.serial,
                 hot_x: s.hot_x,
                 hot_y: s.hot_y,
-                visible: showing && in_rect,
+                // `handle != 0` is part of "visible", not just of "worth rasterising": `SetCursor(NULL)`
+                // — how a game or a video player hides the pointer for its own window — leaves
+                // `CURSOR_SHOWING` set with a NULL `hCursor`. Judging on the flags alone published
+                // `visible: true` carrying the last shape we rasterised, so the composite path blended a
+                // ghost arrow into a game that had hidden its cursor, and the forward path told the
+                // client to draw one too. Every rasterise gate below already tests this; the published
+                // verdict has to agree with them.
+                visible: showing && in_rect && handle != 0,
             }
         });
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = overlay;

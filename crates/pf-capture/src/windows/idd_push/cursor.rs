@@ -42,7 +42,9 @@ impl CursorShared {
     /// the section itself (owned by `self`); the caller duplicates it into the WUDFHost.
     pub(super) fn create(target_id: u32) -> Result<CursorShared> {
         // SAFETY: plain FFI. Unnamed pagefile-backed section, host-lifetime owned; the view is
-        // mapped once and unmapped never (the capturer's life = the session's life).
+        // mapped once here and unmapped exactly once by `MappedSection::drop` (which unmaps before
+        // closing the mapping handle). No borrow into the view outlives the `MappedSection`: every
+        // access goes through `&self` accessors on the owner.
         let section = unsafe {
             let map = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,

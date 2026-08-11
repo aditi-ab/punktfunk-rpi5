@@ -554,9 +554,11 @@ impl HdrP010Converter {
             let mut ps_uv = None;
             device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
             let sd = D3D11_SAMPLER_DESC {
-                // POINT: the Y pass samples a single texel centre exactly, and the UV pass does its OWN
-                // 2x2 box average via 4 explicit taps at texel centres (offset half a texel). Point
-                // sampling keeps each tap exact; the averaging is in the shader, not the sampler.
+                // POINT: the Y pass samples a single texel centre exactly, and the UV pass takes its OWN
+                // two explicit taps on the 2x2 block's LEFT column (left-cositing) and averages them.
+                // Point sampling keeps each tap exact; the averaging is in the shader, not the sampler.
+                // (It was a 4-tap CENTER-sited 2x2 box until that was found to shift chroma by half a
+                // luma pixel — see `HDR_P010_UV_PS`.)
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
                 AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
