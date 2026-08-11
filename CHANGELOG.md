@@ -42,6 +42,27 @@ never touches the port, so a never-paired `--gamestream` host exposes no ENet at
 the management API's unpair endpoint never persisted (`save_paired` was missing), so an unpair
 lasted only until the next restart — fixed. `rusty_enet` is now pinned `=0.4.0`.
 
+### GameStream is now a cargo feature (compile-time isolation — packager-visible)
+
+The Moonlight-compat planes (nvhttp pairing, RTSP, the ENet control stream, `_nvstream` mDNS,
+the compat media path) are gated behind a new **`gamestream` cargo feature — default ON**, so
+every stock package is behaviorally identical (GameStream stays runtime-opt-in via
+`--gamestream` / `PUNKTFUNK_GAMESTREAM`). Building with
+`--no-default-features --features pyrowave` produces the **hardened native-only host**:
+
+- **no `rusty_enet`** — the c2rust-transpiled C ENet stack (158 unsafe sites) is absent from
+  the binary, provably (`cargo tree -i rusty_enet` finds nothing; CI asserts it);
+- **no `rsa`** — the native planes run on the P-256 identity (above), and the legacy-identity
+  fallback is a pem-only read (rustls/ring serves an existing RSA cert without the crate), so
+  the accepted Marvin advisory (RUSTSEC-2023-0071) no longer applies to native-only builds;
+- ~6,700 lines of Moonlight protocol code gone; `serve --gamestream` (or the env knob) against
+  such a binary **refuses to start** with a clear error rather than serving less than asked;
+- the native-only management API (and its OpenAPI document) has no GameStream PIN endpoints
+  (`/api/v1/pair`, `/api/v1/pair/pin`); everything else — including the paired-client list and
+  unpair — is identical, so consoles work unchanged.
+
+The checked-in `api/openapi.json` remains the default-features document.
+
 ### The identity split — the native planes get their own (P-256) host identity
 
 One RSA-2048 identity historically served every plane, because Moonlight mandates RSA and the

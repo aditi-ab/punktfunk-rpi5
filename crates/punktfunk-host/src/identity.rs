@@ -73,16 +73,37 @@ pub fn load_or_adopt(np: &crate::native_pairing::NativePairing) -> Result<Native
     }
     // Live native pairings pinned the legacy RSA cert — switching identities now would strand
     // every one of them (the pin is the SHA-256 of the leaf DER). Keep serving what they pinned.
-    tracing::info!(
-        "native identity: keeping the legacy RSA cert — paired native clients pinned it. To \
-         migrate to the P-256 identity: unpair ALL native clients, restart the host, re-pair."
+    // A pem-only read on purpose (WP19): rustls/ring can SERVE an existing RSA cert without the
+    // `rsa` crate, so the native-only build never links it — the crate exists solely behind the
+    // `gamestream` feature (generation + the pairing signer).
+    if let (Ok(c), Ok(k)) = (
+        fs::read_to_string(dir.join("cert.pem")),
+        fs::read_to_string(dir.join("key.pem")),
+    ) {
+        if !c.trim().is_empty() && !k.trim().is_empty() {
+            tracing::info!(
+                "native identity: keeping the legacy RSA cert — paired native clients pinned it. \
+                 To migrate to the P-256 identity: unpair ALL native clients, restart the host, \
+                 re-pair."
+            );
+            return Ok(NativeIdentity {
+                cert_pem: c,
+                key_pem: k,
+            });
+        }
+    }
+    // Degenerate: native pairings exist but the cert they pinned is gone from disk — those
+    // clients are stranded whatever we serve, so mint the P-256 identity and say so.
+    tracing::warn!(
+        "native identity: paired native clients exist but the legacy cert.pem/key.pem they \
+         pinned is missing — minting the P-256 identity; those clients must re-pair"
     );
-    let legacy = crate::gamestream::cert::ServerIdentity::load_or_create()
-        .context("load legacy host identity for the native planes")?;
-    Ok(NativeIdentity {
-        cert_pem: legacy.cert_pem,
-        key_pem: legacy.key_pem,
-    })
+    let (cert_pem, key_pem) = generate()?;
+    pf_paths::write_secret_file(&key_path, key_pem.as_bytes())
+        .with_context(|| format!("write {}", key_path.display()))?;
+    pf_paths::write_secret_file(&cert_path, cert_pem.as_bytes())
+        .with_context(|| format!("write {}", cert_path.display()))?;
+    Ok(NativeIdentity { cert_pem, key_pem })
 }
 
 /// Throwaway in-memory identity — nothing touches the config dir (tests).
@@ -197,11 +218,30 @@ mod tests {
         let _env = EnvGuard::set(tmp.path());
         let np = empty_store(tmp.path());
         np.add("old-client", &"ab".repeat(32)).unwrap();
+        // The legacy identity that client pinned. Contents are opaque to the fallback — it
+        // serves the files verbatim (pem-only read; no `rsa` crate involved, WP19).
+        std::fs::write(tmp.path().join("cert.pem"), "legacy cert pem").unwrap();
+        std::fs::write(tmp.path().join("key.pem"), "legacy key pem").unwrap();
         let id = load_or_adopt(&np).unwrap();
         // The legacy RSA identity is what that client pinned — it must be what we serve…
-        let legacy = crate::gamestream::cert::ServerIdentity::load_or_create().unwrap();
-        assert_eq!(id.cert_pem, legacy.cert_pem);
+        assert_eq!(id.cert_pem, "legacy cert pem");
         // …and no P-256 identity may be minted while the pin is live.
         assert!(!tmp.path().join("native-cert.pem").exists());
+    }
+
+    /// Degenerate: pairings exist but the legacy cert they pinned is gone — those clients are
+    /// stranded whatever we serve, so the P-256 identity is minted rather than failing to start.
+    #[test]
+    fn mints_p256_when_legacy_files_vanished() {
+        let _serial = super::CONFIG_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let np = empty_store(tmp.path());
+        np.add("stranded-client", &"cd".repeat(32)).unwrap();
+        let id = load_or_adopt(&np).unwrap();
+        assert!(id.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(tmp.path().join("native-cert.pem").exists());
     }
 }

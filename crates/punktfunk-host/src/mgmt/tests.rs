@@ -3,8 +3,10 @@
 
 use super::*;
 use crate::encode::Codec;
+#[cfg(feature = "gamestream")]
+use crate::gamestream::cert::ServerIdentity;
 use crate::gamestream::tls::{PeerAddr, PeerCertFingerprint};
-use crate::gamestream::{cert::ServerIdentity, Host, LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::gamestream::{Host, LaunchSession, HTTPS_PORT, HTTP_PORT};
 use axum::body::Body;
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
@@ -32,8 +34,15 @@ fn test_state() -> Arc<AppState> {
         os_chain: "linux/arch/steamos".into(),
         os_name: "SteamOS".into(),
     };
-    let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
-    Arc::new(AppState::new(host, identity, test_stats()))
+    #[cfg(feature = "gamestream")]
+    {
+        let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
+        Arc::new(AppState::new(host, identity, test_stats()))
+    }
+    #[cfg(not(feature = "gamestream"))]
+    {
+        Arc::new(AppState::new(host, test_stats()))
+    }
 }
 
 // The mgmt API now always requires auth, so the router always has a token. A test that passes
@@ -638,10 +647,10 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
     assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
 
     // The carve-outs answer 403 (authenticated but not authorized), not 401.
-    for (method, path) in [
+    #[cfg_attr(not(feature = "gamestream"), allow(unused_mut))]
+    let mut carveouts = vec![
         (Method::GET, "/api/v1/hooks"),
         (Method::PUT, "/api/v1/hooks"),
-        (Method::GET, "/api/v1/pair"),
         (Method::POST, "/api/v1/native/pair/arm"),
         (Method::GET, "/api/v1/native/pending"),
         (Method::DELETE, "/api/v1/clients/aabbcc"),
@@ -652,7 +661,11 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         (Method::POST, "/api/v1/store/uninstall"),
         (Method::POST, "/api/v1/store/runtime"),
         (Method::PUT, "/api/v1/store/sources/evil"),
-    ] {
+    ];
+    // The PIN route only exists in GameStream-featured builds (WP19).
+    #[cfg(feature = "gamestream")]
+    carveouts.push((Method::GET, "/api/v1/pair"));
+    for (method, path) in carveouts {
         let (status, body) = send(&app, plugin_req(method.clone(), path)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
         assert!(body["error"].as_str().unwrap().contains("plugin token"));
@@ -789,8 +802,10 @@ async fn paired_clients_list_and_unpair() {
     let state = test_state();
     let app = test_app(state.clone(), None);
 
-    // Pin the host's own cert DER as a stand-in client.
-    let (_, pem) = x509_parser::pem::parse_x509_pem(state.identity.cert_pem.as_bytes()).unwrap();
+    // Pin a throwaway cert DER as a stand-in client (the native ephemeral identity — CN
+    // "punktfunk" — so this works in both build flavors; WP19).
+    let stand_in = crate::identity::ephemeral().unwrap();
+    let (_, pem) = x509_parser::pem::parse_x509_pem(stand_in.cert_pem.as_bytes()).unwrap();
     let der = pem.contents.clone();
     let fingerprint = hex::encode(Sha256::digest(&der));
     // Isolate from any real paired store on the dev box: AppState::new loads
@@ -837,6 +852,7 @@ async fn paired_clients_list_and_unpair() {
     );
 }
 
+#[cfg(feature = "gamestream")]
 #[tokio::test]
 async fn submit_pin_validates_and_requires_pending_pairing() {
     let app = test_app(test_state(), None);
@@ -1292,6 +1308,15 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             .join("/")
     }
 
+    // The GameStream PIN routes exist only in gamestream-featured builds (WP19) — drop their
+    // rows from the expectation when the feature is off (`cfg!` keeps both sides type-checked).
+    let expected: Vec<(&str, &str, bool, bool)> = EXPECTED
+        .iter()
+        .copied()
+        .filter(|(_, p, _, _)| {
+            cfg!(feature = "gamestream") || !matches!(*p, "/api/v1/pair" | "/api/v1/pair/pin")
+        })
+        .collect();
     let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
     let mut live: Vec<(String, String)> = Vec::new();
     for (path, ops) in doc["paths"].as_object().unwrap() {
@@ -1305,7 +1330,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
     // 1. Every LIVE route has a classification row. A new route fails here until it gets one.
     for (method, path) in &live {
         assert!(
-            EXPECTED
+            expected
                 .iter()
                 .any(|(m, p, _, _)| m == method && p == path),
             "route {method} {path} has no lane classification — add a row to EXPECTED in this test \
@@ -1314,14 +1339,14 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         );
     }
     // 2. No STALE rows: a removed route must not leave a classification behind claiming coverage.
-    for (method, path, _, _) in EXPECTED {
+    for (method, path, _, _) in &expected {
         assert!(
             live.iter().any(|(m, p)| m == method && p == path),
             "EXPECTED lists {method} {path}, which is not in the live route table — remove the row"
         );
     }
     // 3. The gates agree with the classification, on both lanes.
-    for (method, path, plugin_ok, cert_ok) in EXPECTED {
+    for (method, path, plugin_ok, cert_ok) in &expected {
         let m = Method::from_bytes(method.as_bytes()).unwrap();
         let concrete = concrete(path);
         assert_eq!(
@@ -1377,7 +1402,10 @@ fn plugin_allowlist_matches_whole_segments_only() {
 }
 
 /// The OpenAPI document lists every route with a unique operationId (codegen relies
-/// on both), and the checked-in copy is current.
+/// on both), and the checked-in copy is current. Feature-gated: `api/openapi.json` IS the
+/// default-features document — a native-only build's spec (no PIN routes) is intentionally
+/// different and not checked in (WP19).
+#[cfg(feature = "gamestream")]
 #[test]
 fn openapi_document_is_complete_and_checked_in() {
     let json = openapi_json();
@@ -1765,7 +1793,10 @@ async fn gpu_endpoints_list_and_validate() {
 async fn logs_endpoint_pages_by_cursor() {
     let app = test_app(test_state(), None);
 
-    // The ring is a process-wide singleton — start from wherever its cursor currently is.
+    // The ring is a process-wide singleton — start from wherever its cursor currently is. Other
+    // tests in this binary legitimately log (e.g. the identity tests' adopt/migrate lines), so a
+    // page can carry THEIR entries interleaved with ours: assert on OUR markers within the page,
+    // never on the page being exactly ours (that raced once and failed the suite).
     let (s, json) = send(&app, get_req("/api/v1/logs")).await;
     assert_eq!(s, StatusCode::OK);
     let start = json["next"].as_u64().unwrap();
@@ -1777,18 +1808,32 @@ async fn logs_endpoint_pages_by_cursor() {
     let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={start}"))).await;
     assert_eq!(s, StatusCode::OK);
     let entries = json["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0]["msg"], "first");
-    assert_eq!(entries[0]["level"], "WARN");
-    assert_eq!(json["next"].as_u64().unwrap(), start + 2);
+    let ours: Vec<_> = entries
+        .iter()
+        .filter(|e| e["target"] == "mgmt::tests")
+        .collect();
+    assert_eq!(ours.len(), 2, "both markers on the page, in order");
+    assert_eq!(ours[0]["msg"], "first");
+    assert_eq!(ours[0]["level"], "WARN");
+    assert_eq!(ours[1]["msg"], "second");
+    let next = json["next"].as_u64().unwrap();
+    assert_eq!(
+        next,
+        start + entries.len() as u64,
+        "the cursor advances by exactly the entries served"
+    );
     assert_eq!(json["dropped"], false);
 
-    // Nothing newer → empty page, cursor unchanged.
-    let after = start + 2;
-    let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={after}"))).await;
+    // Nothing newer than the served cursor at the time we ask — the page may again carry a
+    // concurrent test's fresh entries, but never our (already-served) markers a second time.
+    let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={next}"))).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(json["entries"].as_array().unwrap().is_empty());
-    assert_eq!(json["next"].as_u64().unwrap(), after);
+    assert!(json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["target"] != "mgmt::tests"));
+    assert!(json["next"].as_u64().unwrap() >= next);
 }
 
 // ------------------------------------------------------------------ events (SSE)

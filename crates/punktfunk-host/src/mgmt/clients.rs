@@ -19,6 +19,7 @@ pub(crate) struct PairedClient {
 }
 
 /// Pairing-flow status.
+#[cfg(feature = "gamestream")]
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PairingStatus {
     /// True while a pairing handshake is parked waiting for the user's PIN.
@@ -26,6 +27,7 @@ pub(crate) struct PairingStatus {
 }
 
 /// The PIN Moonlight displays during pairing.
+#[cfg(feature = "gamestream")]
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SubmitPin {
     /// 1–16 ASCII digits (Moonlight shows 4).
@@ -136,6 +138,7 @@ pub(crate) async fn unpair_client(
 /// Pairing-flow status
 ///
 /// Poll this to know when to prompt the user for the PIN Moonlight displays.
+#[cfg(feature = "gamestream")]
 #[utoipa::path(
     get,
     path = "/pair",
@@ -156,6 +159,7 @@ pub(crate) async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json
 ///
 /// Delivers the PIN the Moonlight client is displaying, completing the out-of-band half
 /// of the pairing handshake.
+#[cfg(feature = "gamestream")]
 #[utoipa::path(
     post,
     path = "/pair/pin",
