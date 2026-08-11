@@ -111,6 +111,10 @@ pub async fn run(
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     gamestream_enabled: bool,
+    // The identity split (`crate::identity`): the mgmt API must present the SAME identity as
+    // the native QUIC plane — paired clients hold ONE pinned fingerprint for both — so the
+    // caller resolves it once and hands it to both.
+    identity: crate::identity::NativeIdentity,
 ) -> Result<()> {
     // Close out any update-intent record a previous apply left behind (the update reports its
     // own outcome across its own restart — update/jobs.rs). Once per boot, before serving.
@@ -123,11 +127,10 @@ pub async fn run(
         .token
         .filter(|t| !t.trim().is_empty())
         .context("management API has no token — internal error: parse_serve must provide one")?;
-    // Serve over HTTPS with the host's persistent identity (the cert clients already pin) and
-    // OPTIONAL client-cert auth: a paired native client presents its cert (authorized by
-    // fingerprint, no token), a browser presents none and uses the bearer token. See `require_auth`.
-    let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
-        .context("load host identity for the management API TLS")?;
+    // Serve over HTTPS with the native identity (the cert clients already pin — see the
+    // `identity` parameter) and OPTIONAL client-cert auth: a paired native client presents its
+    // cert (authorized by fingerprint, no token), a browser presents none and uses the bearer
+    // token. See `require_auth`.
     let tls = crate::gamestream::tls::server_config_optional_client(
         &identity.cert_pem,
         &identity.key_pem,

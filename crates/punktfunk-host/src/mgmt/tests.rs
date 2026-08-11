@@ -761,6 +761,10 @@ async fn status_reflects_runtime_state() {
     assert!(!body.to_string().contains("gcm"));
 }
 
+// Holding `CONFIG_DIR_TEST_LOCK` across the awaits is the POINT: the env override must cover
+// the whole test body, and `#[tokio::test]` is a single-threaded runtime — nothing else can
+// need the executor while we hold it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn paired_clients_list_and_unpair() {
     // Unpair PERSISTS (save_paired → paired.json in the config dir), so point the config dir
@@ -775,6 +779,9 @@ async fn paired_clients_list_and_unpair() {
             }
         }
     }
+    let _serial = crate::identity::CONFIG_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
     std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path());
@@ -881,9 +888,16 @@ async fn blank_token_rejected() {
         token: Some("   ".into()),
         plugin_token: None,
     };
-    let err = run(test_state(), opts, None, test_stats(), false)
-        .await
-        .unwrap_err();
+    let err = run(
+        test_state(),
+        opts,
+        None,
+        test_stats(),
+        false,
+        crate::identity::ephemeral().unwrap(),
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("no token"), "{err}");
 }
 

@@ -62,6 +62,9 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
+// Network-facing on the secure default host (see the forbid block at `mod mgmt` below).
+#[forbid(unsafe_code)]
+mod identity;
 // The input-injection backends live in the `pf-inject` subsystem crate (plan §W6); this shim keeps
 // every existing `crate::inject::*` path valid (the native/gamestream input planes + devtest consume
 // the trait, factory, and per-device backends through it).

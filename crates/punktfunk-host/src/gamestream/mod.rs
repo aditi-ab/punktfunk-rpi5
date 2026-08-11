@@ -336,6 +336,10 @@ pub fn serve(
         crate::native_pairing::NativePairing::load_with(None, None, false)
             .context("native pairing store")?,
     );
+    // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
+    // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
+    // the two planes cannot race the first-run adoption. See `crate::identity`.
+    let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
@@ -422,9 +426,16 @@ pub fn serve(
                     mgmt,
                     Some(np.clone()),
                     stats.clone(),
-                    gamestream
+                    gamestream,
+                    native_ident.clone(),
                 ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+                crate::native::serve(
+                    native_opts,
+                    native.mgmt_port,
+                    np,
+                    stats.clone(),
+                    native_ident
+                ),
             )
             .map(|_| ())
         } else {
@@ -440,9 +451,16 @@ pub fn serve(
                     mgmt,
                     Some(np.clone()),
                     stats.clone(),
-                    gamestream
+                    gamestream,
+                    native_ident.clone(),
                 ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+                crate::native::serve(
+                    native_opts,
+                    native.mgmt_port,
+                    np,
+                    stats.clone(),
+                    native_ident
+                ),
             )
             .map(|_| ())
         };
@@ -460,6 +478,13 @@ fn hostname_string() -> String {
     if let Some(n) = pf_host_config::config().host_name.as_deref() {
         return sanitize_display_name(n);
     }
+    machine_hostname()
+}
+
+/// The raw machine hostname (no `PUNKTFUNK_HOST_NAME` override, no display sanitizing) — what a
+/// certificate SAN or a DNS-ish consumer wants, as opposed to [`hostname_string`]'s free-text
+/// display name.
+pub(crate) fn machine_hostname() -> String {
     #[cfg(target_os = "windows")]
     if let Some(n) = std::env::var_os("COMPUTERNAME") {
         let s = n.to_string_lossy().trim().to_string();
