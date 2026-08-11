@@ -65,6 +65,16 @@ impl VirtualDisplay for MirrorDisplay {
         self.hw_cursor
     }
 
+    fn poolable_now(&self) -> bool {
+        // Never. `create` below always reports `DisplayOwnership::External` — we did not make this
+        // head and must not keep it — so the registry never pools a mirror, and the trait's `true`
+        // default was a claim this backend cannot honour on any request. It costs nothing today
+        // (the reuse lookup can only miss: no `"mirror"` entry ever enters the pool), but it is the
+        // answer the registry consults BEFORE `create` gets to declare ownership, so leaving it
+        // optimistic means the one pre-create statement of intent contradicts the post-create fact.
+        false
+    }
+
     fn create(&mut self, _mode: Mode) -> Result<VirtualOutput> {
         // Resolve the pin against the live head list FIRST: it yields the geometry the input anchor
         // needs, and it turns "that monitor is gone" into one clear error before any compositor
@@ -101,7 +111,14 @@ impl VirtualDisplay for MirrorDisplay {
             Compositor::Gamescope => {
                 crate::gamescope::stream_existing_output(&target.connector, self.hw_cursor)?
             }
-            #[allow(unreachable_patterns)]
+            // Gated to non-Linux (`monitors::list`'s shape), NOT the bare `#[allow(unreachable_
+            // patterns)] other =>` this replaced: with it, a newly added `Compositor` variant fell
+            // through to a runtime bail on the very platform that would define it, silently, in the
+            // one place that decides which backends can mirror a head. Cfg'd out on Linux, the match
+            // is exhaustive and the new variant is a compile error here instead. The arm exists at
+            // all only because every arm above is itself `cfg(target_os = "linux")` — this module is
+            // Linux-only today, so it is a placeholder that keeps the shape honest if that changes.
+            #[cfg(not(target_os = "linux"))]
             other => bail!(
                 "mirroring an existing monitor is not supported on the {} backend",
                 other.id()
@@ -172,11 +189,28 @@ fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) 
     Ok(())
 }
 
-/// Does this compositor's `managed` flag mean "ours, for certain"? KWin outputs carry the
-/// `Virtual-punktfunk` prefix we chose, and Hyprland's are `PF-N` — both ours by construction.
-/// Sway's `HEADLESS-N` is sway's own generic naming, so it is a hint, not proof.
+/// Does this compositor's `managed` flag mean "ours, for certain"?
+///
+/// EXHAUSTIVE on purpose, unlike the `matches!` it used to be. This is the one table in the crate
+/// whose un-listed default is the UNSAFE direction: a `false` sends [`check_mirrorable`] down the
+/// warn-and-proceed branch, which for a backend that DOES name its managed outputs by construction
+/// (the KWin/Hyprland shape — i.e. both backends that have the property today) means streaming
+/// punktfunk's own virtual display back to the client, the capture loop
+/// `one_of_our_own_virtual_displays_is_refused` exists to forbid. Adding a `Compositor` variant must
+/// therefore be a compile error here rather than a silent opt-out. (Contrast
+/// [`Compositor::needs_live_session`], also a `matches!` — its omitted default is the safe one.)
 fn names_ours_conclusively(compositor: Compositor) -> bool {
-    matches!(compositor, Compositor::Kwin | Compositor::Hyprland)
+    match compositor {
+        // Ours by construction: KWin outputs carry the `Virtual-punktfunk-<id>` name the identity
+        // module hands the backend, Hyprland's are `PF-N`. Nothing else mints those names.
+        Compositor::Kwin | Compositor::Hyprland => true,
+        // Sway names EVERY headless output `HEADLESS-N`, its own included; Mutter's virtual monitors
+        // carry no distinguishing name at all (it won't take one from us); and gamescope's
+        // `list_monitors` only ever reports the real DRM head a Game Mode session drives, so
+        // `managed` is never even set there. A hint at most — refusing would break the legitimate
+        // headless-sway setup this feature serves.
+        Compositor::Wlroots | Compositor::Mutter | Compositor::Gamescope => false,
+    }
 }
 
 /// mHz → whole Hz for [`VirtualOutput::preferred_mode`], never 0 (the negotiation treats 0 as
@@ -250,6 +284,28 @@ mod tests {
         assert!(check_mirrorable(&m, Compositor::Wlroots).is_ok());
         // Hyprland's `PF-N` IS our naming, so it stays conclusive.
         assert!(check_mirrorable(&m, Compositor::Hyprland).is_err());
+    }
+
+    /// Pin the conclusive-naming table per variant. The answer is a safety decision whose wrong
+    /// direction is the SILENT one: a backend that mints punktfunk-named outputs but is missing
+    /// from the `true` arm takes the warn-and-proceed branch and streams our own virtual display
+    /// back to the client. Exhaustive `match` + this test = the new variant has to be considered.
+    #[test]
+    fn the_conclusive_naming_table_is_pinned_per_backend() {
+        assert!(names_ours_conclusively(Compositor::Kwin));
+        assert!(names_ours_conclusively(Compositor::Hyprland));
+        assert!(!names_ours_conclusively(Compositor::Wlroots));
+        assert!(!names_ours_conclusively(Compositor::Mutter));
+        assert!(!names_ours_conclusively(Compositor::Gamescope));
+    }
+
+    /// The registry asks `poolable_now` BEFORE `create` gets to report ownership, so the two must
+    /// agree: a mirror's `create` always reports `External` (we did not make this head), therefore
+    /// no mirror request is ever poolable.
+    #[test]
+    fn a_mirrored_head_is_never_registry_poolable() {
+        let vd = MirrorDisplay::new(Compositor::Kwin, "DP-2".into()).unwrap();
+        assert!(!vd.poolable_now());
     }
 
     /// A head listed but not driving a mode (enabled yet modeless) would negotiate a 0x0 stream.

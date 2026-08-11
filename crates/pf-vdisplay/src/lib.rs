@@ -8,17 +8,36 @@
 //! * **KWin** — privileged `zkde_screencast_unstable_v1::stream_virtual_output` ([`kwin`]).
 //! * **wlroots/Sway** — `swaymsg create_output` + `output mode --custom` ([`wlroots`]).
 //! * **Mutter/GNOME** — D-Bus `RemoteDesktop` + `ScreenCast.RecordVirtual` ([`mutter`]).
+//! * **Hyprland** — `hyprctl output create headless` + the xdg-desktop-portal-hyprland ScreenCast
+//!   portal. Its own backend, not a wlroots dialect (`design/hyprland-support.md` D1).
+//! * **gamescope** — three sub-modes behind one backend ([`GamescopeRoute`]): bare
+//!   **spawn** of a nested headless session, host-**managed** `gamescope-session-plus`/SteamOS
+//!   takeover, and **attach** to a session somebody else started. By far the largest backend here,
+//!   because it owns session lifecycle rather than just minting an output.
+//! * **monitor mirror** — no virtual display at all: stream a PHYSICAL head the compositor already
+//!   has (the `PUNKTFUNK_CAPTURE_MONITOR` pin), reporting [`DisplayOwnership::External`] so none of
+//!   the lifecycle policy is applied to someone else's screen.
+//! * **Windows pf-vdisplay** — the all-Rust IddCx driver + its `manager`, the sole Windows backend.
+//!
+//! No list of file sizes here: it rots. The rule instead — the Linux backends plus the Windows
+//! manager are the bulk of this crate, and the platform-neutral half (`policy`, `registry`,
+//! `lifecycle`, `layout`, `identity`, `admission`, `monitors`, `session`, `routing`, `proc`,
+//! `portal_config`) is the minority that every platform's CI actually compiles and tests.
 //!
 //! [`VirtualDisplay::create`] returns a [`VirtualOutput`]: the PipeWire node to capture plus an
 //! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
 //! consumes the node via the host `capture::capture_virtual_output`.
 
-// `dead_code` is ENFORCED on Linux, where ~10k of this crate's ~17k lines live. Off elsewhere for
-// one structural reason: `proc`, `session`, `routing`, `monitors` and `lifecycle` are declared
-// unconditionally but exist to serve the Linux backends, so on Windows/macOS most of their surface
-// is legitimately unreferenced. Scoping it this way rather than crate-wide keeps the platform that
-// owns the code honest. (Was a bare crate-wide allow whose "scaffold, defined ahead of the target
-// that uses them" rationale had stopped being true.)
+// `dead_code` is ENFORCED on Linux, where the clear majority of this crate lives — every compositor
+// backend under `vdisplay/linux/` plus everything only they consume, which is roughly half the crate
+// on its own and the half that carries the session-lifecycle risk. Off elsewhere for one structural
+// reason: `proc`, `session`, `routing`, `monitors` and `lifecycle` are declared unconditionally but
+// exist to serve the Linux backends, so on Windows/macOS most of their surface is legitimately
+// unreferenced. Note what that waives: the Windows backend (`vdisplay/windows/`, itself thousands of
+// lines) gets NO dead-code enforcement, so an orphaned Windows path has to be found by review.
+// Scoping it this way rather than crate-wide still keeps the platform that owns most of the code
+// honest. (Was a bare crate-wide allow whose "scaffold, defined ahead of the target that uses them"
+// rationale had stopped being true.)
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -200,9 +219,16 @@ impl Compositor {
 /// The compositor backends usable on this host *right now*: gamescope wherever its binary is
 /// installed (it spawns a nested session — independent of the running desktop), plus the live
 /// session's own compositor (KWin / Mutter / wlroots / Hyprland) when the host runs inside it.
-/// Cheap, side-effect-free probes — safe to call per management request. A concrete client
-/// preference is validated against this set before it's honored (see the punktfunk/1 handshake's
-/// resolution).
+/// Side-effect-free, but **not cheap, and not memoized**: every call re-walks `/proc`
+/// ([`detect_active_session`]), and each backend probe that the live/pinned short-circuit below does
+/// not exempt does real work — `gamescope::is_available` FORKS `gamescope --version`,
+/// `kwin::is_available` does a Wayland registry roundtrip, `wlroots`/`hyprland` read a socket path
+/// and `mutter` a D-Bus name. So a console polling `/host/compositors` on a KDE box still forks a
+/// gamescope per poll, on a thread the caller must therefore not assume is cheap to block (mgmt
+/// calls it inline on the async runtime). Callers wanting a hot path should cache the answer;
+/// treating this as free is what the "cheap, safe per management request" claim this doc used to
+/// make invited. A concrete client preference is validated against this set before it's honored
+/// (see the punktfunk/1 handshake's resolution).
 ///
 /// The **live session is the primary signal**, ahead of each backend's own probe. Those probes read
 /// the process env (`XDG_CURRENT_DESKTOP` for Mutter, `WAYLAND_DISPLAY` for KWin's registry
@@ -311,7 +337,12 @@ pub fn detect() -> Result<Compositor> {
         if let Some(c) = compositor_for_kind(detect_active_session().kind) {
             return Ok(c);
         }
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        // Under [`ENV_LOCK`]: `apply_session_env` `set_var`s — and, for a dead session,
+        // `remove_var`s — this very key from another session's `spawn_blocking`, and a glibc
+        // `getenv` concurrent with a `setenv` is the `environ` realloc data race ENV_LOCK exists
+        // for (it is UB regardless of which key each side touches, so "different variable" is no
+        // defence). Read-then-drop: only the read needs serializing.
+        let desktop = with_env_lock(|| std::env::var("XDG_CURRENT_DESKTOP"))
             .unwrap_or_default()
             .to_ascii_uppercase();
         if desktop.contains("KDE") {
@@ -559,13 +590,18 @@ pub fn effective_topology() -> policy::Topology {
         return resolve_topology(e.topology);
     }
     // Unconfigured: honor a legacy operator env if present (a host runs one desktop backend, so at
-    // most one of these is set), else the Auto default.
-    let legacy = [
-        "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",
-        "PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY",
-    ]
-    .iter()
-    .find_map(|k| std::env::var(k).ok());
+    // most one of these is set), else the Auto default. Read under [`ENV_LOCK`] like every other
+    // env read on the session-setup path: this runs inside `create`, concurrent with another
+    // session's `apply_session_env` `set_var`s, and glibc's `environ` realloc makes a racing
+    // `getenv` UB no matter that these particular keys are ones nobody writes.
+    let legacy = with_env_lock(|| {
+        [
+            "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",
+            "PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY",
+        ]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+    });
     match legacy.as_deref().map(str::trim) {
         Some("1" | "true" | "yes" | "on") => policy::Topology::Exclusive,
         Some("0" | "false" | "no" | "off") => policy::Topology::Extend,
@@ -637,19 +673,79 @@ pub fn gamescope_composites_cursor() -> bool {
 ///
 /// A host-managed `gamescope-session-plus` / SteamOS session counts as a spawn: we own its
 /// `GAMESCOPE_BIN` wrapper (or PATH shim), so the flags are ours.
+///
+/// **Ask the resolved ROUTE, never the env.** This used to test the spawn-vs-attach term by reading
+/// `PUNKTFUNK_GAMESCOPE_NODE`, which worked only while `apply_input_env` PUBLISHED its decision into
+/// that key. Phase 2.3 deleted the publication (routing.rs: "Nothing is written back to the two
+/// knobs") and left the key as an operator override — rung 2 of a 6-rung ladder — so the session
+/// that reaches [`GamescopeRoute::Attach`] at the ladder's rung 5 instead (a foreign gamescope on an
+/// infra-less box), and the monitor-pin mirror that never consults the ladder at all, both answered
+/// "ours". The two consequences were silent and unrecoverable: the punktfunk/1 Welcome fixed the
+/// session at 10-bit BT.2020/PQ against a foreign 8-bit SDR composite, and the host skipped the
+/// XFixes cursor reconstruction for a session whose gamescope was never given
+/// `--pipewire-composite-cursor` — a stream with no pointer in it at all.
+///
+/// **Two residual gaps**, both of which need a route this crate cannot see from here:
+///
+/// * the ladder is re-run with `dedicated_launch = false`, since a capability query carries no
+///   session context — so it cannot see the one input that would move a session from
+///   Managed/Attach to Spawn;
+/// * `create_managed_session` can degrade a resolved `Managed` to an ATTACH at create time (a
+///   mask-fragile DM it may not stop — it then mirrors the box's own game-mode session). That
+///   happens after this answer is due, and the ladder re-run here still says `Managed`, so such a
+///   session is still credited with flags it does not own.
+///
+/// The first fails closed; the second does not. Both close the same way: give these two functions
+/// the session's own [`GamescopeRoute`] (which `SessionContext` already carries) and have the
+/// backend report the degrade — a change to two public signatures and every host call site.
 fn gamescope_ours_and(#[cfg(target_os = "linux")] probe: fn() -> bool) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let attaching = with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some());
-        !attaching && probe()
+        // `probe` first: it is memoized (the `--version` banner is parsed once per process), while
+        // the route resolution walks `/proc` for a foreign gamescope. On a box with a stock
+        // gamescope the answer is already `false` and the walk never happens.
+        probe()
+            && !session_is_a_foreign_gamescope(
+                capture_monitor().is_some(),
+                resolve_gamescope_route(Compositor::Gamescope, false).as_ref(),
+            )
     }
     #[cfg(not(target_os = "linux"))]
     false
 }
 
-// Platform-neutral per-client stable display-id map (Stage 3): Windows seeds the monitor EDID +
-// ConnectorIndex from the id; KWin names its output from it. `allow(dead_code)` because only Windows
-// consumes it in non-test code today — the KWin wiring is the next Stage-3 step.
+/// Pure predicate behind [`gamescope_ours_and`]: is the gamescope this session will use one
+/// SOMEBODY ELSE started, whose spawn flags we therefore cannot vouch for?
+///
+/// Two ways to land on a foreign session, and both must count:
+///
+/// * `mirror_pinned` — a `PUNKTFUNK_CAPTURE_MONITOR` pin routes [`open`] to the mirror backend,
+///   whose gamescope arm attaches to the node the RUNNING session already publishes without
+///   consulting the sub-mode ladder at all. On a Bazzite/SteamOS box that session is Game Mode's,
+///   i.e. by definition not ours.
+/// * a [`GamescopeRoute::Attach`] verdict — however the ladder reached it (operator override,
+///   or the foreign-gamescope rung).
+///
+/// [`GamescopeRoute::Managed`] is NOT foreign: the managed takeover starts the session through our
+/// own `GAMESCOPE_BIN` wrapper / PATH shim, so its flags are the ones we chose.
+///
+/// `mirror_pinned` is judged from the pin alone, not from whether the mirror actually took: [`open`]
+/// degrades a pin to the virtual-display path when the session reports no physical heads, and a
+/// pinned box that lands there is called foreign here although it will bare-spawn. That is the
+/// fail-closed direction — a capability withheld from a session that could have had it — and the
+/// alternative (enumerating heads from a capability query) would put a compositor roundtrip on a
+/// path that must answer before anything exists to ask.
+fn session_is_a_foreign_gamescope(mirror_pinned: bool, route: Option<&GamescopeRoute>) -> bool {
+    mirror_pinned || matches!(route, Some(GamescopeRoute::Attach { .. }))
+}
+
+// Platform-neutral per-client stable display-id map: Windows seeds the monitor EDID serial +
+// IddCx ConnectorIndex from the id; KWin names its output `Virtual-punktfunk-<id>` (kwin.rs's
+// `resolve_slot` call); Mutter cannot carry the id into its virtual monitor at all, so it keys the
+// host-persisted `ScaleMap` on the same identity key. All three are production call sites, so the
+// `allow(dead_code)` below no longer stands for "unwired yet" (it did when only Windows consumed the
+// map); it now covers whatever helpers no CURRENT backend reaches. Worth re-testing without it —
+// that has to happen on a Linux build, since this is the platform where dead_code is enforced.
 #[allow(dead_code)]
 #[path = "vdisplay/identity.rs"]
 pub(crate) mod identity;
@@ -733,6 +829,48 @@ mod tests {
         );
         // No live session → no backend; the caller turns this into a handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
+    }
+
+    /// The spawn-vs-attach term behind [`gamescope_hdr_available`] /
+    /// [`gamescope_composites_cursor`]. Both answers are IRREVOCABLE once the punktfunk/1 Welcome
+    /// has gone out (bit depth is fixed there; the session plan's cursor decision feeds the encoder
+    /// open), so an over-promise here is not recoverable at runtime — which is why the regression
+    /// this pins mattered: the term used to be read off `PUNKTFUNK_GAMESCOPE_NODE`, a key nothing
+    /// writes any more, so every foreign session answered "ours".
+    #[test]
+    fn only_a_session_we_start_can_promise_gamescope_capabilities() {
+        // Attach — however the ladder got there — is somebody else's session: unknown spawn flags.
+        assert!(session_is_a_foreign_gamescope(
+            false,
+            Some(&GamescopeRoute::Attach {
+                node: "auto".into()
+            })
+        ));
+        assert!(session_is_a_foreign_gamescope(
+            false,
+            Some(&GamescopeRoute::Attach { node: "42".into() })
+        ));
+        // A bare spawn is ours by definition; so is the managed takeover (it starts gamescope
+        // through our own GAMESCOPE_BIN wrapper / PATH shim, so the flags are the ones we chose).
+        assert!(!session_is_a_foreign_gamescope(
+            false,
+            Some(&GamescopeRoute::Spawn)
+        ));
+        assert!(!session_is_a_foreign_gamescope(
+            false,
+            Some(&GamescopeRoute::Managed {
+                client: "steam".into()
+            })
+        ));
+        // No route at all = not a gamescope session; the binary probe alone then decides.
+        assert!(!session_is_a_foreign_gamescope(false, None));
+        // A monitor pin bypasses the ladder entirely (mirror backend → attach to the node the
+        // RUNNING session publishes), so it is foreign whatever the ladder would have said.
+        assert!(session_is_a_foreign_gamescope(true, None));
+        assert!(session_is_a_foreign_gamescope(
+            true,
+            Some(&GamescopeRoute::Spawn)
+        ));
     }
 
     #[test]

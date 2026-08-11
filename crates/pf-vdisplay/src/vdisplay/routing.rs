@@ -77,29 +77,22 @@ fn pick_gamescope_mode(
     }
 }
 
-/// Route input to match the chosen video backend (they must not diverge), via the highest-priority
-/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope the sub-mode ladder
-/// ([`pick_gamescope_mode`]) selects **managed** (a host-managed session at the client's mode —
-/// tears the TV's autologin down on connect, restored on a debounced idle; only where
-/// session-plus/SteamOS actually exists), **attach** (mirror a running gamescope at its own mode;
-/// explicit via `PUNKTFUNK_GAMESCOPE_ATTACH`/`PUNKTFUNK_GAMESCOPE_NODE`, or the fallback for a
-/// foreign gamescope on an infra-less box), or **bare spawn** (a per-session headless gamescope
-/// nesting the session's launch command — the plain-distro default). `PUNKTFUNK_GAMESCOPE_MANAGED`
-/// forces managed over all of it.
-/// The operator's gamescope overrides, sampled ONCE — before this module has written anything.
+/// The operator's gamescope overrides, sampled ONCE — at first use, and never written back.
 ///
-/// [`apply_input_env`] both WRITES `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` (to publish the sub-mode it
-/// chose) and READS them as operator overrides. Reading them live therefore fed the ladder its own
-/// previous output: the Attach arm sets `_NODE=auto`, and `node_env` sits at rung 2 of
+/// `apply_input_env` used to both WRITE `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` (to publish the
+/// sub-mode it chose) and READ them as operator overrides. Reading them live therefore fed the
+/// ladder its own previous output: the Attach arm set `_NODE=auto`, and `node_env` sits at rung 2 of
 /// [`pick_gamescope_mode`] — ABOVE `dedicated_launch` at rung 3 — so one Attach decision latched
 /// Attach for the rest of the host's life and silently overrode `game_session=dedicated`. Only rung
 /// 1 (`_MANAGED`) could escape, because the Spawn arm that would clear the keys sits below the rung
 /// that by then always fired.
 ///
 /// Sampling at first use keeps the override's actual meaning — "the operator set this before we
-/// ran" — and makes it immune to our own writes. The live reads that remain
-/// ([`launch_is_nested`], gamescope's `poolable_now`) are deliberate: those consume the PUBLISHED
-/// decision, which is what the keys carry after this function has run.
+/// ran". Nothing publishes these keys any more (see [`resolve_gamescope_route`]): the resolved
+/// decision travels as a [`GamescopeRoute`] VALUE carried on the backend instance, and every
+/// consumer takes it that way — [`launch_is_nested`] by parameter, gamescope's `poolable_now` off
+/// `self.route`, `crate::gamescope_hdr_available` by re-resolving the ladder. A change that
+/// "restores" the write to serve some reader would restore the latch with it.
 #[cfg(target_os = "linux")]
 static OPERATOR_GAMESCOPE: std::sync::OnceLock<OperatorGamescope> = std::sync::OnceLock::new();
 
@@ -138,6 +131,16 @@ fn operator_gamescope() -> &'static OperatorGamescope {
     })
 }
 
+/// Route input to match the chosen video backend (they must not diverge), via the highest-priority
+/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors.
+///
+/// For gamescope the sub-mode ladder ([`pick_gamescope_mode`]) selects **managed** (a host-managed
+/// session at the client's mode — tears the TV's autologin down on connect, restored on a debounced
+/// idle; only where session-plus/SteamOS actually exists), **attach** (mirror a running gamescope at
+/// its own mode; explicit via `PUNKTFUNK_GAMESCOPE_ATTACH`/`PUNKTFUNK_GAMESCOPE_NODE`, or the
+/// fallback for a foreign gamescope on an infra-less box), or **bare spawn** (a per-session headless
+/// gamescope nesting the session's launch command — the plain-distro default).
+/// `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over all of it.
 ///
 /// Returns the resolved [`GamescopeRoute`] when `chosen` is gamescope — the caller must carry it to
 /// the backend instance via `VirtualDisplay::set_gamescope_route`. It is a RETURN VALUE and no
@@ -449,11 +452,12 @@ mod tests {
         assert_eq!(pick(true, false, false, true, false, false, false), Attach);
     }
 
-    /// The ladder must not be able to read back its own output. `apply_input_env`'s Attach arm
-    /// writes `PUNKTFUNK_GAMESCOPE_NODE=auto`, and `node_env` outranks `dedicated_launch` — so when
-    /// the override was read live, one Attach latched Attach for the host's lifetime and silently
-    /// overrode `game_session=dedicated`. Sampling once is what breaks the loop; this pins that the
-    /// sample does not move when the key is written afterwards.
+    /// The ladder must not be able to read back its own output. `apply_input_env`'s Attach arm used
+    /// to write `PUNKTFUNK_GAMESCOPE_NODE=auto`, and `node_env` outranks `dedicated_launch` — so
+    /// while the override was read live, one Attach latched Attach for the host's lifetime and
+    /// silently overrode `game_session=dedicated`. Sampling once is what breaks the loop, and it is
+    /// what makes restoring the write a non-event rather than a relapse; this pins that the sample
+    /// does not move when the key is written afterwards.
     #[test]
     #[cfg(target_os = "linux")]
     fn operator_overrides_do_not_see_our_own_writes() {
