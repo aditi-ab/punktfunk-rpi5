@@ -4,10 +4,14 @@
 //! This is the pure config layer that sits **above** the per-compositor [`VirtualDisplay`](super)
 //! backends: a small set of orthogonal options ([`DisplayPolicy`]) with safe defaults and named
 //! [`Preset`]s, persisted to `<config>/display-settings.json` and editable from the web console.
-//! The lifecycle/registry that *acts* on this policy lands in later stages; **Stage 0** (this file
-//! plus the mgmt endpoints) stands up the surface and wires the two behaviors the existing code can
-//! already express — the Windows monitor linger duration and the Linux "make the streamed output
-//! the sole desktop" topology — through it.
+//! Every axis here is now *acted on*, so nothing in this file is a stored-but-inert knob: `keep_alive`
+//! by the display lifecycle (`lifecycle` + [`super::registry`]), `topology` by each backend's
+//! [`super::effective_topology`] apply, `mode_conflict` by [`super::admission`] before the Welcome,
+//! `identity` by the `identity` slot table (whose carriers are the Windows EDID serial + IddCx
+//! connector index, KWin's per-slot output name and the host-persisted Mutter scale map), and
+//! `layout` by `layout::arrange` — on Linux the *position apply* is KWin-only, everywhere else the
+//! arrangement is the `/display/state` readout. This file plus the mgmt endpoints remain the single
+//! surface the console writes.
 //!
 //! Precedence, mirroring the GPU preference (`console preference > env pin > default`): a present,
 //! valid `display-settings.json` (console-written) **wins**; when it is absent the host keeps its
@@ -43,18 +47,25 @@ pub enum KeepAlive {
     /// Keep the display for `seconds` after the last session leaves, then tear it down; a reconnect
     /// inside the window reuses it.
     Duration {
-        /// Linger window in seconds.
+        /// Linger window in seconds, clamped to `0..=86400` on write (see
+        /// [`DisplayPolicy::sanitized`]): a window longer than a day is `forever` by any honest
+        /// reading, and `u32` seconds is ~136 years — a deadline the reaper would never reach and a
+        /// nonsense `expires_in_ms` in `/display/state`.
         seconds: u32,
     },
     /// Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).
-    /// **Not honored until the display-lifecycle stage** — rejected by the mgmt PUT at Stage 0.
+    /// Honored end-to-end: the registry resolves it to `Release::Pin`, so the display survives every
+    /// disconnect — free it with `POST /display/release` (which force-releases `Pinned` exactly like
+    /// a `Lingering` display). This is what the `gaming-rig` preset selects.
     Forever,
 }
 
 impl Default for KeepAlive {
     fn default() -> Self {
-        // The historical Windows behavior, made explicit; the Linux backends had no linger and map
-        // `Off`/short-duration onto their (nonexistent) keep-alive as a no-op until the lifecycle stage.
+        // The historical Windows behavior, made explicit: 10 s is long enough for a client's own
+        // reconnect (a mode change, a network blip) to reuse the display instead of re-minting it,
+        // short enough that a walk-away leaves no ghost head on the desktop. Every backend now runs
+        // the same lifecycle, so this is the linger on Linux too.
         KeepAlive::Duration { seconds: 10 }
     }
 }
@@ -100,7 +111,8 @@ pub enum Topology {
 }
 
 /// Admission when a *different* client connects while a display/session is already live and asks for
-/// a different mode. Stored at Stage 0; enforced from the mode-conflict admission stage.
+/// a different mode. Enforced by [`super::admission`] before the Welcome is sent, so a `reject` is a
+/// clean handshake error rather than a half-built session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeConflict {
@@ -115,8 +127,9 @@ pub enum ModeConflict {
     Reject,
 }
 
-/// Stable display identity, so desktop environments persist per-display config (KDE scaling). Stored
-/// at Stage 0; carriers wired from the identity stage.
+/// Stable display identity, so desktop environments persist per-display config (KDE scaling). The
+/// slot this resolves to is carried per backend: the Windows EDID serial + IddCx connector index,
+/// KWin's per-slot output name, and the host-persisted Mutter scale map.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Identity {
@@ -130,8 +143,9 @@ pub enum Identity {
     PerClientMode,
 }
 
-/// How group members are arranged in the desktop coordinate space. Stored at Stage 0; applied from
-/// the multi-monitor stage.
+/// How group members are arranged in the desktop coordinate space, resolved by `layout::arrange` —
+/// which both the `/display/state` readout and (on Linux, KWin only) the per-backend position apply
+/// consume, so the answer is computed in exactly one place.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum LayoutMode {
@@ -155,6 +169,11 @@ pub struct Position {
 pub struct Layout {
     #[serde(default)]
     pub mode: LayoutMode,
+    /// Keys are the **canonical decimal** identity-slot id (`"1"`..`"15"`) — the exact string
+    /// `arrange` looks a member up by. [`DisplayPolicy::sanitized`] re-canonicalizes them on write
+    /// (`"01"` → `"1"`) and drops anything that is not a slot id, because a key that never matches is
+    /// a pin the operator can see in the console and in `GET /display/settings` while every session
+    /// silently auto-rows past it.
     #[serde(default)]
     pub positions: BTreeMap<String, Position>,
 }
@@ -201,7 +220,9 @@ pub enum Preset {
 /// single [`EffectivePolicy`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DisplayPolicy {
-    /// Schema version (currently 1) — lets a future field addition migrate rather than reject.
+    /// Schema version (currently 1) — lets a future field addition migrate rather than reject. Read
+    /// at load time ([`DisplayPolicyStore::load_from`] warns when a file claims a version this host
+    /// does not know, then reads it best-effort) and pinned back to the current version on write.
     #[serde(default = "one")]
     pub version: u32,
     #[serde(default)]
@@ -258,6 +279,22 @@ pub struct DisplayPolicy {
     pub capture_monitor: Option<String>,
 }
 
+/// The schema version this host writes and understands. A file carrying anything else is still read
+/// (every field is `#[serde(default)]`, so a newer document degrades to "the axes we know"), but the
+/// mismatch is logged — silently treating a future document as ours is how a migration gets skipped.
+const CURRENT_VERSION: u32 = 1;
+
+/// Upper bound on `KeepAlive::Duration.seconds` (24 h). Anything longer is `forever` in every
+/// practical sense, and the unclamped `u32` a PUT could carry (~136 years) produced a deadline the
+/// lifecycle reaper never reaches plus a ~4.29e12 ms `expires_in_ms` in the `/display/state` readout.
+/// `forever` is the honest way to say "keep it": it is releasable by design via `POST /display/release`.
+const MAX_KEEP_ALIVE_SECS: u32 = 24 * 60 * 60;
+
+/// The highest identity-slot id `identity`'s slot table can ever hand out (its `MAX_ID`) — the upper
+/// bound on a usable [`Layout::positions`] key. Mirrored rather than imported because the slot table
+/// is a private module; a key above it can never match a member and is dropped at write time.
+const MAX_IDENTITY_SLOT: u32 = 15;
+
 fn one() -> u32 {
     1
 }
@@ -268,9 +305,9 @@ fn default_max_displays() -> u32 {
 impl Default for DisplayPolicy {
     fn default() -> Self {
         // Bit-for-bit today's behavior (the `default` preset expanded), so an unconfigured host reads
-        // the same policy the Stage-0 call sites already produce.
+        // the same policy the un-overridden call sites already produce.
         DisplayPolicy {
-            version: 1,
+            version: CURRENT_VERSION,
             preset: Preset::Custom,
             keep_alive: KeepAlive::default(),
             topology: Topology::Auto,
@@ -286,16 +323,28 @@ impl Default for DisplayPolicy {
     }
 }
 
-/// The six resolved fields after preset expansion — what the lifecycle/registry and the Stage-0 call
+/// The six resolved fields after preset expansion — what the lifecycle/registry and the policy call
 /// sites read, and what the mgmt API echoes as the "currently in force" policy. Pure output of
 /// [`DisplayPolicy::effective`].
+///
+/// Every field is `#[serde(default)]` for the same reason [`DisplayPolicy`]'s are: this shape is also
+/// *persisted*, inside each entry of the custom-preset catalog, so a document written before an axis
+/// existed (or by a hand edit that dropped one) must still load. Without the defaults a single
+/// missing `max_displays` failed the whole `Vec<CustomPreset>` deserialize and took the operator's
+/// entire catalog with it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EffectivePolicy {
+    #[serde(default)]
     pub keep_alive: KeepAlive,
+    #[serde(default)]
     pub topology: Topology,
+    #[serde(default)]
     pub mode_conflict: ModeConflict,
+    #[serde(default)]
     pub identity: Identity,
+    #[serde(default)]
     pub layout: Layout,
+    #[serde(default = "default_max_displays")]
     pub max_displays: u32,
 }
 
@@ -322,11 +371,15 @@ impl DisplayPolicy {
         }
     }
 
-    /// Clamp fields to their valid ranges (called on write). `max_displays` to `1..=16` (the
-    /// pf-vdisplay connector ceiling / a sane Linux bound).
+    /// Clamp fields to their valid ranges (called on write, and on load so a hand-edited file gets
+    /// the same treatment as a console PUT). `max_displays` to `1..=16` (the pf-vdisplay connector
+    /// ceiling / a sane Linux bound), the linger window to `MAX_KEEP_ALIVE_SECS`, and the manual
+    /// layout keys to canonical slot ids.
     pub fn sanitized(mut self) -> Self {
-        self.version = 1;
+        self.version = CURRENT_VERSION;
         self.max_displays = self.max_displays.clamp(1, 16);
+        self.keep_alive = clamp_keep_alive(self.keep_alive);
+        self.layout.positions = canonical_positions(std::mem::take(&mut self.layout.positions));
         // A picker that clears its selection sends `""`; that means "no pin", not "match the
         // monitor named empty string" — same normalization the env knob does.
         self.capture_monitor = self
@@ -335,6 +388,60 @@ impl DisplayPolicy {
             .filter(|s| !s.is_empty());
         self
     }
+}
+
+/// Clamp a keep-alive's linger window to `MAX_KEEP_ALIVE_SECS`. Shared by [`DisplayPolicy::sanitized`]
+/// and [`sanitize_preset_fields`] so a custom preset can never smuggle in a window a direct PUT is
+/// refused; `Off`/`Forever` carry no window and pass through untouched.
+fn clamp_keep_alive(keep_alive: KeepAlive) -> KeepAlive {
+    match keep_alive {
+        KeepAlive::Duration { seconds } if seconds > MAX_KEEP_ALIVE_SECS => KeepAlive::Duration {
+            seconds: MAX_KEEP_ALIVE_SECS,
+        },
+        other => other,
+    }
+}
+
+/// Re-key a manual layout table to canonical identity-slot ids, dropping (loudly) what can never
+/// match a member.
+///
+/// `layout::arrange` looks a pin up by `u32::to_string()` — an exact string match — so `"01"`,
+/// `"slot1"`, `" 1"` or `"99"` are accepted by the PUT, echoed back by `GET /display/settings` and
+/// then silently ignored at arrange time, leaving the operator with a manual arrangement that never
+/// takes effect and no signal anywhere. Parsing here makes `"01"` *work* and makes junk visible in
+/// the log at write time rather than invisible at stream time. A key already in canonical form wins
+/// over an equivalent non-canonical spelling of the same slot, so the result never depends on
+/// `BTreeMap` iteration order.
+fn canonical_positions(positions: BTreeMap<String, Position>) -> BTreeMap<String, Position> {
+    use std::collections::btree_map::Entry;
+    let mut out: BTreeMap<String, Position> = BTreeMap::new();
+    for (key, pos) in positions {
+        let id = key.parse::<u32>().ok().filter(|id| {
+            // `identity`'s slot table only ever hands out 1..=MAX_ID; a pin outside that range is
+            // addressed to a display that cannot exist.
+            (1..=MAX_IDENTITY_SLOT).contains(id)
+        });
+        let Some(id) = id else {
+            tracing::warn!(
+                key = %key,
+                "display layout pin keyed by something that is not an identity slot \
+                 (1..={MAX_IDENTITY_SLOT}) — dropping it; it could never have been applied"
+            );
+            continue;
+        };
+        let canonical = id.to_string();
+        let already_canonical = key == canonical;
+        match out.entry(canonical) {
+            Entry::Vacant(v) => {
+                v.insert(pos);
+            }
+            Entry::Occupied(mut o) if already_canonical => {
+                o.insert(pos);
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+    out
 }
 
 impl EffectivePolicy {
@@ -352,7 +459,7 @@ impl EffectivePolicy {
         capture_monitor: Option<String>,
     ) -> DisplayPolicy {
         DisplayPolicy {
-            version: 1,
+            version: CURRENT_VERSION,
             preset: Preset::Custom,
             keep_alive: self.keep_alive,
             topology: self.topology,
@@ -434,29 +541,111 @@ pub fn preset_fields(preset: Preset) -> Option<EffectivePolicy> {
 pub struct DisplayPolicyStore {
     path: PathBuf,
     /// `Some` only when a valid `display-settings.json` was loaded / written — the "console has
-    /// configured this host" signal that gates whether Stage-0 call sites override their historical
-    /// env/default behavior.
+    /// configured this host" signal that gates whether the policy call sites override their
+    /// historical env/default behavior.
     cur: Mutex<Option<DisplayPolicy>>,
+    /// Serializes the whole write transaction (serialize → temp-write → rename → publish to `cur`).
+    /// Without it two concurrent `PUT /display/settings` can rename in one order and publish to
+    /// memory in the other, leaving the file and the in-memory value disagreeing — exactly what
+    /// [`Self::set`]'s contract promises cannot happen. Held *around* the `cur` lock rather than
+    /// instead of it, so a reader (`get`, on the acquire path) never blocks on disk I/O.
+    write: Mutex<()>,
 }
 
 impl DisplayPolicyStore {
-    /// Load from `path`. A missing file ⇒ unconfigured (`None`); a corrupt file ⇒ unconfigured with a
-    /// warning (never fail host startup over a settings file).
+    /// Load from `path`. A missing file ⇒ unconfigured (`None`); a corrupt file ⇒ best-effort
+    /// per-axis salvage, and only a file we cannot make any sense of falls back to unconfigured with
+    /// a warning (never fail host startup over a settings file).
     pub fn load_from(path: PathBuf) -> Self {
         let cur = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<DisplayPolicy>(&bytes) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(),
-                        "display-settings.json unreadable — using built-in defaults: {e}");
-                    None
-                }
-            },
-            Err(_) => None,
+            Ok(bytes) => Self::parse(&path, &bytes),
+            // A settings file that exists but cannot be READ (EACCES after a bad chown, EIO on a
+            // failing disk) is NOT the same thing as an unconfigured host, and the two used to be
+            // folded into one silent `None` — the console's entire configuration reverting to
+            // built-in defaults with nothing in the log to say why. Only NotFound is quiet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(),
+                    "display-settings.json exists but could not be read ({e}) — this host is \
+                     running on BUILT-IN DEFAULTS, not on its configured policy");
+                None
+            }
         };
         DisplayPolicyStore {
             path,
             cur: Mutex::new(cur),
+            write: Mutex::new(()),
+        }
+    }
+
+    /// Parse the settings document, salvaging what we can. Split out of [`Self::load_from`] so the
+    /// recovery rules are unit-tested without touching the filesystem.
+    ///
+    /// Three layers, because the failure that used to discard the whole policy was almost never
+    /// "the file is garbage": (1) the strict parse, which is what a console-written file always
+    /// takes; (2) a `version` check, so a document from a future host is read best-effort but
+    /// *announced* rather than silently treated as ours; (3) a per-axis salvage — every field is
+    /// `#[serde(default)]`, so a member that does not deserialize on its own (an enum variant this
+    /// build has never heard of, a hand-typed `"max_displays": "four"`) is dropped and the other
+    /// eleven survive. Dropping one axis to its default is a much smaller lie than reverting the
+    /// operator's entire configuration.
+    fn parse(path: &std::path::Path, bytes: &[u8]) -> Option<DisplayPolicy> {
+        let value: serde_json::Value = match serde_json::from_slice(bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path.display(),
+                    "display-settings.json is not valid JSON ({e}) — this host is running on \
+                     BUILT-IN DEFAULTS, not on its configured policy");
+                return None;
+            }
+        };
+        let claimed = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(CURRENT_VERSION as u64);
+        if claimed != CURRENT_VERSION as u64 {
+            tracing::warn!(path = %path.display(), claimed, current = CURRENT_VERSION,
+                "display-settings.json claims a schema version this host does not know — reading it \
+                 best-effort (unknown axes are ignored); the next write pins it back to the current \
+                 version");
+        }
+        match serde_json::from_value::<DisplayPolicy>(value.clone()) {
+            Ok(p) => Some(p.sanitized()),
+            Err(e) => {
+                let mut obj = match value {
+                    serde_json::Value::Object(o) => o,
+                    _ => {
+                        tracing::warn!(path = %path.display(),
+                            "display-settings.json is not a JSON object ({e}) — this host is running \
+                             on BUILT-IN DEFAULTS, not on its configured policy");
+                        return None;
+                    }
+                };
+                // Probe each member on its own: because every field defaults, a one-key document
+                // parses iff that key's value is valid, which localizes the failure with no
+                // hand-maintained field list to drift when an axis is added.
+                obj.retain(|key, member| {
+                    let one = serde_json::Value::Object(
+                        std::iter::once((key.clone(), member.clone())).collect(),
+                    );
+                    let ok = serde_json::from_value::<DisplayPolicy>(one).is_ok();
+                    if !ok {
+                        tracing::warn!(path = %path.display(), field = %key,
+                            "display-settings.json carries an unreadable value for this setting — \
+                             falling back to its built-in default and keeping the rest of the policy");
+                    }
+                    ok
+                });
+                match serde_json::from_value::<DisplayPolicy>(serde_json::Value::Object(obj)) {
+                    Ok(p) => Some(p.sanitized()),
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(),
+                            "display-settings.json unreadable even per-setting ({e}) — this host is \
+                             running on BUILT-IN DEFAULTS, not on its configured policy");
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -498,18 +687,38 @@ impl DisplayPolicyStore {
     }
 
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
-    /// write succeeds, so a full disk can't leave memory and file disagreeing.
+    /// write succeeds, so a full disk can't leave memory and file disagreeing — and the whole
+    /// transaction runs under [`Self::write`], so neither can two concurrent PUTs.
     pub fn set(&self, policy: DisplayPolicy) -> Result<()> {
         let policy = policy.sanitized();
+        let _tx = self.write.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = self.path.parent() {
             pf_paths::create_private_dir(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = unique_tmp_path(&self.path);
         pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&policy)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            // The rename is what publishes the write; if it fails the temp file is ours alone
+            // (unique name) and would otherwise sit in the config dir forever.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         *self.cur.lock().unwrap() = Some(policy);
         Ok(())
     }
+}
+
+/// A temp path for a temp-write + atomic-rename that no other writer can be using: `<name>.<pid>.<n>.tmp`.
+/// A *fixed* `.json.tmp` is safe only while one thread writes at a time — two host processes over the
+/// same config dir (a service plus a hand-run binary, an upgrade overlap) would otherwise interleave
+/// their partial writes into one file and rename the mixture over the real one.
+fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// The process-wide display-policy store (config-dir file), loaded once on first access — the same
@@ -564,64 +773,187 @@ fn custom_presets_path() -> PathBuf {
 }
 
 /// Clamp a saved preset's fields to their valid ranges — the same bounds [`DisplayPolicy::sanitized`]
-/// enforces, so a preset can never carry an out-of-range `max_displays` that a later apply would reject.
+/// enforces, so a preset can never carry an out-of-range `max_displays` or linger window that a later
+/// apply would silently smuggle past the direct PUT's checks.
 fn sanitize_preset_fields(mut fields: EffectivePolicy) -> EffectivePolicy {
     fields.max_displays = fields.max_displays.clamp(1, 16);
+    fields.keep_alive = clamp_keep_alive(fields.keep_alive);
+    fields.layout.positions = canonical_positions(std::mem::take(&mut fields.layout.positions));
     fields
 }
 
-/// Load the saved custom presets (empty + non-fatal if the file is absent or malformed — a bad
-/// catalog never breaks the console's settings GET).
-pub fn load_custom_presets() -> Vec<CustomPreset> {
+/// What a catalog read recovered: the entries we could make sense of, plus whether anything was lost
+/// getting there. `lossy` is the flag the CRUD path checks before it overwrites the file — a save
+/// that would drop entries must preserve the original first.
+struct CatalogRead {
+    presets: Vec<CustomPreset>,
+    lossy: bool,
+}
+
+/// Parse the catalog **entry-wise**. Pure (no I/O) so the recovery rules are unit-tested.
+///
+/// The whole-document `from_slice::<Vec<CustomPreset>>` this replaces made every entry hostage to
+/// every other: one hand-edited preset missing a field, or naming an enum variant this build does not
+/// know, returned `Vec::new()` — and because the CRUD path is load → mutate → save, the very next
+/// "create preset" atomically renamed that one-element vector over the operator's entire catalog.
+/// Here a bad entry costs exactly itself, and the caller learns (via `lossy`) that the file on disk
+/// holds more than we understood.
+fn parse_catalog(bytes: &[u8]) -> CatalogRead {
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "display-presets.json is not a JSON array of presets — ignoring the custom-preset \
+                 catalog; it is preserved as display-presets.json.bad if anything overwrites it");
+            return CatalogRead {
+                presets: Vec::new(),
+                lossy: true,
+            };
+        }
+    };
+    let mut presets = Vec::with_capacity(entries.len());
+    let mut lossy = false;
+    for (i, entry) in entries.into_iter().enumerate() {
+        // Keep the id/name for the log even when the body is unreadable — "entry 3" is useless to an
+        // operator staring at a console list of names.
+        let named = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_string();
+        match serde_json::from_value::<CustomPreset>(entry) {
+            Ok(mut p) => {
+                p.fields = sanitize_preset_fields(p.fields);
+                presets.push(p);
+            }
+            Err(e) => {
+                lossy = true;
+                tracing::warn!(index = i, name = %named, error = %e,
+                    "display-presets.json entry is unreadable — skipping just this preset, the rest \
+                     of the catalog is kept");
+            }
+        }
+    }
+    CatalogRead { presets, lossy }
+}
+
+/// Read + parse the catalog file. `Ok(CatalogRead)` for "absent" (an empty catalog) and for
+/// "readable, possibly lossy"; `Err` only when the file exists and the OS refused to hand it over
+/// (EACCES/EIO) — which the CRUD path must NOT paper over, because writing back what we could read
+/// (nothing) would erase a catalog that is merely unreachable.
+fn read_catalog() -> Result<CatalogRead> {
     match std::fs::read(custom_presets_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "display-presets.json malformed — ignoring custom presets");
-            Vec::new()
+        Ok(bytes) => Ok(parse_catalog(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogRead {
+            presets: Vec::new(),
+            lossy: false,
         }),
-        Err(_) => Vec::new(),
+        Err(e) => Err(e.into()),
     }
 }
 
+/// Copy the catalog aside to `display-presets.json.bad` before a save that would not round-trip it.
+/// A copy, not a rename: the original stays in place until the atomic rename replaces it, so a crash
+/// in between still leaves a catalog where the host looks for one. Best-effort — failing to preserve
+/// a file we already could not fully read must not fail the operator's write.
+fn quarantine_catalog() {
+    let path = custom_presets_path();
+    let bad = path.with_extension("json.bad");
+    match std::fs::copy(&path, &bad) {
+        Ok(_) => tracing::warn!(path = %bad.display(),
+            "the custom-preset catalog held entries this host could not read; the original was \
+             copied aside before being rewritten"),
+        Err(e) => tracing::warn!(error = %e, path = %bad.display(),
+            "could not preserve the unreadable custom-preset catalog before rewriting it"),
+    }
+}
+
+/// Serializes the catalog's read → mutate → save transaction. The three CRUD entry points are free
+/// functions over one shared file, so without this a concurrent add + delete each write back the
+/// catalog they loaded and one of the two edits vanishes wholesale.
+static CATALOG_LOCK: Mutex<()> = Mutex::new(());
+
 /// Persist the catalog (private dir, temp-write + atomic rename — the [`DisplayPolicyStore::set`]
-/// discipline, so a crash mid-write never truncates it).
+/// discipline, so a crash mid-write never truncates it). Callers hold [`CATALOG_LOCK`].
 fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
     let path = custom_presets_path();
     if let Some(dir) = path.parent() {
         pf_paths::create_private_dir(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = unique_tmp_path(&path);
     pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(presets)?)?;
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
-/// 12 hex chars from the name + wall-clock nanos — collision-free in practice, no uuid dep (the
-/// the host `library` custom-entry id scheme).
-fn new_preset_id(name: &str) -> String {
+/// Load the saved custom presets (empty + non-fatal if the file is absent, unreadable or malformed —
+/// a bad catalog never breaks the console's settings GET).
+pub fn load_custom_presets() -> Vec<CustomPreset> {
+    match read_catalog() {
+        Ok(c) => c.presets,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "display-presets.json exists but could not be read — the console will show no custom \
+                 presets; the file itself is untouched");
+            Vec::new()
+        }
+    }
+}
+
+/// 12 hex chars from the name + wall-clock nanos + a `nonce` — no uuid dep (the host `library`
+/// custom-entry id scheme). The nonce exists because the name+nanos pair is NOT unique: two creates
+/// of the same name inside one clock tick (a double-clicked Save, two console tabs, a clock that
+/// stepped back) hash identically, after which `update_custom_preset`'s `find(|p| p.id == id)`
+/// silently edits whichever landed first.
+fn preset_id(name: &str, nanos: u128, nonce: u64) -> String {
+    hex::encode(&Sha256::digest(format!("{name}:{nanos}:{nonce}").as_bytes())[..6])
+}
+
+/// The first id not already taken in `presets`, re-rolling the nonce against a **single** clock read
+/// — 48 bits is collision-free in practice only if something actually checks, and re-reading the
+/// clock per attempt would make the retry indistinguishable from luck (and untestable).
+fn free_preset_id_at(presets: &[CustomPreset], name: &str, nanos: u128) -> String {
+    (0u64..)
+        .map(|nonce| preset_id(name, nanos, nonce))
+        .find(|id| presets.iter().all(|p| &p.id != id))
+        .expect("the nonce space is unbounded, so some id is always free")
+}
+
+fn free_preset_id(presets: &[CustomPreset], name: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    hex::encode(&Sha256::digest(format!("{name}:{nanos}").as_bytes())[..6])
+    free_preset_id_at(presets, name, nanos)
 }
 
 /// Create a custom preset, returning it with its assigned id.
 pub fn add_custom_preset(input: CustomPresetInput) -> Result<CustomPreset> {
-    let mut presets = load_custom_presets();
+    let _tx = CATALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let catalog = read_catalog()?;
+    let mut presets = catalog.presets;
     let preset = CustomPreset {
-        id: new_preset_id(&input.name),
+        id: free_preset_id(&presets, &input.name),
         name: input.name,
         fields: sanitize_preset_fields(input.fields),
         game_session: input.game_session,
     };
     presets.push(preset.clone());
+    if catalog.lossy {
+        quarantine_catalog();
+    }
     save_custom_presets(&presets)?;
     Ok(preset)
 }
 
 /// Replace a custom preset's fields (id preserved). `None` ⇒ no preset with that id.
 pub fn update_custom_preset(id: &str, input: CustomPresetInput) -> Result<Option<CustomPreset>> {
-    let mut presets = load_custom_presets();
+    let _tx = CATALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let catalog = read_catalog()?;
+    let mut presets = catalog.presets;
     let Some(slot) = presets.iter_mut().find(|p| p.id == id) else {
         return Ok(None);
     };
@@ -629,17 +961,25 @@ pub fn update_custom_preset(id: &str, input: CustomPresetInput) -> Result<Option
     slot.fields = sanitize_preset_fields(input.fields);
     slot.game_session = input.game_session;
     let updated = slot.clone();
+    if catalog.lossy {
+        quarantine_catalog();
+    }
     save_custom_presets(&presets)?;
     Ok(Some(updated))
 }
 
 /// Delete a custom preset. `false` ⇒ no preset with that id.
 pub fn delete_custom_preset(id: &str) -> Result<bool> {
-    let mut presets = load_custom_presets();
+    let _tx = CATALOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let catalog = read_catalog()?;
+    let mut presets = catalog.presets;
     let before = presets.len();
     presets.retain(|p| p.id != id);
     if presets.len() == before {
         return Ok(false);
+    }
+    if catalog.lossy {
+        quarantine_catalog();
     }
     save_custom_presets(&presets)?;
     Ok(true)
@@ -840,8 +1180,15 @@ mod tests {
         assert_eq!(e2.layout.positions.get("7"), Some(&want));
     }
 
+    /// The **file** contract, not the PUT contract. `display-settings.json` must survive every axis
+    /// this crate has ever added, so a document written by an older host loads with the missing axes
+    /// at their defaults. Do NOT read this as "an omitted field means reset": for `PUT
+    /// /display/settings` the same shape is a whole-object replace, which is why an omitted
+    /// `capture_monitor` currently clears an operator's pin (§13 11.1). Fixing that means an
+    /// `Option<T>`-per-axis DTO merged onto `prefs().get()` in the mgmt handler — the wire type gains
+    /// a sibling, this behavior stays exactly as asserted here.
     #[test]
-    fn partial_json_fills_defaults() {
+    fn serde_defaults_fill_a_partial_document() {
         // A hand-written file with only a couple of fields loads, the rest defaulting.
         let p: DisplayPolicy =
             serde_json::from_str(r#"{ "preset": "custom", "max_displays": 2 }"#).unwrap();
@@ -886,5 +1233,259 @@ mod tests {
         assert_eq!(reopened.configured().unwrap().preset, Preset::SharedDesktop);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Guard for §13 11.1: the merge the mgmt PUT needs has to enumerate every axis, and the way that
+    /// goes wrong is a NEW field nobody wires in — silently, because no test counts them. Bump this
+    /// number only in the same change that teaches the update path about the new axis.
+    #[test]
+    fn every_policy_axis_is_accounted_for() {
+        let v = serde_json::to_value(DisplayPolicy::default()).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys.len(),
+            12,
+            "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
+             per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
+        );
+    }
+
+    #[test]
+    fn sanitize_clamps_an_absurd_linger_to_a_day() {
+        // ~136 years of `duration` is a deadline the reaper never reaches and a nonsense
+        // `expires_in_ms`; `forever` is how you say "keep it" (and stays releasable).
+        let p = DisplayPolicy {
+            keep_alive: KeepAlive::Duration { seconds: u32::MAX },
+            ..DisplayPolicy::default()
+        }
+        .sanitized();
+        assert_eq!(
+            p.keep_alive,
+            KeepAlive::Duration {
+                seconds: MAX_KEEP_ALIVE_SECS
+            }
+        );
+        // A window inside the bound, and the window-less variants, pass through untouched.
+        for k in [
+            KeepAlive::Duration { seconds: 300 },
+            KeepAlive::Off,
+            KeepAlive::Forever,
+        ] {
+            let p = DisplayPolicy {
+                keep_alive: k,
+                ..DisplayPolicy::default()
+            }
+            .sanitized();
+            assert_eq!(p.keep_alive, k);
+        }
+        // The same bound applies through the custom-preset catalog, which would otherwise be a way
+        // to smuggle a window past the direct PUT.
+        let mut f = preset_fields(Preset::Default).unwrap();
+        f.keep_alive = KeepAlive::Duration { seconds: u32::MAX };
+        assert_eq!(
+            sanitize_preset_fields(f).keep_alive,
+            KeepAlive::Duration {
+                seconds: MAX_KEEP_ALIVE_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn sanitize_canonicalizes_layout_keys_and_drops_unusable_ones() {
+        let mut positions = BTreeMap::new();
+        positions.insert("01".to_string(), Position { x: 10, y: 0 }); // zero-padded: usable
+        positions.insert("2".to_string(), Position { x: 20, y: 0 }); // already canonical
+        positions.insert("slot3".to_string(), Position { x: 30, y: 0 }); // not a slot id
+        positions.insert(" 4".to_string(), Position { x: 40, y: 0 }); // whitespace: not a slot id
+        positions.insert("99".to_string(), Position { x: 50, y: 0 }); // no such slot, ever
+        positions.insert("0".to_string(), Position { x: 60, y: 0 }); // slots start at 1
+        let p = DisplayPolicy {
+            layout: Layout {
+                mode: LayoutMode::Manual,
+                positions,
+            },
+            ..DisplayPolicy::default()
+        }
+        .sanitized();
+        let got = &p.layout.positions;
+        assert_eq!(got.len(), 2, "only the two real slot pins survive: {got:?}");
+        // "01" now resolves — `arrange` looks members up by `u32::to_string()`, so before this it was
+        // a pin the console showed and no session ever honored.
+        assert_eq!(got.get("1"), Some(&Position { x: 10, y: 0 }));
+        assert_eq!(got.get("2"), Some(&Position { x: 20, y: 0 }));
+    }
+
+    #[test]
+    fn canonical_positions_prefers_the_canonical_spelling_over_a_duplicate() {
+        // Two spellings of slot 1 in one table: the answer must not depend on BTreeMap order.
+        let mut positions = BTreeMap::new();
+        positions.insert("01".to_string(), Position { x: 10, y: 0 });
+        positions.insert("1".to_string(), Position { x: 11, y: 0 });
+        let out = canonical_positions(positions);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("1"), Some(&Position { x: 11, y: 0 }));
+    }
+
+    #[test]
+    fn a_readable_file_is_sanitized_on_load_not_only_on_write() {
+        // A hand-edited settings file gets exactly the treatment a console PUT gets — otherwise the
+        // clamps are enforceable only by whoever last used the web UI.
+        let doc = br#"{ "version": 1, "max_displays": 999,
+                       "keep_alive": { "mode": "duration", "seconds": 4294967295 },
+                       "layout": { "mode": "manual", "positions": { "01": { "x": 5, "y": 6 } } } }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
+        assert_eq!(p.max_displays, 16);
+        assert_eq!(
+            p.keep_alive,
+            KeepAlive::Duration {
+                seconds: MAX_KEEP_ALIVE_SECS
+            }
+        );
+        assert_eq!(p.layout.positions.get("1"), Some(&Position { x: 5, y: 6 }));
+    }
+
+    #[test]
+    fn one_unreadable_axis_does_not_discard_the_whole_policy() {
+        // `topology: "hologram"` is an enum variant this build has never heard of — the whole-document
+        // parse fails on it. Before the per-axis salvage that reverted the host to built-in defaults:
+        // the operator's capture-monitor pin, their preset, their linger, all silently gone.
+        let doc = br#"{ "version": 1, "preset": "hotdesk", "topology": "hologram",
+                        "max_displays": 3, "capture_monitor": "DP-2" }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc)
+            .expect("a single bad axis must not discard the document");
+        assert_eq!(p.topology, Topology::Auto, "the bad axis falls to default");
+        assert_eq!(p.preset, Preset::Hotdesk, "…and everything else survives");
+        assert_eq!(p.max_displays, 3);
+        assert_eq!(p.capture_monitor.as_deref(), Some("DP-2"));
+    }
+
+    #[test]
+    fn a_mistyped_scalar_falls_back_to_its_own_default_not_zero() {
+        // `max_displays` has a non-`Default::default()` serde default (4); the salvage must go through
+        // the same path, or a typo would leave the host admitting zero displays.
+        let doc = br#"{ "max_displays": "four", "preset": "workstation" }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
+        assert_eq!(p.max_displays, default_max_displays());
+        assert_eq!(p.preset, Preset::Workstation);
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_policy_at_all_is_unconfigured() {
+        // Only genuine nonsense falls back to "unconfigured" — and it must, since half-reading a
+        // truncated file would be worse than admitting we have nothing.
+        assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"{ not json").is_none());
+        assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"[1, 2, 3]").is_none());
+        // An empty object IS a policy: every axis defaults.
+        assert_eq!(
+            DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"{}"),
+            Some(DisplayPolicy::default())
+        );
+    }
+
+    #[test]
+    fn a_future_schema_version_is_still_read() {
+        // Rejecting a version we don't know would revert the host to defaults on a downgrade — the
+        // exact failure the version field exists to avoid. We read it and log the mismatch.
+        let doc = br#"{ "version": 7, "preset": "gaming-rig", "future_axis": { "a": 1 } }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
+        assert_eq!(p.preset, Preset::GamingRig);
+        assert_eq!(
+            p.version, CURRENT_VERSION,
+            "sanitized back to what we write"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_and_a_present_one_are_different_states() {
+        let dir = std::env::temp_dir().join(format!("pf-disp-io-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("display-settings.json");
+        let _ = std::fs::remove_file(&path);
+        assert!(DisplayPolicyStore::load_from(path.clone())
+            .configured()
+            .is_none());
+        std::fs::write(&path, br#"{"preset":"hotdesk"}"#).unwrap();
+        assert_eq!(
+            DisplayPolicyStore::load_from(path.clone())
+                .configured()
+                .unwrap()
+                .preset,
+            Preset::Hotdesk
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unique_tmp_paths_never_repeat_and_stay_in_the_same_dir() {
+        let path = PathBuf::from("/tmp/pf/display-settings.json");
+        let a = unique_tmp_path(&path);
+        let b = unique_tmp_path(&path);
+        assert_ne!(a, b, "a fixed temp name is what two writers collide on");
+        assert_eq!(
+            a.parent(),
+            path.parent(),
+            "rename must stay intra-filesystem"
+        );
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("display-settings.json."));
+    }
+
+    #[test]
+    fn one_bad_catalog_entry_costs_only_itself() {
+        // The whole-document parse this replaces returned an EMPTY vector here — and the next
+        // "create preset" renamed that empty vector over the operator's catalog.
+        let doc = br#"[
+            { "id": "a", "name": "Keep", "fields": { "keep_alive": { "mode": "forever" },
+              "topology": "exclusive", "mode_conflict": "steal", "identity": "per-client",
+              "layout": { "mode": "auto-row", "positions": {} }, "max_displays": 2 } },
+            { "id": "b", "name": "Broken", "fields": { "topology": "hologram" } },
+            { "id": "c", "name": "Also kept", "fields": {} }
+        ]"#;
+        let read = parse_catalog(doc);
+        assert!(read.lossy, "the caller must know an entry was dropped");
+        let names: Vec<&str> = read.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Keep", "Also kept"]);
+        // The entry that omitted every field defaults them (and gets the real `max_displays`
+        // default, not 0) — a catalog written before an axis existed still loads.
+        let c = &read.presets[1];
+        assert_eq!(c.fields.max_displays, default_max_displays());
+        assert_eq!(c.fields.keep_alive, KeepAlive::default());
+        assert_eq!(c.fields.topology, Topology::Auto);
+        assert_eq!(c.game_session, GameSession::Auto);
+        // Entries are clamped on read, exactly like a fresh write.
+        assert_eq!(read.presets[0].fields.max_displays, 2);
+    }
+
+    #[test]
+    fn a_clean_catalog_is_not_lossy_and_a_broken_one_is() {
+        let clean = parse_catalog(b"[]");
+        assert!(clean.presets.is_empty() && !clean.lossy);
+        // Not an array at all: nothing recovered, and `lossy` so the CRUD path preserves the file
+        // instead of renaming an empty vector over it.
+        let junk = parse_catalog(br#"{"presets":[]}"#);
+        assert!(junk.presets.is_empty() && junk.lossy);
+    }
+
+    #[test]
+    fn preset_ids_never_collide_with_the_catalog() {
+        let entry = |id: &str| CustomPreset {
+            id: id.to_string(),
+            name: "Same name".into(),
+            fields: preset_fields(Preset::Default).unwrap(),
+            game_session: GameSession::Auto,
+        };
+        // Same name, same nanosecond — the collision a double-clicked Save produces. Before the
+        // re-roll both creates got one id and `update_custom_preset` then edited whichever came
+        // first; the second create must now step to the next nonce.
+        let first = free_preset_id_at(&[], "Same name", 42);
+        assert_eq!(first, preset_id("Same name", 42, 0));
+        let second = free_preset_id_at(&[entry(&first)], "Same name", 42);
+        assert_eq!(second, preset_id("Same name", 42, 1));
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 12, "12 hex chars, unchanged id shape");
     }
 }
