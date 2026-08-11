@@ -2239,36 +2239,20 @@ impl Encoder for AmfEncoder {
 mod tests {
     use super::*;
 
-    /// The mirrored `AMFVariantStruct` must match the C layout: 4-byte tag + 4 padding + 16-byte
-    /// union = 24 bytes, align 8, payload at offset 8 (it is passed BY VALUE across the FFI).
+    // The LAYOUT of `AmfVariant`, `AmfGuid` and `AmfHdrMetadata` is no longer asserted here.
+    // Those checks moved to `const _: ()` assertions beside the mirrors themselves in
+    // `amf_sys.rs`, together with per-slot offset guards for the five vtables. As `#[test]`s
+    // they only ran when someone ran pf-encode's tests, on Windows, with AMF enabled — never in
+    // a release build, which is precisely where a mis-mirrored `AMFVariantStruct` would do its
+    // damage. As const assertions they hold on EVERY build that compiles the module.
+    //
+    // What stays here is the part a layout check cannot express: that the little-endian packing
+    // of the union payload matches what the C side will read out of those bytes.
     #[test]
-    fn variant_layout_matches_c() {
-        assert_eq!(std::mem::size_of::<AmfVariant>(), 24);
-        assert_eq!(std::mem::align_of::<AmfVariant>(), 8);
-        assert_eq!(std::mem::offset_of!(AmfVariant, payload), 8);
+    fn variant_payload_packing_matches_c() {
         let v = AmfVariant::from_rate(60, 1);
         assert_eq!(v.payload[0], 60u64 | (1u64 << 32));
         assert_eq!(AmfVariant::from_i64(-1).payload[0], u64::MAX);
-    }
-
-    /// `AMFGuid` is the flattened Win32-GUID layout (16 bytes).
-    #[test]
-    fn guid_layout_matches_c() {
-        assert_eq!(std::mem::size_of::<sys::AmfGuid>(), 16);
-    }
-
-    /// `AMFHDRMetadata` (components/ColorSpace.h): 8×u16 + 2×u32 + 2×u16 = 28 bytes, no padding.
-    #[test]
-    fn hdr_metadata_layout_matches_c() {
-        assert_eq!(std::mem::size_of::<sys::AmfHdrMetadata>(), 28);
-        assert_eq!(
-            std::mem::offset_of!(sys::AmfHdrMetadata, max_mastering_luminance),
-            16
-        );
-        assert_eq!(
-            std::mem::offset_of!(sys::AmfHdrMetadata, max_content_light_level),
-            24
-        );
     }
 
     /// A representative HDR10 grade for the live tests (BT.2020 primaries, 1000-nit mastering)

@@ -409,6 +409,118 @@ pub struct AmfBufferVtbl {
     pub remove_observer_buffer: Slot,
 }
 
+// -- Layout guards ---------------------------------------------------------------------------
+//
+// THE CONTRACT, STATED ONCE. Everything above is a hand-written mirror of a C type this crate
+// does not own and cannot include. Two classes of drift are possible and NEITHER fails to
+// compile on its own:
+//
+//   1. A POD passed by value (`AmfVariant`, `AmfGuid`, `AmfHdrMetadata`) whose field offsets
+//      disagree with the C struct. The runtime then reads a tag or a payload out of the wrong
+//      bytes — `AmfVariant` crosses the FFI by value on EVERY `SetProperty`.
+//   2. A vtable slot inserted, removed or reordered. `amf.rs` dispatches BY POSITION through
+//      these mirrors, so a shifted slot calls an arbitrary function pointer through a
+//      mismatched signature. There is no compile error, no runtime signal, and the failure is
+//      whatever the neighbouring AMF entry point happens to do with our arguments.
+//
+// `AMF_MIN_VERSION` does not defend against either: it checks a version NUMBER, not a layout,
+// and it is a floor with no ceiling. The assertions below are the actual defence. They are
+// `const _: ()` rather than `#[cfg(test)]` deliberately — the three POD checks below used to
+// live only in `amf.rs`'s test module, which means they were verified only when someone ran
+// pf-encode's tests, on Windows, with AMF enabled, and NEVER in a release build. This is the
+// same hole `a8dd348b` closed for the cuda.h mirrors; it was missed here.
+//
+// Every slot index below was counted against the vtable declarations above. A slot is asserted
+// when `amf.rs` calls it — those are the ones whose displacement is directly exploitable — plus
+// the total size of each table, which catches an insertion PAST the last called slot (invisible
+// to a per-slot check, but still a sign the mirror has drifted from the header).
+
+/// One vtable slot. Every mirrored table is a flat array of these, so an offset in bytes is
+/// always `index * SLOT`.
+const SLOT: usize = core::mem::size_of::<Slot>();
+
+// Every slot is a plain code pointer, so all five tables are pointer-sized-array-shaped. If this
+// ever fails, the tables are not flat arrays any more and every offset below is meaningless.
+const _: () = assert!(SLOT == core::mem::size_of::<usize>());
+const _: () = assert!(core::mem::align_of::<Slot>() == core::mem::align_of::<usize>());
+
+// -- PODs crossing the FFI by value --
+// `AMFVariantStruct`: 4-byte tag + 4 padding + 16-byte union = 24 bytes, payload at 8.
+const _: () = assert!(core::mem::size_of::<AmfVariant>() == 24);
+const _: () = assert!(core::mem::align_of::<AmfVariant>() == 8);
+const _: () = assert!(core::mem::offset_of!(AmfVariant, payload) == 8);
+// `AMFGuid`: the flattened Win32 GUID.
+const _: () = assert!(core::mem::size_of::<AmfGuid>() == 16);
+const _: () = assert!(core::mem::align_of::<AmfGuid>() == 4);
+// `AMFHDRMetadata` (components/ColorSpace.h): 8×u16 + 2×u32 + 2×u16 = 28 bytes, no padding.
+const _: () = assert!(core::mem::size_of::<AmfHdrMetadata>() == 28);
+const _: () = assert!(core::mem::offset_of!(AmfHdrMetadata, max_mastering_luminance) == 16);
+const _: () = assert!(core::mem::offset_of!(AmfHdrMetadata, max_content_light_level) == 24);
+
+// -- AMFFactory (7 slots) — `create_context` 0, `create_component` 1 --
+const _: () = assert!(core::mem::size_of::<AmfFactoryVtbl>() == 7 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_context) == 0 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_component) == 1 * SLOT);
+
+// -- AMFContext (55 slots) = AMFInterface(3) + AMFPropertyStorage(10) + AMFContext(42) --
+const _: () = assert!(core::mem::size_of::<AmfContextVtbl>() == 55 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, release) == 1 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, terminate) == 13 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, init_dx11) == 18 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, alloc_buffer) == 43 * SLOT);
+const _: () =
+    assert!(core::mem::offset_of!(AmfContextVtbl, create_surface_from_dx11_native) == 49 * SLOT);
+
+// -- AMFComponent (28 slots) = AMFInterface(3) + PropertyStorage(10) + StorageEx(4) + Component(11) --
+const _: () = assert!(core::mem::size_of::<AmfComponentVtbl>() == 28 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, release) == 1 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, set_property) == 3 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, init) == 17 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, terminate) == 19 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, drain) == 20 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, flush) == 21 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, submit_input) == 22 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, query_output) == 23 * SLOT);
+
+// -- AMFData (23 slots) = AMFInterface(3) + AMFPropertyStorage(10) + AMFData(10) --
+const _: () = assert!(core::mem::size_of::<AmfDataVtbl>() == 23 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, release) == 1 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, query_interface) == 2 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_property) == 3 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, get_property) == 4 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_pts) == 19 * SLOT);
+
+// -- AMFBuffer (28 slots) = the AMFData prefix (23) + AMFBuffer(5) --
+const _: () = assert!(core::mem::size_of::<AmfBufferVtbl>() == 28 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, release) == 1 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_size) == 24 * SLOT);
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_native) == 25 * SLOT);
+
+// -- The shared-prefix agreement --
+// `AMFBuffer` derives from `AMFData`, and `create_surface_from_dx11_native` hands back an
+// `AMFSurface*` that this module drives through the `AmfData` mirror on the strength of that
+// single-inheritance prefix (see the comment on that slot). If the two mirrors ever disagree
+// about where a shared slot lives, that reinterpretation is silently wrong — so assert the
+// agreement rather than restating it in prose.
+const _: () = assert!(
+    core::mem::offset_of!(AmfDataVtbl, release) == core::mem::offset_of!(AmfBufferVtbl, release)
+);
+const _: () = assert!(
+    core::mem::offset_of!(AmfDataVtbl, set_property)
+        == core::mem::offset_of!(AmfBufferVtbl, set_property)
+);
+const _: () = assert!(
+    core::mem::offset_of!(AmfDataVtbl, get_property)
+        == core::mem::offset_of!(AmfBufferVtbl, get_property)
+);
+const _: () = assert!(
+    core::mem::offset_of!(AmfDataVtbl, set_pts) == core::mem::offset_of!(AmfBufferVtbl, set_pts)
+);
+const _: () = assert!(
+    core::mem::offset_of!(AmfDataVtbl, get_duration)
+        == core::mem::offset_of!(AmfBufferVtbl, get_duration)
+);
+
 // -- DLL entry points (core/Factory.h; AMF_CDECL_CALL) --------------------------------------
 pub type AmfQueryVersionFn = unsafe extern "C" fn(*mut u64) -> AmfResult;
 pub type AmfInitFn = unsafe extern "C" fn(u64, *mut *mut AmfFactory) -> AmfResult;
