@@ -1032,7 +1032,7 @@ fn write_session_plus_dropin(
         wsi = if wsi_ok {
             String::new()
         } else {
-            "Environment=ENABLE_GAMESCOPE_WSI=0\n".to_string()
+            wsi_off_unit_lines()
         },
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
@@ -3521,6 +3521,52 @@ fn arm_session_bind(wrapper: &std::path::Path) -> Option<SessionBind> {
     Some(bind)
 }
 
+/// The environment that turns the distro's `VkLayer_FROG_gamescope_wsi` off for a whole session
+/// tree — applied wherever we start one: [`launch_session`]'s transient unit and the box-session
+/// drop-in ([`write_session_plus_dropin`]).
+///
+/// ⭐⭐⭐ **`DISABLE_GAMESCOPE_WSI` is the one that actually works, and it is not the obvious one.**
+/// `gamescope-session-plus` does an unconditional `export ENABLE_GAMESCOPE_WSI=1` near the top of
+/// the script, before it launches anything — so a `--setenv=ENABLE_GAMESCOPE_WSI=0` on the unit is
+/// CLOBBERED for the script and every child it spawns: gamescope, Steam, and every game Steam
+/// launches. The Vulkan loader resolves an implicit layer's two manifest knobs in a fixed order
+/// (`loader.c`, `loader_implicit_layer_is_enabled`): `enable_environment` switches the layer on
+/// only when the variable equals exactly `"1"`, and then `disable_environment` is consulted last —
+/// *"has priority over everything else"* — where the mere PRESENCE of the variable, at any value,
+/// forces the layer off. Nothing in the session script mentions `DISABLE_GAMESCOPE_WSI`, so it is
+/// the only one of the two that survives the script.
+///
+/// ⚠️⚠️ What getting this wrong looks like in the field (Nobara 44, 2026-08-11): the layer stayed
+/// on for games while this host's own log said it had been disabled. Neither Steam Big Picture nor
+/// mangoapp is a Vulkan client, so both paint regardless and the session looks perfectly healthy —
+/// right up until a game starts. Then the game runs with sound and input while its swapchain is
+/// dead: a black screen, and not one line of error anywhere.
+///
+/// `ENABLE_GAMESCOPE_WSI=0` is kept alongside for a layer built without a `disable_environment`
+/// (the loader warns about such a layer but honours its `enable_environment`), and because it is
+/// what an operator reading the unit will look for.
+const WSI_OFF_ENV: [(&str, &str); 2] = [
+    ("DISABLE_GAMESCOPE_WSI", "1"),
+    ("ENABLE_GAMESCOPE_WSI", "0"),
+];
+
+/// [`WSI_OFF_ENV`] as `systemd-run` arguments, for the transient unit.
+fn wsi_off_setenv_args() -> Vec<String> {
+    WSI_OFF_ENV
+        .iter()
+        .map(|(name, value)| format!("--setenv={name}={value}"))
+        .collect()
+}
+
+/// [`WSI_OFF_ENV`] as unit-file lines, for the box-session drop-in. Trailing newline included, so
+/// whatever the body puts after it still parses — same contract as [`SessionBind::unit_lines`].
+fn wsi_off_unit_lines() -> String {
+    WSI_OFF_ENV
+        .iter()
+        .map(|(name, value)| format!("Environment={name}={value}\n"))
+        .collect()
+}
+
 /// Whether the box's `VkLayer_FROG_gamescope_wsi` can be trusted against the gamescope we run.
 ///
 /// The layer ships with the DISTRO's gamescope and speaks its `gamescope_swapchain` protocol; we
@@ -3533,8 +3579,10 @@ fn arm_session_bind(wrapper: &std::path::Path) -> Option<SessionBind> {
 /// byte-identical between those commits, so this is the distro PATCHING gamescope, not a version
 /// bump — which is why the check is "do the version triples differ", not a floor.
 ///
-/// `ENABLE_GAMESCOPE_WSI=0` is gamescope's own opt-out and costs only the layer's extras
-/// (present-mode control, client HDR metadata) — far cheaper than a client that cannot start.
+/// Disabling it costs only the layer's extras (XWayland bypass, present-mode control, client HDR
+/// metadata) — far cheaper than a client that cannot start.
+///
+/// ⚠️ **`ENABLE_GAMESCOPE_WSI=0` is NOT enough on its own**, which is what [`WSI_OFF_ENV`] is for.
 fn wsi_layer_matches_our_gamescope() -> bool {
     let ours = discovery::gamescope_version_of(std::path::Path::new(gamescope_bin()));
     let distro = discovery::gamescope_version_of(std::path::Path::new(DISTRO_GAMESCOPE_PATH));
@@ -3589,14 +3637,17 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
     // an armed bind is the one thing here that can stop the session coming up at all.
     let mut bind = arm_session_bind(&wrapper);
     // The distro's Vulkan WSI layer speaks the distro gamescope's protocol; ours may differ, and a
-    // mismatch kills every Vulkan client (Steam included) with no error but a black screen.
+    // mismatch kills every Vulkan client with no error but a black screen. Steam Big Picture is not
+    // one of them, so the casualty is the GAMES — see [`WSI_OFF_ENV`] for why both variables go.
     let wsi_ok = wsi_layer_matches_our_gamescope();
     if !wsi_ok {
         tracing::warn!(
             "gamescope: this box's VkLayer_FROG_gamescope_wsi was built for a different gamescope \
-             than the one we run — disabling it for this session (ENABLE_GAMESCOPE_WSI=0). Left \
-             enabled it rejects the client's swapchain_feedback and every Vulkan client dies, \
-             which shows up as a black screen with no other symptom."
+             than the one we run — disabling it for this session (DISABLE_GAMESCOPE_WSI=1, which \
+             the session script cannot clobber the way it clobbers ENABLE_GAMESCOPE_WSI). Left \
+             enabled it rejects the client's swapchain_feedback and every Vulkan client dies; \
+             Steam's own UI is not one, so what you see is a game that runs with sound and input \
+             on a black screen, with no other symptom."
         );
     }
     let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
@@ -3606,7 +3657,9 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             cmd.arg(arg);
         }
         if !wsi_ok {
-            cmd.arg("--setenv=ENABLE_GAMESCOPE_WSI=0");
+            for arg in wsi_off_setenv_args() {
+                cmd.arg(arg);
+            }
         }
         let status = cmd
             // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
@@ -4043,9 +4096,9 @@ mod tests {
         display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
         is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
         release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
-        shape_dedicated_command, switch_ends_mask_window, unmask_unit, xwayland_refusal_marker,
-        BindOff, BindPlan, DmHelperError, SessionBind, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH,
-        STOPPED_AUTOLOGIN, X11_SOCKET_DIR,
+        shape_dedicated_command, switch_ends_mask_window, unmask_unit, wsi_off_setenv_args,
+        wsi_off_unit_lines, xwayland_refusal_marker, BindOff, BindPlan, DmHelperError, SessionBind,
+        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
     };
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
@@ -4705,5 +4758,34 @@ mod tests {
             xwayland_refusal_marker("steam.sh: line 1: pipewire: command not found\n"),
             None
         );
+    }
+
+    /// `gamescope-session-plus` runs `export ENABLE_GAMESCOPE_WSI=1` before it launches anything,
+    /// so that variable alone cannot turn the layer off for Steam or for the games Steam launches
+    /// — only `DISABLE_GAMESCOPE_WSI`, which the script never mentions and which the Vulkan loader
+    /// treats as an unconditional force-off, survives. Dropping it would restore the field bug
+    /// (a game with sound and input on a black screen) while the host's log still claimed the
+    /// layer was disabled, which is what made it so expensive to find. See [`WSI_OFF_ENV`].
+    #[test]
+    fn the_wsi_opt_out_carries_the_variable_the_session_script_cannot_clobber() {
+        assert!(
+            WSI_OFF_ENV.contains(&("DISABLE_GAMESCOPE_WSI", "1")),
+            "the clobber-proof variable is the whole point of the opt-out"
+        );
+
+        // Both spellings reach both launch paths, and neither may lose the other.
+        let args = wsi_off_setenv_args();
+        let lines = wsi_off_unit_lines();
+        for (name, value) in WSI_OFF_ENV {
+            assert!(args.contains(&format!("--setenv={name}={value}")), "{name}");
+            assert!(
+                lines.contains(&format!("Environment={name}={value}\n")),
+                "{name}"
+            );
+        }
+
+        // Trailing newline: the drop-in body appends nothing after this block today, but the bind
+        // lines above it rely on the same contract and the order has changed before.
+        assert!(lines.ends_with('\n'));
     }
 }

@@ -42,6 +42,27 @@ availability probe. The `comm` fast path is still one read for every ordinary di
 Also reached by the same rung: `gamescope` carries `cap_sys_nice` on a number of distros, so a
 *wrapped and capped* gamescope was equally invisible to the foreign-gamescope probe.
 
+### Game Mode on Nobara — the WSI opt-out never reached the games
+
+🛑 **v0.27.0's fix for the distro Vulkan WSI layer was clobbered by the session script, so games ran
+on a black screen** while the host's own log claimed the layer had been disabled. Steam Big Picture
+came up, showed the right mode, showed the perf overlay — and then every game played sound and took
+input over a black picture, with no error on either side.
+
+The layer (`VkLayer_FROG_gamescope_wsi`) ships with the *distro's* gamescope and speaks its
+`gamescope_swapchain` protocol; ours disagrees, so the compositor rejects the client's
+`swapchain_feedback` and kills it. v0.27.0 turned the layer off with `ENABLE_GAMESCOPE_WSI=0` on the
+session unit. `gamescope-session-plus` then runs an unconditional `export ENABLE_GAMESCOPE_WSI=1`
+near the top of the script — before it launches anything — so the opt-out survived exactly as long
+as it took the script to start, and every process the session spawned got the layer back. Nothing
+looked wrong because the casualty is Vulkan clients specifically: Steam's own UI is not one.
+
+The opt-out is now `DISABLE_GAMESCOPE_WSI=1` as well. The Vulkan loader reads an implicit layer's
+two manifest knobs in a fixed order: `enable_environment` must equal `"1"` to switch the layer on,
+and `disable_environment` is then consulted last and wins on **presence alone**, at any value. The
+session script never mentions that second variable, so it is the one that survives. Both spellings
+go out, on the transient unit and on the box's own session drop-in.
+
 ## v0.27.0
 
 87 commits since v0.26.0.
