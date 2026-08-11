@@ -11,7 +11,6 @@
 //! details. Windows-subsystem binary — a console exe in the HKLM Run key would flash a terminal
 //! window at every sign-in.
 // Unsafe-proof program: every `unsafe {}` in the tray carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(target_os = "linux")]

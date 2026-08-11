@@ -23,6 +23,8 @@ mod tests {
     #[test]
     fn api_version_matches_vendored_pin() {
         let (mut major, mut minor, mut patch) = (0u32, 0u32, 0u32);
+        // SAFETY: the version query writes three u32s through live local out-pointers and
+        // touches no device or global state.
         unsafe { pyrowave_get_api_version(&mut major, &mut minor, &mut patch) };
         assert_eq!((major, minor, patch), (0, 4, 0), "vendored pyrowave API version moved — re-check the §4.2 protocol coupling before bumping");
     }

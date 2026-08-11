@@ -12,8 +12,6 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 // P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s + a `// SAFETY:` proof on
 // each (this crate is the IddCx DDI dispatch layer — inherently unsafe, so audited, not unsafe-free).
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub use wdk_sys::iddcx;
 

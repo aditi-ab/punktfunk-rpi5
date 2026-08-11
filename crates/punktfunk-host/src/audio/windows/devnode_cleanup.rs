@@ -24,9 +24,6 @@
 //! bundled one all carry no marker and are therefore untouchable here — uninstalling punktfunk
 //! removes what punktfunk created, and nothing else.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{audio_control, audio_probe, minted, pad_endpoint as pe};
 use anyhow::Result;
 use windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiEnumDeviceInfo;

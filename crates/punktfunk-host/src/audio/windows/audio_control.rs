@@ -46,9 +46,6 @@
 //! `PUNKTFUNK_KEEP_DEFAULT`) leaves the user's chosen defaults untouched — the plan is still
 //! computed, since the mic must still pick a target.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::wiring_plan::{self, plan, plan_with_formats, Endpoint, MixFormat, Wiring};
 use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;

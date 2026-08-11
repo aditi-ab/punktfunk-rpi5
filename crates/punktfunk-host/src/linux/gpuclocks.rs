@@ -37,8 +37,6 @@
 //!    self-heals. Deliberately
 //!    NOT default-on: it defeats idle downclocking for the whole box and is wrong on
 //!    battery-powered hosts.
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::{Mutex, OnceLock};

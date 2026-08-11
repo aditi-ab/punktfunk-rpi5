@@ -16,9 +16,6 @@
 //! Only the driver-specific bits (GUID, IOCTL codes, request/reply structs, the version handshake) are
 //! here, per `pf_driver_proto`.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

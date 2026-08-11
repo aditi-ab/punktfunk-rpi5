@@ -46,7 +46,6 @@
 //     `qos_windows`) — sendmmsg/recvmsg_x/USO/qWAVE move caller-owned buffers, nothing more.
 // A new module parsing wire data may NOT add a carve-out.
 #![deny(unsafe_code)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;

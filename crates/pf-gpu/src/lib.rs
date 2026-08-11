@@ -23,7 +23,6 @@
 //! live session actually encodes on, for the console's "in use" display.
 
 // Unsafe-proof program: every `unsafe {}` in this leaf carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

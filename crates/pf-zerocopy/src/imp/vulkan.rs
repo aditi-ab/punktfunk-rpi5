@@ -16,9 +16,6 @@
 //! a stream's life). Falls back cleanly: any init/import error disables the importer and the
 //! CPU mmap path takes over.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::cuda::{self, DeviceBuffer};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;

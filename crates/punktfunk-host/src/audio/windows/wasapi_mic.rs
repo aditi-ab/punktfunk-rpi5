@@ -28,9 +28,6 @@
 //! ([`VirtualMic::set_target_depth`]), filling silence when the client isn't talking. WASAPI
 //! objects are `!Send`, so they live entirely on that thread (mirrors `WasapiLoopbackCapturer`).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{audio_control, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;

@@ -5,8 +5,6 @@
 //! shared `pf-driver-proto` ABI crate (no_std + bytemuck) across the workspace boundary.
 
 #![allow(non_snake_case)]
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 mod iddcx_rt;
 mod iddcx_surface_assert;

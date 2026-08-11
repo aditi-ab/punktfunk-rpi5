@@ -15,3 +15,6 @@ description = "punktfunk UMDF driver util: safe shared-memory + sealed-channel +
 [dependencies]
 wdk-sys.workspace = true
 pf-driver-proto.workspace = true
+
+[lints]
+workspace = true

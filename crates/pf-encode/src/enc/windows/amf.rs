@@ -49,8 +49,6 @@
 // restate the signature. Clearing this file means DELETING the markers that carry no caller
 // contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
 #![allow(unsafe_op_in_unsafe_fn)]
-// Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};

@@ -27,6 +27,8 @@ mod tests {
     /// implementations — that's fine, MFXLoad itself must still succeed).
     #[test]
     fn dispatcher_links_and_loads() {
+        // SAFETY: MFXLoad allocates the dispatcher's loader context (documented to work with no
+        // driver present) and MFXUnload frees that same non-null handle; nothing else is touched.
         unsafe {
             let loader = MFXLoad();
             assert!(!loader.is_null(), "MFXLoad returned NULL");

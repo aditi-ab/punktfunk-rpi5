@@ -6,9 +6,6 @@
 //! A worker death — the whole point of the isolation — surfaces as an `Err` with
 //! [`RemoteImporter::dead`] set, never as a host fault.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::cuda::{self, CUdeviceptr, DeviceBuffer, CU_IPC_HANDLE_SIZE};
 use super::egl::DmabufPlane;
 use super::ipc;

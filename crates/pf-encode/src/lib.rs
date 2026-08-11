@@ -12,7 +12,6 @@
 // `#[cfg(test)]` instead.
 // Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
 // program). As a parent module this also covers the child modules (windows/linux backends).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::Result;
 use pf_frame::{CapturedFrame, PixelFormat};

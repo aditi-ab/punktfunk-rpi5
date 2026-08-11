@@ -39,13 +39,6 @@
 // honest. (Was a bare crate-wide allow whose "scaffold, defined ahead of the target that uses them"
 // rationale had stopped being true.)
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-// …and that program only covers a whole `unsafe fn` body once the body needs its own block: in
-// edition 2021 `unsafe_op_in_unsafe_fn` is allow-by-default, which exempted this crate's hardest
-// FFI from the deny above — every IOCTL wrapper, and `restore_displays_ccd`, the call the whole
-// Windows teardown path depends on to give the operator their physical panels back.
-#![deny(unsafe_op_in_unsafe_fn)]
 
 use anyhow::Result;
 pub use punktfunk_core::Mode;

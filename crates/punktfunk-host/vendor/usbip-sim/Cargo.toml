@@ -1,3 +1,7 @@
+# Vendored snapshot — like pf-bitstream/vendor/cros-codecs, deliberately NOT opted into the
+# workspace [lints] tables: upstream code stays as close to pristine as the trim allows, so a
+# re-sync against upstream stays a diff, not an archaeology dig. (Zero `unsafe` today anyway.)
+#
 # Vendored + trimmed copy of the `usbip` crate (jiegec/usbip v0.8.0, MIT), reduced to the
 # USB/IP *server simulation* path only: we present a virtual Steam Deck and let the local
 # `vhci_hcd` attach it. The upstream crate hard-depends on `rusb`→`libusb1-sys` (for its USB

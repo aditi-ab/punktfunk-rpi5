@@ -20,9 +20,6 @@
 //! `winsta0\default` (the service supervisor retargets the token — `windows/service.rs`
 //! `spawn_host`), so the poller thread sees the session's cursor directly; no helper process.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,

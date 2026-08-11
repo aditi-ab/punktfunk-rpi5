@@ -2,9 +2,6 @@
 //! capturer): duplicates the unnamed shared header / ring / event handles into the driver's WUDFHost
 //! and delivers them as bare handle values over the SYSTEM-only control device.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 
 /// The sealed channel's handle-duplication broker (`design/idd-push-security.md`): the frame objects

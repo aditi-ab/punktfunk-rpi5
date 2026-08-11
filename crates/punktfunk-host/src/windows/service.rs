@@ -25,9 +25,6 @@
 //! loaded into the service's environment and carried to the host child. Logs land in
 //! `%ProgramData%\punktfunk\logs\`.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

@@ -23,9 +23,6 @@
 //! "Could not find output". We talk raw Wayland on `$WAYLAND_DISPLAY`, so the host must run inside
 //! the KWin session's environment.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::{AsFd, AsRawFd};

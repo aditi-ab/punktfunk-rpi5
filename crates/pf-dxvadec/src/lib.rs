@@ -52,7 +52,6 @@
 //! ([`dxva::as_bytes`] / [`dxva::slice_bytes`]), fenced behind a sealed trait
 //! that only this crate's `#[repr(C)]` PODs implement, and carrying a written
 //! proof — enforced:
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod config;
 pub mod descriptors;

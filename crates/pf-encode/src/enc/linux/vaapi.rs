@@ -19,8 +19,6 @@
 //! hwdevice/hwframes/buffersrc/buffersink calls go through `ffmpeg::ffi` (= `ffmpeg_sys_next`),
 //! as the CUDA encode path and the clients' decode paths already do. The encoder is opened
 //! *without* a global header, so VPS/SPS/PPS are in-band on every IDR.
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Codec, EncodedFrame, Encoder};
 use anyhow::{anyhow, bail, Context, Result};

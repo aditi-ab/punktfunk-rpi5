@@ -8,8 +8,6 @@
 //! verified (ioctl numbers + a live signal→wait round trip), ready to wire in the moment a producer
 //! gains working `SPA_META_SyncTimeline`.
 #![allow(dead_code)]
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 //!
 //! Compositors that render directly into the PipeWire buffer pool (Mutter's virtual
 //! monitors) hand buffers over at GPU-submit time; on drivers without implicit dmabuf

@@ -33,9 +33,6 @@
 //! The session's `FlushTimer` is 1 s, so a bracket from the trailing second of a gap can land
 //! AFTER that stall's report line — the next report (and the metronomic tally) still carries it.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};

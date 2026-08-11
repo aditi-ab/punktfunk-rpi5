@@ -37,8 +37,6 @@
 //! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
 //! `AVD3D11VADeviceContext`/`AVD3D11VAFramesContext` layouts are mirrored (the bindings don't
 //! allowlist `hwcontext_d3d11va.h`), as [`super::linux`] mirrors `AVCUDADeviceContext`.
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use anyhow::{anyhow, bail, Context, Result};

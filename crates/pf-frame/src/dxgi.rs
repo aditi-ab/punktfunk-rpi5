@@ -7,9 +7,6 @@
 //! The win32u GPU-preference hook, the HDR/video-engine converters, and the self-tests stay in the
 //! capture crate — they are capture mechanics, not shared identity.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::{Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, LUID};

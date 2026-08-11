@@ -20,7 +20,6 @@
 //!        `display-disturb modeset [--interval-ms 2000]`
 
 // Unsafe-proof program: every `unsafe {}` in this tool carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(not(target_os = "windows"))]
 fn main() {

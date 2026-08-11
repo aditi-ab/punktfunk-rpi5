@@ -1,9 +1,6 @@
 //! Capture-stall detection (plan §W4, carved out of the IDD-push capturer): flags multi-hundred-ms
 //! holes in DWM frame delivery that open while the desktop was actively composing.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 
 /// A detected capture stall: a multi-hundred-ms hole in DWM's frame delivery that opened while the

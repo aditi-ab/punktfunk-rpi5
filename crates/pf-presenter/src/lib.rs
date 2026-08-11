@@ -17,7 +17,6 @@
 //! the decode chain there is Vulkan → D3D11VA → software.
 
 // Unsafe-proof program: every `unsafe {}` in this crate carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 // THE VULKAN CONTRACT, stated once - most `// SAFETY:` proofs in this crate are an instance of it.
 //

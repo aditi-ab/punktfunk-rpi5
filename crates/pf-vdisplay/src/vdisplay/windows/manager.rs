@@ -14,9 +14,6 @@
 //! its `Drop` releases the refcount (a *stale* lease — its monitor was preempted + recreated under it —
 //! is a no-op, so it can never tear down the live monitor).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

@@ -35,9 +35,6 @@
 //! COM discipline matches the sibling modules: WASAPI/COM objects live on the thread that made
 //! them (the provisioning worker, the capture thread); only channels and plain data cross.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{audio_control, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashSet, VecDeque};

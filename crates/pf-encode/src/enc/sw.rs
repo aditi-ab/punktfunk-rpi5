@@ -12,8 +12,6 @@
 //! defaulting to BT.709 limited — true of every punktfunk client (`csc_rows` falls back to 709 on
 //! "unspecified"), but NOT of vendor TV decoders, which guess colorimetry from RESOLUTION: an LG
 //! webOS panel reads a 4K SDR stream as BT.2020 and renders it visibly washed out.
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{EncodedFrame, Encoder};
 use anyhow::{bail, ensure, Context, Result};

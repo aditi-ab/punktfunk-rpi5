@@ -22,9 +22,6 @@
 //! Trust: the host serves with its persistent identity (`~/.config/punktfunk/cert.pem`, shared
 //! with GameStream pairing) and logs the SHA-256 fingerprint clients pin.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};

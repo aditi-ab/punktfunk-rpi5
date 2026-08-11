@@ -15,7 +15,6 @@
 //!                    (measure the path: probe burst → goodput / loss / recommended bitrate)
 
 // Unsafe-proof program: every `unsafe {}` in this client carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 // Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
 // does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
 // terminal's console at startup (see main), so their output is still visible when run from a shell.

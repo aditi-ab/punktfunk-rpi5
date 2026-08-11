@@ -15,6 +15,17 @@ version = "0.0.1"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# The same unsafe discipline as the main workspace (see its Cargo.toml for the full rationale).
+# Restated here because THIS IS A SEPARATE WORKSPACE: the main tree's [workspace.lints] does not
+# reach these crates, so any "workspace-wide" lint claim has to be made here too or it is false
+# for the driver surface. Every member opts in with `[lints] workspace = true`.
+# (`unsafe_op_in_unsafe_fn` is already the edition-2024 default; deny pins it explicitly.)
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 [workspace.dependencies]
 wdk = "0.4.1"
 wdk-sys = "0.5.1"

@@ -14,13 +14,6 @@
 
 // Scaffold: trait methods + per-OS backends are defined ahead of the target that uses them.
 #![allow(dead_code)]
-// Every unsafe block in this crate carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-// …and its companion: without this, an `unsafe fn` body needs no blocks, so an unproven FFI call
-// could hide inside one and still satisfy the deny above. The workspace keeps
-// `unsafe_op_in_unsafe_fn` at `warn` while the encoder backends are cleared; this crate is at zero.
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
 

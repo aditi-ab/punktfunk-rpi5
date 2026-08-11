@@ -16,9 +16,6 @@
 //! [`pf_driver_proto`] (which OWNS the contract, with `const` size asserts) — both sides `use` it, so
 //! drift is a compile error rather than a "must match" comment.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::dxgi::{
     make_device, BgraToYuvPlanes, D3d11Frame, HdrP010Converter, HdrRgb10Converter, PyroFrameShare,
     VideoConverter, WinCaptureTarget,

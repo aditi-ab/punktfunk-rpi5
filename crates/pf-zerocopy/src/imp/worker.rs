@@ -9,9 +9,6 @@
 //! only happens after the capturer AND every in-flight frame on the host side are gone, so pooled
 //! device memory is never freed under a frame the host still reads.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::cuda::{self, CUdeviceptr, DeviceBuffer};
 use super::egl::{DmabufPlane, EglImporter};
 use super::ipc;

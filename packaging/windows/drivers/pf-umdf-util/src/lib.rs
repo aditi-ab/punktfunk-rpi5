@@ -19,12 +19,9 @@
 //!   `pf_gamepad`/`pf_mouse` tell the host, over the device stack, which process is serving this
 //!   devnode. That is what the host trusts instead of the LocalService-writable bootstrap mailbox.
 //!
-//! Lint gates (mirrored in every driver crate, enforced by the drivers CI clippy step):
-//! `unsafe_op_in_unsafe_fn` + `clippy::undocumented_unsafe_blocks` — every remaining `unsafe {}`
-//! must carry a `// SAFETY:` proof.
-
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
+//! Lint gates (workspace-wide via this workspace's `[workspace.lints]`, enforced by the drivers
+//! CI clippy step): `unsafe_op_in_unsafe_fn` + `clippy::undocumented_unsafe_blocks` — every
+//! remaining `unsafe {}` must carry a `// SAFETY:` proof.
 
 pub mod channel;
 pub mod hid;

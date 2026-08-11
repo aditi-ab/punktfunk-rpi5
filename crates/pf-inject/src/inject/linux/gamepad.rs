@@ -15,9 +15,6 @@
 //! `<linux/uinput.h>` on x86_64. `/dev/uinput` needs a udev rule + `input` group membership
 //! (see `scripts/60-punktfunk.rules`); creation fails with a clear error otherwise.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use crate::pad_slots::PadSlots;
 use anyhow::{bail, Result};
 use punktfunk_core::input::{gamepad, GamepadFrame, MAX_PADS};

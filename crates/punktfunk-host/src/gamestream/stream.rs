@@ -3,9 +3,6 @@
 //! either real portal desktop capture (`PUNKTFUNK_VIDEO_SOURCE=portal`, the portal PipeWire path) or
 //! a synthetic test pattern (default). Runs on its own native thread.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};

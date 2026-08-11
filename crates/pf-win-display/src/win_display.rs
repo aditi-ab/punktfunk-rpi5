@@ -8,13 +8,6 @@
 //! them, which let the SudoVDA backend be dropped without losing them (audit §9 / Goal 2 — done). The
 //! plan's `windows/display_ccd.rs`. Extracted verbatim from the former SudoVDA backend before its removal.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-// …and that program only covers a whole `unsafe fn` body once the body needs its own block: in
-// edition 2021 `unsafe_op_in_unsafe_fn` is allow-by-default, which exempted every CCD/GDI helper
-// below — including `restore_displays_ccd`, the call pf-vdisplay's teardown path depends on to give
-// the operator their physical panels back.
-#![deny(unsafe_op_in_unsafe_fn)]
 // The CCD/GDI helpers below are SAFE fns. They were `unsafe fn` for a decade of habit rather than a
 // memory-safety obligation: every one takes `Copy` scalars or borrowed Rust data, returns owned
 // values, and discharges its own FFI preconditions internally (`retry_set_display_config` even binds

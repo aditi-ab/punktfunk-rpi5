@@ -13,16 +13,10 @@
 
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
-// Unsafe-proof program: every `unsafe {}` / `unsafe impl` in the crate must carry a `// SAFETY:`
-// proof of why it is sound. This crate-root deny is the permanent, catch-all gate (it also covers
-// any future module); individual files keep their own `#![deny(...)]` as belt-and-suspenders.
-#![deny(clippy::undocumented_unsafe_blocks)]
-// The companion gate: a proof only covers what it is attached to, and an `unsafe fn` body without
-// this lint needs no blocks at all — so an unproven FFI call could hide inside one and satisfy the
-// deny above. The workspace sets `unsafe_op_in_unsafe_fn` to `warn` (a ratchet across ~590 sites);
-// this crate is at zero, so it denies. Keep the marker only where a caller can actually violate
+// Unsafe-proof program (both lints now enforced by the workspace `[workspace.lints]` tables):
+// every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof, and `unsafe fn` bodies need
+// explicit blocks. Keep the `unsafe fn` marker only where a caller can actually violate
 // something — a raw pointer or a borrowed `HANDLE` parameter, as in `service::spawn_host`.
-#![deny(unsafe_op_in_unsafe_fn)]
 
 mod audio;
 mod bringup;

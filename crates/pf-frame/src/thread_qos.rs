@@ -3,9 +3,6 @@
 //! can't deschedule them; the native, GameStream, and direct-NVENC send threads all reach this the
 //! same way (`pf_frame::thread_qos::boost_thread_priority`).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 /// Raise the current thread's OS scheduling priority so a CPU-heavy game can't deschedule our
 /// capture/encode/send threads. This matters even though our GPU work is already HIGH priority: the
 /// GPU scheduler can only favour commands we've actually SUBMITTED, so if a normal-priority thread is

@@ -17,9 +17,6 @@
 //! data packets are consumed immediately and missing parity only costs loss recovery — so
 //! the validated stereo path stays byte-identical (data packets only, exactly as before).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 use crate::audio::SAMPLE_RATE;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
