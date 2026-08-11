@@ -176,7 +176,13 @@ unsafe extern "system" fn wnd_proc(
             let slice = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, len) };
             let url = String::from_utf16_lossy(slice);
             tracing::debug!(%url, "link from another instance");
-            INBOX.lock().unwrap().push(url);
+            // Poison-recover, never unwrap: a panic out of a window procedure is an abort since
+            // Rust 1.81, and the inbox is a plain Vec that stays valid whatever a poisoned
+            // writer left behind.
+            INBOX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(url);
             return LRESULT(1);
         }
     }

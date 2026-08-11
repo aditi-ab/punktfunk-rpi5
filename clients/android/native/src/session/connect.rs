@@ -9,7 +9,7 @@ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{hex32, jni_guard, parse_hex32, SessionHandle};
+use super::{hex32, jni_guard, lock_recover, parse_hex32, SessionHandle};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -41,7 +41,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastErr
     env: JNIEnv<'local>,
     _this: JObject<'local>,
 ) -> jni::sys::jstring {
-    let token = std::mem::take(&mut *LAST_ERROR.lock().unwrap());
+    let token = std::mem::take(&mut *lock_recover(&LAST_ERROR));
     match env.new_string(token) {
         Ok(s) => s.into_raw(),
         Err(_) => JObject::null().into_raw(),

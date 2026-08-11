@@ -53,6 +53,16 @@ use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 
+/// Poison-recovering lock for the C ABI surface. `.lock().unwrap()` inside an `extern "C"` fn
+/// turns a poisoned mutex (some other thread panicked mid-write) into a panic across the C
+/// boundary — an abort since Rust 1.81, exactly the class the panic-in-extern grep gate exists
+/// for. The slots behind these mutexes are plain last-value caches (frame/audio/cursor/clip), so
+/// whatever a poisoned writer left behind is still structurally valid data to overwrite or hand
+/// out; recovering the guard is strictly better than aborting the embedding application.
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Opaque session handle. Pointer-only from C.
 pub struct PunktfunkSession {
     inner: Session,
@@ -471,8 +481,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
         }
         match s.inner.poll_frame() {
             Ok(frame) => {
-                s.last_frame = Some(frame);
-                let f = s.last_frame.as_ref().unwrap();
+                let f = s.last_frame.insert(frame);
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
                 // matching `#[repr(C)]` type, written once by value.
                 unsafe {
@@ -2249,9 +2258,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
             .next_frame(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(frame) => {
-                let mut slot = c.last.lock().unwrap();
-                *slot = Some(frame);
-                let f = slot.as_ref().unwrap();
+                let mut slot = lock_recover(&c.last);
+                let f = slot.insert(frame);
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
                 // matching `#[repr(C)]` type, written once by value.
                 unsafe {
@@ -2314,9 +2322,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
             .next_audio(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(pkt) => {
-                let mut slot = c.last_audio.lock().unwrap();
-                *slot = Some(pkt);
-                let p = slot.as_ref().unwrap();
+                let mut slot = lock_recover(&c.last_audio);
+                let p = slot.insert(pkt);
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
                 // matching `#[repr(C)]` type, written once by value.
                 unsafe {
@@ -2467,7 +2474,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
             Ok(pkt) => pkt,
             Err(e) => return e.status(),
         };
-        let mut state = c.audio_pcm.lock().unwrap();
+        let mut state = lock_recover(&c.audio_pcm);
         match state.decode_packet(&pkt.data, pkt.seq, channels) {
             // Nothing to hand out this call: a DTX silence marker with no loss owed before it.
             Ok(0) => PunktfunkStatus::NoFrame,
@@ -3072,9 +3079,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
             .next_cursor_shape(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(shape) => {
-                let mut slot = c.last_cursor_shape.lock().unwrap();
-                *slot = Some(shape);
-                let sh = slot.as_ref().unwrap();
+                let mut slot = lock_recover(&c.last_cursor_shape);
+                let sh = slot.insert(shape);
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
                 // matching `#[repr(C)]` type, written once by value.
                 unsafe {
@@ -4053,7 +4059,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
             .next_clip(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(ev) => {
-                let mut slot = c.last_clip.lock().unwrap();
+                let mut slot = lock_recover(&c.last_clip);
                 let out_ev = build_clip_event(ev, &mut slot);
                 // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
                 // written once by value.
@@ -4065,7 +4071,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
                 // traffic is sporadic, so without this a one-off 50 MiB paste stays resident
                 // for the rest of the session (there is no other release entry point). The
                 // borrow contract already says `out` data is valid only until the next call.
-                *c.last_clip.lock().unwrap() = None;
+                *lock_recover(&c.last_clip) = None;
                 e.status()
             }
         }

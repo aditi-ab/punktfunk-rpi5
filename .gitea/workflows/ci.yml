@@ -111,6 +111,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # rust-safety WP2c: three textual gates for classes no lint covers — unsafe fn markers
+      # carrying no contract, panic across an extern boundary (an abort since 1.81), and
+      # process-global safe APIs (env::set_var & co, count-ratcheted). Pure grep/awk, no cargo.
+      # Both failure modes were demonstrated before this became blocking (planted instances).
+      - name: Unsafe-hygiene grep gates
+        run: sh scripts/ci/check-unsafe-hygiene.sh
+
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

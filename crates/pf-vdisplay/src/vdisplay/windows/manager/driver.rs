@@ -81,6 +81,8 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// The monitor is NOT departed; the caller CCD-forces the freshly-advertised mode afterwards.
     /// The default errs so a backend without support routes to the re-arrival fallback.
     ///
+    // unsafe-fn-no-op-ok: trait method — the "dev is live" contract binds every impl; this
+    // default body is a stub that bails.
     /// # Safety
     /// `dev` must be the live control handle.
     unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
@@ -114,6 +116,7 @@ mod tests {
         fn open(&self, _reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
             anyhow::bail!("fake driver has no control device")
         }
+        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
         unsafe fn add_monitor(
             &self,
             _dev: HANDLE,
@@ -125,9 +128,11 @@ mod tests {
         ) -> Result<AddedMonitor> {
             anyhow::bail!("fake driver adds no monitors")
         }
+        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
         unsafe fn remove_monitor(&self, _dev: HANDLE, _key: &MonitorKey) -> Result<()> {
             Ok(())
         }
+        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
         unsafe fn ping(&self, _dev: HANDLE) -> Result<()> {
             Ok(())
         }
