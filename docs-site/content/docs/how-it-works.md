@@ -63,8 +63,9 @@ Punktfunk speaks two protocols over the same host:
   on imperfect networks, and it's what the [native clients](/docs/clients) (Apple, Linux, Windows,
   Android) use.
 
-The native `punktfunk/1` plane runs by default (the secure default); add `--gamestream` and both planes
-serve from a single host process — Moonlight clients use GameStream, the native clients use punktfunk/1.
+The native `punktfunk/1` plane runs by default (the secure default); add `--gamestream` (or
+`PUNKTFUNK_GAMESTREAM=1` in `host.env` for a packaged install) and both planes serve from a single
+host process — Moonlight clients use GameStream, the native clients use punktfunk/1.
 
 ## Pairing and trust
 

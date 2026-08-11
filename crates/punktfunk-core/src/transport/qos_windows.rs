@@ -13,6 +13,10 @@
 //! Same contract as the rest of [`super::qos`]: opt-in (`dscp_enabled`), and every step
 //! debug-logs and continues — QoS is a nicety, never required for correctness.
 
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall glue — qWAVE FFI moves
+// flow handles, never network bytes; each site carries its proof.
+#![allow(unsafe_code)]
+
 use super::qos::MediaClass;
 use std::net::UdpSocket;
 use std::os::windows::io::AsRawSocket;

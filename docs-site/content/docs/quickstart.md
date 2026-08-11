@@ -52,14 +52,15 @@ journalctl --user -u punktfunk-host -f   # watch it come up and print its identi
 Once up, the host advertises itself on your local network, so clients find it by name. It works out
 where your compositor is by itself, so there is nothing to export.
 
-That unit runs `serve --gamestream`: the native `punktfunk/1` plane **plus** the
-GameStream/Moonlight-compatible planes, so stock [Moonlight](/docs/moonlight) clients work too. Those
-extra planes pair over plain HTTP and belong on a trusted LAN only — for a native-only host, see
+That unit runs the **secure native-only host** (Punktfunk clients + the management API). Want stock
+[Moonlight](/docs/moonlight) clients too? GameStream compat is **opt-in** — add
+`PUNKTFUNK_GAMESTREAM=1` to `~/.config/punktfunk/host.env` and restart the unit (trusted LANs only;
+its pairing runs over plain HTTP) — see
 [What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
 
 If the host runs a firewall (Fedora enables firewalld, CachyOS enables ufw), open its ports — the
-firewall step in your distro guide has the exact commands, for **both** `punktfunk-native` and
-`punktfunk-gamestream`, because the packaged unit serves both planes.
+firewall step in your distro guide has the exact commands: `punktfunk-native` always, plus
+`punktfunk-gamestream` only if you enabled Moonlight compat.
 
 On **SteamOS** even that is done for you — the install script wrote its own `punktfunk-host` user
 service and started it (GameStream on by default there too; pass `--no-gamestream` to the install

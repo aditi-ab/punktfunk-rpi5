@@ -29,7 +29,10 @@ mod bringup;
 mod capture;
 mod detect;
 mod devtest;
+// Network-facing on the secure default host (see the forbid block at `mod mgmt` below).
+#[forbid(unsafe_code)]
 mod discovery;
+#[forbid(unsafe_code)]
 mod wol;
 // Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
 // keeps the `crate::*` module names flat (every existing path is unchanged).
@@ -77,9 +80,18 @@ mod interactive;
 mod launchreg;
 mod library;
 mod log_capture;
+// The native punktfunk/1 plane and the management API — everything a SECURE-DEFAULT host
+// exposes — are safe Rust by compiler-enforced invariant (rust-safety programme): `forbid`
+// here means a future edit cannot quietly introduce unsafe into a network-facing module.
+// (`native` carves out its `#[cfg(test)]` C-ABI roundtrip tests, which exercise the CLIENT
+// side of punktfunk-core against this host in-process and are unsafe by nature.)
+#[forbid(unsafe_code)]
 mod mgmt;
+#[forbid(unsafe_code)]
 mod mgmt_token;
+#[cfg_attr(not(test), forbid(unsafe_code))]
 mod native;
+#[forbid(unsafe_code)]
 mod native_pairing;
 mod osinfo;
 mod pipeline;
@@ -831,6 +843,10 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         data_port,
         mdns: !no_mdns && discovery::mdns_enabled(),
     };
+    // The Moonlight-compat planes are opt-in from EITHER source: the `--gamestream` CLI flag or
+    // `PUNKTFUNK_GAMESTREAM` in host.env — the packaged systemd units ship a fixed native-only
+    // ExecStart, so the env knob is how a package user opts in without editing the unit.
+    let gamestream = gamestream || pf_host_config::config().gamestream;
     Ok((opts, native, gamestream))
 }
 
@@ -980,7 +996,9 @@ SERVE OPTIONS:
     --gamestream  (--moonlight)  ALSO run the GameStream/Moonlight-compat planes (nvhttp pairing,
                                  RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
                                  inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce
-                                 reuse, security-review #5/#9); enable only on a TRUSTED LAN
+                                 reuse, security-review #5/#9); enable only on a TRUSTED LAN.
+                                 Also PUNKTFUNK_GAMESTREAM=1 in host.env (how a packaged install
+                                 opts in — the shipped units run native-only)
     --native                     no-op (the native punktfunk/1 plane always runs in `serve` now)
     --native-port <PORT>         native QUIC port (default 9777)
     --data-port <PORT>           pin the per-session video data plane to this fixed UDP port and

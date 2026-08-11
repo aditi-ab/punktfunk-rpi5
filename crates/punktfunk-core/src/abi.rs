@@ -14,6 +14,11 @@
 //!   because they cannot panic: [`punktfunk_abi_version`] returns a constant, and the
 //!   `punktfunk_connect*` shims forward every argument unchanged into a guarded implementation.
 
+// The crate denies `unsafe_code` (lib.rs): the network plane is safe Rust by compiler-enforced
+// invariant. This module is one of the two documented carve-outs — an `extern "C"` surface for
+// the platform clients cannot exist without unsafe, and every site below carries its proof.
+#![allow(unsafe_code)]
+
 // THE ABI CONTRACT, stated once - most `// SAFETY:` proofs below are an instance of it.
 //
 // Every pointer crossing this boundary is C memory the CALLER owns, and the header

@@ -1,6 +1,10 @@
 //! Apple/BSD batched UDP receive: Darwin `recvmsg_x`, `recv`-loop fallback on other BSDs.
 //! The platform body of [`super::UdpTransport`]'s `recv_batch` override.
 
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue — `recvmsg_x`
+// fills caller-owned buffers; nothing here interprets network bytes. Proofs at each site.
+#![allow(unsafe_code)]
+
 use super::{is_transient_io, UdpTransport};
 
 /// Apple (macOS/iOS) batched-receive enable state. Darwin has no `recvmmsg(2)`, so without this our

@@ -2,6 +2,10 @@
 //! The platform bodies of [`super::UdpTransport`]'s `send_batch`/`send_gso`/`recv_batch`
 //! overrides live here (called by the cfg-gated delegators in the parent `impl Transport`).
 
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue —
+// `sendmmsg`/`recvmmsg`/GSO move caller-owned buffers; nothing here interprets network bytes.
+#![allow(unsafe_code)]
+
 use super::{is_transient_io, UdpTransport};
 
 #[cfg(target_os = "android")]

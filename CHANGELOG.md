@@ -14,6 +14,44 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.27.1 — in development
 
+### GameStream is now opt-in on EVERY route (⚠ packager-visible default change)
+
+The secure native-only host is the default everywhere; the Moonlight-compat planes (plain-HTTP
+pairing + the legacy GCM path, security-review #5/#9) are enabled only by an explicit choice:
+
+- **The shipped systemd user unit** (`scripts/punktfunk-host.service`, installed by deb/RPM/Arch/
+  sysext) runs bare `serve` — `--gamestream` is no longer baked into `ExecStart`. Opt in via the
+  new **`PUNKTFUNK_GAMESTREAM=1`** knob in `host.env` (pf-host-config; equivalent to the flag —
+  either source enables), so no unit editing survives-upgrades dance is needed.
+  ⚠ **Upgrade note:** a packaged host that served Moonlight by default becomes native-only until
+  the operator sets the knob (a hand-made `ExecStart` drop-in keeps winning as before).
+- **NixOS module**: `services.punktfunk.host.gamestream` default flipped `true` → `false`
+  (module-check gained a "default is native-only" assertion); enabling it still opens the
+  GameStream firewall ports.
+- **Steam Deck installer**: `--gamestream` opts in (was on-by-default with `--no-gamestream`;
+  the old flag is still accepted as explicit-off).
+- Windows was already opt-in (unchecked installer task) and is unchanged.
+
+### The ENet control port now exists only while a pairing does (rust-safety WP0)
+
+`rusty_enet` — a c2rust-style transpile of C ENet, and the host's only pre-auth-reachable unsafe
+surface — no longer listens unconditionally: UDP 47999 binds when the paired-client list becomes
+non-empty and is torn down when the last pairing is removed (a live client gets the same
+TERMINATION+disconnect farewell as a host-side session end). Pairing itself is HTTPS on nvhttp and
+never touches the port, so a never-paired `--gamestream` host exposes no ENet at all. En route:
+the management API's unpair endpoint never persisted (`save_paired` was missing), so an unpair
+lasted only until the next restart — fixed. `rusty_enet` is now pinned `=0.4.0`.
+
+### Memory-safety, compiler-enforced (embedder-visible lint tightening)
+
+`punktfunk-core` now carries `#![deny(unsafe_code)]` crate-wide: everything that parses network
+bytes is safe Rust by compiler-enforced invariant. The documented `#![allow]` carve-outs are the
+client surface (`abi`, `client`) and the platform syscall-batching shims under `transport`
+(`udp/{apple,linux,windows}`, `qos_windows`) — none of which interpret attacker bytes. In
+`punktfunk-host`, the modules a secure-default host exposes (`native`, `native_pairing`, `mgmt`,
+`mgmt_token`, `discovery`, `wol`) are `#[forbid(unsafe_code)]`. If you embed `punktfunk-core` and
+patch it, new unsafe outside the carve-outs is now a compile error.
+
 ### NixOS + KDE — session detection, the other half
 
 🛑 **v0.27.0's NixOS session-detection fix did not reach a stock NixOS + Plasma 6 box.** It resolved

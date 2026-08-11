@@ -144,6 +144,13 @@ pub struct HostConfig {
     /// text ("Living Room PC"); the DNS-level `<label>.local.` target keeps using a sanitized
     /// machine-safe label, so a spacey display name can't produce an invalid mDNS record.
     pub host_name: Option<String>,
+    /// `PUNKTFUNK_GAMESTREAM` — enable the GameStream/Moonlight-compat planes (nvhttp pairing,
+    /// RTSP, ENet control, `_nvstream` mDNS) from `host.env`, equivalent to the `--gamestream`
+    /// CLI flag (either source turns it on). **Default OFF** — the secure native-only host: the
+    /// compat planes carry plain-HTTP pairing + the legacy GCM-nonce path (security-review
+    /// #5/#9), so stock-Moonlight support is opt-in on every route, and the packaged units ship
+    /// without the flag so this knob is how a package user opts in.
+    pub gamestream: bool,
     /// `PUNKTFUNK_ENCODER` — explicit encoder-backend override (lowercased; empty = auto-detect by GPU vendor).
     pub encoder_pref: String,
     /// `PUNKTFUNK_RENDER_ADAPTER` — discrete render-GPU pin by description substring (`Some` even when empty:
@@ -356,6 +363,9 @@ impl HostConfig {
             host_name: val("PUNKTFUNK_HOST_NAME")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            // Default OFF, explicit-on grammar: the Moonlight-compat planes are opt-in
+            // everywhere (see the field doc); `--gamestream` on the CLI also turns them on.
+            gamestream: env_on("PUNKTFUNK_GAMESTREAM").unwrap_or(false),
             encoder_pref: std::env::var("PUNKTFUNK_ENCODER")
                 .unwrap_or_default()
                 .to_ascii_lowercase(),

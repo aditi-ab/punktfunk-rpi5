@@ -9,36 +9,38 @@ desktop you log into and a fully headless box.
 
 ## What the unit starts
 
-The bundled unit runs `serve --gamestream`, so it serves both the native `punktfunk/1` plane and
-stock [Moonlight](/docs/moonlight) clients. Every Linux package installs that unit as it ships and
-only rewrites the binary path, so a host you installed from apt, dnf, pacman or the Bazzite sysext
-has **GameStream on**. See what yours starts:
+The bundled unit runs `serve`: the **secure native-only host** — the `punktfunk/1` plane plus the
+management API. Stock [Moonlight](/docs/moonlight) (GameStream) support is **opt-in** on every
+install route: its pairing runs over plain HTTP and its legacy encryption is weaker (see
+[Security & Safe Use](/docs/security)), so it belongs on trusted LANs you chose to enable it on.
+See what yours starts:
 
 ```sh
 systemctl --user cat punktfunk-host
 ```
 
-For a **native-only** host (no GameStream — its pairing runs over plain HTTP and its legacy
-encryption is weaker; see [Security & Safe Use](/docs/security)), drop the flag. The packaged unit is
-a package file that an upgrade replaces, so override `ExecStart` with a drop-in rather than editing
-it:
-
-```sh
-systemctl --user edit punktfunk-host
-```
+To serve stock Moonlight clients too, add one line to `~/.config/punktfunk/host.env` (the unit's
+`EnvironmentFile` — no drop-in or unit editing needed) and restart:
 
 ```ini
-[Service]
-ExecStart=
-ExecStart=/usr/bin/punktfunk-host serve
+PUNKTFUNK_GAMESTREAM=1
 ```
 
-The empty `ExecStart=` is required — without it systemd adds a second command instead of replacing
-the first — and the path must match the one `systemctl --user cat` printed (the distro packages use
-`/usr/bin`). Save, then `systemctl --user restart punktfunk-host`.
+```sh
+systemctl --user restart punktfunk-host
+```
 
-Windows is the other way round: an install from the setup `.exe` leaves GameStream **off** unless you
-tick it, and it is configured differently — see [Windows](#windows) below.
+Then also open the `punktfunk-gamestream` firewall service alongside `punktfunk-native` — the
+firewall step in your distro guide has the exact commands.
+
+> **Upgrading?** Earlier releases baked `--gamestream` into the unit's `ExecStart`, so a packaged
+> host served Moonlight by default. The upgrade replaces that unit with the native-only one — if
+> you relied on Moonlight, add `PUNKTFUNK_GAMESTREAM=1` to `host.env` as above. (A hand-made
+> `systemctl --user edit` drop-in that sets its own `ExecStart` keeps winning either way —
+> `systemctl --user cat punktfunk-host` shows what is in effect.)
+
+Windows works the same way: an install from the setup `.exe` leaves GameStream **off** unless you
+tick it, configured through its own mechanism — see [Windows](#windows) below.
 
 ## A. A desktop you log into
 

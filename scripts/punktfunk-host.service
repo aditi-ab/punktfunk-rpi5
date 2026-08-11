@@ -1,6 +1,9 @@
-# punktfunk streaming host — systemd USER unit (`serve --gamestream` = native punktfunk/1 + the
-# GameStream/Moonlight-compat planes). For a SECURE native-only host (no plain-HTTP pairing / legacy
-# GCM nonce reuse — security-review #5/#9; native clients only), drop `--gamestream` from ExecStart.
+# punktfunk streaming host — systemd USER unit. Runs the SECURE native-only host by default
+# (punktfunk/1 clients + the management API; no plain-HTTP pairing / legacy GCM nonce reuse —
+# security-review #5/#9). Stock-Moonlight (GameStream) compat is OPT-IN: add
+#   PUNKTFUNK_GAMESTREAM=1
+# to ~/.config/punktfunk/host.env (the EnvironmentFile below) and restart — no unit editing
+# needed. Only do that on a TRUSTED LAN; it opens the compat planes' extra ports too.
 #
 # Install (against an already-running compositor session — the host auto-detects and follows it,
 # so host.env needs no backend config):
@@ -35,7 +38,7 @@
 # unit (when present) just needs to be up by the time a client streams (seconds later, user-driven).
 # A missing After= unit (e.g. gamescope backend, no kde-session installed) is simply ignored.
 [Unit]
-Description=punktfunk GameStream + punktfunk/1 host
+Description=punktfunk streaming host (punktfunk/1; +GameStream when PUNKTFUNK_GAMESTREAM=1)
 After=pipewire.service punktfunk-kde-session.service
 # PartOf the kwin session (when present): the host's libei input uses the RemoteDesktop portal,
 # whose D-Bus connection goes stale if the compositor session restarts the portal under it — the
@@ -52,7 +55,7 @@ PartOf=punktfunk-kde-session.service
 # `punktfunk-host serve` by hand already does. Contrast punktfunk-web.service, which marks
 # mgmt-token mandatory ON PURPOSE so Restart waits for the host to write it — this is not that.
 EnvironmentFile=-%h/.config/punktfunk/host.env
-ExecStart=%h/punktfunk/target/release/punktfunk-host serve --gamestream
+ExecStart=%h/punktfunk/target/release/punktfunk-host serve
 Restart=on-failure
 RestartSec=2
 

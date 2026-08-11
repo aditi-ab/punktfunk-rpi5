@@ -13,18 +13,21 @@ a browser, a smart TV, or any device without a native client.
 
 ## 1. Make sure the host is running with GameStream enabled
 
-Moonlight needs the GameStream planes, which are **opt-in** on the host — but most installs already
-enable them:
+Moonlight needs the GameStream planes, which are **opt-in on every install route** (the default is
+the secure native-only host):
 
-- **Linux packages, NixOS, SteamOS / Steam Deck** — already on: the shipped `punktfunk-host` user
-  unit runs `serve --gamestream`. To turn it *off*, override `ExecStart` with a drop-in so a package
-  upgrade doesn't undo it — see
-  [What the unit starts](/docs/running-as-a-service#what-the-unit-starts) — or set
-  `services.punktfunk.host.gamestream = false` on NixOS, or re-run the Deck installer with
-  `--no-gamestream`.
-- **Windows** — off unless you ticked the installer's *Enable GameStream (Moonlight) compatibility*
-  checkbox. To turn it on afterwards, run this from an **elevated** prompt (`=off` puts it back) —
-  see [Windows Host](/docs/windows-host):
+- **Linux packages (apt / dnf / pacman / sysext)** — add `PUNKTFUNK_GAMESTREAM=1` to
+  `~/.config/punktfunk/host.env` and `systemctl --user restart punktfunk-host` — see
+  [What the unit starts](/docs/running-as-a-service#what-the-unit-starts). (Installs from before
+  the opt-in change served Moonlight by default; an upgrade switches them to native-only until you
+  set the knob.)
+- **NixOS** — set `services.punktfunk.host.gamestream = true;` (also opens the GameStream firewall
+  ports).
+- **SteamOS / Steam Deck** — run the installer with `--gamestream` (re-running it is safe and
+  keeps the rest of your config).
+- **Windows** — tick the installer's *Enable GameStream (Moonlight) compatibility* checkbox, or
+  turn it on afterwards from an **elevated** prompt (`=off` puts it back) — see
+  [Windows Host](/docs/windows-host):
 
   ```powershell
   punktfunk-host service install --gamestream=on

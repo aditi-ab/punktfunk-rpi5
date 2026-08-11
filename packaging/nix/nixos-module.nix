@@ -89,11 +89,13 @@ in
 
       gamestream = mkOption {
         type = types.bool;
-        default = true;
+        default = false;
         description = ''
           Advertise the GameStream/Moonlight-compatible planes (`serve --gamestream`) so a stock
-          Moonlight client can pair. Set to `false` for a native-only, more secure host (no
-          plain-HTTP pairing / legacy GCM path) and drop the GameStream firewall ports.
+          Moonlight client can pair, and open their firewall ports. OPT-IN (default `false`,
+          matching every other package route): the compat planes carry plain-HTTP pairing and the
+          legacy GCM-nonce path (security-review #5/#9), so the default is the secure native-only
+          host — Punktfunk clients only. Enable only on a trusted LAN.
         '';
       };
 

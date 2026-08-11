@@ -91,9 +91,9 @@ systemctl --user enable --now punktfunk-host
 journalctl --user -u punktfunk-host -f
 ```
 
-This unit runs `serve --gamestream`, so it serves stock [Moonlight](/docs/moonlight) clients as well
-as the native ones. For a native-only host, see
-[What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
+This unit runs the secure native-only host. To also serve stock [Moonlight](/docs/moonlight)
+clients, GameStream compat is opt-in (`PUNKTFUNK_GAMESTREAM=1` in `host.env`, trusted LANs only) —
+see [What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
 
 ## Bring up the console and pair
 
