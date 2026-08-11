@@ -5,10 +5,18 @@
 
 use super::*;
 
-/// Wait for gamescope to report its PipeWire node. Authoritative source: gamescope's own log
-/// line `stream available on node ID: N` (its node carries `node.name=gamescope` on TWO objects
-/// — the adapter and the inner stream — and only the advertised id is the correct capture
-/// target). Falls back to `pw-dump` discovery if the log line doesn't show.
+/// Budget for a `pw-dump` snapshot. Two facts make an unbounded one the worst call in this file:
+/// it is polled every 300–500 ms from three separate 45 s loops, and it talks to the very daemon
+/// this module documents gamescope as head-blocking below [`MIN_GAMESCOPE`] — so the failure mode
+/// is not "slow", it is "never returns", on the session's own stream thread. Two seconds is far
+/// above a populated graph's real cost; every caller already has a "couldn't ask" path.
+const PW_DUMP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Budget for a `gamescope --version` probe. It loads the binary and prints a banner — no Vulkan
+/// device, no daemon — so anything approaching this bound is a binary that cannot run at all,
+/// which is exactly what a `None`/`false` answer means to each caller.
+const VERSION_PROBE_BUDGET: Duration = Duration::from_secs(2);
+
 /// B2 (game-exit detection): confirm a **dedicated** gamescope session's game has exited. gamescope is
 /// a single-app compositor — it exits when its nested app exits — so once capture is lost, THIS
 /// session's `node_id` not reappearing within a short confirmation window means the game quit (vs. a
@@ -159,15 +167,50 @@ pub(super) fn poll_managed_node(timeout: Duration) -> Option<u32> {
     }
 }
 
+/// Wait for a freshly spawned gamescope to report its PipeWire node. Authoritative source:
+/// gamescope's own log line `stream available on node ID: N` (its node carries
+/// `node.name=gamescope` on TWO objects — the adapter and the inner stream — and only the
+/// advertised id is the correct capture target). Falls back, at the deadline, to `pw-dump`
+/// discovery SCOPED to this spawn's process tree (`child`'s pid, A5), so a coexisting gamescope's
+/// node is never mistaken for ours.
+///
+/// Takes the `Child` rather than a bare pid so it can **stop early when gamescope is already
+/// dead**. A gamescope that fails `vkCreateDevice` exits in under a second, and polling its corpse
+/// for the full 15 s bought nothing except a caller error that blamed the wrong thing ("headless
+/// capture is unsupported on this GPU/driver"). `try_wait` turns that into an immediate `None`
+/// while the log — which the caller names in the same error — still holds the real reason.
 pub(super) fn wait_for_node(
     timeout: Duration,
     log: &std::path::Path,
-    child_pid: u32,
+    child: &mut Child,
 ) -> Option<u32> {
+    let child_pid = child.id();
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(id) = node_from_log(log) {
             return Some(id);
+        }
+        // Check for a node FIRST, then for death: a gamescope that published its node and then
+        // exited in the same tick still gives us the id, and the caller's own liveness handling
+        // (the keepalive `Child`, `kept_display_alive`) owns what happens next.
+        match child.try_wait() {
+            // Still running — keep waiting.
+            Ok(None) => {}
+            // Exited. One last scoped look (the node line may have been written between the two
+            // reads above), then give up rather than poll a corpse to the deadline.
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    pid = child_pid,
+                    %status,
+                    log = %log.display(),
+                    "gamescope: the spawned process exited before publishing a PipeWire node — \
+                     not waiting out the rest of the budget"
+                );
+                return node_from_log(log).or_else(|| find_gamescope_node_scoped(Some(child_pid)));
+            }
+            // `try_wait` itself failed (the child was reaped elsewhere, ECHILD): fall back to the
+            // old behaviour rather than inventing a death.
+            Err(_) => {}
         }
         if Instant::now() >= deadline {
             // Last-resort fallback scoped to THIS spawn's process tree (A5), so a coexisting gamescope's
@@ -197,7 +240,10 @@ fn node_from_log(log: &std::path::Path) -> Option<u32> {
 /// keep-alive reuse liveness probe ([`GamescopeDisplay::kept_display_alive`]): a kept gamescope node
 /// vanishes when its nested game exits, so a missing id means "recreate, don't reuse the corpse".
 pub(super) fn gamescope_node_present(node_id: u32) -> bool {
-    let Ok(out) = Command::new("pw-dump").arg(node_id.to_string()).output() else {
+    let Ok(out) = crate::proc::output_within(
+        Command::new("pw-dump").arg(node_id.to_string()),
+        PW_DUMP_BUDGET,
+    ) else {
         // pw-dump unavailable → don't block reuse (mark_failed is the backstop on a genuinely dead node).
         return true;
     };
@@ -229,7 +275,7 @@ pub(super) fn find_gamescope_node() -> Option<u32> {
 /// belong to OUR gamescope's process tree, so a coexisting foreign / other-session gamescope node is
 /// never mistaken for ours). `None` = any gamescope node (the managed/attach paths, single-session).
 fn find_gamescope_node_scoped(scope: Option<u32>) -> Option<u32> {
-    let out = Command::new("pw-dump").output().ok()?;
+    let out = crate::proc::output_within(&mut Command::new("pw-dump"), PW_DUMP_BUDGET).ok()?;
     let dump: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let nodes = dump.as_array()?;
     let node_props = |obj: &serde_json::Value| -> Option<(u32, String, String, Option<u32>)> {
@@ -302,7 +348,12 @@ fn find_gamescope_node_scoped(scope: Option<u32>) -> Option<u32> {
 /// most recently created (the live session). Returns the bare socket *name* (the injector
 /// resolves it against `XDG_RUNTIME_DIR`, matching libei's own `LIBEI_SOCKET` semantics).
 pub(super) fn find_gamescope_eis_socket() -> Option<String> {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    // Under the shared env lock: `session::apply_session_env` `set_var`s XDG_RUNTIME_DIR from the
+    // connect thread, and glibc's setenv/getenv pair is a data race the crate's own `lib.rs`
+    // documents as UB. The lock is not reentrant, so this must stay a read taken HERE and not
+    // hoisted into a caller — the only caller, `point_injector_at_eis`, holds nothing (its
+    // `ei_socket_file()` takes and releases the same lock separately).
+    let runtime = crate::with_env_lock(|| std::env::var("XDG_RUNTIME_DIR").ok())?;
     let mut live: Vec<(std::time::SystemTime, String)> = Vec::new();
     for entry in std::fs::read_dir(&runtime).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -328,11 +379,12 @@ pub(super) fn find_gamescope_eis_socket() -> Option<String> {
 /// not require any particular desktop to be running. Quiet (no version warning — that's for the
 /// create path); just checks the binary executes.
 pub(crate) fn is_available() -> bool {
-    std::process::Command::new(gamescope_bin())
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::proc::output_within(
+        Command::new(gamescope_bin()).arg("--version"),
+        VERSION_PROBE_BUDGET,
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
 }
 
 /// The gamescope binary this host spawns, resolved ONCE per process:
@@ -400,14 +452,20 @@ fn which_in_path(name: &str) -> Option<String> {
 ///
 /// Monotonic, so one probe answers every capability:
 /// * `1` — 10-bit BT.2020/PQ capture formats ([`gamescope_hdr_capable`]);
-/// * `2` — …and `--pipewire-composite-cursor` ([`gamescope_can_composite_cursor`]).
+/// * `2` — …and `--pipewire-composite-cursor` ([`gamescope_can_composite_cursor`]);
+/// * `3` — …and `--custom-refresh-rates` ([`gamescope_can_offer_refresh_rates`]);
+/// * `4` — …and `--pipewire-composite-external-overlay`
+///   ([`gamescope_can_composite_external_overlay`]).
 ///
 /// When upstream takes the functional patches this becomes a plain version floor, exactly like
 /// [`MIN_GAMESCOPE_OVERLAY`].
 fn gamescope_patch_level() -> u32 {
     static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
-        let Ok(out) = Command::new(gamescope_bin()).arg("--version").output() else {
+        let Ok(out) = crate::proc::output_within(
+            Command::new(gamescope_bin()).arg("--version"),
+            VERSION_PROBE_BUDGET,
+        ) else {
             return 0;
         };
         // The banner goes to stderr on some builds, stdout on others (same as the version gate).
@@ -530,7 +588,8 @@ fn parse_patch_level(banner: &str) -> u32 {
 /// WSI-layer check has to compare TWO binaries — ours and the distro's — and a `None` there means
 /// "leave the layer alone", not "assume old".
 pub(super) fn gamescope_version_of(bin: &std::path::Path) -> Option<(u32, u32, u32)> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
+    let out = crate::proc::output_within(Command::new(bin).arg("--version"), VERSION_PROBE_BUDGET)
+        .ok()?;
     // Same stdout/stderr split as the version gate: builds disagree on where the banner goes.
     let text = format!(
         "{}{}",
@@ -549,8 +608,15 @@ const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
 /// the overlay-window paint (gated on the consumer negotiating `gamescope_focus_appid == 0`, which
 /// we do by never advertising that property — see the capturer's EnumFormat builders) first ships
 /// in 3.16.23 (gamescope commits `ccd62074` + `f8b33d38`). Below this the overlay is *never* in the
-/// node, so it cannot appear in the stream no matter what the host does. The cursor and
-/// external-overlay / notification layers are excluded on *every* version (handled host-side).
+/// node, so it cannot appear in the stream no matter what the host does.
+///
+/// On a **stock** gamescope the cursor and external-overlay / notification layers are excluded from
+/// `paint_pipewire` on every version, and the host handles the cursor itself. punktfunk's own build
+/// puts both back: `--pipewire-composite-cursor` at patch level 2+
+/// ([`gamescope_can_composite_cursor`], which is what suppresses the host-side blend) and
+/// `--pipewire-composite-external-overlay` at 4+ ([`gamescope_can_composite_external_overlay`]) —
+/// see [`gamescope_patch_level`]. So "the overlay is missing from the stream" is a question about
+/// which flags reached the running compositor, not about host-side compositing.
 const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
 
 /// Best-effort: warn if the installed gamescope is older than [`MIN_GAMESCOPE`] (capture is
@@ -558,10 +624,11 @@ const MIN_GAMESCOPE_OVERLAY: (u32, u32, u32) = (3, 16, 23);
 /// the stream). Parsing failures are silent (don't block a possibly-fine custom build) — this is a
 /// diagnostic, not a gate. Returns the parsed version when it could read one.
 pub(super) fn check_gamescope_version() -> Option<(u32, u32, u32)> {
-    let out = Command::new(gamescope_bin())
-        .arg("--version")
-        .output()
-        .ok()?;
+    let out = crate::proc::output_within(
+        Command::new(gamescope_bin()).arg("--version"),
+        VERSION_PROBE_BUDGET,
+    )
+    .ok()?;
     // gamescope prints the version banner to stderr on some builds, stdout on others.
     let text = format!(
         "{}{}",
