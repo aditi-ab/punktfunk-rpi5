@@ -19,7 +19,7 @@ pkgname=punktfunk-gamescope
 # bump it with the marker so pacman sees a new version when only our patches moved.
 _gsver=3.16.25
 _gsrev=5fb8dce4a09d0a68d097b9faf9513782106bc843
-pkgver="${_gsver}.pfhdr5"
+pkgver="${_gsver}.pfhdr6"
 # 2: patch 0006 (never destroy the Vulkan device/output at exit). No capability moved, so the
 # `.pfhdrN` level deliberately stays put — see README.md.
 # 3: pin moved 8c676c39 -> 5fb8dce4 (3.16.25-1 -> 3.16.25-11), which brings upstream's own
@@ -33,6 +33,12 @@ pkgver="${_gsver}.pfhdr5"
 # a session on every capture renegotiation — i.e. on every client connect, since the host sets the
 # session to the client's mode. This one DOES move `.pfhdrN`, even though it adds no capability:
 # every deployed pfhdr4 binary crash-loops, so an operator has to be able to tell them apart.
+#
+# pfhdr6 / rel 1: patch 0008 honors GAMESCOPE_NO_FOCUS — a mapped-but-unpainted window carrying it
+# (Bazzite's hhd-ui crash-looping under a headless takeover) used to WIN focus selection and turn
+# the composite (and the stream) black while every health signal stayed green. No capability the
+# host probes for, but a field box's banner has to distinguish a build that can lose its composite
+# this way from one that cannot.
 pkgrel=1
 pkgdesc="gamescope with 10-bit BT.2020/PQ PipeWire capture, for punktfunk HDR streaming"
 arch=('x86_64' 'aarch64')

@@ -63,6 +63,35 @@ and `disable_environment` is then consulted last and wins on **presence alone**,
 session script never mentions that second variable, so it is the one that survives. Both spellings
 go out, on the transient unit and on the box's own session drop-in.
 
+### punktfunk-gamescope `+pfhdr6` — a NO_FOCUS window can no longer steal the composite
+
+🛑 **A mapped-but-unpainted window carrying `GAMESCOPE_NO_FOCUS=1` could win gamescope's focus
+selection and turn the composite — and the stream fed from it — black while every health signal
+stayed green.** Bazzite's hhd-ui (Handheld Daemon overlay) sets that atom once at init, stamps
+Steam's appid, and crash-loops under a headless takeover; each respawn remapped a fullscreen black
+window that steamcompmgr then chose over Big Picture (observed on a Bazzite box: client stats
+happily decoding 60 fps at 0.1 Mb/s of black; killing hhd-ui restored the picture instantly). No
+gamescope — upstream or Bazzite's fork — ever consumed the atom; its setters (hhd-ui, MangoHud)
+show and hide via the `STEAM_OVERLAY` protocol and rely on never being focusable. Patch 0008 wires
+`GAMESCOPE_NO_FOCUS` exactly like `GAMESCOPE_EXTERNAL_OVERLAY` (read at map, PropertyNotify-tracked,
+skipped by both focus-candidate collectors) without touching compositing or `appID`. Banner
+`+pfhdr5` → `+pfhdr6`; no new capability — the bump is so a field box's banner tells the two
+behaviors apart.
+
+### Linux capture — the truncated first attempt no longer latches sticky downgrades
+
+🛑 **The pipeline retry loop's deliberately short (2.5 s) first-frame attempt could permanently
+downgrade the whole host process.** On expiry, the portal capturer's timeout diagnosis latched
+whichever offer it implicated — HDR capture off (per source), the raw-dmabuf offer off, the
+EGL→CUDA offer off — as if the compositor had refused it, when the budget was truncated by design
+and a gamescope cold start routinely needs longer before delivering anything. One lost race at
+connect then pinned every later session to SDR and/or CPU capture until the host restarted. The
+truncated attempt is now declared provisional end to end
+(`Capturer::next_frame_within_provisional`): its expiry names the same suspect in the error text
+but latches nothing; only the full-length attempts that follow hand down negotiation verdicts. The
+classification is a pure function with tests
+(`pf_capture::linux::first_frame_timeout_tests`).
+
 ## v0.27.0
 
 87 commits since v0.26.0.

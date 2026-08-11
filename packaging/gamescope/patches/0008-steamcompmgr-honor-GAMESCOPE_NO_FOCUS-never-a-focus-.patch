@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: enricobuehler <enrico.buehler@unom.io>
+Date: Tue, 11 Aug 2026 21:48:29 +0200
+Subject: [PATCH] =?UTF-8?q?steamcompmgr:=20honor=20GAMESCOPE=5FNO=5FFOCUS?=
+ =?UTF-8?q?=20=E2=80=94=20such=20windows=20are=20never=20focus=20candidate?=
+ =?UTF-8?q?s?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hhd (Handheld Daemon) sets GAMESCOPE_NO_FOCUS=1 on its hhd-ui overlay window once at init and
+never clears it (hhd src/hhd/plugins/overlay/x11.py, prepare_hhd); MangoHud sets the same atom.
+The show/hide protocol for these clients is STEAM_OVERLAY / STEAM_INPUT_FOCUS — the window is
+never meant to win focus selection on its own.
+
+Nothing consumed the atom: neither this tree nor Bazzite's fork (checked ba148) interns it, so a
+mapped-but-unpainted hhd-ui window — it crash-loops under a headless punktfunk takeover and
+remaps on every respawn, stamping Steam's appid 769 — was a perfectly ordinary focus candidate.
+steamcompmgr picked it over Big Picture, and the composite (and the stream fed from it) went
+black while every other health signal stayed green (observed on Bazzite .41, 2026-08-11:
+GAMESCOPE_FOCUSED_WINDOW = the hhd-ui window, GAMESCOPE_NO_FOCUS(CARDINAL)=1 on that window,
+client stats 60 fps at 0.1 Mb/s of black; killing hhd-ui flipped focus back to Steam and the
+picture returned instantly).
+
+Wire the atom exactly like GAMESCOPE_EXTERNAL_OVERLAY — read at map, tracked on PropertyNotify
+(with MakeFocusDirty), skipped in both focus-candidate collectors (X11 and XDG). Unlike the
+overlay flags it does NOT zero appID and does not change compositing: the window still paints
+normally if something else (the baselayer protocol) brings it into view; it is only barred from
+being CHOSEN.
+
+Banner: +pfhdr6 (no new capability — the bump exists so a field box's banner distinguishes a
+build that can lose its composite to a NO_FOCUS window from one that cannot).
+---
+ src/meson.build             |  3 ++-
+ src/steamcompmgr.cpp        | 24 ++++++++++++++++++++----
+ src/steamcompmgr_shared.hpp |  4 ++++
+ src/xwayland_ctx.hpp        |  1 +
+ 4 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 9a3a287..acfcaea 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -185,7 +185,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr3 — …and the headless connector advertises its mode + `--custom-refresh-rates`
+ #   +pfhdr4 — …and `--pipewire-composite-external-overlay`
+ #   +pfhdr5 — …and the PipeWire buffer use-after-free is fixed (no new capability)
+-version_tag = vcs_tag + '+pfhdr5' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr6 — …and GAMESCOPE_NO_FOCUS windows are never focus candidates (no new capability)
++version_tag = vcs_tag + '+pfhdr6' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 64e1a8c..14596ae 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1109,6 +1109,7 @@ bool g_bPendingFade = false;
+ #define STEAM_PROP			"STEAM_BIGPICTURE"
+ #define OVERLAY_PROP		"STEAM_OVERLAY"
+ #define EXTERNAL_OVERLAY_PROP		"GAMESCOPE_EXTERNAL_OVERLAY"
++#define NO_FOCUS_PROP			"GAMESCOPE_NO_FOCUS"
+ #define GAMES_RUNNING_PROP 	"STEAM_GAMES_RUNNING"
+ #define SCREEN_SCALE_PROP	"STEAM_SCREEN_SCALE"
+ #define SCREEN_MAGNIFICATION_PROP	"STEAM_SCREEN_MAGNIFICATION"
+@@ -3848,8 +3849,8 @@ found:;
+ 
+ 	for (steamcompmgr_win_t *w = this->list; w; w = w->xwayland().next)
+ 	{
+-		// Always skip system tray icons and overlays
+-		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay )
++		// Always skip system tray icons, overlays, and windows that asked never to be focused
++		if ( w->isSysTrayIcon || w->isOverlay || w->isExternalOverlay || w->isNoFocus )
+ 		{
+ 			continue;
+ 		}
+@@ -4197,8 +4198,8 @@ steamcompmgr_xdg_get_possible_focus_windows()
+ 	std::vector< steamcompmgr_win_t* > windows;
+ 	for ( auto &win : g_steamcompmgr_xdg_wins )
+ 	{
+-		// Always skip system tray icons and overlays
+-		if ( win->isSysTrayIcon || win->isOverlay || win->isExternalOverlay )
++		// Always skip system tray icons, overlays, and windows that asked never to be focused
++		if ( win->isSysTrayIcon || win->isOverlay || win->isExternalOverlay || win->isNoFocus )
+ 		{
+ 			continue;
+ 		}
+@@ -4960,6 +4961,10 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
+ 	if ( w->isExternalOverlay )
+ 		w->appID = 0;
+ 
++	// Never a focus candidate; appID stays — the window may share the focused app's id (hhd-ui
++	// stamps Steam's) and zeroing it here is not needed to keep it out of focus selection.
++	w->isNoFocus = get_prop(ctx, w->xwayland().id, ctx->atoms.noFocusAtom, 0);
++
+ 	w->oulTargetVROverlay = get_u64_prop(ctx, w->xwayland().id, ctx->atoms.steamGamescopeVROverlayTarget);
+ 	if ( w->oulTargetVROverlay )
+ 	{
+@@ -5243,6 +5248,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
+ 
+ 	new_win->isOverlay = false;
+ 	new_win->isExternalOverlay = false;
++	new_win->isNoFocus = false;
+ 	new_win->isSteamLegacyBigPicture = false;
+ 	new_win->isSteamStreamingClient = false;
+ 	new_win->isSteamStreamingClientVideo = false;
+@@ -6193,6 +6199,15 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
+ 			MakeFocusDirty();
+ 		}
+ 	}
++	if (ev->atom == ctx->atoms.noFocusAtom)
++	{
++		steamcompmgr_win_t * w = find_win(ctx, ev->window);
++		if (w)
++		{
++			w->isNoFocus = get_prop(ctx, w->xwayland().id, ctx->atoms.noFocusAtom, 0);
++			MakeFocusDirty();
++		}
++	}
+ 	if (ev->atom == ctx->atoms.winTypeAtom)
+ 	{
+ 		steamcompmgr_win_t * w = find_win(ctx, ev->window);
+@@ -7927,6 +7942,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
+ 	ctx->atoms.gameAtom = XInternAtom(ctx->dpy, GAME_PROP, false);
+ 	ctx->atoms.overlayAtom = XInternAtom(ctx->dpy, OVERLAY_PROP, false);
+ 	ctx->atoms.externalOverlayAtom = XInternAtom(ctx->dpy, EXTERNAL_OVERLAY_PROP, false);
++	ctx->atoms.noFocusAtom = XInternAtom(ctx->dpy, NO_FOCUS_PROP, false);
+ 	ctx->atoms.opacityAtom = XInternAtom(ctx->dpy, OPACITY_PROP, false);
+ 	ctx->atoms.gamesRunningAtom = XInternAtom(ctx->dpy, GAMES_RUNNING_PROP, false);
+ 	ctx->atoms.screenScaleAtom = XInternAtom(ctx->dpy, SCREEN_SCALE_PROP, false);
+diff --git a/src/steamcompmgr_shared.hpp b/src/steamcompmgr_shared.hpp
+index 21ddc5f..924e0d2 100644
+--- a/src/steamcompmgr_shared.hpp
++++ b/src/steamcompmgr_shared.hpp
+@@ -116,6 +116,10 @@ struct steamcompmgr_win_t {
+ 	uint32_t appID = 0;
+ 	bool isOverlay = false;
+ 	bool isExternalOverlay = false;
++	// GAMESCOPE_NO_FOCUS on the window: the client asks never to be a focus candidate (hhd-ui and
++	// MangoHud set it once at init). Unlike an overlay it still composites normally if something
++	// else focuses it into view; it is only excluded from focus selection.
++	bool isNoFocus = false;
+ 
+ 	bool bIsSteamPid = false;
+ 	bool bIsSteamWebHelperPid = false;
+diff --git a/src/xwayland_ctx.hpp b/src/xwayland_ctx.hpp
+index 978728a..d6ce90f 100644
+--- a/src/xwayland_ctx.hpp
++++ b/src/xwayland_ctx.hpp
+@@ -105,6 +105,7 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
+ 		Atom gameAtom;
+ 		Atom overlayAtom;
+ 		Atom externalOverlayAtom;
++		Atom noFocusAtom;
+ 		Atom gamesRunningAtom;
+ 		Atom screenZoomAtom;
+ 		Atom screenScaleAtom;
+-- 
+2.50.1 (Apple Git-155)
+

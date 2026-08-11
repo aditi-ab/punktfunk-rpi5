@@ -533,7 +533,7 @@ fn spawn_pipewire(
 
 impl Capturer for PortalCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.frame_within(Duration::from_secs(10))
+        self.frame_within(Duration::from_secs(10), TimeoutVerdict::Conclusive)
     }
 
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
@@ -563,7 +563,13 @@ impl Capturer for PortalCapturer {
     }
 
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
-        self.frame_within(budget)
+        self.frame_within(budget, TimeoutVerdict::Conclusive)
+    }
+
+    fn next_frame_within_provisional(&mut self, budget: Duration) -> Result<CapturedFrame> {
+        // The retry loop's truncated first attempt: its expiry re-runs the schedule, it does not
+        // convict an offer — see `TimeoutVerdict` and the latch arms in `next_frame_timed_out`.
+        self.frame_within(budget, TimeoutVerdict::Provisional)
     }
 
     fn supports_arrival_wait(&self) -> bool {
@@ -699,12 +705,73 @@ impl Capturer for PortalCapturer {
     }
 }
 
+/// Whether an expired first-frame budget is allowed to CONVICT an offer. The retry loop's
+/// deliberately truncated first attempt passes `Provisional`: its expiry means the schedule
+/// moved on, not that the compositor refused anything — a gamescope cold start regularly needs
+/// longer than that window to accept every offer it would have accepted. Latching from it pinned
+/// the whole host process to SDR + CPU capture off a race the attempt lost by design; only a
+/// full-length wait carries a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutVerdict {
+    Conclusive,
+    Provisional,
+}
+
+/// Which offer a first-frame timeout implicates — the diagnosis behind
+/// [`PortalCapturer::next_frame_timed_out`], split out pure so the latch policy is testable.
+/// Mirrors the negotiation state exactly: a negotiated format clears every offer (the compositor
+/// accepted, it just produced nothing), and a forced `PUNKTFUNK_ZEROCOPY=1` keeps both dmabuf
+/// arms erroring loudly instead of implicating them (the operator asked for exactly that path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutOffer {
+    /// Format negotiated; no offer implicated — the compositor produced no buffers.
+    NoBuffers,
+    /// The 10-bit PQ/BT.2020 (HDR) dmabuf offer was never accepted.
+    Hdr,
+    /// The dmabuf-only raw-passthrough offer was never accepted.
+    RawDmabuf,
+    /// The dmabuf-only EGL→CUDA offer was never accepted.
+    GpuDmabuf,
+    /// Nothing negotiated and no offer implicated — format/modifier mismatch.
+    NoFormat,
+}
+
+fn classify_first_frame_timeout(
+    negotiated: bool,
+    hdr_offer: bool,
+    vaapi_dmabuf: bool,
+    gpu_dmabuf_offer: bool,
+    zerocopy_forced: bool,
+) -> TimeoutOffer {
+    if negotiated {
+        TimeoutOffer::NoBuffers
+    } else if hdr_offer {
+        TimeoutOffer::Hdr
+    } else if vaapi_dmabuf && !zerocopy_forced {
+        TimeoutOffer::RawDmabuf
+    } else if gpu_dmabuf_offer && !zerocopy_forced {
+        TimeoutOffer::GpuDmabuf
+    } else {
+        TimeoutOffer::NoFormat
+    }
+}
+
+/// The latch policy: only a conclusive expiry of an offer-implicating timeout fires the offer's
+/// sticky process-wide downgrade.
+fn timeout_convicts(offer: TimeoutOffer, verdict: TimeoutVerdict) -> bool {
+    verdict == TimeoutVerdict::Conclusive
+        && matches!(
+            offer,
+            TimeoutOffer::Hdr | TimeoutOffer::RawDmabuf | TimeoutOffer::GpuDmabuf
+        )
+}
+
 impl PortalCapturer {
     /// The blocking first-frame wait behind [`Capturer::next_frame`] /
     /// [`Capturer::next_frame_within`]. First frame can lag behind format negotiation; later
     /// frames arrive at ~fps. Wait in short slices so a GPU-import poison (worker death) fails
     /// the capture within ~0.5 s instead of sitting out the full first-frame budget.
-    fn frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
+    fn frame_within(&mut self, budget: Duration, verdict: TimeoutVerdict) -> Result<CapturedFrame> {
         let deadline = std::time::Instant::now() + budget;
         loop {
             if self.signals.broken.load(Ordering::Relaxed) {
@@ -730,7 +797,7 @@ impl PortalCapturer {
                     if let Some(f) = self.take_frame() {
                         return Ok(f);
                     }
-                    return self.next_frame_timed_out(e, budget);
+                    return self.next_frame_timed_out(e, budget, verdict);
                 }
             }
         }
@@ -752,83 +819,118 @@ impl PortalCapturer {
     }
 
     /// The [`frame_within`](Self::frame_within) budget expired (or the thread ended) — turn it
-    /// into the diagnosis-bearing error. Split out of the slicing loop above; behavior unchanged.
+    /// into the diagnosis-bearing error, and fire the offer's sticky downgrade latch when — and
+    /// only when — the expiry convicts the offer (see [`timeout_convicts`]).
     fn next_frame_timed_out(
         &self,
         err: RecvTimeoutError,
         budget: Duration,
+        verdict: TimeoutVerdict,
     ) -> Result<CapturedFrame> {
         let within = budget.as_secs_f32();
         match err {
             RecvTimeoutError::Timeout => {
-                // Split the two black-screen root causes apart so the operator gets a cause, not
-                // just a symptom: did the format negotiate (compositor produced no buffers) or
-                // not (no acceptable format / node never emitted a param)?
-                if self.signals.negotiated.load(Ordering::Relaxed) {
-                    Err(anyhow!(
+                let offer = classify_first_frame_timeout(
+                    self.signals.negotiated.load(Ordering::Relaxed),
+                    self.hdr_offer,
+                    self.vaapi_dmabuf,
+                    self.signals.gpu_dmabuf_offer.load(Ordering::Relaxed),
+                    pf_zerocopy::zerocopy_forced(),
+                );
+                let convicted = timeout_convicts(offer, verdict);
+                // A provisional expiry names the same suspect but hands down no sentence — the
+                // full-length retry that follows is the one whose timeout latches.
+                let sentence = if convicted {
+                    "" // each arm below states its own downgrade
+                } else {
+                    " (short first-attempt window — nothing is latched; the full-length retry \
+                     decides)"
+                };
+                match offer {
+                    TimeoutOffer::NoBuffers => Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): format negotiated but no \
                          buffers arrived — the compositor produced no frames (virtual output \
                          idle/unmapped, capture never started, or a stream bound during a \
                          compositor (re)start that will never deliver — a reconnect fixes that)",
                         self.node_id
-                    ))
-                } else if self.hdr_offer {
-                    // The HDR (10-bit PQ dmabuf) offer was never accepted — the monitor left HDR
-                    // mode between the probe and the negotiation, the compositor pre-dates the
-                    // GNOME 50 HDR formats, or its allocator can't do LINEAR for XR30/XB30.
-                    // Latch the process-wide SDR downgrade so the next session (Moonlight
-                    // auto-reconnects) negotiates SDR instead of re-running this same timeout.
-                    super::note_hdr_capture_failed(self.hdr_source);
-                    Err(anyhow!(
-                        "no PipeWire frame within {within}s (node {}): the compositor never \
-                         accepted the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored \
-                         monitor in HDR mode on GNOME 50+? Downgrading this host to SDR capture; \
-                         reconnect to stream SDR",
-                        self.node_id
-                    ))
-                } else if self.vaapi_dmabuf && !pf_zerocopy::zerocopy_forced() {
-                    // The dmabuf-only raw-passthrough offer was never accepted. Latch the
-                    // downgrade so the encode loop's pipeline rebuild retries on the CPU offer
-                    // instead of failing this same negotiation forever. The latch is SCOPED to the
-                    // raw-passthrough decision: it used to be `note_vaapi_dmabuf_failed`, which fed
-                    // `pf_zerocopy::enabled()` and therefore dropped every later session on this
-                    // host — NVENC's EGL→CUDA path included — to CPU capture. Since this offer is
-                    // also the PyroWave one (any vendor), a single PyroWave negotiation timeout was
-                    // enough to do that.
-                    pf_zerocopy::note_raw_dmabuf_negotiation_failed();
-                    Err(anyhow!(
-                        "no PipeWire frame within {within}s (node {}): the compositor never \
-                         accepted the dmabuf-only offer (raw-dmabuf passthrough) — downgrading \
-                         THIS path to CPU capture for the rest of the process; the pipeline \
-                         rebuild will renegotiate without dmabuf",
-                        self.node_id
-                    ))
-                } else if self.signals.gpu_dmabuf_offer.load(Ordering::Relaxed)
-                    && !pf_zerocopy::zerocopy_forced()
-                {
-                    // The EGL→CUDA dmabuf-only offer was never accepted — the twin of the raw-
-                    // passthrough arm above (the offer the thread ACTUALLY made, per the signal
-                    // it set — see `CaptureSignals::gpu_dmabuf_offer`). One timeout is conclusive:
-                    // a compositor that allocates none of the importer's modifiers refuses them
-                    // identically on every retry, so latch the offer off and let the pipeline
-                    // rebuild renegotiate the CPU path instead of re-running this same 10 s
-                    // timeout on every reconnect. A forced PUNKTFUNK_ZEROCOPY=1 keeps erroring
-                    // loudly instead (same rule as the raw arm).
-                    pf_zerocopy::note_gpu_dmabuf_negotiation_failed();
-                    Err(anyhow!(
-                        "no PipeWire frame within {within}s (node {}): the compositor never \
-                         accepted the dmabuf-only offer (EGL→CUDA GPU import) — downgrading THIS \
-                         offer to the CPU path for the rest of the process; the pipeline rebuild \
-                         will renegotiate without dmabuf",
-                        self.node_id
-                    ))
-                } else {
-                    Err(anyhow!(
+                    )),
+                    TimeoutOffer::Hdr => {
+                        // The HDR (10-bit PQ dmabuf) offer was never accepted — the monitor left HDR
+                        // mode between the probe and the negotiation, the compositor pre-dates the
+                        // GNOME 50 HDR formats, or its allocator can't do LINEAR for XR30/XB30.
+                        // Latch the SDR downgrade for THIS source (`HdrSource`, not process-wide — one
+                        // shared flag let either Linux HDR source disable the other) so the next session
+                        // (Moonlight auto-reconnects) negotiates SDR instead of re-running this timeout.
+                        if convicted {
+                            super::note_hdr_capture_failed(self.hdr_source);
+                        }
+                        Err(anyhow!(
+                            "no PipeWire frame within {within}s (node {}): the compositor never \
+                             accepted the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored \
+                             monitor in HDR mode on GNOME 50+?{}",
+                            self.node_id,
+                            if convicted {
+                                " Downgrading this host to SDR capture; reconnect to stream SDR"
+                            } else {
+                                sentence
+                            }
+                        ))
+                    }
+                    TimeoutOffer::RawDmabuf => {
+                        // The dmabuf-only raw-passthrough offer was never accepted. Latch the
+                        // downgrade so the encode loop's pipeline rebuild retries on the CPU offer
+                        // instead of failing this same negotiation forever. The latch is SCOPED to the
+                        // raw-passthrough decision: it used to be `note_vaapi_dmabuf_failed`, which fed
+                        // `pf_zerocopy::enabled()` and therefore dropped every later session on this
+                        // host — NVENC's EGL→CUDA path included — to CPU capture. Since this offer is
+                        // also the PyroWave one (any vendor), a single PyroWave negotiation timeout was
+                        // enough to do that.
+                        if convicted {
+                            pf_zerocopy::note_raw_dmabuf_negotiation_failed();
+                        }
+                        Err(anyhow!(
+                            "no PipeWire frame within {within}s (node {}): the compositor never \
+                             accepted the dmabuf-only offer (raw-dmabuf passthrough){}",
+                            self.node_id,
+                            if convicted {
+                                " — downgrading THIS path to CPU capture for the rest of the \
+                                 process; the pipeline rebuild will renegotiate without dmabuf"
+                            } else {
+                                sentence
+                            }
+                        ))
+                    }
+                    TimeoutOffer::GpuDmabuf => {
+                        // The EGL→CUDA dmabuf-only offer was never accepted — the twin of the raw-
+                        // passthrough arm above (the offer the thread ACTUALLY made, per the signal
+                        // it set — see `CaptureSignals::gpu_dmabuf_offer`). One FULL-LENGTH timeout
+                        // is conclusive: a compositor that allocates none of the importer's
+                        // modifiers refuses them identically on every retry, so latch the offer off
+                        // and let the pipeline rebuild renegotiate the CPU path instead of
+                        // re-running this same 10 s timeout on every reconnect. A forced
+                        // PUNKTFUNK_ZEROCOPY=1 keeps erroring loudly instead (same rule as the raw
+                        // arm).
+                        if convicted {
+                            pf_zerocopy::note_gpu_dmabuf_negotiation_failed();
+                        }
+                        Err(anyhow!(
+                            "no PipeWire frame within {within}s (node {}): the compositor never \
+                             accepted the dmabuf-only offer (EGL→CUDA GPU import){}",
+                            self.node_id,
+                            if convicted {
+                                " — downgrading THIS offer to the CPU path for the rest of the \
+                                 process; the pipeline rebuild will renegotiate without dmabuf"
+                            } else {
+                                sentence
+                            }
+                        ))
+                    }
+                    TimeoutOffer::NoFormat => Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): format negotiation never \
                          completed — the compositor offered no format this consumer accepts \
                          (pixel-format/modifier mismatch) or the node never emitted a Format param",
                         self.node_id
-                    ))
+                    )),
                 }
             }
             RecvTimeoutError::Disconnected => Err(anyhow!(
@@ -874,3 +976,89 @@ mod pipewire;
 // unit-test without a compositor, which is the point.
 mod pw_cursor;
 mod pw_pods;
+
+#[cfg(test)]
+mod first_frame_timeout_tests {
+    use super::{classify_first_frame_timeout, timeout_convicts, TimeoutOffer, TimeoutVerdict};
+
+    #[test]
+    fn a_provisional_expiry_convicts_no_offer_whatever_was_on_the_table() {
+        // The bug this pins down: the retry loop's truncated 2.5 s first attempt latched all
+        // three sticky process-wide downgrades as if the compositor had refused the offers — a
+        // gamescope HDR cold start then streamed SDR (and CPU-copied) for the process lifetime.
+        for offer in [
+            TimeoutOffer::NoBuffers,
+            TimeoutOffer::Hdr,
+            TimeoutOffer::RawDmabuf,
+            TimeoutOffer::GpuDmabuf,
+            TimeoutOffer::NoFormat,
+        ] {
+            assert!(
+                !timeout_convicts(offer, TimeoutVerdict::Provisional),
+                "provisional expiry must not latch {offer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conclusive_expiry_convicts_exactly_the_offer_bearing_diagnoses() {
+        assert!(timeout_convicts(
+            TimeoutOffer::Hdr,
+            TimeoutVerdict::Conclusive
+        ));
+        assert!(timeout_convicts(
+            TimeoutOffer::RawDmabuf,
+            TimeoutVerdict::Conclusive
+        ));
+        assert!(timeout_convicts(
+            TimeoutOffer::GpuDmabuf,
+            TimeoutVerdict::Conclusive
+        ));
+        // A negotiated-but-idle stream and a plain format mismatch implicate no offer — nothing
+        // to latch even on a full-length wait.
+        assert!(!timeout_convicts(
+            TimeoutOffer::NoBuffers,
+            TimeoutVerdict::Conclusive
+        ));
+        assert!(!timeout_convicts(
+            TimeoutOffer::NoFormat,
+            TimeoutVerdict::Conclusive
+        ));
+    }
+
+    #[test]
+    fn classification_mirrors_the_negotiation_state_precedence() {
+        // A negotiated format clears every offer, whatever else was on the table.
+        assert_eq!(
+            classify_first_frame_timeout(true, true, true, true, false),
+            TimeoutOffer::NoBuffers
+        );
+        // The HDR offer outranks the dmabuf arms (it is the offer that failed to negotiate).
+        assert_eq!(
+            classify_first_frame_timeout(false, true, true, true, false),
+            TimeoutOffer::Hdr
+        );
+        assert_eq!(
+            classify_first_frame_timeout(false, false, true, true, false),
+            TimeoutOffer::RawDmabuf
+        );
+        assert_eq!(
+            classify_first_frame_timeout(false, false, false, true, false),
+            TimeoutOffer::GpuDmabuf
+        );
+        assert_eq!(
+            classify_first_frame_timeout(false, false, false, false, false),
+            TimeoutOffer::NoFormat
+        );
+    }
+
+    #[test]
+    fn a_forced_zerocopy_keeps_both_dmabuf_arms_erroring_loudly_instead_of_implicated() {
+        // PUNKTFUNK_ZEROCOPY=1 is the operator insisting on the path — the timeout falls through
+        // to the generic diagnosis (and so never latches), exactly as the old else-if chain did.
+        assert_eq!(
+            classify_first_frame_timeout(false, false, true, true, true),
+            TimeoutOffer::NoFormat
+        );
+    }
+}

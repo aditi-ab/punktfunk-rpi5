@@ -4129,7 +4129,10 @@ fn build_pipeline_with_retry(
     // SteamOS: every gamescope bring-up burned the full 10 s on attempt 1, then attempt 2 got
     // frames instantly → 17 s bring-ups). Healthy compositors deliver the first frame well inside
     // this window (KWin ~0.3 s), and the genuinely-slow cold start above still gets the patient
-    // 10 s window on every later attempt.
+    // 10 s window on every later attempt. The truncated attempt is PROVISIONAL end to end: its
+    // expiry must not latch the capturer's sticky downgrades (see
+    // `Capturer::next_frame_within_provisional`) — only the full-length attempts hand down
+    // negotiation verdicts.
     const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=max_attempts {
@@ -4484,7 +4487,13 @@ fn build_pipeline(
     }
     capturer.set_active(true);
     let first = match first_frame_budget {
-        Some(budget) => capturer.next_frame_within(budget),
+        // Provisional: this is the retry loop's deliberately truncated first attempt, and its
+        // expiry is the schedule firing, not a negotiation verdict — the capturer must not latch
+        // its sticky process-wide downgrades (HDR capture, the dmabuf-only offers) from it. A
+        // gamescope cold start regularly outlives this window and then accepts every offer on the
+        // full-length attempt that follows (observed on .41: one truncated expiry pinned the whole
+        // host process to SDR + CPU capture).
+        Some(budget) => capturer.next_frame_within_provisional(budget),
         None => capturer.next_frame(),
     };
     let frame = match first.context("first frame") {
