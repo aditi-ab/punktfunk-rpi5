@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -51,15 +52,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -75,6 +77,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -95,8 +98,14 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.deviceBodyVibrator
+import androidx.compose.ui.zIndex
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
@@ -473,7 +482,10 @@ fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocus
         label = "consoleFocus",
     )
     val background by animateColorAsState(
-        if (active) ink.accent(0.20f) else ink.glass,
+        // 0.28, not the 0.20 it launched with: with the shadow and bloom gone (see consoleGlass),
+        // the tint IS the whole focus statement, and Apple's rows carry accent(0.30) for the same
+        // reason. Slightly under Apple's because this fill also rides a luminance gradient.
+        if (active) ink.accent(0.28f) else ink.glass,
         ConsoleMotion.ease(ConsoleMotion.FOCUS_MS),
         label = "consoleBg",
     )
@@ -492,18 +504,21 @@ fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocus
 /**
  * The console's glass: what every row, field, card and tile is cut from, in one place.
  *
- * Four things separate it from the flat translucent fill it replaces, all of them the desktop
- * console's `theme::panel()` in Compose terms:
+ * Two things separate it from a flat translucent fill:
  *  * a vertical LUMINANCE gradient in the fill, so the pane has a lit top and a settled bottom
  *    instead of one even wash;
  *  * a 1 px top-edge HIGHLIGHT that fades down into the border — the cue that reads as "this is a
- *    physical pane catching the light above it";
- *  * a drop SHADOW that grows with focus, so the focused row genuinely sits above its neighbours;
- *  * a soft accent BLOOM behind it, drawn outside the clip, so focus reads as a lens over the
- *    backdrop rather than a recolour of the row.
+ *    physical pane catching the light above it".
  *
- * The bloom and shadow are driven by [ConsoleFocusVisuals.focus], so they arrive and leave with the
- * same curve as the fill — one focus change, not four independent animations.
+ * Focus is the FILL and the BORDER brightening — nothing else, which matches the Apple client's
+ * glass (`GlassStyle.swift`: material + an animatable tint, full stop). Two earlier additions were
+ * removed after the first on-glass review, and neither may come back:
+ *  * a drop shadow. An elevation shadow is drawn UNDER the surface, and this surface is
+ *    translucent — the shadow showed straight through the fill as a dark rectangle floating
+ *    inside every row and card.
+ *  * an accent bloom drawn outside the clip. Unclipped drawing does not stop at the row's
+ *    neighbours either: in a list the glow painted over the rows above and below, and in the
+ *    carousel it escaped the card entirely.
  */
 @Composable
 fun Modifier.consoleGlass(
@@ -519,7 +534,6 @@ fun Modifier.consoleGlass(
 ): Modifier {
     val ink = LocalGamepadInk.current
     val focus = visuals.focus
-    val accent = ink.accent
     val highlight = ink.highlight
     val fill = visuals.background
     val border = visuals.border
@@ -558,22 +572,6 @@ fun Modifier.consoleGlass(
     }
     return this
         .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
-        // BEFORE the clip, so the bloom can spill past the row's own rectangle — a glow that stops
-        // at the edge is just a brighter border.
-        .drawBehind {
-            if (focus <= 0.01f) return@drawBehind
-            val r = size.height * 1.35f
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(accent.copy(alpha = 0.18f * focus), Color.Transparent),
-                    center = Offset(size.width / 2f, size.height / 2f),
-                    radius = r,
-                ),
-                topLeft = Offset(-r, -r),
-                size = Size(size.width + 2f * r, size.height + 2f * r),
-            )
-        }
-        .shadow(elevation = ConsoleGlassLift * focus, shape = shape, clip = false)
         .clip(shape)
         .background(
             Brush.verticalGradient(
@@ -593,9 +591,6 @@ fun Modifier.consoleGlass(
             shape = shape,
         )
 }
-
-/** How far a fully focused console surface lifts off the field. */
-private val ConsoleGlassLift = 8.dp
 
 /**
  * A MODAL card's surface. Unlike [consoleGlass] this one is near-opaque: a dialog's job is to
@@ -819,6 +814,134 @@ fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) 
                 .background(ink.fg),
         )
     }
+}
+
+// --- The option band ---------------------------------------------------------------------------
+
+/**
+ * A choice row's value as a REAL band — the Android port of the Apple client's
+ * `GamepadOptionBand.swift`, and the fix for "the select field is nowhere near the Apple client":
+ * the options sit side by side on a drum segment curving about a vertical axis. The current one
+ * faces you flat; a step rotates the next one in with perspective. The drum's position is ONE
+ * continuous value driven by a spring, and Compose's `Animatable` retargets with velocity — rapid
+ * presses accumulate into one accelerating travel instead of five restarted crossfades.
+ *
+ * The band is LINEAR, not a ring (the Apple field verdict, inherited whole): a ring showed the
+ * first option waiting to the right of the last one, which left/right can't reach — a promise the
+ * navigation doesn't keep. Positions are fixed, the ends are the ends, and A's wrap from the last
+ * option travels BACK across the list to the first. Neighbours exist only while the drum is
+ * actually moving — at rest a row shows exactly its value (a resting neighbour under a long label
+ * rendered as overlapping, unreadable text on Apple, and would here too).
+ *
+ * [width] is FIXED by the row: a step must never reflow the row (the free-width value shifted the
+ * chevrons with every label), and the drum needs its stage even when the facing label is short.
+ *
+ * Purely presentational: stepping semantics (clamp with a boundary thud, A cycles wrapping,
+ * disabled rows refuse) stay in the settings screen's row closures.
+ */
+@Composable
+fun ConsoleOptionBand(
+    options: List<String>,
+    selection: Int,
+    focused: Boolean,
+    width: Dp,
+    modifier: Modifier = Modifier,
+) {
+    val ink = LocalGamepadInk.current
+    val animated = animationsEnabled()
+    val color = ink.fg(if (focused) 1f else 0.6f)
+    val drum = remember { Animatable(selection.toFloat()) }
+    // Where the spring is headed (jumps instantly on a step; only the drum chases it). The
+    // distance between them is "how mid-flight are we" — the neighbours exist exactly as long as
+    // the drum is moving.
+    var target by remember { mutableIntStateOf(selection) }
+    LaunchedEffect(selection, options.size, animated) {
+        val old = target
+        target = selection
+        // A step (or A's wrap — on a linear band a fast travel back to the start) springs the
+        // drum; anything else (an external write from the touch settings, a re-derived options
+        // list) re-seats it — a travel to a value the user didn't step to would read as the UI
+        // acting on its own.
+        val wrapped = options.size > 1 && old == options.size - 1 && selection == 0
+        if (animated && (abs(selection - old) == 1 || wrapped)) {
+            drum.animateTo(
+                selection.toFloat(),
+                // Apple's `.spring(response: 0.32, dampingFraction: 0.78)`; stiffness is
+                // (2π / response)² ≈ 385.
+                spring(dampingRatio = 0.78f, stiffness = 385f),
+            )
+        } else {
+            drum.snapTo(selection.toFloat())
+        }
+    }
+    Box(
+        modifier
+            .width(width)
+            .clipToBounds()
+            // One element to a screen reader — the neighbour texts are rendering, not content.
+            .clearAndSetSemantics {
+                contentDescription = options.getOrNull(selection).orEmpty()
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        val rotation = drum.value
+        val flight = min(1f, abs(rotation - target) * 3f)
+        val widthPx = with(LocalDensity.current) { width.toPx() }
+        // Puts the ±1 neighbour ~40 % of the band off-centre, curling toward the edge.
+        val radius = widthPx * 0.72f
+        options.forEachIndexed { i, label ->
+            // Plain signed distance — option i has ONE home and nothing waits beyond the ends.
+            val d = i - rotation
+            // Only the facing option at rest; its neighbours join it for the travel.
+            if (abs(d) < 0.5f || (flight > 0.001f && abs(d) <= 2.5f)) {
+                val angle = d * DRUM_STEP_RAD
+                val depth = cos(angle)
+                val x = radius * sin(angle)
+                val alpha = max(depth, 0f).let { it * it * it } *
+                    (if (abs(d) < 0.5f) 1f else flight) * drumEdgeFade(x, widthPx)
+                Text(
+                    label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = color,
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier
+                        // The Apple `fixedSize()`: never let a turning label re-wrap to the
+                        // band's width mid-flight — it clips at the band's edge fade instead.
+                        .wrapContentWidth(unbounded = true)
+                        .zIndex(depth)
+                        .graphicsLayer {
+                            translationX = x
+                            val s = 0.70f + 0.30f * depth
+                            scaleX = s
+                            scaleY = s
+                            // Foreshorten the label as it turns away — what sells the cylinder.
+                            rotationY = Math.toDegrees(angle.toDouble()).toFloat()
+                            cameraDistance = 6f * density
+                            this.alpha = alpha
+                        },
+                )
+            }
+        }
+    }
+}
+
+/** Angular pitch between adjacent options on the drum — Apple's 34°. */
+private const val DRUM_STEP_RAD = 34f * (PI.toFloat() / 180f)
+
+/**
+ * The soft edge, per option rather than as a container mask: full strength through the middle of
+ * the band, dissolving to nothing by an option's rim, so the drum never ends on a hard cut. (The
+ * Apple file documents why it must not be a mask: a mask rasterises what it covers, which throws
+ * the 3D projection away every frame — the same trap exists in Compose via `graphicsLayer` alpha
+ * masking a parent.)
+ */
+private fun drumEdgeFade(x: Float, width: Float): Float {
+    val half = width / 2f
+    if (half <= 0f) return 1f
+    val fadeStart = half * 0.55f
+    if (abs(x) <= fadeStart) return 1f
+    return ((half - abs(x)) / (half - fadeStart)).coerceIn(0f, 1f)
 }
 
 // --- Menu haptics -----------------------------------------------------------------------------

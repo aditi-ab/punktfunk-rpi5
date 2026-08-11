@@ -124,6 +124,16 @@ class ScreenshotTest {
     fun consoleSettingsLight() =
         shootRoot("console-settings-light") { ConsoleSettingsScene(paletteId = "holo") }
 
+    /**
+     * Landscape — the orientation the console actually runs in, and a DIFFERENT layout since the
+     * on-glass review: rows capped and left-aligned, the focused row's description in a side pane
+     * on the right instead of the floating band.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun consoleSettingsLandscape() =
+        shootRoot("console-settings-landscape") { ConsoleSettingsScene() }
+
     // The console home, the screen the living backdrop is most of. The default sdk (36) draws the
     // real AGSL MESH field; the paired API-31 shot below draws the blob fallback, so the two
     // renderings of the same palette can be compared rather than assumed equivalent.

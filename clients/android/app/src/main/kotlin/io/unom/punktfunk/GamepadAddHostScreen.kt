@@ -295,7 +295,8 @@ fun GamepadAddHostScreen(
                     horizontalArrangement = Arrangement.spacedBy(18.dp),
                 ) {
                     Column(
-                        Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                        Modifier.weight(1f).fillMaxHeight().widthIn(max = 620.dp)
+                            .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         ConsoleHeader(title, horizontalInset = false)
@@ -316,7 +317,9 @@ fun GamepadAddHostScreen(
                 // compressed by the keyboard; the keyboard sits below it; the legend floats (fixed).
                 Column(Modifier.fillMaxSize().consoleSafeArea().padding(horizontal = ConsoleEdgeInset)) {
                     Column(
-                        Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
+                        // Same 620 dp cap as the settings rows: a field stretched across a wide
+                        // landscape phone is a ribbon, not an input.
+                        Modifier.weight(1f).widthIn(max = 620.dp).verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         ConsoleHeader(title, horizontalInset = false)

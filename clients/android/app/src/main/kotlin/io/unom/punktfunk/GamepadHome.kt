@@ -208,7 +208,12 @@ fun GamepadHome(
             val cardWidth = (maxWidth * 0.82f).coerceAtMost(360.dp)
             val cardHeight = (maxHeight * 0.56f).coerceAtMost(216.dp)
             val sidePad = ((maxWidth - cardWidth) / 2).coerceAtLeast(0.dp)
-            Box(Modifier.fillMaxSize().consoleSafeArea()) {
+            // The carousel deliberately IGNORES the safe area (first on-glass verdict): only the
+            // CENTRED card matters, and it sits mid-screen; the fanned neighbours running under
+            // the hole punch is ambience, while insetting the pager CLIPPED them at the cutout
+            // edge — cards visibly cut off is worse than cards behind a camera. The title and the
+            // legend keep their insets; they are content.
+            Box(Modifier.fillMaxSize()) {
                 HorizontalPager(
                     state = pagerState,
                     pageSize = PageSize.Fixed(cardWidth),
