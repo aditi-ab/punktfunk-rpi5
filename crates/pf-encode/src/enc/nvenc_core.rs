@@ -7,10 +7,13 @@
 
 // UNSAFE-LINT EXEMPTION REMOVED — the old fence rationale ("raw nvEncodeAPI entry-table calls
 // almost line for line") was false for this file: it makes ZERO FFI calls. Its unsafe surface is
-// C-union writes whose soundness hangs entirely on which codec arm is active, and the 4:4:4 note
+// C-union access whose soundness hangs entirely on which codec arm is active, and the 4:4:4 note
 // below records the shipped bug (hevcConfig bytes stamped onto an AV1 config) that per-operation
-// blocks make visible. So this file runs the strictest discipline in the crate: every union
-// access sits in its own `unsafe {}` block naming the codec guard it relies on.
+// visibility makes findable. So this file runs the strictest discipline in the crate: every
+// union READ, borrow, or bitfield-setter call sits in its own `unsafe {}` block naming the codec
+// guard it relies on. (Plain union-arm field WRITES are safe by language rule — writing an arm
+// cannot itself be UB; the hazard is the mismatched read — so those stay bare, guarded by the
+// same codec matches.)
 #![deny(clippy::multiple_unsafe_ops_per_block)]
 
 use super::Codec;
@@ -1210,10 +1213,10 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     // are the only accepted config). H.264 has no tier. Level 0 = autoselect for HEVC.
     match c.codec {
         Codec::H265 => {
-            // SAFETY: HEVC session (matched on `c.codec`), so `hevcConfig` is the active arm.
-            unsafe { cfg.encodeCodecConfig.hevcConfig.tier = 1 };
-            // SAFETY: same HEVC arm, same match guard.
-            unsafe { cfg.encodeCodecConfig.hevcConfig.level = 0 };
+            // Plain union-arm writes are safe by language rule (the hazard is a mismatched
+            // READ later); the match on `c.codec` keeps the arm honest.
+            cfg.encodeCodecConfig.hevcConfig.tier = 1;
+            cfg.encodeCodecConfig.hevcConfig.level = 0;
         }
         Codec::Av1 => {}
         Codec::H264 => {}
@@ -1229,16 +1232,12 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     if let Some(n) = Some(c.slices).filter(|n| *n >= 2) {
         match c.codec {
             Codec::H264 => {
-                // SAFETY: H.264 session (matched on `c.codec`), so `h264Config` is the active arm.
-                unsafe { cfg.encodeCodecConfig.h264Config.sliceMode = 3 };
-                // SAFETY: same H.264 arm, same match guard.
-                unsafe { cfg.encodeCodecConfig.h264Config.sliceModeData = n };
+                cfg.encodeCodecConfig.h264Config.sliceMode = 3;
+                cfg.encodeCodecConfig.h264Config.sliceModeData = n;
             }
             Codec::H265 => {
-                // SAFETY: HEVC session (matched on `c.codec`), so `hevcConfig` is the active arm.
-                unsafe { cfg.encodeCodecConfig.hevcConfig.sliceMode = 3 };
-                // SAFETY: same HEVC arm, same match guard.
-                unsafe { cfg.encodeCodecConfig.hevcConfig.sliceModeData = n };
+                cfg.encodeCodecConfig.hevcConfig.sliceMode = 3;
+                cfg.encodeCodecConfig.hevcConfig.sliceModeData = n;
             }
             Codec::Av1 | Codec::PyroWave => {}
         }
@@ -1361,20 +1360,15 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
         let one = nv::NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
         match c.codec {
             Codec::H264 => {
-                // SAFETY: H.264 session (matched on `c.codec`), so `h264Config` is the active arm.
-                unsafe { cfg.encodeCodecConfig.h264Config.maxNumRefFrames = RFI_DPB };
-                // SAFETY: same H.264 arm, same match guard.
-                unsafe { cfg.encodeCodecConfig.h264Config.numRefL0 = one };
+                cfg.encodeCodecConfig.h264Config.maxNumRefFrames = RFI_DPB;
+                cfg.encodeCodecConfig.h264Config.numRefL0 = one;
             }
             Codec::H265 => {
-                // SAFETY: HEVC session (matched on `c.codec`), so `hevcConfig` is the active arm.
-                unsafe { cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = RFI_DPB };
-                // SAFETY: same HEVC arm, same match guard.
-                unsafe { cfg.encodeCodecConfig.hevcConfig.numRefL0 = one };
+                cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = RFI_DPB;
+                cfg.encodeCodecConfig.hevcConfig.numRefL0 = one;
             }
             Codec::Av1 => {
-                // SAFETY: AV1 session (matched on `c.codec`), so `av1Config` is the active arm.
-                unsafe { cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB };
+                cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB;
             }
             Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
         }
