@@ -508,15 +508,25 @@ fn running_as_system() -> bool {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
         return true; // fail closed
     }
-    let mut buf = [0u8; 256];
+    // TOKEN_USER is align-8; a bare `[u8; 256]` is align-1, and forming `&TOKEN_USER` out of it
+    // below would be UB by the language rule whenever the stack slot happens to land misaligned.
+    // (Shipped codegen happens to 8-align it today — that is luck, not a guarantee.) The wrapper
+    // keeps the buffer at 256 BYTES: redeclaring as `[u64; 32]` would silently turn the length
+    // argument below into 32 — `len()` counts elements — and a console operator's 44-byte
+    // TOKEN_USER+SID would then fail with ERROR_INSUFFICIENT_BUFFER, misclassifying every
+    // hand-run host as SYSTEM (it fits exactly for SYSTEM's own 16-byte S-1-5-18, so a
+    // SYSTEM-side test would not catch it).
+    #[repr(align(8))]
+    struct TokenUserBuf([u8; 256]);
+    let mut buf = TokenUserBuf([0u8; 256]);
     let mut len = 0u32;
     // SAFETY: `buf` is a writable local of the length passed; `len` is a live out-param.
     let got = unsafe {
         GetTokenInformation(
             token,
             TokenUser,
-            Some(buf.as_mut_ptr().cast()),
-            buf.len() as u32,
+            Some(buf.0.as_mut_ptr().cast()),
+            std::mem::size_of_val(&buf) as u32,
             &mut len,
         )
     };
@@ -542,11 +552,22 @@ fn running_as_system() -> bool {
     {
         return true; // fail closed
     }
-    // SAFETY: `buf` holds a TOKEN_USER written by GetTokenInformation; its `User.Sid` points into
-    // the same buffer, and both SIDs are valid for this comparison.
+    // SAFETY: `buf` holds a TOKEN_USER written by GetTokenInformation (align guaranteed by
+    // TokenUserBuf); its `User.Sid` points into the same buffer, and both SIDs are valid for
+    // this comparison.
     unsafe {
-        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
-        EqualSid(tu.User.Sid, PSID(system.as_mut_ptr().cast())).is_ok()
+        let tu = &*(buf.0.as_ptr() as *const TOKEN_USER);
+        // windows-rs maps EqualSid's BOOL(0) to Err BOTH for "SIDs differ" and for a genuine
+        // failure, telling them apart only via GetLastError — so clear it first (a stale value
+        // from an earlier call would otherwise read as failure) and split three ways. `.is_ok()`
+        // here previously meant an EqualSid ERROR yielded "not SYSTEM" — the fail-OPEN
+        // direction, contradicting the contract in the doc comment above.
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
+        match EqualSid(tu.User.Sid, PSID(system.as_mut_ptr().cast())) {
+            Ok(()) => true,                      // equal: we are SYSTEM
+            Err(e) if e.code().is_ok() => false, // BOOL(0), last-error 0: genuinely not equal
+            Err(_) => true,                      // EqualSid itself failed: fail closed
+        }
     }
 }
 
