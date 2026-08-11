@@ -44,6 +44,26 @@ struct State {
     mock: Cell<bool>,
 }
 
+/// What the page calls the host it is browsing. A request that carries a one-off profile
+/// came from a PINNED card (design §5.2a), and every title launched off this grid inherits
+/// it — so the page names it, the same `host · profile` shape the card wears. A plain card
+/// says nothing extra: its binding is the host's own default, not a second thing to read.
+/// A one-off whose profile has since been deleted resolves as no profile everywhere else,
+/// and reads as a plain host here.
+fn page_host_label(req: &ConnectRequest) -> String {
+    let Some(id) = req.profile.as_deref().filter(|id| !id.is_empty()) else {
+        return req.name.clone();
+    };
+    pf_client_core::profiles::ProfilesFile::load()
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .map_or_else(
+            || req.name.clone(),
+            |p| format!("{} \u{b7} {}", req.name, p.name),
+        )
+}
+
 /// Open the library page for a saved host and start the fetch. `mgmt_port` comes from
 /// the live mDNS `mgmt` TXT when the host is advertising (the hosts page resolves it).
 pub fn open(
@@ -194,7 +214,7 @@ fn build(
     toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::builder()
-        .title(format!("{} — Library", req.name))
+        .title(format!("{} — Library", page_host_label(&req)))
         .child(&toolbar)
         .build();
 

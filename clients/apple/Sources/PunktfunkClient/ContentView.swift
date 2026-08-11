@@ -71,7 +71,7 @@ struct ContentView: View {
     /// drives the cancelable "Waiting for approval" prompt and the pin-as-paired on success.
     @State private var awaitingApproval: ApprovalRequest?
     @State private var speedTestTarget: StoredHost?
-    @State private var libraryTarget: StoredHost?
+    @State private var libraryTarget: LibraryTarget?
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
     /// "Waking…" phase of the connect overlay). Available on every platform now that the iOS/tvOS
     /// multicast entitlement is granted (see PunktfunkConnection.wakeOnLANAvailable).
@@ -412,10 +412,10 @@ struct ContentView: View {
         // (like the sheets below) so it survives the streaming → home transition the disconnect
         // drives, and consumed here — the model hands the host over once and we clear it, so a
         // later manual dismiss of the library can't be undone by a stale value.
-        .onChange(of: model.returnToLibrary) { _, host in
-            guard let host else { return }
+        .onChange(of: model.returnToLibrary) { _, shelf in
+            guard let shelf else { return }
             model.returnToLibrary = nil
-            libraryTarget = host
+            libraryTarget = shelf
         }
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
@@ -448,9 +448,9 @@ struct ContentView: View {
         // (the coverflow is a GeometryReader, ideal ≈ zero), so without a frame it collapses to a
         // tiny panel.
         #if os(macOS)
-        .sheet(item: $libraryTarget) { host in
+        .sheet(item: $libraryTarget) { shelf in
             NavigationStack {
-                LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+                LibraryView(store: store, target: shelf, onLaunch: { launchTitle(shelf, $0) })
             }
             .frame(minWidth: 940, minHeight: 620)
         }
@@ -461,9 +461,9 @@ struct ContentView: View {
         // tile, `returnToLibrary`) keeps writing the same `libraryTarget` either way, and a
         // controller arriving or leaving mid-browse hands the open library to whichever
         // presentation the new mode owns.
-        .fullScreenCover(item: touchLibraryTarget) { host in
+        .fullScreenCover(item: touchLibraryTarget) { shelf in
             NavigationStack {
-                LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+                LibraryView(store: store, target: shelf, onLaunch: { launchTitle(shelf, $0) })
             }
         }
         #endif
@@ -573,7 +573,7 @@ struct ContentView: View {
 
     /// The iOS library cover's item: `libraryTarget`, hidden while the gamepad shell presents
     /// the library in place (see the cover's comment).
-    private var touchLibraryTarget: Binding<StoredHost?> {
+    private var touchLibraryTarget: Binding<LibraryTarget?> {
         Binding(
             get: { gamepadUIActive ? nil : libraryTarget },
             set: { libraryTarget = $0 })
@@ -743,6 +743,25 @@ struct ContentView: View {
     /// library fetch rides the paired mTLS identity, so there is nothing to show before the host
     /// is saved (the notice says what to do instead).
     private func openLibrary(from link: DeepLink) {
+        // A `profile=` on a browse link picks the shelf, exactly as it picks the settings on a
+        // connect link — and refuses the same way (§10.6): an unknown or ambiguous reference must
+        // never quietly degrade to the host's binding, which is a different shelf wearing the same
+        // host's name.
+        var selection = ProfileSelection.inherit
+        if let reference = link.profile {
+            let (profile, resolution) = profiles.catalog.resolve(reference)
+            switch resolution {
+            case .found:
+                selection = .profile(profile?.id ?? "")
+            case .notFound:
+                deepLinkNotice = "No settings profile called “\(reference)” on this device."
+                return
+            case .ambiguous:
+                deepLinkNotice = "More than one settings profile is called “\(reference)”. "
+                    + "Rename one, or link to it by its id."
+                return
+            }
+        }
         switch link.resolveHost(in: store.hosts) {
         case .known(let host):
             guard !link.pinConflict(with: host) else {
@@ -755,7 +774,7 @@ struct ContentView: View {
                 deepLinkNotice = "Already streaming \(current). End that session first."
                 return
             }
-            libraryTarget = host
+            libraryTarget = LibraryTarget(host: host, profile: selection)
         case .unknown(let address, _, let name, _):
             deepLinkNotice = "\(name ?? address) isn't saved on this device yet. "
                 + "Add it with the + button first — a library can only be browsed on a saved host."
@@ -833,9 +852,9 @@ struct ContentView: View {
                     PairSheet(host: host) { fingerprint in handlePaired(host, fingerprint: fingerprint) }
                         .onExitCommand { pairingTarget = nil }
                 }
-                .fullScreenCover(item: $libraryTarget) { host in
+                .fullScreenCover(item: $libraryTarget) { shelf in
                     NavigationStack {
-                        LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+                        LibraryView(store: store, target: shelf, onLaunch: { launchTitle(shelf, $0) })
                     }
                     .onExitCommand { libraryTarget = nil }
                 }
@@ -1234,6 +1253,10 @@ struct ContentView: View {
                 setting: PunktfunkConnection.GamepadType(
                     rawValue: UInt32(clamping: effective.gamepadType)) ?? .auto),
             launchID: launchID,
+            // Where a game exit returns to, when this connect launched a title: the shelf that
+            // title was picked on — the host's own, or the pinned card whose profile this connect
+            // is using. Ignored by the model unless there is a launchID.
+            shelf: LibraryTarget(host: host, profile: profile),
             allowTofu: allowTofu,
             requestAccess: requestAccess,
             onUnreachable: onUnreachable)
@@ -1289,9 +1312,13 @@ struct ContentView: View {
 
     /// Picked a title in the (experimental) library: dismiss the browser and start a session that
     /// asks the host to launch it.
-    private func launchTitle(_ host: StoredHost, _ id: String) {
+    /// A title picked on a library shelf: dial its host, booting straight into that title — with
+    /// the shelf's profile. A pinned card's shelf carries its card's profile as the one-off, so a
+    /// launch made there streams with the profile the card promises; the host's own shelf carries
+    /// `.inherit` and the binding decides, exactly as a plain card tap does.
+    private func launchTitle(_ shelf: LibraryTarget, _ id: String) {
         libraryTarget = nil
-        connect(host, launchID: id)
+        connect(shelf.host, launchID: id, profile: shelf.profile)
     }
 
     /// Tap a discovered host: save it (so the session has a stored identity and the trust pin

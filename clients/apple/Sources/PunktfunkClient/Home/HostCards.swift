@@ -219,6 +219,13 @@ struct HostCardView: View {
             // the way to remove the shortcut itself. Unpinning touches neither the profile nor
             // the host's default binding.
             connectWithMenu(menu)
+            // Browsing IS a connect-shaped action — it is this card's connect with a title picked
+            // first — so a pinned card offers it and opens its own shelf, whose launches carry the
+            // pinned profile. (Pair / speed test / wake / forget stay on the host's card: those
+            // are about the machine, and a shortcut has no business claiming them.)
+            if let onBrowseLibrary {
+                Button("Browse Library…", action: onBrowseLibrary)
+            }
             if LinkClipboard.isAvailable {
                 Button("Copy Link") { menu.copyLink(pinned.id) }
             }

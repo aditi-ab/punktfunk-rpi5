@@ -913,9 +913,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
 
             // …then this host's pinned host+profile tiles, in the order they were pinned
             // (design §5.2a). They share the host's live status because they read the same
-            // record, and a pin whose profile is gone simply doesn't render. No menu of their
-            // own: a pinned tile is a shortcut, not a second host, and pin/unpin already live
-            // on the primary tile's menu — the one place you decide it.
+            // record, and a pin whose profile is gone simply doesn't render. Their menu is
+            // deliberately short: a pinned tile is a shortcut, not a second host, so it carries
+            // only what STARTS it (the library — this tile's connect with a title picked first,
+            // which is why the grid it opens launches with the tile's profile), the link that
+            // reproduces it, and the way to remove it. Everything that configures the machine —
+            // pair, speed test, wake, edit, forget, and pinning itself — stays on the primary
+            // tile's menu, the one place you decide it.
             for id in &k.pinned_profiles {
                 let Some((id, name, accent)) = profiles.iter().find(|(pid, ..)| pid == id) else {
                     continue;
@@ -923,6 +927,67 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (ctx3, ss3, st3) = (ctx.clone(), set_screen.clone(), set_status.clone());
                 let mut pinned_target = pinned_base.clone();
                 pinned_target.profile = Some(id.clone());
+                let pinned_menu = {
+                    let (svc, target) = (props.svc.clone(), pinned_target.clone());
+                    let (fp, pin_id) = (k.fp_hex.clone(), id.clone());
+                    let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
+                    let link_host = k.clone();
+                    let link_profile = id.clone();
+                    let unpin_label = format!("{MENU_UNPIN}{name}");
+                    let unpin_item = unpin_label.clone();
+                    button("")
+                        .icon(Symbol::More)
+                        .subtle()
+                        .tooltip("More options")
+                        .automation_name("More options")
+                        .menu_flyout({
+                            let mut items = Vec::new();
+                            // Same gate as the primary tile's: the mgmt API needs the paired
+                            // identity, and the page is behind the experimental toggle.
+                            if library_enabled && k.paired {
+                                items.push(menu_item(MENU_LIBRARY));
+                            }
+                            items.push(menu_item(MENU_COPY_LINK));
+                            items.push(menu_separator());
+                            items.push(menu_item(unpin_label));
+                            items
+                        })
+                        .on_item_clicked(move |item: String| match item.as_str() {
+                            MENU_LIBRARY => {
+                                // The shared target IS what the library page launches through, so
+                                // parking THIS tile's target here is what makes its grid launch
+                                // with the pinned profile.
+                                *svc.ctx.shared.target.lock().unwrap() = target.clone();
+                                super::library::start_fetch(&svc.ctx, &svc.set_library);
+                                svc.set_screen.call(Screen::Library);
+                            }
+                            MENU_COPY_LINK => {
+                                let url = pf_client_core::deeplink::DeepLink::for_host(
+                                    &link_host,
+                                    None,
+                                    Some(link_profile.as_str()),
+                                )
+                                .to_url();
+                                pf_client_core::clipboard::set_text(&url);
+                            }
+                            other if other == unpin_item => {
+                                tracing::info!(pin = %pin_id, host = %fp, on = false, "pin toggle");
+                                let mut known = KnownHosts::load();
+                                if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                                    h.pinned_profiles.retain(|x| x != &pin_id);
+                                    if let Err(e) = known.save() {
+                                        tracing::warn!(
+                                            error = %format!("{e:#}"), "saving a pin"
+                                        );
+                                    }
+                                }
+                                // Same reason as the primary tile's toggle: nothing the page reads
+                                // as state changed, so the bump is what makes this tile vanish NOW.
+                                set_hosts_rev.call(hosts_rev + 1);
+                            }
+                            _ => {}
+                        })
+                };
                 tiles.push(host_tile(
                     // Its own hover key: two tiles for one host must not light up together.
                     &format!("{}#{id}", k.fp_hex),
@@ -935,7 +1000,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         (!k.paired).then_some(("Trusted", Pill::Info)),
                         Some((name.as_str(), accent.clone())),
                     ),
-                    None,
+                    Some(pinned_menu),
                     Some(Box::new(move || {
                         if can_wake {
                             initiate_waking(&ctx3, pinned_target.clone(), &ss3, &st3);

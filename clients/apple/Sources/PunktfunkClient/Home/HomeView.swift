@@ -24,7 +24,7 @@ struct HomeView: View {
     @Binding var showAddHost: Bool
     @Binding var pairingTarget: StoredHost?
     @Binding var speedTestTarget: StoredHost?
-    @Binding var libraryTarget: StoredHost?
+    @Binding var libraryTarget: LibraryTarget?
     #if !os(macOS)
     @Binding var showSettings: Bool
     #endif
@@ -34,8 +34,9 @@ struct HomeView: View {
     let connectDiscovered: (DiscoveredHost) -> Void
     /// Pairing succeeded (tvOS PairSheet route) — pin + connect (ContentView guards staleness).
     let onPaired: (StoredHost, Data) -> Void
-    /// Picked a title in the (experimental) library — start a session that launches it.
-    let onLaunchTitle: (StoredHost, String) -> Void
+    /// Picked a title in the (experimental) library — start a session that launches it, with the
+    /// shelf's profile (a pinned card's own; the host's binding on its primary card).
+    let onLaunchTitle: (LibraryTarget, String) -> Void
     /// Explicit Wake-on-LAN of an offline host — fires the packet and waits for it to come online
     /// (the "Waking…" overlay), without connecting. Routed through ContentView's HostWaker.
     let wake: (StoredHost) -> Void
@@ -154,8 +155,8 @@ struct HomeView: View {
             .navigationDestination(item: $speedTestTarget) { host in
                 SpeedTestSheet(host: host)
             }
-            .navigationDestination(item: $libraryTarget) { host in
-                LibraryView(store: store, host: host, onLaunch: { onLaunchTitle(host, $0) })
+            .navigationDestination(item: $libraryTarget) { shelf in
+                LibraryView(store: store, target: shelf, onLaunch: { onLaunchTitle(shelf, $0) })
             }
             #endif
             #if !os(tvOS)
@@ -263,9 +264,13 @@ struct HomeView: View {
     }
 
     private func hostCard(_ host: StoredHost, pinned: StreamProfile?) -> some View {
-        let onBrowseLibrary: (() -> Void)? = libraryEnabled ? { libraryTarget = host } : nil
         // A pinned card connects with ITS profile; the primary card follows the binding.
         let selection: ProfileSelection = pinned.map { .profile($0.id) } ?? .inherit
+        // …and browsing is that same connect with a title picked first, so a pinned card opens its
+        // OWN shelf: every launch off it carries the card's profile rather than the host's binding.
+        let onBrowseLibrary: (() -> Void)? = libraryEnabled
+            ? { libraryTarget = LibraryTarget(host: host, profile: selection) }
+            : nil
         return HostCardView(
             host: host,
             isOnline: isOnline(host),

@@ -4,7 +4,6 @@ import androidx.compose.ui.graphics.Color
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.security.KnownHost
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -177,9 +176,10 @@ class HomeTilesTest {
             assertTrue(it.paired)
             assertNotNull(it.knownHost)
         }
-        // Host tile → library (Y); pin tile → none, because a pin is a shortcut, not a second host.
+        // Both tiles reach the library (Y): a pin card opens its OWN shelf, whose launches carry
+        // the pinned profile — the library is a way to start a card, not a host-level action.
         assertTrue(result[0].hasLibrary)
-        assertFalse(result[1].hasLibrary)
+        assertTrue(result[1].hasLibrary)
     }
 
     /**

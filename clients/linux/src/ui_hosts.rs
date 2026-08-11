@@ -466,6 +466,13 @@ impl relm4::factory::FactoryComponent for HostCard {
                     // offering them here would blur what the card is.
                     let launch = gio::Menu::new();
                     launch.append(Some("Connect"), Some("card.connect"));
+                    // …and the same stream with a title picked first. The library is a way to
+                    // START this card, not a property of the host, so it belongs to a shortcut
+                    // as much as Connect does — and the card's request carries its profile, so
+                    // what launches from that grid is this card's profile, not the binding.
+                    if *library_enabled {
+                        launch.append(Some("Browse library\u{2026}"), Some("card.library"));
+                    }
                     menu.append_section(None, &launch);
 
                     let links = gio::Menu::new();

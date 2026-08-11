@@ -6,11 +6,53 @@
 import PunktfunkKit
 import SwiftUI
 
+/// Which library shelf is open: a host, and — when it was opened from a PINNED host+profile card
+/// (design/client-settings-profiles.md §5.2a) — that card's profile, which every title launched off
+/// the shelf then runs with, exactly as the card's own tap would.
+///
+/// One value rather than a host plus a profile carried beside it: a host and its pinned cards are
+/// different cards on the grid, so "which library" is not answered by the host alone. That is also
+/// why `id` folds the profile in — a presentation keyed on the host would not re-present when you
+/// move between a host's own shelf and one of its pins.
+struct LibraryTarget: Identifiable, Hashable {
+    let host: StoredHost
+    /// `.inherit` from the host's own card (its binding decides, as it always has); `.profile` from
+    /// a pinned card. `.defaults` never reaches here — nothing opens a library "with the globals".
+    var profile: ProfileSelection = .inherit
+
+    var id: String {
+        switch profile {
+        case .inherit: host.id.uuidString
+        case .defaults: "\(host.id.uuidString)#defaults"
+        case .profile(let id): "\(host.id.uuidString)#\(id)"
+        }
+    }
+
+    /// The pinned profile's id, if this shelf belongs to a pinned card.
+    var pinnedProfileID: String? {
+        if case .profile(let id) = profile { return id }
+        return nil
+    }
+
+    /// What the screen calls itself: the host, and the profile when a pinned card opened it — the
+    /// same `host · profile` shape that card wears, so which shelf you are on is on screen rather
+    /// than remembered from the card you pressed. A pin whose profile has since been deleted
+    /// resolves as no profile everywhere else, and reads as the plain host here.
+    @MainActor func title(in catalog: ProfileStore) -> String {
+        guard let id = pinnedProfileID, let profile = catalog.profile(id: id) else {
+            return host.displayName
+        }
+        return "\(host.displayName) \u{b7} \(profile.name)"
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject var store: HostStore
-    let host: StoredHost
+    /// The shelf being browsed — the host, plus the pinned profile when a pinned card opened it.
+    let target: LibraryTarget
     /// Tapping a title starts a session that asks the host to launch it (the library id is passed
-    /// through). `nil` ⇒ browse-only (cards aren't tappable).
+    /// through). `nil` ⇒ browse-only (cards aren't tappable). The PROFILE a launch runs with is the
+    /// caller's to apply: it holds `target` and connects with `target.profile`.
     var onLaunch: ((String) -> Void)? = nil
     /// How the gamepad shell (GamepadLibraryScreen) closes this screen; nil — every sheet/cover
     /// presentation — falls back to the environment dismiss.
@@ -20,6 +62,12 @@ struct LibraryView: View {
     /// default (their being up IS the launcher's gate).
     var controllerActive = true
     @Environment(\.dismiss) private var dismiss
+    /// Resolves a pinned shelf's profile NAME for the title (the target carries only its id).
+    @ObservedObject private var profiles = ProfileStore.shared
+
+    /// The host this shelf belongs to — every fetch, every poster URL and the launch itself address
+    /// it, and a pinned shelf is the same host seen through one of its cards.
+    private var host: StoredHost { target.host }
 
     @State private var games: [GameEntry] = []
     @State private var loading = false
@@ -50,7 +98,7 @@ struct LibraryView: View {
 
     var body: some View {
         content
-            .navigationTitle("\(host.displayName) — Library")
+            .navigationTitle("\(target.title(in: profiles)) — Library")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif

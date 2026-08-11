@@ -209,7 +209,7 @@ impl Screen {
     pub(crate) fn title(&self, _ctx: &Ctx) -> String {
         match self {
             Screen::Home(_) => "Select a Host".into(),
-            Screen::Library(s) => s.host_name().to_string(),
+            Screen::Library(s) => s.title(),
             Screen::Settings(_) => "Settings".into(),
             Screen::AddHost(s) => s.title(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),

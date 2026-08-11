@@ -42,7 +42,7 @@ internal fun ConnectPrompts(
     optionsTarget: HostCardEntry?,
     onDismissOptions: () -> Unit,
     libraryEnabled: Boolean,
-    onOpenLibrary: (KnownHost) -> Unit,
+    onOpenLibrary: (KnownHost, String?) -> Unit,
     onWake: (KnownHost) -> Unit,
     onSpeedTest: (KnownHost) -> Unit,
     onCopyLink: (KnownHost, StreamProfile?) -> Unit,
@@ -119,9 +119,11 @@ internal fun ConnectPrompts(
             canWake = kh.mac.isNotEmpty() && offline,
             onWake = { onDismissOptions(); onWake(kh) },
             // A saved host always has a library (it's a knownHost) → offer it when the setting's on,
-            // so a TV remote reaches the library here instead of via the Y face button.
-            onLibrary = if (libraryEnabled && pin == null) {
-                { onDismissOptions(); onOpenLibrary(kh) }
+            // so a TV remote reaches the library here instead of via the Y face button. A PIN card
+            // gets it too, opening its own shelf: unlike wake/edit/forget, the library is a way to
+            // start the card, not a property of the host.
+            onLibrary = if (libraryEnabled) {
+                { onDismissOptions(); onOpenLibrary(kh, pin?.id) }
             } else {
                 null
             },

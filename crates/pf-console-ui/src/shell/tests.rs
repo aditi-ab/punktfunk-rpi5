@@ -180,6 +180,87 @@ fn finish_motion(s: &mut Shell) {
     s.motion = Motion::None;
 }
 
+/// A pinned host+profile card's library launches with THAT profile (design §5.2a).
+///
+/// The card's plain A-press always carried its profile; Y — which the card offers, being
+/// paired and saved — opened a library screen that knew only the host, so every title
+/// launched off it silently fell back to the host's default binding. The profile a user
+/// pinned is the whole reason they pressed that card.
+#[test]
+fn a_pinned_cards_library_launches_with_its_profile() {
+    let mut rows = hosts();
+    let card = HostRow {
+        key: "aa11\u{0}hdr".into(),
+        pin: Some(crate::model::ProfileChip {
+            id: "hdr".into(),
+            name: "HDR".into(),
+            accent: None,
+        }),
+        ..rows[0].clone()
+    };
+    rows.insert(1, card);
+    let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    console.set_hosts(rows);
+    s.sync();
+
+    // Focus the pinned card (it sits right after its host's primary tile), then Y.
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    match s.stack.last() {
+        Some(Screen::Library(l)) => assert_eq!(
+            l.title(),
+            "Living Room PC \u{b7} HDR",
+            "the shelf names the profile it will launch with"
+        ),
+        _ => panic!("Y on a pinned card opens its library"),
+    }
+
+    library.set_games(vec![crate::library::LibraryGame {
+        id: "steam:570".into(),
+        title: "Dota 2".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+    }]);
+    s.handle_menu(MenuEvent::Confirm);
+    match s.take_action() {
+        Some(OverlayAction::Launch {
+            launch, profile, ..
+        }) => {
+            assert_eq!(launch.as_deref(), Some("steam:570"));
+            assert_eq!(
+                profile.as_deref(),
+                Some("hdr"),
+                "the launch carries the pinned card's profile"
+            );
+        }
+        _ => panic!("A on a title raises a launch"),
+    }
+}
+
+/// …and off the host's PRIMARY tile there is no one-off: the host's binding decides,
+/// which is what the resolver sees as `None`.
+#[test]
+fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Secondary); // paired+online host focused first
+    finish_motion(&mut s);
+    library.set_games(vec![crate::library::LibraryGame {
+        id: "steam:570".into(),
+        title: "Dota 2".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+    }]);
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(matches!(
+        s.take_action(),
+        Some(OverlayAction::Launch { profile: None, .. })
+    ));
+}
+
 #[test]
 fn wake_gates_input_in_the_same_press() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);

@@ -22,14 +22,16 @@ enum GamepadScreen: Identifiable {
     case settings
     case addHost
     case pair(StoredHost)
-    case library(StoredHost)
+    case library(LibraryTarget)
 
     var id: String {
         switch self {
         case .settings: return "settings"
         case .addHost: return "addHost"
         case .pair(let host): return "pair-\(host.id.uuidString)"
-        case .library(let host): return "library-\(host.id.uuidString)"
+        // Keyed on the SHELF, not the host: a host and each of its pinned cards open different
+        // libraries, and sharing an id would let one stand in for another mid-transition.
+        case .library(let shelf): return "library-\(shelf.id)"
         }
     }
 
