@@ -18,7 +18,6 @@
 // proof of why it is sound. This crate held ~91 unsafe items with NO enforcement while every
 // other subsystem crate denied it — the decoders' `unsafe impl Send`s had a one-line aside
 // instead of an argument precisely because nothing required one.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(any(target_os = "linux", windows))]
 mod au_dump;

@@ -88,8 +88,6 @@
 //! the readback geometry (row pitch / crop) or intra decode; mismatches that
 //! only appear on later frames point at inter prediction / DPB management.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 mod common;
 
 use ash::vk;

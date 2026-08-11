@@ -101,6 +101,17 @@ repository = "https://git.unom.io/unom/punktfunk"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+# The companion lint: every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof. Hoisted here
+# from ~85 per-file `#![deny(...)]` attributes so a NEW crate (or a new module in an old one) is
+# covered on creation rather than on remembering — the per-file form left pf-vkhdr-layer,
+# wdk-probe, and half of pf-clipboard uncovered for months. NOTE: this table reaches only crates
+# with `[lints] workspace = true`; `packaging/windows/drivers` and `packaging/windows/pf-vkhdr-layer`
+# are SEPARATE workspaces and restate it (any "workspace-wide" claim must be made three times or it
+# is false). Of the members, only the two vendored snapshots (pf-bitstream/vendor/cros-codecs,
+# punktfunk-host/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

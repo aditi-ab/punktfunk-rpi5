@@ -5,8 +5,6 @@
 //! and drive this layer.
 
 #![allow(non_camel_case_types, non_snake_case)]
-// Every `unsafe` block/impl below carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{bail, Result};
 use std::os::raw::{c_int, c_uint, c_void};

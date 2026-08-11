@@ -5,8 +5,6 @@
 //! [`super`].
 
 #![allow(non_upper_case_globals)]
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{bail, ensure, Result};
 use std::os::raw::{c_int, c_void};

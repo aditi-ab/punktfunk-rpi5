@@ -7,13 +7,6 @@
 //! [`FrameChannelSender`] closure, so this crate reaches neither the encoder nor the host
 //! orchestrator).
 
-// Every unsafe block in this crate carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-// …and that program only covers a whole `unsafe fn` body once the body needs its own block: in
-// edition 2021 `unsafe_op_in_unsafe_fn` is allow-by-default, which exempted the crate's hardest FFI
-// (the ring/slot construction, the channel broker, every D3D converter ctor) from the deny above.
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use anyhow::Result;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 // The Linux capturer reaches `DmabufFrame` through `super::`; `CursorOverlay` it names directly as

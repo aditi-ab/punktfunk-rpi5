@@ -16,8 +16,6 @@
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
 // Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 

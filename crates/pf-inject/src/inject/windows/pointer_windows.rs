@@ -15,9 +15,6 @@
 //! with its position (never at a stale point), tip edges get their own DOWN/UP frames, and a
 //! range-leave is a final frame without `INRANGE`.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::{Context, Result};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{

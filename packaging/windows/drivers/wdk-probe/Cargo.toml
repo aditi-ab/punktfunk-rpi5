@@ -27,3 +27,6 @@ wdk.workspace = true
 # do its WDF/DXGI types resolve to wdk-sys's (so the generated module compiles)?
 wdk-sys = { workspace = true, features = ["iddcx"] }
 pf-driver-proto.workspace = true
+
+[lints]
+workspace = true

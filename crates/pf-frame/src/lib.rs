@@ -10,7 +10,6 @@
 //! tuning), and — on Windows — [`dxgi`] (the capture identity + D3D11 device creation).
 
 // Unsafe-proof program: every `unsafe {}` / `unsafe impl` must carry a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod hdr;
 pub mod metronome;

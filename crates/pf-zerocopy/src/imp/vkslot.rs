@@ -34,9 +34,6 @@
 //! Falls back cleanly: if bring-up fails the encoder allocates plain CUDA surfaces and composite
 //! mode degrades to no cursor (warned once) — never a failed session.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::cuda::{self, CUdeviceptr};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;

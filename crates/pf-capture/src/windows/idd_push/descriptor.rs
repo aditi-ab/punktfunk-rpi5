@@ -1,9 +1,6 @@
 //! Off-thread display-descriptor polling (plan §W4, carved out of the IDD-push capturer): the
 //! live HDR state + active resolution of the virtual target, sampled off the capture loop via CCD.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 
 /// The display descriptor the capture loop follows: live HDR state + active resolution of the

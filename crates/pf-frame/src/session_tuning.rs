@@ -11,9 +11,6 @@
 //! state) auto-revert at thread exit (= session end); the process-wide bits revert at process exit.
 //! See `design/host-latency-plan.md` Tier 3A.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 #[cfg(target_os = "windows")]
 mod imp {
     #![allow(non_snake_case)]

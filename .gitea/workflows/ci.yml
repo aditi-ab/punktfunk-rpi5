@@ -111,6 +111,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # rust-safety WP2c: three textual gates for classes no lint covers — unsafe fn markers
+      # carrying no contract, panic across an extern boundary (an abort since 1.81), and
+      # process-global safe APIs (env::set_var & co, count-ratcheted). Pure grep/awk, no cargo.
+      # Both failure modes were demonstrated before this became blocking (planted instances).
+      - name: Unsafe-hygiene grep gates
+        run: sh scripts/ci/check-unsafe-hygiene.sh
+
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -139,8 +146,8 @@ jobs:
       # `nvenc` gates enc/linux/nvenc_cuda.rs (+ nvenc_core/nvenc_status) and `vulkan-encode` gates
       # enc/linux/vulkan_video.rs (+ the vendored vk_av1_encode/vk_valve_rgb bindings) — ~8,150
       # lines carrying ~70 `unsafe` blocks. Their ONLY prior CI coverage was deb.yml's
-      # `cargo build`, where warnings are not errors, so pf-encode's own
-      # `#![deny(clippy::undocumented_unsafe_blocks)]` — the crate's stated unsafe-proof gate —
+      # `cargo build`, where warnings are not errors, so the `undocumented_unsafe_blocks` deny
+      # (now hoisted into [workspace.lints]) — pf-encode's stated unsafe-proof gate —
       # was never actually enforced on them. (`pyrowave` needs no extra step: punktfunk-host has
       # `default = ["pyrowave"]`, so the steps above already cover it.)
       #

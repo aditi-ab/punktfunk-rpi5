@@ -6,9 +6,6 @@
 //! to evdev/US), and translate events into virtual pointer/keyboard requests, tracking modifier
 //! state so the compositor resolves shifted keysyms correctly.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
 use anyhow::{bail, Context, Result};
 use punktfunk_core::input::InputKind;

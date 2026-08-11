@@ -14,13 +14,8 @@
 //! that is correct for launching *our own* streamer, but a store launcher needs the real user's token
 //! for activation + auth). The host process itself stays SYSTEM.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-// …and the proofs only cover the whole file once an `unsafe fn` body needs its own blocks: the
-// workspace sets `unsafe_op_in_unsafe_fn` to `warn`, which is a ratchet, not a floor. This module is
-// at zero, so hold it there — `merged_env_block`'s pointer walk is the one real contract here, and
-// it must not silently re-absorb the FFI calls around it.
-#![deny(unsafe_op_in_unsafe_fn)]
+// This module is at zero `unsafe fn` markers; hold it there — `merged_env_block`'s pointer walk
+// is the one real contract here, and it must not silently re-absorb the FFI calls around it.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;

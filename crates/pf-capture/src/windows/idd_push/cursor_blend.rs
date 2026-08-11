@@ -10,9 +10,6 @@
 //! alpha-blended quad (the GDI poller's full-fidelity shape at its polled position), entirely
 //! GPU-side on the capture device, before the normal conversion runs from the scratch.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 use windows::core::s;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;

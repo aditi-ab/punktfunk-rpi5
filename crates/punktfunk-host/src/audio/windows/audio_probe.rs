@@ -21,9 +21,6 @@
 //! endpoint of that name, and the probe restores the default playback/recording devices it
 //! disturbed before exiting.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::pad_endpoint as pe;
 use super::{audio_control, SAMPLE_RATE};
 use anyhow::{anyhow, bail, Context, Result};

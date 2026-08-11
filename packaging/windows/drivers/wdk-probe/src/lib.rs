@@ -4,7 +4,7 @@
 //! stub link AND prove the `iddcx` subset is callable + links against `IddCxStub`. Also force-links the
 //! shared `pf-driver-proto` ABI crate (no_std + bytemuck) across the workspace boundary.
 
-#![allow(non_snake_case, clippy::missing_safety_doc)]
+#![allow(non_snake_case)]
 
 mod iddcx_rt;
 mod iddcx_surface_assert;
@@ -29,6 +29,9 @@ static PROTO_GUID_LO: u64 = pf_driver_proto::PF_VDISPLAY_INTERFACE_GUID_U128 as 
 #[unsafe(no_mangle)]
 pub static IddMinimumVersionRequired: ULONG = 4;
 
+/// # Safety
+/// Called by the UMDF host at driver load: `driver` and `registry_path` must be the
+/// loader-provided driver object and registry path, both valid for the duration of the call.
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
@@ -57,6 +60,9 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // IddCxStub (CI), and that a self-signed IddCx driver loads + dispatches (box); the full callback
     // surface + a valid adapter come with the driver port. At runtime IddCxDeviceInitConfig will reject
     // the null callbacks, but the call site is what links IddCxStub and exercises table dispatch.
+    // SAFETY: IDD_CX_CLIENT_CONFIG is a C aggregate of integers, pointers, and nullable
+    // callbacks (`Option<extern fn>`) — all-zero is a valid value (null callbacks, see above);
+    // Size is stamped on the next line.
     let mut cfg: IDD_CX_CLIENT_CONFIG = unsafe { core::mem::zeroed() };
     cfg.Size = core::mem::size_of::<IDD_CX_CLIENT_CONFIG>() as ULONG;
     // SAFETY: device_init is the framework-provided init; cfg is a valid (if minimal) config.
@@ -76,8 +82,11 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // SAFETY: device is the just-created WDFDEVICE.
     let _ = unsafe { iddcx_rt::IddCxDeviceInitialize(device) };
 
-    // SAFETY: zeroed adapter-init args — a link/dispatch reference, not a valid adapter (see above).
+    // SAFETY: IDARG_IN_ADAPTER_INIT is a C aggregate of handles/pointers/integers — all-zero is
+    // a valid value (a link/dispatch reference, not a valid adapter; see above).
     let in_args: IDARG_IN_ADAPTER_INIT = unsafe { core::mem::zeroed() };
+    // SAFETY: IDARG_OUT_ADAPTER_INIT is a C aggregate of handles — all-zero is a valid value,
+    // and the call below only writes through it.
     let mut out_args: IDARG_OUT_ADAPTER_INIT = unsafe { core::mem::zeroed() };
     // SAFETY: in/out args are valid local storage for the call.
     let _ = unsafe { iddcx_rt::IddCxAdapterInitAsync(&in_args, &mut out_args) };

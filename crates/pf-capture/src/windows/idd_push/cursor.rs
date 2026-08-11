@@ -5,9 +5,6 @@
 //! [`pf_frame::CursorOverlay`] the Linux portal path produces — everything downstream (the
 //! cursor forwarder, the wire, the client renderer) is shared.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::*;
 use pf_driver_proto::cursor::{
     CursorShm, CURSOR_MAGIC, CURSOR_SHAPE_BYTES, CURSOR_SHAPE_MAX, CURSOR_SHAPE_OFFSET,

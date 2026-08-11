@@ -39,8 +39,6 @@
 //! so releases pass `false`), soak, and both vendors' DPB arrangements at once
 //! (each box exercises only its own).
 
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 mod common;
 
 use ash::vk;

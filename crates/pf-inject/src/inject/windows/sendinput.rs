@@ -14,9 +14,6 @@
 //! user's, and any layout re-reads a *position* as a *character* — on a German host that is
 //! exactly the y↔z swap / ü-on-ö scramble.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
 use std::mem::size_of;

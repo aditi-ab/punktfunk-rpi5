@@ -29,3 +29,6 @@ pf-umdf-util.workspace = true
 [features]
 default = []
 nightly = ["wdk-sys/nightly", "wdk/nightly"]
+
+[lints]
+workspace = true

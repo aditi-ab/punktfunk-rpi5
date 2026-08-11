@@ -112,10 +112,9 @@
 //! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
 //! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
 //! encode side does it (`pf-encode/src/enc/linux/vk_build.rs`), and the GPU half is
-//! Vulkan FFI. Every unsafe block therefore carries a written `// SAFETY:` proof,
-//! enforced (and unlike the encoder there is NO file-level
-//! `unsafe_op_in_unsafe_fn` exemption — every operation is individually fenced):
-#![deny(clippy::undocumented_unsafe_blocks)]
+//! Vulkan FFI. Every unsafe block therefore carries a written `// SAFETY:` proof — enforced by
+//! the workspace `[workspace.lints]` tables, and (unlike the encoder) with NO file-level
+//! `unsafe_op_in_unsafe_fn` exemption: every operation is individually fenced.
 
 pub mod caps;
 pub mod caps_av1;

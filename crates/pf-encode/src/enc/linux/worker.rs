@@ -41,9 +41,6 @@
 //! worker caches it, so the steady state passes **zero** descriptors (the PipeWire pool recycles a
 //! small buffer set).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use anyhow::{Context, Result};
 use pf_frame::{CapturedFrame, CursorOverlay, DmabufFrame, FramePayload, PixelFormat};
 use pf_zerocopy::ipc;

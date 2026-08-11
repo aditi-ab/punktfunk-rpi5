@@ -11,7 +11,6 @@
 //! capture hint, start banner.
 
 // Unsafe-proof program: every `unsafe {}` in the Skia/Vulkan overlay carries a `// SAFETY:` proof.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(any(target_os = "linux", windows))]
 mod anim;

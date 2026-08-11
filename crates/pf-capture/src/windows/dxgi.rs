@@ -9,9 +9,6 @@
 //! `crate::dxgi::*` path keeps resolving. DXGI Desktop Duplication has been removed; this
 //! module contains no capturer.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
 
 // The P010 colour self-test (sweep Phase 5.5) — the `hdr-p010-selftest` subcommand, its f64

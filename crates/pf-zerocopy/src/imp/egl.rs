@@ -12,8 +12,6 @@
 //! owned [`DeviceBuffer`] so the dmabuf can be returned to the compositor immediately.
 
 #![allow(non_upper_case_globals)]
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::cuda::{self, DeviceBuffer};
 use anyhow::{ensure, Context as _, Result};

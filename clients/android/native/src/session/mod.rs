@@ -45,6 +45,15 @@ pub(crate) fn jni_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// Poison-recovering lock for the JNI entry points that are NOT behind [`jni_guard`]: a
+/// `.lock().unwrap()` there turns a poisoned mutex into a panic across the `extern "system"`
+/// boundary — an abort of the whole app on Rust ≥ 1.81 (the panic-in-extern grep gate's class).
+/// The slots behind these mutexes are plane-thread handles and last-value caches; whatever a
+/// poisoned writer left is still valid to inspect or replace.
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A live session behind the `jlong` handle: the connector + the decode thread it feeds.
 pub(crate) struct SessionHandle {
     // Read only by the android decode path (`nativeStartVideo` → `crate::decode`); on the host

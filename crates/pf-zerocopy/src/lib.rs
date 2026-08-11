@@ -8,13 +8,9 @@
 //! consumes the shared frame vocabulary, which sits ABOVE this crate (this crate provides the
 //! `DeviceBuffer` that vocabulary's `FramePayload::Cuda` owns).
 
-// Unsafe-proof program: every `unsafe {}` / `unsafe impl` must carry a `// SAFETY:` proof. Each
-// file keeps its own `#![deny(...)]` too; this crate-root deny is the catch-all gate.
-// `unsafe_op_in_unsafe_fn` closes the gap the clippy lint leaves: operations inside an
-// `unsafe fn` body are not "unsafe blocks", so without it ~45 functions' worth of raw driver
-// calls sat OUTSIDE the invariant this crate advertises.
-#![deny(clippy::undocumented_unsafe_blocks)]
-#![deny(unsafe_op_in_unsafe_fn)]
+// Unsafe-proof program: every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof, and
+// `unsafe fn` bodies need explicit blocks (~45 functions' worth of raw driver calls used to sit
+// outside that invariant). Both lints are enforced by the workspace `[workspace.lints]` tables.
 
 /// Wait for a dmabuf's implicit read-ready fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + poll).
 #[cfg(target_os = "linux")]

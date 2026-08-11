@@ -48,6 +48,8 @@ impl AvBuffer {
     /// allocator returns on failure (so the `is_null` check every caller used to open-code happens
     /// once, here).
     ///
+    // unsafe-fn-no-op-ok: contract-deferring constructor (`Vec::set_len` shape) — the body is
+    // safe; the ownership transfer promised here is what Drop/as_ptr later rely on.
     /// # Safety
     /// `p` must be null, or a live `AVBufferRef` whose ownership passes to the returned value —
     /// nothing else may unref it.

@@ -18,9 +18,6 @@
 //! inode with `punktfunk-host`, because a shared inode shares the file capability — so it passes
 //! its own resolved path to [`spawn_worker`] instead.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::File;

@@ -8,7 +8,7 @@ use jni::objects::JString;
 use jni::sys::{jboolean, jdoubleArray, jintArray, jlong, jsize, jstring};
 use jni::JNIEnv;
 
-use super::{jni_guard, SessionHandle};
+use super::{jni_guard, lock_recover, SessionHandle};
 
 /// `NativeBridge.nativeStartVideo(handle, surface, decoderName, lowLatencyMode, lowLatencyFeature,
 /// isTv, presentPriority, smoothBuffer)` — wrap the SurfaceView's `Surface` as an `ANativeWindow`
@@ -48,7 +48,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         .filter(|s| !s.is_empty());
     // SAFETY: live handle per the nativeConnect/nativeClose contract.
     let h = unsafe { &*(handle as *const SessionHandle) };
-    let mut guard = h.video.lock().unwrap();
+    let mut guard = lock_recover(&h.video);
     if guard.is_some() {
         return; // already streaming
     }
@@ -222,7 +222,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        if h.video.lock().unwrap().is_none() {
+        if lock_recover(&h.video).is_none() {
             return std::ptr::null_mut(); // not streaming → no stats
         }
         let snap = h
@@ -385,7 +385,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract.
     let h = unsafe { &*(handle as *const SessionHandle) };
-    let mut guard = h.audio.lock().unwrap();
+    let mut guard = lock_recover(&h.audio);
     if guard.is_some() {
         return; // already playing
     }
@@ -434,7 +434,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract.
     let h = unsafe { &*(handle as *const SessionHandle) };
-    let mut guard = h.mic.lock().unwrap();
+    let mut guard = lock_recover(&h.mic);
     if let Some(m) = guard.as_ref() {
         return m.session_id(); // already capturing — same stream, same session
     }
@@ -516,7 +516,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
             speaker != 0,
         ) {
             Some(p) => {
-                *h.pad_audio.lock().unwrap() = Some(p);
+                *lock_recover(&h.pad_audio) = Some(p);
                 1
             }
             None => 0,
@@ -629,6 +629,6 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        jboolean::from(h.mic.lock().unwrap().is_some())
+        jboolean::from(lock_recover(&h.mic).is_some())
     })
 }

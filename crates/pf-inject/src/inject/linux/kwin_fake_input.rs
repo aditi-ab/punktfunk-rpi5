@@ -17,8 +17,6 @@
 //! output's logical rectangle — the same shape the libei backend uses with its EI region.
 
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
 use anyhow::{Context, Result};

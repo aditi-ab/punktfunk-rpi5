@@ -37,9 +37,6 @@
 //! it stays behind the same gate and falls back to IDR wherever the driver declines. 4:4:4 stays
 //! `false` until probed on real hardware (design §8.6).
 
-// Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;

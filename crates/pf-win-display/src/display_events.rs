@@ -28,9 +28,6 @@
 //! suspects — without ever touching the CCD lock itself (the display-config lock is exactly what
 //! stalls during churn; the capture thread must never block on it).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::collections::VecDeque;
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Instant;

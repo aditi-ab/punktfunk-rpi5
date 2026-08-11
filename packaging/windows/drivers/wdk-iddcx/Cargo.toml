@@ -12,3 +12,6 @@ publish = false
 
 [dependencies]
 wdk-sys = { workspace = true, features = ["iddcx"] }
+
+[lints]
+workspace = true

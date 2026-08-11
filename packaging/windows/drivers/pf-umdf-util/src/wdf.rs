@@ -29,6 +29,8 @@ pub struct Request(WDFREQUEST);
 impl Request {
     /// Wrap the raw request handed to the current framework callback.
     ///
+    // unsafe-fn-no-op-ok: contract-deferring constructor — the body only wraps the handle; every
+    // later `complete`/`forward` call trusts the framework-liveness promised here.
     /// # Safety
     /// `raw` must be the live, framework-provided `WDFREQUEST` of the callback invocation this is
     /// called from (WDF owns handle validity; a forged/dangling handle is framework UB).

@@ -10,6 +10,10 @@
 //! [`spawn_decline_loop`] — so its control loop compiles unchanged on every host platform; the
 //! platform split lives entirely behind [`start`].
 
+// Unsafe-proof program: every `unsafe` block in any backend carries a `// SAFETY:` proof,
+// enforced workspace-wide by `[workspace.lints]` — a new backend under `host/` is covered on
+// creation.
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 

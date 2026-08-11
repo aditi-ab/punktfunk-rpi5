@@ -25,7 +25,6 @@
 // Every `unsafe` block in this module TREE carries a `// SAFETY:` proof; enforce it (unsafe-proof
 // program). This file itself has none — the FFI lives in the child modules declared at the bottom
 // (`pipewire`, `pw_cursor`, `pw_pods`, `portal`, `xfixes_cursor`), which this inner attribute covers.
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};

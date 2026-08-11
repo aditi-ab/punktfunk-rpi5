@@ -9,7 +9,6 @@
 //! diagnosis. The Rust-panic analogue (a panic hook that tees into `tracing`) lives in `main()`.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::{

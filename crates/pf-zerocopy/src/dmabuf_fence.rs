@@ -14,9 +14,6 @@
 //! wait, no harm, and `WaitOutcome::NoFence` tells us the driver doesn't fence (so zero-copy
 //! would still race).
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 

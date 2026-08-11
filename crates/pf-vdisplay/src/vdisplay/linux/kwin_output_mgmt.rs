@@ -20,8 +20,6 @@
 //! each output's name / enabled / priority / current-mode size, then build a
 //! `kde_output_configuration_v2` and `apply()` it, waiting for `applied` / `failed`.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};

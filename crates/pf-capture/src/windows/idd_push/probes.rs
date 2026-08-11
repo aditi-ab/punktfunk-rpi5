@@ -25,9 +25,6 @@
 //! ([`acquire`]), refcounted across parallel capturers; probes sample at 20 Hz or slower and cost
 //! microseconds each, so the engine is invisible next to a streaming session.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
