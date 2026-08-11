@@ -99,8 +99,42 @@ pub(crate) fn upsert(existing: &str, block: Block<'_>, key: &str, value: &str) -
 /// Read `path`, set `key` in `block`, write it back — and back the original up ONCE, the first time
 /// we touch a file we did not write. Returns `true` when the file changed (the caller restarts the
 /// portal only then).
+///
+/// The read is matched EXPLICITLY, and only [`ErrorKind::NotFound`](std::io::ErrorKind::NotFound)
+/// may mean "empty". This used to be `read_to_string(path).unwrap_or_default()`, which folded every
+/// read failure into an empty string — and an empty string is the one input for which this function
+/// destroys data: `upsert("")` yields a file holding ONLY our block, the backup below is skipped
+/// because there is nothing to back up, and the write replaces the user's config. One non-UTF-8 byte
+/// in a comment (a Latin-1 character, an 8-bit paste) or a transient EIO on an NFS/overlay config
+/// dir was enough, and the result was exactly the silent, permanent loss this module exists to
+/// prevent. A config we cannot read is a config we refuse to rewrite.
 pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) -> Result<bool> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Read BYTES: whether a backup is owed is a question about what is on disk, not about what
+    // decoded — and the decode failure below is itself one of the cases that must not be silent.
+    let raw = match std::fs::read(path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "read {} (refusing to rewrite a portal config we could not read)",
+                    path.display()
+                )
+            })
+        }
+    };
+    let existing = match &raw {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .with_context(|| {
+                format!(
+                    "{} is not UTF-8 — refusing to rewrite it (the one key we own is not worth \
+                     losing the rest of the file for; fix or move the file and reconnect)",
+                    path.display()
+                )
+            })?
+            .to_string(),
+        None => String::new(),
+    };
     let updated = upsert(&existing, block, key, value);
     if updated == existing {
         return Ok(false);
@@ -108,9 +142,9 @@ pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
-    // One-time backup. `create_new` makes this genuinely once: a later edit must not overwrite the
-    // user's ORIGINAL with our own previous output.
-    if !existing.is_empty() {
+    // One-time backup, of the bytes we actually read. `create_new` makes this genuinely once: a
+    // later edit must not overwrite the user's ORIGINAL with our own previous output.
+    if let Some(bytes) = raw.as_deref().filter(|b| !b.is_empty()) {
         let backup = path.with_extension("punktfunk-backup");
         match std::fs::OpenOptions::new()
             .write(true)
@@ -119,7 +153,7 @@ pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) 
         {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = f.write_all(existing.as_bytes());
+                let _ = f.write_all(bytes);
                 tracing::info!(
                     backup = %backup.display(),
                     "backed up the existing portal config before editing it"
@@ -133,8 +167,47 @@ pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) 
             ),
         }
     }
-    std::fs::write(path, &updated).with_context(|| format!("write {}", path.display()))?;
+    write_atomic(path, updated.as_bytes())?;
     Ok(true)
+}
+
+/// Replace `path`'s contents with `bytes` **atomically**: fill a temp file beside it, then rename
+/// over it. `fs::write` truncates first and fills afterwards, so a crash, a full disk or a killed
+/// host between the two leaves the user's config truncated — the same loss this module exists to
+/// prevent, arrived at from the other side. The temp file goes in the SAME directory because a
+/// rename is only atomic within one filesystem, and it inherits the original's permission bits so
+/// an operator's 0600 config does not come back at the umask default.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    // Per-process name: two hosts editing the same config must not fill one another's temp file.
+    let tmp = dir.join(format!(".{stem}.punktfunk-{}.tmp", std::process::id()));
+    let write = || -> Result<()> {
+        {
+            let mut f =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(bytes)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            // The rename must not publish a name whose contents are still in the page cache only.
+            f.sync_all()
+                .with_context(|| format!("sync {}", tmp.display()))?;
+        } // closed before the rename — Windows is far happier renaming a file nobody holds open.
+        if let Ok(md) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&tmp, md.permissions());
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    };
+    let r = write();
+    if r.is_err() {
+        // Never leave a half-written dotfile beside the user's config.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 #[cfg(test)]
@@ -235,5 +308,168 @@ mod tests {
             upsert("", Block::Ini("screencast"), "k", "v"),
             "[screencast]\nk=v\n"
         );
+    }
+}
+
+/// [`ensure_key`] itself — the half that touches the user's disk.
+///
+/// The merge above was pinned by seven cases while the I/O wrapper around it, which is where the
+/// destructive behaviour lives (the read, the once-only backup, the replacing write), had none. That
+/// is backwards: `upsert` can at worst return a wrong string, `ensure_key` can delete a config.
+/// Filesystem-only — no compositor, no portal — so these run on every platform, like the merge tests.
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    /// A scratch directory removed on drop. `tempfile` is deliberately not a dependency of this
+    /// crate; the temp-dir + pid + counter convention is the one `proc.rs`'s fixtures already use.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("pf-vd-portalcfg-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn backup_of(p: &Path) -> std::path::PathBuf {
+        p.with_extension("punktfunk-backup")
+    }
+
+    /// The data-loss case. A config that cannot be decoded must be left EXACTLY as it is: the old
+    /// `unwrap_or_default()` turned it into an empty string, wrote a file holding only our block,
+    /// skipped the backup (nothing to back up, as far as it could tell) and returned `Ok(true)`.
+    #[test]
+    fn a_non_utf8_config_is_refused_not_replaced() {
+        let s = Scratch::new("nonutf8");
+        let p = s.path("config");
+        // A Latin-1 'ÿ' in a comment — the whole file is otherwise perfectly ordinary.
+        let raw: &[u8] = b"[screencast]\n# r\xffgler\nchooser_type=simple\noutput_name=DP-1\n";
+        std::fs::write(&p, raw).expect("seed");
+        let err = ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x")
+            .expect_err("an unreadable config must not be rewritten");
+        assert!(
+            format!("{err:#}").contains("not UTF-8"),
+            "the error must name the real cause: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&p).expect("still there"),
+            raw,
+            "byte-identical"
+        );
+        assert!(
+            !backup_of(&p).exists(),
+            "nothing was edited, so nothing is owed a backup"
+        );
+    }
+
+    /// The ordinary first-connect path: no file yet, so one is created — and there is no original
+    /// to preserve, so no backup is left lying beside it.
+    #[test]
+    fn a_missing_file_is_created_without_a_backup() {
+        let s = Scratch::new("missing");
+        let p = s.path("nested").join("config");
+        assert!(ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("write"));
+        assert_eq!(
+            std::fs::read_to_string(&p).expect("created"),
+            "[screencast]\nchooser_cmd=cat x\n"
+        );
+        assert!(!backup_of(&p).exists());
+    }
+
+    /// `create_new` is what makes the backup once-only, and this is the invariant it buys: after a
+    /// second edit (a new `$XDG_RUNTIME_DIR`, so a new value) the backup must still hold the user's
+    /// PRISTINE file — not our own previous output.
+    #[test]
+    fn the_backup_holds_the_original_across_two_edits() {
+        let s = Scratch::new("backup");
+        let p = s.path("config");
+        let pristine = "[screencast]\nchooser_type=simple\noutput_name=DP-1\n";
+        std::fs::write(&p, pristine).expect("seed");
+        assert!(
+            ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat /run/a").expect("1st")
+        );
+        assert!(
+            ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat /run/b").expect("2nd")
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_of(&p)).expect("backup"),
+            pristine
+        );
+        let now = std::fs::read_to_string(&p).expect("edited");
+        assert!(
+            now.contains("chooser_cmd=cat /run/b"),
+            "the second value won"
+        );
+        assert!(
+            now.contains("output_name=DP-1"),
+            "the user's other keys survived"
+        );
+    }
+
+    /// Idempotence at the I/O level: an already-correct file is not rewritten and reports `false`,
+    /// because the caller RESTARTS the portal on `true` — a spurious `true` restarts xdpw/xdph on
+    /// every connect.
+    #[test]
+    fn an_unchanged_file_returns_false_and_does_not_rewrite() {
+        let s = Scratch::new("unchanged");
+        let p = s.path("config");
+        assert!(ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("1st"));
+        let after_first = std::fs::read_to_string(&p).expect("written");
+        let mtime = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert!(
+            !ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("2nd"),
+            "an unchanged config must report no change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).expect("still there"),
+            after_first
+        );
+        assert_eq!(
+            std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+            mtime,
+            "the file must not have been touched at all"
+        );
+    }
+
+    /// The write publishes the WHOLE new file or nothing (temp + rename), and it leaves no debris
+    /// beside the config — a stray dotfile in `~/.config/hypr` is the kind of thing that outlives
+    /// several releases.
+    #[test]
+    fn the_write_is_atomic_and_leaves_no_temp_behind() {
+        let s = Scratch::new("atomic");
+        let p = s.path("config");
+        std::fs::write(&p, "[other]\nkeep=me\n").expect("seed");
+        assert!(ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("write"));
+        let names: Vec<String> = std::fs::read_dir(&s.0)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".tmp")),
+            "temp file left behind: {names:?}"
+        );
+        assert!(std::fs::read_to_string(&p)
+            .expect("edited")
+            .contains("keep=me"));
     }
 }
