@@ -71,6 +71,7 @@ fn xbox_games() -> Vec<GameEntry> {
             games.push(GameEntry {
                 provider: None,
                 role: GameRole::Game,
+                icon: None,
                 meta: GameMeta::pc(),
                 id,
                 store: "xbox".into(),

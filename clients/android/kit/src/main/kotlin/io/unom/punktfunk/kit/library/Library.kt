@@ -44,6 +44,9 @@ data class Artwork(val portrait: String?, val header: String?, val hero: String?
  * opens the launcher itself (Steam Big Picture, Heroic) rather than a title. Kept a plain nullable
  * String on purpose: the host owns the vocabulary, and an unknown future value must degrade to a
  * game rather than break the decode (design D4).
+ *
+ * [icon] is the token for the entry's brand mark (`"steam"`, `"heroic"`) — never art, never a URL.
+ * Null on every older host and on every ordinary title.
  */
 data class GameEntry(
     val id: String,
@@ -51,11 +54,24 @@ data class GameEntry(
     val title: String,
     val art: Artwork,
     val role: String? = null,
+    val icon: String? = null,
 ) {
     val isCustom: Boolean get() = store == "custom"
 
     /** Whether this entry opens a launcher rather than a game. */
     val isLauncher: Boolean get() = role == "launcher"
+
+    /**
+     * The brand-icon token, re-validated rather than taken on trust.
+     *
+     * The host checks the shape on the way in, so this only fires for a host older than that
+     * check or one that isn't ours. It costs a scan of a short string and means no consumer has
+     * to wonder what it is about to look up.
+     */
+    val iconToken: String? get() = icon?.takeIf { t ->
+        t.isNotEmpty() && t.length <= 32 && t[0] in 'a'..'z' &&
+            t.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
+    }
 
     /**
      * Display name for the store badge — the same table the other clients use
@@ -151,6 +167,7 @@ object LibraryClient {
                         hero = resolveArt(str(art, "hero"), base),
                     ),
                     role = str(o, "role"),
+                    icon = str(o, "icon"),
                 ),
             )
         }

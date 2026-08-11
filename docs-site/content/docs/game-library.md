@@ -109,6 +109,11 @@ key, the answer is cached on the host, and a lookup that fails just leaves a tit
 A [plugin](/docs/plugins) can own a slice of the library and keep it in sync — this is how the ROM
 Manager and Playnite plugins get your collection into the grid, box art and all.
 
+A library plugin can also publish a **launcher tile** — an entry that opens Steam Big Picture,
+Heroic, Lutris or Playnite itself rather than a game, so you can install or fix something from the
+couch. Clients group those into their own row above your titles, and each one draws its launcher's
+logo. A launcher tile you don't want is a switch in that plugin's settings.
+
 Entries a plugin owns are read-only to you. The host refuses a hand edit or a delete of one, because
 the next sync would overwrite it anyway — change the title at its source and let the plugin sync
 again. Only the plugin can remove its own entries, and it removes every one of them at once. Your

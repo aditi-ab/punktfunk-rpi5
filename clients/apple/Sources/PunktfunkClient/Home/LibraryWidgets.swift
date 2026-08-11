@@ -71,6 +71,9 @@ struct PosterImage: View {
     let candidates: [URL]
     let title: String
     let loader: LibraryArtLoader?
+    /// The entry's brand-mark token (`GameEntry.iconToken`), when it has one. A launcher tile ships
+    /// no cover art by design, so for those the mark IS the poster — see `placeholder`.
+    var icon: String?
     /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
     /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
     /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
@@ -121,11 +124,26 @@ struct PosterImage: View {
     private var placeholder: some View {
         ZStack {
             Rectangle().fill(.quaternary)
-            Text(title)
-                .font(.geist(17, .semibold, relativeTo: .headline))
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .padding(8)
+            // A launcher's brand mark, drawn at poster size and tinted like the text it replaces.
+            // `scaledToFit` inside a fraction of the card keeps a non-square master (the Steam mark
+            // is 496×512, Playnite's 1024×1024) in its own aspect ratio rather than stretched.
+            // Falling back to the title is the pre-icon design, so an unshipped mark loses nothing.
+            if let mark = launcherIconImage(for: icon) {
+                GeometryReader { geo in
+                    mark
+                        .resizable()
+                        .scaledToFit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: geo.size.width * 0.44, height: geo.size.height * 0.44)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+            } else {
+                Text(title)
+                    .font(.geist(17, .semibold, relativeTo: .headline))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .padding(8)
+            }
         }
     }
 }

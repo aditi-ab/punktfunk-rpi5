@@ -43,6 +43,10 @@ pub(crate) struct Game {
     /// design D4. Reduced from the wire's `role` by `GameEntry::is_launcher`, so "anything that
     /// isn't `launcher` is a game" is decided in one place for every client.
     pub(crate) launcher: bool,
+    /// The `file:///` URI of this entry's brand mark, already resolved by
+    /// [`super::launcher_icons::uri`] — `None` when the entry names no mark or one we don't ship.
+    /// Resolved at decode time rather than per render: the shelf re-renders on every art arrival.
+    pub(crate) icon_uri: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -140,6 +144,7 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
                         title: g.title.clone(),
                         store: g.store.clone(),
                         launcher: g.is_launcher(),
+                        icon_uri: super::launcher_icons::uri(g.icon_token()),
                     })
                     .collect(),
             );
@@ -245,23 +250,38 @@ fn poster_tile(
             .height(poster_h)
             .into(),
         // A launcher rarely has poster art, and an art-less launcher drawn like an art-less game
-        // reads as "a game whose cover failed to load". So it names its launcher instead of
-        // showing a title monogram, and the frame below picks up the accent stroke.
-        None => border(
-            text_block(if game.launcher {
-                store_label(&game.store).to_string()
-            } else {
-                initials(&game.title)
-            })
-            .font_size(if game.launcher { 18.0 } else { 28.0 })
-            .semibold()
-            .foreground(ThemeRef::SecondaryText)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center),
-        )
-        .background(ThemeRef::SubtleFill)
-        .height(poster_h)
-        .into(),
+        // reads as "a game whose cover failed to load". Its brand mark, when we ship one, IS the
+        // poster; failing that it names its launcher. Either way the frame below picks up the
+        // accent stroke.
+        //
+        // `Uniform`, not `UniformToFill`: the marks keep their masters' aspect ratios (Steam is
+        // 496x512, Playnite 1024x1024), and filling a 2:3 frame would crop them to a strip — the
+        // very thing that kept launcher tiles art-less in the first place.
+        None => match game.icon_uri.as_deref() {
+            Some(uri) => border(
+                Image::new_with_uri(uri)
+                    .stretch(Stretch::Uniform)
+                    .margin(uniform(poster_h * 0.28)),
+            )
+            .background(ThemeRef::SubtleFill)
+            .height(poster_h)
+            .into(),
+            None => border(
+                text_block(if game.launcher {
+                    store_label(&game.store).to_string()
+                } else {
+                    initials(&game.title)
+                })
+                .font_size(if game.launcher { 18.0 } else { 28.0 })
+                .semibold()
+                .foreground(ThemeRef::SecondaryText)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center),
+            )
+            .background(ThemeRef::SubtleFill)
+            .height(poster_h)
+            .into(),
+        },
     };
     let framed = border(grid(vec![
         poster,
