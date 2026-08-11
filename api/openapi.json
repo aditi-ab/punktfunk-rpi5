@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.26.0"
+    "version": "0.27.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -4788,7 +4788,7 @@
           "version": {
             "type": "integer",
             "format": "int32",
-            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject.",
+            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject. Read\nat load time ([`DisplayPolicyStore::load_from`] warns when a file claims a version this host\ndoes not know, then reads it best-effort) and pinned back to the current version on write.",
             "minimum": 0
           }
         }
@@ -4857,7 +4857,7 @@
       },
       "EffectivePolicy": {
         "type": "object",
-        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the Stage-0 call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].",
+        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the policy call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].\n\n**Every field is required on the wire, deliberately.** Unlike [`DisplayPolicy`] — which is only\never a *file* — this shape is also the `fields` member of [`CustomPresetInput`], i.e. the request\nbody of `POST /display/presets` and `PUT /display/presets/{id}`, and a *response* member three\ntimes over (`DisplaySettingsState.effective`, `PresetInfo.fields`, `CustomPreset.fields`).\n`#[serde(default)]` here would (a) turn `{\"name\":\"Kiosk\",\"fields\":{}}` — or any camelCase typo —\nfrom a serde rejection into a 201 storing a preset that expands to six axes nobody chose, and\n(b) make all six OPTIONAL in the generated OpenAPI schema, so every codegen'd client has to\nnull-check them. The *persisted* catalog's tolerance for an entry written before an axis existed\nis bought where it belongs, on the read path only: see [`StoredEffectivePolicy`].",
         "required": [
           "keep_alive",
           "topology",
@@ -5915,7 +5915,7 @@
       },
       "Identity": {
         "type": "string",
-        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). Stored\nat Stage 0; carriers wired from the identity stage.",
+        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). The\nslot this resolves to is carried per backend: the Windows EDID serial + IddCx connector index,\nKWin's per-slot output name, and the host-persisted Mutter scale map.",
         "enum": [
           "shared",
           "per-client",
@@ -6132,14 +6132,14 @@
               "seconds": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Linger window in seconds.",
+                "description": "Linger window in seconds, clamped to `0..=86400` on write (see\n[`DisplayPolicy::sanitized`]): a window longer than a day is `forever` by any honest\nreading, and `u32` seconds is ~136 years — a deadline the reaper would never reach and a\nnonsense `expires_in_ms` in `/display/state`.",
                 "minimum": 0
               }
             }
           },
           {
             "type": "object",
-            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\n**Not honored until the display-lifecycle stage** — rejected by the mgmt PUT at Stage 0.",
+            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\nHonored end-to-end: the registry resolves it to `Release::Pin`, so the display survives every\ndisconnect — free it with `POST /display/release` (which force-releases `Pinned` exactly like\na `Lingering` display). This is what the `gaming-rig` preset selects.",
             "required": [
               "mode"
             ],
@@ -6183,6 +6183,7 @@
           },
           "positions": {
             "type": "object",
+            "description": "Keys are the **canonical decimal** identity-slot id (`\"1\"`..`\"15\"`) — the exact string\n`arrange` looks a member up by. [`DisplayPolicy::sanitized`] re-canonicalizes them on write\n(`\"01\"` → `\"1\"`) and drops anything that is not a slot id, because a key that never matches is\na pin the operator can see in the console and in `GET /display/settings` while every session\nsilently auto-rows past it.",
             "additionalProperties": {
               "$ref": "#/components/schemas/Position"
             },
@@ -6194,7 +6195,7 @@
       },
       "LayoutMode": {
         "type": "string",
-        "description": "How group members are arranged in the desktop coordinate space. Stored at Stage 0; applied from\nthe multi-monitor stage.",
+        "description": "How group members are arranged in the desktop coordinate space, resolved by `layout::arrange` —\nwhich both the `/display/state` readout and (on Linux, KWin only) the per-backend position apply\nconsume, so the answer is computed in exactly one place.",
         "enum": [
           "auto-row",
           "manual"
@@ -6354,7 +6355,7 @@
       },
       "ModeConflict": {
         "type": "string",
-        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Stored at Stage 0; enforced from the mode-conflict admission stage.",
+        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Enforced by [`super::admission`] before the Welcome is sent, so a `reject` is a\nclean handshake error rather than a half-built session.",
         "enum": [
           "separate",
           "steal",
