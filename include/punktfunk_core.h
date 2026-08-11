@@ -2259,8 +2259,10 @@ PunktfunkStatus punktfunk_client_poll_frame(PunktfunkSession *s, PunktfunkFrame 
 
 // Client: serialize and send one input event to the host.
 //
+// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+//
 // # Safety
-// `s` is a valid client handle; `ev` points to a valid [`InputEvent`].
+// `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
 PunktfunkStatus punktfunk_send_input(PunktfunkSession *s, const PunktfunkInputEvent *ev);
 
 // Register the host-side input callback (pass a NULL fn pointer to clear). The callback
@@ -3024,8 +3026,10 @@ PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint3
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 //
+// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+//
 // # Safety
-// `c` is a valid connection handle; `ev` points to a valid [`InputEvent`].
+// `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
 PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
                                                 const PunktfunkInputEvent *ev);
 #endif
