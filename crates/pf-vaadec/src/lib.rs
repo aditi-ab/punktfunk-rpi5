@@ -78,6 +78,13 @@
 //! a `VASurfaceID` rather than an index — so the conversion will take that table as
 //! a parameter and stay pure.
 
+// The header above states the crate's whole design constraint: it is the CPU-testable half, it
+// links no libva, and it compiles on macOS — "which is the point". That constraint is exactly
+// what `forbid(unsafe_code)` encodes. The crate is full of hand-declared libva `repr(C)` mirrors,
+// and the moment one of them gets dereferenced through a raw pointer here, the crate has quietly
+// become the other half and stops being testable off a Linux box with a GPU.
+#![forbid(unsafe_code)]
+
 pub mod config;
 pub mod drm;
 pub mod pic;

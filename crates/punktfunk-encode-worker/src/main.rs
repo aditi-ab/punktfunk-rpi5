@@ -5,6 +5,14 @@
 //! Everything it does lives in [`pf_encode::worker`]; this file exists so the capability has a
 //! **file of its own** (see this crate's Cargo.toml for why that is not negotiable).
 
+// This binary is the one that carries a CAPABILITY (`cap_sys_nice`), and the header above makes
+// a minimal-attack-surface claim: no Wayland, no D-Bus, no network, no plugins. `forbid` makes
+// the memory-safety half of that claim mechanical rather than aspirational — a capability-
+// carrying process is the last place a raw pointer should appear, and `forbid` (unlike `deny`)
+// cannot be re-opened by an `#[allow]` further down. The heavy lifting lives in
+// `pf_encode::worker`, which is a separate crate and keeps its own discipline.
+#![forbid(unsafe_code)]
+
 fn main() -> std::process::ExitCode {
     // Stderr, inherited from the host, so the worker's lines land in the host's journal next to
     // the session that spawned it. `RUST_LOG` is inherited too, so raising the host's level
