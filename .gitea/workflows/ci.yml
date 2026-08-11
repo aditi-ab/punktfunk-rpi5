@@ -114,6 +114,21 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # WP19 (rust-safety): the hardened NATIVE-ONLY host — no Moonlight-compat planes, no
+      # `rusty_enet` (transpiled C ENet), no `rsa`. Kept compiling here so the cfg boundary can't
+      # rot, and the dependency claim is ASSERTED, not assumed: `cargo tree -i` must find neither
+      # crate in the native-only graph (it exits non-zero with "nothing depends on" — inverted).
+      - name: Clippy + tree (native-only host, no gamestream feature)
+        run: |
+          cargo clippy -p punktfunk-host --no-default-features --features pyrowave \
+            --all-targets --locked -- -D warnings
+          if cargo tree -p punktfunk-host --no-default-features --features pyrowave \
+            --locked -i rusty_enet 2>/dev/null | grep -q rusty_enet; then
+            echo "native-only build still depends on rusty_enet"; exit 1; fi
+          if cargo tree -p punktfunk-host --no-default-features --features pyrowave \
+            --locked -i rsa 2>/dev/null | grep -q "^rsa"; then
+            echo "native-only build still depends on rsa"; exit 1; fi
+
       - name: Build
         run: cargo build --workspace --locked
 

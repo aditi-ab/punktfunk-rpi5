@@ -1,12 +1,20 @@
-//! The backend-specific virtual-display **seam** (SudoVDA vs pf-vdisplay), carved out of the manager
-//! (plan §W3): the REMOVE-key type, the `add_monitor` reply, and the IOCTL trait. This is the ONLY
-//! thing that differs between the two Windows backends — the refcount machine, linger, pinger, and
-//! CCD/GDI glue are all backend-neutral in [`super::VirtualDisplayManager`].
+//! The virtual-display driver **seam**, carved out of the manager (plan §W3): the REMOVE-key type,
+//! the `add_monitor` reply, and the IOCTL trait. It isolates the DRIVER's wire protocol from the
+//! lifecycle — the refcount machine, linger, pinger and CCD/GDI glue are all driver-neutral in
+//! [`super::VirtualDisplayManager`]. It was born as a two-backend seam (SudoVDA vs pf-vdisplay) and
+//! has exactly one implementor since SudoVDA was removed: `crate::driver::PfVdisplayDriver` (the
+//! flattened module name of `vdisplay/windows/pf_vdisplay.rs`). Kept as a trait because it is also
+//! the only place the IOCTL surface can be faked, not because a second backend is expected.
 
 use super::*;
 
-/// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
-/// a fresh `GUID`; pf-vdisplay keys them by a monotonic `u64` session id.
+/// The per-driver REMOVE key stamped on ADD and consumed on REMOVE. pf-vdisplay keys monitors by a
+/// monotonic `u64` session id.
+///
+/// `Guid` is a RETAINED, UNUSED variant: it keyed SudoVDA's monitors (a fresh `GUID` per monitor) and
+/// nothing constructs it since that backend was removed — the `else` arms in `pf_vdisplay`'s
+/// `update_modes`/`remove_monitor` that reject it are therefore dead today. Left in place so the
+/// enum still documents that the key is a per-driver choice rather than a `u64` by nature.
 #[derive(Clone, Copy)]
 pub(crate) enum MonitorKey {
     Guid(windows::core::GUID),
@@ -29,10 +37,10 @@ pub(crate) struct AddedMonitor {
     pub cursor_excluded: bool,
 }
 
-/// The backend-specific IOCTL surface — the *only* thing that differs between SudoVDA and pf-vdisplay.
-/// Everything else (the refcount machine, the linger, the pinger, the CCD/GDI glue) is shared in
-/// [`VirtualDisplayManager`]. `Send + Sync` because the manager (and so the boxed driver) is a
-/// `&'static` singleton reached from the pinger + linger threads.
+/// The driver's IOCTL surface — everything else (the refcount machine, the linger, the pinger, the
+/// CCD/GDI glue) is driver-neutral and shared in [`VirtualDisplayManager`]. `Send + Sync` because the
+/// manager (and so the boxed driver) is a `&'static` singleton reached from the pinger + linger
+/// threads.
 pub(crate) trait VdisplayDriver: Send + Sync {
     fn name(&self) -> &'static str;
     /// Find + open the control device, validate it (version handshake), and read the watchdog
@@ -42,9 +50,14 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// owned handle + watchdog seconds + the driver's reported protocol version (the in-place
     /// resize gates on it).
     ///
-    /// # Safety
-    /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)>;
+    /// SAFE, and owning — unlike every other method here, which takes the raw `dev` handle. It has
+    /// no caller obligation: it takes only a `bool`, opens the handle it then IOCTLs, and hands back
+    /// an `OwnedHandle` that closes on drop. It used to be an `unsafe fn` whose `# Safety` section
+    /// ("issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment") restated what
+    /// the body does rather than naming anything a caller could uphold — an un-checkable proof
+    /// obligation at the one call site, which trains a reviewer to wave through the neighbouring
+    /// blocks where the `dev` precondition is real.
+    fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)>;
     /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
     /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). `client_hdr`
     /// is the CLIENT display's HDR volume for the monitor's EDID CTA HDR block (`None` = the
@@ -84,4 +97,63 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// # Safety
     /// `dev` must be the live control handle.
     unsafe fn ping(&self, dev: HANDLE) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A driver that implements nothing but the required methods — so the DEFAULTED `update_modes`
+    /// is what gets called.
+    struct FakeDriver;
+
+    impl VdisplayDriver for FakeDriver {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn open(&self, _reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
+            anyhow::bail!("fake driver has no control device")
+        }
+        unsafe fn add_monitor(
+            &self,
+            _dev: HANDLE,
+            _mode: Mode,
+            _render_luid: Option<LUID>,
+            _preferred_monitor_id: u32,
+            _client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+            _hw_cursor: bool,
+        ) -> Result<AddedMonitor> {
+            anyhow::bail!("fake driver adds no monitors")
+        }
+        unsafe fn remove_monitor(&self, _dev: HANDLE, _key: &MonitorKey) -> Result<()> {
+            Ok(())
+        }
+        unsafe fn ping(&self, _dev: HANDLE) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The `update_modes` default must ERR, not silently succeed: `resize_in_place` treats `Ok(())`
+    /// as "the driver refreshed the monitor's advertised mode list" and goes straight on to the CCD
+    /// force-set + settle — so a default that returned `Ok` would burn the full 1.5 s settle against
+    /// a mode list nobody updated, on every mid-stream resize, before falling back to the
+    /// re-arrival it should have taken immediately.
+    #[test]
+    fn the_defaulted_update_modes_reports_not_supported() {
+        let d = FakeDriver;
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        // SAFETY: the defaulted `update_modes` discharges its `dev` obligation by never using it —
+        // the body discards all three arguments and errs — so the null handle is never touched.
+        let err = unsafe { d.update_modes(HANDLE::default(), &MonitorKey::Session(1), mode) }
+            .expect_err("the default must not report success");
+        assert!(
+            err.to_string()
+                .contains("does not support in-place mode updates"),
+            "unexpected error text: {err:#}"
+        );
+    }
 }

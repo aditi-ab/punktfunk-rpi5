@@ -67,7 +67,11 @@ mac_address = "1"
 if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
-rsa = "0.9"
+# GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
+# pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
+# The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
+# native-only build also sheds the accepted Marvin advisory (RUSTSEC-2023-0071, .cargo/audit.toml).
+rsa = { version = "0.9", optional = true }
 sha2 = { version = "0.10", features = ["oid"] }
 aes = "0.8"
 aes-gcm = "0.10"
@@ -105,7 +109,13 @@ futures-util = "0.3"
 # Webhook signing (X-Punktfunk-Signature: sha256=<hex HMAC>) for operator hooks; pairs with
 # the existing sha2. Already in the lockfile transitively.
 hmac = "0.12"
-rusty_enet = "0.4"
+# GameStream control-stream ENet — a c2rust-style transpile of C ENet (158 unsafe sites; raw
+# pointer arithmetic, manual allocation). Its port binds only while a pairing exists (rust-safety
+# WP0, gamestream/control.rs) and the whole crate exists only behind the `gamestream` feature
+# (WP19) — a native-only build contains no transpiled C ENet at all. Pinned EXACTLY so a bump is
+# a deliberate, reviewed act rather than a lockfile refresh, and left to the cargo-audit job
+# (audit.yml) to flag advisories against it.
+rusty_enet = { version = "=0.4.0", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Management/control-plane REST API + OpenAPI (control pane, M2). `axum_extras` wires
@@ -303,7 +313,14 @@ bytemuck = { version = "1.19", features = ["derive"] }
 [features]
 # PyroWave ships in every default build (the codec stays strictly opt-in per session — a client
 # must explicitly prefer CODEC_PYROWAVE; nothing changes for normal HEVC/AV1 sessions).
-default = ["pyrowave"]
+# GameStream ships in every default build too (still runtime-OPT-IN via --gamestream /
+# PUNKTFUNK_GAMESTREAM); building with `--no-default-features --features pyrowave` produces the
+# hardened NATIVE-ONLY host — no Moonlight-compat planes, no `rusty_enet` (transpiled C), no
+# `rsa` (rust-safety WP19). `serve --gamestream` on such a binary refuses to start, loudly.
+default = ["pyrowave", "gamestream"]
+# The GameStream/Moonlight-compat planes (nvhttp pairing, RTSP, ENet control, `_nvstream` mDNS)
+# at COMPILE time — see the `default` note above for what leaving it off buys.
+gamestream = ["dep:rusty_enet", "dep:rsa"]
 # NVENC hardware encode (Linux CUDA + Windows D3D11). OFF by default; entry points resolved at
 # RUNTIME from the driver DLL/so, so the same binary starts fine on AMD/Intel boxes. Build the GPU
 # host with `--features nvenc`.

@@ -6,24 +6,45 @@
 //! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
 //! the media streams follow (see the GameStream host task list / plan).
 
+// The Moonlight-protocol modules exist only behind the `gamestream` cargo feature (rust-safety
+// WP19): a native-only build (`--no-default-features --features pyrowave`) contains none of this
+// code — and none of its dependencies (`rusty_enet`, `rsa`). What stays unconditional in this
+// module is the shared vocabulary history parked here: `AppState`, `Host`, the port/version
+// constants, the paired-list persistence, `serve` itself, and `tls` (the mgmt API's TLS lives
+// there; only its Moonlight-client-cert leniency is feature-gated).
+#[cfg(feature = "gamestream")]
 pub mod apps;
 // Platform-neutral wire/negotiation logic + the Linux capture/encode pipeline (non-Linux
 // builds get a stub `start` inside the module).
+#[cfg(feature = "gamestream")]
 mod audio;
+#[cfg(feature = "gamestream")]
 pub(crate) mod cert;
+#[cfg(feature = "gamestream")]
 mod control;
+#[cfg(feature = "gamestream")]
 mod crypto;
+#[cfg(feature = "gamestream")]
 pub mod gamepad;
+#[cfg(feature = "gamestream")]
 mod input;
+#[cfg(feature = "gamestream")]
 mod mdns;
+#[cfg(feature = "gamestream")]
 mod nvhttp;
+#[cfg(feature = "gamestream")]
 mod pairing;
 /// Moonlight `SS_PEN`/`SS_TOUCH` → the native pen model / wire touch (design/pen-tablet-input.md §4).
+#[cfg(feature = "gamestream")]
 mod pen;
+#[cfg(feature = "gamestream")]
 mod rtsp;
+#[cfg(feature = "gamestream")]
 mod serverinfo;
+#[cfg(feature = "gamestream")]
 mod stream;
 pub(crate) mod tls;
+#[cfg(feature = "gamestream")]
 mod video;
 
 use anyhow::{Context, Result};
@@ -170,16 +191,28 @@ pub struct LaunchSession {
 /// Shared control-plane state used as the axum app state.
 pub struct AppState {
     pub host: Host,
+    /// The GameStream (RSA-2048) identity — Moonlight pins it, its pairing hashes bind its X.509
+    /// signature bytes. The native planes present `crate::identity` instead (the identity split).
+    #[cfg(feature = "gamestream")]
     pub identity: cert::ServerIdentity,
+    #[cfg(feature = "gamestream")]
     pub pairing: pairing::Pairing,
-    /// Pinned (paired) client certificate DERs — the post-pair allow-list.
+    /// Pinned (paired) client certificate DERs — the post-pair allow-list. Unconditional on
+    /// purpose: the mgmt list/unpair endpoints stay in every build (a native-only host can still
+    /// list + revoke pairings made by a GameStream-featured build sharing the config dir).
     pub paired: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// The ENet control port's lifecycle gate (rust-safety WP0): 47999 is bound only while
+    /// `paired` is non-empty — see [`control::sync`] / [`sync_control`].
+    #[cfg(feature = "gamestream")]
+    pub(crate) control_gate: control::Gate,
     /// The active launch session (set by `/launch`, consumed by RTSP/media).
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
     /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
+    #[cfg(feature = "gamestream")]
     pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
     /// Negotiated audio parameters from RTSP ANNOUNCE (channels/quality/packet duration);
     /// defaults to stereo when a client never ANNOUNCEs them.
+    #[cfg(feature = "gamestream")]
     pub audio_params: std::sync::Mutex<audio::AudioParams>,
     /// True while the video stream thread is running (also its keep-running flag).
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -207,6 +240,7 @@ pub struct AppState {
     /// it was opened with the HDR (10-bit PQ) offer — a stream whose negotiated `hdr` differs
     /// drops the pooled capturer and opens a fresh screencast session at the right depth
     /// (mirroring the audio capturer's channel-count reuse gate).
+    #[cfg(feature = "gamestream")]
     pub video_cap: stream::CapturerSlot,
     /// Persistent audio capturer, reused across streams when the channel count still matches
     /// (avoids a PipeWire stream setup per reconnect); drained on reuse so no stale audio is
@@ -245,6 +279,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .is_some();
+        #[cfg(feature = "gamestream")]
         self.stream.lock().unwrap_or_else(|e| e.into_inner()).take();
         if was_streaming || was_audio || had_launch {
             tracing::info!(
@@ -271,7 +306,9 @@ impl AppState {
 
     /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
     /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
-    /// mgmt API and the streaming loops.
+    /// mgmt API and the streaming loops. (The native-only build's variant is below — same state
+    /// minus the Moonlight identity/pairing machinery.)
+    #[cfg(feature = "gamestream")]
     pub fn new(
         host: Host,
         identity: cert::ServerIdentity,
@@ -282,6 +319,7 @@ impl AppState {
             identity,
             pairing: pairing::Pairing::new(),
             paired: std::sync::Mutex::new(load_paired()),
+            control_gate: control::Gate::new(),
             launch: std::sync::Mutex::new(None),
             stream: std::sync::Mutex::new(None),
             audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
@@ -295,6 +333,41 @@ impl AppState {
             stats,
         }
     }
+
+    /// The native-only build's [`AppState::new`]: identical control-plane state minus the
+    /// Moonlight machinery (identity/pairing/control-gate and the RTSP-negotiated stream slots),
+    /// which does not exist in this build.
+    #[cfg(not(feature = "gamestream"))]
+    pub fn new(host: Host, stats: Arc<crate::stats_recorder::StatsRecorder>) -> AppState {
+        AppState {
+            host,
+            paired: std::sync::Mutex::new(load_paired()),
+            launch: std::sync::Mutex::new(None),
+            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            quit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stats,
+        }
+    }
+}
+
+/// Reconcile the ENet control port to the paired-client list — bound iff at least one pairing
+/// exists (rust-safety WP0; see [`control::sync`]). A crate-visible wrapper so callers outside
+/// `gamestream` (the management API's unpair) can reach it past the private `control` module.
+/// A no-op unless `serve` armed the gate (`--gamestream`).
+#[cfg(feature = "gamestream")]
+pub(crate) fn sync_control(state: &Arc<AppState>) -> Result<()> {
+    control::sync(state)
+}
+
+/// Native-only build: there is no ENet control port to reconcile — the callers (the mgmt unpair)
+/// stay uniform and this is the whole implementation.
+#[cfg(not(feature = "gamestream"))]
+pub(crate) fn sync_control(_state: &Arc<AppState>) -> Result<()> {
+    Ok(())
 }
 
 /// Run the host (blocks): mDNS, the nvhttp servers, and the management REST API.
@@ -312,18 +385,38 @@ pub fn serve(
     native: crate::native::NativeServe,
     gamestream: bool,
 ) -> Result<()> {
+    // WP19: `serve --gamestream` / PUNKTFUNK_GAMESTREAM=1 against a native-only binary is an
+    // explicit ask this build cannot honor — refuse loudly rather than quietly serve less than
+    // the operator configured.
+    #[cfg(not(feature = "gamestream"))]
+    if gamestream {
+        anyhow::bail!(
+            "this punktfunk-host was built WITHOUT the 'gamestream' feature — stock-Moonlight \
+             compat is unavailable in this binary. Remove --gamestream / PUNKTFUNK_GAMESTREAM \
+             from the configuration, or install a standard (GameStream-featured) build."
+        );
+    }
     let host = Host::detect()?;
-    let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
     // The shared streaming-stats recorder: one handle for the mgmt API, the GameStream encode loop
     // (via `AppState`), and the native punktfunk/1 loops (passed to `native::serve`).
     let stats = crate::stats_recorder::StatsRecorder::new(crate::stats_recorder::default_dir());
-    let state = Arc::new(AppState::new(host, identity, stats.clone()));
+    #[cfg(feature = "gamestream")]
+    let state = {
+        let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
+        Arc::new(AppState::new(host, identity, stats.clone()))
+    };
+    #[cfg(not(feature = "gamestream"))]
+    let state = Arc::new(AppState::new(host, stats.clone()));
     // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
     // and the management API) always exists.
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(None, None, false)
             .context("native pairing store")?,
     );
+    // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
+    // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
+    // the two planes cannot race the first-run adoption. See `crate::identity`.
+    let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
@@ -379,36 +472,58 @@ pub fn serve(
             gamestream,
         });
         let served: anyhow::Result<()> = if gamestream {
-            // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
-            // fatal on failure when enabled (Moonlight clients can't find the host without it) —
-            // `--no-mdns` / PUNKTFUNK_MDNS=0 skips it for multicast-dead environments (stock
-            // Moonlight then needs a manually-added host).
-            let _advert = if native.mdns {
-                Some(mdns::advertise(&state.host).context("mDNS advertise")?)
-            } else {
+            // WP19: `gamestream` can only be true when the feature is compiled in — serve()'s
+            // top bails otherwise — so the native-only build's arm is a plain unreachable.
+            #[cfg(not(feature = "gamestream"))]
+            {
+                unreachable!("serve() refuses --gamestream in a native-only build")
+            }
+            #[cfg(feature = "gamestream")]
+            {
+                // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
+                // fatal on failure when enabled (Moonlight clients can't find the host without it) —
+                // `--no-mdns` / PUNKTFUNK_MDNS=0 skips it for multicast-dead environments (stock
+                // Moonlight then needs a manually-added host).
+                let _advert = if native.mdns {
+                    Some(mdns::advertise(&state.host).context("mDNS advertise")?)
+                } else {
+                    tracing::info!(
+                        "GameStream mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS)"
+                    );
+                    None
+                };
+                rtsp::spawn(state.clone()).context("start RTSP server")?;
+                // WP0 (rust-safety): the ENet control port is the host's one pre-auth-reachable
+                // unsafe surface (`rusty_enet` is a transpiled C stack), so it binds only while a
+                // pairing exists — a never-paired host on a hostile LAN exposes no ENet at all.
+                // Pairing is HTTPS on nvhttp and never touches 47999; phase 4 re-syncs the port the
+                // moment the first client pins, so it is up before that client can `/launch`.
+                state.control_gate.enable();
+                sync_control(&state).context("start ENet control server")?;
                 tracing::info!(
-                    "GameStream mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS)"
+                    port = native.port,
+                    "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"
                 );
-                None
-            };
-            rtsp::spawn(state.clone()).context("start RTSP server")?;
-            control::spawn(state.clone()).context("start ENet control server")?;
-            tracing::info!(
-                port = native.port,
-                "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"
-            );
-            tokio::try_join!(
-                nvhttp::run(state.clone()),
-                crate::mgmt::run(
-                    state.clone(),
-                    mgmt,
-                    Some(np.clone()),
-                    stats.clone(),
-                    gamestream
-                ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
-            )
-            .map(|_| ())
+                tokio::try_join!(
+                    nvhttp::run(state.clone()),
+                    crate::mgmt::run(
+                        state.clone(),
+                        mgmt,
+                        Some(np.clone()),
+                        stats.clone(),
+                        gamestream,
+                        native_ident.clone(),
+                    ),
+                    crate::native::serve(
+                        native_opts,
+                        native.mgmt_port,
+                        np,
+                        stats.clone(),
+                        native_ident
+                    ),
+                )
+                .map(|_| ())
+            }
         } else {
             // Secure default: native punktfunk/1 + management API only (no GameStream surface).
             tracing::info!(
@@ -422,9 +537,16 @@ pub fn serve(
                     mgmt,
                     Some(np.clone()),
                     stats.clone(),
-                    gamestream
+                    gamestream,
+                    native_ident.clone(),
                 ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+                crate::native::serve(
+                    native_opts,
+                    native.mgmt_port,
+                    np,
+                    stats.clone(),
+                    native_ident
+                ),
             )
             .map(|_| ())
         };
@@ -442,6 +564,13 @@ fn hostname_string() -> String {
     if let Some(n) = pf_host_config::config().host_name.as_deref() {
         return sanitize_display_name(n);
     }
+    machine_hostname()
+}
+
+/// The raw machine hostname (no `PUNKTFUNK_HOST_NAME` override, no display sanitizing) — what a
+/// certificate SAN or a DNS-ish consumer wants, as opposed to [`hostname_string`]'s free-text
+/// display name.
+pub(crate) fn machine_hostname() -> String {
     #[cfg(target_os = "windows")]
     if let Some(n) = std::env::var_os("COMPUTERNAME") {
         let s = n.to_string_lossy().trim().to_string();
@@ -601,13 +730,21 @@ mod session_tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
         let stats = crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
             "pf-gs-endsession-{}-{:p}",
             std::process::id(),
             &0u8 as *const u8
         )));
-        AppState::new(host, identity, stats)
+        // Both build flavors: the session teardown under test is feature-independent.
+        #[cfg(feature = "gamestream")]
+        {
+            let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
+            AppState::new(host, identity, stats)
+        }
+        #[cfg(not(feature = "gamestream"))]
+        {
+            AppState::new(host, stats)
+        }
     }
 
     /// `end_session` is THE compat-plane teardown: one call must clear the whole session — both
@@ -630,22 +767,26 @@ mod session_tests {
             peer_ip: None,
             owner_fp: None,
         });
-        *state.stream.lock().unwrap() = Some(stream::StreamConfig {
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            packet_size: 1024,
-            bitrate_kbps: 20_000,
-            codec: crate::encode::Codec::H265,
-            min_fec: 0,
-            hdr: false,
-            slices: 1, // the no-request default — hardware decoders get single-slice AUs
-        });
+        #[cfg(feature = "gamestream")]
+        {
+            *state.stream.lock().unwrap() = Some(stream::StreamConfig {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                packet_size: 1024,
+                bitrate_kbps: 20_000,
+                codec: crate::encode::Codec::H265,
+                min_fec: 0,
+                hdr: false,
+                slices: 1, // the no-request default — hardware decoders get single-slice AUs
+            });
+        }
 
         assert!(state.end_session("test"), "video was live");
         assert!(!state.streaming.load(Ordering::SeqCst));
         assert!(!state.audio_streaming.load(Ordering::SeqCst));
         assert!(state.launch.lock().unwrap().is_none());
+        #[cfg(feature = "gamestream")]
         assert!(state.stream.lock().unwrap().is_none());
 
         // Idempotent: a second end (e.g. `/cancel` racing the ENet Disconnect) is a no-op.

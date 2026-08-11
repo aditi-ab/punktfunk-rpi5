@@ -8,11 +8,13 @@
 //! the wire contract OWNED by [`pf_driver_proto::control`] (versioned + `#[repr(C)] Pod` structs,
 //! NOT the SudoVDA ABI). No DLL, no named pipe. See `design/windows-host-rewrite.md`.
 //!
-//! This is a faithful clone of [`super::sudovda`] (the shipping fallback) repointed at the new driver:
-//! same reference-counted/lingering monitor lifecycle, same CCD isolation + active-mode forcing — those
-//! backend-NEUTRAL helpers are REUSED from `sudovda` (a pf-vdisplay monitor's `target_id` is a real OS
-//! target id, so the CCD/DXGI code works unchanged). Only the driver-specific bits (GUID, IOCTL codes,
-//! request/reply structs, the version handshake) differ, per `pf_driver_proto`.
+//! punktfunk's IddCx driver is the SOLE Windows backend — the legacy SudoVDA fallback was removed and
+//! its driver is no longer shipped (`lib.rs`), so nothing here is a "clone of the fallback" any more.
+//! The backend-NEUTRAL half — the reference-counted/lingering monitor lifecycle, the CCD isolation and
+//! the active-mode forcing — lives in [`super::manager`] and `pf_win_display::win_display` (a
+//! pf-vdisplay monitor's `target_id` is a real OS target id, so that CCD/DXGI code applies unchanged).
+//! Only the driver-specific bits (GUID, IOCTL codes, request/reply structs, the version handshake) are
+//! here, per `pf_driver_proto`.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -97,9 +99,10 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
 /// pinning an OS VidPN target against the IddCx adapter's fixed monitor-slot budget; once ~16 accumulate,
 /// `IOCTL_ADD` wedges at 0x80070490 (`ERROR_NOT_FOUND`) and every session black-screens until a manual
 /// reset/reboot. Removing the not-present PDOs frees the slots — the in-process equivalent of
-/// `reset-pf-vdisplay.ps1` step 2 (proven on-box). Best-effort + idempotent: only NOT-present nodes
-/// (`Status != OK`) are removed, so the LIVE session's monitor (`Status OK`) is never touched; any
-/// failure is logged and swallowed. Returns the number removed.
+/// `reset-pf-vdisplay.ps1` step 2 (proven on-box). Best-effort + idempotent: only ABSENT nodes
+/// (`Present` false AND `Status` `Unknown`) are removed, so a LIVE session's monitor is never
+/// touched — not even while it is in a transient problem state; any failure is logged and
+/// swallowed. Returns the number removed.
 ///
 /// The outcome is logged UNCONDITIONALLY, as found + removed: the old script counted only removals
 /// and the host spoke only when that count was positive, so a reap whose pnputil never launched and
@@ -108,8 +111,17 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
 /// wedge with every sleep cycle.
 fn reap_ghost_monitors() -> u32 {
     // Mirrors reset-pf-vdisplay.ps1 step 2. powershell is always present for the SYSTEM service; the
-    // matched tokens ('OK', 'punktfunk', the InstanceId) are locale-invariant, so this is safe on a
-    // non-English box (unlike a .ps1 *file* read in the machine codepage).
+    // matched tokens ('Unknown', 'punktfunk', the InstanceId) are locale-invariant, so this is safe
+    // on a non-English box (unlike a .ps1 *file* read in the machine codepage).
+    //
+    // The selector asks about PRESENCE, not health — the exact complement of the liveness predicate
+    // the adapter reload below uses (`$_.Present -or $_.Status -ne 'Unknown'`). It used to read
+    // `Status -ne 'OK'`, which is a HEALTH field: `Error`, `Degraded` and `Unknown` all satisfy it,
+    // so a PRESENT virtual monitor in a transient problem state was handed to `pnputil
+    // /remove-device` — and this runs mid-session from `add_monitor`'s 0x80070490 recovery, i.e.
+    // while sibling sessions are live, so it could rip out a live client's monitor. `Present` is the
+    // authoritative bit; the `Status -eq 'Unknown'` conjunct is the guard for `Present` reading null
+    // (`-not $null` is TRUE, which alone would select every device on the box).
     //
     // pnputil is resolved by full path and `$LASTEXITCODE` pre-seeded to failure before every
     // launch, exactly like the reload path below: a LocalSystem service's PATH need not include
@@ -117,7 +129,7 @@ fn reap_ghost_monitors() -> u32 {
     // elevated), and the old bare-name call failed INVISIBLY there — `SilentlyContinue` swallowed
     // the miss, no exit code was written, and the ghosts stayed to wedge `IOCTL_ADD` at 0x80070490.
     const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        $g = @(Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }); \
+        $g = @(Get-PnpDevice -Class Monitor | Where-Object { -not $_.Present -and $_.Status -eq 'Unknown' -and $_.FriendlyName -match 'punktfunk' }); \
         $pnp = ($env:SystemRoot + '\\System32\\pnputil.exe'); \
         $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
         Write-Output ($g.Count.ToString() + ' ' + $n)";
@@ -593,14 +605,20 @@ fn probe_device() -> Probe {
         // SAFETY: `buf` is at least `required` bytes and aligned to 8 (so also to the struct's 4),
         // so stamping `cbSize` and letting the API fill up to `required` bytes stays in bounds;
         // `detail` aliases `buf` only within this iteration, and the `DevicePath` pointer is read
-        // before `buf` is dropped.
+        // before `buf` is dropped. That path pointer is taken as a RAW place projection off
+        // `detail`, so it keeps the whole `buf` allocation's provenance: `DevicePath` is declared
+        // `[u16; 1]` (a flexible-array-member stub), so `.as_ptr()` would auto-ref it and hand
+        // `CreateFileW` a pointer tagged for TWO bytes while the API reads the full NUL-terminated
+        // path (100+ bytes) — everything past `DevicePath[0]` out of bounds for that tag, and a
+        // compiler entitled to fold the zero-init back in and pass an EMPTY device name. Same
+        // defect class (and same fix) as the `MONITORINFOEXW` retag in `vdisplay/ddc.rs`.
         let opened = unsafe {
             (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
             SetupDiGetDeviceInterfaceDetailW(hdev.0, &idata, Some(detail), required, None, None)
                 .context("SetupDiGetDeviceInterfaceDetailW(pf-vdisplay)")
                 .and_then(|()| {
                     CreateFileW(
-                        PCWSTR((*detail).DevicePath.as_ptr()),
+                        PCWSTR((&raw const (*detail).DevicePath).cast::<u16>()),
                         0xC000_0000, // GENERIC_READ | GENERIC_WRITE
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                         None,
@@ -635,7 +653,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         "pf-vdisplay"
     }
 
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
+    fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
         // A short re-probe, and deliberately NO adapter reload — this replaces the second, impatient
         // copy of the recovery that used to live here. Session bring-up already ran the full
         // `ensure_available` before constructing the backend, so anything left for this open to
@@ -686,18 +704,42 @@ impl VdisplayDriver for PfVdisplayDriver {
             );
         }
         let watchdog_s = info.watchdog_timeout_s.max(1);
-        if info.protocol_version < pf_driver_proto::PROTOCOL_VERSION {
+        // UNCONDITIONAL: this line is the only place the negotiated watchdog is reported, and the
+        // pinger's cadence (`watchdog/3`) is derived from it — yet it used to sit in the `else` of
+        // the version warning, so exactly the hosts where the number is worth having (anything but
+        // an exact-version pair) logged nothing at all.
+        tracing::info!(
+            "pf-vdisplay protocol {} (host drives {}..={}, watchdog timeout {}s)",
+            info.protocol_version,
+            pf_driver_proto::MIN_DRIVER_PROTOCOL_VERSION,
+            pf_driver_proto::PROTOCOL_VERSION,
+            watchdog_s
+        );
+        // Version-SPECIFIC capability gaps, reported independently. Every bump since v3 is ADDITIVE,
+        // so the old blanket `< PROTOCOL_VERSION` test named the WRONG gap: it told a v4 or v5
+        // driver it "lacks the in-place resize" — added IN v4 — purely because it was not v6. Each
+        // rung below names the capability the host actually gates on that version.
+        if info.protocol_version < 4 {
             tracing::warn!(
-                "pf-vdisplay protocol {} (host supports {}): driver lacks the in-place resize — \
-                 mid-stream resizes use the monitor re-arrival path until the driver is updated",
-                info.protocol_version,
-                pf_driver_proto::PROTOCOL_VERSION
+                "pf-vdisplay protocol {}: driver lacks the in-place mid-stream resize \
+                 (IOCTL_UPDATE_MODES, added in v4) — every mid-stream resize costs a monitor \
+                 re-arrival (one hotplug per switch) until the driver is updated",
+                info.protocol_version
             );
-        } else {
+        }
+        if info.protocol_version < 5 {
+            tracing::warn!(
+                "pf-vdisplay protocol {}: driver lacks the IddCx hardware-cursor channel (added in \
+                 v5) — the pointer stays composited into the captured frame",
+                info.protocol_version
+            );
+        }
+        if info.protocol_version < 6 {
             tracing::info!(
-                "pf-vdisplay protocol {} (watchdog timeout {}s)",
-                info.protocol_version,
-                watchdog_s
+                "pf-vdisplay protocol {}: driver lacks the mid-stream cursor-forward flip \
+                 (IOCTL_SET_CURSOR_FORWARD, added in v6) — the cursor model declared at monitor ADD \
+                 stands for the whole session",
+                info.protocol_version
             );
         }
         // Reap monitors orphaned by a crashed previous host — a FIRST-CLASS op (driver returns

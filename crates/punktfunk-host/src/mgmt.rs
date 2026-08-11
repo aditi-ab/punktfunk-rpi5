@@ -111,6 +111,10 @@ pub async fn run(
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     gamestream_enabled: bool,
+    // The identity split (`crate::identity`): the mgmt API must present the SAME identity as
+    // the native QUIC plane — paired clients hold ONE pinned fingerprint for both — so the
+    // caller resolves it once and hands it to both.
+    identity: crate::identity::NativeIdentity,
 ) -> Result<()> {
     // Close out any update-intent record a previous apply left behind (the update reports its
     // own outcome across its own restart — update/jobs.rs). Once per boot, before serving.
@@ -123,11 +127,10 @@ pub async fn run(
         .token
         .filter(|t| !t.trim().is_empty())
         .context("management API has no token — internal error: parse_serve must provide one")?;
-    // Serve over HTTPS with the host's persistent identity (the cert clients already pin) and
-    // OPTIONAL client-cert auth: a paired native client presents its cert (authorized by
-    // fingerprint, no token), a browser presents none and uses the bearer token. See `require_auth`.
-    let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
-        .context("load host identity for the management API TLS")?;
+    // Serve over HTTPS with the native identity (the cert clients already pin — see the
+    // `identity` parameter) and OPTIONAL client-cert auth: a paired native client presents its
+    // cert (authorized by fingerprint, no token), a browser presents none and uses the bearer
+    // token. See `require_auth`.
     let tls = crate::gamestream::tls::server_config_optional_client(
         &identity.cert_pem,
         &identity.key_pem,
@@ -189,94 +192,97 @@ fn app(
 /// The versioned API routes + the OpenAPI document collected from them. Single source of
 /// truth for both the live server and the `openapi` subcommand.
 fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
+    let api_v1 = OpenApiRouter::new()
+        .routes(routes!(host::get_health))
+        .routes(routes!(host::get_host_info))
+        .routes(routes!(host::list_compositors))
+        .routes(routes!(gpu::list_gpus))
+        .routes(routes!(gpu::set_gpu_preference))
+        .routes(routes!(display::get_display_settings))
+        .routes(routes!(display::set_display_settings))
+        .routes(routes!(display::get_display_state))
+        .routes(routes!(display::get_display_monitors))
+        .routes(routes!(display::release_display))
+        .routes(routes!(display::set_display_layout))
+        .routes(routes!(
+            display::list_custom_presets,
+            display::create_custom_preset
+        ))
+        .routes(routes!(
+            display::update_custom_preset,
+            display::delete_custom_preset
+        ))
+        .routes(routes!(host::get_status))
+        .routes(routes!(host::get_local_summary))
+        .routes(routes!(clients::list_paired_clients))
+        .routes(routes!(clients::unpair_client));
+    // The GameStream PIN flow exists only when the compat planes do (WP19) — a native-only
+    // build's API (and its OpenAPI document) simply has no such endpoints.
+    #[cfg(feature = "gamestream")]
+    let api_v1 = api_v1
+        .routes(routes!(clients::get_pairing_status))
+        .routes(routes!(clients::submit_pairing_pin));
+    let api_v1 = api_v1
+        .routes(routes!(native::get_native_pairing))
+        .routes(routes!(native::arm_native_pairing))
+        .routes(routes!(native::disarm_native_pairing))
+        .routes(routes!(native::list_native_clients))
+        .routes(routes!(native::unpair_native_client))
+        .routes(routes!(native::list_pending_devices))
+        .routes(routes!(native::approve_pending_device))
+        .routes(routes!(native::deny_pending_device))
+        .routes(routes!(session::stop_session))
+        .routes(routes!(session::request_idr))
+        .routes(routes!(
+            session::get_session_settings,
+            session::set_session_settings
+        ))
+        .routes(routes!(session::end_game))
+        .routes(routes!(library::get_library))
+        .routes(routes!(library::list_library_scanners))
+        .routes(routes!(library::set_library_scanner))
+        .routes(routes!(library::set_library_entry_hidden))
+        .routes(routes!(library::create_custom_game))
+        .routes(routes!(
+            library::update_custom_game,
+            library::delete_custom_game
+        ))
+        .routes(routes!(
+            library::reconcile_provider_entries,
+            library::delete_provider_entries
+        ))
+        .routes(routes!(library::get_library_art))
+        .routes(routes!(stats::stats_capture_start))
+        .routes(routes!(stats::stats_capture_stop))
+        .routes(routes!(stats::stats_capture_status))
+        .routes(routes!(stats::stats_capture_live))
+        .routes(routes!(stats::stats_recordings_list))
+        .routes(routes!(
+            stats::stats_recording_get,
+            stats::stats_recording_delete
+        ))
+        .routes(routes!(stats::logs_get))
+        .routes(routes!(events::stream_events))
+        .routes(routes!(hooks::get_hooks, hooks::set_hooks))
+        .routes(routes!(plugins::list_plugins))
+        .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
+        .routes(routes!(plugins::get_ui_credential))
+        .routes(routes!(plugins::ingest_plugin_logs))
+        .routes(routes!(store::get_catalog))
+        .routes(routes!(store::refresh_catalog))
+        .routes(routes!(store::list_installed))
+        .routes(routes!(store::install_plugin))
+        .routes(routes!(store::uninstall_plugin))
+        .routes(routes!(store::list_jobs))
+        .routes(routes!(store::get_job))
+        .routes(routes!(store::list_sources))
+        .routes(routes!(store::put_source, store::delete_source))
+        .routes(routes!(store::get_runtime, store::set_runtime))
+        .routes(routes!(update::get_update_status))
+        .routes(routes!(update::force_update_check))
+        .routes(routes!(update::apply_update));
     OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .nest(
-            "/api/v1",
-            OpenApiRouter::new()
-                .routes(routes!(host::get_health))
-                .routes(routes!(host::get_host_info))
-                .routes(routes!(host::list_compositors))
-                .routes(routes!(gpu::list_gpus))
-                .routes(routes!(gpu::set_gpu_preference))
-                .routes(routes!(display::get_display_settings))
-                .routes(routes!(display::set_display_settings))
-                .routes(routes!(display::get_display_state))
-                .routes(routes!(display::get_display_monitors))
-                .routes(routes!(display::release_display))
-                .routes(routes!(display::set_display_layout))
-                .routes(routes!(
-                    display::list_custom_presets,
-                    display::create_custom_preset
-                ))
-                .routes(routes!(
-                    display::update_custom_preset,
-                    display::delete_custom_preset
-                ))
-                .routes(routes!(host::get_status))
-                .routes(routes!(host::get_local_summary))
-                .routes(routes!(clients::list_paired_clients))
-                .routes(routes!(clients::unpair_client))
-                .routes(routes!(clients::get_pairing_status))
-                .routes(routes!(clients::submit_pairing_pin))
-                .routes(routes!(native::get_native_pairing))
-                .routes(routes!(native::arm_native_pairing))
-                .routes(routes!(native::disarm_native_pairing))
-                .routes(routes!(native::list_native_clients))
-                .routes(routes!(native::unpair_native_client))
-                .routes(routes!(native::list_pending_devices))
-                .routes(routes!(native::approve_pending_device))
-                .routes(routes!(native::deny_pending_device))
-                .routes(routes!(session::stop_session))
-                .routes(routes!(session::request_idr))
-                .routes(routes!(
-                    session::get_session_settings,
-                    session::set_session_settings
-                ))
-                .routes(routes!(session::end_game))
-                .routes(routes!(library::get_library))
-                .routes(routes!(library::list_library_scanners))
-                .routes(routes!(library::set_library_scanner))
-                .routes(routes!(library::set_library_entry_hidden))
-                .routes(routes!(library::create_custom_game))
-                .routes(routes!(
-                    library::update_custom_game,
-                    library::delete_custom_game
-                ))
-                .routes(routes!(
-                    library::reconcile_provider_entries,
-                    library::delete_provider_entries
-                ))
-                .routes(routes!(library::get_library_art))
-                .routes(routes!(stats::stats_capture_start))
-                .routes(routes!(stats::stats_capture_stop))
-                .routes(routes!(stats::stats_capture_status))
-                .routes(routes!(stats::stats_capture_live))
-                .routes(routes!(stats::stats_recordings_list))
-                .routes(routes!(
-                    stats::stats_recording_get,
-                    stats::stats_recording_delete
-                ))
-                .routes(routes!(stats::logs_get))
-                .routes(routes!(events::stream_events))
-                .routes(routes!(hooks::get_hooks, hooks::set_hooks))
-                .routes(routes!(plugins::list_plugins))
-                .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
-                .routes(routes!(plugins::get_ui_credential))
-                .routes(routes!(plugins::ingest_plugin_logs))
-                .routes(routes!(store::get_catalog))
-                .routes(routes!(store::refresh_catalog))
-                .routes(routes!(store::list_installed))
-                .routes(routes!(store::install_plugin))
-                .routes(routes!(store::uninstall_plugin))
-                .routes(routes!(store::list_jobs))
-                .routes(routes!(store::get_job))
-                .routes(routes!(store::list_sources))
-                .routes(routes!(store::put_source, store::delete_source))
-                .routes(routes!(store::get_runtime, store::set_runtime))
-                .routes(routes!(update::get_update_status))
-                .routes(routes!(update::force_update_check))
-                .routes(routes!(update::apply_update)),
-        )
+        .nest("/api/v1", api_v1)
         .split_for_parts()
 }
 

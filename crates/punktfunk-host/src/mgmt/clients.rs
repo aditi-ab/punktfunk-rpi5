@@ -19,6 +19,7 @@ pub(crate) struct PairedClient {
 }
 
 /// Pairing-flow status.
+#[cfg(feature = "gamestream")]
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PairingStatus {
     /// True while a pairing handshake is parked waiting for the user's PIN.
@@ -26,6 +27,7 @@ pub(crate) struct PairingStatus {
 }
 
 /// The PIN Moonlight displays during pairing.
+#[cfg(feature = "gamestream")]
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SubmitPin {
     /// 1–16 ASCII digits (Moonlight shows 4).
@@ -76,10 +78,13 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
 
 /// Unpair a client
 ///
-/// Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer
-/// does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
-/// client cert — a planned hardening step), so until that lands this removes the client
-/// from the listing without severing its ability to reconnect.
+/// Removes the client's certificate from the pairing store (persisted — the removal survives a
+/// host restart). Revocation is complete: a LIVE GameStream session owned by this certificate is
+/// ended (the client gets the standard TERMINATION+disconnect), and removing the last pairing
+/// also closes the ENet control port (UDP 47999), which is only bound while at least one pairing
+/// exists. The nvhttp TLS layer still completes a handshake with any well-formed client cert BY
+/// DESIGN (authorization is per-request via the paired-fingerprint check) — an unpaired client
+/// that reconnects is rejected at every post-pair endpoint.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",
@@ -110,6 +115,34 @@ pub(crate) async fn unpair_client(
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {
+        // Persist the removal — without this the unpair lasted only until the next host
+        // restart, which now also matters below: a resurrected pairing would silently
+        // re-open the control port.
+        crate::gamestream::save_paired(&paired);
+        drop(paired);
+        // Revocation reaches a LIVE session too: a mid-stream client whose pairing was just
+        // removed must not keep streaming until it chooses to leave. Clearing the launch makes
+        // the ENet control thread give it the standard TERMINATION+disconnect farewell. (An
+        // owner-less launch — the cert was unreadable at /launch — cannot be attributed and is
+        // left to the port teardown below when this was the last pairing.)
+        let removed_fp: Option<[u8; 32]> = hex::decode(&fingerprint)
+            .ok()
+            .and_then(|v| v.try_into().ok());
+        let live_owner = st
+            .app
+            .launch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .and_then(|l| l.owner_fp);
+        if removed_fp.is_some() && removed_fp == live_owner {
+            st.app.quit_session("client unpaired");
+        }
+        // The last pairing going away closes the ENet control port (rust-safety WP0). A
+        // no-op while other pairings remain — or on a native-only host, where the gate is
+        // never armed.
+        if let Err(e) = crate::gamestream::sync_control(&st.app) {
+            tracing::warn!(error = %format!("{e:#}"), "control port sync after unpair failed");
+        }
         tracing::info!(fingerprint, "management API: client unpaired");
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -123,6 +156,7 @@ pub(crate) async fn unpair_client(
 /// Pairing-flow status
 ///
 /// Poll this to know when to prompt the user for the PIN Moonlight displays.
+#[cfg(feature = "gamestream")]
 #[utoipa::path(
     get,
     path = "/pair",
@@ -143,6 +177,7 @@ pub(crate) async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json
 ///
 /// Delivers the PIN the Moonlight client is displaying, completing the out-of-band half
 /// of the pairing handshake.
+#[cfg(feature = "gamestream")]
 #[utoipa::path(
     post,
     path = "/pair/pin",

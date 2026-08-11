@@ -21,9 +21,10 @@
 //! The task itself runs as **`NT AUTHORITY\LocalService`**, not SYSTEM: plugins are
 //! operator-installed code, and a plugin defect must cost a throwaway service account, not the
 //! most privileged principal on the box. `enable` converges the principal (migrating tasks an
-//! older installer registered as SYSTEM) and grants LocalService read on exactly the two files
-//! the runner's `connect()` needs — the scoped `plugin-token` and the TLS pin `cert.pem` — never
-//! the full-admin `mgmt-token`.
+//! older installer registered as SYSTEM) and grants LocalService read on exactly the files the
+//! runner's `connect()` needs — the scoped `plugin-token` and the TLS-pin cert
+//! (`native-cert.pem` on identity-split hosts, `cert.pem` on legacy ones) — never the
+//! full-admin `mgmt-token`.
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
@@ -405,11 +406,13 @@ fn systemctl_output(args: &[&str]) -> Option<String> {
 #[cfg(target_os = "windows")]
 const LOCAL_SERVICE_SID: &str = "*S-1-5-19";
 
-/// The two (and only two) secrets the runner needs to read to reach the mgmt API: the scoped
-/// plugin token and the host identity cert it pins TLS against. `mgmt-token` (full admin) is
-/// deliberately NOT here.
+/// The secrets the runner needs to read to reach the mgmt API: the scoped plugin token and the
+/// host identity cert it pins TLS against — `native-cert.pem` when the identity split minted
+/// one (what mgmt then serves), `cert.pem` on legacy hosts. `mgmt-token` (full admin) is
+/// deliberately NOT here. The grant loop tolerates absent files, so listing both is safe on
+/// either kind of host.
 #[cfg(target_os = "windows")]
-const RUNNER_SECRET_FILES: [&str; 2] = ["plugin-token", "cert.pem"];
+const RUNNER_SECRET_FILES: [&str; 3] = ["plugin-token", "native-cert.pem", "cert.pem"];
 
 /// The unit directories the runner imports code from. LocalService gets an inheritable
 /// read+execute+write-attributes grant on these: bun's module loader opens unit files

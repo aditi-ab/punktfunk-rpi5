@@ -58,22 +58,21 @@ pub fn observe_session_instance(active: &ActiveSession) {
     let changed = {
         let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
         let prev = *last;
-        *last = Some(cur);
+        // A `None` scan result is NOT an observation (see [`classify_instance_change`]), so it must
+        // not become the baseline either: recording it would make the NEXT poll — the one that sees
+        // the still-running desktop again — read as `None → DesktopKde`, i.e. a fresh instance, and
+        // bump the epoch out from under every pooled display. Leave the baseline on the last REAL
+        // instance and a transient miss is fully inert, in both directions.
+        if cur.0 != ActiveKind::None {
+            *last = Some(cur);
+        }
         prev
     };
     if let Some(prev) = changed {
-        // Only a **desktop** compositor (KWin / Mutter / wlroots) instance change bumps the epoch +
-        // invalidates its kept displays — its PipeWire node dies with the compositor. A **gamescope**
-        // session (`ActiveKind::Gaming`) is NOT the epoch's subject: the box's game-mode / managed
-        // gamescope isn't pooled, and dedicated **spawns** are independent nested sessions whose nodes
-        // outlive any active-session change. So a game-mode gamescope restart, a Gaming↔Gaming winning-PID
-        // flap (e.g. B1 stopping the autologin before a dedicated spawn), or a coexisting-gamescope set
-        // change must NOT bump/invalidate — that would tear down a live/kept dedicated session (review
-        // findings #6/#7/#10). Gate the whole action on a desktop kind being involved.
-        if prev != cur && (is_desktop_kind(prev.0) || is_desktop_kind(cur.0)) {
+        if let InstanceChange::NewInstance { invalidate } = classify_instance_change(prev, cur) {
             // Invalidate only the OLD backend, and only if it was a desktop compositor (never gamescope).
-            if is_desktop_kind(prev.0) {
-                if let Some(old) = compositor_for_kind(prev.0) {
+            if let Some(old_kind) = invalidate {
+                if let Some(old) = compositor_for_kind(old_kind) {
                     registry::invalidate_backend(old.id());
                 }
                 // The dead desktop's socket vars may still sit in the systemd --user manager env
@@ -92,6 +91,54 @@ pub fn observe_session_instance(active: &ActiveSession) {
                 "desktop compositor instance changed — session epoch bumped"
             );
         }
+    }
+}
+
+/// What a `prev` → `cur` observation means for the session epoch — the pure core of
+/// [`observe_session_instance`], so the (surprisingly load-bearing) rules below are unit-tested
+/// without the process-global baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstanceChange {
+    /// The same instance, or a change the epoch does not track — do nothing.
+    Nothing,
+    /// A new compositor instance: bump the epoch. `invalidate` names the OUTGOING desktop
+    /// compositor whose kept displays must be dropped (its PipeWire nodes died with it); `None`
+    /// when the outgoing session was gamescope / nothing, which owns no pooled displays.
+    NewInstance { invalidate: Option<ActiveKind> },
+}
+
+/// The epoch's rules, in one place:
+///
+/// * A `cur` of [`ActiveKind::None`] is **never** a change. `detect_active_session` answers `None`
+///   both for "no graphical session is running" and for a scan that simply saw nothing — its whole
+///   probe hangs off `if let Ok(entries) = std::fs::read_dir("/proc")`, and every per-PID rung
+///   (`metadata`, `match_name`) can lose a race with a re-exec. Treating that as "the desktop
+///   changed" ran `registry::invalidate_backend`, which removes pool entries in ANY lifecycle state
+///   — Active ones included — so one unlucky `/proc` read tore down displays that were mid-stream,
+///   and scrubbed the live session's socket vars out of the systemd `--user` manager on the way.
+///   A real logout is picked up by the NEXT real observation (a different kind, or the same kind at
+///   a new PID), which is the evidence-carrying end of the same transition.
+/// * Only a **desktop** compositor (KWin / Mutter / wlroots) instance change counts. A **gamescope**
+///   session ([`ActiveKind::Gaming`]) is not the epoch's subject: the box's game-mode / managed
+///   gamescope isn't pooled, and dedicated **spawns** are independent nested sessions whose nodes
+///   outlive any active-session change. So a game-mode gamescope restart, a Gaming↔Gaming
+///   winning-PID flap (e.g. B1 stopping the autologin before a dedicated spawn), or a
+///   coexisting-gamescope set change must NOT bump/invalidate — that would tear down a live/kept
+///   dedicated session (review findings #6/#7/#10).
+/// * A same-kind PID change IS a change: a fresh KWin's node-id space is unrelated to the dead
+///   one's (A4).
+fn classify_instance_change(
+    prev: (ActiveKind, Option<u32>),
+    cur: (ActiveKind, Option<u32>),
+) -> InstanceChange {
+    if cur.0 == ActiveKind::None
+        || prev == cur
+        || !(is_desktop_kind(prev.0) || is_desktop_kind(cur.0))
+    {
+        return InstanceChange::Nothing;
+    }
+    InstanceChange::NewInstance {
+        invalidate: is_desktop_kind(prev.0).then_some(prev.0),
     }
 }
 
@@ -701,6 +748,90 @@ pub fn settle_desktop_portal(chosen: Compositor) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn settle_desktop_portal(_chosen: Compositor) {}
+
+/// The epoch rules are platform-neutral (they are pure over [`ActiveKind`] + PID), so — unlike the
+/// `/proc`-and-socket tests below — these run on every host this crate builds on.
+#[cfg(test)]
+mod instance_change_tests {
+    use super::*;
+
+    /// The 10.9 regression: a scan that answered `None` while KDE was in fact still up used to
+    /// satisfy `is_desktop_kind(prev)` and run the full invalidate — which drops pool entries in
+    /// ANY state, live streaming ones included.
+    #[test]
+    fn a_none_observation_is_never_a_change() {
+        for prev in [
+            (ActiveKind::DesktopKde, Some(42)),
+            (ActiveKind::DesktopGnome, Some(7)),
+            (ActiveKind::Gaming, Some(9)),
+            (ActiveKind::None, None),
+        ] {
+            assert_eq!(
+                classify_instance_change(prev, (ActiveKind::None, None)),
+                InstanceChange::Nothing,
+                "a None scan result must not invalidate {prev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_desktop_swap_invalidates_the_outgoing_desktop() {
+        assert_eq!(
+            classify_instance_change(
+                (ActiveKind::DesktopKde, Some(1)),
+                (ActiveKind::DesktopGnome, Some(2))
+            ),
+            InstanceChange::NewInstance {
+                invalidate: Some(ActiveKind::DesktopKde)
+            }
+        );
+        // Desktop → gamescope (Game Mode): the dead KWin's kept displays go with it.
+        assert_eq!(
+            classify_instance_change(
+                (ActiveKind::DesktopKde, Some(1)),
+                (ActiveKind::Gaming, Some(2))
+            ),
+            InstanceChange::NewInstance {
+                invalidate: Some(ActiveKind::DesktopKde)
+            }
+        );
+        // gamescope → desktop: a new epoch, but gamescope owns no pooled entries to invalidate.
+        assert_eq!(
+            classify_instance_change(
+                (ActiveKind::Gaming, Some(1)),
+                (ActiveKind::DesktopKde, Some(2))
+            ),
+            InstanceChange::NewInstance { invalidate: None }
+        );
+    }
+
+    #[test]
+    fn a_same_kind_restart_is_a_new_instance_but_a_gamescope_flap_is_not() {
+        // A fresh KWin (new PID) has an unrelated node-id space — A4.
+        assert_eq!(
+            classify_instance_change(
+                (ActiveKind::DesktopKde, Some(1)),
+                (ActiveKind::DesktopKde, Some(2))
+            ),
+            InstanceChange::NewInstance {
+                invalidate: Some(ActiveKind::DesktopKde)
+            }
+        );
+        // The same instance re-detected: inert.
+        assert_eq!(
+            classify_instance_change(
+                (ActiveKind::DesktopKde, Some(1)),
+                (ActiveKind::DesktopKde, Some(1))
+            ),
+            InstanceChange::Nothing
+        );
+        // Gaming↔Gaming winning-PID flap: never the epoch's business (findings #6/#7/#10).
+        assert_eq!(
+            classify_instance_change((ActiveKind::Gaming, Some(1)), (ActiveKind::Gaming, Some(2))),
+            InstanceChange::Nothing
+        );
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

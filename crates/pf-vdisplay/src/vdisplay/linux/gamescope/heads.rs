@@ -34,24 +34,28 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<PhysicalMonitor>> {
     Ok(heads_under(
         Path::new("/sys/class/drm"),
         &super::gamescope_argvs(),
-        super::current_gamescope_output_size(),
     ))
 }
 
 /// [`list_monitors`] against an arbitrary sysfs root and a supplied argv set — the unit-testable
-/// core. `output_size` is gamescope's own `-W`/`-H`, which OUTRANKS the EDID's preferred timing
-/// because it is the size the capture node actually produces.
-fn heads_under(
-    base: &Path,
-    argvs: &[Vec<String>],
-    output_size: Option<(u32, u32)>,
-) -> Vec<PhysicalMonitor> {
+/// core.
+///
+/// The head's size comes from the `-W`/`-H` of the argv selected HERE, which OUTRANKS the EDID's
+/// preferred timing because it is the size the capture node actually produces. It used to arrive as
+/// a parameter filled by a scan over ALL gamescopes on the box — including the nested child this
+/// function had just deliberately rejected, and any headless one the crate spawned itself. On a
+/// Deck driving eDP-1 at 1280x800 with a game nested at `-W 1920 -H 1080`, the panel was listed as
+/// 1920x1080, and `mirror::create` publishes that row verbatim as the `preferred_mode` the stream
+/// negotiates against — a mode the composited node never produces, and one `check_mirrorable` waves
+/// through because it only rejects `0x0`.
+fn heads_under(base: &Path, argvs: &[Vec<String>]) -> Vec<PhysicalMonitor> {
     // A gamescope that isn't on DRM has no head of its own. Any DRM-backed one qualifies the box:
     // a Deck streaming from Game Mode often has a second, nested gamescope running the game inside
     // the session one, and that child must not disqualify its parent.
     let Some(argv) = argvs.iter().find(|a| drives_drm(a)) else {
         return Vec::new();
     };
+    let output_size = super::gamescope_output_size(argv);
     let connected = connected_connectors(base);
     if connected.is_empty() {
         return Vec::new();
@@ -342,7 +346,6 @@ mod tests {
         let heads = heads_under(
             &base,
             &[argv("/usr/bin/gamescope --prefer-output HDMI-A-1 --steam")],
-            None,
         );
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].connector, "HDMI-A-1");
@@ -366,12 +369,12 @@ mod tests {
             "gamescope --backend sdl",
         ] {
             assert!(
-                heads_under(&base, &[argv(a)], None).is_empty(),
+                heads_under(&base, &[argv(a)]).is_empty(),
                 "expected no heads for {a:?}"
             );
         }
         // No gamescope at all is the same answer, not an error.
-        assert!(heads_under(&base, &[], None).is_empty());
+        assert!(heads_under(&base, &[]).is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -384,12 +387,15 @@ mod tests {
             &base,
             &[
                 argv("gamescope --backend wayland -W 1280 -H 800"),
-                argv("/usr/bin/gamescope --prefer-output *,eDP-1 --steam"),
+                argv("/usr/bin/gamescope --prefer-output *,eDP-1 -W 2560 -H 1440 --steam"),
             ],
-            None,
         );
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].connector, "eDP-1");
+        // …and the size comes from the DRM PARENT, not from the nested child listed first. Reading
+        // it off any-gamescope-on-the-box is what published a 1280x800 panel as the mirror's
+        // preferred mode on a box where the game happened to be nested at a different size.
+        assert_eq!((heads[0].width, heads[0].height), (2560, 1440));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -404,7 +410,7 @@ mod tests {
                 ("card1-HDMI-A-1", "connected\n", "enabled\n"),
             ],
         );
-        let heads = heads_under(&base, &[argv("gamescope --prefer-output *,eDP-1")], None);
+        let heads = heads_under(&base, &[argv("gamescope --prefer-output *,eDP-1")]);
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].connector, "eDP-1");
         std::fs::remove_dir_all(&base).unwrap();
@@ -421,7 +427,7 @@ mod tests {
                 ("card1-HDMI-A-1", "connected\n", "enabled\n"),
             ],
         );
-        let heads = heads_under(&base, &[argv("gamescope --steam")], None);
+        let heads = heads_under(&base, &[argv("gamescope --steam")]);
         assert_eq!(
             heads
                 .iter()
@@ -440,7 +446,7 @@ mod tests {
             "unplugged",
             &[("card1-HDMI-A-1", "disconnected\n", "disabled\n")],
         );
-        assert!(heads_under(&base, &[argv("gamescope --steam")], None).is_empty());
+        assert!(heads_under(&base, &[argv("gamescope --steam")]).is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -452,7 +458,6 @@ mod tests {
         let heads = heads_under(
             &base,
             &[argv("gamescope -W 2560 -H 1440 --prefer-output HDMI-A-1")],
-            Some((2560, 1440)),
         );
         assert_eq!((heads[0].width, heads[0].height), (2560, 1440));
         std::fs::remove_dir_all(&base).unwrap();
@@ -511,7 +516,6 @@ mod tests {
             &[argv(
                 "gamescope --nested-refresh 30 --prefer-output HDMI-A-1",
             )],
-            None,
         );
         assert_eq!(heads[0].refresh_mhz, 60_000);
         assert_eq!(heads[0].mode_label(), "1920x1080@60");
@@ -539,7 +543,7 @@ mod tests {
             "3840x2160\n1920x1080\n",
         )
         .unwrap();
-        let heads = heads_under(&base, &[argv("gamescope --steam")], None);
+        let heads = heads_under(&base, &[argv("gamescope --steam")]);
         assert_eq!((heads[0].width, heads[0].height), (3840, 2160));
         std::fs::remove_dir_all(&base).unwrap();
     }

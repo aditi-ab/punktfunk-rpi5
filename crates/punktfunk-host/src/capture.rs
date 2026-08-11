@@ -10,12 +10,20 @@ use anyhow::Result;
 
 // The shared frame vocabulary lives in `pf-frame`; re-export the pieces host modules still name via
 // `crate::capture::*` (the capture mechanics that used the rest moved into pf-capture).
-pub use pf_frame::{CapturedFrame, OutputFormat, PixelFormat};
+pub use pf_frame::{CapturedFrame, OutputFormat};
+// `PixelFormat` is named through `crate::capture::` only by the GameStream media path; the Linux
+// pyrowave-modifier plumbing below uses it in-module. Off both (a native-only Windows build,
+// WP19), the re-export would be dead and -D warnings rejects it.
+#[cfg(any(target_os = "linux", feature = "gamestream"))]
+pub use pf_frame::PixelFormat;
 // The capturer types + trait + synthetics live in `pf-capture`; re-export them at the old paths.
 // `capturer_supports_hdr` is deliberately NOT re-exported: on Linux it is only the platform floor,
 // and a caller reaching for it by that name would silently miss the gamescope arm. The host's
 // answer is [`capturer_supports_hdr_for`] below.
-pub use pf_capture::{capturer_supports_444, Capturer, FastSyntheticCapturer, SyntheticCapturer};
+pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
+// Only the GameStream compat media path uses the fast synthetic source (WP19).
+#[cfg(feature = "gamestream")]
+pub use pf_capture::FastSyntheticCapturer;
 // `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest_at}` (main.rs subcommands) and
 // `crate::capture::synthetic_nv12` resolve through pf-capture's Windows modules.
 #[cfg(target_os = "windows")]

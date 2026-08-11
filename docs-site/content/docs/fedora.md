@@ -157,8 +157,14 @@ binary path — so a host you enabled with `systemctl --user enable --now punktf
 ```sh
 sudo firewall-cmd --reload                                            # load the installed definitions
 sudo firewall-cmd --permanent --add-service=punktfunk-native
-sudo firewall-cmd --permanent --add-service=punktfunk-gamestream
 sudo firewall-cmd --reload
+```
+
+Enabled **GameStream/Moonlight compat** (`PUNKTFUNK_GAMESTREAM=1` in `host.env` — see
+[What the unit starts](/docs/running-as-a-service#what-the-unit-starts))? Then also:
+
+```sh
+sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
 ```
 
 `punktfunk-native` opens UDP 9777 (QUIC control), UDP 5353 (mDNS discovery) and TCP 47990 (the
@@ -166,11 +172,6 @@ mgmt/library API — HTTPS + mTLS, read-only off loopback). `punktfunk-gamestrea
 Moonlight ports — TCP 47984, 47989 and 48010, UDP 47998–48000 — plus the same mDNS. The media
 **data plane** uses an ephemeral UDP port the client opens with a hole-punch, so there is nothing
 fixed to open for video.
-
-Switched the host to **native-only** — dropped `--gamestream` with a
-`systemctl --user edit punktfunk-host` drop-in, or you run `punktfunk-host serve` by hand? Then add
-`punktfunk-native` alone and leave `punktfunk-gamestream` out. `systemctl --user cat punktfunk-host`
-shows which one yours is.
 
 And if you want the web console reachable from another device, open **TCP 47992**:
 

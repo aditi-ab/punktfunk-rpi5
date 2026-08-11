@@ -231,6 +231,17 @@ pub(crate) async fn unpair_native_client(
     };
     match np.remove(&fingerprint) {
         Ok(true) => {
+            // Revocation reaches a LIVE session too: without this, a mid-stream client kept
+            // streaming after its pairing was removed, until it chose to disconnect.
+            let stopped =
+                crate::session_status::stop_by_fingerprint(&fingerprint.to_ascii_lowercase());
+            if stopped > 0 {
+                tracing::info!(
+                    fingerprint,
+                    stopped,
+                    "unpair: live native session(s) stopped"
+                );
+            }
             tracing::info!(fingerprint, "management API: native client unpaired");
             StatusCode::NO_CONTENT.into_response()
         }

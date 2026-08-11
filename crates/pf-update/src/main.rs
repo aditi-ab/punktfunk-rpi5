@@ -25,6 +25,12 @@
 //! (root-written, world-readable) for the unprivileged caller to read; stdout/stderr land in
 //! the unit's journal.
 
+// ROOT RUNS THIS. `deny` rather than `forbid` only because of the single `geteuid` call in
+// `linux_main::effective_uid`, which carries the one localized `#[allow(unsafe_code)]` in the
+// crate and explains there why it is not worth a dependency to remove. Any NEW unsafe anywhere
+// in this helper is a build error.
+#![deny(unsafe_code)]
+
 #[cfg(target_os = "linux")]
 mod linux_main {
     use serde::Serialize;
@@ -313,8 +319,7 @@ mod linux_main {
         };
         // Effective root is required for every leg; refuse early with a clear message
         // rather than half-running.
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc_geteuid() } != 0 {
+        if effective_uid() != 0 {
             eprintln!("pf-update: must run as root (start punktfunk-update.service)");
             std::process::exit(1);
         }
@@ -396,6 +401,20 @@ mod linux_main {
     extern "C" {
         #[link_name = "geteuid"]
         fn libc_geteuid() -> u32;
+    }
+
+    /// The crate's ONLY unsafe operation, isolated so the crate-level `deny(unsafe_code)` can
+    /// stand and the exemption is one named function rather than a whole call site.
+    ///
+    /// Deliberately NOT rewritten to `rustix::process::geteuid()`: this crate's Cargo.toml states
+    /// that the zero-dependency posture *is* a security invariant of a root helper ("no HTTP
+    /// client, no TLS, no argument parsing"), so pulling in a general-purpose syscall crate to
+    /// delete one `unsafe` would trade a real property for a cosmetic one.
+    #[allow(unsafe_code)]
+    fn effective_uid() -> u32 {
+        // SAFETY: `geteuid` is a POSIX syscall wrapper that takes no arguments, reads no memory
+        // through a pointer, cannot fail, and has no preconditions whatsoever.
+        unsafe { libc_geteuid() }
     }
 }
 

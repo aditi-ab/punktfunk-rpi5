@@ -36,6 +36,16 @@
 // Unsafe-proof program: every `unsafe {}` / `unsafe impl` in this crate carries a `// SAFETY:`
 // proof. The bulk lives in `abi.rs`, whose sites are instances of the ABI contract stated once at
 // the top of that file rather than 141 independent arguments.
+//
+// Beyond the proofs: `unsafe` is DENIED crate-wide, making the census result a compiler-enforced
+// invariant (rust-safety programme): **everything that PARSES network bytes is safe Rust** —
+// quic, packet, session, fec, crypto, tls, and the rest. The documented `#![allow(unsafe_code)]`
+// carve-outs are exactly two classes, and neither interprets attacker bytes:
+//   * the CLIENT surface — `abi` (the `extern "C"` boundary itself) and `client` (embedder glue);
+//   * the platform syscall-batching shims under `transport` (`udp/{apple,linux,windows}`,
+//     `qos_windows`) — sendmmsg/recvmsg_x/USO/qWAVE move caller-owned buffers, nothing more.
+// A new module parsing wire data may NOT add a carve-out.
+#![deny(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 

@@ -21,6 +21,7 @@
 //! Persisted to `<config>/display-identity.json` (migrated from the legacy Windows
 //! `pf-vdisplay-identity.json`) so ids — and the client→config association — survive host restarts.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -78,12 +79,38 @@ impl DisplayIdentityMap {
     pub(crate) fn load() -> Self {
         let dir = pf_paths::config_dir();
         let path = dir.join(FILE);
-        let bytes = std::fs::read(&path)
-            .or_else(|_| std::fs::read(dir.join(LEGACY_FILE)))
-            .ok();
-        let mut store = bytes
-            .and_then(|b| serde_json::from_slice::<Store>(&b).ok())
-            .unwrap_or_default();
+        let (from, bytes) = match std::fs::read(&path) {
+            Ok(b) => (path.clone(), Some(b)),
+            Err(_) => {
+                let legacy = dir.join(LEGACY_FILE);
+                match std::fs::read(&legacy) {
+                    Ok(b) => (legacy, Some(b)),
+                    // No file at all is the ordinary first-run case — not worth a word.
+                    Err(_) => (path.clone(), None),
+                }
+            }
+        };
+        let mut store = match bytes {
+            Some(b) => match serde_json::from_slice::<Store>(&b) {
+                Ok(s) => s,
+                Err(e) => {
+                    // An UNPARSEABLE map used to be swallowed into `Default::default()`, and the very
+                    // next `resolve` persisted that empty store OVER the file — silently discarding
+                    // every client's Windows EDID serial / KWin `Virtual-punktfunk-<id>` and the
+                    // per-display DPI the OS keyed to them. Say so, and move the file aside so the
+                    // damage is recoverable by hand (same treatment `display-presets.json` gets).
+                    tracing::warn!(
+                        path = %from.display(),
+                        error = %e,
+                        "display-identity map is unreadable — starting a fresh one; \
+                         the old file is kept as .bad (every client re-derives its display id once)"
+                    );
+                    let _ = std::fs::rename(&from, from.with_extension("json.bad"));
+                    Store::default()
+                }
+            },
+            None => Store::default(),
+        };
         // SANITIZE a hand-edited / corrupt / cross-version file before trusting it: resolve()'s
         // found-entry branch returns the stored id verbatim, so an out-of-range id (0 = the "auto"
         // sentinel, or > MAX_ID) or a duplicate id/key would flow straight into the display identity.
@@ -100,7 +127,17 @@ impl DisplayIdentityMap {
 
     /// The stable id (`1..=15`) for the client `key` ([`identity_key`]): its remembered id, or a
     /// freshly assigned one (lowest free, else LRU-evict at the cap). Bumps the entry to MRU and persists.
-    pub(crate) fn resolve(&mut self, key: &str) -> u32 {
+    ///
+    /// `live` is the set of ids that currently drive a REAL display (the Windows manager's slot keys
+    /// / the Linux pool's `identity_slot`s). An id in it is never evicted, and when every eviction
+    /// candidate is live this **refuses** (`None`) rather than handing the newcomer an id that is
+    /// already someone else's monitor. That is not hypothetical: the id keys the Windows manager's
+    /// slot map, whose plain-JOIN branch attaches an arriving session to whatever monitor the slot
+    /// already holds — so evicting a live id handed client B client A's streaming monitor, capture
+    /// target and all. Refusing costs the newcomer its stable identity (upstream falls back to the
+    /// shared/auto slot: `resolve_slot` → `None`, `slot_id_for` → `0`); evicting cost a live client
+    /// its session.
+    pub(crate) fn resolve(&mut self, key: &str, live: &BTreeSet<u32>) -> Option<u32> {
         self.store.tick = self.store.tick.wrapping_add(1);
         let now = self.store.tick;
 
@@ -108,32 +145,43 @@ impl DisplayIdentityMap {
             e.seen = now;
             let id = e.id;
             self.persist();
-            return id;
+            return Some(id);
         }
 
-        // New client: prefer the lowest free id in 1..=MAX_ID; if all are taken, evict the LRU entry and
-        // reuse its id (the evicted client re-establishes its scaling once on its next connect).
-        let id = (1..=MAX_ID)
-            .find(|i| !self.store.entries.iter().any(|e| e.id == *i))
-            .unwrap_or_else(|| {
+        // New client: prefer the lowest free id in 1..=MAX_ID; if all are taken, evict the
+        // least-recently-seen entry that is NOT live and reuse its id (that client re-establishes its
+        // scaling once on its next connect).
+        let id = match (1..=MAX_ID).find(|i| !self.store.entries.iter().any(|e| e.id == *i)) {
+            Some(free) => free,
+            None => {
                 let lru = self
                     .store
                     .entries
                     .iter()
                     .enumerate()
+                    .filter(|(_, e)| !live.contains(&e.id))
                     .min_by_key(|(_, e)| e.seen)
-                    .map(|(i, _)| i)
-                    .expect("entries are non-empty whenever every id 1..=MAX_ID is taken");
-                let evicted = self.store.entries.remove(lru);
-                evicted.id
-            });
+                    .map(|(i, _)| i);
+                let Some(lru) = lru else {
+                    tracing::warn!(
+                        cap = MAX_ID,
+                        live = live.len(),
+                        "display identity map is full and every id is driving a live display — \
+                         this client gets the shared/auto display identity (no persisted per-client \
+                         scaling) rather than displacing a live one"
+                    );
+                    return None;
+                };
+                self.store.entries.remove(lru).id
+            }
+        };
         self.store.entries.push(Entry {
             key: key.to_string(),
             id,
             seen: now,
         });
         self.persist();
-        id
+        Some(id)
     }
 
     /// Persist atomically (temp file + rename). Best-effort: a write failure just means a restart may
@@ -168,7 +216,8 @@ pub(crate) fn global() -> &'static Mutex<DisplayIdentityMap> {
 /// Resolve the connecting client's stable slot id per the `identity` policy. When no policy is
 /// configured, `default` applies — **PerClient on Windows / Shared on Linux**, preserving each
 /// platform's historical behavior (Windows always keyed monitors per-client; Linux used one shared
-/// output name). `None` ⇒ shared / anonymous → the backend uses its base name / auto slot.
+/// output name). `None` ⇒ shared / anonymous (or the map [refused](DisplayIdentityMap::resolve) an
+/// id because every one is live) → the backend uses its base name / auto slot.
 pub(crate) fn resolve_slot(
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
@@ -185,12 +234,40 @@ pub(crate) fn resolve_slot(
         Identity::PerClientMode => true,
     };
     let fp = fp?;
-    Some(
-        global()
-            .lock()
-            .unwrap()
-            .resolve(&identity_key(fp, mode, per_client_mode)),
-    )
+    // Sample the live ids BEFORE taking the map lock, never under it: the sources below take the
+    // Windows manager's `state` lock / the Linux pool lock, and this map is reached from inside a
+    // backend `create` — a lock order of (display owner → identity map) in both directions would be
+    // a deadlock. One direction only, and the map lock stays a leaf.
+    let live = live_slot_ids();
+    global()
+        .lock()
+        .unwrap()
+        .resolve(&identity_key(fp, mode, per_client_mode), &live)
+}
+
+/// The identity slots currently driving a REAL display — the eviction guard for
+/// [`DisplayIdentityMap::resolve`]. Windows reads the manager's slot map (the key IS the identity
+/// slot); Linux reads the registry pool's per-entry `identity_slot`. Both include KEPT
+/// (lingering/pinned) displays on purpose: a kept display is a live compositor/driver resource whose
+/// owner is expected back, and the whole point of the id is that the reconnect finds it again.
+/// Anonymous (`0`) is not an identity and never blocks an assignment.
+fn live_slot_ids() -> BTreeSet<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::manager::snapshot()
+            .into_iter()
+            .map(|i| i.slot_id)
+            .filter(|s| *s != 0)
+            .collect()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::registry::live_identity_slots()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        BTreeSet::new()
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -306,24 +383,31 @@ mod tests {
         }
     }
 
+    /// Nothing is streaming — the ordinary case, where the live set never constrains anything.
+    fn nothing_live() -> BTreeSet<u32> {
+        BTreeSet::new()
+    }
+
     #[test]
     fn stable_across_calls_and_distinct_per_client() {
         let mut m = temp_map("stable");
-        let a1 = m.resolve(&identity_key(fp(1), (1920, 1080), false));
-        let b = m.resolve(&identity_key(fp(2), (1920, 1080), false));
-        let a2 = m.resolve(&identity_key(fp(1), (1280, 720), false)); // per-client: mode ignored
+        let a1 = m.resolve(&identity_key(fp(1), (1920, 1080), false), &nothing_live());
+        let b = m.resolve(&identity_key(fp(2), (1920, 1080), false), &nothing_live());
+        // per-client: mode ignored
+        let a2 = m.resolve(&identity_key(fp(1), (1280, 720), false), &nothing_live());
         assert_eq!(a1, a2, "same client → same id (per-client ignores mode)");
         assert_ne!(a1, b, "distinct clients → distinct ids");
-        assert!((1..=MAX_ID).contains(&a1) && (1..=MAX_ID).contains(&b));
+        assert!(a1.is_some_and(|i| (1..=MAX_ID).contains(&i)));
+        assert!(b.is_some_and(|i| (1..=MAX_ID).contains(&i)));
         let _ = std::fs::remove_file(&m.path);
     }
 
     #[test]
     fn per_client_mode_splits_by_resolution() {
         let mut m = temp_map("permode");
-        let hd = m.resolve(&identity_key(fp(1), (1920, 1080), true));
-        let uhd = m.resolve(&identity_key(fp(1), (3840, 2160), true));
-        let hd2 = m.resolve(&identity_key(fp(1), (1920, 1080), true));
+        let hd = m.resolve(&identity_key(fp(1), (1920, 1080), true), &nothing_live());
+        let uhd = m.resolve(&identity_key(fp(1), (3840, 2160), true), &nothing_live());
+        let hd2 = m.resolve(&identity_key(fp(1), (1920, 1080), true), &nothing_live());
         assert_ne!(hd, uhd, "same client, different resolution → different id");
         assert_eq!(hd, hd2, "same client + resolution → same id");
         let _ = std::fs::remove_file(&m.path);
@@ -333,13 +417,69 @@ mod tests {
     fn lru_eviction_reuses_an_id_at_the_cap() {
         let mut m = temp_map("lru");
         for n in 1..=15u8 {
-            m.resolve(&identity_key(fp(n), (1920, 1080), false));
+            m.resolve(&identity_key(fp(n), (1920, 1080), false), &nothing_live());
         }
-        let _ = m.resolve(&identity_key(fp(2), (1920, 1080), false)); // touch 2 so 1 is LRU
-        let id16 = m.resolve(&identity_key(fp(16), (1920, 1080), false));
+        // touch 2 so 1 is LRU
+        let _ = m.resolve(&identity_key(fp(2), (1920, 1080), false), &nothing_live());
+        let id16 = m
+            .resolve(&identity_key(fp(16), (1920, 1080), false), &nothing_live())
+            .expect("nothing is live → the LRU id is free to take");
         assert!((1..=MAX_ID).contains(&id16));
         assert_eq!(m.store.entries.len(), 15, "cap holds at 15 entries");
         assert!(m.store.entries.iter().all(|e| (1..=MAX_ID).contains(&e.id)));
+        let _ = std::fs::remove_file(&m.path);
+    }
+
+    /// 10.2: the LRU victim is chosen among ids that are NOT driving a display. Handing the LRU id
+    /// to a newcomer while its owner streams is what let the Windows manager's plain-JOIN branch
+    /// attach the newcomer to the live client's monitor.
+    #[test]
+    fn lru_eviction_never_takes_a_live_id() {
+        let mut m = temp_map("lru-live");
+        let mut ids = Vec::new();
+        for n in 1..=15u8 {
+            ids.push(
+                m.resolve(&identity_key(fp(n), (1920, 1080), false), &nothing_live())
+                    .unwrap(),
+            );
+        }
+        // fp(1) is the least-recently-seen — and it is the one that is streaming.
+        let lru_id = ids[0];
+        let live: BTreeSet<u32> = [lru_id].into_iter().collect();
+        let id16 = m
+            .resolve(&identity_key(fp(16), (1920, 1080), false), &live)
+            .expect("14 idle ids remain — one of them is the victim");
+        assert_ne!(id16, lru_id, "must not take the id of a live display");
+        assert_eq!(id16, ids[1], "the next-least-recently-seen IDLE id instead");
+        // The live client's mapping is untouched, so its reconnect still finds its own display.
+        assert_eq!(
+            m.resolve(&identity_key(fp(1), (1920, 1080), false), &live),
+            Some(lru_id)
+        );
+        let _ = std::fs::remove_file(&m.path);
+    }
+
+    /// Fail-closed at the extreme: every id live ⇒ refuse, rather than displace a streaming client.
+    /// The caller degrades to the shared/auto identity (`resolve_slot` → `None`, `slot_id_for` → 0).
+    #[test]
+    fn refuses_rather_than_evicting_when_every_id_is_live() {
+        let mut m = temp_map("lru-all-live");
+        let mut live = BTreeSet::new();
+        for n in 1..=15u8 {
+            live.insert(
+                m.resolve(&identity_key(fp(n), (1920, 1080), false), &BTreeSet::new())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            m.resolve(&identity_key(fp(16), (1920, 1080), false), &live),
+            None
+        );
+        assert_eq!(m.store.entries.len(), 15, "nothing was evicted");
+        // A KNOWN client is still resolved even when everything is live — it owns that id already.
+        assert!(m
+            .resolve(&identity_key(fp(3), (1920, 1080), false), &live)
+            .is_some());
         let _ = std::fs::remove_file(&m.path);
     }
 

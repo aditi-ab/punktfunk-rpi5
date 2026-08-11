@@ -197,6 +197,15 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     if bw == 0 || bh == 0 || bw > 1024 || bh > 1024 {
         return;
     }
+    // SPA's second "no image data" signal, distinct from the `bitmap_offset == 0` position-only
+    // case above: `spa_meta_bitmap.offset` is the offset of the PIXELS within the bitmap struct,
+    // and 0 means there are none. Without this, `pix_off == 0` made the pixel extent start at the
+    // `spa_meta_bitmap` header itself, so a producer signalling an invisible pointer got its own
+    // header words (format/size/stride/offset) decoded and cached as the cursor bitmap. In bounds,
+    // so not unsound — just garbage pixels blitted into every later frame.
+    if pix_off == 0 {
+        return;
+    }
     let row = bw as usize * 4;
     let stride = if stride < row { row } else { stride };
     let Some(extent) = bitmap_extent(bmp_off, pix_off, stride, row, bh as usize, region_size)
@@ -327,7 +336,8 @@ pub(super) fn composite_cursor_rgb10(
 }
 
 /// Alpha-blend the cached cursor bitmap into the tightly-packed CPU frame at its latched
-/// position. Cheap: a straight-alpha blit over at most ~256×256 pixels, clipped to the frame —
+/// position. Cheap: a straight-alpha blit over at most 1024×1024 pixels (the accepted cap; real
+/// cursors are ≤96 px), clipped to the frame —
 /// the whole point of cursor-as-metadata (no forced full-frame composite on the producer).
 pub(super) fn composite_cursor(
     tight: &mut [u8],

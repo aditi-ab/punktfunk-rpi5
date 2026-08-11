@@ -17,7 +17,7 @@
 // child-module shape. External imports are this file's own; `vk_util` is a crate-root sibling,
 // so the path is `crate::`, not the parent-relative `super::` the parent uses.
 use super::*;
-use crate::vk_util::{find_mem, make_plain_image, make_view};
+use crate::vk_util::{ext_advertised, find_mem, make_plain_image, make_view};
 use anyhow::{bail, Result};
 use ash::vk;
 use std::ffi::c_void;
@@ -53,10 +53,10 @@ pub(super) unsafe fn probe_rgb_direct(
     let Ok(exts) = instance.enumerate_device_extension_properties(pd) else {
         return Err("probe-failed(ext-enum)");
     };
-    if !exts
-        .iter()
-        .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == vrgb::EXTENSION_NAME)
-    {
+    // Route through `vk_util::ext_advertised` rather than open-coding the walk a second time:
+    // this copy used the same unbounded `CStr::from_ptr` and had the same read-past-the-array
+    // hazard on a driver that fills all VK_MAX_EXTENSION_NAME_SIZE bytes without a NUL.
+    if !ext_advertised(&exts, vrgb::EXTENSION_NAME) {
         return Err("no-ext(mesa<26.0-or-no-efc)");
     }
     // 2. Feature bit.

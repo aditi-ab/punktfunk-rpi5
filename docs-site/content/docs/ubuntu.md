@@ -152,27 +152,27 @@ Ubuntu installs `ufw` but leaves it **inactive**, so out of the box
 there is nothing to open. If you did enable one — common on Ubuntu Server — the package ships the
 openers for both, because a package never edits your firewall itself.
 
-The packaged unit runs `serve --gamestream` — the `.deb` installs it as it ships and only rewrites
-the binary path — so a host you enabled with `systemctl --user enable --now punktfunk-host` serves
-**both** the native `punktfunk/1` plane and stock [Moonlight](/docs/moonlight) clients, and needs
-**both** openers:
+The packaged unit runs the **secure native-only host** (`serve`, no GameStream), so a host you
+enabled with `systemctl --user enable --now punktfunk-host` needs only the native opener:
 
 ```sh
 # ufw:
 sudo ufw allow punktfunk-native
-sudo ufw allow punktfunk-gamestream
 
 # firewalld:
 sudo firewall-cmd --reload                                        # load the installed definitions
 sudo firewall-cmd --permanent --add-service=punktfunk-native
-sudo firewall-cmd --permanent --add-service=punktfunk-gamestream
 sudo firewall-cmd --reload
 ```
 
-Switched the host to **native-only** — dropped `--gamestream` with a
-`systemctl --user edit punktfunk-host` drop-in, or you run `punktfunk-host serve` by hand? Then open
-`punktfunk-native` alone and leave `punktfunk-gamestream` closed. `systemctl --user cat
-punktfunk-host` shows which one yours is.
+Enabled **GameStream/Moonlight compat** (`PUNKTFUNK_GAMESTREAM=1` in `host.env` — see
+[What the unit starts](/docs/running-as-a-service#what-the-unit-starts)), or you pass
+`--gamestream` by hand? Then also open its service:
+
+```sh
+sudo ufw allow punktfunk-gamestream                               # ufw
+sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
+```
 
 `punktfunk-native` opens UDP 9777 (QUIC control), UDP 5353 (mDNS discovery) and TCP 47990 (the
 mgmt/library API — HTTPS + mTLS, read-only off loopback). `punktfunk-gamestream` opens the fixed

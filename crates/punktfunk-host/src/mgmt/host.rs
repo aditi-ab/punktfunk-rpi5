@@ -432,6 +432,9 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
 pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
     // GameStream plane (set by RTSP/nvhttp on the compat path).
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
+    // The RTSP-negotiated stream slot only exists in GameStream-featured builds (WP19); a
+    // native-only build never has a compat-plane stream to report.
+    #[cfg(feature = "gamestream")]
     let gs_stream = *st.app.stream.lock().unwrap_or_else(|e| e.into_inner());
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
@@ -454,39 +457,41 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
                 fps: s.fps,
             })
         });
-    let stream = gs_stream
-        .map(|c| StreamInfo {
-            width: c.width,
-            height: c.height,
-            fps: c.fps,
-            bitrate_kbps: c.bitrate_kbps,
-            packet_size: c.packet_size as u32,
-            min_fec: c.min_fec,
-            codec: c.codec.into(),
-            // Transition latencies are traced on the native plane only (latency plan P0.1).
-            time_to_first_frame_ms: None,
-            last_resize_ms: None,
+    #[cfg(feature = "gamestream")]
+    let gs_stream_info = gs_stream.map(|c| StreamInfo {
+        width: c.width,
+        height: c.height,
+        fps: c.fps,
+        bitrate_kbps: c.bitrate_kbps,
+        packet_size: c.packet_size as u32,
+        min_fec: c.min_fec,
+        codec: c.codec.into(),
+        // Transition latencies are traced on the native plane only (latency plan P0.1).
+        time_to_first_frame_ms: None,
+        last_resize_ms: None,
+    });
+    #[cfg(not(feature = "gamestream"))]
+    let gs_stream_info: Option<StreamInfo> = None;
+    let stream = gs_stream_info.or_else(|| {
+        native.first().map(|s| StreamInfo {
+            width: s.width,
+            height: s.height,
+            fps: s.fps,
+            bitrate_kbps: s.bitrate_kbps,
+            // FEC/packetization are RTSP-negotiated (GameStream only); the native QUIC plane
+            // shards differently, so these are 0 (not applicable) for a native session.
+            packet_size: 0,
+            min_fec: 0,
+            codec: s.codec.into(),
+            time_to_first_frame_ms: (s.time_to_first_frame_ms > 0)
+                .then_some(s.time_to_first_frame_ms),
+            last_resize_ms: (s.last_resize_ms > 0).then_some(s.last_resize_ms),
         })
-        .or_else(|| {
-            native.first().map(|s| StreamInfo {
-                width: s.width,
-                height: s.height,
-                fps: s.fps,
-                bitrate_kbps: s.bitrate_kbps,
-                // FEC/packetization are RTSP-negotiated (GameStream only); the native QUIC plane
-                // shards differently, so these are 0 (not applicable) for a native session.
-                packet_size: 0,
-                min_fec: 0,
-                codec: s.codec.into(),
-                time_to_first_frame_ms: (s.time_to_first_frame_ms > 0)
-                    .then_some(s.time_to_first_frame_ms),
-                last_resize_ms: (s.last_resize_ms > 0).then_some(s.last_resize_ms),
-            })
-        });
+    });
     Json(RuntimeStatus {
         video_streaming: gs_video || !native.is_empty(),
         audio_streaming: gs_audio || !native.is_empty(),
-        pin_pending: st.app.pairing.pin.awaiting_pin(),
+        pin_pending: gs_pin_pending(&st),
         paired_clients: st
             .app
             .paired
@@ -575,7 +580,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
             .unwrap_or_else(|e| e.into_inner())
             .len() as u32,
         native_paired_clients,
-        pin_pending: st.app.pairing.pin.awaiting_pin(),
+        pin_pending: gs_pin_pending(&st),
         pending_approvals,
         kept_displays: crate::vdisplay::registry::snapshot()
             .displays
@@ -593,4 +598,16 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
             })
             .collect(),
     })
+}
+
+/// Whether the GameStream PIN flow is parked waiting for a PIN — `false` by construction in a
+/// native-only build (WP19), where the pairing machinery does not exist. The API field stays so
+/// the schema (and every console) is identical across build flavors.
+#[cfg(feature = "gamestream")]
+fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
+    st.app.pairing.pin.awaiting_pin()
+}
+#[cfg(not(feature = "gamestream"))]
+fn gs_pin_pending(_st: &Arc<MgmtState>) -> bool {
+    false
 }

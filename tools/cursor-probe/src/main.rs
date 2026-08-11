@@ -7,6 +7,11 @@
 //! `--embedded` A/Bs the pre-channel path (compositor embeds the pointer, no metadata expected);
 //! `--gpu` takes the zero-copy dmabuf negotiation a real session uses instead of the CPU mmap path.
 
+// A diagnostic that drives the same PipeWire/dmabuf negotiation the host does, but through safe
+// wrappers only. Free to lock down, and worth locking down: a probe is exactly the kind of tool
+// where "just deref it quickly to see what's there" is tempting.
+#![forbid(unsafe_code)]
+
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     linux::run()

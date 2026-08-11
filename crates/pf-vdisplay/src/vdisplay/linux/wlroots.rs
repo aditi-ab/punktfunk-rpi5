@@ -40,7 +40,11 @@ fn chooser_file() -> String {
 }
 
 /// The chooser command xdpw runs via `/bin/sh -c`, reading stdout. The `|| echo` fallback keeps
-/// plain portal capture (`--source portal`) working when no session has written the chooser file.
+/// plain portal capture (`--source portal`) working when no session of ours is mid-handshake — it
+/// is a GUESS at sway's own first headless output, right on a box whose sway loads the headless
+/// backend with one output of its own and wrong (a cast of nothing) otherwise. It is reachable
+/// again: the per-session file is removed with the handshake it steers ([`ChooserFile`]), so it no
+/// longer sits there naming an output we have since unplugged.
 fn chooser_cmd() -> String {
     format!(
         "cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'",
@@ -68,8 +72,14 @@ impl WlrootsDisplay {
 
 /// wlroots/Sway is usable when the host runs inside a Sway session — signalled by `SWAYSOCK`
 /// (the IPC socket `swaymsg create_output` needs). Cheap env check for the enumeration path.
+///
+/// Under [`crate::with_env_lock`]: this runs on a management worker (`/host/compositors` →
+/// [`crate::available`]) concurrently with another connect's `apply_session_env`, which `set_var`s
+/// — and, when no sway session is live, `remove_var`s — this very key. A glibc `getenv` racing a
+/// `setenv` is the `environ` realloc data race ENV_LOCK exists for, and it is UB whichever key each
+/// side names. No caller holds the lock (the mutex is not reentrant).
 pub fn is_available() -> bool {
-    std::env::var_os("SWAYSOCK").is_some()
+    crate::with_env_lock(|| std::env::var_os("SWAYSOCK")).is_some()
 }
 
 impl VirtualDisplay for WlrootsDisplay {
@@ -86,13 +96,33 @@ impl VirtualDisplay for WlrootsDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        let before = output_names()
-            .context("swaymsg get_outputs (is the host inside the sway session env — SWAYSOCK?)")?;
-        swaymsg(&["create_output"])
-            .context("swaymsg create_output (sway needs the headless backend loaded)")?;
-        // The output appears synchronously in practice; poll briefly to be safe, and own it
-        // from here on so error unwinding unplugs it.
-        let output = OutputGuard(wait_new_output(&before, Duration::from_secs(5))?);
+        warn_topology_is_extend_only();
+        // Snapshot → create → identify, all under CREATE_LOCK. sway names the headless output
+        // itself (`HEADLESS-N`), so the only way to know which one is ours is "the name that was not
+        // there before" — and two concurrent creates each picking the other's output is a silent
+        // mis-capture, not a failure (mutter's TOPOLOGY_LOCK exists for exactly this class). The
+        // lock also gives the failure path somewhere safe to unplug from: the output already exists
+        // by the time `wait_new_output` can fail, and nothing else may have created one meanwhile.
+        let output = {
+            let _create = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let before = output_names().context(
+                "swaymsg get_outputs (is the host inside the sway session env — SWAYSOCK?)",
+            )?;
+            swaymsg(&["create_output"])
+                .context("swaymsg create_output (sway needs the headless backend loaded)")?;
+            // The output appears synchronously in practice; poll briefly to be safe, and own it
+            // from here on so error unwinding unplugs it.
+            match wait_new_output(&before, Duration::from_secs(5)) {
+                Ok(name) => OutputGuard(name),
+                Err(e) => {
+                    // `create_output` reported success, so an output very probably exists — it just
+                    // never showed up in time (or showed up a moment after we gave up). Unowned, it
+                    // would sit in the operator's sway layout forever.
+                    unplug_strays(&before);
+                    return Err(e);
+                }
+            }
+        };
         let name = output.0.clone();
 
         // The client's exact mode (also the refresh clock that makes the output produce frames).
@@ -128,7 +158,7 @@ impl VirtualDisplay for WlrootsDisplay {
             remote_fd: Some(fd),
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
             keepalive: Box::new(Keepalive {
-                _stop: StopGuard(stop),
+                _stop: stop,
                 _output: output,
             }),
             // Owned (the compositor output is ours to tear down), but not registry-poolable: the
@@ -159,6 +189,52 @@ impl Drop for StopGuard {
     }
 }
 
+/// Serializes **snapshot → `create_output` → identify-the-new-name**, process-wide. sway names its
+/// headless outputs itself, so ownership is established by a before/after diff and two concurrent
+/// creates would each adopt the other's output — which does not fail, it silently streams the wrong
+/// one. Mutter's `TOPOLOGY_LOCK` is the same guard for the same reason; Hyprland needs none because
+/// it lets us NAME the output (D6).
+static CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unplug any headless output that appeared since `before` and that nothing owns — the cleanup for a
+/// `create_output` whose output we could not identify in time. Only `HEADLESS-*` is touched: a
+/// physical hotplug in the same window is the operator's, not ours, and `unplug` on a real connector
+/// would take their screen away. Best-effort by construction, and it runs with [`CREATE_LOCK`] held
+/// so nothing else in this process can have created the strays it sees.
+fn unplug_strays(before: &[String]) {
+    let Ok(now) = output_names() else { return };
+    for name in now
+        .into_iter()
+        .filter(|n| n.starts_with("HEADLESS-") && !before.iter().any(|b| b == n))
+    {
+        match swaymsg(&["output", &name, "unplug"]) {
+            Ok(_) => tracing::warn!(output = %name, "unplugged a headless output we created but \
+                 could not identify in time"),
+            Err(e) => tracing::warn!(output = %name, error = %format!("{e:#}"), "could not unplug \
+                 the headless output left behind by a failed create"),
+        }
+    }
+}
+
+/// The configured [`crate::policy::Topology`] is not implemented on this backend — say so once per
+/// create instead of leaving the management API's echo as the only signal that the pin was dropped
+/// (sweep 13.18). sway's virtual output is always an EXTENSION: nothing here promotes it to primary
+/// or disables the operator's heads.
+fn warn_topology_is_extend_only() {
+    let topology = crate::effective_topology();
+    if !matches!(
+        topology,
+        crate::policy::Topology::Extend | crate::policy::Topology::Auto
+    ) {
+        tracing::warn!(
+            ?topology,
+            "wlroots: this backend implements EXTEND only — the headless output is added beside the \
+             operator's heads and nothing is promoted or disabled. Configure `topology: extend` to \
+             stop the console promising otherwise."
+        );
+    }
+}
+
 /// Owns the created headless output; dropping it unplugs it from sway.
 struct OutputGuard(String);
 
@@ -171,15 +247,26 @@ impl Drop for OutputGuard {
     }
 }
 
+/// Budget for one `swaymsg` call ([`crate::proc`]).
+///
+/// swaymsg is a CLIENT of the compositor it drives: against a wedged sway it blocks in its own
+/// connect to the IPC socket and never returns — and these calls run on the session's stream thread,
+/// whose only way to end a session is to return, so one hung query used to wedge the session
+/// permanently. Generous next to a healthy call (single-digit milliseconds), and every call site
+/// here already has a failed-query path, so a timeout lands on behaviour that already exists.
+const SWAYMSG_BUDGET: Duration = Duration::from_secs(5);
+
+/// Budget for the one-shot xdpw restart. `systemctl --user try-restart` waits for the unit's job to
+/// settle, so it is the slowest helper on this path — and its result is already ignored.
+const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
+
 /// Run `swaymsg -- <args>`, returning stdout (`--` so command tokens like `--custom` reach
 /// sway instead of swaymsg's own getopt). swaymsg exits non-zero (with the error on stderr/
 /// stdout) when the command fails, so checking the status covers `{"success": false}` too.
 fn swaymsg(args: &[&str]) -> Result<String> {
-    let out = Command::new("swaymsg")
-        .arg("--")
-        .args(args)
-        .output()
-        .context("run swaymsg (is sway installed?)")?;
+    let out =
+        crate::proc::output_within(Command::new("swaymsg").arg("--").args(args), SWAYMSG_BUDGET)
+            .context("run swaymsg (is sway installed?)")?;
     if !out.status.success() {
         bail!(
             "swaymsg {:?} failed: {}{}",
@@ -197,10 +284,11 @@ fn swaymsg(args: &[&str]) -> Result<String> {
 /// *command*, which is right for `create_output` and wrong for a query — `-t` after `--` comes back
 /// as `Unknown/invalid command '-t'` (caught on-glass writing the monitor enumeration).
 fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
-    let out = Command::new("swaymsg")
-        .args(["-t", kind, "--raw"])
-        .output()
-        .context("run swaymsg (is sway installed?)")?;
+    let out = crate::proc::output_within(
+        Command::new("swaymsg").args(["-t", kind, "--raw"]),
+        SWAYMSG_BUDGET,
+    )
+    .context("run swaymsg (is sway installed?)")?;
     if !out.status.success() {
         bail!(
             "swaymsg -t {kind} failed: {}",
@@ -230,13 +318,37 @@ fn output_names() -> Result<Vec<String>> {
 /// handshake, not just the write, because the read happens inside it.
 static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The per-session chooser file, removed when the handshake it steers is over.
+///
+/// Its lifetime is the HANDSHAKE, not the session: xdpw reads it once, inside
+/// [`select_and_cast`]'s critical section, and everything after that is the cast's own business.
+/// Left behind (as it was) the stale `Monitor: HEADLESS-3` outlives the output `Drop` has since
+/// unplugged, and it permanently shadows [`chooser_cmd`]'s `|| echo` fallback — so a later
+/// `--source portal` capture with no session of ours running steers at a connector that is gone.
+/// Tying removal to the CAST instead would be worse still: the file is one per user, so a session
+/// ending hours later would delete a *sibling's* selection out from under its picker.
+struct ChooserFile(String);
+
+impl Drop for ChooserFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %self.0, error = %e, "could not remove the xdpw chooser file");
+            }
+        }
+    }
+}
+
 /// Point xdpw's chooser at `output` and run the ScreenCast handshake, returning the portal fd +
 /// node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
-fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, Arc<AtomicBool>)> {
+fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopGuard)> {
     ensure_xdpw_config()?;
     let chooser = chooser_file();
     std::fs::write(&chooser, format!("Monitor: {output}\n"))
         .with_context(|| format!("write {chooser}"))?;
+    // Owned from the write on: every arm below (and every `?`) leaves the handshake, which is the
+    // only thing that reads it.
+    let _chooser = ChooserFile(chooser);
     let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -244,8 +356,16 @@ fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, Arc<A
         .name("punktfunk-wlr-cast".into())
         .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
         .context("spawn wlroots portal thread")?;
+    // Built BEFORE the wait so EVERY error arm below sets the flag on its way out — as Mutter's
+    // `create` does. Returning the bare `Arc` and letting the CALLER wrap it left the two failure
+    // arms dropping an un-set flag: the thread's `send` can still LAND in the queue in the window
+    // between `recv_timeout` giving up and `setup_rx` being dropped, so it reports success and then
+    // parks forever on `while !stop`, holding a live ScreenCast session, its zbus connection, an
+    // `OwnedFd` and a 2-worker tokio runtime — one more set per slow-portal connect, for the host's
+    // lifetime, against an output that no longer exists.
+    let guard = StopGuard(stop);
     match setup_rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok((fd, node_id))) => Ok((fd, node_id, stop)),
+        Ok(Ok((fd, node_id))) => Ok((fd, node_id, guard)),
         Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
         Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
     }
@@ -266,7 +386,7 @@ pub(crate) fn stream_existing_output(
     Ok(crate::mirror::MirrorStream {
         node_id,
         remote_fd: Some(fd),
-        keepalive: Box::new(StopGuard(stop)),
+        keepalive: Box::new(stop),
     })
 }
 
@@ -374,9 +494,13 @@ fn ensure_xdpw_config() -> Result<()> {
         return Ok(());
     }
     tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-wlr at the managed output chooser");
-    let _ = Command::new("systemctl")
-        .args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"])
-        .status();
+    // Bounded: `systemctl --user` blocks on the user manager's job queue, and this runs on the
+    // session's stream thread. Its result was already ignored — a timeout just means the portal
+    // picks the new config up whenever it next starts.
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"]),
+        PORTAL_RESTART_BUDGET,
+    );
     Ok(())
 }
 

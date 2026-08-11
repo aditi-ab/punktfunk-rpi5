@@ -273,7 +273,13 @@ fn fetch_summary(agent: &ureq::Agent, url: &str) -> Option<Summary> {
 /// a port-squatter gains nothing but a fake "streaming" tooltip on an already-compromised box.
 fn load_pin() -> Option<[u8; 32]> {
     use rustls::pki_types::pem::PemObject;
-    let pem = std::fs::read(punktfunk_config_dir()?.join("cert.pem")).ok()?;
+    let dir = punktfunk_config_dir()?;
+    // The mgmt API presents the NATIVE identity when one exists (the identity split —
+    // host `crate::identity`); `cert.pem` is the legacy/GameStream identity, still what mgmt
+    // serves on hosts that predate the split. Prefer the native cert, fall back to legacy.
+    let pem = std::fs::read(dir.join("native-cert.pem"))
+        .or_else(|_| std::fs::read(dir.join("cert.pem")))
+        .ok()?;
     let der = rustls::pki_types::CertificateDer::from_pem_slice(&pem).ok()?;
     Some(punktfunk_core::tls::cert_fingerprint(der.as_ref()))
 }

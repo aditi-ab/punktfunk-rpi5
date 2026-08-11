@@ -122,8 +122,14 @@ impl MutterDisplay {
 /// `XDG_SESSION_DESKTOP` alongside would resurrect the bug that scrub exists to prevent — a stale
 /// `gnome` there after a gnome-shell crash reports Mutter usable and routes the next client into a
 /// dead session (45 s create timeouts instead of a crisp handshake error).
+///
+/// The read takes [`crate::with_env_lock`]: this runs on a management worker (`/host/compositors` →
+/// [`crate::available`]) concurrently with another connect's `apply_session_env`, which `set_var`s
+/// this key for a live session and `remove_var`s it when nothing is — and a glibc `getenv` racing
+/// that is the `environ` realloc data race ENV_LOCK exists for, torn answer at best and a host
+/// segfault mid-connect at worst. Read-then-drop; no caller holds the lock (it is not reentrant).
 pub fn is_available() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
+    crate::with_env_lock(|| std::env::var("XDG_CURRENT_DESKTOP"))
         .map(|d| d.to_ascii_uppercase().contains("GNOME"))
         .unwrap_or(false)
 }
@@ -718,13 +724,24 @@ async fn connect(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Optional: make the per-session virtual output the PRIMARY monitor (PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY).
+// Optional: make the per-session virtual output the PRIMARY monitor.
 //
 // `RecordVirtual` adds the virtual monitor as an *extended* desktop. On a headless host that's the
 // only display, so the shell + windows live there. But when a physical monitor is attached, GNOME
 // keeps it primary and the virtual output is an empty extension — the stream shows only the
-// wallpaper. We fix that by promoting the virtual output to primary (physical kept on, secondary)
-// via `org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig`, and restore on teardown.
+// wallpaper. We fix that by promoting the virtual output via
+// `org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig`.
+//
+// Which shape is `crate::effective_topology()`'s call, not this module's: the console policy first,
+// then the legacy `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, then the Auto default. `Primary`
+// keeps the physicals on as secondaries; `Exclusive` omits them, so Mutter disables them for the
+// session; `Extend` skips this block entirely.
+//
+// Applied at APPLY_TEMPORARY, and **MUTTER ITSELF REVERTS IT** when the virtual monitor disappears
+// and our DisplayConfig connection closes. We must never re-assert the layout on teardown: the
+// banner used to promise a "restore on teardown" that the teardown deliberately does not do, and
+// issuing that ApplyMonitorsConfig is what SIGSEGVed gnome-shell on Mutter 50 + NVIDIA and wedged a
+// box at the GDM greeter (see the teardown comment in `session_thread`).
 // ---------------------------------------------------------------------------------------------
 
 /// `org.gnome.Mutter.DisplayConfig.GetCurrentState` reply shapes (see the interface XML):
@@ -811,7 +828,9 @@ fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i
 /// Pure mode-pick for a KEPT physical (unit-tested). Given the physical's PRE-connect mode
 /// (`pre_mode = (id, w, h, refresh)`; `None` when the connector is new since the snapshot) and the
 /// mode list Mutter reports for it in the POST-virtual state
-/// (`(id, w, h, refresh, is_current, is_preferred)`), return the `(mode_id, width)` to re-apply.
+/// (`(id, w, h, refresh, is_current, is_preferred)`), return the `(mode_id, width, height)` to
+/// re-apply. The height is not decoration: a head rotated 90°/270° is as wide on the desktop as its
+/// mode is tall, and the caller lays the kept heads out side by side.
 ///
 /// Mutter re-derives its layout when the `RecordVirtual` output appears and can silently drop a
 /// 120 Hz panel to its EDID-preferred 60 Hz — so the post-virtual `is-current` is *already* 60 Hz.
@@ -821,40 +840,40 @@ fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i
 fn pick_keep_mode(
     pre_mode: Option<(String, i32, i32, f64)>,
     state_modes: &[(String, i32, i32, f64, bool, bool)],
-) -> Option<(String, i32)> {
+) -> Option<(String, i32, i32)> {
     let state_current = || {
         state_modes
             .iter()
             .find(|m| m.4)
             .or_else(|| state_modes.iter().find(|m| m.5))
             .or_else(|| state_modes.first())
-            .map(|m| (m.0.clone(), m.1))
+            .map(|m| (m.0.clone(), m.1, m.2))
     };
     let Some((pre_id, w, h, hz)) = pre_mode else {
         return state_current();
     };
     // The exact pre mode id, if the connector still offers it (same session ⇒ usually true).
     if state_modes.iter().any(|m| m.0 == pre_id) {
-        return Some((pre_id, w));
+        return Some((pre_id, w, h));
     }
     // Else a re-keyed id with the same geometry + refresh (still the real 120 Hz).
     if let Some(m) = state_modes
         .iter()
         .find(|m| m.1 == w && m.2 == h && (m.3 - hz).abs() < 0.5)
     {
-        return Some((m.0.clone(), m.1));
+        return Some((m.0.clone(), m.1, m.2));
     }
     // The physical genuinely no longer offers that mode — use whatever is valid now.
     state_current()
 }
 
-/// The `(mode_id, width)` a kept physical should be RE-APPLIED at — its PRE-connect mode preserved
-/// across Mutter's virtual-output layout re-derive. See [`pick_keep_mode`].
+/// The `(mode_id, width, height)` a kept physical should be RE-APPLIED at — its PRE-connect mode
+/// preserved across Mutter's virtual-output layout re-derive. See [`pick_keep_mode`].
 fn physical_keep_mode(
     pre: &CurrentState,
     state: &CurrentState,
     conn: &str,
-) -> Option<(String, i32)> {
+) -> Option<(String, i32, i32)> {
     let pre_mode = current_mode_full(pre, conn);
     let state_modes: Vec<(String, i32, i32, f64, bool, bool)> = state
         .1
@@ -1044,13 +1063,57 @@ fn snap_integral_scale(want: f64, width: u32, height: u32) -> f64 {
         .unwrap_or(want)
 }
 
-/// The scale of the logical monitor carrying `connector`, if present.
-fn logical_scale(state: &CurrentState, connector: &str) -> Option<f64> {
+/// The `(scale, transform)` of the logical monitor carrying `connector`. `None` means **no logical
+/// monitor carries it** — which is how Mutter reports a head the operator has DISABLED, and is the
+/// distinction [`keep_head_layout`] turns into "leave it off".
+fn logical_placement(state: &CurrentState, connector: &str) -> Option<(f64, u32)> {
     state
         .2
         .iter()
         .find(|l| l.5.iter().any(|spec| spec.0 == connector))
-        .map(|l| l.2)
+        .map(|l| (l.2, l.3))
+}
+
+/// The scale of the logical monitor carrying `connector`, if present.
+fn logical_scale(state: &CurrentState, connector: &str) -> Option<f64> {
+    logical_placement(state, connector).map(|(scale, _)| scale)
+}
+
+/// Whether a kept physical should be re-applied at all, and with what `(scale, transform)`. Pure —
+/// unit-tested, because getting it wrong is invisible on a headless lab box and very visible on the
+/// operator's desk.
+///
+/// The rebuild used to hardcode `scale = 1.0`, `transform = 0` and to list every connector Mutter
+/// reported, so one connect un-rotated a portrait panel, dropped a 2×-scaled 4K head to native
+/// pixels, and switched a deliberately-dark monitor back on. All three facts are in the PRE-connect
+/// snapshot: `pre_logical` is the head's logical-monitor entry there, and Mutter reports a disabled
+/// head by omitting it from `logical_monitors` entirely. So: carry the pre values when the head was
+/// on; leave it out when the connector existed pre-connect and carried no logical monitor (disabled
+/// on purpose); and for a connector that was not in the snapshot at all — a hotplug inside our
+/// window — keep it on at whatever Mutter has just derived for it, which is the friendlier reading
+/// of "the operator plugged this in while we were connecting".
+fn keep_head_layout(
+    existed_pre: bool,
+    pre_logical: Option<(f64, u32)>,
+    state_logical: Option<(f64, u32)>,
+) -> Option<(f64, u32)> {
+    // A non-finite or non-positive scale would fail the whole ApplyMonitorsConfig, taking the
+    // primary switch down with it.
+    let sane = |(scale, transform): (f64, u32)| {
+        (
+            if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            },
+            transform,
+        )
+    };
+    match (pre_logical, existed_pre) {
+        (Some(l), _) => Some(sane(l)),
+        (None, true) => None,
+        (None, false) => Some(sane(state_logical.unwrap_or((1.0, 0)))),
+    }
 }
 
 /// Every head Mutter reports, for [`crate::monitors::list`].
@@ -1142,16 +1205,20 @@ fn build_exclusive_config(vconn: &str, vmode: &str, scale: f64) -> Vec<ApplyLogi
     )]
 }
 
-/// **Primary** — the virtual output primary at `(0, 0)`, with every currently-active physical
-/// monitor KEPT as a secondary (laid left-to-right past the virtual, each at its **pre-connect**
-/// mode). So the shell + new windows land on the streamed surface, but the operator's physical
-/// screen stays on **at its real refresh**. On a headless host (no physicals) this is identical to
-/// [`build_exclusive_config`].
+/// **Primary** — the virtual output primary at `(0, 0)`, with every physical monitor the operator
+/// had ENABLED kept as a secondary (laid left-to-right past the virtual, each at its **pre-connect**
+/// mode, scale and transform). So the shell + new windows land on the streamed surface, but the
+/// operator's physical screen stays exactly as they left it. On a headless host (no physicals) this
+/// is identical to [`build_exclusive_config`].
 ///
 /// `pre` is the snapshot taken *before* the virtual output existed (physical still at its true
-/// refresh); `state` is the post-virtual state. We read each physical's mode from `pre` because
-/// Mutter can knock a 120 Hz panel down to 60 Hz when it re-derives the layout for the virtual
-/// monitor — reading `state` would cement that 60 Hz (`physical_keep_mode`).
+/// refresh); `state` is the post-virtual state. Everything about a kept head is read from `pre`,
+/// because the post-virtual state is already contaminated: Mutter re-derives the layout when the
+/// `RecordVirtual` output appears and can knock a 120 Hz panel down to 60 Hz, so reading `state`
+/// would cement that 60 Hz (`physical_keep_mode`). Scale, transform and enabled-ness come from the
+/// same snapshot for the same reason — and because rebuilding them from scratch is what used to
+/// un-rotate portrait panels, flatten a 2× scale and re-light a head the operator had switched off
+/// ([`keep_head_layout`]).
 ///
 /// *Physical-keep is unvalidated on-glass* — the lab boxes are headless (no attached display to keep
 /// on); the layout math is conservative (append to the right) but wants a display-attached box.
@@ -1190,16 +1257,42 @@ fn build_primary_keeping_physicals(
         if conn == vconn {
             continue;
         }
-        if let Some((mode_id, w)) = physical_keep_mode(pre, state, conn) {
+        let existed_pre = pre.1.iter().any(|m| m.0 .0 == *conn);
+        let Some((head_scale, transform)) = keep_head_layout(
+            existed_pre,
+            logical_placement(pre, conn),
+            logical_placement(state, conn),
+        ) else {
+            // Omitted from the config ⇒ Mutter leaves it disabled, which is what the operator asked
+            // for. Listing it would switch their dark head on for the length of the session.
+            tracing::debug!(
+                connector = %conn,
+                "mutter: this head was disabled before the session — leaving it disabled"
+            );
+            continue;
+        };
+        if let Some((mode_id, w, h)) = physical_keep_mode(pre, state, conn) {
             logicals.push((
                 x,
                 0,
-                1.0,
-                0,
+                head_scale,
+                transform,
                 false,
                 vec![(conn.clone(), mode_id, HashMap::new())],
             ));
-            x += w.max(0);
+            // Advance by the head's own LOGICAL footprint, in the layout's coordinate space — the
+            // same space the virtual's advance above uses. A 3840-wide panel at scale 2 occupies
+            // 1920, and a head rotated 90°/270° (transform 1/3, or their flipped twins 5/7) is as
+            // wide as its mode is TALL. Advancing by raw mode width was only ever *consistent* with
+            // the forced scale of 1.0 this rebuild used to apply; preserving the real scale without
+            // this would just trade one wrong layout for another (overlapping or gapped heads).
+            let rotated = matches!(transform, 1 | 3 | 5 | 7);
+            let footprint = if rotated { h } else { w };
+            x += if physical_layout {
+                footprint.max(0)
+            } else {
+                ((footprint as f64 / head_scale).round() as i32).max(0)
+            };
         }
     }
     logicals
@@ -1207,7 +1300,10 @@ fn build_primary_keeping_physicals(
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode, MonitorInfo};
+    use super::{
+        keep_head_layout, pick_keep_mode, pick_virtual, snap_integral_scale, HashMap, Mode,
+        MonitorInfo,
+    };
 
     // (id, w, h, refresh, is_current, is_preferred)
     fn m(
@@ -1232,7 +1328,7 @@ mod tests {
         ];
         assert_eq!(
             pick_keep_mode(pre, &state),
-            Some(("M120".to_string(), 2560))
+            Some(("M120".to_string(), 2560, 1440))
         );
     }
 
@@ -1247,7 +1343,7 @@ mod tests {
         ];
         assert_eq!(
             pick_keep_mode(pre, &state),
-            Some(("new-120".to_string(), 2560))
+            Some(("new-120".to_string(), 2560, 1440))
         );
     }
 
@@ -1262,7 +1358,7 @@ mod tests {
         ];
         assert_eq!(
             pick_keep_mode(pre, &state),
-            Some(("s-100".to_string(), 3440))
+            Some(("s-100".to_string(), 3440, 1440))
         );
     }
 
@@ -1289,7 +1385,10 @@ mod tests {
             m("A", 1920, 1080, 60.0, true, false),
             m("B", 1920, 1080, 144.0, false, true),
         ];
-        assert_eq!(pick_keep_mode(None, &state), Some(("A".to_string(), 1920)));
+        assert_eq!(
+            pick_keep_mode(None, &state),
+            Some(("A".to_string(), 1920, 1080))
+        );
 
         let no_current = vec![
             m("A", 1920, 1080, 60.0, false, false),
@@ -1297,7 +1396,35 @@ mod tests {
         ];
         assert_eq!(
             pick_keep_mode(None, &no_current),
-            Some(("B".to_string(), 1920))
+            Some(("B".to_string(), 1920, 1080))
+        );
+    }
+
+    /// A kept physical must come back exactly as the operator had it. Rebuilding the layout from
+    /// scratch (`scale = 1.0`, `transform = 0`, every connector listed) un-rotated portrait panels,
+    /// flattened a 2× scale, and switched a deliberately-dark head back on the moment a client
+    /// connected — while the code went to real trouble to preserve the refresh.
+    #[test]
+    fn a_kept_head_carries_its_pre_connect_scale_and_transform() {
+        // Rotated + 2×-scaled, exactly as it was before the virtual output appeared.
+        assert_eq!(
+            keep_head_layout(true, Some((2.0, 1)), Some((1.0, 0))),
+            Some((2.0, 1))
+        );
+        // Disabled on purpose (present pre-connect, carried by no logical monitor) — stays off.
+        assert_eq!(keep_head_layout(true, None, Some((1.0, 0))), None);
+        // Hotplugged inside our window: not in the snapshot at all, so keep it on at whatever
+        // Mutter derived rather than disabling a monitor the operator just plugged in.
+        assert_eq!(
+            keep_head_layout(false, None, Some((1.5, 2))),
+            Some((1.5, 2))
+        );
+        assert_eq!(keep_head_layout(false, None, None), Some((1.0, 0)));
+        // A junk scale would fail the WHOLE ApplyMonitorsConfig, taking the primary switch with it.
+        assert_eq!(keep_head_layout(true, Some((0.0, 3)), None), Some((1.0, 3)));
+        assert_eq!(
+            keep_head_layout(true, Some((f64::NAN, 0)), None),
+            Some((1.0, 0))
         );
     }
 

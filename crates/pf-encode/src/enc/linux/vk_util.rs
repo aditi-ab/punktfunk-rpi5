@@ -19,11 +19,15 @@ use pf_frame::PixelFormat;
 /// barriers were used without the extension ever being enabled; `pf-presenter/dmabuf.rs` is the
 /// in-repo precedent that enables it).
 pub(super) fn ext_advertised(exts: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
-    exts.iter().any(|e| {
-        // SAFETY: `extension_name` is a spec-guaranteed NUL-terminated UTF-8 byte array inside
-        // the driver-filled `VkExtensionProperties` (VK_MAX_EXTENSION_NAME_SIZE bound).
-        unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name }
-    })
+    // `extension_name_as_c_str()` is ash's BOUNDED accessor: it stops at
+    // `VK_MAX_EXTENSION_NAME_SIZE` and returns `Err` when the array holds no NUL, so a
+    // malformed driver entry is a non-match rather than a read past the array. The previous
+    // `CStr::from_ptr(e.extension_name.as_ptr())` had no in-Rust bound at all — its SAFETY
+    // comment asserted the spec guarantee instead of enforcing it, so a driver that filled all
+    // 256 bytes without a terminator ran the walk into the NEXT `ExtensionProperties` and, on
+    // the last element, past the allocation. Same accessor `pyrowave.rs` already uses for the
+    // identical job. No unsafe, no unchecked read, same answer on every well-formed driver.
+    exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
 }
 
 pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
@@ -451,6 +455,29 @@ mod tests {
             &exts[..1],
             ash::ext::queue_family_foreign::NAME
         ));
+    }
+
+    /// A driver entry with NO terminator anywhere in `extension_name` must be a non-match, not a
+    /// read past the array.
+    ///
+    /// This is the case the old `CStr::from_ptr(e.extension_name.as_ptr())` could not survive:
+    /// with every one of VK_MAX_EXTENSION_NAME_SIZE bytes non-NUL it walked into the NEXT
+    /// `ExtensionProperties`, and on the LAST element past the allocation entirely. The old test
+    /// only ever built well-formed, NUL-terminated entries, so it proved nothing about the bound
+    /// — which is why the hazard survived a SAFETY comment that asserted the spec guarantee
+    /// rather than enforcing it.
+    #[test]
+    fn ext_advertised_rejects_unterminated_name_without_overrunning() {
+        let mut bad = ash::vk::ExtensionProperties::default();
+        bad.extension_name.fill(b'A' as std::ffi::c_char);
+        // Deliberately LAST, so an unbounded walk would leave the whole array.
+        let exts = [ash::vk::ExtensionProperties::default(), bad];
+        assert!(!super::ext_advertised(
+            &exts,
+            ash::ext::queue_family_foreign::NAME
+        ));
+        // And a name that is a prefix of the garbage still must not match.
+        assert!(!super::ext_advertised(&exts, c"AAAA"));
     }
 
     use super::*;

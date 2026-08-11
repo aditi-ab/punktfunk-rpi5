@@ -136,7 +136,26 @@ pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
             !live.is_empty(),
         )
     };
-    let _ = any_live; // read only by the Windows budget block below
+    let _ = any_live; // read only by the budget blocks below
+
+    // The operator's `max_displays` ceiling (design §5.3). Applied HERE, once per connecting
+    // session, and deliberately NOT in the display create path: `acquire` runs again on every
+    // mid-stream rebuild (capture loss, a Game↔Desktop switch), and those rebuild before dropping
+    // the old display — so a ceiling enforced there counts the session against itself and refuses
+    // the recovery. Admission is reached once per connect, so it cannot.
+    #[cfg(target_os = "linux")]
+    if matches!(decision, Admission::Separate) && any_live {
+        // The Linux pool had no ceiling at all: its reuse key includes the CLIENT-SUPPLIED mode, so
+        // a client reconnecting at a different resolution misses reuse and mints a fresh display,
+        // and a handful of reconnects could row out an unbounded number of compositor outputs.
+        let max = policy::prefs().get().effective().max_displays;
+        let live = super::registry::live_display_count();
+        if live >= max {
+            return Admission::Reject(format!(
+                "host display budget exhausted: {live} display(s) live/kept, max_displays = {max}"
+            ));
+        }
+    }
     #[cfg(windows)]
     if matches!(decision, Admission::Separate) && any_live {
         let max = policy::prefs().get().effective().max_displays;

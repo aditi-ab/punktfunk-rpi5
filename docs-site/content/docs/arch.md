@@ -144,19 +144,21 @@ stock [Moonlight](/docs/moonlight) clients, and needs **both** openers:
 ```sh
 # ufw — CachyOS (and Ubuntu, once you enable ufw):
 sudo ufw allow punktfunk-native
-sudo ufw allow punktfunk-gamestream
 
 # firewalld — Fedora-like spins (EndeavourOS, …):
 sudo firewall-cmd --reload                                        # load the installed definitions
 sudo firewall-cmd --permanent --add-service=punktfunk-native
-sudo firewall-cmd --permanent --add-service=punktfunk-gamestream
 sudo firewall-cmd --reload
 ```
 
-Switched the host to **native-only** — dropped `--gamestream` with a
-`systemctl --user edit punktfunk-host` drop-in, or you run `punktfunk-host serve` by hand? Then open
-`punktfunk-native` alone and leave `punktfunk-gamestream` closed. `systemctl --user cat
-punktfunk-host` shows which one yours is.
+Enabled **GameStream/Moonlight compat** (`PUNKTFUNK_GAMESTREAM=1` in `host.env` — see
+[What the unit starts](/docs/running-as-a-service#what-the-unit-starts)), or you pass
+`--gamestream` by hand? Then also open its service:
+
+```sh
+sudo ufw allow punktfunk-gamestream                               # ufw
+sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
+```
 
 `punktfunk-native` opens the QUIC control port (UDP 9777), mDNS discovery and the mgmt/library API
 (TCP 47990); `punktfunk-gamestream` opens the fixed Moonlight ports — TCP 47984, 47989 and 48010,

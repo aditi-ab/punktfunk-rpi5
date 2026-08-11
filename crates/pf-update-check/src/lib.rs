@@ -14,6 +14,12 @@
 //! and per-platform; it lives with the product that does it (`punktfunk-host::update`,
 //! `pf-client-core::update`, and the root helper in `pf-update`).
 
+// This crate parses a SIGNED, NETWORK-FETCHED manifest and, per the header above, "owns the part
+// where being wrong is a security bug". Signature verification is worthless if the parser around
+// it can be made to read out of bounds, so the absence of unsafe here is a security property and
+// is now enforced rather than merely true today.
+#![forbid(unsafe_code)]
+
 /// The Ed25519 public keys trusted for update manifests — two slots, so a key rotation is
 /// "sign with the new one, ship builds trusting both, retire the old" (the plugin-store
 /// `OFFICIAL_KEYS` drill) rather than a flag day. The private half is the

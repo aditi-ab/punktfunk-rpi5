@@ -11,6 +11,11 @@
 //! invariant) plus a blocking data-plane pump; frames cross to the embedder over a bounded
 //! channel. All methods are safe to call from any single embedder thread.
 
+// The crate denies `unsafe_code` (lib.rs); this client-side module is one of the two documented
+// carve-outs (with `abi`) — its few sites are platform glue (thread ids, priorities) for the
+// embedders, each with its `// SAFETY:` proof. The host serves nothing from this module.
+#![allow(unsafe_code)]
+
 use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::{PunktfunkError, Result};

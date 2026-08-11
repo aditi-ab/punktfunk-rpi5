@@ -82,6 +82,9 @@ let
     services.punktfunk.host = {
       enable = true;
       users = [ "alice" ];
+      # Explicit: gamestream defaults to false now (opt-in on every route) — this fixture
+      # is the one that proves opting IN still reaches the argv and the firewall.
+      gamestream = true;
       gamescopeHdr = false;
       desktopSession = true;
     };
@@ -186,6 +189,14 @@ let
         !(has nativeOnly "punktfunk-host" "--gamestream")
         && !(lib.elem 47984 nativeOnly.networking.firewall.allowedTCPPorts)
         && lib.elem 47990 nativeOnly.networking.firewall.allowedTCPPorts;
+    }
+    {
+      # The DEFAULT is the secure native-only host — gamestream unset must behave like
+      # gamestream=false (opt-in on every package route; the appliance fixture leaves it unset).
+      name = "gamestream default (unset) is native-only";
+      ok =
+        !(has appliance "punktfunk-host" "--gamestream")
+        && !(lib.elem 47984 appliance.networking.firewall.allowedTCPPorts);
     }
     {
       name = "openFirewall opens the console AND its plugin origin";

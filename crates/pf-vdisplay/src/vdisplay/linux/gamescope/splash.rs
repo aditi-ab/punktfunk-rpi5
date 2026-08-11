@@ -143,17 +143,57 @@ pub(crate) fn run() -> Result<()> {
     }
 }
 
+/// How long the splash waits for the session's X server before giving up.
+const CONNECT_BUDGET: Duration = Duration::from_secs(10);
+
 /// Connect to the session's `DISPLAY`, retrying briefly — gamescope sets the variable before
 /// exec'ing the nested command, but a slow Xwayland under cold driver init gets a grace window.
+///
+/// The retry runs on a worker thread and the budget is enforced by `recv_timeout` rather than by
+/// re-checking a deadline between attempts. The difference is the whole point: `x11rb::connect`
+/// has no timeout of its own, so against an Xwayland that ACCEPTED the socket and then never
+/// answered the setup handshake it blocks indefinitely — and a deadline consulted only in the
+/// `Err` arm is never reached at all. That is the failure this module exists to prevent, from the
+/// inside: no painting client, no composite, no PipeWire buffers, and the capture dies on its 10 s
+/// first-frame timeout having never logged "gamescope splash: mapped", so the diagnosis points
+/// anywhere but here.
+///
+/// A worker still stuck in `connect` is abandoned rather than joined; it is one thread in a
+/// process whose whole job is this window, and the alternative is the hang.
 fn connect_with_retry() -> Result<(RustConnection, usize)> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match x11rb::connect(None) {
-            Ok(ok) => return Ok(ok),
-            Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(e).context("gamescope splash: could not connect to the session DISPLAY")
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pf-splash-x11-connect".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + CONNECT_BUDGET;
+            loop {
+                match x11rb::connect(None) {
+                    Ok(ok) => {
+                        let _ = tx.send(Ok(ok));
+                        return;
+                    }
+                    Err(e) if std::time::Instant::now() >= deadline => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        })
+        .context("gamescope splash: could not start the X connect thread")?;
+    // A little past the worker's own deadline, so a connect that merely finished slowly still wins
+    // and only a genuinely blocked one trips this.
+    match rx.recv_timeout(CONNECT_BUDGET + Duration::from_secs(1)) {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(e).context("gamescope splash: could not connect to the session DISPLAY"),
+        Err(_) => {
+            tracing::warn!(
+                secs = CONNECT_BUDGET.as_secs(),
+                "gamescope splash: the session's X server accepted no connection and never \
+                 answered — giving up. Nothing will paint in this gamescope, so it will composite \
+                 nothing and the capture will starve; the gamescope log is where the reason is."
+            );
+            anyhow::bail!("gamescope splash: connecting to the session DISPLAY did not return")
         }
     }
 }

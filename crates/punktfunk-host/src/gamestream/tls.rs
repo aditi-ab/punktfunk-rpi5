@@ -133,13 +133,17 @@ impl ClientCertVerifier for AcceptAnyClientCert {
         cert: &CertificateDer,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(
+        let verdict = verify_tls12_signature(
             message,
             cert,
             dss,
             &self.provider.signature_verification_algorithms,
-        )
-        .or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e))
+        );
+        // The Moonlight-client-cert leniency exists only when the compat planes do (WP19) —
+        // native clients present webpki-clean certs and never need it.
+        #[cfg(feature = "gamestream")]
+        let verdict = verdict.or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e));
+        verdict
     }
 
     fn verify_tls13_signature(
@@ -148,13 +152,17 @@ impl ClientCertVerifier for AcceptAnyClientCert {
         cert: &CertificateDer,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(
+        let verdict = verify_tls13_signature(
             message,
             cert,
             dss,
             &self.provider.signature_verification_algorithms,
-        )
-        .or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e))
+        );
+        // The Moonlight-client-cert leniency exists only when the compat planes do (WP19) —
+        // native clients present webpki-clean certs and never need it.
+        #[cfg(feature = "gamestream")]
+        let verdict = verdict.or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e));
+        verdict
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -187,6 +195,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
 /// signature still fails, and any non-RSA / unsupported scheme falls through to webpki's original
 /// error `webpki_err`. Moonlight/Sunshine client certs are RSA-2048, so this matches Sunshine's
 /// leniency without loosening the pinned trust model.
+#[cfg(feature = "gamestream")]
 fn accept_legacy_moonlight_cert(
     message: &[u8],
     cert: &CertificateDer,

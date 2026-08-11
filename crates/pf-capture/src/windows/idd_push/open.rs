@@ -152,8 +152,11 @@ impl IddPushCapturer {
     }
 
     /// Open the IDD-push capturer. On success the caller's `keepalive` is attached (the capturer owns the
-    /// virtual display); on FAILURE the keepalive is handed BACK so the caller can fall back to DDA
-    /// instead of tearing the display down (audit §5.1 — no more 20 s black bail). "Failure" includes the
+    /// virtual display); on FAILURE the keepalive is handed BACK so the caller decides the display's fate
+    /// itself — retire it, or reuse the monitor for a retry — instead of this function tearing it down
+    /// (audit §5.1 — no more 20 s black bail). There is no second capture path to fall back TO: DDA was
+    /// removed (see `lib.rs`), and `punktfunk-host`'s caller drops the returned keepalive under
+    /// `.context("IDD-push capture open (no fallback)")`. "Failure" includes the
     /// driver not attaching to the ring within a few seconds (e.g. a hybrid-GPU render mismatch).
     #[allow(clippy::too_many_arguments)]
     pub fn open(
@@ -666,7 +669,7 @@ impl IddPushCapturer {
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
                 // Placeholder; `open()` attaches the real keepalive on success, so a FAILED open can hand
-                // it back to the caller for the DDA fallback (audit §5.1).
+                // it back to the caller to retire or reuse the display (audit §5.1).
                 _keepalive: Box::new(()),
             };
             // The HDR SDR-white reference for the composited cursor, queried ONCE here rather than
@@ -675,15 +678,15 @@ impl IddPushCapturer {
             me.refresh_sdr_white_scale();
             // Bounded wait for the driver to ATTACH to the ring AND publish a first frame. An attach
             // failure (DRV_STATUS_TEX_FAIL) or an attach-but-no-frames (a game left the display in a
-            // format/size the ring can't match) becomes an open failure the caller falls back from (→ DDA),
-            // instead of next_frame's 20 s black-then-bail.
+            // format/size the ring can't match) becomes an open failure the caller handles by retiring the
+            // display, instead of next_frame's 20 s black-then-bail.
             me.wait_for_attach()?;
             Ok(me)
         }
     }
 
     /// Block (bounded) until the driver has ATTACHED to the host ring (`DRV_STATUS_OPENED`) **and published
-    /// a first frame**, else fail so the caller can fall back to DDA (audit §5.1 +
+    /// a first frame**, else fail so the caller can retire the display and rebuild (audit §5.1 +
     /// `design/windows-host-rewrite.md` §2.5 — the GB1 game-capture fix).
     ///
     /// Requiring the first frame — not just the attach — catches the *reconnect-into-a-broken-state* case:

@@ -16,13 +16,9 @@ publish = false
 
 [dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
-pf-frame = { path = "../pf-frame" }
-pf-gpu = { path = "../pf-gpu" }
 pf-host-config = { path = "../pf-host-config" }
 pf-paths = { path = "../pf-paths" }
 pf-win-display = { path = "../pf-win-display" }
-# The Windows admission gate consults NVENC's session budget (can_open_another_session).
-pf-encode = { path = "../pf-encode" }
 anyhow = "1"
 tracing = "0.1"
 # The platform-neutral policy/identity/custom-preset state is serde-serialized (persisted + the mgmt
@@ -41,8 +37,12 @@ hex = "0.4"
 # the shipped host's dependency closure through this crate is unchanged.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# `proc`'s process-group tree guard is Unix-wide, not Linux-only: the module is compiled on every
+# platform and its tests run on whatever the developer is sitting at (macOS, here).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # The Mutter backend drives D-Bus RemoteDesktop + ScreenCast.RecordVirtual via ashpd on a tokio
 # runtime; the gamescope restore worker + portal handshakes use tokio too.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
@@ -61,6 +61,15 @@ bitflags = "2"
 x11rb = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Windows-only, all three, and gated here rather than unconditionally so the LINUX build does not
+# drag their closures in for nothing: `pf-frame` for the DXGI capture identity + the CTA-861.3 HDR
+# luminance fields, `pf-gpu` for the render-adapter LUID, and `pf-encode` for the admission gate's
+# NVENC session budget (`can_open_another_session`, admission.rs, itself `#[cfg(windows)]`). Every
+# use site of all three is Windows-gated — verified by grep — and between them they pull FFmpeg,
+# ash and openh264, none of which a Linux host reaches through this crate.
+pf-frame = { path = "../pf-frame" }
+pf-gpu = { path = "../pf-gpu" }
+pf-encode = { path = "../pf-encode" }
 # The host<->driver wire contract for the pf-vdisplay IddCx backend (control IOCTLs + Pod structs).
 pf-driver-proto = { path = "../pf-driver-proto" }
 bytemuck = { version = "1.19", features = ["derive"] }

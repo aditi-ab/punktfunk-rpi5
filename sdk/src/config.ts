@@ -5,7 +5,7 @@
 //   PUNKTFUNK_MGMT_URL     (default https://127.0.0.1:47990)
 //   PUNKTFUNK_MGMT_TOKEN   (admin override), else PUNKTFUNK_PLUGIN_TOKEN,
 //                          else <config_dir>/plugin-token, else <config_dir>/mgmt-token
-//   PUNKTFUNK_MGMT_CA      (path; else <config_dir>/cert.pem when present)
+//   PUNKTFUNK_MGMT_CA      (path; else <config_dir>/native-cert.pem, else cert.pem when present)
 //
 // Token precedence is deliberate: the host mints a capability-limited `plugin-token` for the
 // scripting runner (it cannot register hooks or administer pairing), and that is what a plugin's
@@ -27,7 +27,7 @@ export interface ConnectOptions {
 	url?: string;
 	/** Bearer token (default: `PUNKTFUNK_MGMT_TOKEN`, else the host's `mgmt-token` file). */
 	token?: string;
-	/** PEM of the CA to trust — the host's identity cert (default: `PUNKTFUNK_MGMT_CA`, else `cert.pem`). */
+	/** PEM of the CA to trust — the host's identity cert (default: `PUNKTFUNK_MGMT_CA`, else `native-cert.pem`, else `cert.pem`). */
 	ca?: string;
 }
 
@@ -137,7 +137,10 @@ export const resolveConfig = async (
 		options?.ca ??
 		(caPath ? readIfExists(caPath) : undefined) ??
 		(url.startsWith("https://")
-			? readIfExists(path.join(configDir(), "cert.pem"))
+			? // The mgmt API presents the NATIVE identity when one exists (the host's identity
+				// split); `cert.pem` is the legacy identity, still served on hosts that predate it.
+				(readIfExists(path.join(configDir(), "native-cert.pem")) ??
+				readIfExists(path.join(configDir(), "cert.pem")))
 			: undefined);
 	return { url, token, ca, fetch: await makeFetch(ca) };
 };

@@ -1,6 +1,10 @@
 //! Windows batched UDP send: `WSASendMsg` UDP Send Offload (USO). The platform body of
 //! [`super::UdpTransport`]'s `send_gso` override, plus the standalone [`send_uso_all`].
 
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue — `WSASendMsg`
+// USO sends caller-owned buffers; nothing here interprets network bytes. Proofs at each site.
+#![allow(unsafe_code)]
+
 use super::{is_transient_io, UdpTransport};
 use crate::transport::Transport;
 

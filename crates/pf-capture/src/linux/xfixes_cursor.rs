@@ -55,16 +55,6 @@ use x11rb::rust_connection::{DefaultStream, RustConnection};
 
 use crate::GamescopeCursorTargets;
 
-/// Serializes the `XAUTHORITY` env swap of the LEGACY connect fallback (the var is process-global).
-///
-/// The fallback is a last resort now — see [`connect_conn`]. It serialises this source against
-/// itself and nothing else: `getenv` needs no lock to be racy, so every OTHER thread's read (libspa
-/// plugin load, EGL/CUDA init — concurrent by construction, since `attach_gamescope_cursor` runs
-/// while the PipeWire thread is starting) could still observe the swapped value or a torn
-/// environ. That is why the primary path parses the cookie itself and never touches the
-/// environment.
-static XAUTH_LOCK: Mutex<()> = Mutex::new(());
-
 /// The `MIT-MAGIC-COOKIE-1` auth-protocol name, as it appears in an `.Xauthority` entry.
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
 
@@ -267,17 +257,18 @@ fn connect(dpy: &str, xauthority: Option<&str>) -> Result<Connected, String> {
 /// environment.
 ///
 /// `RustConnection::connect` reads `XAUTHORITY` from the env, so the original implementation
-/// `set_var`'d it around each connect under [`XAUTH_LOCK`]. That is unsound from a live
-/// multithreaded host: the lock serialises this source against itself, but `getenv` takes no lock,
-/// so any concurrent reader (libspa's plugin load, EGL/CUDA init — running at exactly this moment,
-/// since the PipeWire thread is starting up) could read the swapped value or race the environ
-/// rewrite outright. The project already has a process-wide env-lock discipline elsewhere, but
-/// sharing it would be the wrong layer AND would still not fix `getenv`.
+/// `set_var`'d it around each connect under a mutex. That is unsound from a live multithreaded
+/// host: the lock serialised this source against itself, but `getenv` takes no lock, so any
+/// concurrent reader (libspa's plugin load, EGL/CUDA init — running at exactly this moment, since
+/// the PipeWire thread is starting up) could read the swapped value or race the environ rewrite
+/// outright. The project already has a process-wide env-lock discipline elsewhere, but sharing it
+/// would be the wrong layer AND would still not fix `getenv`.
 ///
 /// So: parse the MIT-MAGIC-COOKIE-1 entry out of the file ourselves and hand it to
 /// `connect_to_stream_with_auth_info`, which is what `RustConnection::connect` does internally with
-/// the cookie IT found. The env swap survives only as a fallback for a file we cannot parse (an
-/// unexpected layout, or an auth family whose entry we decline to guess at).
+/// the cookie IT found. Where that finds nothing usable we connect with an explicitly empty token
+/// ([`connect_unauthenticated`]) rather than swapping the environment — this process no longer
+/// writes `environ` at all.
 fn connect_conn(dpy: &str, xauthority: Option<&str>) -> Result<(RustConnection, usize), String> {
     let Some(path) = xauthority else {
         // No per-display cookie file to inject: the ambient environment is already what this
@@ -289,16 +280,16 @@ fn connect_conn(dpy: &str, xauthority: Option<&str>) -> Result<(RustConnection, 
             Ok(v) => return Ok(v),
             Err(e) => tracing::debug!(
                 dpy = %dpy, xauthority = %path, error = %e,
-                "gamescope cursor: cookie connect failed — falling back to the XAUTHORITY env swap"
+                "gamescope cursor: cookie connect failed — retrying unauthenticated"
             ),
         },
         None => tracing::debug!(
             dpy = %dpy, xauthority = %path,
-            "gamescope cursor: no MIT-MAGIC-COOKIE-1 entry for this display — falling back to the \
-             XAUTHORITY env swap"
+            "gamescope cursor: no MIT-MAGIC-COOKIE-1 entry for this display — connecting \
+             unauthenticated"
         ),
     }
-    connect_via_env_swap(dpy, path)
+    connect_unauthenticated(dpy)
 }
 
 /// Connect to `dpy` and complete the setup handshake with an explicit cookie — the same two steps
@@ -331,19 +322,31 @@ fn connect_with_cookie(
         .map_err(|e| format!("setup: {e}"))
 }
 
-/// LEGACY fallback (see [`connect_conn`]): swap `XAUTHORITY`, connect, restore. Serialised against
-/// this source's own concurrent connects, but NOT against other threads' `getenv` — which is why it
-/// is a fallback and not the path taken.
-fn connect_via_env_swap(dpy: &str, xauthority: &str) -> Result<(RustConnection, usize), String> {
-    let _g = XAUTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var_os("XAUTHORITY");
-    std::env::set_var("XAUTHORITY", xauthority);
-    let out = RustConnection::connect(Some(dpy));
-    match prev {
-        Some(p) => std::env::set_var("XAUTHORITY", p),
-        None => std::env::remove_var("XAUTHORITY"),
-    }
-    out.map_err(|e| format!("connect: {e}"))
+/// Last-resort fallback (see [`connect_conn`]): connect with an EXPLICITLY EMPTY auth token.
+///
+/// This replaces a `set_var("XAUTHORITY", …)` / connect / restore dance, which was unsound and is
+/// not fixable in place. `setenv`/`unsetenv` rewrite the process-global `environ`; glibc
+/// *reallocates* that array when a variable is added, and the host is emphatically multithreaded
+/// at this moment — `attach_gamescope_cursor` runs while the PipeWire thread is inside `pw_init`'s
+/// `dlopen` and a dozen bare `getenv()` calls, with EGL/CUDA init alongside. A mutex here
+/// serialised this source against itself and against nothing else, because `getenv` takes no lock.
+/// The damaging branch is the one where `XAUTHORITY` is ABSENT and therefore gets *added* — which
+/// `scripts/punktfunk-host.service` makes the normal configuration, since the unit deliberately
+/// does not import the login shell's environment. And `rediscover` re-runs this every 2 s for the
+/// whole session, because a display whose connect fails is never recorded and so is never skipped.
+///
+/// Connecting with an empty token is what the swap actually achieved. We only reach here when our
+/// own lookup found no usable `MIT-MAGIC-COOKIE-1` entry, and x11rb's internal lookup reads the
+/// same file with a STRICTER matcher (it also matches family/address, which we deliberately do
+/// not) — so where we find nothing, it finds nothing too, and connects unauthenticated. That is
+/// precisely why the swap "worked" against a nested Xwayland started without `-auth`.
+///
+/// The one case this gives up is an `.Xauthority` whose entry uses an auth family we decline to
+/// guess at but x11rb would have handled. A gamescope Xwayland writes a single-entry
+/// MIT-MAGIC-COOKIE-1 file, so that case is not reachable here — and a cursor overlay that
+/// declines to attach is the correct outcome anyway, against a torn `environ` in a live session.
+fn connect_unauthenticated(dpy: &str) -> Result<(RustConnection, usize), String> {
+    connect_with_cookie(dpy, Vec::new(), Vec::new())
 }
 
 /// The `MIT-MAGIC-COOKIE-1` `(name, data)` for `dpy` from the `.Xauthority`-format file at `path`.

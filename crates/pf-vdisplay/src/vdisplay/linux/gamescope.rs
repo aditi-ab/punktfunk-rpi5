@@ -37,12 +37,22 @@ pub(crate) use discovery::{
 pub(crate) use heads::list_monitors;
 pub(crate) use splash::run as splash_run;
 
-/// The gamescope virtual-display driver. Three modes by env, in precedence order:
-/// * `PUNKTFUNK_GAMESCOPE_SESSION=<client>` — host-MANAGE a `gamescope-session-plus` session
-///   (full Steam-Deck-UI polish) headless at the CLIENT's mode; relaunch it when the mode changes.
-/// * `PUNKTFUNK_GAMESCOPE_NODE=<id|auto>` — ATTACH to an already-running gamescope (capture +
-///   inject, no lifecycle ownership).
-/// * else — SPAWN a bare headless gamescope sized to the mode, running `PUNKTFUNK_GAMESCOPE_APP`.
+/// The gamescope virtual-display driver. Three sub-modes, resolved **per session** by
+/// [`crate::resolve_gamescope_route`] and handed over through
+/// [`VirtualDisplay::set_gamescope_route`] — never read out of the process env here, because a
+/// second connect resolving its own route would otherwise retarget this session between the
+/// decision and its `create` (Phase 2.3):
+/// * **Managed** — host-MANAGE a `gamescope-session-plus`/SteamOS session (full Steam-Deck-UI
+///   polish) headless at the CLIENT's mode; relaunch it when the mode changes.
+/// * **Attach** — attach to an already-running gamescope (capture + inject, no lifecycle
+///   ownership).
+/// * **Spawn** — a bare headless gamescope sized to the mode, running the per-session launch
+///   command ([`VirtualDisplay::set_launch_command`]) and falling back to
+///   `PUNKTFUNK_GAMESCOPE_APP` only when that is empty.
+///
+/// `PUNKTFUNK_GAMESCOPE_{MANAGED,ATTACH,NODE,SESSION}` still exist, but purely as **operator
+/// overrides** feeding that ladder — sampled once at first use in `routing::operator_gamescope`,
+/// never republished.
 #[derive(Default)]
 pub struct GamescopeDisplay {
     /// The resolved per-session launch command (set via [`VirtualDisplay::set_launch_command`]); the
@@ -79,6 +89,22 @@ struct SessionState {
 /// different mode relaunches it. Cleared/relaunched by `launch_session`; survives across client
 /// connections; on host restart the next launch stops the leftover unit by name and starts fresh.
 static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> = std::sync::Mutex::new(None);
+
+/// Serialises the managed-session LAUNCH in [`create_managed_session`] — and nothing else.
+///
+/// [`MANAGED_SESSION`] used to be held from the same-mode test all the way across `launch_session`,
+/// which gave two things at once: the tracked state, and mutual exclusion between two connects. That
+/// wide hold is exactly what stranded a box on shutdown (`do_restore_tv_session` needs the same
+/// mutex and could sit behind a ~90 s launch until `native.rs`'s 20 s grace expired and `exit(0)`
+/// skipped the display-manager restore), so the decision was narrowed to a scope of its own — but
+/// the mutual exclusion went with it. Two clients resolving the Managed route inside one launch
+/// window then BOTH relaunched, and `launch_session`'s first act is `stop_session(SESSION_UNIT)`:
+/// the second connect tore down the session the first was still polling for.
+///
+/// This lock restores only the exclusion. LOCK ORDER: `MANAGED_LAUNCH` → [`MANAGED_SESSION`], never
+/// the reverse, and **no restore path may ever take it** — that is what keeps the shutdown restore
+/// off the launch's critical path, which is the whole point of the narrowing.
+static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Autologin gaming-mode `gamescope-session-plus@*` units we stopped on connect to free Steam
 /// (single-instance), so [`schedule_restore_tv_session`] can restart them when the client disconnects.
@@ -142,9 +168,11 @@ const RESTORE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// coexisting gamescopes (a kept lingering spawn + a fresh one) never parse each other's node id.
 static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// This spawn instance's log path, under `$XDG_RUNTIME_DIR` (per-user, tmpfs; falls back to `/tmp`
-/// only if unset). Replaces the shared `/tmp/punktfunk-gamescope.log` so concurrent spawns don't
-/// clobber each other's `stream available on node ID:` line.
+/// This spawn instance's log path, under the resolved per-user runtime dir
+/// ([`crate::session::runtime_dir`] — `$XDG_RUNTIME_DIR` when set and non-empty, else
+/// `/run/user/<uid>`; **never** `/tmp`, which Phase 4.2 removed from every one of these paths as a
+/// world-writable-directory defect). Replaces the shared `/tmp/punktfunk-gamescope.log` so
+/// concurrent spawns don't clobber each other's `stream available on node ID:` line.
 fn spawn_log_path(inst: u64) -> std::path::PathBuf {
     let base = crate::session::runtime_dir();
     std::path::Path::new(&base).join(format!("punktfunk-gamescope-{inst}.log"))
@@ -170,6 +198,28 @@ const STEAMOS_SESSION_TARGET: &str = "gamescope-session.target";
 /// restart the physical session.
 static STEAMOS_TOOK_OVER: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+/// Set once this host has written the `gamescope-session-plus@` bind drop-in over the BOX's own
+/// autologin template ([`write_session_plus_dropin`] from [`ensure_box_gamescope_mode`]) — i.e.
+/// whether there is a drop-in left to take away.
+///
+/// It needs its own flag because that path steals nothing: no autologin unit is stopped, no DM, no
+/// SteamOS target, no managed session — so every one of the takeover statics stays empty and
+/// [`takeover_live`] used to answer `false`. The drop-in then outlived the stream AND the host:
+/// nothing in-process ever removed it, and from that point the operator's own Game Mode ran
+/// punktfunk's patched gamescope inside our mount+user namespace, with `/tmp/.X11-unix` replaced
+/// and the last client's HDR/refresh flags applied. Only the next host START swept it
+/// ([`restore_takeover_on_startup`]), which is why it read as an anomaly "from a previous host
+/// instance" — it was this one.
+static SESSION_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Set once this host has pushed `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` into the
+/// `systemd --user` manager's environment to re-mode the box's OWN game-mode session
+/// ([`ensure_box_gamescope_mode`]). Those are process-global to the user manager and survive every
+/// unit restart, so a stream that ended left the box's own Game Mode pinned at the last client's
+/// resolution for the rest of the login — the restore has to `unset-environment` them, and may
+/// only do so for values it put there itself (an operator's own `set-environment` is theirs).
+static FORCED_SESSION_SCREEN_ENV: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 /// Persisted takeover state (`design/gamemode-and-dedicated-sessions.md` A3): the takeover mechanics
 /// ([`STOPPED_AUTOLOGIN`] / [`STEAMOS_TOOK_OVER`]) are process memory, so a host **crash** mid-stream
 /// would strand the box out of gaming mode with no restore. Mirroring the statics to a file lets
@@ -184,6 +234,28 @@ struct TakeoverState {
     /// `restart` of the DM). `default` so takeover files from older hosts still parse.
     #[serde(default)]
     stopped_dm: Option<String>,
+    /// Whether a host-managed [`SESSION_UNIT`] was running. It steals nothing — it is the managed
+    /// session started BESIDE a live desktop (a client gamescope pin on a KDE box) — but it is
+    /// still ours to end, and [`takeover_live`] already counts it for exactly that reason. Without
+    /// it here, a host that crashed with such a session left the transient unit running with no
+    /// record anywhere: the next start read the three stealing fields as empty and cleared the
+    /// file, so nothing ever stopped it ("closing the app does not end the session" survives a host
+    /// restart). Restored as an impossible-mode marker, never as a reusable session — see
+    /// [`restore_takeover_on_startup`].
+    #[serde(default)]
+    managed_session: bool,
+    /// Whether this host forced `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` into the
+    /// `systemd --user` manager to re-mode the box's own game-mode session
+    /// ([`FORCED_SESSION_SCREEN_ENV`]). Unlike [`SESSION_DROPIN_ARMED`] — runtime-dir state the next
+    /// host start sweeps unconditionally — these live in the MANAGER, which outlives this process
+    /// and every unit restart for the rest of the login. Nothing sweeps them and nothing may sweep
+    /// them blind (`unset-environment` is indiscriminate; an operator's own `set-environment` is
+    /// theirs), so this flag is the only way a host that was SIGKILLed/OOM-killed/updated in place
+    /// can know they are ours to take back. Without it the operator's Game Mode came up at the last
+    /// client's resolution for the remainder of that login, with no record and no code path that
+    /// would ever undo it. `default` so takeover files from older hosts still parse.
+    #[serde(default)]
+    forced_screen_env: bool,
 }
 
 /// Path of the persisted [`TakeoverState`], under `$XDG_RUNTIME_DIR` (per-user, 0700, tmpfs — cleared
@@ -195,6 +267,10 @@ fn takeover_state_path() -> std::path::PathBuf {
 
 /// Persist the current takeover mechanics so a host crash doesn't strand the box out of gaming mode.
 /// Best-effort (a write failure just loses crash-restore, not correctness).
+/// ⚠ Never call this while holding any of the four statics it samples — [`MANAGED_SESSION`]
+/// included, which is new here. Each is taken and released in turn (one lock at a time, as
+/// [`takeover_live`] does), and a caller holding one would deadlock on itself: `std::sync::Mutex`
+/// is not reentrant.
 fn persist_takeover() {
     let state = TakeoverState {
         stopped_autologin: STOPPED_AUTOLOGIN
@@ -203,8 +279,15 @@ fn persist_takeover() {
             .clone(),
         steamos: *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()),
         stopped_dm: STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        managed_session: MANAGED_SESSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some(),
+        forced_screen_env: *FORCED_SESSION_SCREEN_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
     };
-    if state.stopped_autologin.is_empty() && !state.steamos && state.stopped_dm.is_none() {
+    if !takeover_state_is_live(&state) {
         clear_takeover();
         return;
     }
@@ -216,6 +299,28 @@ fn persist_takeover() {
 /// Remove the persisted takeover file (after a completed restore, or when there's nothing to restore).
 fn clear_takeover() {
     let _ = std::fs::remove_file(takeover_state_path());
+}
+
+/// Does this [`TakeoverState`] describe anything a restore would have to undo? The file-side twin
+/// of [`takeover_live`], and split out pure because the same test used to be written longhand in
+/// two places and drifted from the in-memory one: `persist_takeover` and
+/// `restore_takeover_on_startup` both tested only the three *stealing* fields, so a state whose
+/// sole content was a managed session was written as "nothing to restore" and deleted on the spot.
+///
+/// It is narrower than [`takeover_live`] by exactly ONE flag, and the reason is which side of the
+/// process boundary the state lives on. [`SESSION_DROPIN_ARMED`] is a file in the runtime dir that
+/// [`restore_takeover_on_startup`] removes unconditionally in its prologue, so persisting it would
+/// only make the file exist for a restore with nothing left to do. The forced `SCREEN_*`
+/// ([`FORCED_SESSION_SCREEN_ENV`]) are NOT that: they live in the `systemd --user` manager, nothing
+/// sweeps them, and the earlier version of this comment claimed otherwise — which is what licensed
+/// leaving them out of the file, so the one mechanism built to survive a crash excluded the one
+/// piece of state that most needs it. They are persisted and counted here now.
+fn takeover_state_is_live(state: &TakeoverState) -> bool {
+    !state.stopped_autologin.is_empty()
+        || state.steamos
+        || state.stopped_dm.is_some()
+        || state.managed_session
+        || state.forced_screen_env
 }
 
 /// On host startup, restore the TV's gaming session if a previous host instance took it over and
@@ -249,7 +354,7 @@ pub fn restore_takeover_on_startup() {
         clear_takeover();
         return;
     };
-    if state.stopped_autologin.is_empty() && !state.steamos && state.stopped_dm.is_none() {
+    if !takeover_state_is_live(&state) {
         clear_takeover();
         return;
     }
@@ -257,6 +362,8 @@ pub fn restore_takeover_on_startup() {
         units = ?state.stopped_autologin,
         steamos = state.steamos,
         stopped_dm = ?state.stopped_dm,
+        managed_session = state.managed_session,
+        forced_screen_env = state.forced_screen_env,
         "gamescope: found a stranded takeover from a previous host instance — scheduling TV restore"
     );
     // Assume the adopted takeover carries our runtime mask whenever it stopped units: whether it did
@@ -268,6 +375,33 @@ pub fn restore_takeover_on_startup() {
     *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
     *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_dm;
+    // [`SESSION_DROPIN_ARMED`] is deliberately NOT persisted and not adopted here: the sweep at the
+    // top of this function already removed the drop-in (from both of its homes) and reloaded
+    // systemd, unconditionally and before anything else — so there is nothing left for a restored
+    // flag to owe.
+    //
+    // The forced SCREEN_* are the opposite case and ARE adopted: the previous host put them in the
+    // user manager, which this process did not restart and cannot sweep blind, so only this flag can
+    // authorise the `unset-environment` the scheduled restore owes ([`unset_forced_session_screen_env`]
+    // no-ops without it). Adopting a `false` is also correct — it means the crashed host never forced
+    // them, and unsetting an operator's own values would be a fresh bug.
+    *FORCED_SESSION_SCREEN_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = state.forced_screen_env;
+    if state.managed_session {
+        // An ADOPTED managed session is something to STOP, never something to reuse: the mode it
+        // was launched at is not persisted (and a wrong one would hand the next client a session at
+        // someone else's resolution while reporting a same-mode reuse). The impossible 0x0/0 Hz
+        // marker can never satisfy `create_managed_session`'s equality test, so every route through
+        // it relaunches — while `takeover_live` and `do_restore_tv_session`'s nothing-was-stolen arm
+        // both see a session that owes the box a `stop`.
+        *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
+            width: 0,
+            height: 0,
+            refresh_hz: 0,
+            hdr: false,
+        });
+    }
     // Re-baseline the session-select sentinel: after a crash-restore the launch-time baseline is
     // gone, and a long-existing sentinel file must not read as a fresh in-stream switch request.
     record_session_select_baseline();
@@ -308,11 +442,14 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn poolable_now(&self) -> bool {
-        // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); managed
-        // (`PUNKTFUNK_GAMESCOPE_SESSION`) and attach (`PUNKTFUNK_GAMESCOPE_NODE`) report
-        // `SessionManaged`/`External`, so the registry must not reuse a kept spawn for them (same
-        // backend name). Mirrors [`crate::launch_is_nested`]; read under the env lock the
-        // sub-mode ladder writes these keys under.
+        // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); Managed and
+        // Attach report `SessionManaged`/`External`, so the registry must not reuse a kept spawn
+        // for them (same backend name). `None` is poolable because `create`'s own `None` arm falls
+        // through to the bare spawn — the invariant to keep is "agrees with what `create` does with
+        // the same route", NOT "agrees with [`crate::launch_is_nested`]", which answers `false` for
+        // `None`. Reads THIS session's resolved route (handed over by `set_gamescope_route`): no
+        // env read, and therefore no env lock — Phase 2.3 deleted both the read and the writer that
+        // used to publish `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` back into the process env.
         matches!(self.route, None | Some(crate::GamescopeRoute::Spawn))
     }
 
@@ -383,7 +520,15 @@ impl VirtualDisplay for GamescopeDisplay {
                                    // first and exit (crashing the spawn) — so free the autologin session first. Its restore is the
                                    // A3 takeover machinery (recorded in STOPPED_AUTOLOGIN + persisted; restarted on session end via
                                    // schedule_restore_tv_session). Non-Steam launches don't conflict, so they skip this.
-        if self.cmd.as_deref().is_some_and(is_steam_launch) {
+
+        // Resolve the app ONCE, HERE — before the gate, and hand the answer to [`spawn`]. The gate
+        // used to test `self.cmd` alone while `spawn` resolved the `PUNKTFUNK_GAMESCOPE_APP`
+        // fallback afterwards and recognised it as Steam (`steam_mode`), so the documented
+        // `PUNKTFUNK_GAMESCOPE_APP="steam -gamepadui"` route got gamescope's `--steam` mode with
+        // NO instance free — and then collided with the box's own autologin/desktop Steam, which
+        // is precisely the collision this block exists to prevent.
+        let app = resolved_spawn_app(self.cmd.as_deref());
+        if app.as_deref().is_some_and(is_steam_launch) {
             // A dedicated launch NEEDS Steam's single instance — no attach degrade exists here, so
             // a mask-fragile-DM box without takeover privilege fails with the actionable error.
             stop_autologin_sessions()
@@ -402,25 +547,28 @@ impl VirtualDisplay for GamescopeDisplay {
             mode.width,
             mode.height,
             mode.refresh_hz.max(1),
-            self.cmd.as_deref(),
+            app,
             &log,
             self.hdr,
         )?;
-        let child_pid = child.id();
-        let proc = GamescopeProc {
+        let mut proc = GamescopeProc {
             child,
             log: log.clone(),
         };
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
-        // alive meanwhile, and killed if we give up). Discovery reads THIS spawn's log, and the
-        // fallback is scoped to this spawn's process tree.
-        let node_id = wait_for_node(Duration::from_secs(15), &log, child_pid).ok_or_else(|| {
-            anyhow!(
-                "gamescope PipeWire node did not appear within 15s — gamescope may have failed to \
-                 start or headless capture is unsupported on this GPU/driver (see {})",
-                log.display()
-            )
-        })?;
+        // alive meanwhile, and killed if we give up). Discovery reads THIS spawn's log, the
+        // fallback is scoped to this spawn's process tree, and it gives up early if the process is
+        // already gone — a `vkCreateDevice` failure exits in under a second, and the 15 s the wait
+        // used to spend on its corpse produced a timeout error that blamed the GPU instead.
+        let node_id =
+            wait_for_node(Duration::from_secs(15), &log, &mut proc.child).ok_or_else(|| {
+                anyhow!(
+                    "gamescope published no PipeWire node within 15s (or exited first) — it may \
+                     have failed to start, or headless capture may be unsupported on this \
+                     GPU/driver; its own log says which (see {})",
+                    log.display()
+                )
+            })?;
         tracing::info!(
             node_id,
             w = mode.width,
@@ -489,13 +637,18 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     // sessions — right after a capture loss the caller's session detection can be stale, and a
     // destructive rebuild here would fight the session the user just switched to.
     if crate::rebuild_probe_active() {
-        let guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        let same_mode = guard.as_ref().is_some_and(|s| {
-            s.width == mode.width
-                && s.height == mode.height
-                && s.refresh_hz == mode.refresh_hz
-                && s.hdr == hdr
-        });
+        // Read the tracked mode in a scope of its own: everything below is a `pw-dump` and a file
+        // write, and holding MANAGED_SESSION across either puts a probe on the restore worker's
+        // critical path for no gain.
+        let same_mode = {
+            let guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_some_and(|s| {
+                s.width == mode.width
+                    && s.height == mode.height
+                    && s.refresh_hz == mode.refresh_hz
+                    && s.hdr == hdr
+            })
+        };
         if same_mode {
             if let Some(node_id) = find_gamescope_node() {
                 point_injector_at_eis();
@@ -541,13 +694,46 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     // would make the managed session's own Steam exit at birth. The managed session's Steam itself
     // is exempt (it lives in the SESSION_UNIT cgroup), so the same-mode reuse below is unaffected.
     free_desktop_steam()?;
-    let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    let same_mode = guard.as_ref().is_some_and(|s| {
-        s.width == mode.width
-            && s.height == mode.height
-            && s.refresh_hz == mode.refresh_hz
-            && s.hdr == hdr
-    });
+    // DECIDE under the lock, ACT outside it — the shape `session::observe_session_instance` and the
+    // registry already use, and the shape `create_managed_session_steamos` adopted for exactly this
+    // reason (see its LOCK ORDER note). The guard used to be held across `find_gamescope_node` (an
+    // unbounded `pw-dump`), `point_injector_at_eis` and — the long one — `launch_session`, whose two
+    // 45 s node-poll deadlines plus `systemd-run` round trips make ~90 s an ordinary duration.
+    // Meanwhile `do_restore_tv_session` needs the same mutex, and reaches it only AFTER it has
+    // stopped our unit and consumed the takeover: on a `systemctl --user restart punktfunk-host`
+    // during a launch, the shutdown restore blocked there while `native.rs`'s 20 s
+    // SHUTDOWN_RESTORE_GRACE ran out and `exit(0)` skipped the display-manager restore entirely —
+    // a box with its DM stopped, no graphical session, and nothing left on disk to heal it.
+    //
+    // The exclusion the wide hold ALSO provided is not free, though, and dropping it silently was
+    // this shape's own regression: two connects at the same mode inside one launch window both saw
+    // no tracked session, both relaunched, and the second `stop_session(SESSION_UNIT)`'d the unit the
+    // first was polling for. [`MANAGED_LAUNCH`] takes that duty back on its own — held from BEFORE
+    // the decision (so the second arrival re-tests it only once the first has recorded its result,
+    // and then reuses) to the end of the function, and touched by no restore path.
+    let _launching = MANAGED_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
+    let same_mode = {
+        let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        let same = guard.as_ref().is_some_and(|s| {
+            s.width == mode.width
+                && s.height == mode.height
+                && s.refresh_hz == mode.refresh_hz
+                && s.hdr == hdr
+        });
+        // Clear it up front on a mode change: from here on the tracked session is about to be torn
+        // down by `launch_session` anyway, and a concurrent restore must not read it as live.
+        //
+        // Residual, and deliberately preferred to the block it replaces: for the duration of the
+        // launch a managed session that stole NOTHING (started beside a live desktop) is invisible
+        // to `takeover_live`, so a restore firing inside that window returns early instead of
+        // waiting for the launch and then stopping the unit. The launch's own failure arm arms a
+        // restore, and a success records the session for the next disconnect — whereas the held
+        // guard could strand a whole box with its display manager down.
+        if !same {
+            *guard = None;
+        }
+        same
+    };
     if same_mode {
         if let Some(node_id) = find_gamescope_node() {
             point_injector_at_eis();
@@ -561,18 +747,17 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             return Ok(managed_output(node_id, mode));
         }
         tracing::warn!("gamescope session: tracked session has no live node — relaunching");
-        *guard = None;
+        *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    // (Re)launch at the new mode. `launch_session` stops the old unit by name first, so there is
-    // exactly one gamescope `Video/Source` node for discovery.
+    // (Re)launch at the new mode, holding NOTHING. `launch_session` stops the old unit by name
+    // first, so there is exactly one gamescope `Video/Source` node for discovery.
     let node_id = match launch_session(client, SESSION_UNIT, mode, hdr) {
         Ok(id) => id,
         Err(e) => {
             // The takeover already happened (autologin units stopped, possibly the DM down) — arm
             // the restore now, or a failed launch strands the box sessionless until a host
             // restart. Policy-timed; a quick client retry cancels it and relaunches warm.
-            // MANAGED_SESSION must be released first: the scheduler reads it (orphan detection).
-            drop(guard);
+            // MANAGED_SESSION is already released (the scheduler reads it for orphan detection).
             schedule_restore_tv_session();
             return Err(e);
         }
@@ -581,12 +766,19 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     // "Switch to Desktop") should read as a switch request, not the one that led here.
     record_session_select_baseline();
     point_injector_at_eis();
-    *guard = Some(SessionState {
+    // Re-acquire only to record the result — the same shape `create_managed_session_steamos` uses.
+    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
         width: mode.width,
         height: mode.height,
         refresh_hz: mode.refresh_hz,
         hdr,
     });
+    // A3, and the reason `TakeoverState` carries a `managed_session` flag at all: on a box where
+    // this session stole NOTHING (a client gamescope pin beside a live desktop) the only earlier
+    // `persist_takeover` — `stop_autologin_sessions`' — wrote an all-empty state and DELETED the
+    // file. A host that then crashed left the transient unit running with no record of it anywhere.
+    // Called after the guard above has dropped: `persist_takeover` samples the same mutex.
+    persist_takeover();
     tracing::info!(
         node_id,
         w = mode.width,
@@ -845,10 +1037,49 @@ fn discover_session_display_env() -> Option<(Option<String>, Option<String>, Opt
     None
 }
 
+/// Budget for a cheap unit STATE query (`systemctl is-active`). These answer from the manager's
+/// in-memory state, so tens of milliseconds is the normal cost. Several sit inside 10–45 s poll
+/// loops, where an unbounded one blows the whole deadline in a single tick.
+///
+/// ⚠ Only for callers whose timeout answer is the SAFE one. Both current callers time out into
+/// "assume active"/"keep looping", so a miss costs a poll tick. A caller whose timeout would invert
+/// the answer into the refusing direction must NOT use this bound — `loginctl show-user -p Linger`
+/// was given it and became a hard connect failure on a correctly-configured box (see
+/// [`linger_enabled`], now on [`UNIT_QUERY_BUDGET`]): 300 ms is an in-memory-read budget, and
+/// anything that spawns a process and makes a D-Bus round trip is not that.
+const UNIT_STATE_BUDGET: Duration = Duration::from_millis(300);
+
+/// Budget for an enumeration or a `loginctl` write (`systemctl list-units`, `enable-linger`) —
+/// heavier than a state query (it walks every loaded unit, and lingering goes through polkit) but
+/// still a local round trip.
+const UNIT_QUERY_BUDGET: Duration = Duration::from_secs(5);
+
+/// Budget for a unit LIFECYCLE verb on the user manager: `start`/`stop`/`restart`/`kill`,
+/// `daemon-reload`, `mask`/`unmask`, `reset-failed`, `set-environment`, `systemd-run --user`.
+/// Generous, because a stop job legitimately waits on the unit's own teardown — but bounded,
+/// because every one of these runs on a stream thread or the shutdown restore, and
+/// [`crate::proc`]'s module doc is about precisely that: a hung helper pins the thread whose only
+/// way to end a session is to return.
+const UNIT_VERB_BUDGET: Duration = Duration::from_secs(10);
+
+/// Budget for a SYSTEM-bus display-manager verb ([`systemctl_system`]) and for the distro's own
+/// session-switch helper. Much larger than [`UNIT_VERB_BUDGET`]: stopping a DM tears down a whole
+/// seat's worth of sessions, and a premature kill here would abandon a takeover half-done. The
+/// bound still matters — the callers fall through to the pkexec helper on failure, so the worst a
+/// timeout costs is one redundant helper call, against a wedge that would otherwise be permanent.
+const DM_VERB_BUDGET: Duration = Duration::from_secs(30);
+
 /// Run a `systemctl --user` subcommand best-effort — a failure just means the session won't change,
 /// which the caller's node-wait surfaces.
+///
+/// Status-blind by design (every caller here treats it as fire-and-forget), but NOT time-blind: it
+/// is the shared chokepoint behind daemon-reload/restart/stop/set-environment across this file, so
+/// one wedged user manager used to pin the stream thread through any of them.
 fn systemctl_user(args: &[&str]) {
-    let _ = Command::new("systemctl").arg("--user").args(args).status();
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").arg("--user").args(args),
+        UNIT_VERB_BUDGET,
+    );
 }
 
 /// Directory holding the per-user `gamescope` PATH-shim (tmpfs under `XDG_RUNTIME_DIR`).
@@ -1058,6 +1289,47 @@ fn remove_session_plus_dropin() -> bool {
     removed
 }
 
+/// [`remove_session_plus_dropin`] **plus** clearing [`SESSION_DROPIN_ARMED`] and the
+/// `daemon-reload` the removal owes systemd — the one call every hand-back path should make, so
+/// that "the box's own unit template is clean again" and "we no longer think we owe it a removal"
+/// can never disagree. A removal systemd has not reloaded still applies at the unit's next start,
+/// which for the box's own autologin unit means its next BOOT.
+fn disarm_session_plus_dropin() {
+    let removed = remove_session_plus_dropin();
+    *SESSION_DROPIN_ARMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = false;
+    if removed {
+        systemctl_user(&["daemon-reload"]);
+    }
+}
+
+/// Take back the `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` this host forced into the
+/// user manager for a re-moded box session ([`FORCED_SESSION_SCREEN_ENV`]). No-op unless we set
+/// them — `unset-environment` is indiscriminate, and an operator who set their own must keep it.
+/// `session.rs`'s `scrub_desktop_manager_env` does exactly this for `WAYLAND_DISPLAY`/`DISPLAY`;
+/// these three had no such counterpart at all, which is why they outlived every stream.
+fn unset_forced_session_screen_env() {
+    let mut forced = FORCED_SESSION_SCREEN_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !*forced {
+        return;
+    }
+    *forced = false;
+    drop(forced);
+    systemctl_user(&[
+        "unset-environment",
+        "SCREEN_WIDTH",
+        "SCREEN_HEIGHT",
+        "CUSTOM_REFRESH_RATES",
+    ]);
+    tracing::info!(
+        "gamescope: unset the forced SCREEN_WIDTH/SCREEN_HEIGHT/CUSTOM_REFRESH_RATES — the box's \
+         own game mode is back on its own resolution"
+    );
+}
+
 /// Take over SteamOS's `gamescope-session.target` headless at the CLIENT's mode: write the shim + a
 /// drop-in carrying the mode, `daemon-reload`, then RESTART the target so `steam-launcher.service`
 /// brings Steam up in the fresh headless gamescope — and attach to its node. A same-mode reconnect
@@ -1111,17 +1383,36 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
                         // gamescope's node appears within a few seconds of the restart; Steam's first FRAME is slower
                         // (Big Picture cold start) and is awaited by the caller's first-frame retry loop. The managed
                         // session logs to journald (not a per-spawn file), so poll `find_gamescope_node` directly.
-    let node_id = poll_managed_node(Duration::from_secs(30)).ok_or_else(|| {
-        anyhow!(
-            "SteamOS headless gamescope node did not appear within 30s after restarting \
-             {STEAMOS_SESSION_TARGET} — check `journalctl --user -u gamescope-session.service`"
-        )
-    })?;
+
+    // BOTH failure exits below arm the restore before returning, exactly as
+    // `create_managed_session` does at its own post-takeover failure (see its `Err` arm's comment,
+    // verbatim: "The takeover already happened … or a failed launch strands the box sessionless
+    // until a host restart"). The takeover here has ALREADY happened — `gamescope-session.target`
+    // is restarted headless and STEAMOS_TOOK_OVER is set — so a bare `?` left the Deck in a
+    // headless session with its panel dark, PENDING_RESTORE unset, and no in-process path that
+    // would ever run `do_restore_tv_session`: the GameStream plane calls `cancel_pending_restore`
+    // on connect and never `restore_managed_session`, so it stayed dark until the host exited or
+    // restarted, with each of the 8 pipeline retries restarting the target again.
+    // MANAGED_SESSION is already released (the `drop(guard)` above), which is what the scheduler's
+    // orphan-detection read needs.
+    let node_id = match poll_managed_node(Duration::from_secs(30)) {
+        Some(id) => id,
+        None => {
+            schedule_restore_tv_session();
+            bail!(
+                "SteamOS headless gamescope node did not appear within 30s after restarting \
+                 {STEAMOS_SESSION_TARGET} — check `journalctl --user -u gamescope-session.service`"
+            );
+        }
+    };
     // The shim is only a PATH entry — confirm the session actually took it before we trust the
     // capabilities the plan was already built on (a stock gamescope here means no HDR and, worse,
     // a silently pointerless stream). Leaves the tracked state unset on failure, so the retry does
     // a clean restart rather than a same-mode reuse of a session we just rejected.
-    verify_managed_spawn_flags(hdr)?;
+    if let Err(e) = verify_managed_spawn_flags(hdr) {
+        schedule_restore_tv_session();
+        return Err(e);
+    }
     point_injector_at_eis();
     // Re-acquire to record the tracked session — the same shape `create_managed_session` uses.
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionState {
@@ -1130,6 +1421,9 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
         refresh_hz: mode.refresh_hz,
         hdr,
     });
+    // Re-persist now that the tracked session exists: the write above the node poll recorded the
+    // takeover, this one records that a session came out of it.
+    persist_takeover();
     tracing::info!(
         node_id,
         w = mode.width,
@@ -1149,8 +1443,11 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
 /// Steam restarts only on an actual resolution CHANGE.
 fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     let target = (mode.width, mode.height);
+    // Sampled ONCE and read as a three-state answer ([`BoxOutputSize`]) — never as `== Some(target)`,
+    // which made "cannot tell" mean "restart the box's session".
+    let size = box_output_size();
     // Fast path: already at the client's resolution — just attach to the live node.
-    if current_gamescope_output_size() == Some(target) {
+    if size == BoxOutputSize::Known(target) {
         if let Some(node) = find_gamescope_node() {
             tracing::info!(
                 w = mode.width,
@@ -1182,16 +1479,64 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     // restart is the headless-box model (no panel ⇒ the game-mode resolution is ours to set);
     // on-glass it would flip the user's own screen to the client's resolution — and on a
     // DM-session-driven box (Nobara) the unit restart bounces the login session with it.
+    //
+    // The guard is on the DECISION, not on finding a node: a momentarily absent node (the session
+    // restarting, a `pw-dump` that timed out) used to fall straight THROUGH this `if` into
+    // `set-environment SCREEN_WIDTH/HEIGHT` + a unit restart — doing on a panel exactly what the
+    // paragraph above forbids, and leaving the forced SCREEN_* behind in the user manager
+    // afterwards. Refuse instead, the same shape the attach-only rebuild probe above uses: the
+    // caller's retry re-asks once the node is back.
     if physical_display_connected() {
-        if let Some(node) = find_gamescope_node() {
-            tracing::info!(
-                node,
-                client_w = mode.width,
-                client_h = mode.height,
-                "gamescope: box drives a physical display — attaching at its own mode (no re-mode)"
-            );
-            return Ok(node);
-        }
+        let node = find_gamescope_node().ok_or_else(|| {
+            anyhow!(
+                "the box drives a physical display, so its game-mode session is mirrored at its \
+                 OWN mode — and it publishes no gamescope Video/Source node right now. Refusing to \
+                 re-mode it to {}x{}: that would flip the screen someone is looking at and, on a \
+                 DM-driven box, bounce the login session with it",
+                mode.width,
+                mode.height
+            )
+        })?;
+        tracing::info!(
+            node,
+            client_w = mode.width,
+            client_h = mode.height,
+            "gamescope: box drives a physical display — attaching at its own mode (no re-mode)"
+        );
+        return Ok(node);
+    }
+    // AMBIGUOUS — two coexisting gamescopes at different sizes, so we cannot say which one the box's
+    // session unit owns. Everything below this line is destructive (`set-environment` + a restart of
+    // the box's OWN autologin unit), and the commonest way to reach ambiguity is the most expensive
+    // one to be wrong about: a game running in a nested per-title gamescope (`gamescope -W … --
+    // %command%`) inside a session that may well ALREADY be at the client's resolution. Restarting
+    // there kills the user's running game on every connect.
+    //
+    // So mirror the live node at whatever mode it is at — the same non-destructive degrade the
+    // physical-display arm above takes, and the same outcome the pre-`Option` code produced here
+    // whenever its arbitrary first-`/proc`-entry pick happened to be the session compositor. Refusing
+    // instead (the reviewer's first suggestion) would fail EVERY connect for as long as the nested
+    // gamescope lives, i.e. for the whole game — a retry cannot converge on a state that only ends
+    // when the user quits the game.
+    if size == BoxOutputSize::Ambiguous {
+        let node = find_gamescope_node().ok_or_else(|| {
+            anyhow!(
+                "two gamescopes are running at different output sizes and neither publishes a \
+                 Video/Source node right now — refusing to re-mode the box's session to {}x{} \
+                 without knowing which one it is (re-detection follows the live session)",
+                mode.width,
+                mode.height
+            )
+        })?;
+        tracing::warn!(
+            node,
+            client_w = mode.width,
+            client_h = mode.height,
+            "gamescope: two coexisting gamescopes disagree on the output size (a game nested in the \
+             session is the usual cause) — attaching at the live node's own mode instead of \
+             restarting the box's session under it"
+        );
+        return Ok(node);
     }
     let Some(unit) = running_autologin_gamescope_unit() else {
         // No box-owned autologin session to reconfigure (a bare/foreign gamescope): attach to
@@ -1204,7 +1549,7 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         });
     };
     tracing::info!(
-        from = ?current_gamescope_output_size(),
+        from = ?size,
         to_w = mode.width,
         to_h = mode.height,
         hz = mode.refresh_hz,
@@ -1212,19 +1557,39 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         "gamescope: relaunching the box game-mode session at the client's resolution"
     );
     // The session reads SCREEN_WIDTH/HEIGHT (+ CUSTOM_REFRESH_RATES) from the user-manager
-    // environment; set them and restart the box's own unit.
+    // environment; set them and restart the box's own unit. Record that we did: the manager keeps
+    // them for the rest of the login, so the restore owes them an `unset-environment`
+    // ([`unset_forced_session_screen_env`]) or the box's own Game Mode stays at the client's
+    // resolution long after the stream ended.
+    *FORCED_SESSION_SCREEN_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = true;
     systemctl_user(&[
         "set-environment",
         &format!("SCREEN_WIDTH={}", mode.width),
         &format!("SCREEN_HEIGHT={}", mode.height),
         &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
     ]);
+    // …and persist that, which is new: this path steals nothing, so it used to write no takeover
+    // file at all, and the three variables above outlive this process. A host SIGKILLed / OOM-killed
+    // / updated in place left the operator's own Game Mode pinned at the last client's resolution
+    // for the rest of the login with nothing on disk saying who did it. Called with no takeover
+    // static held (the guard above dropped at its semicolon) — `persist_takeover` samples them all.
+    persist_takeover();
     // Same two fixes the transient path gets, but this unit is the BOX's own — they have to arrive
     // as a drop-in, and `daemon-reload` before the restart or systemd runs the old unit.
     let mut bound = match write_gamescope_bin_wrapper()
         .and_then(|w| write_session_plus_dropin(&w, mode, hdr, wsi_layer_matches_our_gamescope()))
     {
         Ok(true) => {
+            // Record it BEFORE the restart, and persist it: from this instant the box's OWN
+            // autologin template carries our bind, and only a restore takes it back. Nothing else
+            // on this path sets a takeover static, so without this flag `takeover_live()` answered
+            // `false` and neither the disconnect restore nor the shutdown one ever ran — the
+            // drop-in outlived the stream and the host process both.
+            *SESSION_DROPIN_ARMED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = true;
             tracing::info!(
                 bin = %gamescope_bin(),
                 %unit,
@@ -1234,7 +1599,15 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
             );
             true
         }
-        Ok(false) => false,
+        Ok(false) => {
+            // `write_session_plus_dropin` REMOVES rather than writes when there is no bind to arm,
+            // so this arm is also the disarm — the flag must follow it or the restore would owe a
+            // removal for a drop-in that is already gone.
+            *SESSION_DROPIN_ARMED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+            false
+        }
         // Best-effort: a box whose session already runs our binary loses nothing, and a failure
         // here must not block a restart that would otherwise work.
         Err(e) => {
@@ -1252,7 +1625,8 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     // first-frame retry absorbs Steam's cold start.
     let mut deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        if current_gamescope_output_size() == Some(target) {
+        // "Did what we asked for come up", NOT "is the box unanimous" — see [`any_output_size_is`].
+        if any_output_size_is(&gamescope_argvs(), target) {
             if let Some(node) = find_gamescope_node() {
                 tracing::info!(
                     node,
@@ -1271,8 +1645,7 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
             // drop-in, reload, and give it one more restart without it.
             if bound {
                 note_bind_hazard(&unit);
-                remove_session_plus_dropin();
-                systemctl_user(&["daemon-reload"]);
+                disarm_session_plus_dropin(); // also clears the flag: there is nothing left to undo
                 systemctl_user(&["restart", &unit]);
                 bound = false;
                 deadline = Instant::now() + Duration::from_secs(45);
@@ -1325,19 +1698,108 @@ fn gamescope_argvs() -> Vec<Vec<String>> {
     found
 }
 
-/// Output (capture) resolution `-W <w> -H <h>` of the running gamescope, parsed from its
-/// `/proc/<pid>/cmdline`. `None` if no gamescope is running or the flags aren't present — which is
-/// also the final filter that separates a compositor from anything else [`gamescope_argvs`] let by.
+/// Output (capture) resolution `-W <w> -H <h>` of ONE gamescope, from its argv. `None` if the
+/// flags aren't both present — which is also the final filter that separates a compositor from
+/// anything else [`gamescope_argvs`] let by. Pure + unit-tested.
+fn gamescope_output_size(argv: &[String]) -> Option<(u32, u32)> {
+    match (
+        argv_u32(argv, &["-W", "--output-width"]),
+        argv_u32(argv, &["-H", "--output-height"]),
+    ) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// What "the gamescope on this box" is producing — a **three-state** answer, because on the one
+/// deployment that matters the question genuinely has three answers and collapsing two of them is
+/// what makes a caller do the wrong thing.
+///
+/// This started as `find_map` over `/proc` read_dir order: the first gamescope with a `-W`/`-H`,
+/// which is arbitrary. A Deck or Bazzite box in Game Mode routinely runs TWO — the session
+/// compositor and a nested one for the game (a per-title `gamescope -W 1920 -H 1080 -- %command%`
+/// launch option produces exactly that, and `heads.rs`'s own test encodes the shape as normal) —
+/// plus any headless one this crate spawned. A wrong-but-confident answer scaled the libei
+/// injector's absolute coordinates to the wrong picture and made [`ensure_box_gamescope_mode`]
+/// compare its target against a compositor it was not restarting.
+///
+/// It then became `Option`, and *that* is what forced this enum: at both of
+/// [`ensure_box_gamescope_mode`]'s `== Some(target)` sites, "cannot tell" was indistinguishable
+/// from "a different resolution" — i.e. it meant DO THE DESTRUCTIVE THING. On a headless Game Mode
+/// box with a game nested inside the session (the normal shape) a connect at the session's own
+/// resolution stopped taking the fast path and instead `set-environment`ed + restarted the box's
+/// own unit, killing the running game. Three states keep "unknown" answerable as "unknown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoxOutputSize {
+    /// Every gamescope that carries a `-W`/`-H` carries THIS one — the only state a caller may act
+    /// on, in either direction (reuse when it matches, re-mode when it does not).
+    Known((u32, u32)),
+    /// Nothing on the box reports an output size: no gamescope running, or one launched without
+    /// those flags. Not ambiguity — there is no second opinion to be wrong about — so the re-mode
+    /// path treats it as the pre-`Option` code did and proceeds.
+    Unreported,
+    /// Two coexisting gamescopes report DIFFERENT sizes and nothing here can say which one owns the
+    /// session. Callers must pick their NON-destructive branch: identifying the session compositor
+    /// (rather than declining to guess) needs a `/proc` ppid map to reject the nested ones, which is
+    /// deliberately not built here.
+    Ambiguous,
+}
+
+/// [`BoxOutputSize`] for the gamescopes running right now.
+fn box_output_size() -> BoxOutputSize {
+    classify_output_size(&gamescope_argvs())
+}
+
+/// The single size every gamescope carrying `-W`/`-H` agrees on. `None` for BOTH of the other two
+/// states, which is sound only because this reader's one consumer — the libei injector's coordinate
+/// hint — treats "unknown" as "omit the hint and use raw client pixels". Anything that would ACT on
+/// the difference must call [`box_output_size`] instead.
 fn current_gamescope_output_size() -> Option<(u32, u32)> {
-    gamescope_argvs().into_iter().find_map(|args| {
-        match (
-            argv_u32(&args, &["-W", "--output-width"]),
-            argv_u32(&args, &["-H", "--output-height"]),
-        ) {
-            (Some(w), Some(h)) => Some((w, h)),
-            _ => None,
+    match box_output_size() {
+        BoxOutputSize::Known(size) => Some(size),
+        BoxOutputSize::Unreported | BoxOutputSize::Ambiguous => None,
+    }
+}
+
+/// [`box_output_size`]'s decision over a supplied argv set. Pure + unit-tested — the three-way rule
+/// is the whole point of the function, and it is not observable from the `/proc`-reading half.
+fn classify_output_size(argvs: &[Vec<String>]) -> BoxOutputSize {
+    let mut agreed: Option<(u32, u32)> = None;
+    for argv in argvs {
+        let Some(size) = gamescope_output_size(argv) else {
+            continue;
+        };
+        match agreed {
+            None => agreed = Some(size),
+            Some(seen) if seen == size => {}
+            Some(seen) => {
+                tracing::debug!(
+                    ?seen,
+                    ?size,
+                    "gamescope: two coexisting gamescopes report different output sizes — \
+                     answering 'ambiguous' rather than picking one of them"
+                );
+                return BoxOutputSize::Ambiguous;
+            }
         }
-    })
+    }
+    match agreed {
+        Some(size) => BoxOutputSize::Known(size),
+        None => BoxOutputSize::Unreported,
+    }
+}
+
+/// Is ANY gamescope on the box producing exactly `target`? The right question after we restarted the
+/// box's own session at `target`: we are not asking "what is this box's size" (the unanimity
+/// question) but "did the thing we asked for come up". Unanimity is the wrong test there — a single
+/// unrelated gamescope at another size (a kept bare spawn of ours for a different client, which does
+/// NOT die with the restarted unit) would hold the answer at `Ambiguous` forever, spending the whole
+/// 45 s wait, the bind-hazard backstop's second restart, and another 45 s before failing a connect
+/// whose session had in fact come up. Pure + unit-tested.
+fn any_output_size_is(argvs: &[Vec<String>], target: (u32, u32)) -> bool {
+    argvs
+        .iter()
+        .any(|argv| gamescope_output_size(argv) == Some(target))
 }
 
 /// The numeric value following the first of `names` present in `argv`. Pure + unit-tested — it is
@@ -1514,8 +1976,8 @@ fn missing_flags<'a>(expected: &'a [String], argvs: &[Vec<String>]) -> Vec<&'a s
 /// The running autologin gaming-mode unit (`gamescope-session-plus@<client>.service`), if any — the
 /// box's own game-mode session, which [`ensure_box_gamescope_mode`] reconfigures + restarts.
 fn running_autologin_gamescope_unit() -> Option<String> {
-    let out = Command::new("systemctl")
-        .args([
+    let out = crate::proc::output_within(
+        Command::new("systemctl").args([
             "--user",
             "list-units",
             "--type=service",
@@ -1523,9 +1985,10 @@ fn running_autologin_gamescope_unit() -> Option<String> {
             "--no-legend",
             "--plain",
             "gamescope-session-plus@*.service",
-        ])
-        .output()
-        .ok()?;
+        ]),
+        UNIT_QUERY_BUDGET,
+    )
+    .ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_whitespace().next())
@@ -1541,15 +2004,21 @@ fn running_autologin_gamescope_unit() -> Option<String> {
 /// reboot. SIGKILL skips that handler so the driver reclaims the context cleanly via normal process
 /// exit. Follow with `stop` + `reset-failed` to clear the unit's state so a relaunch is clean.
 fn kill_unit(unit: &str) {
-    let _ = Command::new("systemctl")
-        .args(["--user", "kill", "--signal=SIGKILL", unit])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", unit])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "reset-failed", unit])
-        .status();
+    // All three budgeted: this runs on the disconnect restore and on the shutdown path, where the
+    // whole sequence has ~20 s before `native.rs` gives up and exits — three unbounded `systemctl`
+    // calls against a busy user manager were enough on their own to spend it.
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "kill", "--signal=SIGKILL", unit]),
+        UNIT_VERB_BUDGET,
+    );
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "stop", unit]),
+        UNIT_VERB_BUDGET,
+    );
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "reset-failed", unit]),
+        UNIT_VERB_BUDGET,
+    );
 }
 
 /// Runtime-mask `unit` so the box's session supervisor cannot restart it underneath the takeover.
@@ -1580,17 +2049,19 @@ fn kill_unit(unit: &str) {
 /// the way back is barred until reboot (`--runtime` lives in tmpfs — which is exactly why "it works
 /// again after a reboot").
 fn mask_unit(unit: &str) {
-    let _ = Command::new("systemctl")
-        .args(["--user", "mask", "--runtime", unit])
-        .status();
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "mask", "--runtime", unit]),
+        UNIT_VERB_BUDGET,
+    );
 }
 
 /// Undo [`mask_unit`] — every restore path must unmask before (or regardless of) restarting, or the
 /// box's own return-to-gaming-mode stays broken until reboot.
 fn unmask_unit(unit: &str) {
-    let _ = Command::new("systemctl")
-        .args(["--user", "unmask", "--runtime", unit])
-        .status();
+    let _ = crate::proc::status_within(
+        Command::new("systemctl").args(["--user", "unmask", "--runtime", unit]),
+        UNIT_VERB_BUDGET,
+    );
 }
 
 /// Lift the takeover's runtime mask ([`mask_unit`]) on the box's own autologin units, so the box can
@@ -1992,10 +2463,17 @@ fn user_in_group(user: &str, group: &str) -> bool {
 /// failure the callers are written for, so the pkexec helper (`allow_any`, no agent needed) takes
 /// over instead of a dialog. Field-suspect in the 0.20.0 Nobara report (intermittent disconnect +
 /// a screen that never comes back), where the timing is a race against the KDE agent's own death.
+///
+/// Bounded by [`DM_VERB_BUDGET`] on top of that: `--no-ask-password` removes the *dialog*, not the
+/// wait — a system manager mid-shutdown can still take the request and never answer. A timeout
+/// reads as `false`, which is the same answer an unauthorized call already gives, so every caller
+/// falls through to the pkexec helper exactly as it does today.
 fn systemctl_system(args: &[&str]) -> bool {
     let mut cmd = Command::new("systemctl");
     cmd.arg("--no-ask-password").args(args);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    crate::proc::status_within(&mut cmd, DM_VERB_BUDGET)
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Would stopping the display manager also stop US? A packaged host runs as a `systemd --user`
@@ -2027,9 +2505,10 @@ fn ensure_host_survives_dm_stop() -> std::result::Result<(), String> {
     // user's session can do this itself; a sessionless one (the packaged unit) goes through the
     // helper, whose grant is scoped to the calling uid.
     let uid = uid_string();
-    let _ = Command::new("loginctl")
-        .args(["--no-ask-password", "enable-linger", &uid])
-        .status();
+    let _ = crate::proc::status_within(
+        Command::new("loginctl").args(["--no-ask-password", "enable-linger", &uid]),
+        UNIT_QUERY_BUDGET,
+    );
     let helper = if linger_enabled() {
         Ok(()) // the plain verb was enough — the helper was never needed
     } else {
@@ -2077,13 +2556,27 @@ fn uid_string() -> String {
     crate::proc::current_uid().to_string()
 }
 
-/// Is lingering on for this user (logind keeps the `--user` manager alive with no session)?
+/// Is lingering on for this user (logind keeps the `--user` manager alive with no session)? An
+/// unanswered one reads as "not lingering", which refuses the takeover rather than risking the DM
+/// stop taking the host down with it.
+///
+/// [`UNIT_QUERY_BUDGET`], not [`UNIT_STATE_BUDGET`], and the failure DIRECTION is why. The 300 ms
+/// bound is documented as "anything near it means the manager is wedged — the case each caller's
+/// failure path already covers", and that holds for the other two callers, whose timeout answers
+/// `true`/keep-looping (benign). Here a timeout INVERTS the answer to `false`, and `false` is the
+/// refusing direction: `ensure_host_survives_dm_stop` then reports "`enable-linger` reported success
+/// but lingering is still off" and the bare-spawn Steam path fails a connect that would have worked,
+/// blaming a lingering configuration that is in fact correct. And this is not an in-memory read the
+/// way `systemctl is-active` is: it is a process spawn plus libsystemd's dynamic link plus a logind
+/// D-Bus round trip, sampled at the busiest moment on the box (a takeover, with Steam and a
+/// compositor being torn down). Only a genuinely wedged logind exceeds 5 s.
 fn linger_enabled() -> bool {
-    Command::new("loginctl")
-        .args(["show-user", &uid_string(), "-p", "Linger", "--value"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
-        .unwrap_or(false)
+    crate::proc::output_within(
+        Command::new("loginctl").args(["show-user", &uid_string(), "-p", "Linger", "--value"]),
+        UNIT_QUERY_BUDGET,
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+    .unwrap_or(false)
 }
 
 /// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
@@ -2213,11 +2706,14 @@ fn honor_session_select_switch(dm: String) {
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let active = Command::new("systemctl")
-            .args(["is-active", &dm])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-            .unwrap_or(false);
+        // Budgeted: this is a 10 s loop, and a single unbounded `is-active` against a system
+        // manager that is itself mid-restart would consume the whole window in one tick.
+        let active = crate::proc::output_within(
+            Command::new("systemctl").args(["is-active", &dm]),
+            UNIT_STATE_BUDGET,
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
         if active {
             break;
         }
@@ -2227,7 +2723,13 @@ fn honor_session_select_switch(dm: String) {
     // Absent/failing helper degrades to a plain DM restore — the box lands back in game mode on
     // glass and the stream follows that instead (no black screen either way).
     if std::path::Path::new(OS_SESSION_SELECT).exists() {
-        match Command::new(OS_SESSION_SELECT).arg("desktop").status() {
+        // [`DM_VERB_BUDGET`] rather than a unit budget: the helper self-pkexecs and rewrites the
+        // DM's autologin config, which is DM-verb-shaped work — and it runs on the stream thread
+        // that is honoring the user's in-stream switch.
+        match crate::proc::status_within(
+            Command::new(OS_SESSION_SELECT).arg("desktop"),
+            DM_VERB_BUDGET,
+        ) {
             Ok(s) if s.success() => {
                 // The relogin only fires when the CURRENT (game-mode) login session exits: wait
                 // for its autologin unit to come up, then stop it. Never mask here — the mask is
@@ -2293,8 +2795,8 @@ fn honor_session_select_switch(dm: String) {
 ///   **fails the takeover** — the error tells the caller to degrade to ATTACH (mirror the box's
 ///   own session) rather than destabilize the seat.
 fn stop_autologin_sessions() -> Result<()> {
-    let Ok(out) = Command::new("systemctl")
-        .args([
+    let Ok(out) = crate::proc::output_within(
+        Command::new("systemctl").args([
             "--user",
             "list-units",
             "--type=service",
@@ -2302,9 +2804,9 @@ fn stop_autologin_sessions() -> Result<()> {
             "--no-legend",
             "--plain",
             "gamescope-session-plus@*.service",
-        ])
-        .output()
-    else {
+        ]),
+        UNIT_QUERY_BUDGET,
+    ) else {
         return Ok(());
     };
     // `(unit, ACTIVE state)` — the `--plain` columns are UNIT LOAD ACTIVE SUB DESCRIPTION.
@@ -2433,6 +2935,19 @@ fn stop_autologin_sessions() -> Result<()> {
 /// down a running game (Proton/wineserver included) on the way out, so this is generous.
 const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
+/// Budget for the `steam -shutdown` HELPER itself — derived from [`STEAM_SHUTDOWN_WAIT`], because
+/// the cause may not be given less time than we are willing to wait for the effect.
+///
+/// It was [`UNIT_QUERY_BUDGET`] (5 s) on the premise that `/usr/bin/steam` is a thin IPC forwarder.
+/// It is not: on every mainstream distro it is the `steam.sh` bootstrap — env setup, runtime and
+/// bootstrap checks, library-path shimming — which only then runs the client binary that forwards
+/// `-shutdown`. And [`crate::proc::status_within`] does not merely stop waiting at the budget: it
+/// `killpg`s the whole process group, so an expiry KILLS the forwarder before the request leaves,
+/// after which the 20 s wait below can only ever time out and tell the operator to close by hand the
+/// Steam we just silently shot at. Half the effect budget leaves the wait its own room while still
+/// covering a cold `steam.sh` on a loaded box.
+const STEAM_SHUTDOWN_SEND_BUDGET: Duration = Duration::from_secs(STEAM_SHUTDOWN_WAIT.as_secs() / 2);
+
 /// B1b: free Steam held by a plain **desktop** session (GNOME/KDE — e.g. a Steam the user opened
 /// while streaming the desktop). [`stop_autologin_sessions`] only frees `gamescope-session-plus@*`
 /// autologin units, so a desktop Steam still holds the single instance — a dedicated launch's
@@ -2453,11 +2968,22 @@ fn free_desktop_steam() -> Result<()> {
         pid,
         "freeing Steam: a desktop-session Steam holds the single instance — sending `steam -shutdown`"
     );
-    let _ = Command::new("steam")
-        .arg("-shutdown")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    // REAPED, not fire-and-forget. `let _ = …spawn()` dropped the `Child` immediately, and
+    // `Child`'s Drop explicitly does not wait — so this helper became a zombie held for the host's
+    // whole lifetime. Nothing downstream collected it: the loop below polls the TARGET Steam's pid,
+    // and `pid_running` documents the very state this call site was manufacturing ("a zombie keeps
+    // its /proc entry but has already released the Steam instance"). The budget is
+    // [`STEAM_SHUTDOWN_SEND_BUDGET`], NOT a query-sized one: this helper is `steam.sh`'s bootstrap
+    // before it is an IPC send, and the budget kills its whole process group — so too short a bound
+    // does not merely stop waiting, it destroys the request. The rest of the waiting is the
+    // `STEAM_SHUTDOWN_WAIT` loop below, which is about the OTHER process.
+    let _ = crate::proc::status_within(
+        Command::new("steam")
+            .arg("-shutdown")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        STEAM_SHUTDOWN_SEND_BUDGET,
+    );
     let deadline = Instant::now() + STEAM_SHUTDOWN_WAIT;
     while Instant::now() < deadline {
         if !pid_running(pid) {
@@ -2591,8 +3117,9 @@ pub fn schedule_restore_tv_session() {
 }
 
 /// Is anything of the box's own session ours right now — an autologin unit we stopped, a stopped
-/// display manager, a SteamOS target we re-pointed, or a managed session we launched beside a live
-/// desktop? The precondition for every restore path.
+/// display manager, a SteamOS target we re-pointed, a bind drop-in we armed over the box's own
+/// session template, a resolution we pinned into its user manager, or a managed session we
+/// launched beside a live desktop? The precondition for every restore path.
 fn takeover_live() -> bool {
     // ONE lock at a time. In a `||` chain every `.lock()` temporary lives to the end of the
     // statement, so this used to hold all four simultaneously — putting it in the lock-order graph
@@ -2606,9 +3133,20 @@ fn takeover_live() -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
+    // The ATTACH re-mode path steals nothing, so none of the three above records it — but it DID
+    // rewrite the box's own `gamescope-session-plus@` template and pin the user manager's
+    // SCREEN_*/CUSTOM_REFRESH_RATES at the client's mode, and only a restore takes those back.
+    let dropin = *SESSION_DROPIN_ARMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let screen_env = *FORCED_SESSION_SCREEN_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     autologin
         || steamos
         || dm
+        || dropin
+        || screen_env
         // A managed session that took nothing over (started beside a live desktop — e.g. a client
         // gamescope pin on a KDE box) still owns the transient SESSION_UNIT: without this arm it
         // was ORPHANED forever after disconnect ("closing the app does not end the session",
@@ -2636,6 +3174,47 @@ pub fn restore_takeover_now() {
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None; // doing it right here
     tracing::info!("gamescope: host is shutting down — restoring the box's own session first");
     do_restore_tv_session();
+}
+
+/// What a bounded `systemctl --user` lifecycle verb on the RESTORE path actually did. Three states,
+/// because the log line these produce is the only thing an operator ever sees about a box that may
+/// or may not have its screen back.
+enum RestoreVerb {
+    /// The job completed and systemd reported success.
+    Done,
+    /// We stopped WAITING at the budget — the job itself is untouched. `status_within` kills the
+    /// systemctl CLIENT; a queued systemd job is not cancelled by that, so the unit still starts.
+    StillRunning,
+    /// systemd said no (masked unit, tripped start limit, missing unit), or the helper could not be
+    /// spawned at all. The only outcome an operator has to act on.
+    Failed(String),
+}
+
+/// Issue `systemctl --user <args>` on the restore path, bounded, and classify the outcome
+/// ([`RestoreVerb`]).
+///
+/// The classification is the point. The sweep made these two call sites status-CHECKED (they used to
+/// log an unconditional success over a discarded exit status, which is worse) but routed
+/// [`std::io::ErrorKind::TimedOut`] into the same arm as a real failure — and for lifecycle verbs on
+/// a restore that arm is the loud "the panel stays dark, run this by hand" error. Exceeding
+/// [`UNIT_VERB_BUDGET`] is the ORDINARY case for these two: a `restart` of
+/// `gamescope-session.target` blocks on `steam-launcher.service` stopping, i.e. on Steam tearing a
+/// running game down. So the box came back exactly as intended while the highest-visibility
+/// diagnostic on it said it had not — a false alarm on every SteamOS restore with a game loaded.
+///
+/// The bound itself stays: this runs on the shutdown path, where `native.rs`'s 20 s
+/// `SHUTDOWN_RESTORE_GRACE` then `exit(0)` means an unbounded verb costs the display-manager restore
+/// that follows it.
+fn issue_restore_verb(args: &[&str]) -> RestoreVerb {
+    match crate::proc::status_within(
+        Command::new("systemctl").arg("--user").args(args),
+        UNIT_VERB_BUDGET,
+    ) {
+        Ok(s) if s.success() => RestoreVerb::Done,
+        Ok(s) => RestoreVerb::Failed(format!("systemctl exited with {s}")),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => RestoreVerb::StillRunning,
+        Err(e) => RestoreVerb::Failed(format!("could not run systemctl: {e}")),
+    }
 }
 
 /// Does any DRM connector report a physically `connected` display? Scans
@@ -2683,7 +3262,6 @@ fn do_restore_tv_session() {
                 return;
             }
             *took = false;
-            clear_takeover(); // A3: takeover undone — drop the persisted crash-restore marker
             *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
             remove_steamos_dropin();
             systemctl_user(&["daemon-reload"]);
@@ -2699,12 +3277,37 @@ fn do_restore_tv_session() {
                     "gamescope (SteamOS): a desktop session is active — removed the headless \
                      override, not restarting the gaming session"
                 );
+                clear_takeover(); // A3: takeover undone — and only now that it actually is
                 return;
             }
-            systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
-            tracing::info!(
-                "gamescope (SteamOS): restored the physical gaming session (removed headless override)"
-            );
+            // Checked, not `systemctl_user`'d: that helper is status-blind (`let _ = …status()`),
+            // so this used to log an unconditional success over a restart that may never have
+            // happened — on the one box whose panel goes dark until it does.
+            match issue_restore_verb(&["restart", STEAMOS_SESSION_TARGET]) {
+                RestoreVerb::Done => tracing::info!(
+                    "gamescope (SteamOS): restored the physical gaming session (removed headless \
+                     override)"
+                ),
+                // NOT an error, and this is the ordinary outcome on a Deck with a game loaded: a
+                // `restart` of the target blocks on `steam-launcher.service`'s stop, i.e. on Steam
+                // tearing a title (Proton/wineserver included) down — the very teardown this file
+                // budgets 20 s for elsewhere and calls "generous". systemd has the job queued and
+                // will finish it; all we stopped was our own wait.
+                RestoreVerb::StillRunning => tracing::info!(
+                    "gamescope (SteamOS): the {STEAMOS_SESSION_TARGET} restart is still running \
+                     after {}s (Steam closing a game is the usual reason) — systemd owns the job \
+                     from here; the panel comes back when it completes",
+                    UNIT_VERB_BUDGET.as_secs()
+                ),
+                RestoreVerb::Failed(why) => tracing::error!(
+                    status = %why,
+                    "gamescope (SteamOS): could not restart {STEAMOS_SESSION_TARGET} — the Deck's \
+                     panel stays dark until someone runs \
+                     `systemctl --user restart {STEAMOS_SESSION_TARGET}` (the headless override is \
+                     already removed, so that restart is all it needs)"
+                ),
+            }
+            clear_takeover(); // A3: consumed — after the restart, not before it
             return;
         }
     }
@@ -2716,27 +3319,51 @@ fn do_restore_tv_session() {
     lift_autologin_mask();
     let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
     let dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
+    // Consume the managed-session record HERE, in a scope of its own, and never hold that lock
+    // across the work below. `create_managed_session` can be inside `launch_session` holding it for
+    // up to ~90 s (two 45 s node-poll deadlines plus `systemd-run` round trips), and this function
+    // is the shutdown path: blocking on it AFTER `stop_session` had already killed the unit meant
+    // the display-manager restore below was never reached before `native.rs`'s 20 s
+    // `SHUTDOWN_RESTORE_GRACE` expired and the process `exit(0)`ed — a box with its DM stopped, no
+    // graphical session, and (with `clear_takeover` where it used to be) nothing on disk to heal it.
+    let managed_was_running = MANAGED_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some();
     if units.is_empty() && dm.is_none() {
         // Nothing was stolen — but a managed session that started BESIDE a live desktop (client
         // gamescope pin on a KDE box) still owns the transient unit; stop it so it doesn't run
         // orphaned forever after the disconnect. No-op when the unit isn't running.
-        if MANAGED_SESSION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .is_some()
-        {
+        if managed_was_running {
             stop_session(SESSION_UNIT);
             tracing::info!(
                 "gamescope: stopped the idle managed session (nothing was taken over — no box \
                  session to restore)"
             );
         }
+        // …and the ATTACH re-mode path steals nothing either, yet leaves the two most durable
+        // marks this backend can make on a box: a bind drop-in over its OWN autologin template and
+        // a user manager pinned at the client's resolution. Both used to survive the stream, the
+        // host process, and (for the `$HOME` drop-in) the reboot. Undoing them does NOT restart
+        // the box's session: the live one keeps the client's mode until it next starts, which is
+        // the non-destructive direction — bouncing the user's own Game Mode on a disconnect is the
+        // very thing the physical-display guard in `ensure_box_gamescope_mode` refuses to do.
+        disarm_session_plus_dropin();
+        unset_forced_session_screen_env();
+        clear_takeover();
         return;
     }
-    clear_takeover(); // A3: takeover consumed — drop the persisted crash-restore marker
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
-    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    // Hand the box back its OWN gamescope and its own resolution BEFORE any of the branches below,
+    // every one of which can return: our bind drop-in exists to serve a punktfunk stream, and
+    // leaving it would silently put the patched build (plus our HDR/cursor flags) under the user's
+    // ordinary game mode — exactly the "sits beside the distro package" rule this whole design
+    // rests on. It used to sit after the desktop-active and DM returns, so those two paths leaked
+    // it.
+    disarm_session_plus_dropin();
+    unset_forced_session_screen_env();
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
     // user switched to a desktop session (KDE/GNOME/wlroots/Hyprland) in the meantime, don't yank
     // them back to gaming — leave the desktop alone. (We still stopped our idle managed session
@@ -2752,6 +3379,7 @@ fn do_restore_tv_session() {
         tracing::info!(
             "gamescope: a desktop session is active — not restoring the TV gaming session"
         );
+        clear_takeover(); // A3: consumed — the units/DM records are already drained into locals
         return;
     }
     // DM-stop takeover ([`dm_plan`] — every flavor stops a DM that drove a live gaming session):
@@ -2782,23 +3410,44 @@ fn do_restore_tv_session() {
                  `systemctl reset-failed {dm} && systemctl restart {dm}` as root"
             ),
         }
+        // LAST, not first. The persisted marker is the ONLY thing that heals a box whose DM is
+        // down after this process dies, and every step above it is unbounded work on a shutdown
+        // path with a 20 s grace (`native.rs`'s `SHUTDOWN_RESTORE_GRACE`, then `exit(0)` — which
+        // runs no destructors). Deleting it before the restart had been issued meant an expiry
+        // anywhere in between left the box dark with nothing on disk saying so.
+        clear_takeover();
         return;
     }
-    // Hand the box back its OWN gamescope before restarting its session: our bind drop-in exists
-    // to serve a punktfunk stream, and leaving it would silently put the patched build (plus our
-    // HDR/cursor flags) under the user's ordinary game mode — exactly the "sits beside the distro
-    // package" rule this whole design rests on.
-    remove_session_plus_dropin();
-    systemctl_user(&["daemon-reload"]);
     for unit in units {
-        let _ = Command::new("systemctl")
-            .args(["--user", "start", &unit])
-            .status();
-        tracing::info!(
-            unit,
-            "restored the TV's autologin gaming session (debounce elapsed, no client)"
-        );
+        // Checked, not discarded: this call and the SteamOS `restart` above were the two places
+        // that logged an unconditional success over a thrown-away exit status. A `--user start`
+        // fails for reasons an operator can act on (the unit is masked, its start limit tripped),
+        // and the DM branch thirty lines up already shows the shape — say what happened.
+        match issue_restore_verb(&["start", &unit]) {
+            RestoreVerb::Done => tracing::info!(
+                unit,
+                "restored the TV's autologin gaming session (debounce elapsed, no client)"
+            ),
+            // A `--user start` of a gamescope-session-plus unit waits for its Exec to signal, and on
+            // a cold box that is Steam's own start — routinely longer than the bound. Queued is not
+            // failed; only a status we actually READ can say the box is out of game mode.
+            RestoreVerb::StillRunning => tracing::info!(
+                unit,
+                "the TV's autologin gaming session is still starting after {}s — systemd owns the \
+                 job from here",
+                UNIT_VERB_BUDGET.as_secs()
+            ),
+            RestoreVerb::Failed(why) => tracing::error!(
+                unit,
+                status = %why,
+                "could not restart the TV's autologin gaming session — the box is left out of \
+                 game mode until someone runs `systemctl --user start {unit}` (a masked unit or a \
+                 tripped start limit are the usual causes: \
+                 `systemctl --user unmask --runtime {unit} && systemctl --user reset-failed {unit}`)"
+            ),
+        }
     }
+    clear_takeover(); // A3: consumed — and only now, with the restarts actually issued
 }
 
 /// Host-lifetime worker that fires a pending [`schedule_restore_tv_session`] once its debounce
@@ -2844,6 +3493,14 @@ fn point_injector_at_eis() {
             // the injector can't learn the output geometry from the protocol — the hint lets
             // it scale normalized client positions correctly even when the client streams at
             // a different resolution than the session runs (foreign attach, supersample).
+            //
+            // The two halves of this file are resolved from different sources — the socket is the
+            // newest CONNECTABLE `gamescope-*-ei`, the size comes off `/proc` — so on a box running
+            // two gamescopes they could describe two different compositors. That is why the size
+            // probe now answers `None` unless every gamescope agrees: omitting the hint makes
+            // `pf-inject` fall back to raw client pixels, whereas a hint taken from the nested
+            // game's `-W 1280 -H 800` while the socket belongs to the 1920x1080 session put the
+            // pointer's reachable area at two thirds of the picture.
             let size = current_gamescope_output_size();
             let body = match size {
                 Some((w, h)) => format!("{sock}\n{w}x{h}"),
@@ -3661,11 +4318,10 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
                 cmd.arg(arg);
             }
         }
-        let status = cmd
-            // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
-            // user manager env, which can carry a (possibly stale) desktop DISPLAY/WAYLAND_DISPLAY
-            // that would abort gamescope at startup.
-            .arg("--property=UnsetEnvironment=DISPLAY WAYLAND_DISPLAY")
+        // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
+        // user manager env, which can carry a (possibly stale) desktop DISPLAY/WAYLAND_DISPLAY
+        // that would abort gamescope at startup.
+        cmd.arg("--property=UnsetEnvironment=DISPLAY WAYLAND_DISPLAY")
             .arg("--setenv=BACKEND=headless")
             .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
             .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
@@ -3685,12 +4341,15 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             .arg(format!("--setenv=CUSTOM_REFRESH_RATES={offered}"))
             .arg("--")
             .arg(SESSION_PLUS_BIN)
-            .arg(client)
-            .status()
-            .context(
-                "launch gamescope-session-plus via `systemd-run --user` (is the user systemd \
-                 manager up with XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS set?)",
-            )?;
+            .arg(client);
+        // Budgeted: without `--wait`, `systemd-run` returns as soon as the manager has accepted the
+        // transient unit, so the only way this takes seconds is a user manager that is not
+        // answering — the exact case the caller's error text is written for, and one that used to
+        // pin the connecting client's thread indefinitely instead.
+        let status = crate::proc::status_within(&mut cmd, UNIT_VERB_BUDGET).context(
+            "launch gamescope-session-plus via `systemd-run --user` (is the user systemd \
+             manager up with XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS set?)",
+        )?;
         if !status.success() {
             anyhow::bail!(
                 "`systemd-run --user` failed to start the gamescope session (exit {status})"
@@ -3749,9 +4408,10 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             // and the NVIDIA driver reclaims that context asynchronously — an instant relaunch pays
             // the reclaim serialization on top of device init and misses the 5 s window again.
             std::thread::sleep(Duration::from_millis(1500));
-            let _ = Command::new("systemctl")
-                .args(["--user", "reset-failed", unit_name])
-                .status();
+            let _ = crate::proc::status_within(
+                Command::new("systemctl").args(["--user", "reset-failed", unit_name]),
+                UNIT_VERB_BUDGET,
+            );
             start_unit(bind.as_ref())?;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -3761,11 +4421,16 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
 /// Is the unit currently starting or up (`activating` / `active` — also `deactivating`: let a stop
 /// finish; the next poll tick sees the settled state)? Unknown/unreachable states report `true` so a
 /// systemctl hiccup can't trigger a relaunch storm.
+///
+/// Budgeted at [`UNIT_STATE_BUDGET`], and this is the site where that matters most: it is polled
+/// every 500 ms inside `launch_session`'s 45 s node-wait, so one unbounded `is-active` against a
+/// wedged user manager blew the entire deadline in a single tick — and a timeout reads as `true`,
+/// which is already the documented "don't storm" answer.
 fn unit_starting_or_active(unit: &str) -> bool {
-    let Ok(out) = Command::new("systemctl")
-        .args(["--user", "is-active", unit])
-        .output()
-    else {
+    let Ok(out) = crate::proc::output_within(
+        Command::new("systemctl").args(["--user", "is-active", unit]),
+        UNIT_STATE_BUDGET,
+    ) else {
         return true;
     };
     matches!(
@@ -3955,9 +4620,30 @@ fn refresh_rate_args(session_hz: u32) -> Vec<String> {
     ]
 }
 
-/// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
-/// `PUNKTFUNK_GAMESCOPE_APP` (default a no-op that just keeps gamescope alive — set it to a real
-/// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
+/// What a bare SPAWN will actually run, resolved ONCE per `create`: the per-session launch command
+/// ([`VirtualDisplay::set_launch_command`]) wins; else the process-global `PUNKTFUNK_GAMESCOPE_APP`
+/// (the documented manual fallback); else `None`, meaning [`spawn`]'s no-op keep-alive. Each level
+/// is taken only if non-empty, so a blank per-session command transparently falls through to the
+/// env.
+///
+/// Split out of [`spawn`] because `create` has to gate the Steam single-instance free on the SAME
+/// answer `spawn` later turns into `--steam`. It did not: it tested only the per-session command,
+/// so the env fallback reached `spawn`, was recognised as Steam there, and got the integration
+/// flag with none of the instance work — a nested second Steam that sees the box's and exits,
+/// taking the spawn down with it. It also removes the second env read from the spawn path: one
+/// [`crate::with_env_lock`] acquisition per create instead of two.
+fn resolved_spawn_app(cmd: Option<&str>) -> Option<String> {
+    cmd.map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        // Read the env fallback under the shared env lock so it can't race a concurrent session's
+        // `set_var` of the same key (security-review 2026-06-28 #7).
+        .or_else(|| crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok()))
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. `app` is this session's resolved
+/// launch command ([`resolved_spawn_app`] — the per-session `set_launch_command`, else the
+/// `PUNKTFUNK_GAMESCOPE_APP` fallback); `None` runs a no-op that just keeps gamescope alive.
 /// stdout/stderr go to `log` (this spawn's per-instance log, A5). The app is launched through a tiny
 /// shell wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`ei_socket_file`]
 /// so the input injector can connect to gamescope's EIS server from outside — and (unless
@@ -3969,21 +4655,10 @@ fn spawn(
     w: u32,
     h: u32,
     hz: u32,
-    cmd: Option<&str>,
+    app: Option<String>,
     log: &std::path::Path,
     hdr: bool,
 ) -> Result<Child> {
-    // A non-empty per-session command (set via `set_launch_command`) wins; else the
-    // `PUNKTFUNK_GAMESCOPE_APP` env var (the documented manual fallback); else a no-op that keeps
-    // gamescope alive. Each level is taken only if non-empty, so a blank per-session cmd transparently
-    // falls through to the env (matching the pre-fix behaviour).
-    let app = cmd
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-        // Read the env fallback under the shared env lock so it can't race a concurrent session's
-        // `set_var` of the same key (security-review 2026-06-28 #7).
-        .or_else(|| crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok()))
-        .filter(|s| !s.trim().is_empty());
     // A real app was requested (vs. the `sleep infinity` keep-alive) — used to scope the game-only
     // cursor-grab flag below.
     let game_launch = app.is_some();
@@ -4092,14 +4767,168 @@ impl Drop for GamescopeProc {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
-        display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
-        is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
+        any_output_size_is, cgroup_is_punktfunk_owned, cgroup_under_user_manager,
+        classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
+        dm_survives_masked_unit, game_hz, gamescope_output_size, hdr_args, is_steam_launch,
+        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
         release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
-        shape_dedicated_command, switch_ends_mask_window, unmask_unit, wsi_off_setenv_args,
-        wsi_off_unit_lines, xwayland_refusal_marker, BindOff, BindPlan, DmHelperError, SessionBind,
-        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
+        shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
+        wsi_off_setenv_args, wsi_off_unit_lines, xwayland_refusal_marker, BindOff, BindPlan,
+        BoxOutputSize, DmHelperError, SessionBind, TakeoverState, AUTOLOGIN_MASKED,
+        DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
     };
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    /// The output-size probe answers for the box, and three consumers read it as "this session's
+    /// size" — the libei injector's coordinate scale among them. A box running two gamescopes (a
+    /// Game Mode session plus a nested per-title one, the shape `heads.rs` pins as normal) has no
+    /// single answer, and the original `find_map` returned whichever `/proc` `read_dir` yielded
+    /// first. "Cannot tell" is a state every consumer can handle; a confident wrong number is not.
+    #[test]
+    fn the_output_size_probe_refuses_to_pick_between_disagreeing_gamescopes() {
+        let session = argv("/usr/bin/gamescope -W 1920 -H 1080 --prefer-output HDMI-A-1");
+        let nested = argv("gamescope --backend wayland -W 1280 -H 800");
+        // One compositor, or several that agree — a plain answer.
+        assert_eq!(
+            classify_output_size(std::slice::from_ref(&session)),
+            BoxOutputSize::Known((1920, 1080))
+        );
+        assert_eq!(
+            classify_output_size(&[session.clone(), session.clone()]),
+            BoxOutputSize::Known((1920, 1080))
+        );
+        // Disagreement is AMBIGUOUS, not a coin flip — in either enumeration order.
+        assert_eq!(
+            classify_output_size(&[session.clone(), nested.clone()]),
+            BoxOutputSize::Ambiguous
+        );
+        assert_eq!(
+            classify_output_size(&[nested.clone(), session.clone()]),
+            BoxOutputSize::Ambiguous
+        );
+        // Nothing to go on at all is its OWN state, and it must not be confused with the one above:
+        // `ensure_box_gamescope_mode` proceeds to re-mode on `Unreported` (there is no second
+        // opinion to be wrong about) and must never re-mode on `Ambiguous` (the second opinion is
+        // very likely the session the user's game is running in).
+        assert_eq!(classify_output_size(&[]), BoxOutputSize::Unreported);
+        assert_eq!(
+            classify_output_size(&[argv("gamescope --steam")]),
+            BoxOutputSize::Unreported
+        );
+        assert_ne!(BoxOutputSize::Unreported, BoxOutputSize::Ambiguous);
+    }
+
+    /// After we restart the box's own unit at `target`, the question is "did what we asked for come
+    /// up", NOT "is the box unanimous". Testing unanimity there let one unrelated gamescope at
+    /// another size — a kept bare spawn of ours for a different client, which does NOT die with the
+    /// restarted unit — hold the answer at `Ambiguous` for the full 45 s wait, the bind-hazard
+    /// backstop's second restart and another 45 s, and then fail a connect whose session was up all
+    /// along (having bounced the operator's Game Mode twice on the way).
+    #[test]
+    fn the_post_restart_wait_asks_whether_the_target_size_is_present() {
+        let session = argv("/usr/bin/gamescope -W 1920 -H 1080");
+        let stray = argv("punktfunk-gamescope --backend headless -W 1280 -H 720");
+        assert!(any_output_size_is(
+            std::slice::from_ref(&session),
+            (1920, 1080)
+        ));
+        // The stray one neither satisfies nor blocks the answer.
+        assert!(any_output_size_is(
+            &[stray.clone(), session.clone()],
+            (1920, 1080)
+        ));
+        assert!(!any_output_size_is(
+            std::slice::from_ref(&stray),
+            (1920, 1080)
+        ));
+        assert!(!any_output_size_is(&[], (1920, 1080)));
+        // …and unanimity WOULD have blocked it — the regression this predicate replaces.
+        assert_eq!(
+            classify_output_size(&[stray, session]),
+            BoxOutputSize::Ambiguous
+        );
+    }
+
+    /// `-W`/`-H` must be read as a pair off ONE argv, and the long spellings count: a half-answer
+    /// would otherwise be published as a monitor row (`heads_under`) or a pointer scale.
+    #[test]
+    fn output_size_needs_both_flags_from_the_same_argv() {
+        assert_eq!(
+            gamescope_output_size(&argv("gamescope -W 2560 -H 1440")),
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            gamescope_output_size(&argv("gamescope --output-width 800 --output-height 600")),
+            Some((800, 600))
+        );
+        assert_eq!(gamescope_output_size(&argv("gamescope -W 2560")), None);
+        assert_eq!(gamescope_output_size(&argv("gamescope -H 1440")), None);
+        // The NESTED size (`-w`/`-h`) is a different thing and must never stand in for the output.
+        assert_eq!(
+            gamescope_output_size(&argv("gamescope -w 1280 -h 800")),
+            None
+        );
+    }
+
+    /// A persisted takeover exists so a host CRASH can heal the box. The file used to be written
+    /// (and, on the next start, adopted) only when one of the three *stealing* fields was set — so
+    /// a managed session that took nothing over, the one arm `takeover_live` grew specifically
+    /// because such a session was "ORPHANED forever after disconnect", was recorded as nothing at
+    /// all and its transient unit outlived the host.
+    #[test]
+    fn a_managed_session_alone_is_a_takeover_worth_persisting() {
+        let nothing = TakeoverState::default();
+        assert!(!takeover_state_is_live(&nothing));
+        let managed = TakeoverState {
+            managed_session: true,
+            ..Default::default()
+        };
+        assert!(takeover_state_is_live(&managed));
+        // …and the three original fields keep their meaning, each on its own.
+        assert!(takeover_state_is_live(&TakeoverState {
+            stopped_autologin: vec!["gamescope-session-plus@steam.service".into()],
+            ..Default::default()
+        }));
+        assert!(takeover_state_is_live(&TakeoverState {
+            steamos: true,
+            ..Default::default()
+        }));
+        assert!(takeover_state_is_live(&TakeoverState {
+            stopped_dm: Some("sddm.service".into()),
+            ..Default::default()
+        }));
+    }
+
+    /// The ATTACH re-mode path steals nothing, so all four fields above stay empty — but it pins
+    /// `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`CUSTOM_REFRESH_RATES` in the `systemd --user` MANAGER, which
+    /// outlives this process and every unit restart for the rest of the login. Nothing sweeps them
+    /// (`restore_takeover_on_startup`'s unconditional prologue removes the drop-in and nothing
+    /// else), and nothing may sweep them blind, so the persisted flag is the only thing that lets a
+    /// host which was SIGKILLed mid-stream know they are ours to take back. Written as "nothing to
+    /// restore", the file was deleted on the spot and the operator's own Game Mode came up at the
+    /// last client's resolution until they logged out.
+    #[test]
+    fn a_forced_session_resolution_alone_is_a_takeover_worth_persisting() {
+        assert!(takeover_state_is_live(&TakeoverState {
+            forced_screen_env: true,
+            ..Default::default()
+        }));
+    }
+
+    /// An older host's takeover file has neither new field; it must still parse (the box it
+    /// describes is mid-takeover, and refusing the file is refusing the restore).
+    #[test]
+    fn an_older_takeover_file_still_parses() {
+        let old =
+            r#"{"stopped_autologin":["gamescope-session-plus@steam.service"],"steamos":false}"#;
+        let state: TakeoverState = serde_json::from_str(old).expect("older file parses");
+        assert_eq!(state.stopped_autologin.len(), 1);
+        assert!(!state.managed_session, "absent field defaults to false");
+        assert!(takeover_state_is_live(&state));
+    }
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
     /// indistinguishable, on-glass, from a capture negotiation failure. Both flags are required:

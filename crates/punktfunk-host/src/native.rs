@@ -216,8 +216,32 @@ pub fn run(opts: Punktfunk1Options) -> Result<()> {
     // (harmless — the loops' `is_armed()` gate is always false). The unified `serve` shares one
     // recorder across mgmt + both streaming paths instead.
     let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
+    // Standalone runs resolve the native identity themselves (the unified `serve` resolves it
+    // once for both planes — see `crate::identity::load_or_adopt`'s once-per-process note).
+    let ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     // Standalone `punktfunk1-host` runs no management API, so advertise no `mgmt` port (0).
-    rt.block_on(serve(opts, 0, np, stats))
+    rt.block_on(serve(opts, 0, np, stats, ident))
+}
+
+/// [`run`] with a throwaway in-memory identity — for the in-process tests, which must never
+/// read or (worse) MINT identity files in the machine's real config dir: on a dev box that is
+/// also a live host, a test-minted `native-cert.pem` would be adopted by the real host at its
+/// next restart and strand every pinned client.
+#[cfg(test)]
+fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    let np = Arc::new(NativePairing::load_with(
+        opts.paired_store.clone(),
+        opts.pairing_pin.clone(),
+        opts.allow_pairing || opts.require_pairing,
+    )?);
+    let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
+    let ident = crate::identity::ephemeral()?;
+    rt.block_on(serve(opts, 0, np, stats, ident))
 }
 
 fn fingerprint_hex(fp: &[u8; 32]) -> String {
@@ -289,9 +313,10 @@ pub(crate) async fn serve(
     mgmt_port: u16,
     np: Arc<NativePairing>,
     stats: Arc<StatsRecorder>,
+    // The identity split (`crate::identity`): P-256 on hosts no native client ever pinned, the
+    // legacy RSA cert otherwise — resolved by the caller so the planes cannot race adoption.
+    identity: crate::identity::NativeIdentity,
 ) -> Result<()> {
-    let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
-        .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
         .map_err(|e| anyhow!("cert fingerprint: {e}"))?;
     let ep = endpoint::server_with_identity_idle(
@@ -2220,7 +2245,7 @@ mod tests {
         use punktfunk_core::error::PunktfunkStatus;
 
         let host = std::thread::spawn(|| {
-            run(Punktfunk1Options {
+            run_ephemeral(Punktfunk1Options {
                 port: 19777,
                 source: Punktfunk1Source::Synthetic,
                 seconds: 0,
@@ -2421,7 +2446,7 @@ mod tests {
         std::env::set_var("PUNKTFUNK_CLIPBOARD", "1");
 
         let host = std::thread::spawn(|| {
-            run(Punktfunk1Options {
+            run_ephemeral(Punktfunk1Options {
                 port: 19781,
                 source: Punktfunk1Source::Synthetic,
                 seconds: 0,
@@ -2573,6 +2598,7 @@ mod tests {
                 StatsRecorder::new(
                     std::env::temp_dir().join(format!("pf-approval-stats-{}", std::process::id())),
                 ),
+                crate::identity::ephemeral().unwrap(),
             ))
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -2659,7 +2685,7 @@ mod tests {
         use punktfunk_core::quic::endpoint;
 
         let host = std::thread::spawn(|| {
-            run(Punktfunk1Options {
+            run_ephemeral(Punktfunk1Options {
                 port: 19778,
                 source: Punktfunk1Source::Synthetic,
                 seconds: 0,
