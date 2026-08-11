@@ -211,6 +211,29 @@ export default defineConfig({
 			compatibilityDate: "2026-06-10",
 			// Scan server/{middleware,routes} for the auth gate + the /api proxy.
 			scanDirs: [serverDir],
+			// Silence rollup's MODULE_LEVEL_DIRECTIVE noise. Because `noExternals` re-bundles the
+			// whole dep tree into the server output, every React package that ships a `"use client"`
+			// banner — @tanstack/react-router, radix-ui, framer-motion under @unom/ui — earns one
+			// "directive was ignored" line, ~800 of them per build, which buries the warnings worth
+			// reading. Ignoring is the CORRECT outcome here and not a papered-over bug: this bundle is
+			// the Bun/Nitro server, not an RSC module graph, and Start splits client/server with its
+			// own transform, so nothing downstream ever consults the banner.
+			//
+			// Supplying `onwarn` REPLACES nitro's own (it defu-merges ours over its default), so
+			// nitro's three filters are restated here — drop this and CIRCULAR_DEPENDENCY comes back.
+			rollupConfig: {
+				onwarn(warning, defaultHandler) {
+					if (
+						["CIRCULAR_DEPENDENCY", "EVAL", "MODULE_LEVEL_DIRECTIVE"].includes(
+							warning.code ?? "",
+						) ||
+						warning.message.includes("Unsupported source map comment")
+					) {
+						return;
+					}
+					defaultHandler(warning);
+				},
+			},
 		}),
 		// Must come AFTER tanstackStart — provides the React JSX transform + Refresh runtime
 		// that Start's dev mode requires (omitting it leaves the client JS unable to load).
