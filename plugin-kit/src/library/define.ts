@@ -65,6 +65,10 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	 * every reconcile, so toggling one in config takes effect on the next sync. Emit them with
 	 * `role: "launcher"`; the kit does not stamp it for you, because a plugin may legitimately want
 	 * an entry that opens a launcher but still lists as an ordinary game.
+	 *
+	 * Give each one an `icon` too — the token for its brand mark (`ProviderEntry.icon`). Without it
+	 * the tile falls back to the launcher's name on a flat accent face, which is legible but is the
+	 * blandest thing in the grid.
 	 */
 	readonly launchers?: (cfg: S["Type"]) => ReadonlyArray<ProviderEntry>;
 	/** Launcher data dirs to watch, so a newly installed game appears without waiting for a poll. */

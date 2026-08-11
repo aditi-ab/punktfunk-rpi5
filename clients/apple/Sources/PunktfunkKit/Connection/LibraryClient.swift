@@ -47,11 +47,27 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
     /// optional String: the host owns the vocabulary, and an unknown future value must never fail
     /// the whole library decode. Anything that isn't `"launcher"` is a game (design D4).
     public var role: String?
+    /// The token for this entry's brand mark (`"steam"`, `"heroic"`) — never art, never a URL.
+    /// `nil` on every older host and on every ordinary title. See `launcherIconImage`.
+    public var icon: String?
 
     public var isCustom: Bool { store == "custom" }
 
     /// Whether this entry opens a launcher rather than a game.
     public var isLauncher: Bool { role == "launcher" }
+
+    /// The brand-icon token, re-validated rather than taken on trust.
+    ///
+    /// The host checks the shape on the way in, so this can only fire for a host older than that
+    /// check or one that isn't ours. The value reaches `Image(named:)`, and "the peer promised" is
+    /// not the standard a name lookup deserves.
+    public var iconToken: String? {
+        guard let t = icon, !t.isEmpty, t.count <= 32,
+              let first = t.first, first.isASCII, first.isLowercase,
+              t.allSatisfy({ $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-") })
+        else { return nil }
+        return t
+    }
 
     /// Display name for the store badge — the same table the Rust clients use
     /// (`pf-console-ui::library::store_label`). Before this existed the badge said "Steam" for

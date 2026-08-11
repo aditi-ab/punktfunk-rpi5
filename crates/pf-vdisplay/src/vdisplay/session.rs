@@ -362,7 +362,11 @@ pub fn detect_active_session() -> ActiveSession {
     // exactly, `pkill -x` style — but resolved through [`crate::proc::match_name`], NOT a raw
     // `comm` read: on NixOS every one of these binaries is a nixpkgs wrapper whose real ELF is
     // `.<name>-wrapped`, so a raw `comm` says `.kwin_wayland-w` and this whole probe answered
-    // `None` on a running KDE desktop.
+    // `None` on a running KDE desktop. ⚠ Nor is `/proc/<pid>/exe` alone enough to undo that: NixOS
+    // caps KWin (`security.wrappers.kwin_wayland`, `cap_sys_nice+ep`) and the kernel refuses that
+    // link to an uncapped reader — see `match_name`, which falls through to `argv[0]` for exactly
+    // this box. The uid filter below is unaffected: a capped process's `/proc/<pid>` keeps its
+    // real owner (measured).
     let mut kind = ActiveKind::None;
     let mut best = 0u8;
     // The winning compositor's PID — kept so a same-kind compositor RESTART (a new PID) bumps the

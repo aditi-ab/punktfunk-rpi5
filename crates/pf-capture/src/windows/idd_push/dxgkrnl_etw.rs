@@ -142,7 +142,12 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
             (*record).EventHeader.ProcessId,
         )
     };
-    let mut ring = RING.lock().unwrap();
+    // Poison-tolerant, and that is load-bearing rather than tidy: this is an `extern "system"`
+    // callback invoked from an OS thread, so a panic here unwinds across an FFI boundary and
+    // ABORTS the host process. `unwrap()` made a single poisoned lock turn every subsequent event
+    // delivery into a hard abort — a diagnostic taking down capture. Nothing else under this lock
+    // can panic, so recovering the guard also makes the poison unreachable in the first place.
+    let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
     if ring.len() == RING_CAP {
         ring.pop_front();
     }

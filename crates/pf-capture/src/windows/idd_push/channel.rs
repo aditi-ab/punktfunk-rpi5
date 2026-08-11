@@ -160,7 +160,18 @@ impl ChannelBroker {
         event: HANDLE,
         slots: &[HostSlot],
     ) -> Result<()> {
-        debug_assert!(slots.len() <= control::RING_LEN_USIZE);
+        // An ERROR, not a `debug_assert`: in a release build the assert is compiled out and the
+        // over-long slice instead panics on `req.texture_handles[k]` in the middle of
+        // `duplicate_and_deliver` — after handles have already been planted in WUDFHost. That panic
+        // unwinds straight past the reap below, leaking every duplicate made so far into the driver
+        // process. Refuse before the first duplication, while there is nothing to reap.
+        if slots.len() > control::RING_LEN_USIZE {
+            anyhow::bail!(
+                "frame channel: {} ring slots exceeds the wire limit of {}",
+                slots.len(),
+                control::RING_LEN_USIZE
+            );
+        }
         let mut req = control::SetFrameChannelRequest {
             target_id,
             generation,

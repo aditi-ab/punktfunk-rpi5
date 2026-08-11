@@ -317,7 +317,8 @@ impl StallWatch {
     /// Frames of pre-gap history that must be tight for flow to count as active. Stalls are thus
     /// naturally spaced ≥ RECENT frame times apart — no extra log rate limit needed.
     const RECENT: usize = 8;
-    /// The RECENT pre-gap frames must all fit in this span (8 frames in 400 ms ≈ ≥ 20 fps flow —
+    /// The RECENT pre-gap frames must all fit in this span (8 frames spanning 400 ms is 7 intervals,
+    /// so the real bar is ≈ ≥ 17.5 fps flow —
     /// loose enough for a 30 fps-capped game, tight enough to reject idle-desktop damage).
     const ACTIVE_SPAN: Duration = Duration::from_millis(400);
     /// The smallest hole that counts as a stall (~9 missed frames at 60 Hz) — well below the

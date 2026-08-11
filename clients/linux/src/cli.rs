@@ -782,6 +782,7 @@ fn mock_library() -> (
         art: crate::library::Artwork::default(),
         platform: None,
         role: None,
+        icon: None,
     };
     let games = vec![
         game("steam:570", "steam", "Dota 2"),

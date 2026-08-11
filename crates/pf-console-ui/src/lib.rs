@@ -18,6 +18,8 @@ mod anim;
 #[cfg(any(target_os = "linux", windows))]
 mod glyphs;
 #[cfg(any(target_os = "linux", windows))]
+mod launcher_icons;
+#[cfg(any(target_os = "linux", windows))]
 pub mod library;
 #[cfg(any(target_os = "linux", windows))]
 pub mod model;

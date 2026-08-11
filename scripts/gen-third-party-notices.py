@@ -88,6 +88,18 @@ VENDORED_TREES = [
     ("Bazzite logo (vendored, assets/os-icons)",
      "assets/os-icons/LICENSES/bazzite.txt",
      "https://github.com/ublue-os/bazzite"),
+    # Launcher brand marks for the library's launcher tiles (assets/launcher-icons/, CC BY 4.0 /
+    # CC0 / MIT — see assets/launcher-icons/README.md). A separate registry from the OS marks
+    # above, with its own sources, so it carries its own notices even where a vendor overlaps.
+    ("Font Awesome Free brand icons (vendored, assets/launcher-icons)",
+     "assets/launcher-icons/LICENSES/font-awesome-brands.txt",
+     "https://fontawesome.com"),
+    ("Simple Icons (vendored, assets/launcher-icons)",
+     "assets/launcher-icons/LICENSES/simple-icons.txt",
+     "https://simpleicons.org"),
+    ("Playnite logo (vendored, assets/launcher-icons)",
+     "assets/launcher-icons/LICENSES/playnite.txt",
+     "https://github.com/JosefNemec/Playnite"),
 ]
 
 

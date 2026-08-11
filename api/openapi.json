@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.27.0"
+    "version": "0.26.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -4489,6 +4489,13 @@
                 ],
                 "description": "The provider's own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is."
               },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark a client should draw for this entry — see [`GameEntry::icon`]. A token\n(`steam`, `heroic`), never bytes and never a URL."
+              },
               "id": {
                 "type": "string",
                 "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
@@ -4554,6 +4561,13 @@
               "detect": {
                 "$ref": "#/components/schemas/DetectHint",
                 "description": "How to recognize this title's process — see [`CustomEntry::detect`]."
+              },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw — see [`GameEntry::icon`]. Hand-settable for the same reason `role`\nis: an operator's own \"Steam\" tile should be able to look like one."
               },
               "launch": {
                 "oneOf": [
@@ -4774,7 +4788,7 @@
           "version": {
             "type": "integer",
             "format": "int32",
-            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject. Read\nat load time ([`DisplayPolicyStore::load_from`] warns when a file claims a version this host\ndoes not know, then reads it best-effort) and pinned back to the current version on write.",
+            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject.",
             "minimum": 0
           }
         }
@@ -4843,7 +4857,7 @@
       },
       "EffectivePolicy": {
         "type": "object",
-        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the policy call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].\n\n**Every field is required on the wire, deliberately.** Unlike [`DisplayPolicy`] — which is only\never a *file* — this shape is also the `fields` member of [`CustomPresetInput`], i.e. the request\nbody of `POST /display/presets` and `PUT /display/presets/{id}`, and a *response* member three\ntimes over (`DisplaySettingsState.effective`, `PresetInfo.fields`, `CustomPreset.fields`).\n`#[serde(default)]` here would (a) turn `{\"name\":\"Kiosk\",\"fields\":{}}` — or any camelCase typo —\nfrom a serde rejection into a 201 storing a preset that expands to six axes nobody chose, and\n(b) make all six OPTIONAL in the generated OpenAPI schema, so every codegen'd client has to\nnull-check them. The *persisted* catalog's tolerance for an entry written before an axis existed\nis bought where it belongs, on the read path only: see [`StoredEffectivePolicy`].",
+        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the Stage-0 call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].",
         "required": [
           "keep_alive",
           "topology",
@@ -5349,6 +5363,14 @@
             "properties": {
               "art": {
                 "$ref": "#/components/schemas/Artwork"
+              },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw for this entry, as a **token** — `steam`, `heroic`, `playnite` —\nnever image bytes and never a URL. See [`is_icon_token`].\n\nIt exists for launcher tiles, which by design ship no cover art: a launcher's own icon is\nsquare, every client cover-crops a 2:3 poster, and the crop turns a mark into a strip — so\nuntil now those tiles were the launcher's name on a flat accent face. The token lets a client\ndraw the real mark from art it already ships, at whatever size its tile happens to be.\n\nA token rather than art on the wire because the host's art proxy serves *raster* bytes only\n([`art::local_art_bytes`] sniffs the container and refuses anything else, SVG very much\nincluded — it is script-capable XML and the console renders art in a browser). Sending the\nname of a mark instead of the mark keeps that refusal intact, keeps the glyph vector at every\ntile size, and lets it take the tile's ink.\n\nOrdinary titles may carry one too — nothing here is launcher-specific — but nothing sets it\nfor them: a game has real cover art, which is strictly better than a brand mark.",
+                "example": "steam"
               },
               "id": {
                 "type": "string",
@@ -5893,7 +5915,7 @@
       },
       "Identity": {
         "type": "string",
-        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). The\nslot this resolves to is carried per backend: the Windows EDID serial + IddCx connector index,\nKWin's per-slot output name, and the host-persisted Mutter scale map.",
+        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). Stored\nat Stage 0; carriers wired from the identity stage.",
         "enum": [
           "shared",
           "per-client",
@@ -6110,14 +6132,14 @@
               "seconds": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Linger window in seconds, clamped to `0..=86400` on write (see\n[`DisplayPolicy::sanitized`]): a window longer than a day is `forever` by any honest\nreading, and `u32` seconds is ~136 years — a deadline the reaper would never reach and a\nnonsense `expires_in_ms` in `/display/state`.",
+                "description": "Linger window in seconds.",
                 "minimum": 0
               }
             }
           },
           {
             "type": "object",
-            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\nHonored end-to-end: the registry resolves it to `Release::Pin`, so the display survives every\ndisconnect — free it with `POST /display/release` (which force-releases `Pinned` exactly like\na `Lingering` display). This is what the `gaming-rig` preset selects.",
+            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\n**Not honored until the display-lifecycle stage** — rejected by the mgmt PUT at Stage 0.",
             "required": [
               "mode"
             ],
@@ -6161,7 +6183,6 @@
           },
           "positions": {
             "type": "object",
-            "description": "Keys are the **canonical decimal** identity-slot id (`\"1\"`..`\"15\"`) — the exact string\n`arrange` looks a member up by. [`DisplayPolicy::sanitized`] re-canonicalizes them on write\n(`\"01\"` → `\"1\"`) and drops anything that is not a slot id, because a key that never matches is\na pin the operator can see in the console and in `GET /display/settings` while every session\nsilently auto-rows past it.",
             "additionalProperties": {
               "$ref": "#/components/schemas/Position"
             },
@@ -6173,7 +6194,7 @@
       },
       "LayoutMode": {
         "type": "string",
-        "description": "How group members are arranged in the desktop coordinate space, resolved by `layout::arrange` —\nwhich both the `/display/state` readout and (on Linux, KWin only) the per-backend position apply\nconsume, so the answer is computed in exactly one place.",
+        "description": "How group members are arranged in the desktop coordinate space. Stored at Stage 0; applied from\nthe multi-monitor stage.",
         "enum": [
           "auto-row",
           "manual"
@@ -6333,7 +6354,7 @@
       },
       "ModeConflict": {
         "type": "string",
-        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Enforced by [`super::admission`] before the Welcome is sent, so a `reject` is a\nclean handshake error rather than a half-built session.",
+        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Stored at Stage 0; enforced from the mode-conflict admission stage.",
         "enum": [
           "separate",
           "steal",
@@ -6869,6 +6890,13 @@
               "external_id": {
                 "type": "string",
                 "description": "The provider's stable id for this title (the reconcile diff key)."
+              },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw — see [`GameEntry::icon`]. This is the field a library plugin sets\non its `launchers(cfg)` tiles, and the whole reason the token exists."
               },
               "launch": {
                 "oneOf": [

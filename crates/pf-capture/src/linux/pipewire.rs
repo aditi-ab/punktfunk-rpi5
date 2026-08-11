@@ -1506,7 +1506,20 @@ pub fn pipewire_thread(
             {
                 return;
             }
-            if ud.info.parse(param).is_ok() {
+            // Parse ONCE — `parse` takes `&mut self` — and report a failure instead of swallowing it.
+            // On `Err`, `negotiated` stays false and `format`/`modifier`/`frame_size` keep their
+            // previous values, so the capture dies on the generic "the compositor offered no format
+            // this consumer accepts" timeout — sending the operator hunting a format mismatch when
+            // the real fault was a malformed Format pod we DID accept.
+            let parsed = ud.info.parse(param);
+            if let Err(e) = &parsed {
+                tracing::error!(
+                    error = %e,
+                    "pipewire: failed to parse the negotiated Format pod — capture will time out \
+                     with no usable format"
+                );
+            }
+            if parsed.is_ok() {
                 ud.signals.negotiated.store(true, Ordering::Relaxed);
                 // A (re)negotiation replaces the buffer pool: every cached per-buffer import
                 // (stored fds in the worker, the Vulkan bridge's per-fd sources) keys on

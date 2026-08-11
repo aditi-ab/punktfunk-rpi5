@@ -53,7 +53,9 @@ use super::stall::ProbeWindow;
 
 /// One probe's sample ring: `(completed_at, span, value_us)` — `value` is the measurement (a call
 /// latency or a frozen-span/overshoot), `span` the wall interval it describes ending at
-/// `completed_at`. Capped; ~20 Hz per probe → several minutes of coverage.
+/// `completed_at`. Capped at 512 samples: at the fastest producer's ~20 Hz that is ~26 s of
+/// coverage, ~51 s for the 100 ms loops — comfortably longer than the seconds-old windows a stall
+/// report asks for, but NOT the "several minutes" this used to claim.
 struct Ring {
     samples: Mutex<VecDeque<(Instant, Duration, u64)>>,
 }

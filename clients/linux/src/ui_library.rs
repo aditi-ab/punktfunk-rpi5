@@ -285,27 +285,61 @@ fn render(state: &Rc<State>, games: &[GameEntry]) {
         .set_visible(!launchers.is_empty() && !titles.is_empty());
 }
 
+/// The launcher-tile brand marks this shell ships symbolic art for
+/// (`data/icons/.../pf-launcher-<t>-symbolic.svg`, embedded via gresource). A plugin may name a
+/// mark a newer build carries; an entry whose token isn't here falls back to the launcher's name,
+/// which is exactly how every launcher tile looked before icons existed.
+const LAUNCHER_ICON_TOKENS: &[&str] = &[
+    "steam", "lutris", "heroic", "playnite", "epic", "gog", "xbox",
+];
+
+/// The poster-sized brand mark for an entry, or `None` when it carries no token, names one we
+/// don't ship, or already has real artwork (a plugin that sent a cover has out-voted the token).
+///
+/// Symbolic, so it recolors with the Adwaita theme like every other glyph in the shell.
+fn launcher_icon_image(game: &GameEntry) -> Option<gtk::Image> {
+    if !game.art.is_empty() {
+        return None;
+    }
+    let token = game.icon_token()?;
+    if !LAUNCHER_ICON_TOKENS.contains(&token) {
+        return None;
+    }
+    let img = gtk::Image::from_icon_name(&format!("pf-launcher-{token}-symbolic"));
+    img.set_pixel_size(72);
+    img.add_css_class("pf-poster-launcher-mark");
+    img.set_halign(gtk::Align::Center);
+    img.set_valign(gtk::Align::Center);
+    img.set_vexpand(true);
+    Some(img)
+}
+
 /// One poster tile: 2:3 art (~150×225 logical) over the title, with a store badge and a
 /// monogram placeholder underneath the async art. Activation starts a session launching
 /// this title (silent on a pinned host — the normal trust gate applies).
 fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
-    // A launcher usually ships no poster. Naming the launcher on an accent face says "opens
-    // Steam"; a title monogram on the neutral face would say "a game whose cover didn't load".
+    // A launcher usually ships no poster. Its brand mark, when we ship one, IS the poster; failing
+    // that, naming the launcher on an accent face says "opens Steam". A title monogram on the
+    // neutral face would say "a game whose cover didn't load", which is why games keep it.
     let launcher = game.is_launcher();
-    let monogram = if launcher {
-        let l = gtk::Label::new(Some(store_label(&game.store)));
-        l.add_css_class("pf-poster-launcher-name");
-        l
-    } else {
-        let l = gtk::Label::new(Some(&initials(&game.title)));
-        l.add_css_class("pf-poster-monogram");
-        l
-    };
-    monogram.set_halign(gtk::Align::Center);
-    monogram.set_valign(gtk::Align::Center);
     let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    placeholder.append(&monogram);
-    monogram.set_vexpand(true);
+    if let Some(mark) = launcher_icon_image(game) {
+        placeholder.append(&mark);
+    } else {
+        let monogram = if launcher {
+            let l = gtk::Label::new(Some(store_label(&game.store)));
+            l.add_css_class("pf-poster-launcher-name");
+            l
+        } else {
+            let l = gtk::Label::new(Some(&initials(&game.title)));
+            l.add_css_class("pf-poster-monogram");
+            l
+        };
+        monogram.set_halign(gtk::Align::Center);
+        monogram.set_valign(gtk::Align::Center);
+        monogram.set_vexpand(true);
+        placeholder.append(&monogram);
+    }
 
     let pic = gtk::Picture::new();
     pic.set_content_fit(gtk::ContentFit::Cover);

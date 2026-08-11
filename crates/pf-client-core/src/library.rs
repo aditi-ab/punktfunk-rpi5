@@ -47,6 +47,13 @@ impl Artwork {
             })
             .collect()
     }
+
+    /// Whether this entry has no poster art at all — the condition a launcher's brand mark stands
+    /// in for. Separate from `poster_candidates` so a caller asking the question doesn't have to
+    /// invent a `base` it has no use for.
+    pub fn is_empty(&self) -> bool {
+        self.portrait.is_none() && self.header.is_none() && self.hero.is_none()
+    }
 }
 
 /// One title in the host's unified library. `id` is store-qualified (`steam:<appid>`,
@@ -73,12 +80,40 @@ pub struct GameEntry {
     /// future value must never fail the whole library decode.
     #[serde(default)]
     pub role: Option<String>,
+    /// Which brand mark to draw for this entry — `"steam"`, `"heroic"`, `"playnite"` — or `None`
+    /// when the host sent none (every older host, and every ordinary title).
+    ///
+    /// A **token**, not art: the shell resolves it against the marks it ships
+    /// (`assets/launcher-icons`) and falls back to naming the launcher for one it doesn't have, so
+    /// a plugin can name a mark this client has never heard of without breaking the tile. The host
+    /// guarantees the slug shape (`[a-z][a-z0-9-]{0,31}`), which is what makes it safe to
+    /// interpolate into a resource name or an asset lookup — but see [`GameEntry::icon_token`],
+    /// which re-checks rather than trusting it.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 impl GameEntry {
     /// Whether this entry opens a launcher rather than a game.
     pub fn is_launcher(&self) -> bool {
         self.role.as_deref() == Some("launcher")
+    }
+
+    /// The brand-icon token, re-validated here rather than taken on trust.
+    ///
+    /// The host validates the shape on the way in, so this can only fire for a host that is older
+    /// than that check, compromised, or simply not ours. Every caller interpolates the result into
+    /// a resource name (`pf-launcher-{t}-symbolic`), an asset-catalog lookup or a file path, and
+    /// "the peer promised" is not the standard those deserve — a client re-checks what it is about
+    /// to concatenate. Cheap enough to do at the call site.
+    pub fn icon_token(&self) -> Option<&str> {
+        let t = self.icon.as_deref()?;
+        let ok = !t.is_empty()
+            && t.len() <= 32
+            && t.starts_with(|c: char| c.is_ascii_lowercase())
+            && t.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        ok.then_some(t)
     }
 }
 

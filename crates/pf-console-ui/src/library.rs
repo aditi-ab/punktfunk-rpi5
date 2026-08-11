@@ -569,6 +569,10 @@ pub struct LibraryGame {
     /// [`pf_client_core::library::GameEntry::is_launcher`] so the "anything that isn't
     /// `launcher` is a game" rule lives in exactly one place.
     pub launcher: bool,
+    /// The token for this entry's brand mark (`"steam"`, `"heroic"`), already validated by
+    /// [`pf_client_core::library::GameEntry::icon_token`]. Empty when the entry names no mark;
+    /// a token we ship no art for simply draws nothing and the tile falls back to its name.
+    pub icon: String,
 }
 
 struct Shared {
@@ -689,6 +693,7 @@ mod tests {
             title: title.to_string(),
             store: "steam".into(),
             launcher,
+            icon: String::new(),
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -717,6 +722,7 @@ mod tests {
                     title: (*t).to_string(),
                     store: "steam".into(),
                     launcher: false,
+                    icon: String::new(),
                 })
                 .collect(),
         );

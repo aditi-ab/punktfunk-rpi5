@@ -12,6 +12,36 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.27.1 — in development
+
+### NixOS + KDE — session detection, the other half
+
+🛑 **v0.27.0's NixOS session-detection fix did not reach a stock NixOS + Plasma 6 box.** It resolved
+the nixpkgs wrapper decoration through `/proc/<pid>/exe` (below) — and on that exact box the kernel
+refuses to let us read that link. Reading `/proc/<pid>/exe` is not gated on owning the process: it
+goes through `cap_ptrace_access_check`, which requires the reader's effective set to be a superset
+of the target's **permitted** set. NixOS's own Plasma module ships
+`security.wrappers.kwin_wayland = { capabilities = "cap_sys_nice+ep"; }`, so KWin holds a capability
+and the host — which must stay uncapped, because a capability is exactly what makes it
+unidentifiable to KWin (v0.27.0, above) — gets `EACCES`. The two traps compose: the name *needs*
+`exe` because nixpkgs wrapped the binary, and `exe` is *denied* because NixOS capped it. Detection
+went straight back to `ActiveKind::None`, `wayland` to `-`, and every connect to
+`no usable compositor`. It presents identically to the v0.27.0 bug, which is why a box that had been
+worked around with a decoy process broke again the moment the decoy was removed.
+
+Name resolution now falls through to `argv[0]` (`/proc/<pid>/cmdline`) when the kernel refuses `exe`.
+That reads correctly for the same reason `ps` does: make-wrapper's wrapper `exec -a "$0"`s the hidden
+binary, so `argv[0]` survives the decoration `comm` does not. Measured on Linux 6.x against a capped
+target, for a file capability and for the ambient form `security.wrappers` uses, identically: the
+`/proc/<pid>` directory keeps its real owner (so the uid filter was never the problem), `comm` and
+`cmdline` stay readable, and only `exe` fails. `argv[0]` is consulted **last** and never overrides a
+readable `exe` — it is the process's own claim about itself, and a same-uid process can set it to
+anything; the worst a spoof achieves is aiming detection at a backend that then fails its own
+availability probe. The `comm` fast path is still one read for every ordinary distro.
+
+Also reached by the same rung: `gamescope` carries `cap_sys_nice` on a number of distros, so a
+*wrapped and capped* gamescope was equally invisible to the foreign-gamescope probe.
+
 ## v0.27.0
 
 87 commits since v0.26.0.

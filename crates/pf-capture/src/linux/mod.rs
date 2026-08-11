@@ -1,4 +1,4 @@
-//! Live capture: xdg ScreenCast portal (`ashpd`) → PipeWire (`pipewire`), CPU-copy path.
+//! Live capture: xdg ScreenCast portal (`ashpd`) → PipeWire (`pipewire`).
 //!
 //! Two dedicated threads, because both stacks are tied to their thread:
 //!   * **portal thread** drives the async ashpd handshake on a multi-thread tokio runtime
@@ -7,9 +7,13 @@
 //!     drops; ashpd's `Session` has no `Drop`);
 //!   * **pipewire thread** owns the (`!Send`) MainLoop/Stream and pumps frames.
 //!
-//! The portal hands the PipeWire remote fd + node id to the pipewire thread; decoded BGRx
-//! frames leave the pipewire thread over a bounded channel. The authoritative frame size
-//! comes from the negotiated PipeWire format, not the portal's size hint.
+//! The portal hands the PipeWire remote fd + node id to the pipewire thread; frames leave that
+//! thread through a ONE-DEEP OVERWRITING slot (`FrameSlot`) plus a wakeup edge — not the bounded
+//! `sync_channel(8)` this once used, which was drop-NEWEST and so handed a stalled consumer stale
+//! frames (see `FrameSlot`'s own note). The payload is not necessarily BGRx either: the negotiation
+//! can settle on packed RGB, NV12, YUV444 or 10-bit PQ, and on a dmabuf passthrough it never touches
+//! the CPU. The authoritative frame size comes from the negotiated PipeWire format, not the portal's
+//! size hint.
 //!
 //! Cleanup: BOTH threads are stopped deterministically — [`PortalCapturer`]'s `Drop` sends a
 //! pipewire `channel` quit and joins that thread (releasing its EGL importer / CUDA context
@@ -18,7 +22,9 @@
 //! connection and so ENDS the compositor's ScreenCast session. Dropping a capturer (session end,
 //! or a retried/failed pipeline build) therefore leaves nothing behind on either side.
 
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+// Every `unsafe` block in this module TREE carries a `// SAFETY:` proof; enforce it (unsafe-proof
+// program). This file itself has none — the FFI lives in the child modules declared at the bottom
+// (`pipewire`, `pw_cursor`, `pw_pods`, `portal`, `xfixes_cursor`), which this inner attribute covers.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
@@ -173,8 +179,9 @@ pub struct PortalCapturer {
     /// capture, not per frame.
     negotiation_confirmed: bool,
     /// This capture ran the HDR (10-bit PQ/BT.2020 dmabuf) offer — see [`Self::open`]'s
-    /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the
-    /// process-wide SDR downgrade) and by [`hdr_meta`](Capturer::hdr_meta).
+    /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the SDR
+    /// downgrade for THIS [`Self::hdr_source`] only, not process-wide) and by
+    /// [`hdr_meta`](Capturer::hdr_meta).
     hdr_offer: bool,
     /// Which HDR source this capturer is — the latch a failed [`hdr_offer`](Self::hdr_offer)
     /// belongs to. See [`super::HdrSource`] for why the latch is not one process-wide flag.
@@ -463,7 +470,10 @@ fn spawn_pipewire(
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
     // HDR cannot ride the SHM path (see `want_hdr` above): under PUNKTFUNK_FORCE_SHM the HDR
     // offer is dropped — SDR capture, loudly.
-    let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
+    // The shared parser, not a bare `== "1"` compare — matching `PUNKTFUNK_PIPEWIRE_NV12` below.
+    // A bare compare silently ignored `PUNKTFUNK_FORCE_SHM=true`/`=on`/`=yes`, so the knob looked
+    // set and did nothing.
+    let force_shm = pf_host_config::env_on("PUNKTFUNK_FORCE_SHM").unwrap_or(false);
     let want_hdr = if want_hdr && force_shm {
         tracing::warn!(
             "HDR capture requested but PUNKTFUNK_FORCE_SHM=1 — the SHM path is 8-bit only; \
@@ -555,6 +565,14 @@ impl Capturer for PortalCapturer {
         // every nested Xwayland the provider reports, RE-RUNS the provider so a game's Xwayland
         // that appears later is adopted, and follows whichever one gamescope draws the pointer on.
         // `frame_size` lets it map root-space coordinates into frame space.
+        //
+        // Idempotent by construction. The contract says "called once", but nothing enforced it, and a
+        // second call evaluated `spawn` BEFORE dropping the old source: two readers then published
+        // into the same slot for the construction window, and a `spawn` that returned `None` destroyed
+        // a perfectly good reader outright.
+        if self._gs_cursor.is_some() {
+            return;
+        }
         self._gs_cursor = xfixes_cursor::XFixesCursorSource::spawn(
             targets,
             Arc::clone(&self.signals.cursor_live),
@@ -655,6 +673,11 @@ impl Capturer for PortalCapturer {
             if let Ok(mut slot) = self.slot.lock() {
                 *slot = None;
             }
+            // Clear the stall clock for the same reason the mailbox is flushed: a pooled capturer
+            // whose previous stream ended mid-stall carried that `Instant` into the next one, so the
+            // first `try_latest` that saw `!streaming` found the 1500 ms grace already expired and
+            // reported capture loss on a stream that had been running for microseconds.
+            self.stall_since = None;
         }
     }
 
@@ -776,8 +799,9 @@ impl PortalCapturer {
                     // The HDR (10-bit PQ dmabuf) offer was never accepted — the monitor left HDR
                     // mode between the probe and the negotiation, the compositor pre-dates the
                     // GNOME 50 HDR formats, or its allocator can't do LINEAR for XR30/XB30.
-                    // Latch the process-wide SDR downgrade so the next session (Moonlight
-                    // auto-reconnects) negotiates SDR instead of re-running this same timeout.
+                    // Latch the SDR downgrade for THIS source (`HdrSource`, not process-wide — one
+                    // shared flag let either Linux HDR source disable the other) so the next session
+                    // (Moonlight auto-reconnects) negotiates SDR instead of re-running this timeout.
                     super::note_hdr_capture_failed(self.hdr_source);
                     Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): the compositor never \

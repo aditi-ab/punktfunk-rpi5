@@ -337,6 +337,7 @@ use channel::ChannelBroker;
 use descriptor::{DescriptorPoller, DisplayDescriptor};
 use stall::{StallEvidence, StallWatch};
 
+/// Creates + owns the shared ring; yields the driver's frames as [`FramePayload::D3d11`].
 pub struct IddPushCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -652,14 +653,18 @@ impl IddPushCapturer {
     }
 
     /// The output texture format + the [`PixelFormat`] NVENC encodes, driven by the DISPLAY's HDR
-    /// state (like the WGC path) plus the session's 4:4:4 negotiation: HDR → `P010` (BT.2020 PQ
+    /// state plus the session's 4:4:4 negotiation: HDR → `P010` (BT.2020 PQ
     /// 10-bit limited) → NVENC Main10, and the client auto-detects PQ from the HEVC VUI; SDR →
     /// `Nv12` (BT.709 8-bit limited), or full-chroma `Bgra` passthrough on a 4:4:4 session (NVENC
     /// CSCs RGB→YUV444 itself, following the BT.709 VUI — the one path that deliberately pays the
-    /// SM-side CSC, because the video processor can only produce subsampled output). We do NOT
-    /// gate HDR on the client's advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the
-    /// Mac advertises 10-bit only when its OWN display is HDR), yet all decode Main10 +
-    /// auto-switch, exactly as on the WGC path. HDR and 4:4:4 now COMPOSE: an HDR display that
+    /// SM-side CSC, because the video processor can only produce subsampled output). The
+    /// composition depth DOES follow the session's negotiated `client_10bit` — pinned at open
+    /// (`open.rs`, the `!client_10bit` force-off and the 10-bit enable) and re-pinned every sample
+    /// by [`Self::poll_display_hdr`], because a PQ stream sent to a client that advertised SDR-only
+    /// lands on an SDR desktop and blows out. (The older note here claimed the opposite — that the
+    /// advertised `VIDEO_CAP_10BIT` was ignored because clients under-report it. That reasoning
+    /// survives only in the CODEC choice: an HDR-negotiated H.26x session still follows a host
+    /// "Use HDR" flip in either direction.) HDR and 4:4:4 now COMPOSE: an HDR display that
     /// negotiated full chroma emits packed 10-bit BT.2020 PQ RGB (`Rgb10a2`) for NVENC to CSC to
     /// YUV 4:4:4 — HEVC Main 4:4:4 10. (Before, HDR won and the stream silently downgraded to
     /// 4:2:0 *after* the Welcome had already promised 4:4:4.)
@@ -969,7 +974,7 @@ impl IddPushCapturer {
             },
             Usage: D3D11_USAGE_DEFAULT,
             // RENDER_TARGET: the VIDEO processor (NV12) and the P010 shader passes both write here, and
-            // NVENC registers it as encode input — matching the WGC YUV ring. (PyroWave uses its own
+            // NVENC registers it as encode input. (PyroWave uses its own
             // shareable two-plane `pyro_ring` instead, so this NVENC/AMF/QSV ring stays unshared.)
             BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
             CPUAccessFlags: 0,
@@ -1970,9 +1975,12 @@ impl Capturer for IddPushCapturer {
     fn pipeline_depth(&self) -> usize {
         // 2 = one frame deferred: submit N+1 (capture + convert/copy into a fresh out-ring texture) while
         // NVENC encodes N on the ASIC. We hand a rotating `OUT_RING` of output textures, so this is safe.
-        // `PUNKTFUNK_IDD_DEPTH` overrides (1 disables pipelining; clamp to ≤ OUT_RING so a frame in flight
-        // always has its own texture).
-        pf_host_config::config().idd_depth.clamp(1, OUT_RING)
+        // `PUNKTFUNK_IDD_DEPTH` overrides (1 disables pipelining). The ceiling is `OUT_RING - 1`, NOT
+        // `OUT_RING`: `d` frames in flight need `d + 1` textures, because the rotation has to hand out a
+        // slot that is not one of the `d` still being encoded. Clamping to `OUT_RING` admitted depth 3 on
+        // a 3-slot ring, where `repeat_last`'s rotation lands back on the slot NVENC is reading and the
+        // convert overwrites it in place — torn frames, silently, with no error anywhere.
+        pf_host_config::config().idd_depth.clamp(1, OUT_RING - 1)
     }
 
     fn capture_target_id(&self) -> Option<u32> {

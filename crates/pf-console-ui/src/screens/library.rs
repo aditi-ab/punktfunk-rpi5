@@ -431,22 +431,44 @@ impl LibraryScreen {
                         Color4f::new(0.118, 0.118, 0.145, 1.0)
                     };
                     canvas.draw_rect(crect, &Paint::new(face, None));
-                    let (glyph, size, ink) = if game.launcher {
-                        (store_label(&game.store).to_string(), 22.0 * k, fg(0.85))
+                    // The launcher's brand mark IS the poster when we ship one for it. Inset to
+                    // ~44% of the card so it reads as a mark on a face rather than a cropped
+                    // cover; `launcher_mark` letterboxes inside that box, so a non-square master
+                    // (Steam 496x512, Playnite 1024x1024) keeps its proportions.
+                    let mark = (!game.icon.is_empty())
+                        .then(|| {
+                            let side = (card_w.min(card_h) as f32) * 0.44;
+                            crate::launcher_icons::launcher_mark(
+                                &game.icon,
+                                Rect::from_xywh(
+                                    (card_w as f32 - side) / 2.0,
+                                    (card_h as f32 - side) / 2.0,
+                                    side,
+                                    side,
+                                ),
+                            )
+                        })
+                        .flatten();
+                    if let Some(path) = mark {
+                        canvas.draw_path(&path, &Paint::new(fg(0.85), None));
                     } else {
-                        (initials(&game.title), 38.0 * k, fg(0.45))
-                    };
-                    let font = fonts.font(W::Bold, size);
-                    let tw = font.measure_str(&glyph, None).0;
-                    canvas.draw_str(
-                        &glyph,
-                        Point::new(
-                            (card_w as f32 - tw) / 2.0,
-                            card_h as f32 / 2.0 + 13.0 * k as f32,
-                        ),
-                        &font,
-                        &Paint::new(ink, None),
-                    );
+                        let (glyph, size, ink) = if game.launcher {
+                            (store_label(&game.store).to_string(), 22.0 * k, fg(0.85))
+                        } else {
+                            (initials(&game.title), 38.0 * k, fg(0.45))
+                        };
+                        let font = fonts.font(W::Bold, size);
+                        let tw = font.measure_str(&glyph, None).0;
+                        canvas.draw_str(
+                            &glyph,
+                            Point::new(
+                                (card_w as f32 - tw) / 2.0,
+                                card_h as f32 / 2.0 + 13.0 * k as f32,
+                            ),
+                            &font,
+                            &Paint::new(ink, None),
+                        );
+                    }
                 }
             }
             // Store badge, top-left.
