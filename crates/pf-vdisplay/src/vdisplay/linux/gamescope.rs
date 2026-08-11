@@ -91,6 +91,13 @@ static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 /// never gets DRM master — live-proven on the Nobara repro VM 2026-07-24).
 static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Whether this takeover runtime-masked the [`STOPPED_AUTOLOGIN`] units ([`mask_unit`]) — i.e.
+/// whether there is a mask left to lift. Process memory, like the rest of the takeover mechanics.
+/// [`restore_takeover_on_startup`] sets it for a stranded takeover it adopts: unmasking a unit we
+/// never masked is a no-op, while missing one that IS masked leaves the box unable to enter its
+/// own Game Mode until reboot.
+static AUTOLOGIN_MASKED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 /// mtime of the `steamos-session-select` sentinel as of the takeover — the baseline the in-stream
 /// "Switch to Desktop" detector compares against. Steam's session-select script writes
 /// `~/.config/steamos-session-select` unconditionally in its USER pass, before any of its
@@ -252,6 +259,12 @@ pub fn restore_takeover_on_startup() {
         stopped_dm = ?state.stopped_dm,
         "gamescope: found a stranded takeover from a previous host instance — scheduling TV restore"
     );
+    // Assume the adopted takeover carries our runtime mask whenever it stopped units: whether it did
+    // is not persisted (it follows from the DM flavor, which can only have stayed the same), and the
+    // two errors are not symmetric — unmasking a unit we never masked is a no-op, while skipping one
+    // that IS masked bars the box from its own game mode until reboot.
+    *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) =
+        !state.stopped_autologin.is_empty();
     *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
     *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_dm;
@@ -645,10 +658,12 @@ pub fn foreign_gamescope_running() -> bool {
         if md.uid() != uid {
             continue;
         }
-        let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else {
+        // Resolved, not a raw `comm` read: nixpkgs wraps gamescope too, so on NixOS the kernel
+        // reports `.gamescope-wrap` and this probe saw no foreign session at all.
+        let Some(comm) = crate::proc::match_name(&e.path()) else {
             continue;
         };
-        if !matches!(comm.trim(), "gamescope" | "gamescope-wl") {
+        if !matches!(comm.as_str(), "gamescope" | "gamescope-wl") {
             continue;
         }
         if !descends_from(pid, our_pid) {
@@ -1547,16 +1562,23 @@ fn kill_unit(unit: &str) {
 /// 2026-07-07). `--runtime` keeps the mask in tmpfs so a reboot clears it even if the host dies
 /// without restoring (the same semantics as the persisted takeover file).
 ///
-/// ⚠ The mask only covers the UNIT path — it is NOT what stops the relogin loop itself. On images
-/// whose SDDM session helper execs the session script directly (`/etc/sddm/wayland-session
-/// gamescope-session-plus steam`, f43 bazzite-deck — live-diagnosed on the .41 VM 2026-07-31) the
-/// relogin never touches the unit, so the mask blocks nothing: SDDM relogins ~3×/s, each a full
-/// `bash --login` session start that fails against the managed instance — 328 forks/s, load 6+,
-/// 1481 logind sessions in 8 minutes, the journal flooded past its own rotation. The stream itself
+/// ⚠ The mask stops the UNIT from starting — it does NOT stop the relogin loop that keeps trying.
+/// On images whose SDDM session helper execs the session script directly (`/etc/sddm/wayland-session
+/// gamescope-session-plus steam`, f43 bazzite-deck — live-diagnosed on the .41 VM 2026-07-31) SDDM
+/// relogins ~3×/s regardless, each a full `bash --login` session start — 328 forks/s, load 6+, 1481
+/// logind sessions in 8 minutes, the journal flooded past its own rotation. The stream itself
 /// survives, but the storm starves the game and the encoder ("atrocious, unplayable 240fps"). The
-/// real defense is stopping the DM ([`dm_plan`]); the mask stays as belt-and-braces for the window
-/// before the stop lands, for images that DO route the relogin through the unit, and as the
-/// degraded takeover when the stop is impossible.
+/// real defense against the storm is stopping the DM ([`dm_plan`]); the mask stays as belt-and-braces
+/// for the window before the stop lands, and as the degraded takeover when the stop is impossible.
+///
+/// ⚠⚠ The mask DOES bite on that image, which is easy to miss and was the 2026-08-10 field bug: the
+/// session script's last act is `systemctl --user --wait start gamescope-session-plus@$1.service`, so
+/// a masked unit makes every entry into game mode — including the user's own deliberate "Return to
+/// Gaming Mode" — fail instantly, with Steam left sitting on its "Switch to Desktop…" modal forever.
+/// The mask is therefore only sound while our managed session actually holds the box: the moment the
+/// box leaves it (a mid-stream switch to a desktop session), [`lift_autologin_mask`] must lift it, or
+/// the way back is barred until reboot (`--runtime` lives in tmpfs — which is exactly why "it works
+/// again after a reboot").
 fn mask_unit(unit: &str) {
     let _ = Command::new("systemctl")
         .args(["--user", "mask", "--runtime", unit])
@@ -1569,6 +1591,58 @@ fn unmask_unit(unit: &str) {
     let _ = Command::new("systemctl")
         .args(["--user", "unmask", "--runtime", unit])
         .status();
+}
+
+/// Lift the takeover's runtime mask ([`mask_unit`]) on the box's own autologin units, so the box can
+/// enter its own game mode again. Idempotent and cheap once lifted (the flag short-circuits), so
+/// every path that hands the box back may call it unconditionally.
+///
+/// Deliberately does NOT consume [`STOPPED_AUTOLOGIN`]: the mask's lifetime is shorter than the
+/// takeover's. Lifting it mid-stream only says "the box may start its own gaming session again"; the
+/// restore still owes that list a `start` if the box is still ours at disconnect
+/// ([`do_restore_tv_session`]).
+fn lift_autologin_mask() {
+    let mut masked = AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if !*masked {
+        return;
+    }
+    *masked = false;
+    let units = STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner());
+    for unit in units.iter() {
+        unmask_unit(unit);
+    }
+    tracing::info!(
+        units = ?*units,
+        "gamescope: lifted the takeover's runtime mask — the box can enter its own game mode again"
+    );
+}
+
+/// Does a mid-stream session switch TO `kind` end the window in which the takeover's mask is sound?
+/// Only a **desktop** session does: it means the box left our managed game session for one of its
+/// own, so nothing is left for the mask to defend and the user's next move — "Return to Gaming
+/// Mode" — needs the unit ([`mask_unit`]).
+///
+/// [`ActiveKind::Gaming`] must not lift by itself (a takeover's own managed session reads as Gaming,
+/// and lifting there would void the mask for the whole stream, in exactly the storm window it exists
+/// for), and neither must [`ActiveKind::None`] — a managed session momentarily down between
+/// relaunches reads as `None`, and that is mid-takeover, not the end of one.
+fn switch_ends_mask_window(kind: super::ActiveKind) -> bool {
+    use super::ActiveKind;
+    matches!(
+        kind,
+        ActiveKind::DesktopKde
+            | ActiveKind::DesktopGnome
+            | ActiveKind::DesktopWlroots
+            | ActiveKind::DesktopHyprland
+    )
+}
+
+/// The host's mid-stream session watcher calls this on every switch it confirms; see
+/// [`switch_ends_mask_window`] for which ones actually lift the mask.
+pub fn release_autologin_mask(switched_to: super::ActiveKind) {
+    if switch_ends_mask_window(switched_to) {
+        lift_autologin_mask();
+    }
 }
 
 /// The unit name of the display manager driving this box's graphical logins, from the
@@ -2118,7 +2192,13 @@ fn honor_session_select_switch(dm: String) {
         "gamescope: in-stream session-select detected — restoring the display manager and \
          switching the box to the desktop session"
     );
-    // Consume the takeover state up front: from here on the box is the DM's again.
+    // Consume the takeover state up front: from here on the box is the DM's again. The mask goes
+    // FIRST and while the unit list still exists — this path discards that list, and it is the only
+    // record of what carries a mask. Without this the mask outlived not just the stream but the
+    // boot: the disconnect restore (the only other unmask) would find an empty list and lift
+    // nothing. It is also what lets step 1 below work at all, since the DM's autologin heads back
+    // into game mode through exactly this unit.
+    lift_autologin_mask();
     std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
     clear_takeover();
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2327,6 +2407,11 @@ fn stop_autologin_sessions() -> Result<()> {
     }
     let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
     let mut stopped = Vec::new();
+    if plan.mask {
+        // Record that a mask is outstanding BEFORE laying it: every hand-back path lifts it off this
+        // flag, and one that ran between the mask and an unrecorded flag would leave it on forever.
+        *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
     for unit in units {
         if plan.mask {
             mask_unit(&unit); // belt-and-braces under a stopped DM; the whole defense otherwise
@@ -2623,6 +2708,12 @@ fn do_restore_tv_session() {
             return;
         }
     }
+    // Unmask BEFORE taking the list (it reads that list) and unconditionally — before the
+    // desktop-active early return below, and before the restart loop: a unit left masked would break
+    // the user's own return to gaming mode until reboot. Usually already lifted by then (the
+    // mid-stream switch that ends the mask's window does it — [`release_autologin_mask`]), in which
+    // case this is a no-op.
+    lift_autologin_mask();
     let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
     let dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
     if units.is_empty() && dm.is_none() {
@@ -2645,11 +2736,6 @@ fn do_restore_tv_session() {
     }
     clear_takeover(); // A3: takeover consumed — drop the persisted crash-restore marker
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
-                                // Unmask UNCONDITIONALLY (before the desktop-active early return below): a unit left masked
-                                // would break the user's own return to gaming mode until reboot.
-    for unit in &units {
-        unmask_unit(unit);
-    }
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
     // user switched to a desktop session (KDE/GNOME/wlroots/Hyprland) in the meantime, don't yank
@@ -3955,10 +4041,11 @@ mod tests {
     use super::{
         cgroup_is_punktfunk_owned, cgroup_under_user_manager, connected_connector_under,
         display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz, hdr_args,
-        is_steam_launch, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
-        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
-        xwayland_refusal_marker, BindOff, BindPlan, DmHelperError, SessionBind,
-        DISTRO_GAMESCOPE_PATH, X11_SOCKET_DIR,
+        is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
+        release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
+        shape_dedicated_command, switch_ends_mask_window, unmask_unit, xwayland_refusal_marker,
+        BindOff, BindPlan, DmHelperError, SessionBind, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH,
+        STOPPED_AUTOLOGIN, X11_SOCKET_DIR,
     };
 
     /// The HDR spawn flags are what make a nested game render HDR at all — and their absence is
@@ -4125,6 +4212,80 @@ mod tests {
         // No DM at all (getty autologin): mask+kill, nothing to stop.
         let p = dm_plan(None, true);
         assert!(!p.skip && p.mask && !p.stop_dm);
+    }
+
+    #[test]
+    fn only_a_desktop_switch_ends_the_mask_window() {
+        use crate::ActiveKind;
+        // The user switched the box to a desktop session mid-stream: our managed game session is
+        // over, so the mask defends nothing — and the "Return to Gaming Mode" that follows has to
+        // be able to start the unit (the distro session script starts exactly it).
+        for kind in [
+            ActiveKind::DesktopKde,
+            ActiveKind::DesktopGnome,
+            ActiveKind::DesktopWlroots,
+            ActiveKind::DesktopHyprland,
+        ] {
+            assert!(switch_ends_mask_window(kind), "{kind:?}");
+        }
+        // A takeover's own managed session reads as Gaming, so lifting here would void the mask for
+        // the whole stream — in exactly the SDDM-relogin window it exists for. (Coming BACK to
+        // gaming needs no lift either: it evidently already started.)
+        assert!(!switch_ends_mask_window(ActiveKind::Gaming));
+        // A managed session momentarily down between relaunches reads as None. That is
+        // mid-takeover, not the end of one.
+        assert!(!switch_ends_mask_window(ActiveKind::None));
+    }
+
+    /// The same rule as above, but end-to-end against REAL systemd — that the decision is actually
+    /// wired to the mask, that a lift leaves the restart list intact, and that `--runtime` is what
+    /// comes off (a plain `unmask` does NOT clear a runtime mask, which is the whole reason the
+    /// stranded mask survived every non-reboot remedy in the field).
+    ///
+    /// Ignored by default: it needs a live `systemd --user` manager. On a Linux box with a session:
+    /// `cargo test -p pf-vdisplay -- --ignored the_mask_comes_off`. Uses a unit name nothing owns —
+    /// `mask` works on a non-existent unit (it is just a symlink to `/dev/null`), so this never goes
+    /// near the box's real gaming session.
+    #[test]
+    #[ignore = "needs a live systemd --user manager (run explicitly on a Linux box with a session)"]
+    fn the_mask_comes_off_only_when_the_box_takes_itself_back() {
+        const PROBE: &str = "punktfunk-mask-probe@lifetime-test.service";
+        let is_enabled = || {
+            let out = std::process::Command::new("systemctl")
+                .args(["--user", "is-enabled", PROBE])
+                .output()
+                .expect("systemctl --user");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        unmask_unit(PROBE); // a previous failed run must not decide this one
+
+        // Lay the takeover's mask exactly as `stop_autologin_sessions` does.
+        *STOPPED_AUTOLOGIN.lock().unwrap() = vec![PROBE.to_string()];
+        *AUTOLOGIN_MASKED.lock().unwrap() = true;
+        mask_unit(PROBE);
+        assert_eq!(is_enabled(), "masked-runtime");
+
+        // Mid-stream, with the box still ours: the mask is doing its job and must stay. `Gaming` is
+        // what our own managed session reads as, and `None` is one momentarily down between
+        // relaunches — lifting on either would void the mask for the whole stream.
+        release_autologin_mask(crate::ActiveKind::Gaming);
+        release_autologin_mask(crate::ActiveKind::None);
+        assert_eq!(is_enabled(), "masked-runtime");
+
+        // The user switched the box to its own desktop mid-stream: the window is over, and the way
+        // back into game mode has to be clear before they ask for it.
+        release_autologin_mask(crate::ActiveKind::DesktopKde);
+        assert_ne!(is_enabled(), "masked-runtime");
+        // The restart list SURVIVES the lift: the mask's lifetime is shorter than the takeover's,
+        // and the disconnect restore still owes these units a `start`.
+        assert_eq!(STOPPED_AUTOLOGIN.lock().unwrap().as_slice(), [PROBE]);
+        // Idempotent — the watcher calls it on every switch it confirms.
+        release_autologin_mask(crate::ActiveKind::DesktopGnome);
+        assert_ne!(is_enabled(), "masked-runtime");
+
+        unmask_unit(PROBE);
+        STOPPED_AUTOLOGIN.lock().unwrap().clear();
+        *AUTOLOGIN_MASKED.lock().unwrap() = false;
     }
 
     #[test]

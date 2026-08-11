@@ -20,6 +20,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PageSize
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -57,6 +58,7 @@ import androidx.compose.ui.unit.sp
 import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import io.unom.punktfunk.components.launcherIcon
 import io.unom.punktfunk.kit.library.DEFAULT_MGMT_PORT
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
@@ -393,16 +395,28 @@ private fun Poster(game: GameEntry, loader: ImageLoader, modifier: Modifier = Mo
                 onError = { idx++ }, // this candidate failed — try the next, or fall to the placeholder
             )
         } else {
-            // A launcher rarely has poster art. Naming the launcher says "opens Steam"; the title
-            // would read as "a game whose cover failed to load".
-            Text(
-                if (game.isLauncher) game.storeLabel else game.title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = ink.fg(0.75f),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(12.dp),
-            )
+            // A launcher ships no poster by design, so its brand mark IS the poster — drawn big and
+            // centred, tinted like the text it replaces. Falling back to the launcher's name says
+            // "opens Steam" for a mark we don't ship; the title would read as "a game whose cover
+            // failed to load".
+            val mark = launcherIcon(game.iconToken)
+            if (mark != null) {
+                Icon(
+                    imageVector = mark,
+                    contentDescription = game.title,
+                    tint = ink.fg(0.75f),
+                    modifier = Modifier.fillMaxSize(0.45f),
+                )
+            } else {
+                Text(
+                    if (game.isLauncher) game.storeLabel else game.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ink.fg(0.75f),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
         }
         // Store badge, top-start — brand-filled for a launcher entry (design D4).
         Box(Modifier.fillMaxSize().padding(8.dp), contentAlignment = Alignment.TopStart) {

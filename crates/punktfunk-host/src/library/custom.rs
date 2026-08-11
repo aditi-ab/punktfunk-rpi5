@@ -39,6 +39,10 @@ pub struct CustomEntry {
     /// Whether this entry is a game or the launcher itself — see [`GameRole`].
     #[serde(default, skip_serializing_if = "GameRole::is_game")]
     pub role: GameRole,
+    /// Which brand mark a client should draw for this entry — see [`GameEntry::icon`]. A token
+    /// (`steam`, `heroic`), never bytes and never a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// How to recognize this title's process once it is running (design §9) — the one thing a
     /// provider knows that the host cannot work out for itself.
     ///
@@ -68,6 +72,10 @@ pub struct CustomInput {
     /// entry is legal (an operator may want a "Steam" tile without installing the steam plugin).
     #[serde(default)]
     pub role: GameRole,
+    /// Which brand mark to draw — see [`GameEntry::icon`]. Hand-settable for the same reason `role`
+    /// is: an operator's own "Steam" tile should be able to look like one.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// How to recognize this title's process — see [`CustomEntry::detect`].
     #[serde(default)]
     pub detect: DetectHint,
@@ -95,6 +103,10 @@ pub struct ProviderEntryInput {
     /// emits its `launchers(cfg)` entries with `role: "launcher"`.
     #[serde(default)]
     pub role: GameRole,
+    /// Which brand mark to draw — see [`GameEntry::icon`]. This is the field a library plugin sets
+    /// on its `launchers(cfg)` tiles, and the whole reason the token exists.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its
     /// titles' install directories (Playnite does) should send them: it is what lets a game launched
     /// through the provider's own client still end its session when the player quits.
@@ -127,6 +139,7 @@ impl From<CustomEntry> for GameEntry {
             title: c.title,
             art: c.art,
             role: c.role,
+            icon: c.icon,
             launch: c.launch,
             provider: c.provider,
             detect,
@@ -310,6 +323,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         external_id: None,
         store: None,
         role: input.role,
+        icon: input.icon,
         detect: input.detect,
         meta: input.meta,
     };
@@ -334,6 +348,7 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     slot.launch = input.launch;
     slot.prep = input.prep;
     slot.role = input.role;
+    slot.icon = input.icon;
     slot.detect = input.detect;
     slot.meta = input.meta;
     let updated = slot.clone();
@@ -542,6 +557,7 @@ fn reconcile_entries(
             // (`<store>:<external_id>`) — see `library_id_for`.
             store: store.map(str::to_string),
             role: input.role,
+            icon: input.icon,
             detect: input.detect,
             meta: input.meta,
         });
@@ -660,6 +676,7 @@ mod tests {
             external_id: None,
             store: None,
             role: GameRole::Game,
+            icon: None,
             detect: DetectHint::default(),
             meta: GameMeta::default(),
         }
@@ -673,6 +690,7 @@ mod tests {
             launch: None,
             prep: Vec::new(),
             role: GameRole::Game,
+            icon: None,
             detect: DetectHint::default(),
             meta: GameMeta::default(),
         }
@@ -806,6 +824,60 @@ mod tests {
             vg.get("role").is_none(),
             "a game's role stays off the wire, so old clients are unaffected"
         );
+    }
+
+    /// The `icon` token takes the same route as `role`: payload → stored entry → the `GameEntry` a
+    /// client renders → the wire. Same reasoning as the test above — the field is skipped when
+    /// absent, so it could be dropped anywhere along that path and every existing test would still
+    /// pass, while every launcher tile silently lost its mark.
+    #[test]
+    fn an_icon_token_survives_reconcile_onto_the_wire() {
+        let mut launcher = input("launcher", "Lutris");
+        launcher.role = GameRole::Launcher;
+        launcher.icon = Some("lutris".into());
+
+        let mut entries = Vec::new();
+        let out = reconcile_entries(
+            &mut entries,
+            "lutris",
+            Some("lutris"),
+            vec![launcher, input("42", "Some Game")],
+        );
+
+        assert_eq!(out[0].icon.as_deref(), Some("lutris"));
+        assert_eq!(out[1].icon, None, "the game is untouched");
+
+        let tile: GameEntry = out[0].clone().into();
+        assert_eq!(tile.icon.as_deref(), Some("lutris"));
+        assert_eq!(serde_json::to_value(&tile).unwrap()["icon"], "lutris");
+
+        let game: GameEntry = out[1].clone().into();
+        assert!(
+            serde_json::to_value(&game)
+                .unwrap()
+                .get("icon")
+                .is_none(),
+            "an entry with no mark stays byte-identical on the wire, so older clients are unaffected"
+        );
+    }
+
+    /// A second reconcile that drops the token must clear it, not leave the old one behind. The
+    /// reconcile is declarative — `slot.icon = input.icon` — and this is the test that would fail if
+    /// someone ever made it an `Option`-merging update, which for `art` would be a defensible choice
+    /// and here would strand a mark on a tile whose plugin removed it.
+    #[test]
+    fn dropping_the_icon_on_a_later_reconcile_clears_it() {
+        let mut first = input("launcher", "Lutris");
+        first.role = GameRole::Launcher;
+        first.icon = Some("lutris".into());
+
+        let mut entries = Vec::new();
+        reconcile_entries(&mut entries, "lutris", Some("lutris"), vec![first]);
+
+        let mut second = input("launcher", "Lutris");
+        second.role = GameRole::Launcher;
+        let out = reconcile_entries(&mut entries, "lutris", Some("lutris"), vec![second]);
+        assert_eq!(out[0].icon, None);
     }
 
     /// The metadata contract on the wire and on disk: fields serialize FLAT (no `meta` nesting —

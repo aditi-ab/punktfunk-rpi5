@@ -191,6 +191,13 @@ public struct DeepLink: Equatable, Sendable {
             profile: (profile?.isEmpty ?? true) ? nil : profile)
     }
 
+    /// A library link for a saved host — the shape the library widget and the Open Library intent
+    /// emit. Opens the host's game library without starting a session; a session begins only when
+    /// the user picks a title there, through the normal connect path.
+    public static func browse(host: UUID) -> DeepLink {
+        DeepLink(route: .browse, hostRef: host.uuidString)
+    }
+
     /// The self-emitted form for a saved host: id first (address-independent), with the address
     /// and pin alongside so the link degrades to a confirmation sheet instead of a dead click when
     /// the record is gone ("Copy link", and any shortcut written from a card).

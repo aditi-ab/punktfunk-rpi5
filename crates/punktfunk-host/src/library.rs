@@ -163,6 +163,40 @@ impl GameRole {
     }
 }
 
+/// The longest an [`GameEntry::icon`] token may be. Generous for a slug like `epic-games`, short
+/// enough that the field can never carry a payload.
+const ICON_TOKEN_MAX: usize = 32;
+
+/// Whether `t` is a well-formed brand-icon token: `[a-z][a-z0-9-]{0,31}`.
+///
+/// The host validates the **shape** and nothing else. Which tokens actually draw is a client
+/// question — every client ships its own curated set of marks (`assets/launcher-icons`) and falls
+/// back to the launcher's name for one it doesn't have, so a host that gated on a registry would
+/// only be able to reject tokens that a *newer* client already knows how to draw.
+///
+/// The shape check is not cosmetic. Without it the field is free-form text a plugin controls, and
+/// every client interpolates it — into a resource name, an asset-catalog lookup, a file path. A slug
+/// alphabet makes `../`, a URL, a `data:` payload and a NUL unrepresentable, so no client has to
+/// re-derive that guard for itself.
+pub fn is_icon_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= ICON_TOKEN_MAX
+        && t.starts_with(|c: char| c.is_ascii_lowercase())
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Reject a malformed [`GameEntry::icon`] token, naming the offender. `Ok(())` when absent.
+pub fn validate_icon(icon: Option<&str>) -> std::result::Result<(), String> {
+    match icon {
+        Some(t) if !is_icon_token(t) => Err(format!(
+            "`icon` must be a brand token matching [a-z][a-z0-9-]{{0,{}}} (got {t:?})",
+            ICON_TOKEN_MAX - 1
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// One title in the unified library, regardless of which store it came from.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct GameEntry {
@@ -177,6 +211,25 @@ pub struct GameEntry {
     /// Whether this entry is a game or the launcher itself — see [`GameRole`].
     #[serde(default, skip_serializing_if = "GameRole::is_game")]
     pub role: GameRole,
+    /// Which brand mark to draw for this entry, as a **token** — `steam`, `heroic`, `playnite` —
+    /// never image bytes and never a URL. See [`is_icon_token`].
+    ///
+    /// It exists for launcher tiles, which by design ship no cover art: a launcher's own icon is
+    /// square, every client cover-crops a 2:3 poster, and the crop turns a mark into a strip — so
+    /// until now those tiles were the launcher's name on a flat accent face. The token lets a client
+    /// draw the real mark from art it already ships, at whatever size its tile happens to be.
+    ///
+    /// A token rather than art on the wire because the host's art proxy serves *raster* bytes only
+    /// ([`art::local_art_bytes`] sniffs the container and refuses anything else, SVG very much
+    /// included — it is script-capable XML and the console renders art in a browser). Sending the
+    /// name of a mark instead of the mark keeps that refusal intact, keeps the glyph vector at every
+    /// tile size, and lets it take the tile's ink.
+    ///
+    /// Ordinary titles may carry one too — nothing here is launcher-specific — but nothing sets it
+    /// for them: a game has real cover art, which is strictly better than a brand mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "steam")]
+    pub icon: Option<String>,
     /// How the host would launch it, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
@@ -388,6 +441,7 @@ mod tests {
             title: title.into(),
             art: Artwork::default(),
             role: GameRole::default(),
+            icon: None,
             launch: None,
             provider: None,
             detect: DetectSpec::default(),

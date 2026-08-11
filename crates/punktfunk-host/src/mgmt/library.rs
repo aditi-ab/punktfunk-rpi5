@@ -29,6 +29,7 @@ fn check_entry_fields(
     art: &crate::library::Artwork,
     launch: Option<&crate::library::LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
+    icon: Option<&str>,
 ) -> Option<(String, Response)> {
     if !lane.may_set_privileged_fields() {
         if let Some(field) = crate::library::privileged_field(launch, prep) {
@@ -46,6 +47,13 @@ fn check_entry_fields(
                 ),
             ));
         }
+    }
+    // Shape-only, and on every lane: an icon token names no resource the host owns, so there is
+    // nothing here for an operator token to unlock — it is refused for being unrepresentable as a
+    // slug, not for being privileged. Clients interpolate the value, so the guard belongs upstream
+    // of all of them (`crate::library::validate_icon`).
+    if let Err(e) = crate::library::validate_icon(icon) {
+        return Some((e.clone(), api_error(StatusCode::BAD_REQUEST, &e)));
     }
     crate::library::validate_art_paths(art)
         .err()
@@ -301,9 +309,13 @@ pub(crate) async fn create_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some((_, denied)) =
-        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
-    {
+    if let Some((_, denied)) = check_entry_fields(
+        lane,
+        &input.art,
+        input.launch.as_ref(),
+        &input.prep,
+        input.icon.as_deref(),
+    ) {
         return denied;
     }
     match crate::library::add_custom(input) {
@@ -336,9 +348,13 @@ pub(crate) async fn update_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
-    if let Some((_, denied)) =
-        check_entry_fields(lane, &input.art, input.launch.as_ref(), &input.prep)
-    {
+    if let Some((_, denied)) = check_entry_fields(
+        lane,
+        &input.art,
+        input.launch.as_ref(),
+        &input.prep,
+        input.icon.as_deref(),
+    ) {
         return denied;
     }
     use crate::library::MutateOutcome;
@@ -464,7 +480,8 @@ pub(crate) async fn reconcile_provider_entries(
     // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
     // one privileged field anywhere in it is one command execution.
     for (i, e) in inputs.iter().enumerate() {
-        if let Some((reason, denied)) = check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep)
+        if let Some((reason, denied)) =
+            check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep, e.icon.as_deref())
         {
             tracing::warn!(
                 provider,

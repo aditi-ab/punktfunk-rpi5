@@ -44,8 +44,10 @@ manifest is OpenPGP-signed by packages@unom.io (key `AF245C506F4E4763`, the same
 RPMs), and `punktfunk-sysext` checks that signature against a key baked into the script before it
 trusts a single checksum — so it needs `gpg` on the box, and it refuses a feed it can't verify.
 
-The plugin runner rides along in the image but isn't started: run
-`systemctl --user enable --now punktfunk-scripting` when you want [plugins](/docs/plugins).
+The plugin runner rides along in the image and is **started for you** — the image bakes in its
+`default.target.wants` symlink, because the game-library scanners ship as
+[plugins](/docs/plugins). To turn it off: `systemctl --user mask punktfunk-scripting` (`mask`, not
+`disable` — a plain disable cannot remove a symlink that lives in `/usr`).
 
 From then on:
 

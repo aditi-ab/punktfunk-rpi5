@@ -124,8 +124,10 @@ dropped, unknown parameters are ignored, an empty value means "not given", and i
 appears twice the first one wins. `pf://` parses as an input alias, but nothing emits it and no app
 registers it with the operating system, so write `punktfunk://`.
 
-`connect` is the only route any client acts on today; `wake` and `browse` parse, but every client
-answers them with a notice. Values are capped (2048 for the whole URL, 128 for the host reference
+`connect` works everywhere. `browse` — the same grammar with no parameters acted on — opens the
+host's game library instead of streaming, on the Apple apps today (it backs their library widget
+and the Open Game Library shortcut); every other client answers it with a notice, as they all do
+for `wake`. Values are capped (2048 for the whole URL, 128 for the host reference
 and `launch`, 64 for `profile` and `name`), and `launch` must be printable ASCII with no spaces,
 quotes, backslashes, `$` or backticks.
 

@@ -396,6 +396,22 @@ pub fn restore_takeover_now() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_now() {}
 
+/// Tell the takeover that the box switched to `switched_to` mid-stream. A managed takeover
+/// runtime-masks the box's own autologin gaming unit so its session supervisor cannot restart it
+/// underneath us — but that mask is only sound while our managed session actually holds the box.
+/// Once the user has switched the box to a desktop session mid-stream, the mask defends nothing and
+/// bars the way back: the distro's session script starts that very unit, so "Return to Gaming Mode"
+/// fails instantly and Steam sits on its "Switch to Desktop…" modal until a reboot clears the mask.
+/// Call from the mid-stream session watcher on every switch it confirms; no-op when no takeover
+/// masked anything, and when the switch does not end the mask's window.
+#[cfg(target_os = "linux")]
+pub fn release_autologin_mask(switched_to: crate::ActiveKind) {
+    gamescope::release_autologin_mask(switched_to);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn release_autologin_mask(_switched_to: crate::ActiveKind) {}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

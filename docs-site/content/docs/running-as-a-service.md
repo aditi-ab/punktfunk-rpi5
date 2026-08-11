@@ -108,6 +108,12 @@ the host running against a compositor that no longer exists. It keeps listening 
 every session after that fails at capture, which is a confusing way to find out. The drop-in makes a
 compositor restart a host restart.
 
+On **NixOS** don't copy anything — the module has the option:
+
+```nix
+services.punktfunk.host.desktopSession = true;
+```
+
 Skip it on the headless/appliance route below (which has its own session unit), and on **Sway or
 Hyprland**, which don't hand their session to systemd: they never reach `graphical-session.target`, so
 the drop-in is harmless there but does nothing. To make the host come and go with the session on
@@ -243,9 +249,11 @@ KWin virtual output failed: KWin does not expose zkde_screencast_unstable_v1 to 
 ```
 
 which reads exactly like a missing or mis-installed `.desktop` file and survives reinstalling both
-ends. Version 0.26.0-1 granted the host the capability for the reason above and shipped precisely
-this, on every Linux channel; 0.26.0-2 revoked it everywhere. If you ever see that error, check the
-binaries before anything else — the host's own message names the capability when it finds one:
+ends. The first 0.26.0 packages granted the host the capability for the reason above and shipped
+precisely this, on every Linux channel; the grant was revoked everywhere later the same day, and
+0.27.0 is the first release whose version number carries that revocation to a machine that already
+installed one of them. If you ever see that error, check the binaries before anything else — the
+host's own message names the capability when it finds one:
 
 ```sh
 getcap /usr/bin/punktfunk-host              # correct output is nothing at all

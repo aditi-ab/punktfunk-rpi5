@@ -1,0 +1,17 @@
+Font Awesome Free — brand icons (steam, xbox in assets/launcher-icons/) are from
+Font Awesome Free.
+
+Copyright (c) Fonticons, Inc. (https://fontawesome.com)
+
+Font Awesome Free icons are licensed under the Creative Commons Attribution 4.0
+International license (CC BY 4.0), https://creativecommons.org/licenses/by/4.0/.
+The icons are redistributed here as monochrome SVG path data with no
+modifications beyond color normalization (fill="currentColor").
+
+Per the Font Awesome Free license (https://fontawesome.com/license/free):
+"Font Awesome Free is free, open source, and GPL friendly. You can use it for
+commercial projects, open source projects, or really almost whatever you want.
+Attribution is required by MIT, SIL OFL, and CC BY licenses."
+
+Brand icons are trademarks of their respective owners and are used for
+identification purposes only; their use does not imply endorsement.

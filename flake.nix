@@ -126,6 +126,7 @@
         system:
         let
           pf = packagesFor system;
+          pkgs = pkgsFor system;
         in
         {
           inherit (pf)
@@ -134,6 +135,17 @@
             punktfunk-web
             punktfunk-scripting
             ;
+
+          # The NixOS module, actually evaluated. `nix flake check` does NOT do this for
+          # `nixosModules` — it only forces the value and asserts it is a lambda taking an open
+          # attribute set, so a module with a nonexistent option, a nonexistent `pkgs` attribute
+          # and a nonexistent `lib` function passes clean (measured). Routing the module through a
+          # `checks` entry instead means the eval-only CI leg has to instantiate it, and every
+          # assertion in module-check.nix is pure Nix so instantiation is enough to run them.
+          nixos-module = pkgs.callPackage ./packaging/nix/module-check.nix {
+            inherit nixpkgs system;
+            module = import ./packaging/nix/nixos-module.nix;
+          };
         }
       );
 

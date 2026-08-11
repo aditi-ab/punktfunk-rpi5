@@ -434,6 +434,7 @@ fn dump_console_screens() {
             title: (*t).to_string(),
             store: "steam".into(),
             launcher: false,
+            icon: String::new(),
         })
         .collect(),
     );

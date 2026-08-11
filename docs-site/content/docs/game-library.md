@@ -109,6 +109,11 @@ key, the answer is cached on the host, and a lookup that fails just leaves a tit
 A [plugin](/docs/plugins) can own a slice of the library and keep it in sync — this is how the ROM
 Manager and Playnite plugins get your collection into the grid, box art and all.
 
+A library plugin can also publish a **launcher tile** — an entry that opens Steam Big Picture,
+Heroic, Lutris or Playnite itself rather than a game, so you can install or fix something from the
+couch. Clients group those into their own row above your titles, and each one draws its launcher's
+logo. A launcher tile you don't want is a switch in that plugin's settings.
+
 Entries a plugin owns are read-only to you. The host refuses a hand edit or a delete of one, because
 the next sync would overwrite it anyway — change the title at its source and let the plugin sync
 again. Only the plugin can remove its own entries, and it removes every one of them at once. Your
@@ -142,7 +147,10 @@ and runs what it already knows about the title, so a client can never hand the h
   See [Moonlight](/docs/moonlight).
 - **A link** — a [`punktfunk://` link](/docs/profiles-and-links) carries the id in a `launch=`
   parameter, so a desktop shortcut, a browser bookmark or a home-automation rule starts the stream
-  with the title already launching: `punktfunk://connect/couch-pc?launch=steam:570`.
+  with the title already launching: `punktfunk://connect/couch-pc?launch=steam:570`. On the Apple
+  apps, `punktfunk://browse/couch-pc` opens the library itself instead — that route backs their
+  home-screen library widget and the **Open Game Library** shortcut, so a tap lands you in a
+  picked host's library with nothing streaming yet.
 - **The command line** — the client's own [`punktfunk`](/docs/host-cli#punktfunk-on-the-client-machine)
   command, which ships with the Linux and Windows clients. `punktfunk library <host-ref>` prints `id`,
   `store` and `title` as tab-separated lines, then a count (`--json` for tools);

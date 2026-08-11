@@ -125,7 +125,7 @@ struct LibraryCoverflowView: View {
     ) -> some View {
         PosterImage(
             candidates: game.art.posterCandidates, title: game.title, loader: artLoader,
-            onLoaded: { artSettled += 1 })
+            icon: game.iconToken, onLoaded: { artSettled += 1 })
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(alignment: .topLeading) {

@@ -1,0 +1,2 @@
+• The OLED colour scheme is called Eclipse now — the same black-with-a-violet-ember palette, under a name that belongs beside Nebula and Abyss. Your saved choice carries over.
+• The rest of this release is on the computer you stream from. Once it updates: HDR streams from an NVIDIA machine no longer have red and blue swapped, and Linux hosts hold their frame rate far better under a demanding game.

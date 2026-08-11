@@ -111,6 +111,132 @@ pub(crate) fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The longest `/proc/<pid>/comm` the kernel will report: `TASK_COMM_LEN` is 16 *including* the
+/// NUL, so a name of exactly this many bytes may be a truncation of a longer one.
+#[cfg(target_os = "linux")]
+const COMM_MAX: usize = 15;
+
+/// The executable name to identify a process by, with nixpkgs wrapper decoration undone.
+///
+/// `comm` is the kernel's name for the **executed file**, truncated to [`COMM_MAX`] bytes — it is
+/// not `argv[0]` and not the command line. nixpkgs wraps essentially every graphical binary:
+/// `wrapProgram` moves the real ELF aside to `.<name>-wrapped` and installs a shell wrapper under
+/// the original name, and that wrapper `exec -a "$0"`s the hidden file. So `ps`/`pgrep -a` show a
+/// perfectly ordinary `kwin_wayland` (they read argv) while the kernel reports `.kwin_wayland-w`
+/// — 15 bytes of `.kwin_wayland-wrapped`, which can never equal `kwin_wayland`.
+///
+/// That is not a KDE-only detail. On NixOS `kwin_wayland`, `gamescope`, `gnome-shell` and
+/// `Hyprland` are all wrapped, so an exact `comm` comparison made [`super::session`]'s probe
+/// answer [`crate::ActiveKind::None`] on a visibly running desktop — and because the probe is the
+/// *only* input to that decision, no environment variable could reach it: `WAYLAND_DISPLAY` was
+/// correct, capture worked the moment detection was satisfied, and a `PUNKTFUNK_COMPOSITOR` pin
+/// turned the miss into a hard error via `pinned_at_a_dead_session`. (sway survives by accident —
+/// nixpkgs' wrapper execs a real binary that is itself still called `sway`.)
+///
+/// The `comm` fast path is kept for every ordinary distro: one read, no readlink. Only a name that
+/// *could* be decorated or truncated — it starts with `.`, or it is exactly [`COMM_MAX`] bytes —
+/// is re-resolved, first through `/proc/<pid>/exe` and then, when the kernel refuses that link,
+/// through `argv[0]`.
+///
+/// 🛑 **That last rung is not defensive padding — without it this resolver misses the exact box it
+/// was written for.** Reading `/proc/<pid>/exe` is *not* merely a matter of owning the process: the
+/// kernel gates it behind `cap_ptrace_access_check`, which demands the reader's effective set be a
+/// superset of the target's PERMITTED set. A compositor holding a capability is therefore opaque to
+/// our (deliberately uncapped — see the KWin identification note in `pf-encode`) host, same uid or
+/// not. And NixOS's own Plasma module ships exactly that:
+/// `security.wrappers.kwin_wayland = { capabilities = "cap_sys_nice+ep"; }`. So on NixOS + KDE the
+/// two traps compose — the name needs `exe` *because* nixpkgs wrapped it, and `exe` is denied
+/// *because* NixOS capped it — and the session probe went straight back to
+/// [`crate::ActiveKind::None`] on a running desktop.
+///
+/// Measured (Linux 6.x, same-uid reader, target holding `cap_sys_nice`), for a file capability and
+/// for the ambient-capability form `security.wrappers` actually uses, identically:
+///
+/// | probe | capped target |
+/// |---|---|
+/// | `/proc/<pid>` owner | ✅ still the real uid — the uid filter upstream is unaffected |
+/// | `comm` | ✅ readable (decorated/truncated, so still unusable on its own) |
+/// | `exe` | ❌ **EACCES** |
+/// | `cmdline` (`argv[0]`) | ✅ readable |
+///
+/// `argv[0]` is only consulted when the kernel has refused the authoritative answer, because it is
+/// the process's own claim about itself rather than the kernel's: a same-uid process can set it to
+/// anything. The exposure that buys is small and one-directional — the worst a spoof achieves is
+/// aiming detection at a compositor backend that then fails its own availability probe — whereas
+/// without the rung a capped compositor is simply invisible. It reads correctly here for the same
+/// reason `ps` does: make-wrapper's generated wrapper `exec -a "$0"`s the hidden binary, so
+/// `argv[0]` survives the decoration that `comm` does not.
+///
+/// `pid_path` is a `/proc/<pid>` directory. `None` when the process vanished mid-scan.
+#[cfg(target_os = "linux")]
+pub(crate) fn match_name(pid_path: &std::path::Path) -> Option<String> {
+    let comm = std::fs::read_to_string(pid_path.join("comm")).ok()?;
+    let comm = comm.trim();
+    // An undecorated name short enough to be complete is already the answer.
+    if !comm.starts_with('.') && comm.len() < COMM_MAX {
+        return Some(comm.to_string());
+    }
+    // The authoritative rung: the kernel's own record of the executed file, untruncated. Absent for
+    // a kernel thread and for a process exiting under us, and REFUSED for a capability-holding one.
+    let exe = std::fs::read_link(pid_path.join("exe")).ok();
+    if let Some(full) = exe
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
+        return Some(undecorate(full).to_string());
+    }
+    // Refused or gone: fall back to what the process calls itself, then to the truncated `comm`.
+    match argv0_name(pid_path) {
+        Some(name) => {
+            tracing::debug!(
+                comm = %comm,
+                resolved = %name,
+                "/proc/<pid>/exe unreadable (a capability-holding process refuses it); \
+                 identified via argv[0]"
+            );
+            Some(name)
+        }
+        None => Some(comm.to_string()),
+    }
+}
+
+/// The file name in `argv[0]`, with nixpkgs decoration undone — the last rung of [`match_name`].
+///
+/// `/proc/<pid>/cmdline` is NUL-separated, so the first field is `argv[0]` whole, with no splitting
+/// on whitespace to get wrong. `None` when it is unreadable or empty, which is the normal state for
+/// a kernel thread and for a zombie.
+#[cfg(target_os = "linux")]
+fn argv0_name(pid_path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read(pid_path.join("cmdline")).ok()?;
+    let argv0 = raw.split(|b| *b == 0).next()?;
+    // A process that rewrote its own argv (setproctitle-style) can leave anything here, including
+    // something that is not a path at all — `file_name` simply yields it unchanged and it fails to
+    // match any compositor name, which is the correct outcome.
+    let argv0 = std::str::from_utf8(argv0).ok()?;
+    let name = std::path::Path::new(argv0).file_name()?.to_str()?;
+    (!name.is_empty()).then(|| undecorate(name).to_string())
+}
+
+/// Strip nixpkgs `wrapProgram` decoration: `.<name>-wrapped`, plus the `_` suffixes make-wrapper
+/// appends when that hidden name is already taken (a doubly-wrapped app — Qt *and* GApps).
+///
+/// **Both** halves are required, and that is the load-bearing part rather than pedantry: KWin
+/// ships its own real binary called `kwin_wayland_wrapper` (the session's parent process), so a
+/// rule that merely stripped a `wrapper`-ish suffix would rewrite it into `kwin_wayland` and hand
+/// the session probe the wrong PID. Demanding the leading `.` as well keeps it — and any genuine
+/// `foo-wrapped` — under its real name.
+#[cfg(target_os = "linux")]
+fn undecorate(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix('.') else {
+        return name;
+    };
+    match rest.trim_end_matches('_').strip_suffix("-wrapped") {
+        Some(real) if !real.is_empty() => real,
+        _ => name,
+    }
+}
+
 /// Ending the *tree* the helper started, not just the process we spawned.
 ///
 /// [`std::process::Child::kill`] is one `TerminateProcess` / one `SIGKILL`: it ends exactly the
@@ -277,6 +403,284 @@ mod tests {
         .expect("ran");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "punktfunk");
+    }
+}
+
+/// The `comm`-vs-real-name resolution ([`match_name`]). Linux-only, because the trap it exists for
+/// is a Linux kernel detail (`comm` names the executed FILE, truncated to 15 bytes) crossed with a
+/// nixpkgs packaging convention.
+///
+/// Driven against **fixture** `/proc/<pid>` directories rather than spawned processes, for the same
+/// reason the `/proc` matcher in `punktfunk-host` learned the hard way: a stand-in has to be a real
+/// ELF that tolerates being *renamed*, and `/bin/sleep` is not one. Modern coreutils (uutils on
+/// Ubuntu 25.10+, busybox elsewhere) is a MULTI-CALL binary — copied to `.kwin_wayland-wrapped` it
+/// prints "unknown program" and exits before `/proc` can be read, and restoring `argv[0]` does not
+/// save it. That reads exactly like this resolver being broken. The truncation the fixtures encode
+/// is not guessed: the strings below were measured from a live kernel (`.kwin_wayland-w`,
+/// `.kwin_wayland_w`, `.gamescope-wrap` — all 15 bytes) against binaries installed and exec'd the
+/// way nixpkgs does it.
+#[cfg(all(test, target_os = "linux"))]
+mod name_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A fake `/proc/<pid>` directory: a `comm` file and, optionally, the `exe` symlink and a
+    /// `cmdline`. Removed on drop.
+    ///
+    /// An absent `exe` stands in for **both** ways the real link yields nothing: a process exiting
+    /// under the scan, and — the case that matters here — a capability-holding one, whose link the
+    /// kernel refuses with EACCES. `match_name` cannot tell those apart and does not need to.
+    struct FakePid {
+        dir: PathBuf,
+    }
+
+    impl FakePid {
+        /// `comm` is written exactly as the kernel would report it — i.e. already truncated.
+        fn new(tag: &str, comm: &str, exe: Option<&str>) -> FakePid {
+            FakePid::with_cmdline(tag, comm, exe, None)
+        }
+
+        /// `cmdline` is the NUL-separated argument vector the kernel exposes; the fixture is given
+        /// just `argv[0]` and appends the terminator, as a real one carries.
+        fn with_cmdline(tag: &str, comm: &str, exe: Option<&str>, argv0: Option<&str>) -> FakePid {
+            let dir = std::env::temp_dir().join(format!("pf-vd-name-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm");
+            if let Some(exe) = exe {
+                // The target need not exist: `read_link` reports the link's contents, and a real
+                // `/proc/<pid>/exe` routinely points at a path that has since been replaced.
+                std::os::unix::fs::symlink(
+                    format!("/nix/store/eeee-kwin-6.5.0/bin/{exe}"),
+                    dir.join("exe"),
+                )
+                .expect("exe symlink");
+            }
+            if let Some(argv0) = argv0 {
+                std::fs::write(dir.join("cmdline"), format!("{argv0}\0--session\0")).expect("cmd");
+            }
+            FakePid { dir }
+        }
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for FakePid {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The decoration table. The `kwin_wayland_wrapper` rows are the ones that earn their keep: it
+    /// is a REAL KWin binary (the session's parent process), so the rule must leave it under its own
+    /// name in both its plain and its wrapped form rather than collapsing either into
+    /// `kwin_wayland` and handing the session probe the wrong PID.
+    #[test]
+    fn undecorate_strips_only_a_real_nixpkgs_wrapper() {
+        for (raw, want) in [
+            (".kwin_wayland-wrapped", "kwin_wayland"),
+            (".gamescope-wrapped", "gamescope"),
+            (".gnome-shell-wrapped", "gnome-shell"),
+            (".Hyprland-wrapped", "Hyprland"),
+            // make-wrapper appends `_`s when the hidden name is already taken (a Qt + GApps
+            // double-wrap), so the underscores come off before the suffix does.
+            (".kwin_wayland-wrapped_", "kwin_wayland"),
+            (".kwin_wayland-wrapped__", "kwin_wayland"),
+            // Not decoration — every one of these keeps its exact name.
+            ("kwin_wayland", "kwin_wayland"),
+            ("kwin_wayland_wrapper", "kwin_wayland_wrapper"),
+            (".kwin_wayland_wrapper-wrapped", "kwin_wayland_wrapper"),
+            ("foo-wrapped", "foo-wrapped"),
+            (".hidden", ".hidden"),
+            (".-wrapped", ".-wrapped"),
+        ] {
+            assert_eq!(undecorate(raw), want, "undecorate({raw:?})");
+        }
+    }
+
+    /// The whole bug. Every compositor the session probe matches on is wrapped by nixpkgs, so the
+    /// kernel reports a truncated, decorated `comm` that can never equal the name being compared —
+    /// which is why `detect_active_session` answered `ActiveKind::None` on a *running* KDE desktop
+    /// and every connect died "no usable compositor".
+    #[test]
+    fn a_nixpkgs_wrapped_compositor_resolves_to_its_real_name() {
+        for (tag, comm, exe, want) in [
+            (
+                "kwin",
+                ".kwin_wayland-w",
+                ".kwin_wayland-wrapped",
+                "kwin_wayland",
+            ),
+            (
+                "gamescope",
+                ".gamescope-wrap",
+                ".gamescope-wrapped",
+                "gamescope",
+            ),
+            (
+                "gnome",
+                ".gnome-shell-wr",
+                ".gnome-shell-wrapped",
+                "gnome-shell",
+            ),
+            ("hypr", ".Hyprland-wrapp", ".Hyprland-wrapped", "Hyprland"),
+        ] {
+            let p = FakePid::new(tag, comm, Some(exe));
+            assert_eq!(
+                match_name(p.path()).as_deref(),
+                Some(want),
+                "a nixpkgs-wrapped {want} must resolve to the name the session probe matches"
+            );
+        }
+    }
+
+    /// KWin's own `kwin_wayland_wrapper` is a real binary that runs *alongside* `kwin_wayland`, and
+    /// its wrapped `comm` (`.kwin_wayland_w`) differs from the compositor's by a single byte. It
+    /// must NOT resolve to `kwin_wayland`: the probe would then match the parent process and carry
+    /// its PID as the compositor identity, which drives restart detection.
+    #[test]
+    fn kwins_own_wrapper_binary_does_not_masquerade_as_the_compositor() {
+        let p = FakePid::new(
+            "kwrap",
+            ".kwin_wayland_w",
+            Some(".kwin_wayland_wrapper-wrapped"),
+        );
+        assert_eq!(
+            match_name(p.path()).as_deref(),
+            Some("kwin_wayland_wrapper")
+        );
+    }
+
+    /// The other half of the 15-byte limit, with no nix involved: a long name is truncated too, and
+    /// has to be recovered from `exe` rather than matched short.
+    #[test]
+    fn a_long_name_is_recovered_untruncated() {
+        let p = FakePid::new(
+            "long",
+            "a-very-long-com",
+            Some("a-very-long-compositor-name"),
+        );
+        assert_eq!(
+            match_name(p.path()).as_deref(),
+            Some("a-very-long-compositor-name")
+        );
+    }
+
+    /// The fast path answers without consulting `exe` at all — which is what keeps this probe at one
+    /// read per process on every ordinary distro, and what lets it answer for a process whose `exe`
+    /// is unreadable in the first place.
+    #[test]
+    fn an_ordinary_short_name_never_needs_the_exe_link() {
+        let p = FakePid::new("plain", "kwin_wayland", None);
+        assert_eq!(match_name(p.path()).as_deref(), Some("kwin_wayland"));
+    }
+
+    /// A decorated-or-truncated name with neither `exe` nor `cmdline` to fall back on (a kernel
+    /// thread, or a process exiting under the scan) degrades to the truncated `comm` instead of
+    /// failing the whole entry.
+    #[test]
+    fn an_unreadable_exe_falls_back_to_comm() {
+        let p = FakePid::new("noexe", ".kwin_wayland-w", None);
+        assert_eq!(match_name(p.path()).as_deref(), Some(".kwin_wayland-w"));
+    }
+
+    /// **The NixOS + KDE field bug in one assertion.** nixpkgs wraps the binary, so `comm` is
+    /// `.kwin_wayland-w` and only `exe` carries the real name — and NixOS's own Plasma module hands
+    /// KWin `cap_sys_nice+ep` through `security.wrappers`, so the kernel refuses that link to our
+    /// uncapped host. Both traps at once is not a hypothetical combination: it is the default
+    /// install. `argv[0]` is what survives, because make-wrapper's wrapper `exec -a "$0"`s the
+    /// hidden binary.
+    #[test]
+    fn a_capped_wrapped_compositor_is_identified_by_argv0() {
+        for (tag, comm, argv0, want) in [
+            // Plasma's own startup execs the wrapper by absolute path.
+            (
+                "capkwin",
+                ".kwin_wayland-w",
+                "/run/wrappers/bin/kwin_wayland",
+                "kwin_wayland",
+            ),
+            // …and a bare name is just as ordinary.
+            ("capbare", ".kwin_wayland-w", "kwin_wayland", "kwin_wayland"),
+            // gamescope carries `cap_sys_nice` on a great many distros, wrapped or not.
+            (
+                "capgame",
+                ".gamescope-wrap",
+                "/nix/store/aaaa-gamescope/bin/gamescope",
+                "gamescope",
+            ),
+            // A wrapper that passes the hidden path through as `argv[0]` still undecorates.
+            (
+                "capraw",
+                ".kwin_wayland-w",
+                "/nix/store/eeee-kwin/bin/.kwin_wayland-wrapped",
+                "kwin_wayland",
+            ),
+        ] {
+            let p = FakePid::with_cmdline(tag, comm, None, Some(argv0));
+            assert_eq!(
+                match_name(p.path()).as_deref(),
+                Some(want),
+                "a capped, wrapped {want} must still be identified from argv[0]"
+            );
+        }
+    }
+
+    /// `exe` outranks `argv[0]` whenever the kernel allows it: `argv[0]` is the process's own claim
+    /// about itself and a same-uid process can set it to anything, so it may never override the
+    /// kernel's answer — only stand in when there is none.
+    #[test]
+    fn a_readable_exe_outranks_a_lying_argv0() {
+        let p = FakePid::with_cmdline(
+            "liar",
+            ".gamescope-wrap",
+            Some(".gamescope-wrapped"),
+            Some("kwin_wayland"),
+        );
+        assert_eq!(match_name(p.path()).as_deref(), Some("gamescope"));
+    }
+
+    /// A zombie's `cmdline` is empty, and `argv[0]` can be an empty string even when it is not —
+    /// neither may yield an empty name (which would then be compared against, and could match, a
+    /// compositor name only by accident).
+    #[test]
+    fn an_empty_cmdline_does_not_produce_a_name() {
+        for (tag, cmdline) in [("zombie", ""), ("nulls", "\0\0")] {
+            let dir = std::env::temp_dir().join(format!("pf-vd-name-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            std::fs::write(dir.join("comm"), ".kwin_wayland-w\n").expect("comm");
+            std::fs::write(dir.join("cmdline"), cmdline).expect("cmdline");
+            assert_eq!(match_name(&dir).as_deref(), Some(".kwin_wayland-w"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A pid directory that does not exist yields `None`, not a bogus name — the scans `continue`.
+    #[test]
+    fn a_vanished_process_yields_none() {
+        assert_eq!(match_name(Path::new("/proc/0")), None);
+    }
+
+    /// The one thing a fixture cannot establish: that reading `/proc/<pid>/exe` is actually
+    /// *permitted* for a process of our own uid. Checked against the only such process guaranteed
+    /// to be running — this one. ⚠ It holds because *we* are uncapped, and says nothing about the
+    /// processes being scanned: a capped target refuses this same link, which is what
+    /// [`match_name`]'s `argv[0]` rung exists for.
+    #[test]
+    fn our_own_exe_link_is_readable() {
+        let me = Path::new("/proc/self");
+        let exe = std::fs::read_link(me.join("exe"))
+            .expect("/proc/self/exe must be readable for our own uid");
+        let name = exe.file_name().and_then(|n| n.to_str()).expect("exe name");
+        let got = match_name(me).expect("our own name");
+        // Whichever rung answered, it must agree with the real binary: the fast path returns the
+        // (short, undecorated) comm, which is a prefix of it; the exe path returns it outright.
+        assert!(
+            name.starts_with(got.as_str()) || got == name,
+            "resolved {got:?} disagrees with our real binary {name:?}"
+        );
     }
 }
 

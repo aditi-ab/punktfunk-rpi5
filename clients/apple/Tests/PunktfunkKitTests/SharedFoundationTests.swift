@@ -178,6 +178,18 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertEqual(try DeepLink(url: profiled.url).profile, "a1b2c3d4e5f6")
     }
 
+    /// The library widget's and the Open Library intent's emitter — the reserved `browse` route
+    /// with a bare UUID path. Same backward-compatibility stakes as connect: a Home-Screen widget
+    /// keeps sending yesterday's URL.
+    func testDeepLinkBrowseRoundTrips() throws {
+        let id = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
+        let link = DeepLink.browse(host: id)
+        XCTAssertEqual(link.route, .browse)
+        XCTAssertEqual(
+            link.urlString, "punktfunk://browse/11111111-2222-4333-8444-555555555555")
+        XCTAssertEqual(try DeepLink(url: link.url), link)
+    }
+
     /// Self-emitted links ("Copy link", a shortcut) carry all three references, so they survive
     /// both a re-addressed host and a wiped store.
     func testDeepLinkForHostCarriesIDAddressAndPin() throws {

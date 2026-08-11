@@ -12,10 +12,72 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
-## v0.27.0 — in development
+## v0.27.1 — in development
 
-Sections accumulate here as work lands. The version table and the commit count are written at the
-version bump, alongside `docs/releases/v0.27.0.md` — see `docs/releases/README.md`.
+### NixOS + KDE — session detection, the other half
+
+🛑 **v0.27.0's NixOS session-detection fix did not reach a stock NixOS + Plasma 6 box.** It resolved
+the nixpkgs wrapper decoration through `/proc/<pid>/exe` (below) — and on that exact box the kernel
+refuses to let us read that link. Reading `/proc/<pid>/exe` is not gated on owning the process: it
+goes through `cap_ptrace_access_check`, which requires the reader's effective set to be a superset
+of the target's **permitted** set. NixOS's own Plasma module ships
+`security.wrappers.kwin_wayland = { capabilities = "cap_sys_nice+ep"; }`, so KWin holds a capability
+and the host — which must stay uncapped, because a capability is exactly what makes it
+unidentifiable to KWin (v0.27.0, above) — gets `EACCES`. The two traps compose: the name *needs*
+`exe` because nixpkgs wrapped the binary, and `exe` is *denied* because NixOS capped it. Detection
+went straight back to `ActiveKind::None`, `wayland` to `-`, and every connect to
+`no usable compositor`. It presents identically to the v0.27.0 bug, which is why a box that had been
+worked around with a decoy process broke again the moment the decoy was removed.
+
+Name resolution now falls through to `argv[0]` (`/proc/<pid>/cmdline`) when the kernel refuses `exe`.
+That reads correctly for the same reason `ps` does: make-wrapper's wrapper `exec -a "$0"`s the hidden
+binary, so `argv[0]` survives the decoration `comm` does not. Measured on Linux 6.x against a capped
+target, for a file capability and for the ambient form `security.wrappers` uses, identically: the
+`/proc/<pid>` directory keeps its real owner (so the uid filter was never the problem), `comm` and
+`cmdline` stay readable, and only `exe` fails. `argv[0]` is consulted **last** and never overrides a
+readable `exe` — it is the process's own claim about itself, and a same-uid process can set it to
+anything; the worst a spoof achieves is aiming detection at a backend that then fails its own
+availability probe. The `comm` fast path is still one read for every ordinary distro.
+
+Also reached by the same rung: `gamescope` carries `cap_sys_nice` on a number of distros, so a
+*wrapped and capped* gamescope was equally invisible to the foreign-gamescope probe.
+
+## v0.27.0
+
+87 commits since v0.26.0.
+
+### Versions
+
+| | v0.26.0 | v0.27.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 17 | **18** | `punktfunk_connection_next_rumble_cmd2` **added**; nothing removed or changed |
+| Workspace crate dirs | 26 | **27** | `crates/punktfunk-encode-worker` (39 members; two `tools/` crates deliberately *excluded*) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3) |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged — three `device_type`s added additively |
+| Plugin index schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.25.0 | **0.25.0** | unchanged — no management-API edits this release |
+| gamescope patch level (`+pfhdrN`) | 4 | **5** | 6 patches → 7 (the PipeWire use-after-free); `pkgrel` resets 3 → 1 |
+| `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged |
+| `@punktfunk/plugin-kit` | 0.4.0 | **0.4.0** | unchanged |
+
+⚠ **`crates/pf-driver-proto` is no longer byte-identical to the previous release.** It was through
+both v0.25.0 and v0.26.0, so if you ship the virtual-display driver or the gamepad channel and have
+been skipping this crate, stop skipping it here. The change is purely additive — three `device_type`
+constants, no field moved, no size changed.
+
+### ⚠ Breaking changes
+
+**None** for embedders or the wire. Every embedder, packager and plugin that works against v0.26.0
+works against v0.27.0 unchanged; the C ABI moves, but by addition only (below).
+
+Two things change shape for **packagers** and one **default** flips:
+
+- **A second installed binary**, `punktfunk-encode-worker` — see the section below. It is the only
+  file that may carry `cap_sys_nice=ep`, and it must be a separate file.
+- **`PUNKTFUNK_XBOX_BACKEND` now defaults to `hid`** on Windows, so an Xbox pad is built as a real
+  HID device rather than the XUSB companion. `=xusb` is the escape hatch.
+- **NixOS `scripting.autoStart` now defaults ON**, matching every other packaging (detailed below).
 
 ### `punktfunk-encode-worker` — the GPU-priority capability moves off the host
 
@@ -65,8 +127,218 @@ code. `PYROWAVE_QUEUE_PRIORITY` keeps its 0.26.0 grammar and is now forwarded **
 handshake rather than read from the worker's environment, which is sanitized at spawn; one env var
 still means one thing on both platforms.
 
+### NixOS — session detection, module defaults, and a CI gate that was never running
+
+🛑 **The host could not detect any graphical session on NixOS, at all.** The live-session probe
+matched `/proc/<pid>/comm` exactly against `kwin_wayland` / `gamescope` / `gnome-shell` /
+`Hyprland`. `comm` is the kernel's name for the **executed file**, truncated to 15 bytes — not
+`argv[0]` — and nixpkgs wraps essentially every graphical binary: `wrapProgram` moves the real ELF
+aside to `.<name>-wrapped` and installs a wrapper that `exec -a "$0"`s it. So the kernel reports
+`.kwin_wayland-w` while `ps` and `pgrep -a` show a perfectly ordinary `kwin_wayland`, because they
+read argv. Every probe answered `ActiveKind::None` on a running desktop, and nothing downstream
+could recover: `wayland` logged as `-`, a correct `WAYLAND_DISPLAY` changed nothing, `Auto` returned
+the *detected* backend so a live KWin already in `available()` was never chosen, and a
+`PUNKTFUNK_COMPOSITOR` pin turned the miss into a hard error through `pinned_at_a_dead_session`.
+sway and river survived by accident — nixpkgs' wrapper execs a binary still called `sway`.
+
+Names are now resolved through `/proc/<pid>/exe`, whose file name is untruncated, with the nixpkgs
+decoration stripped. Stripping requires **both** the leading `.` and a trailing `-wrapped`, so
+KWin's own real `kwin_wayland_wrapper` binary keeps its name instead of collapsing into
+`kwin_wayland` and handing the probe the parent's PID. The `comm` fast path is unchanged for every
+ordinary distro — one read, no readlink — and no name that matched before can stop matching. Also
+applied to the foreign-gamescope probe, which had the same defect.
+
+**Module changes** (`services.punktfunk`):
+
+- **`host.desktopSession`** *(new, default `false`)* — binds the host to `graphical-session.target`,
+  the declarative form of the `punktfunk-host-desktop-session.conf` drop-in. Without it a
+  Plasma/GNOME restart leaves the host holding a Wayland socket and portal D-Bus connection that
+  died with the old compositor: it still listens, still answers, and every session after that fails
+  at capture. Off by default because an appliance may never reach that target and would be left
+  permanently stopped.
+- ⚠ **`scripting.autoStart` now defaults ON** *(behaviour change)*, matching the deb `postinst` and
+  RPM `%post`, which both `systemctl --global enable` the runner, and the sysext's baked-in
+  `default.target.wants` symlink. It was opt-in here on the reasoning that the runner is inert until
+  you add automation — untrue since the game-library scanners became plugins, so a NixOS host came
+  up with an empty library and no obvious cause. Opt out with `scripting.autoStart = false` or
+  `systemctl --user mask punktfunk-scripting`.
+- **Three divergences from the shipped units, ported.** `punktfunk-web` gains
+  `StartLimitIntervalSec=0` (without it, 5 starts / 10 s against `RestartSec=2` gives up permanently
+  after ~10 s — exactly the window before the host's first `serve` writes the mgmt token, so a
+  console enabled before the host's first run stayed dead) and `Restart=always` rather than
+  `on-failure`. `punktfunk-scripting` gains the sandbox the deb/rpm unit has all along
+  (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=%h /tmp`, restricted address families,
+  `PrivateTmp=no`) — it is the one unit that runs arbitrary operator TypeScript by design, and it
+  had been running strictly less confined on NixOS than anywhere else.
+- A **warning** when the host is enabled and `xdg.portal.enable` is not.
+
+🛑 **`nix flake check` does not check `nixosModules`** — worth knowing for anyone maintaining a
+flake. It forces the value and asserts it is a lambda taking an open attribute set, and stops;
+nix's source still carries `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`
+Measured: a module with a nonexistent option, a nonexistent `pkgs` attribute **and** a nonexistent
+`lib` function passes, printing `checking NixOS module ... all checks passed!`. `nix.yml`'s header
+claimed that leg covered the module; it never had. `checks.<system>.nixos-module`
+(`packaging/nix/module-check.nix`) now evaluates it against real nixpkgs across four scenarios and
+asserts on the rendered units, including a guard that the host's `ExecStart` stays on the plain
+store path while the encode worker points at the wrapper. Its assertions are pure Nix, so
+instantiation runs them and the existing `--no-build` leg is enough. `punktfunk-gamescope` gains a
+`build-gamescope` dispatch input — it is on the critical path of every host build yet nothing
+compiled it, and it tracks nixpkgs' gamescope, so a `flake.lock` bump is what breaks it.
+
+### C ABI 17 → 18
+
+**`punktfunk_connection_next_rumble_cmd2` is new.** The `0xCA` rumble plane carries the two Xbox
+impulse-trigger motors (v3, below) and `punktfunk_connection_next_rumble_cmd`'s fixed out-params
+have no room for them:
+
+```c
+PunktfunkStatus punktfunk_connection_next_rumble_cmd2(
+    PunktfunkConnection *c, uint16_t *pad, uint16_t *low, uint16_t *high,
+    uint16_t *left_trigger, uint16_t *right_trigger,
+    uint32_t *backstop_ms, uint32_t timeout_ms);
+```
+
+**Added, not widened.** `_cmd` keeps its signature *and* its values bit-identical for handle-only
+traffic; all four rumble entry points remain exported. An exported parameter list is part of the
+contract, and growing one in place breaks every out-of-tree embedder at once — with a
+stack-corruption signature rather than a link error. This follows the existing
+`next_rumble` → `next_rumble2` precedent.
+
+⚠ **One behavioural delta on the old symbol**, documented in `abi.rs` and pinned by a test: against
+a host driving the trigger motors, a `_cmd` caller now receives commands with `low == high == 0`
+where the demux previously dropped the update entirely. They are idempotent handle stops — the
+command as a whole is not silent, so redundant-stop suppression cannot fold them. Zero cost today:
+nothing sources non-zero trigger levels yet.
+
+**Render trigger levels only on a pad that has trigger motors.** Do not fold them into the handles —
+impulse-trigger content is continuous, so folding it drones the handle motors flat-out. Query
+`SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN` or `GCDeviceHaptics.supportedLocalities`.
+
+🛑 **This delivery path is deliberately built ahead of its producer and nothing here claims
+otherwise.** Exactly one backend can ever source these levels — the Windows HID Xbox pad's output
+report `0x03` — because `XINPUT_VIBRATION` and evdev `FF_RUMBLE` both have two members. That
+producer is reachable only through GameInput, which does not enumerate an `xinputhid`-promoted Xbox
+pad at all (measured against a real Microsoft Elite, equally invisible there while classic XInput
+reads it live). The wire, the engine and this entry point are exercised by synthetic levels only.
+
+### Gamepads
+
+- **`PUNKTFUNK_GAMEPAD_XBOXELITE = 11`** — a new `GamepadPref` wire byte, appended to
+  `Hello`/`Welcome`. The `Auto` sentinel in the round-trip test moved 11 → 12. An older peer
+  degrades an unknown byte to `Auto`, so this is graceful in both directions.
+- **`XboxOne` is now a distinct HID identity on Windows** (`045E:02FD`, Bluetooth Xbox One S)
+  through the UMDF minidriver. It used to fold to `Xbox360` there, because the only Windows Xbox
+  backend was the XUSB companion, which presents one fixed 360 identity and cannot vary it.
+- **Three new `pf_driver_proto::gamepad` device types**, contiguous and sharing one report
+  descriptor byte for byte (they are the same pad in HID terms; the descriptor is the report
+  *shape*, the identity is what the OS keys mappings off):
+
+  | const | value | identity |
+  |---|---|---|
+  | `DEVTYPE_XBOX` | 4 | `045E:0B13` Xbox Wireless Controller |
+  | `DEVTYPE_XBOX_ONE_S` | 5 | `045E:02FD` Xbox Wireless Controller (One S) |
+  | `DEVTYPE_XBOX_ELITE` | 6 | `045E:0B22` Xbox Elite Wireless Controller Series 2 |
+
+  ⚠ The Xbox input report is **not** 64 bytes like its siblings — it is `XBOX_INPUT_REPORT_LEN`
+  (16). The driver serves per-identity report lengths, because hidclass sizes its buffer from the
+  descriptor and refuses an over-long source.
+- ⚠ **Elite paddles are not implemented.** `BTN_PADDLE1..4` still fold or drop exactly as on the
+  other Xbox classes. `DualSenseEdge` remains the only virtual pad with native back-button slots.
+- **All three Xbox identities install `pfGamepadXbox`**, their own DDInstall section, which attaches
+  the `xinputhid` bus filter. Merging it back into the shared `pfGamepad` section is a one-line edit
+  that looks like tidying and would hand a DualSense, DualShock 4, Edge and Steam Deck to
+  Microsoft's Xbox translator. `only_the_xbox_identity_installs_the_xinputhid_section` asserts the
+  split in both directions.
+
+**What actually promotes the pad — two registry values, and the pairing is the whole finding.**
+`UpperFilters=xinputhid` is a `.HW` AddReg (hardware key); `DevicePropertyFlags=1` is a DDInstall
+AddReg (software key). A one-value A/B on real hardware: removing `DevicePropertyFlags` alone
+reverts everything — no `IG_00`, no XUSB interface, no XInput, no WGI entry — while `UpperFilters`
+alone is completely inert. `1` = `BusDevice`, which Microsoft's own comment glosses as "a focused
+bus filter driver for the IG_ problem". **This retracts an earlier in-tree conclusion that the
+filter should never ship**: it was never broken, it had simply never been switched on.
+⚠ Microsoft's allow-list contains `02D1, 02DD, 02E3, 02EA, 0B00, 0B0A, 0B13, 02FF` — neither `02FD`
+nor `0B22` is on it, and promotion happens anyway, because it comes from our own AddReg.
+
+### Wire (no version change)
+
+**The `0xCA` rumble datagram gains a v3 form**, `PUNKTFUNK_RUMBLE_V3_LEN = 14`:
+
+```
+v1   7 B: [0xCA][u16 pad][u16 low][u16 high]
+v2  10 B: … [u8 seq][u16 ttl_ms]
+v3  14 B: … [u16 left_trigger][u16 right_trigger]
+```
+
+v3 is built *from* v2's bytes, so the prefix relationship is structural rather than a convention two
+encoders must keep agreeing on, and every reader gates with `>=`. All four levels share one `seq`
+and one TTL deliberately: they are one statement of the pad's feedback at one instant, so the entire
+v2 apparatus — renewal cadence, stop burst, the client's seq gate, the lease clamp — governs the
+triggers with no new code. The new `RumbleUpdate` fields are plain `u16`, not `Option`: on a
+level-triggered plane "absent" must mean zero, because "absent → keep the previous value" is the
+stuck-rumble bug in a new costume.
+
+⚠ **The two trigger `enable`-mask bits remain conjecture.** Bits 2/3 (the handles) are measured;
+bits 0/1 are inferred from field order and nothing else. No test asserts them. XInput cannot settle
+this; it has two motors.
+
+### Packaging
+
+- **gamescope pin `8c676c39` → `5fb8dce4`** (3.16.25-1 → 3.16.25-11), all six patches rebased, plus
+  a **seventh**: the PipeWire use-after-free that aborted a session on every connect. The marker
+  moves `+pfhdr4` → **`+pfhdr5`**, so `pkgrel` resets to 1.
+- **Patch 0001 offers `xBGR_210LE` before `xRGB_210LE`.** ⚠ Deliberately *not* done by calling
+  upstream's `vulkan_get_rgb10_capture_format()` — that symbol landed after 3.16.25 and would break
+  `packaging/nix/gamescope.nix` with an opaque C++ error instead of a patch conflict.
+- **Every `punktfunk-gamescope` RPM ever published was unsigned.** `Sign RPMs` runs right after
+  `Build RPM`, while the gamescope RPM is built ~90 steps later behind its own cache, so it missed
+  the signing pass entirely — and the repo file we ship carries `gpgcheck=1`. A second pass signs it
+  before publish, fail-closed on a tag.
+- ⚠ **The v0.26.0 gamescope gate failed the job at the *build* step**, which in `deb.yml` runs before
+  both the apt publish and the release attach — so a missing *extra* withheld the host `.deb` itself,
+  and the `.deb` published on v0.26.0 still carries the `CAP_SYS_NICE` grant. `rpm.yml` had the
+  identical latent bug. Both now warn at build/package time and gate as the **last** step of the job.
+- **`driver uninstall --audio`** — a third Inno `[UninstallRun]` entry that removes the MEDIA-class
+  devnodes the host mints at runtime. Marker-matched, never name-matched: our instances are
+  name-identical to Steam's, and a `ROOT\` enumeration guard means a marker-shaped value on a real
+  sound card can never cost the user their hardware.
+- **The sysext `post_merge` step re-runs when already current, plus a new `reapply` verb.** A sysext
+  upgrade is driven by the script from the **old** image, so a `post_merge` step added in a release
+  is executed by nobody, permanently, on exactly the installs that need it.
+
+### Host
+
+- **HDR capture offers `xBGR_210LE` before `xRGB_210LE`.** gamescope's capture textures are
+  mappable, hence linear-tiled, and NVIDIA does not implement linear-tiled STORAGE for
+  `A2R10G10B10_UNORM_PACK32` — so `imageStore` lands in XBGR order while the buffer is still
+  *labelled* `XRGB2101010`. Every mapping on both ends audits clean because the label was right and
+  only the content was wrong. Fixed host-side because the deployed gamescope cannot self-correct.
+- **One NVENC open failure no longer kills every session on the box**, and the 10-bit capability
+  probe no longer wedges a direct-SDK host process-wide with `NV_ENC_ERR_INVALID_VERSION`.
+- **`/api/v1/local/summary` reports the resolution the session actually got**, not the negotiated
+  one it was seeded with.
+
+### Workspace
+
+`crates/punktfunk-encode-worker` joins as a member (above). Two bring-your-own-hardware measurement
+tools are added and **excluded** in the root manifest, so `cargo build --workspace` and CI never see
+them: `tools/hid-descriptor-dump` (dumps and decodes a real HID report descriptor; pulls `hidapi`)
+and `tools/win-input-matrix` (asks each Windows input API what it can see — ⚠ `wake_wgi()` is not
+optional there: both WGI collections return a cache a console app has never started filling, so
+without subscribing first they come back empty with real controllers attached).
+
 ### Host and client environment variables
 
+- **`PUNKTFUNK_XBOX_BACKEND`** *(new, host, Windows)* — `hid` (the new **default**) or `xusb` (the
+  escape hatch). The HID pad is now a superset of the XUSB companion: it keeps classic XInput while
+  gaining Steam, SDL, RawInput, DirectInput, `joy.cpl` and WGI, plus rumble, which XUSB could not
+  source at all. The escape hatch stays because promotion leans on Microsoft's inbox
+  `xinputhid.inf`; if a servicing update changes it, one env var restores the old behaviour with no
+  reinstall. An unrecognised value takes the **default**, not the opt-out, so a typo cannot silently
+  drop a user onto the path with no HID collection.
+- **`PUNKTFUNK_GAMESCOPE_BIND`** *(new, host, Linux)* — unset = auto, `0` = never, `1` = force.
+  Governs whether the host binds the patched gamescope over the distribution's `/usr/bin/gamescope`
+  inside a session's mount namespace.
 - **`PUNKTFUNK_ENCODE_WORKER`** *(new, host, Linux)* — where to find the encode worker. Resolution
   order: this variable → alongside `/proc/self/exe` → `PATH`. `off` forces the in-process encoder,
   the debug escape hatch that makes the A/B a one-line change. Load-bearing on NixOS (above).
@@ -87,6 +359,16 @@ still means one thing on both platforms.
 - The 0.26.0 user-facing notes describe a privilege that is deliberately not granted. That is the
   record of what 0.26.0 shipped and is **not** rewritten; the new phrasing — granted to the worker,
   never to the host — lives in `docs/releases/v0.27.0.md`.
+- `install.md` **NixOS** documents `desktopSession`, and its `punktfunk-scripting` bullet no longer
+  claims the runner "ships disabled": that was true only of Arch and source installs — apt, dnf, the
+  Bazzite sysext and now the NixOS module all start it, because the library scanners are plugins.
+  `bazzite.md` carried the same stale claim and is corrected. **Running as a service → Restart the
+  host with your desktop** gains the NixOS one-liner beside the drop-in.
+- `packaging/nix/README.md`: `desktopSession`, `gamescopeHdr`/`gamescopePackage` and the
+  `punktfunk` group added to the option tables; the "what the module configures" list gains the
+  `security.wrappers` entry, with the KWin-identification reasoning for why the capability is on the
+  worker and not the host; and a caveat recording that `nix flake check` does not check the module,
+  plus the two rules for editing `module-check.nix`.
 
 ---
 

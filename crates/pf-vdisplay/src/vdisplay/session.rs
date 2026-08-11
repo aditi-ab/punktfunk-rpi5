@@ -311,8 +311,15 @@ pub fn detect_active_session() -> ActiveSession {
     let dbus = default_bus(&env, &xdg_runtime_dir);
 
     // Process probe: the running graphical compositor of THIS uid decides the kind. Priority lets
-    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. comm names mirror the
-    // `pkill -x` discipline (exact, ≤15 chars so untruncated).
+    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. Names are matched
+    // exactly, `pkill -x` style — but resolved through [`crate::proc::match_name`], NOT a raw
+    // `comm` read: on NixOS every one of these binaries is a nixpkgs wrapper whose real ELF is
+    // `.<name>-wrapped`, so a raw `comm` says `.kwin_wayland-w` and this whole probe answered
+    // `None` on a running KDE desktop. ⚠ Nor is `/proc/<pid>/exe` alone enough to undo that: NixOS
+    // caps KWin (`security.wrappers.kwin_wayland`, `cap_sys_nice+ep`) and the kernel refuses that
+    // link to an uncapped reader — see `match_name`, which falls through to `argv[0]` for exactly
+    // this box. The uid filter below is unaffected: a capped process's `/proc/<pid>` keeps its
+    // real owner (measured).
     let mut kind = ActiveKind::None;
     let mut best = 0u8;
     // The winning compositor's PID — kept so a same-kind compositor RESTART (a new PID) bumps the
@@ -332,10 +339,10 @@ pub fn detect_active_session() -> ActiveSession {
             if md.uid() != uid {
                 continue;
             }
-            let Ok(comm) = std::fs::read_to_string(pid_path.join("comm")) else {
+            let Some(comm) = crate::proc::match_name(&pid_path) else {
                 continue;
             };
-            let (k, prio) = match comm.trim() {
+            let (k, prio) = match comm.as_str() {
                 "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
                 "kwin_wayland" => (ActiveKind::DesktopKde, 4),
                 "gnome-shell" => (ActiveKind::DesktopGnome, 4),
