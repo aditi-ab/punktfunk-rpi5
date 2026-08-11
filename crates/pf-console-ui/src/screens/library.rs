@@ -10,7 +10,7 @@ use crate::library::{
     StepResult, BUMP_C, BUMP_K, BUMP_PX, FOCUS_GAP, JUMP, PERSPECTIVE, POSTER_H, POSTER_W,
     RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
 };
-use crate::model::{ConsoleCmd, HostRow};
+use crate::model::{ConsoleCmd, HostRow, ProfileChip};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox};
 use crate::theme::{accent, fg, Fonts, W};
@@ -24,6 +24,11 @@ pub(crate) struct LibraryScreen {
     port: u16,
     fp_hex: String,
     mgmt: u16,
+    /// `Some` when this library was opened from a PINNED host+profile card (§5.2a) rather
+    /// than the host's primary tile: every launch off this shelf is that card's connect
+    /// with a title attached, so it carries the same one-off profile the card's plain
+    /// A-press would. `None` = the primary tile, where the host's binding decides.
+    pin: Option<ProfileChip>,
     shared: Option<LibraryShared>,
     // Synced snapshot of the shared model (re-pulled when the generation bumps).
     generation: u64,
@@ -48,6 +53,7 @@ impl LibraryScreen {
             port: host.port,
             fp_hex: host.fp_hex.clone(),
             mgmt: host.mgmt_port,
+            pin: host.pin.clone(),
             shared: None, // adopted from Ctx on the first render (the shell owns it)
             generation: u64::MAX,
             phase: LibraryPhase::Loading,
@@ -60,8 +66,13 @@ impl LibraryScreen {
         }
     }
 
-    pub(crate) fn host_name(&self) -> &str {
-        &self.host_name
+    /// The screen's title: the host, and — when this shelf belongs to a pinned card — the
+    /// profile every launch off it will use, in the card's own `host · profile` shape.
+    pub(crate) fn title(&self) -> String {
+        match &self.pin {
+            Some(p) => format!("{} \u{b7} {}", self.host_name, p.name),
+            None => self.host_name.clone(),
+        }
     }
 
     fn fetch_cmd(&self) -> ConsoleCmd {
@@ -123,10 +134,18 @@ impl LibraryScreen {
                         port: self.port,
                         fp_hex: self.fp_hex.clone(),
                         launch: Some(g.id.clone()),
-                        title: g.title.clone(),
+                        // A pinned card's shelf says which profile it is launching with,
+                        // the same way its tile and this screen's title do.
+                        title: match &self.pin {
+                            Some(p) => format!("{} \u{b7} {}", g.title, p.name),
+                            None => g.title.clone(),
+                        },
                         request_access: false,
-                        // Game launches follow the host's default binding.
-                        profile: None,
+                        // A game launch off a PINNED card's shelf is that card's connect
+                        // with a title attached — it carries the card's profile as the
+                        // one-off. Off the primary tile there is none, and the host's
+                        // default binding decides.
+                        profile: self.pin.as_ref().map(|p| p.id.clone()),
                     });
                     Some(MenuPulse::Confirm)
                 }
