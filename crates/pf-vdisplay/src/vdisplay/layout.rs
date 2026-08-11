@@ -93,9 +93,24 @@ pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
 /// did not exist — so an unpinned display could land exactly on top of a pinned sibling with nothing
 /// downstream noticing (the arrangement is only ever *reported* and *applied*, never validated). One
 /// number in this crate's own fixture separated the tested case from that collision. Rowing the
-/// unpinned members from the rightmost pinned edge instead makes the overlap unrepresentable while
-/// keeping every property the fallback had: deterministic, acquire-ordered, and identical to plain
-/// auto-row when nothing is pinned.
+/// unpinned members from the rightmost pinned edge instead makes the overlap unrepresentable within
+/// one call, and keeps three of the fallback's properties: deterministic, acquire-ordered, and
+/// identical to plain auto-row when nothing is pinned.
+///
+/// ⚠ **The fourth property is gone, knowingly: incremental stability.** The prefix sum could not
+/// move member `i` when member `i+1` joined; this cursor is seeded from the pins of *all* members,
+/// so an already-placed unpinned member's computed `x` shifts the moment a pinned sibling arrives
+/// later in acquire order. Nothing re-applies it — `registry::position_for_new` takes only the
+/// `.last()` placement and the registry moves the newly-acquired display alone — so in that ordering
+/// `GET /display/state` reports a position the desktop never received (the pre-existing shape of
+/// this: an auto-row teardown already shifts every survivor's reported `x` with no re-apply; the
+/// packing widens the class to joins under `Manual`). It is not fixable here: the honest fix is for
+/// the registry to re-apply the WHOLE group's arrangement on any membership change under
+/// `LayoutMode::Manual`, the way `windows/manager.rs`'s `arrange_slots` already does, at which point
+/// this function is right in every ordering. Seeding the cursor from preceding pins only would buy
+/// incremental stability back by reintroducing the collision this exists to prevent — the wrong
+/// trade, since the common ordering (the pin exists, an unpinned client joins) does reach the apply
+/// path and is placed correctly.
 fn arrange_manual(members: &[Member], layout: &Layout) -> Vec<Placement> {
     let pins: Vec<Option<Placement>> = members.iter().map(|m| pin_of(m, layout)).collect();
     // Start the unpinned row at the desktop origin, or past the rightmost pinned edge when there is

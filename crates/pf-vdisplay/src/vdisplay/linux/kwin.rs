@@ -269,7 +269,7 @@ impl VirtualDisplay for KwinDisplay {
                     virtual_output_thread(w, h, name_thread, pointer_mode, setup_tx, stop_thread)
                 })
                 .context("spawn KWin virtual-output thread")?;
-            match setup_rx.recv_timeout(Duration::from_secs(20)) {
+            match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
                 Ok(Err(e)) => bail!("KWin virtual output failed: {e}"),
                 Err(_) => {
@@ -445,6 +445,11 @@ impl VirtualDisplay for KwinDisplay {
 /// unconditionally — including when the call had been killed at [`KSCREEN_BUDGET`], i.e. exactly
 /// the wedged compositor this fallback exists for, with a screen left dark and a green line in the
 /// log saying otherwise.
+///
+/// Reporting honestly is not the same as *stopping* on a bad verdict, and the difference is
+/// [`kscreen_verdict`]'s third state: a helper killed at its budget has told us nothing, and this
+/// path must go on to the mode re-assert and the settle in that case exactly as the pre-verdict
+/// code did — see the `None` arm below for what skipping them costs.
 fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
     if outputs.is_empty() {
         return;
@@ -456,18 +461,38 @@ fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
         .iter()
         .map(|(name, _)| format!("output.{name}.enable"))
         .collect();
-    let enabled = kscreen_ok(&enable_args);
-    if !enabled {
-        // Nothing further to try: both the in-process path and this one have now declined, so the
-        // outputs stay as `exclusive` left them. Say so loudly — a dark monitor with no line in the
-        // log is what this whole restore chain exists to prevent.
-        tracing::error!(
+    let enable_verdict = kscreen_verdict(&enable_args);
+    match enable_verdict {
+        // It ran and it refused (or could not be run at all). Nothing further to try: both the
+        // in-process path and this one have now declined, so the outputs stay as `exclusive` left
+        // them. Say so loudly — a dark monitor with no line in the log is what this whole restore
+        // chain exists to prevent.
+        Some(false) => {
+            tracing::error!(
+                outputs = ?outputs,
+                args = ?enable_args,
+                "KWin: could NOT re-enable the physical/bootstrap outputs (kscreen-doctor refused \
+                 the config, or could not be run, after the in-process restore already declined) — \
+                 a monitor may be left dark"
+            );
+            return;
+        }
+        // Killed at [`KSCREEN_BUDGET`] — which is NOT the same as a refusal, and treating it as one
+        // is a regression this path already had once. kscreen-doctor applies the config and only
+        // THEN waits on the compositor before exiting, so a loaded KWin routinely lands the enable
+        // and still gets killed: the output is lit, and returning here would skip both halves of
+        // the rest of the restore — the mode re-assert (a 120 Hz panel comes back at the
+        // EDID-preferred ~60 Hz without it) and the 200 ms settle that keeps KWin from seeing zero
+        // enabled outputs when the caller reclaims the virtual one right after us (§6.1). The
+        // second budget this costs on the stream thread is deliberate and bounded, and is what the
+        // pre-`match` code spent unconditionally.
+        None => tracing::warn!(
             outputs = ?outputs,
             args = ?enable_args,
-            "KWin: could NOT re-enable the physical/bootstrap outputs (kscreen-doctor failed or hit \
-             its budget after the in-process restore already declined) — a monitor may be left dark"
-        );
-        return;
+            "KWin: kscreen-doctor was killed at its budget re-enabling the physical/bootstrap \
+             outputs — the apply may well have landed, so continuing with the mode restore"
+        ),
+        Some(true) => {}
     }
     // THEN re-assert each captured mode, best-effort — a bare re-enable lets KWin fall back to the
     // EDID-preferred mode (a 120 Hz panel returns at ~60 Hz); this restores the exact refresh. The
@@ -480,12 +505,17 @@ fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
         .collect();
     let modes_restored = mode_args.is_empty() || kscreen_ok(&mode_args);
     std::thread::sleep(Duration::from_millis(200));
+    // `enable_confirmed` rides along on both lines: after a budget kill the enable is *probable*,
+    // not established, and a log that cannot tell the operator which of the two it is put us here
+    // in the first place.
+    let enable_confirmed = enable_verdict == Some(true);
     if modes_restored {
-        tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
+        tracing::info!(reenabled = ?outputs, enable_confirmed, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
     } else {
         tracing::warn!(
             reenabled = ?outputs,
             args = ?mode_args,
+            enable_confirmed,
             "KWin: re-enabled the physical/bootstrap outputs but could not re-assert their captured \
              modes — they are back at KWin's preferred refresh, not the one they were streaming at"
         );
@@ -544,12 +574,27 @@ const KSCREEN_BUDGET: Duration = Duration::from_secs(5);
 /// `kscreen-doctor <args>` run for its exit status, bounded by [`KSCREEN_BUDGET`]. A timeout reads
 /// as a failed apply — the same best-effort path a rejected argument already takes.
 fn kscreen_ok(args: &[String]) -> bool {
-    crate::proc::status_within(
+    kscreen_verdict(args) == Some(true)
+}
+
+/// The same call, keeping the outcome that [`kscreen_ok`]'s `bool` throws away.
+///
+/// `Some(true)`/`Some(false)`: kscreen-doctor ran to completion and accepted / refused (a helper
+/// that cannot be spawned at all counts as a refusal — there is nothing to wait for and no reason
+/// to retry the next invocation). `None`: it was **killed at [`KSCREEN_BUDGET`]**, which is a
+/// different fact entirely. kscreen-doctor applies the config and then waits on the compositor
+/// before exiting, so a slow-but-working KWin gives us a kill on a request that already landed;
+/// any caller that treats `None` as "it failed" is asserting something it does not know, and for
+/// the restore path that assertion costs a monitor its refresh rate.
+fn kscreen_verdict(args: &[String]) -> Option<bool> {
+    match crate::proc::status_within(
         std::process::Command::new("kscreen-doctor").args(args),
         KSCREEN_BUDGET,
-    )
-    .map(|s| s.success())
-    .unwrap_or(false)
+    ) {
+        Ok(status) => Some(status.success()),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// `kscreen-doctor -j` stdout, bounded by [`KSCREEN_BUDGET`]; `None` on any failure.
@@ -1270,7 +1315,7 @@ pub(crate) fn stream_existing_output(
             }
         })
         .context("spawn KWin monitor-mirror thread")?;
-    let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
+    let node_id = match setup_rx.recv_timeout(OPENER_BUDGET) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
         Err(_) => {
@@ -1454,6 +1499,10 @@ fn run_existing(
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
+    // The opener started its own clock a moment ago; everything this worker spends before
+    // `await_created` comes out of the same 20 s (see [`CREATE_BUDGET`] — this path has two
+    // barriers, which is exactly why the create wait cannot be a fixed 15 s here).
+    let started = Instant::now();
     let conn = Connection::connect_to_env()
         .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
     let mut queue = conn.new_event_queue();
@@ -1527,7 +1576,14 @@ fn run_existing(
         "KWin: recording an existing output; awaiting PipeWire node"
     );
 
-    let node_id = await_created(&conn, &mut queue, &mut state, stop, "stream_output")?;
+    let node_id = await_created(
+        &conn,
+        &mut queue,
+        &mut state,
+        stop,
+        "stream_output",
+        started,
+    )?;
     setup_tx
         .send(Ok(node_id))
         .map_err(|_| anyhow!("monitor-mirror opener went away"))?;
@@ -1546,6 +1602,9 @@ fn run(
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
+    // Same clock as the mirror path: one barrier here rather than two, but the create wait is
+    // bounded against the opener either way (see [`CREATE_BUDGET`]).
+    let started = Instant::now();
     let conn = Connection::connect_to_env()
         .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
     let mut queue = conn.new_event_queue();
@@ -1585,7 +1644,14 @@ fn run(
     );
 
     // Pump events until KWin reports the node id (or an error, or the budget).
-    let node_id = await_created(&conn, &mut queue, &mut state, stop, "stream_virtual_output")?;
+    let node_id = await_created(
+        &conn,
+        &mut queue,
+        &mut state,
+        stop,
+        "stream_virtual_output",
+        started,
+    )?;
     setup_tx
         .send(Ok(node_id))
         .map_err(|_| anyhow!("virtual-output opener went away"))?;
@@ -1608,10 +1674,27 @@ const POLL_MS: i32 = 200;
 /// for [`run`] is the session's own bring-up.
 const ROUNDTRIP_BUDGET: Duration = Duration::from_secs(3);
 
-/// Budget for the `created` handshake (the PipeWire node id). Deliberately under the opener's own
-/// 20 s `recv_timeout` in [`spawn_vout`](VirtualDisplay::create) / [`stream_existing_output`], so
-/// the worker returns a REASON ("KWin never created the output") rather than the opener reporting a
-/// bare timeout with the worker still parked behind it.
+/// How long an opener ([`spawn_vout`](VirtualDisplay::create), [`stream_existing_output`]) waits
+/// for the worker's first word before giving up on it.
+const OPENER_BUDGET: Duration = Duration::from_secs(20);
+
+/// Slack subtracted from [`OPENER_BUDGET`] to get the worker's own ceiling: enough for its error to
+/// travel one `mpsc` send while the opener is still listening.
+const WORKER_MARGIN: Duration = Duration::from_millis(500);
+
+/// Budget for the `created` handshake (the PipeWire node id) — but only as a ceiling, because
+/// what actually matters is that the WORKER gives up before its opener does, so the failure the
+/// client sees is a REASON ("KWin never created the output") rather than a bare timeout with the
+/// worker still parked behind it.
+///
+/// That is a property of the whole worker, not of this one step, and it cannot be had by comparing
+/// this constant with [`OPENER_BUDGET`]: the two workers do a different amount of work before they
+/// get here. [`run`] spends one [`ROUNDTRIP_BUDGET`] barrier, so 3 + 15 < 20 ✓ — but [`run_existing`]
+/// needs TWO (the registry globals, then the `wl_output` property burst that carries the connector
+/// name), so 3 + 3 + 15 = 21 s and the mirror path lost the property that the doc here once claimed
+/// for both. Hence [`await_created`] takes the worker's start instant and bounds itself by whichever
+/// comes first, this budget or the opener's deadline; adding a third barrier to some future worker
+/// cannot silently break it again.
 const CREATE_BUDGET: Duration = Duration::from_secs(15);
 
 /// How a bounded pump ended.
@@ -1727,21 +1810,27 @@ fn park_until_stopped(
     Ok(())
 }
 
-/// Wait for the `created` event carrying the PipeWire node id, bounded by [`CREATE_BUDGET`] and
-/// interruptible by `stop`.
+/// Wait for the `created` event carrying the PipeWire node id, bounded and interruptible by `stop`.
 ///
 /// The loop this replaced was a bare `blocking_dispatch` with no deadline that never read `stop`:
 /// a KWin that acknowledged `stream_virtual_output` and then never answered parked the worker
 /// thread for good, and the opener's `recv_timeout` arm — which did not set `stop` either — left it
 /// there holding a half-built output. `request` names the request in the error.
+///
+/// `started` is when the WORKER began, not when this wait did: the bound is the earlier of
+/// [`CREATE_BUDGET`] and the opener's own deadline, so whatever the barriers before us consumed
+/// comes out of this wait rather than out of the opener's patience (see [`CREATE_BUDGET`] for the
+/// arithmetic that made a fixed budget wrong on the mirror path).
 fn await_created(
     conn: &Connection,
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
     stop: &AtomicBool,
     request: &str,
+    started: Instant,
 ) -> Result<u32> {
-    let deadline = Instant::now() + CREATE_BUDGET;
+    let began = Instant::now();
+    let deadline = (began + CREATE_BUDGET).min(started + OPENER_BUDGET - WORKER_MARGIN);
     let settled = |st: &State| st.node_id.is_some() || st.failed.is_some() || st.closed;
     match pump_until(conn, queue, state, Some(deadline), stop, settled)? {
         // Node id first: a `closed` that arrives in the same burst as `created` is a stream that
@@ -1752,8 +1841,12 @@ fn await_created(
             (None, None) => bail!("KWin closed the stream before it was created"),
         },
         Pumped::Stopped => bail!("{request} abandoned — released before KWin created the stream"),
+        // Report the wait we actually got, not the budget we asked for — they differ whenever the
+        // opener's deadline was the tighter of the two, and a message naming 15 s after 11 s is the
+        // kind of thing that sends the next person hunting for a stall that never happened.
         Pumped::Expired => bail!(
-            "KWin acknowledged {request} but never sent the PipeWire node within {CREATE_BUDGET:?}"
+            "KWin acknowledged {request} but never sent the PipeWire node within {:?}",
+            began.elapsed()
         ),
     }
 }

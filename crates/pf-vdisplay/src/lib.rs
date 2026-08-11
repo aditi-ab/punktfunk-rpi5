@@ -689,15 +689,28 @@ pub fn gamescope_composites_cursor() -> bool {
 ///
 /// * the ladder is re-run with `dedicated_launch = false`, since a capability query carries no
 ///   session context — so it cannot see the one input that would move a session from
-///   Managed/Attach to Spawn;
+///   Managed/Attach to Spawn. On a box with no session infrastructure AND a foreign gamescope
+///   running, a `game_session=dedicated` launch really takes rung 3 (`Spawn`) while this re-run
+///   takes rung 5 (`Attach`) and answers "foreign";
 /// * `create_managed_session` can degrade a resolved `Managed` to an ATTACH at create time (a
 ///   mask-fragile DM it may not stop — it then mirrors the box's own game-mode session). That
 ///   happens after this answer is due, and the ladder re-run here still says `Managed`, so such a
 ///   session is still credited with flags it does not own.
 ///
-/// The first fails closed; the second does not. Both close the same way: give these two functions
-/// the session's own [`GamescopeRoute`] (which `SessionContext` already carries) and have the
-/// backend report the degrade — a change to two public signatures and every host call site.
+/// The second over-promises. The first UNDER-promises, and `false` is the deliberate choice for an
+/// input we cannot see, because the two directions do not cost the same: over-promising fixes the
+/// punktfunk/1 Welcome at 10-bit PQ against an 8-bit SDR composite and leaves a stream with **no
+/// pointer at all**, while under-promising costs HDR and draws the pointer twice. But do not read
+/// that as "fails closed": it is not, for the cursor. `gamescope::cursor_args` adds
+/// `--pipewire-composite-cursor` from the BINARY probe alone, ungated by this answer, so on the
+/// bare spawn above gamescope paints the pointer into the node while the host's
+/// `session_plan::gamescope_needs_host_cursor` (`gamescope && !gamescope_composites_cursor()`) also
+/// blends the XFixes pointer on top — two pointers, plus the encoder pushed off its zero-copy arm.
+/// Do not "fix" that by re-running the ladder with a guessed `dedicated_launch = true`: that trades
+/// the mild failure for the severe one on every non-launching session. Both gaps close the same
+/// way, and only that way: give these two functions the session's own [`GamescopeRoute`] (which
+/// `SessionContext` already carries) and have the backend report the degrade — a change to two
+/// public signatures and every host call site, i.e. work outside this crate.
 fn gamescope_ours_and(#[cfg(target_os = "linux")] probe: fn() -> bool) -> bool {
     #[cfg(target_os = "linux")]
     {

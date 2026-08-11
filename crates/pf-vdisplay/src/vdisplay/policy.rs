@@ -327,24 +327,22 @@ impl Default for DisplayPolicy {
 /// sites read, and what the mgmt API echoes as the "currently in force" policy. Pure output of
 /// [`DisplayPolicy::effective`].
 ///
-/// Every field is `#[serde(default)]` for the same reason [`DisplayPolicy`]'s are: this shape is also
-/// *persisted*, inside each entry of the custom-preset catalog, so a document written before an axis
-/// existed (or by a hand edit that dropped one) must still load. Without the defaults a single
-/// missing `max_displays` failed the whole `Vec<CustomPreset>` deserialize and took the operator's
-/// entire catalog with it.
+/// **Every field is required on the wire, deliberately.** Unlike [`DisplayPolicy`] — which is only
+/// ever a *file* — this shape is also the `fields` member of [`CustomPresetInput`], i.e. the request
+/// body of `POST /display/presets` and `PUT /display/presets/{id}`, and a *response* member three
+/// times over (`DisplaySettingsState.effective`, `PresetInfo.fields`, `CustomPreset.fields`).
+/// `#[serde(default)]` here would (a) turn `{"name":"Kiosk","fields":{}}` — or any camelCase typo —
+/// from a serde rejection into a 201 storing a preset that expands to six axes nobody chose, and
+/// (b) make all six OPTIONAL in the generated OpenAPI schema, so every codegen'd client has to
+/// null-check them. The *persisted* catalog's tolerance for an entry written before an axis existed
+/// is bought where it belongs, on the read path only: see [`StoredEffectivePolicy`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EffectivePolicy {
-    #[serde(default)]
     pub keep_alive: KeepAlive,
-    #[serde(default)]
     pub topology: Topology,
-    #[serde(default)]
     pub mode_conflict: ModeConflict,
-    #[serde(default)]
     pub identity: Identity,
-    #[serde(default)]
     pub layout: Layout,
-    #[serde(default = "default_max_displays")]
     pub max_displays: u32,
 }
 
@@ -589,6 +587,27 @@ impl DisplayPolicyStore {
     /// build has never heard of, a hand-typed `"max_displays": "four"`) is dropped and the other
     /// eleven survive. Dropping one axis to its default is a much smaller lie than reverting the
     /// operator's entire configuration.
+    ///
+    /// **Two things the per-axis rule must NOT be applied to**, both discovered after the fact:
+    ///
+    /// * `preset` is not an axis, it is the SELECTOR: [`DisplayPolicy::effective`] branches on it,
+    ///   and its `#[serde(default)]` is `Preset::Custom` — the one value that means "ignore the
+    ///   preset, the explicit fields govern". The console PUTs the whole object, so a document that
+    ///   names a preset also carries the six explicit fields left over from whatever the operator
+    ///   last had. Salvaging an unreadable preset name (a downgrade, a `"gaming_rig"` typo) to
+    ///   `Custom` therefore does not degrade *that* axis — it re-points the entire document at
+    ///   stale data, e.g. quietly running `exclusive` + `forever` + `steal`. A preset name we
+    ///   cannot read means we do not know what the file asks for, so the file is refused whole.
+    /// * a salvage that salvaged *nothing* must not report the host as configured. `configured()`
+    ///   is the "the console has configured this host" gate and `DisplayPolicy::default()` is NOT
+    ///   the unconfigured fallback: `identity::resolve_slot` is passed `Identity::Shared` on both
+    ///   Linux backends and consults it only while `configured_effective()` is `None`, whereas the
+    ///   default policy's `identity` is `PerClient` — so returning `Some(default)` for a document
+    ///   we understood nothing of renames the KWin output and discards KDE's stored per-output
+    ///   config. "Nothing" is judged on the RESULT — a salvage that dropped something and landed
+    ///   bit-for-bit on `DisplayPolicy::default()` taught us nothing — not on a list of surviving
+    ///   keys, since serde ignores unknown members and `version` selects no behaviour, so either
+    ///   could survive a document whose every real axis was thrown away.
     fn parse(path: &std::path::Path, bytes: &[u8]) -> Option<DisplayPolicy> {
         let value: serde_json::Value = match serde_json::from_slice(bytes) {
             Ok(v) => v,
@@ -624,11 +643,28 @@ impl DisplayPolicyStore {
                 // Probe each member on its own: because every field defaults, a one-key document
                 // parses iff that key's value is valid, which localizes the failure with no
                 // hand-maintained field list to drift when an axis is added.
-                obj.retain(|key, member| {
+                let probe = |key: &str, member: &serde_json::Value| -> bool {
                     let one = serde_json::Value::Object(
-                        std::iter::once((key.clone(), member.clone())).collect(),
+                        std::iter::once((key.to_string(), member.clone())).collect(),
                     );
-                    let ok = serde_json::from_value::<DisplayPolicy>(one).is_ok();
+                    serde_json::from_value::<DisplayPolicy>(one).is_ok()
+                };
+                // The selector first, and it is all-or-nothing (see this function's doc): dropping
+                // it to `Custom` would hand governance to the explicit fields the console shipped
+                // alongside it, which is a different policy — not a degraded one.
+                if let Some(preset) = obj.get("preset") {
+                    if !probe("preset", preset) {
+                        tracing::warn!(path = %path.display(), preset = %preset,
+                            "display-settings.json names a preset this host does not know — the \
+                             preset SELECTS the other settings, so falling back to its default \
+                             would silently activate whatever explicit fields the file happens to \
+                             carry; this host is running on BUILT-IN DEFAULTS instead");
+                        return None;
+                    }
+                }
+                let before = obj.len();
+                obj.retain(|key, member| {
+                    let ok = probe(key.as_str(), &*member);
                     if !ok {
                         tracing::warn!(path = %path.display(), field = %key,
                             "display-settings.json carries an unreadable value for this setting — \
@@ -636,8 +672,25 @@ impl DisplayPolicyStore {
                     }
                     ok
                 });
+                let dropped = before - obj.len();
                 match serde_json::from_value::<DisplayPolicy>(serde_json::Value::Object(obj)) {
-                    Ok(p) => Some(p.sanitized()),
+                    // "We threw away every setting you wrote" is not a configured host. The test is
+                    // on the RESULT rather than on a key list, because a surviving key need not be
+                    // an axis at all (serde ignores unknown members, so `{"foo":1,"topology":"…"}`
+                    // would otherwise look like a survivor): if the salvage dropped something and
+                    // what is left is bit-for-bit the built-in default, we learned nothing from the
+                    // file and must say so. See this function's doc for why `Some(default)` is not
+                    // a safe stand-in for `None` — it flips Linux identity Shared → PerClient.
+                    Ok(p) => {
+                        let p = p.sanitized();
+                        if dropped > 0 && p == DisplayPolicy::default() {
+                            tracing::warn!(path = %path.display(),
+                                "display-settings.json had no setting this host could read — this \
+                                 host is running on BUILT-IN DEFAULTS, not on its configured policy");
+                            return None;
+                        }
+                        Some(p)
+                    }
                     Err(e) => {
                         tracing::warn!(path = %path.display(),
                             "display-settings.json unreadable even per-setting ({e}) — this host is \
@@ -695,14 +748,18 @@ impl DisplayPolicyStore {
         if let Some(dir) = self.path.parent() {
             pf_paths::create_private_dir(dir)?;
         }
-        let tmp = unique_tmp_path(&self.path);
-        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&policy)?)?;
-        if let Err(e) = std::fs::rename(&tmp, &self.path) {
-            // The rename is what publishes the write; if it fails the temp file is ours alone
-            // (unique name) and would otherwise sit in the config dir forever.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+        let bytes = serde_json::to_vec_pretty(&policy)?;
+        // Armed BEFORE the write: `write_secret_file` creates+truncates and only then writes, so an
+        // ENOSPC/EIO mid-write returns through `?` with the temp file already on disk. With a fixed
+        // `.json.tmp` that leak was self-limiting (the next attempt overwrote it); with a unique
+        // name every retry would leave one more full copy in a config dir that is, by hypothesis,
+        // already out of space. Nothing in this crate reaps `*.tmp`, and it deliberately must not:
+        // the unique name exists so a SECOND host process can write concurrently, and its in-flight
+        // temp file is indistinguishable from our stale one.
+        let tmp = TmpFile::arm(unique_tmp_path(&self.path));
+        pf_paths::write_secret_file(tmp.path(), &bytes)?;
+        std::fs::rename(tmp.path(), &self.path)?;
+        tmp.published();
         *self.cur.lock().unwrap() = Some(policy);
         Ok(())
     }
@@ -719,6 +776,36 @@ fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.{n}.tmp", std::process::id()));
     path.with_file_name(name)
+}
+
+/// Owns a [`unique_tmp_path`] for the length of one temp-write + rename, deleting it on **every**
+/// early exit — the failed write, the failed rename, and a panic in between. A guard rather than a
+/// cleanup at each `?` because unique names have no self-healing: a fixed `.json.tmp` was
+/// overwritten by the next attempt, whereas a leaked `<name>.<pid>.<n>.tmp` stays forever and the
+/// next attempt mints another one. (What a guard cannot cover: a crash or power loss between write
+/// and rename. That leak needs a reaper, and a reaper cannot safely exist here — see the caller.)
+struct TmpFile(Option<PathBuf>);
+
+impl TmpFile {
+    fn arm(path: PathBuf) -> Self {
+        TmpFile(Some(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("disarmed only by consuming self")
+    }
+    /// The rename succeeded: the path is now the real file (or, if another writer raced us, theirs)
+    /// and must NOT be removed.
+    fn published(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// The process-wide display-policy store (config-dir file), loaded once on first access — the same
@@ -790,6 +877,78 @@ struct CatalogRead {
     lossy: bool,
 }
 
+/// The lenient READ shape of a catalog entry — [`CustomPreset`] with every behaviour axis defaulted.
+///
+/// The tolerance a persisted catalog needs (an entry written before an axis existed, or one a hand
+/// edit dropped a key from, must still load) and the strictness the mgmt API needs (an omitted axis
+/// in a `POST/PUT /display/presets` body is an operator mistake, and all six are required in the
+/// generated OpenAPI response schema) are different contracts. They were briefly satisfied by one
+/// type — `#[serde(default)]` on [`EffectivePolicy`] itself — which silently loosened the request
+/// body: `{"name":"Kiosk","fields":{}}` went from a serde rejection to a 201 storing six axes the
+/// operator never chose. Keep them separate: this mirror is `Deserialize`-only, private, and reached
+/// exclusively from [`parse_catalog`].
+///
+/// It must gain a field whenever [`EffectivePolicy`] does; the `From` below is exhaustive by
+/// construction, so a forgotten axis is a compile error rather than a silently ignored key.
+#[derive(Deserialize)]
+struct StoredEffectivePolicy {
+    #[serde(default)]
+    keep_alive: KeepAlive,
+    #[serde(default)]
+    topology: Topology,
+    #[serde(default)]
+    mode_conflict: ModeConflict,
+    #[serde(default)]
+    identity: Identity,
+    #[serde(default)]
+    layout: Layout,
+    #[serde(default = "default_max_displays")]
+    max_displays: u32,
+}
+
+impl From<StoredEffectivePolicy> for EffectivePolicy {
+    fn from(s: StoredEffectivePolicy) -> Self {
+        let StoredEffectivePolicy {
+            keep_alive,
+            topology,
+            mode_conflict,
+            identity,
+            layout,
+            max_displays,
+        } = s;
+        EffectivePolicy {
+            keep_alive,
+            topology,
+            mode_conflict,
+            identity,
+            layout,
+            max_displays,
+        }
+    }
+}
+
+/// The lenient READ shape of a catalog entry. `id`/`name` stay required — an entry without them is
+/// not a preset, and the entry-wise skip already keeps the rest of the catalog.
+#[derive(Deserialize)]
+struct StoredCustomPreset {
+    id: String,
+    name: String,
+    fields: StoredEffectivePolicy,
+    #[serde(default)]
+    game_session: GameSession,
+}
+
+impl From<StoredCustomPreset> for CustomPreset {
+    fn from(s: StoredCustomPreset) -> Self {
+        CustomPreset {
+            id: s.id,
+            name: s.name,
+            fields: s.fields.into(),
+            game_session: s.game_session,
+        }
+    }
+}
+
 /// Parse the catalog **entry-wise**. Pure (no I/O) so the recovery rules are unit-tested.
 ///
 /// The whole-document `from_slice::<Vec<CustomPreset>>` this replaces made every entry hostage to
@@ -821,8 +980,9 @@ fn parse_catalog(bytes: &[u8]) -> CatalogRead {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<unnamed>")
             .to_string();
-        match serde_json::from_value::<CustomPreset>(entry) {
-            Ok(mut p) => {
+        match serde_json::from_value::<StoredCustomPreset>(entry) {
+            Ok(p) => {
+                let mut p = CustomPreset::from(p);
                 p.fields = sanitize_preset_fields(p.fields);
                 presets.push(p);
             }
@@ -880,12 +1040,13 @@ fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
     if let Some(dir) = path.parent() {
         pf_paths::create_private_dir(dir)?;
     }
-    let tmp = unique_tmp_path(&path);
-    pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(presets)?)?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    let bytes = serde_json::to_vec_pretty(presets)?;
+    // Same guard as `DisplayPolicyStore::set`, for the same reason: a failed `write_secret_file`
+    // returns with the temp file already created, and a unique name never gets reused.
+    let tmp = TmpFile::arm(unique_tmp_path(&path));
+    pf_paths::write_secret_file(tmp.path(), &bytes)?;
+    std::fs::rename(tmp.path(), &path)?;
+    tmp.published();
     Ok(())
 }
 
@@ -1487,5 +1648,105 @@ mod tests {
         assert_eq!(second, preset_id("Same name", 42, 1));
         assert_ne!(first, second);
         assert_eq!(first.len(), 12, "12 hex chars, unchanged id shape");
+    }
+
+    /// The REQUEST contract of `POST/PUT /display/presets`. `EffectivePolicy` is not a file-only
+    /// shape: `#[serde(default)]` on its fields turns `{"fields":{}}` — and every camelCase typo —
+    /// into a 201 that stores six axes the operator never chose, and drops all six from `required`
+    /// in the generated OpenAPI schema. The catalog's leniency lives in `StoredEffectivePolicy`
+    /// instead (see the next test), which is exactly what lets this stay strict.
+    #[test]
+    fn the_wire_shape_of_an_effective_policy_requires_every_axis() {
+        assert!(serde_json::from_str::<EffectivePolicy>("{}").is_err());
+        // The console's own body, minus one axis — an omission is a mistake, not a default.
+        let almost = r#"{ "keep_alive": { "mode": "forever" }, "topology": "exclusive",
+                          "mode_conflict": "steal", "identity": "per-client",
+                          "layout": { "mode": "auto-row", "positions": {} } }"#;
+        assert!(serde_json::from_str::<EffectivePolicy>(almost).is_err());
+        let mut full: serde_json::Value = serde_json::from_str(almost).unwrap();
+        full["max_displays"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<EffectivePolicy>(full).is_ok());
+        // Same strictness through the request body itself.
+        assert!(
+            serde_json::from_str::<CustomPresetInput>(r#"{ "name": "Kiosk", "fields": {} }"#)
+                .is_err()
+        );
+    }
+
+    /// …and the FILE contract, which is the opposite one: a catalog entry written before an axis
+    /// existed still loads, because the read path goes through the lenient private mirror.
+    #[test]
+    fn a_catalog_entry_may_omit_an_axis_even_though_the_wire_shape_may_not() {
+        let doc = br#"[{ "id": "c", "name": "Old", "fields": { "topology": "exclusive" } }]"#;
+        let read = parse_catalog(doc);
+        assert!(!read.lossy, "an omitted axis is not a lost entry");
+        assert_eq!(read.presets.len(), 1);
+        let f = &read.presets[0].fields;
+        assert_eq!(f.topology, Topology::Exclusive);
+        assert_eq!(f.max_displays, default_max_displays(), "not 0");
+        assert_eq!(f.keep_alive, KeepAlive::default());
+    }
+
+    #[test]
+    fn an_unreadable_preset_name_refuses_the_whole_document() {
+        // `preset` SELECTS the other axes, so it is not salvageable per-axis: dropping it to its
+        // `Custom` default would activate the stale explicit fields the console's whole-object PUT
+        // always ships alongside the chosen preset — here `exclusive` + `forever` + `steal`, a
+        // policy nobody selected, on a file whose only unreadable byte was the preset name.
+        let doc = br#"{ "version": 1, "preset": "kiosk",
+                        "keep_alive": { "mode": "forever" }, "topology": "exclusive",
+                        "mode_conflict": "steal", "identity": "per-client",
+                        "layout": { "mode": "auto-row", "positions": {} }, "max_displays": 4 }"#;
+        assert!(
+            DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).is_none(),
+            "a preset name this build cannot read means we do not know what the file asks for"
+        );
+        // A preset name we DO know still salvages its neighbours (the case above must not have
+        // turned the salvage off wholesale).
+        let doc = br#"{ "preset": "hotdesk", "topology": "hologram" }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
+        assert_eq!(p.preset, Preset::Hotdesk);
+        assert_eq!(p.topology, Topology::Auto);
+    }
+
+    #[test]
+    fn a_document_we_understood_nothing_of_is_unconfigured_not_default() {
+        // `configured() == None` is the gate the "host keeps its historical default" contract rests
+        // on, and `DisplayPolicy::default()` is NOT that default: `resolve_slot` is passed
+        // `Identity::Shared` on both Linux backends and only consults it while `configured_effective()`
+        // is `None`, while the default policy's identity is `PerClient` — so `Some(default)` here
+        // renames the KWin output and throws away KDE's stored per-output config.
+        let doc = br#"{ "topology": "hologram", "identity": "perclient" }"#;
+        assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).is_none());
+        // `version` survives its own probe but selects no behaviour, so it cannot make a document
+        // "configured" on its own — nor can a key serde never looked at.
+        let doc = br#"{ "version": 1, "identity": "perclient" }"#;
+        assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).is_none());
+        let doc = br#"{ "note": "mine", "identity": "perclient" }"#;
+        assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).is_none());
+        // One survivor IS a configuration — the salvage still does its job.
+        let doc = br#"{ "identity": "perclient", "max_displays": 2 }"#;
+        let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
+        assert_eq!(p.max_displays, 2);
+        assert_eq!(p.identity, Identity::default());
+    }
+
+    #[test]
+    fn a_temp_file_is_removed_unless_the_rename_published_it() {
+        let dir = std::env::temp_dir().join(format!("pf-disp-tmp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // The write-failed / rename-failed path: every early return must take the temp file with
+        // it, because a unique name is never reused and nothing reaps `*.tmp`.
+        let leaked = unique_tmp_path(&dir.join("display-settings.json"));
+        std::fs::write(&leaked, b"partial").unwrap();
+        drop(TmpFile::arm(leaked.clone()));
+        assert!(!leaked.exists(), "a failed write must not leave {leaked:?}");
+        // The published path: the file is the real one now, and removing it would delete the write.
+        let kept = unique_tmp_path(&dir.join("display-settings.json"));
+        std::fs::write(&kept, b"published").unwrap();
+        TmpFile::arm(kept.clone()).published();
+        assert!(kept.exists());
+        let _ = std::fs::remove_file(&kept);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

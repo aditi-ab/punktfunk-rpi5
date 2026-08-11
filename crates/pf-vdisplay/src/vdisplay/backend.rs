@@ -225,11 +225,14 @@ pub trait VirtualDisplay: Send {
     /// ([`DisplayOwnership::Owned`], keep-alive-able) display? The registry consults this **before**
     /// its keep-alive reuse lookup, so it never hands a kept display of one flavor to a request of
     /// another — specifically a gamescope managed/attach acquire must not reuse a kept **bare-spawn**
-    /// (they share the backend name `"gamescope"`). Overridden by gamescope (`false` unless the
-    /// resolved [`GamescopeRoute`](crate::GamescopeRoute) carried on the instance is `Spawn` — it
-    /// reads `self.route`, NOT env; the sub-mode stopped travelling through
-    /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` in Phase 2.3) and by the mirror backend (`false`
-    /// always). See `design/gamemode-and-dedicated-sessions.md` A1.
+    /// (they share the backend name `"gamescope"`). Overridden by gamescope, which reads the
+    /// resolved [`GamescopeRoute`](crate::GamescopeRoute) carried on the instance (`self.route`, NOT
+    /// env — the sub-mode stopped travelling through `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` in Phase
+    /// 2.3): `false` for `Managed` and `Attach`, `true` for `Spawn` **and for no route at all**,
+    /// since `create`'s own `None` arm falls through to the bare spawn — so an instance nobody
+    /// called `set_gamescope_route` on (the operator-pinned `PUNKTFUNK_COMPOSITOR` path) is
+    /// poolable, and takes both the reuse lookup and the `max_displays` ceiling. Also overridden by
+    /// the mirror backend (`false` always). See `design/gamemode-and-dedicated-sessions.md` A1.
     ///
     /// The default `true` is a DEFAULT, not a fact: it happens to be right for every backend that
     /// creates a display it owns, and it is wrong for any backend whose `create` reports something

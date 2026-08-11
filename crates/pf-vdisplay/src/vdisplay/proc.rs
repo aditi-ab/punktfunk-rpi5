@@ -12,15 +12,44 @@
 //! take their existing failure path instead of hanging.
 //!
 //! What the budget bounds is the whole **process tree**, not just the process we spawned — see
-//! [`tree`] for why that distinction is the entire difference on Windows.
+//! [`tree`] for why that distinction is the entire difference on Windows, and for the one Unix
+//! case (a unit the *user manager* forks for us) that even a process group cannot reach.
 
-use std::io::{Error, ErrorKind, Result};
+// `Read` is in scope for `Take::read_to_end` below — a `Take<R>` is a concrete type, so the
+// generic bound alone does not bring the trait's methods with it.
+use std::io::{Error, ErrorKind, Read, Result};
 use std::process::{Command, ExitStatus, Output};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// Poll interval while waiting for a child to exit. Short enough that a fast helper (the normal
 /// case — `kscreen-doctor` answers in tens of ms) isn't measurably delayed.
 const POLL: Duration = Duration::from_millis(20);
+
+/// Ceiling on how long [`output_within`] waits for its two reader threads once the child **and the
+/// process group under it** are dead.
+///
+/// This is not a working budget — with every write end we can reach closed, the readers hit EOF
+/// within a scheduler slice — it is the bound on the one case we cannot reach. [`tree`] ends a
+/// *group*, so a descendant that deliberately left it keeps the write end open: `systemd-run
+/// --pipe` (the gamescope bind probe) hands our pipes to a transient unit the **user manager**
+/// forks, in its own group and session, and `killpg` by construction cannot touch it. Waiting on
+/// that reader would pin the caller — on the host, the session's stream thread — for as long as
+/// the unit lives, which is exactly the unbounded wait this module exists to prevent. So the
+/// *call* is bounded here and the reader thread, not the call, is what gets left behind. The
+/// price, paid only in that case, is that a call can return up to this much after its own budget —
+/// still a bound, which an unreachable EOF is not.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Ceiling on what one drained pipe may buffer.
+///
+/// `read_to_end` is unbounded in memory, and a reader thread that outlived its call (see
+/// [`DRAIN_GRACE`]) has nobody left to stop it — the cap is what keeps such a thread finite in
+/// both memory and lifetime, and closing its read end is also what finally gives the escaped
+/// writer an EPIPE. 16 MiB is an order of magnitude above the largest `pw-dump` a populated
+/// PipeWire graph produces, so hitting it means a helper that ran away rather than one that was
+/// busy; it is logged instead of being returned as quietly short output.
+const DRAIN_CAP: u64 = 16 * 1024 * 1024;
 
 /// Run `cmd` to completion, killing it if it outlives `budget`.
 ///
@@ -77,7 +106,9 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
             Some(status) => {
                 // The helper is gone, but a grandchild it left behind still holds the pipes' WRITE
                 // ends, so the readers below would wait for an EOF that never arrives. Ending the
-                // tree closes them — this is what makes the joins bounded.
+                // tree closes them for every descendant that stayed in the group — which is all of
+                // them for a direct exec, but NOT for one that left it (see [`DRAIN_GRACE`]), so
+                // the collection below is bounded rather than a plain join.
                 tree.terminate();
                 break status;
             }
@@ -85,14 +116,38 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
                 tree.terminate();
                 let _ = child.kill();
                 let _ = child.wait(); // reap it — never leave a zombie behind
+
+                // Reap the READERS too. This arm used to just drop their handles, i.e. detach two
+                // threads still blocked in `read_to_end` and still owning the pipes' read ends —
+                // so a writer that escaped the group (a `systemd-run --pipe` unit) never even got
+                // the EPIPE the pre-drain implementation gave it by closing those fds with the
+                // `Child`. Joining unconditionally instead would be worse: it would hand the
+                // escaped writer the caller's thread, forever, which is the failure this whole
+                // module exists to prevent. So: a bounded collection, and an honest log when one
+                // of them cannot be reclaimed.
+                let until = Instant::now() + DRAIN_GRACE;
+                let (out, err) = (collect(&out_rx, until), collect(&err_rx, until));
+                if out.is_none() || err.is_none() {
+                    stuck_reader(cmd, "killed at its budget");
+                }
                 return Err(timed_out(cmd, budget));
             }
             None => std::thread::sleep(POLL),
         }
     };
-    // A panicking reader thread cannot lose the call, only its half of the output.
-    let stdout = out_rx.join().unwrap_or_default();
-    let stderr = err_rx.join().unwrap_or_default();
+    // Both halves of the output, or none: a caller parsing half a `pw-dump` is a caller being lied
+    // to, and its failure path is the one it already has for a helper that did not answer.
+    let until = Instant::now() + DRAIN_GRACE;
+    let (Some(stdout), Some(stderr)) = (collect(&out_rx, until), collect(&err_rx, until)) else {
+        stuck_reader(cmd, "exited");
+        let program = cmd.get_program().to_string_lossy().to_string();
+        return Err(Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "`{program}` exited but its output could not be drained within {DRAIN_GRACE:?}"
+            ),
+        ));
+    };
     Ok(Output {
         status,
         stdout,
@@ -100,17 +155,56 @@ pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Outpu
     })
 }
 
-/// Read one of a child's pipes to EOF on its own thread, so the child never blocks in `write()`
-/// waiting for us to catch up. Returns whatever was read; a read error yields the partial buffer,
+/// Read one of a child's pipes on its own thread, so the child never blocks in `write()` waiting
+/// for us to catch up, and hand the result back over a channel — not a `JoinHandle`, because the
+/// caller must be able to give up on a reader it cannot unblock (see [`DRAIN_GRACE`]) and a
+/// `join` offers no way to. Returns whatever was read; a read error yields the partial buffer,
 /// because the caller's failure signal is the budget, not a short pipe.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut r) = pipe {
+        if let Some(r) = pipe {
+            let mut r = r.take(DRAIN_CAP);
             let _ = r.read_to_end(&mut buf);
+            if buf.len() as u64 >= DRAIN_CAP {
+                tracing::warn!(
+                    cap_bytes = DRAIN_CAP,
+                    "a helper outran the drain cap — its output is truncated here, which the \
+                     caller sees as an unparseable answer (i.e. a failed query)"
+                );
+            }
         }
-        buf
-    })
+        // The receiver is gone whenever the call has already returned — a timeout, or a grace that
+        // ran out. That is the only way this send fails, and it is a case we chose.
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Take one drained pipe, waiting no longer than `until`. `None` means the reader is still parked
+/// on a write end nothing we can signal is holding open.
+fn collect(rx: &Receiver<Vec<u8>>, until: Instant) -> Option<Vec<u8>> {
+    match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(buf) => Some(buf),
+        // The reader panicked: that loses its half of the output, never the call.
+        Err(RecvTimeoutError::Disconnected) => Some(Vec::new()),
+        Err(RecvTimeoutError::Timeout) => None,
+    }
+}
+
+/// Say plainly what a stuck reader costs, because the thread is genuinely leaked and there is no
+/// portable way to unblock a thread already inside `read()` on a pipe (a `dup2` over the fd does
+/// not re-target a read in flight, and closing it under the thread is a use-after-free waiting for
+/// an fd number to be reused). It ends when the escaped writer closes or [`DRAIN_CAP`] is reached.
+fn stuck_reader(cmd: &Command, what: &str) {
+    tracing::warn!(
+        program = %cmd.get_program().to_string_lossy(),
+        grace_ms = DRAIN_GRACE.as_millis() as u64,
+        "helper {what} but its pipes never reached EOF — something it started is outside our \
+         process group and still holds the write end (`systemd-run --pipe` is the known case). \
+         The call is bounded; the reader thread is detached until that writer closes."
+    );
 }
 
 fn timed_out(cmd: &Command, budget: Duration) -> Error {
@@ -213,11 +307,10 @@ fn undecorate(name: &str) -> &str {
 /// Ending the *tree* the helper started, not just the process we spawned.
 ///
 /// [`std::process::Child::kill`] is one `TerminateProcess` / one `SIGKILL`: it ends exactly the
-/// process we launched. On Unix that is the whole story here — `kscreen-doctor`, `systemctl`,
-/// `pw-dump` and friends are single processes we exec directly, and none of them forks a worker
-/// that outlives it.
+/// process we launched. That is never the whole story — see the Unix twin below for why it is not
+/// enough there either — but Windows is where it fails hardest.
 ///
-/// On Windows it is not, because there is no direct exec: every helper is reached through a shell
+/// On Windows there is no direct exec: every helper is reached through a shell
 /// (`cmd /c …`, `powershell -Command "… | pnputil …"`), so the process that actually hangs is a
 /// **grandchild**. Killing the shell leaves it running — holding the stdio handles and the working
 /// directory it inherited from us — and a budget that leaves that behind has not bounded anything.
@@ -332,16 +425,24 @@ mod tree {
 /// The Unix half — a **process group**, which is what Unix offers in place of a Job object.
 ///
 /// This used to be an empty stub whose doc said `Child::kill` "already ends the only process there
-/// is". That was never true of this crate's Linux helpers, which are the ones the module header is
-/// about: `pkexec`, `systemd-run`, `systemctl --user` and the `sh -c` wrappers all fork, so the
-/// process that hangs is routinely a grandchild `Child::kill` cannot reach — and with the reader
-/// threads in [`output_within`] blocking until every write end of the pipe closes, a surviving
-/// grandchild is exactly what would keep a "bounded" call waiting forever.
+/// is". Most Linux helpers here really are a single exec — `kscreen-doctor`, `pw-dump`, `hyprctl`,
+/// `swaymsg` — but not all of them: `systemd-run --user` and `systemctl --user` do their work
+/// through the user manager, which forks the actual process, so what hangs is routinely something
+/// `Child::kill` cannot reach. With the reader threads in [`output_within`] waiting until every
+/// write end of a pipe closes, one surviving relative is all it takes to keep a "bounded" call
+/// going, which is why the group exists here too.
 ///
 /// [`prepare`] puts the child in a new process group (it becomes the leader, so the group id is its
 /// pid) and [`Guard::terminate`] `killpg`s that group, reaching every descendant that has not
 /// deliberately left it. `process_group` changes only the group — not the session — so the helper
-/// keeps its controlling terminal and login session, which `pkexec`'s polkit session lookup needs.
+/// keeps its controlling terminal and login session, which anything doing a logind/polkit session
+/// lookup depends on. Note the limit that follows from this and is NOT closed here: a process the
+/// **user manager** forks on our behalf (`systemd-run --pipe`, whose transient unit inherits our
+/// pipe write ends) is in another group and session by construction, so `killpg` misses it — see
+/// [`DRAIN_GRACE`] for how the reader side is bounded in spite of that. The crate's one privileged
+/// path, `pkexec` for the DM helper, deliberately does not come through this module at all: it
+/// calls `Command::output()` directly and is documented as unbounded, because a `stop`/`restore`
+/// verb legitimately takes seconds and killing it mid-flight is worse than waiting.
 ///
 /// Best-effort in the same way as the Windows half: a failed `killpg` is ignored, and the
 /// single-process `Child::kill` on the timeout path still runs.
@@ -419,6 +520,25 @@ mod tests {
         assert!(out.status.success(), "helper failed: {:?}", out.status);
         assert_eq!(out.stdout.len(), BYTES, "stdout was truncated");
         assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
+    }
+
+    /// A helper that exits while a background child of its own still holds the pipe must not park
+    /// the caller: the reader waits for EOF on ALL write ends, so the grandchild's copy is what
+    /// would keep it there. Ending the process group is what closes it — and the collection is
+    /// bounded ([`DRAIN_GRACE`]) so that even the one relative a `killpg` cannot reach (a unit the
+    /// user manager forked for us) costs a detached thread rather than the calling thread.
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_park_the_caller() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 & echo punktfunk");
+        let out = output_within(&mut cmd, Duration::from_secs(10)).expect("the helper exited");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "punktfunk");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the call waited on the grandchild's EOF (took {:?})",
+            started.elapsed()
+        );
     }
 
     /// The normal path is unaffected: a quick command still yields its status and its output.

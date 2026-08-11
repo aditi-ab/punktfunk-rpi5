@@ -113,7 +113,17 @@ pub fn acquire(
     // created with), so emitting again double-counted it — and, since the pool emits exactly one
     // `Released` when it finally goes away, left a phantom display in the console's live view for
     // the rest of the host's life. `reused_gen` is the pool's own answer to "did this already
-    // exist"; every non-pooling platform creates on every acquire.
+    // exist" — and Linux is the only backend that HAS one.
+    //
+    // The non-Linux arm is therefore not a claim that nothing was reused, it is the absence of a
+    // signal, and on Windows that gap is live: the manager keeps `Lingering`/`Pinned` monitors and
+    // has an explicit JOIN branch that refcounts an already-`Active` one (`windows/manager.rs`,
+    // "Active falls through to the JOIN path below (refcount++, no ADD)"), so `vd.create` returns
+    // `Ok` for a monitor that already existed and the console is told `Created` again — the very
+    // double-count this fixed for Linux. Its mirror image is the linger expiry, which emits no
+    // `Released` at all (see the note in `release`). Closing it needs the manager to report its
+    // acquire outcome, not another `cfg` here; that is the work, and until it is done this arm
+    // over-reports rather than being right by construction.
     #[cfg(target_os = "linux")]
     let created = matches!(&out, Ok(o) if o.reused_gen.is_none());
     #[cfg(not(target_os = "linux"))]
@@ -243,6 +253,17 @@ pub fn invalidate_backend(backend: &str) {
 #[cfg(target_os = "linux")]
 pub(crate) fn live_identity_slots() -> std::collections::BTreeSet<u32> {
     linux::live_identity_slots()
+}
+
+/// How many displays the Linux pool is holding — live AND kept — for [`admission`](crate::admission)'s
+/// `max_displays` ceiling, which is the Linux counterpart of the Windows manager's slot count.
+///
+/// Deliberately counts kept/lingering entries too: a kept display still owns a real compositor
+/// output on the desktop, so it consumes the operator's budget exactly like a streaming one, and
+/// this is the same rule `manager::snapshot().len()` applies on Windows.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_display_count() -> u32 {
+    linux::live_display_count()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -395,19 +416,6 @@ mod pool {
     /// game-exit path + `mark_failed`, not the epoch.
     pub(super) fn epoch_matches(backend: &str, entry_epoch: u64, cur_epoch: u64) -> bool {
         backend == "gamescope" || entry_epoch == cur_epoch
-    }
-
-    /// Is the pool already at the host's `max_displays` budget, so this acquire must NOT create
-    /// another display (design §5.3 / `windows-parallel-virtual-displays.md` §2.5 — fail closed)?
-    ///
-    /// Counts KEPT entries as well as Active ones, exactly as the Windows admission budget counts the
-    /// manager's lingering/pinned slots: a kept display is a real compositor output holding real
-    /// resources, and the operator's ceiling is a ceiling on displays, not on sessions. The display
-    /// this acquire SUPERSEDES doesn't count — its replacement takes its place, so a mid-stream mode
-    /// switch at the budget must not be refused.
-    pub(super) fn at_display_budget(entries: &[Entry], supersedes: Option<u64>, max: u32) -> bool {
-        let n = entries.iter().filter(|e| Some(e.gen) != supersedes).count();
-        n as u64 >= max as u64
     }
 
     /// Remove entries whose linger deadline has passed, returning them so the caller drops (tears
@@ -747,28 +755,6 @@ mod pool {
             assert!(in_group("kwin", 3, "kwin", 2, Some(1)));
         }
 
-        #[test]
-        fn the_display_budget_counts_kept_entries_but_not_the_superseded_one() {
-            let pool = vec![
-                test_entry("kwin", 1, None),
-                test_entry("kwin", 2, None),
-                test_entry("kwin", 3, None),
-            ];
-            assert!(
-                !at_display_budget(&pool, None, 4),
-                "3 < 4 → room for one more"
-            );
-            assert!(at_display_budget(&pool, None, 3), "3 >= 3 → at the ceiling");
-            // A mid-stream mode switch replaces gen 2 rather than adding, so it still fits.
-            assert!(!at_display_budget(&pool, Some(2), 3));
-            // …but only for an entry that is actually in the pool.
-            assert!(at_display_budget(&pool, Some(99), 3));
-            assert!(
-                at_display_budget(&[], None, 0),
-                "a zero budget admits nothing"
-            );
-        }
-
         fn row(gen: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
                 gen,
@@ -966,8 +952,8 @@ mod linux {
     use anyhow::Result;
 
     use super::pool::{
-        assemble_displays, assign_group_ids, at_display_budget, effective_linger, epoch_matches,
-        group_key, hand_off_restore, in_group, position_for_new, take_expired, Entry, Restore, Row,
+        assemble_displays, assign_group_ids, effective_linger, epoch_matches, group_key,
+        hand_off_restore, in_group, position_for_new, take_expired, Entry, Restore, Row,
     };
     use super::DisplayInfo;
     use crate::lifecycle::{self, Release};
@@ -1008,6 +994,14 @@ mod linux {
         };
         let es = r.entries.lock().unwrap();
         es.iter().filter_map(|e| e.identity_slot).collect()
+    }
+
+    /// Pool size (live + kept) for the admission ceiling. `0` before the first acquire, when the
+    /// registry has not been initialised at all.
+    pub(super) fn live_display_count() -> u32 {
+        REG.get()
+            .map(|r| r.entries.lock().unwrap().len() as u32)
+            .unwrap_or(0)
     }
 
     /// The linger resolution for Linux: the console policy's `keep_alive` when configured, else
@@ -1223,30 +1217,14 @@ mod linux {
         // and monotonic, never an index).
         let gen = r.gen.fetch_add(1, Ordering::Relaxed);
 
-        // The operator's `max_displays` ceiling (design §5.3). Windows enforces it twice — in
-        // admission and in the manager — while the Linux pool had NO ceiling at all: because the
-        // reuse key includes the client-supplied mode, a client that reconnects at a different
-        // resolution misses reuse and mints a fresh display, so a handful of reconnects could row
-        // out an unbounded number of KWin outputs across the desktop. Refuse here, at the one place
-        // a Linux display is created, and fail closed: a display we are not allowed to create is an
-        // honest error to the connecting session, never a silent 17th monitor.
-        //
-        // Gated on `poolable_now()` for the same reason the reuse lookup is: a gamescope
-        // attach/managed acquire produces a display the registry does not own and never counts, so
-        // it must not be refused against a ceiling it does not consume either.
-        let max = policy::prefs().get().effective().max_displays;
-        let budget_used = if vd.poolable_now() {
-            let es = r.entries.lock().unwrap();
-            at_display_budget(es.as_slice(), supersedes, max).then(|| es.len())
-        } else {
-            None
-        };
-        if let Some(used) = budget_used {
-            anyhow::bail!(
-                "host display budget exhausted: {used} display(s) live/kept, max_displays = {max}"
-            );
-        }
-
+        // NOTE: the operator's `max_displays` ceiling is NOT enforced here. It belongs at
+        // admission (`admission::admit`), which is where Windows has always applied it, and the
+        // difference is not cosmetic: `admit` runs ONCE per connecting session, while `acquire` runs
+        // again on every mid-stream rebuild. A ceiling applied here refuses the create-before-drop
+        // rebuilds — capture loss, a Game↔Desktop switch — because the session being rebuilt still
+        // holds its old lease and so counts itself against the budget. Only the mode-switch path
+        // passes `supersedes`; the other two pass `None`, so at `max_displays = 1` a single
+        // streaming client could never recover from a capture loss. See `admission::admit`.
         // Tell the backend whether it's the FIRST display of its group (no live sibling in the same
         // §6.1 group) — so a topology-establishing backend (Mutter exclusive) extends into an
         // already-exclusive desktop rather than re-clobbering the first session's virtual.

@@ -177,8 +177,26 @@ pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) 
 /// prevent, arrived at from the other side. The temp file goes in the SAME directory because a
 /// rename is only atomic within one filesystem, and it inherits the original's permission bits so
 /// an operator's 0600 config does not come back at the umask default.
+///
+/// A **symlinked** config is followed first, and that is not a nicety: `fs::write` opens the path
+/// and therefore writes through the link, while `rename(2)` replaces the link itself. Individual
+/// files under `~/.config` are symlinks into a dotfiles repo on every stow / chezmoi / home-manager
+/// setup, so renaming over `~/.config/hypr/xdph.conf` would detach the user's repo — their next
+/// `stow` reports a conflict or quietly reverts our key, and the connect after that writes it
+/// again, forever. Following the link keeps this write byte-for-byte equivalent to the `fs::write`
+/// it replaced, atomicity aside; it also makes the permission copy below sample the file the
+/// rename actually lands on rather than one it was about to orphan.
+///
+/// The case this deliberately does NOT paper over: a link into a read-only target (home-manager
+/// pointing at `/nix/store`). Following it fails the write, and the caller fails the connect with
+/// the store path in the error — exactly as the pre-atomic `fs::write` did. Renaming over the link
+/// instead would "work" by quietly detaching a declaratively managed file, which the user's next
+/// `home-manager switch` refuses or reverts; a nix-managed config has to gain our key in the
+/// user's flake, and a legible error is the only thing that tells them so.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    let resolved = follow_link(path);
+    let path = resolved.as_path();
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()
@@ -208,6 +226,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     r
+}
+
+/// `path` with a symlink chain followed to the file it names, or `path` itself when it is not a
+/// link (including when it does not exist yet — the ordinary first-connect case).
+///
+/// `symlink_metadata` rather than `metadata`, because the question is what `path` IS, not what it
+/// points at. A **dangling** link is resolved by hand from its target text: `canonicalize` refuses
+/// a target that does not exist, but `fs::write` through such a link creates it, and this write
+/// stands in for that one.
+fn follow_link(path: &Path) -> std::path::PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => std::fs::canonicalize(path)
+            .or_else(|_| {
+                std::fs::read_link(path).map(|target| {
+                    if target.is_absolute() {
+                        target
+                    } else {
+                        // A relative link is relative to the DIRECTORY holding it.
+                        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                    }
+                })
+            })
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -471,5 +514,79 @@ mod io_tests {
         assert!(std::fs::read_to_string(&p)
             .expect("edited")
             .contains("keep=me"));
+    }
+
+    /// A user who manages dotfiles (stow, chezmoi, home-manager) has `~/.config/hypr/xdph.conf` as
+    /// a SYMLINK into their repo. The edit has to land in the repo file with the link intact:
+    /// `fs::write` followed the link, the temp-file + `rename` that replaced it does not, and a
+    /// detached link is a config the user's tooling then fights us over on every connect.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_edited_through_the_link() {
+        let s = Scratch::new("symlink");
+        let repo = s.path("dotfiles");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let real = repo.join("xdph.conf");
+        std::fs::write(
+            &real,
+            "screencopy {\n    allow_token_by_default = true\n}\n",
+        )
+        .expect("seed");
+        let link = s.path("xdph.conf");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(ensure_key(
+            &link,
+            Block::Hyprlang("screencopy"),
+            "custom_picker_binary",
+            "/run/user/1000/shim.sh",
+        )
+        .expect("write"));
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "the dotfiles link was replaced by a detached regular file"
+        );
+        let target = std::fs::read_to_string(&real).expect("the repo file");
+        assert!(
+            target.contains("custom_picker_binary = /run/user/1000/shim.sh"),
+            "the edit never reached the repo file: {target}"
+        );
+        assert!(
+            target.contains("allow_token_by_default = true"),
+            "the user's own keys survived"
+        );
+    }
+
+    /// The link may point at a file that does not exist yet (a repo checkout that has not been
+    /// populated). `fs::write` created the target through it, so this must too — replacing the
+    /// link would again detach it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_written_through_to_its_target() {
+        let s = Scratch::new("dangling");
+        let repo = s.path("dotfiles");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let real = repo.join("config");
+        let link = s.path("config");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(
+            ensure_key(&link, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("write")
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced instead of written through"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("target created"),
+            "[screencast]\nchooser_cmd=cat x\n"
+        );
     }
 }
