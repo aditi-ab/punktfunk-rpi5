@@ -21,6 +21,11 @@
 #                   workflow_dispatch, the rust-ci container, the same cache pattern) and because
 #                   ci.yml runs on every push against a fleet where 37 of 46 jobs contend for
 #                   ubuntu-24.04. See the `miri:` job below for what it does and does not buy.
+#   * c-abi-asan  → NON-BLOCKING ASAN+LSAN run of the C ABI harness (tests/c/run.sh under
+#                   PF_SAN=address): both sides of the abi.rs boundary instrumented at once, and
+#                   the only automated check on its Box::into_raw/from_raw leak contract. Same
+#                   here-not-ci.yml reasoning as miri — plus -Zbuild-std defeats sccache, so it
+#                   must not ride the per-push leg.
 # Triggers: weekly (catch newly-disclosed CVEs in pinned deps), on every lockfile/allowlist
 # change, and on demand.
 # To silence a known-unfixable Rust advisory, add it to `.cargo/audit.toml` ([advisories] ignore=[…]).
@@ -364,3 +369,80 @@ jobs:
             -p punktfunk-core --lib -- fec::gf8 2>&1 | tee /tmp/miri-gf8.log || ok=0
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/miri-gf8.log || ok=0
           [ "$ok" = 1 ] || echo "::warning::miri (punktfunk-core fec::gf8, AVX2/SSSE3) did not pass — non-blocking; see design/rust-safety-programme.md §7"
+
+  # ASAN + LSAN over the C ABI harness — §6.1 of design/rust-safety-programme.md, its rank-1
+  # tooling item. crates/punktfunk-core/tests/c/run.sh already proves the staticlib links and
+  # round-trips 4 frames byte-exact from C on every push (ci.yml); PF_SAN=address rebuilds BOTH
+  # sides instrumented — the staticlib on nightly with -Zsanitizer/-Zbuild-std (std itself
+  # included), the harness with clang -fsanitize — so ASAN sees the seam a Rust-only tool cannot,
+  # and LSAN (detect_leaks=1, the script's default) becomes the one automated check on abi.rs's
+  # Box::into_raw/from_raw leak contract.
+  # Proven to fail on 192.168.1.25: deleting a single punktfunk_session_free() from harness.c
+  # makes LSAN report the ~308 Rust-side allocations behind the handle and run.sh exit 1.
+  # What it does NOT see: the invalid-InputKind-discriminant UB at abi.rs (that needs the
+  # validator, tracked in §5 of the programme doc), and nothing GPU/Windows — this is the
+  # default-feature (quic-less, opus-less) core only.
+  c-abi-asan:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    env:
+      # The SAME dated pin as the miri job above, deliberately — one nightly date to bump for
+      # both jobs (they have no toolchain interaction; sharing the date just halves the chores).
+      SAN_TOOLCHAIN: nightly-2026-08-10
+      # Same guard as the miri job: audit.yml sets no sccache today, and -Zbuild-std could not
+      # use it anyway. Keeps a future workflow-level sccache from becoming a puzzle.
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # Own `san-` key prefixes — never shared with the miri caches, per the cache-poisoning
+      # note there (and so an incomplete save from one job can never starve the other).
+      - name: cache the nightly toolchain
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/rustup/toolchains/${{ env.SAN_TOOLCHAIN }}-x86_64-unknown-linux-gnu
+          key: san-toolchain-v1-${{ env.SAN_TOOLCHAIN }}
+      - name: cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo/registry
+          key: san-registry-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: san-registry-v1-
+
+      # rust-src is required: -Zbuild-std compiles std from source so it is instrumented too —
+      # without that, LSAN cannot attribute allocations made inside std (Vec, Box, HashMap).
+      - name: install the pinned nightly + rust-src
+        run: |
+          git config --global --add safe.directory "$PWD"
+          rustup toolchain install "$SAN_TOOLCHAIN" --profile minimal --component rust-src
+          echo "root pin, untouched by this job: $(grep -E '^channel' rust-toolchain.toml)"
+          cargo +"$SAN_TOOLCHAIN" --version
+
+      # The image installs clang but Ubuntu does not always pull the compiler-rt sanitizer
+      # runtime with it (verified absent on a stock 26.04 box). Probe with an actual ASAN link
+      # and self-heal via apt if it fails — container jobs on this fleet run as root (the
+      # bun-audit job's apt-get above relies on the same fact).
+      - name: ensure clang's ASAN runtime
+        run: |
+          if ! echo 'int main(void){return 0;}' | clang -fsanitize=address -x c - -o /tmp/asan-probe 2>/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+            echo 'int main(void){return 0;}' | clang -fsanitize=address -x c - -o /tmp/asan-probe
+          fi
+
+      # run.sh handles everything behind PF_SAN (nightly build, target path, clang flags,
+      # ASAN_OPTIONS=detect_leaks=1) and exits non-zero on any report. The grep is the
+      # proved-it-ran guard, same reasoning as the miri steps: a script change that silently
+      # skips the harness must not read as green. run.sh expects bash and PATH cargo — both true
+      # in this container. PF_SAN_TOOLCHAIN pins the script's `cargo +<toolchain>` to the dated
+      # nightly installed above — without it the script would ask for the ROLLING `nightly`
+      # channel, which this job deliberately does not install.
+      - name: C ABI harness under ASAN+LSAN
+        run: |
+          set -o pipefail
+          ok=1
+          PF_SAN=address PF_SAN_TOOLCHAIN="$SAN_TOOLCHAIN" \
+            bash crates/punktfunk-core/tests/c/run.sh 2>&1 | tee /tmp/asan-harness.log || ok=0
+          grep -q 'PASS: 4 frames round-tripped byte-exact' /tmp/asan-harness.log || ok=0
+          [ "$ok" = 1 ] || echo "::warning::c-abi-asan did not pass — non-blocking on day one; see design/rust-safety-programme.md §6.1. An LSAN report here means the abi.rs into_raw/from_raw contract broke."

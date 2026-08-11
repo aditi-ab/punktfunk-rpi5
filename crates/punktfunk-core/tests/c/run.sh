@@ -22,7 +22,8 @@ target_args=""
 target_sub=""
 if [ -n "$san" ]; then
     san_target="x86_64-unknown-linux-gnu"
-    toolchain="+nightly"
+    # -Zsanitizer/-Zbuild-std need a nightly; PF_SAN_TOOLCHAIN pins a dated one (CI does).
+    toolchain="+${PF_SAN_TOOLCHAIN:-nightly}"
     target_args="-Z build-std --target $san_target"
     target_sub="$san_target/"
     export RUSTFLAGS="-Zsanitizer=$san${RUSTFLAGS:+ $RUSTFLAGS}"
