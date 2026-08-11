@@ -904,15 +904,12 @@ unsafe extern "system" fn destroy_surface(
     if let Ok(mut m) = surface_hwnds().lock() {
         m.remove(&surface.as_raw());
     }
-    let down = instances()
-        .lock()
-        .ok()
+    let down = instances().lock().ok().and_then(|g| {
         // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle — a
         // dispatchable object whose first word is the dispatch key.
-        .and_then(|g| {
-            g.get(&unsafe { key(inst.as_raw()) })
-                .and_then(|d| d.destroy_surface)
-        });
+        g.get(&unsafe { key(inst.as_raw()) })
+            .and_then(|d| d.destroy_surface)
+    });
     if let Some(f) = down {
         // SAFETY: `f` is the down-chain vkDestroySurfaceKHR resolved for this instance at
         // create time; forwarding the caller's own arguments unchanged.

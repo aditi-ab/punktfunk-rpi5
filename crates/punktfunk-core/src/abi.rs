@@ -59,6 +59,9 @@ use std::ptr;
 /// for. The slots behind these mutexes are plain last-value caches (frame/audio/cursor/clip), so
 /// whatever a poisoned writer left behind is still structurally valid data to overwrite or hand
 /// out; recovering the guard is strictly better than aborting the embedding application.
+/// (`quic`-gated with its only callers, the `punktfunk_connection_*` entry points — a
+/// `default-features = false` consumer like the tray would otherwise see dead code.)
+#[cfg(feature = "quic")]
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
