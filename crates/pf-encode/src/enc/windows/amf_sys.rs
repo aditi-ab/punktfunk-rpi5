@@ -439,6 +439,14 @@ pub struct AmfBufferVtbl {
 /// always `index * SLOT`.
 const SLOT: usize = core::mem::size_of::<Slot>();
 
+/// Byte offset of vtable slot `i`. A `const fn` rather than a bare `i * SLOT` expression because
+/// clippy's `erasing_op`/`identity_op` reject `0 * SLOT` and `1 * SLOT` under the `-D warnings`
+/// the Windows CI leg runs with — and writing those two as bare `0` and `SLOT` would be the one
+/// place the slot INDEX stops being visible, which is the entire readability of these assertions.
+const fn slot(i: usize) -> usize {
+    i * SLOT
+}
+
 // Every slot is a plain code pointer, so all five tables are pointer-sized-array-shaped. If this
 // ever fails, the tables are not flat arrays any more and every offset below is meaningless.
 const _: () = assert!(SLOT == core::mem::size_of::<usize>());
@@ -458,43 +466,43 @@ const _: () = assert!(core::mem::offset_of!(AmfHdrMetadata, max_mastering_lumina
 const _: () = assert!(core::mem::offset_of!(AmfHdrMetadata, max_content_light_level) == 24);
 
 // -- AMFFactory (7 slots) — `create_context` 0, `create_component` 1 --
-const _: () = assert!(core::mem::size_of::<AmfFactoryVtbl>() == 7 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_context) == 0 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_component) == 1 * SLOT);
+const _: () = assert!(core::mem::size_of::<AmfFactoryVtbl>() == slot(7));
+const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_context) == slot(0));
+const _: () = assert!(core::mem::offset_of!(AmfFactoryVtbl, create_component) == slot(1));
 
 // -- AMFContext (55 slots) = AMFInterface(3) + AMFPropertyStorage(10) + AMFContext(42) --
-const _: () = assert!(core::mem::size_of::<AmfContextVtbl>() == 55 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, release) == 1 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, terminate) == 13 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, init_dx11) == 18 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, alloc_buffer) == 43 * SLOT);
+const _: () = assert!(core::mem::size_of::<AmfContextVtbl>() == slot(55));
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, release) == slot(1));
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, terminate) == slot(13));
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, init_dx11) == slot(18));
+const _: () = assert!(core::mem::offset_of!(AmfContextVtbl, alloc_buffer) == slot(43));
 const _: () =
-    assert!(core::mem::offset_of!(AmfContextVtbl, create_surface_from_dx11_native) == 49 * SLOT);
+    assert!(core::mem::offset_of!(AmfContextVtbl, create_surface_from_dx11_native) == slot(49));
 
 // -- AMFComponent (28 slots) = AMFInterface(3) + PropertyStorage(10) + StorageEx(4) + Component(11) --
-const _: () = assert!(core::mem::size_of::<AmfComponentVtbl>() == 28 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, release) == 1 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, set_property) == 3 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, init) == 17 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, terminate) == 19 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, drain) == 20 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, flush) == 21 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, submit_input) == 22 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, query_output) == 23 * SLOT);
+const _: () = assert!(core::mem::size_of::<AmfComponentVtbl>() == slot(28));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, release) == slot(1));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, set_property) == slot(3));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, init) == slot(17));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, terminate) == slot(19));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, drain) == slot(20));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, flush) == slot(21));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, submit_input) == slot(22));
+const _: () = assert!(core::mem::offset_of!(AmfComponentVtbl, query_output) == slot(23));
 
 // -- AMFData (23 slots) = AMFInterface(3) + AMFPropertyStorage(10) + AMFData(10) --
-const _: () = assert!(core::mem::size_of::<AmfDataVtbl>() == 23 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, release) == 1 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, query_interface) == 2 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_property) == 3 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, get_property) == 4 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_pts) == 19 * SLOT);
+const _: () = assert!(core::mem::size_of::<AmfDataVtbl>() == slot(23));
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, release) == slot(1));
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, query_interface) == slot(2));
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_property) == slot(3));
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, get_property) == slot(4));
+const _: () = assert!(core::mem::offset_of!(AmfDataVtbl, set_pts) == slot(19));
 
 // -- AMFBuffer (28 slots) = the AMFData prefix (23) + AMFBuffer(5) --
-const _: () = assert!(core::mem::size_of::<AmfBufferVtbl>() == 28 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, release) == 1 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_size) == 24 * SLOT);
-const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_native) == 25 * SLOT);
+const _: () = assert!(core::mem::size_of::<AmfBufferVtbl>() == slot(28));
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, release) == slot(1));
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_size) == slot(24));
+const _: () = assert!(core::mem::offset_of!(AmfBufferVtbl, get_native) == slot(25));
 
 // -- The shared-prefix agreement --
 // `AMFBuffer` derives from `AMFData`, and `create_surface_from_dx11_native` hands back an
