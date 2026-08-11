@@ -107,10 +107,13 @@ const OP_BUDGET: Duration = Duration::from_secs(3);
 /// Poll slice while waiting on the Wayland fd (matches the keepalive loop's cadence in `kwin.rs`).
 const POLL_MS: i32 = 100;
 
-/// KWin's CVT generator aligns a custom mode's width DOWN to a multiple of this (libxcvt's cell
-/// grain), so the mode it builds for a `set_custom_modes` request may be a few px narrower than
-/// asked — matches `kwin::CVT_H_GRANULARITY`. Used when matching the generated mode back.
-const CVT_H_GRANULARITY: u32 = 8;
+// KWin's CVT generator aligns a custom mode's width DOWN to a multiple of `CVT_H_GRANULARITY`
+// (libxcvt's cell grain), so the mode it builds for a `set_custom_modes` request may be a few px
+// narrower than asked — used below when matching the generated mode back. IMPORTED, not re-declared:
+// this and `MANAGED_PREFIX` used to be second copies of `kwin.rs`'s literals, each under prose
+// asserting the two "match" — an assertion no compiler was checking, on the two values that decide
+// which output is OURS and which mode is the one we asked for.
+use crate::kwin::{CVT_H_GRANULARITY, MANAGED_PREFIX};
 
 /// `kde_output_management_v2.set_replication_source` (and the device's `replication_source` event)
 /// arrived in v13. wayland-rs does not range-check requests, so sending one to a lower-version bind
@@ -166,9 +169,19 @@ pub(crate) struct TopologyOutcome {
 /// One output as read from `kde_output_device_v2`.
 #[derive(Default, Clone)]
 struct DeviceState {
-    /// The global `name` number (higher = more recently advertised) — used to pick the newest of two
-    /// same-named outputs during a supersede.
+    /// The global `name` number (higher = more recently advertised) — the primary newest-wins
+    /// tie-break between two same-named outputs during a supersede. **Zero for every device on
+    /// KWin ≥ 6.7**, which hands outputs out through `kde_output_device_registry_v2` instead of one
+    /// global per output: those carry no global name at all (see [`seq`](DeviceState::seq)).
     global: u32,
+    /// Order in which THIS connection first saw the device, from 1. The tie-break of last resort
+    /// behind `global`: on the registry model every `global` is 0, so without this the `max_by_key`
+    /// below degrades to "whichever entry `HashMap` iteration happened to reach last" — and `HashMap`
+    /// is seeded per process, so the supersede resolve was a coin flip that could pick the
+    /// PREDECESSOR (same name, same size) and configure the output that is about to disappear.
+    /// Announce order is not a proof of newness — it is the compositor's own enumeration order — but
+    /// it is deterministic, which the hash order was not.
+    seq: u32,
     name: Option<String>,
     uuid: Option<String>,
     enabled: bool,
@@ -204,6 +217,8 @@ struct State {
     /// the life of the session (dropping it would end the announcements).
     device_registry: Option<DeviceRegistry>,
     devices: HashMap<ObjectId, DeviceState>,
+    /// Highest [`DeviceState::seq`] handed out so far — the announce counter.
+    next_device_seq: u32,
     /// mode object id → `(width, height, refresh_mHz)`.
     mode_dims: HashMap<ObjectId, (u32, u32, u32)>,
     /// Highest `wl_callback` serial whose `done` has arrived — the barrier the pump waits on.
@@ -211,6 +226,46 @@ struct State {
     /// Configuration apply verdict: `Some(true)` = applied, `Some(false)` = failed.
     applied: Option<bool>,
     failure_reason: Option<String>,
+}
+
+impl State {
+    /// The entry for a device, stamping its announce order ([`DeviceState::seq`]) the first time we
+    /// see it. Every path that creates a device entry goes through here — the two announce models
+    /// (per-output global, and the ≥ 6.7 registry) plus the event handler, which can race ahead of
+    /// both — so the counter really does reflect the order the devices arrived in.
+    fn device_entry(&mut self, id: ObjectId) -> &mut DeviceState {
+        // Disjoint field borrows: `entry` holds `devices`, the closure holds only the counter.
+        let next = &mut self.next_device_seq;
+        self.devices.entry(id).or_insert_with(|| {
+            *next += 1;
+            DeviceState {
+                seq: *next,
+                ..Default::default()
+            }
+        })
+    }
+
+    /// Forget a `kde_output_device_mode_v2` the compositor has destroyed.
+    ///
+    /// The protocol's `removed` event says the compositor destroys the object *immediately after*
+    /// sending it — and the event is NOT marked `type="destructor"`, so wayland-rs happily keeps the
+    /// proxy alive locally. Anything still holding that id would later hand it back to KWin
+    /// (`kde_output_configuration_v2.mode`) as a request against a dead object, which is a protocol
+    /// error: KWin kills the connection, the apply "fails", and a >60 Hz session degrades to the
+    /// kscreen-doctor path with a log indistinguishable from "this KWin is too old". Reachable
+    /// precisely because `set_custom_modes` REPLACES the persisted custom list, so the mode a
+    /// previous session left behind is destroyed the moment this session installs its own.
+    fn forget_mode(&mut self, id: &ObjectId) {
+        self.mode_dims.remove(id);
+        for dev in self.devices.values_mut() {
+            dev.modes.retain(|(mid, _)| mid != id);
+            if dev.current_mode.as_ref() == Some(id) {
+                // Don't invent a size for a destroyed mode: a resolve keyed on current dims must
+                // miss (and fall back) rather than match on a mode that no longer exists.
+                dev.current_mode = None;
+            }
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -239,7 +294,7 @@ impl Dispatch<WlRegistry, ()> for State {
                     // handler can record it (newest-wins tie-break during a supersede).
                     let dev = registry.bind::<OutputDevice, _, _>(name, v, qh, name);
                     let id = dev.id();
-                    state.devices.entry(id).or_default().proxy = Some(dev);
+                    state.device_entry(id).proxy = Some(dev);
                 } else if interface == DeviceRegistry::interface().name {
                     // KWin ≥ 6.7 (Plasma 6.7.3 verified) no longer advertises ONE
                     // `kde_output_device_v2` global per output — it advertises this registry and
@@ -260,9 +315,14 @@ impl Dispatch<WlRegistry, ()> for State {
 }
 
 /// The device registry hands out one `kde_output_device_v2` per output via its `output` event
-/// (a `new_id`, so the child is created by the `event_created_child!` binding below). Devices that
-/// arrive this way have no global `name` number — the newest-wins supersede tie-break uses 0 for
-/// them, which is fine: that tie-break only matters for the per-output-global model.
+/// (a `new_id`, so the child is created by the `event_created_child!` binding below).
+///
+/// Devices that arrive this way have no global `name` number — the `0u32` UserData below is stamped
+/// on every one of them, so [`DeviceState::global`] is 0 across the board. That is **not** harmless,
+/// and an earlier comment here claimed it was: the registry model is what CURRENT KWin uses, so the
+/// newest-wins supersede tie-break is unavailable exactly where it is needed (two same-named,
+/// same-sized outputs, predecessor still alive). [`DeviceState::seq`] is the deterministic
+/// fallback the tie-break actually lands on there.
 impl Dispatch<DeviceRegistry, ()> for State {
     fn event(
         state: &mut Self,
@@ -274,7 +334,7 @@ impl Dispatch<DeviceRegistry, ()> for State {
     ) {
         if let RegistryEvent::Output { output } = event {
             let id = output.id();
-            state.devices.entry(id).or_default().proxy = Some(output);
+            state.device_entry(id).proxy = Some(output);
         }
     }
 
@@ -319,7 +379,23 @@ impl Dispatch<OutputDevice, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let entry = state.devices.entry(device.id()).or_default();
+        // Before anything re-creates the entry: `removed` (device ≥ v21, and we bind up to 24) means
+        // this output is gone for good and no further update will arrive. Dropping it keeps a
+        // hot-unplugged head from being resolved, disabled or "restored" minutes later, and the XML
+        // asks the client to `release` the object — the only way the server-side one is ever freed,
+        // since wayland-rs sends no destructor when a proxy is merely dropped.
+        if matches!(event, DeviceEvent::Removed) {
+            if let Some(dead) = state.devices.remove(&device.id()) {
+                for (mid, _) in &dead.modes {
+                    state.mode_dims.remove(mid);
+                }
+            }
+            if device.version() >= 21 {
+                device.release();
+            }
+            return;
+        }
+        let entry = state.device_entry(device.id());
         entry.global = *global;
         if entry.proxy.is_none() {
             entry.proxy = Some(device.clone());
@@ -363,6 +439,12 @@ impl Dispatch<DeviceMode, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // `removed` first, and NOT through the entry below: re-inserting a destroyed mode is exactly
+        // the stale row a later `config.mode(...)` would send back to KWin (see [`State::forget_mode`]).
+        if matches!(event, ModeEvent::Removed) {
+            state.forget_mode(&mode.id());
+            return;
+        }
         let entry = state.mode_dims.entry(mode.id()).or_insert((0, 0, 0));
         match event {
             ModeEvent::Size { width, height } => {
@@ -370,6 +452,7 @@ impl Dispatch<DeviceMode, ()> for State {
                 entry.1 = height.max(0) as u32;
             }
             ModeEvent::Refresh { refresh } => entry.2 = refresh.max(0) as u32,
+            // `preferred` / `flags` / `cvt` carry nothing we drive an apply from.
             _ => {}
         }
     }
@@ -419,13 +502,76 @@ struct Session {
     next_sync: u32,
 }
 
+/// Why [`Session::open`] declined, i.e. why this operation degraded to the `kscreen-doctor`
+/// shell-out.
+///
+/// The distinction is the whole value of the type: a bare `None` made every one of these read as
+/// "not a KDE box", which is how a genuine regression — KWin ≥ 6.7 no longer advertising per-output
+/// `kde_output_device_v2` globals, so the device list came back EMPTY — shipped as a fallback that
+/// fired on every current KDE machine with nothing in the log to say so.
+enum OpenFailure {
+    /// No Wayland connection at all (`WAYLAND_DISPLAY` unset/stale) — not a session we can drive.
+    Connect(String),
+    /// The compositor accepted the connection but did not answer the registry barrier in budget:
+    /// the wedge case this whole module exists for.
+    RegistryBarrier,
+    /// Connected and answering, but `kde_output_management_v2` is not advertised to this client
+    /// (too old a KWin, or not KWin at all).
+    NoManagementGlobal,
+    /// Management is there, but the outputs' own property bursts never completed in budget.
+    DeviceBarrier,
+}
+
+impl std::fmt::Display for OpenFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenFailure::Connect(e) => write!(f, "no Wayland connection ({e})"),
+            OpenFailure::RegistryBarrier => {
+                write!(
+                    f,
+                    "the compositor did not answer the registry roundtrip in budget"
+                )
+            }
+            OpenFailure::NoManagementGlobal => {
+                write!(
+                    f,
+                    "kde_output_management_v2 is not advertised to this client"
+                )
+            }
+            OpenFailure::DeviceBarrier => {
+                write!(
+                    f,
+                    "the outputs never finished announcing their state in budget"
+                )
+            }
+        }
+    }
+}
+
 impl Session {
+    /// [`Session::connect`] for the operation named by `op`, logging the reason on the way out.
+    ///
+    /// One log site for all six callers: every one of them silently degraded to `kscreen-doctor`
+    /// before, so on a box where the in-process path never worked the only symptom was that
+    /// topology took ~26 s and nothing said why.
+    fn open(op: &'static str) -> Result<Session, OpenFailure> {
+        let opened = Session::connect();
+        if let Err(reason) = &opened {
+            tracing::warn!(
+                op,
+                %reason,
+                "KWin in-process output management unavailable — falling back to kscreen-doctor"
+            );
+        }
+        opened
+    }
+
     /// Connect to the KWin Wayland socket, bind `kde_output_management_v2` + every
-    /// `kde_output_device_v2`, and read each output's state — all bounded by `OP_BUDGET`. `None` if
-    /// we can't connect, the management global isn't advertised, or the compositor doesn't answer in
-    /// budget (the wedge case — the caller then falls back to `kscreen-doctor`).
-    fn open() -> Option<Session> {
-        let conn = Connection::connect_to_env().ok()?;
+    /// `kde_output_device_v2`, and read each output's state — all bounded by `OP_BUDGET`. The
+    /// [`OpenFailure`] says which rung declined; every one of them sends the caller to
+    /// `kscreen-doctor`.
+    fn connect() -> Result<Session, OpenFailure> {
+        let conn = Connection::connect_to_env().map_err(|e| OpenFailure::Connect(e.to_string()))?;
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
@@ -438,19 +584,15 @@ impl Session {
         let deadline = Instant::now() + OP_BUDGET;
         // Phase 1: process the registry globals (binds management + every device in the handler).
         if !s.sync_barrier(deadline) {
-            return None;
+            return Err(OpenFailure::RegistryBarrier);
         }
         if s.state.management.is_none() {
-            tracing::debug!(
-                "KWin does not advertise kde_output_management_v2 to this client — kscreen-doctor \
-                 fallback"
-            );
-            return None;
+            return Err(OpenFailure::NoManagementGlobal);
         }
         // Phase 2: flush the device binds issued in phase 1 and drain each output's state burst
         // (name / enabled / priority / current_mode / mode sizes / done).
         if !s.sync_barrier(deadline) {
-            return None;
+            return Err(OpenFailure::DeviceBarrier);
         }
         // Phase 3 (KWin ≥ 6.7, the registry model): the devices themselves only arrive as the
         // registry's `output` events during phase 2, so their property bursts are one round further
@@ -460,9 +602,9 @@ impl Session {
             && s.state.devices.values().any(|d| !d.seen_done)
             && !s.sync_barrier(deadline)
         {
-            return None;
+            return Err(OpenFailure::DeviceBarrier);
         }
-        Some(s)
+        Ok(s)
     }
 
     /// Send a `wl_display.sync` and pump the queue until its `done` arrives or `deadline` passes.
@@ -554,6 +696,26 @@ impl Session {
         let id = dev.current_mode.as_ref()?;
         self.state.mode_dims.get(id).copied()
     }
+
+    /// Resolve OUR just-created virtual output: a managed-prefix name AND a current size equal to
+    /// the size we created it at — only the just-created output sits there during a supersede,
+    /// because the replacement deliberately reuses the per-slot name while the predecessor is still
+    /// alive. Newest wins the remaining tie: the global `name` number where there is one, else
+    /// announce order (see [`DeviceState::seq`] — on KWin ≥ 6.7 that is every device).
+    ///
+    /// One resolve for all three operations (topology / de-mirror / custom mode). They had drifted
+    /// into three copies of the same filter, which is how a tie-break fix lands in two of them.
+    fn resolve_ours(&self, our_prefix: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
+        self.state
+            .devices
+            .values()
+            .filter(|d| {
+                d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
+                    && self.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
+            })
+            .max_by_key(|d| (d.global, d.seq))
+            .cloned()
+    }
 }
 
 /// `(width, height, "WxH@Hz")` capture of a device's current mode, Hz rounded — the same shape the
@@ -563,10 +725,10 @@ fn mode_spec(dims: (u32, u32, u32)) -> String {
     format!("{}x{}@{}", dims.0, dims.1, hz)
 }
 
-/// Prefix EVERY managed KWin output shares (mirrors `kwin::MANAGED_PREFIX`) — the streamed outputs
-/// are `Virtual-punktfunk` / `Virtual-punktfunk-<id>`, so a same-family sibling session is never
-/// treated as a physical to disable, and its primary is never stolen (first-slot-wins).
-const MANAGED_PREFIX: &str = "Virtual-punktfunk";
+// `MANAGED_PREFIX` — the prefix EVERY managed KWin output shares (`Virtual-punktfunk` /
+// `Virtual-punktfunk-<id>`), so a same-family sibling session is never treated as a physical to
+// disable and its primary is never stolen (first-slot-wins) — is imported at the top of this file
+// from `kwin.rs`, which owns the naming.
 
 /// Every head KWin reports, for [`crate::monitors::list`].
 ///
@@ -575,12 +737,8 @@ const MANAGED_PREFIX: &str = "Virtual-punktfunk";
 /// burst is skipped rather than reported half-read (its geometry would be a guess, and geometry is
 /// exactly what callers key on).
 pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let session = Session::open().ok_or_else(|| {
-        anyhow::anyhow!(
-            "KWin did not answer kde_output_management_v2 (not a KWin session, the protocol is \
-             not advertised to this client, or the compositor is wedged)"
-        )
-    })?;
+    let session = Session::open("list_monitors")
+        .map_err(|e| anyhow::anyhow!("KWin did not answer kde_output_management_v2: {e}"))?;
     let mut out: Vec<_> = session
         .state
         .devices
@@ -630,24 +788,12 @@ pub(crate) fn apply_topology(
         disabled: Vec::new(),
         handled: false,
     };
-    let Some(mut sess) = Session::open() else {
+    let Ok(mut sess) = Session::open("topology") else {
         return miss();
     };
     let deadline = Instant::now() + OP_BUDGET;
 
-    // Resolve OUR output: managed-prefix name AND current size == the birth size (only the
-    // just-created output sits there during a supersede); newest global wins the tie.
-    let ours = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| {
-            d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-                && sess.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
-        })
-        .max_by_key(|d| d.global)
-        .cloned();
-    let Some(ours) = ours else {
+    let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
         tracing::warn!(
             our_prefix,
             our_w,
@@ -846,7 +992,7 @@ pub(crate) fn apply_topology(
 /// which is broken under every topology equally. So this reads the state and applies **only** when
 /// our output really is mirroring; the ordinary session pays one bounded enumerate and no apply.
 pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32) {
-    let Some(mut sess) = Session::open() else {
+    let Ok(mut sess) = Session::open("clear_replication_source") else {
         return;
     };
     let deadline = Instant::now() + OP_BUDGET;
@@ -858,18 +1004,7 @@ pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32)
     if mgmt_version < REPLICATION_SOURCE_SINCE {
         return;
     }
-    // Same resolve as `apply_topology`: managed-prefix name AND the birth size, newest global wins.
-    let Some(ours) = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| {
-            d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-                && sess.current_dims(d).map(|(w, h, _)| (w, h)) == Some((our_w, our_h))
-        })
-        .max_by_key(|d| d.global)
-        .cloned()
-    else {
+    let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
         return;
     };
     if !is_mirroring(ours.replication_source.as_deref()) {
@@ -918,7 +1053,7 @@ pub(crate) fn set_custom_mode(
     want_h: u32,
     want_hz: u32,
 ) -> Option<(u32, u32, u32)> {
-    let mut sess = Session::open()?;
+    let mut sess = Session::open("custom_mode").ok()?;
     let deadline = Instant::now() + OP_BUDGET;
 
     // `set_custom_modes` is `since 18`; calling it on an older bound management object is a protocol
@@ -928,16 +1063,9 @@ pub(crate) fn set_custom_mode(
         return None;
     }
 
-    // Resolve our output at its birth size (newest global wins a supersede).
+    // Resolve our output at its birth size (newest wins a supersede — see `resolve_ours`).
     let our_proxy = sess
-        .state
-        .devices
-        .values()
-        .filter(|d| {
-            d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-                && sess.current_dims(d).map(|(w, h, _)| (w, h)) == Some((birth_w, birth_h))
-        })
-        .max_by_key(|d| d.global)
+        .resolve_ours(our_prefix, birth_w, birth_h)
         .and_then(|d| d.proxy.clone())?;
     let our_key = our_proxy.id();
 
@@ -985,10 +1113,15 @@ pub(crate) fn set_custom_mode(
     }
 
     // Grab the generated mode's proxy, then select it (this is what changes the size).
+    // Newest match wins: `modes` is in announce order, and the entry we just had KWin generate is
+    // the last one. An earlier session's identical custom mode may still be listed here — KWin only
+    // destroys it (`kde_output_device_mode_v2.removed`) when it processes our `set_custom_modes`,
+    // and that removal may not have been dispatched yet.
     let mode_proxy = {
         let dev = sess.state.devices.get(&our_key)?;
         dev.modes
             .iter()
+            .rev()
             .find(|(mid, _)| mode_matches(&sess.state, mid))
             .map(|(_, p)| p.clone())?
     };
@@ -1031,19 +1164,31 @@ pub(crate) fn set_custom_mode(
 }
 
 /// Re-enable outputs by name at their captured `WxH@Hz` modes (teardown), in-process. Returns
-/// `true` if the config applied; `false` (compositor unresponsive / management absent) tells the
-/// caller to fall back to `kscreen-doctor`.
+/// `true` only if EVERY requested output was staged and the config applied; `false` (compositor
+/// unresponsive, management absent, or an output we could not address) tells the caller to fall
+/// back to `kscreen-doctor`.
+///
+/// The "every requested output" half is load-bearing, not pedantry. The names in `outputs` were
+/// captured on a DIFFERENT connection during [`apply_topology`] and this restore opens a fresh
+/// session minutes later, when the display group's last member drops — so a name that no longer
+/// resolves is a live possibility. An empty `kde_output_configuration_v2` still gets an `applied`
+/// event, so returning the apply verdict alone reported SUCCESS for a total no-op, suppressed the
+/// `reenable_outputs_kscreen` backstop, and left a physical monitor dark.
 pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
     if outputs.is_empty() {
         return true;
     }
-    let Some(mut sess) = Session::open() else {
+    let Ok(mut sess) = Session::open("restore_outputs") else {
         return false;
     };
     let deadline = Instant::now() + OP_BUDGET;
     let config = sess.new_config();
+    let mut matched = 0usize;
     for (name, spec) in outputs {
-        // Find the device by name (physical names are stable across a session).
+        // Find the device by name (physical names are stable across a session). BOTH misses below
+        // leave `matched` un-incremented, the proxy one included: a `DeviceState` can be created by
+        // the event handler ([`State::device_entry`]) and carry a name before the announce that
+        // records its proxy has been dispatched, and a name with no proxy is not addressable.
         let Some(dev) = sess
             .state
             .devices
@@ -1056,6 +1201,7 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
         let Some(proxy) = dev.proxy.as_ref() else {
             continue;
         };
+        matched += 1;
         // Enable first — a bare enable always succeeds, so a physical is never left dark.
         config.enable(proxy, 1);
         // Then re-assert the captured mode so a 120 Hz panel doesn't return at KWin's ~60 Hz default.
@@ -1063,18 +1209,39 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
             config.mode(proxy, &mode);
         }
     }
+    if matched == 0 {
+        // Nothing staged: applying would ack an empty config and read as success. Hand the whole
+        // restore to kscreen-doctor, which addresses outputs by name and needs no live proxy.
+        config.destroy();
+        tracing::warn!(
+            requested = ?outputs,
+            "KWin output management: none of the outputs to restore are addressable on this \
+             connection — kscreen-doctor fallback"
+        );
+        return false;
+    }
     let ok = sess.apply(&config, deadline);
     config.destroy();
-    if ok {
+    let complete = ok && matched == outputs.len();
+    if complete {
         tracing::info!(reenabled = ?outputs, "KWin output management: restored outputs (in-process)");
+    } else {
+        tracing::warn!(
+            requested = ?outputs,
+            matched,
+            applied = ok,
+            reason = ?sess.state.failure_reason,
+            "KWin output management: restore incomplete — kscreen-doctor backstop takes the rest \
+             (an output left disabled is a physical left dark)"
+        );
     }
-    ok
+    complete
 }
 
 /// Position the output identified by `uuid` at `(x, y)` in the desktop layout, in-process. Returns
 /// `true` if applied; `false` tells the caller to fall back to `kscreen-doctor`.
 pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> bool {
-    let Some(mut sess) = Session::open() else {
+    let Ok(mut sess) = Session::open("position") else {
         return false;
     };
     let deadline = Instant::now() + OP_BUDGET;

@@ -18,15 +18,22 @@
 use crate::Compositor;
 use anyhow::{bail, Result};
 
-/// One head as the compositor currently reports it. Logical (post-scale) geometry throughout —
-/// the same coordinate space libei regions and compositor layout use, *not* pixels.
+/// One head as the compositor currently reports it.
+///
+/// **The two halves live in different spaces, and that is not an accident.** `x`/`y` are LOGICAL —
+/// the compositor's global layout coordinates, the same space libei regions use — while
+/// `width`/`height` are the current mode in PIXELS, because that is what every backend actually
+/// reports (KWin's `current_mode` size, `hyprctl`'s mode, the CCD path's source mode) and what a
+/// capturer has to open against. `scale` is the factor between them: see [`Self::logical_size`],
+/// which is the only correct way to compare a size against `x`/`y`. An earlier version of this doc
+/// claimed logical geometry "throughout", which is a trap for exactly the consumer that mixes them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalMonitor {
     /// Connector name — `DP-1`, `HDMI-A-2`, `eDP-1`. The id `PUNKTFUNK_CAPTURE_MONITOR` names.
     pub connector: String,
     /// Human label for a picker (`make model`, else the connector). Never used for matching.
     pub description: String,
-    /// Current mode, in pixels.
+    /// Current mode, in PIXELS (not the logical size — see the type doc and [`Self::logical_size`]).
     pub width: u32,
     pub height: u32,
     /// Refresh in mHz (60000 = 60 Hz). 0 when the backend doesn't report it.
@@ -71,6 +78,24 @@ pub(crate) fn describe(make: &str, model: &str, connector: &str) -> String {
 }
 
 impl PhysicalMonitor {
+    /// The head's extent in the SAME space as `x`/`y` — mode pixels divided by `scale`.
+    ///
+    /// The bridge between the two spaces this type carries, and the only correct way to ask "does
+    /// this head's box contain that layout coordinate?". A consumer that compares `width`/`height`
+    /// against `x`/`y` directly is right only at scale 1.0 and silently wrong on every fractional
+    /// KDE/GNOME desk (a 3840-px panel at 150 % occupies 2560 logical units, so a naive
+    /// `x + width` overlaps the head to its right by 1280).
+    ///
+    /// A non-positive scale can only come from a backend that reported nonsense; it is treated as
+    /// 1.0 rather than dividing by zero.
+    pub fn logical_size(&self) -> (f64, f64) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        (
+            f64::from(self.width) / scale,
+            f64::from(self.height) / scale,
+        )
+    }
+
     /// `1920x1080@60` — for logs and pickers.
     pub fn mode_label(&self) -> String {
         if self.refresh_mhz == 0 {
@@ -94,8 +119,11 @@ impl PhysicalMonitor {
 /// callers resolving a pinned monitor must not (see [`resolve`]).
 pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
     match compositor {
+        // Via the `kwin` backend rather than `kwin_output_mgmt` directly: it owns the
+        // in-process-then-`kscreen-doctor` ladder, so this read degrades the same way every other
+        // KWin operation does instead of being the one that hard-fails on a wedged/old compositor.
         #[cfg(target_os = "linux")]
-        Compositor::Kwin => crate::kwin_output_mgmt::list_monitors(),
+        Compositor::Kwin => crate::kwin::list_monitors(),
         #[cfg(target_os = "linux")]
         Compositor::Mutter => crate::mutter::list_monitors(),
         #[cfg(target_os = "linux")]
@@ -133,15 +161,21 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
 /// * `refresh_mhz` comes from the path's own rational rate, which keeps 59.94 distinct from 60.
 #[cfg(windows)]
 pub fn list_windows() -> Result<Vec<PhysicalMonitor>> {
-    let inv = pf_win_display::win_display::target_inventory();
-    if inv.is_empty() {
-        // Distinguish "reached it, nothing there" from a failure, exactly as [`list`] promises:
-        // an empty CCD database is a real state (every panel off — measured on .173 with the TV
-        // powered down), not an error.
-        return Ok(Vec::new());
-    }
-    Ok(inv
-        .into_iter()
+    // `Ok` even when the inventory is empty, exactly as [`list`] promises: an empty CCD database is
+    // a real state (every panel off — measured on .173 with the TV powered down), not a failure.
+    // Everything past the OS call is the pure mapping, so it lives where a test can reach it.
+    Ok(from_inventory(
+        pf_win_display::win_display::target_inventory(),
+    ))
+}
+
+/// The CCD inventory → [`PhysicalMonitor`] mapping, split from the OS call so the Windows test leg
+/// can exercise it (`list_windows` touches the display database on its first line, which left the
+/// only mapping that decides what an operator can PIN with no coverage on the one platform that
+/// runs it).
+#[cfg(windows)]
+fn from_inventory(inv: Vec<pf_win_display::win_display::TargetInventory>) -> Vec<PhysicalMonitor> {
+    inv.into_iter()
         .map(|t| {
             // The GDI name is what an operator recognises and what capture pins on; an inactive
             // path has none, so fall back to the stable target id rather than an empty string —
@@ -167,7 +201,7 @@ pub fn list_windows() -> Result<Vec<PhysicalMonitor>> {
                 managed: t.ours,
             }
         })
-        .collect())
+        .collect()
 }
 
 /// Resolve a configured monitor name against `monitors`, exactly then case-insensitively.
@@ -257,11 +291,110 @@ mod tests {
         assert_eq!(describe("  ", "unknown", "DP-2"), "DP-2");
     }
 
+    /// The two spaces this type carries: the mode is pixels, `x`/`y` are logical, and `scale` is
+    /// the only thing that relates them. A 4K panel at KDE's 150 % really does occupy 2560x1440
+    /// logical units, which is what a consumer comparing against `x`/`y` must use.
+    #[test]
+    fn logical_size_divides_the_mode_by_the_scale() {
+        let mut m = mon("DP-1");
+        m.width = 3840;
+        m.height = 2160;
+        m.scale = 1.5;
+        assert_eq!(m.logical_size(), (2560.0, 1440.0));
+        // Unscaled: the two spaces coincide, which is why the trap goes unnoticed on most desks.
+        m.scale = 1.0;
+        assert_eq!(m.logical_size(), (3840.0, 2160.0));
+        // A backend that reported nonsense must not produce an infinity or a NaN.
+        m.scale = 0.0;
+        assert_eq!(m.logical_size(), (3840.0, 2160.0));
+    }
+
     #[test]
     fn mode_label_drops_an_unknown_refresh() {
         let mut m = mon("DP-1");
         assert_eq!(m.mode_label(), "1920x1080@60");
         m.refresh_mhz = 0;
         assert_eq!(m.mode_label(), "1920x1080");
+    }
+}
+
+/// The Windows inventory mapping. Windows-only because it maps a Windows-only type — the CI leg
+/// that runs it (`windows-host.yml`, `cargo test --release -p pf-vdisplay`) already exists; until
+/// [`from_inventory`] was split out of the OS call there was simply nothing there to run.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use pf_win_display::win_display::TargetInventory;
+
+    /// One inventory row. Built through a single helper so a field rename shows up in one place —
+    /// the struct is another crate's and carries no `Default`.
+    fn target(target_id: u32, gdi_name: &str, active: bool) -> TargetInventory {
+        TargetInventory {
+            target_id,
+            active,
+            external_physical: true,
+            internal_panel: false,
+            tech: "HDMI",
+            friendly: "ACME TV".into(),
+            monitor_device_path: r"\\?\DISPLAY#ACM1234#".into(),
+            ours: false,
+            gdi_name: gdi_name.into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 59940,
+            primary: active,
+        }
+    }
+
+    /// An INACTIVE path has no source and therefore no GDI name. It must still be listed (the
+    /// "why can't I pick it?" contract) under an id that can actually be pinned — a blank connector
+    /// could never be resolved, and an operator would have no way to name the head at all.
+    #[test]
+    fn an_inactive_path_gets_a_target_id_connector_and_enabled_false() {
+        let mons = from_inventory(vec![target(4352, "", false)]);
+        assert_eq!(mons.len(), 1);
+        assert_eq!(mons[0].connector, "target-4352");
+        assert!(!mons[0].enabled);
+        // Windows applies DPI per application rather than a compositor-global logical scale, so
+        // the geometry above is pixels and the factor is honestly 1.0 — see the fn doc.
+        assert_eq!(mons[0].scale, 1.0);
+    }
+
+    /// The two halves must agree: whatever connector this mapping synthesizes has to be a name
+    /// [`resolve`] can find, because that pair is the whole pin round-trip the console offers.
+    #[test]
+    fn resolve_can_find_a_synthesized_target_name() {
+        let mons = from_inventory(vec![
+            target(4352, "", false),
+            target(1, r"\\.\DISPLAY1", true),
+        ]);
+        assert_eq!(
+            resolve(&mons, "target-4352")
+                .expect("synthesized name")
+                .width,
+            1920
+        );
+        // An active path keeps its GDI name — the id an operator recognises.
+        assert_eq!(
+            resolve(&mons, r"\\.\DISPLAY1").expect("gdi name").connector,
+            r"\\.\DISPLAY1"
+        );
+        assert!(
+            resolve(&mons, r"\\.\display1").is_ok(),
+            "and case-insensitively, as `resolve` promises"
+        );
+    }
+
+    /// Our own IddCx display is flagged, so a picker can grey it out — the one thing Windows can
+    /// answer reliably and the Linux backends cannot.
+    #[test]
+    fn our_own_idd_is_marked_managed() {
+        let mut ours = target(257, r"\\.\DISPLAY2", true);
+        ours.ours = true;
+        let mons = from_inventory(vec![ours]);
+        assert!(mons[0].managed);
+        assert!(!from_inventory(vec![target(1, r"\\.\DISPLAY1", true)])[0].managed);
     }
 }

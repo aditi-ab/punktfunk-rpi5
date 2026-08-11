@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -237,7 +238,20 @@ impl VirtualDisplay for KwinDisplay {
             Some(id) => format!("{VOUT_NAME}-{id}"),
             None => VOUT_NAME.to_string(),
         };
-        self.last_name = Some(name.clone()); // for apply_position (registry-driven §6.2 layout)
+        // `apply_position`'s kscreen-doctor fallback (the registry-driven §6.2 layout) addresses
+        // `last_name`, so seed it with `Virtual-<name>`: the address KWin exposes our output under
+        // and the ONLY spelling kscreen-doctor can resolve. The bare `name` we ask KWin for
+        // (`punktfunk`) matches no output at all, so seeding it with that left every position apply
+        // shelling out against an address that can never exist — and the `is_none()` guard that was
+        // supposed to correct it later could never fire, because this write is never `None`.
+        let our_prefix = format!("Virtual-{name}");
+        self.last_name = Some(our_prefix.clone());
+        // Every `create` re-resolves its own output, so the PREVIOUS one's UUID must not survive
+        // into this one. A supersede keeps this `KwinDisplay` and creates the replacement while the
+        // predecessor is still alive, so a stale UUID still RESOLVES: `set_position` would find the
+        // old output, position it, report success, and never reach the fallback — the new display
+        // silently stays where it was born. Re-set below only if the in-process path handles us.
+        self.our_uuid = None;
         let (width, height) = (mode.width, mode.height);
         let pointer_mode = if self.hw_cursor {
             POINTER_METADATA
@@ -258,7 +272,15 @@ impl VirtualDisplay for KwinDisplay {
             match setup_rx.recv_timeout(Duration::from_secs(20)) {
                 Ok(Ok(v)) => Ok((v, stop)),
                 Ok(Err(e)) => bail!("KWin virtual output failed: {e}"),
-                Err(_) => bail!("timed out creating the KWin virtual output"),
+                Err(_) => {
+                    // Nothing else will ever flip this `stop`: it is dropped with the error, and
+                    // the `StopGuard` that normally owns it is only built on the success path. So
+                    // the worker — which is by construction still inside `await_created` — would
+                    // sit out its own budget holding a half-built output whose Wayland connection
+                    // KWin keeps the output alive for. Release it here.
+                    stop.store(true, Ordering::Relaxed);
+                    bail!("timed out creating the KWin virtual output")
+                }
             }
         };
         // KWin creates virtual outputs at a hardcoded 60 Hz, `stream_virtual_output` has no
@@ -293,8 +315,8 @@ impl VirtualDisplay for KwinDisplay {
         );
         // Topology + positioning address OUR output by its kde_output_management UUID (resolved
         // in-process in `apply_topology`, supersede-robust) — no early kscreen-doctor resolve, so
-        // the path never shells out. `Virtual-<name>` is the name KWin exposes our output as.
-        let our_prefix = format!("Virtual-{name}");
+        // the path never shells out. `our_prefix` (computed above with `last_name`) is the name
+        // KWin exposes our output as.
         let mut expect_exact_dims = false;
         // The size the output actually ENDS UP at — the request, unless KWin's CVT generator had to
         // shrink the width to the cell grain (see `CVT_H_GRANULARITY`). Reported as the output's
@@ -372,12 +394,11 @@ impl VirtualDisplay for KwinDisplay {
         // kscreen-doctor backend; see `apply_topology`), with a kscreen-doctor fallback. `disabled`
         // is the physical/bootstrap outputs, each `(name, "WxH@Hz")`, to restore on teardown.
         let disabled = self.apply_topology(&name, &our_prefix, final_dims);
-        // A plain managed name is enough for apply_position's kscreen-doctor fallback when the
-        // in-process UUID path isn't set (single-output sessions are unambiguous; a supersede uses
-        // the UUID path instead). `want_high` already set `last_name` to the resolved kscreen id.
-        if self.last_name.is_none() {
-            self.last_name = Some(our_prefix);
-        }
+        // `last_name` is already the best address we have: `Virtual-<name>` from the top of this
+        // function, upgraded in place to the RESOLVED numeric kscreen id by whichever of the
+        // `want_high` fallback or `apply_topology`'s fallback actually ran a resolve. Nothing to
+        // fill in here — the guard that used to sit at this spot could never fire (`last_name` is
+        // written unconditionally above) and only made the plain-name case look handled.
         // Per-group restore (§6.1): DON'T bind the re-enable to this session's keepalive (a per-session
         // `StopGuard` restore would re-enable the physical the moment the FIRST of several exclusive
         // sessions drops — under a still-live sibling). Instead stash it as a closure the registry lifts
@@ -385,7 +406,16 @@ impl VirtualDisplay for KwinDisplay {
         // that display's output is reclaimed, so KWin never sees zero outputs). Empty ⇒ nothing to restore.
         self.pending_restore = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
-            // In-process first; fall back to kscreen-doctor if the compositor doesn't answer in budget.
+            // In-process first; fall back to kscreen-doctor if the compositor doesn't answer in
+            // budget. **Both halves now return honest verdicts** — `reenable_outputs` reports
+            // `false` unless every requested output was actually staged (an empty configuration
+            // used to ack as `applied` and suppress this backstop), and
+            // `reenable_outputs_kscreen` branches on its own exit status instead of logging
+            // success unconditionally. Any future extraction of these hand-rolled
+            // in-process-then-kscreen ladders into one facade must keep that property: a fallback
+            // arm that returns a value the helper never checked would re-introduce exactly the
+            // silent-success this pair was fixed for, behind a seam that claims to have one log
+            // site for every decline.
             Box::new(move || {
                 if !crate::kwin_output_mgmt::reenable_outputs(&disabled) {
                     reenable_outputs_kscreen(&disabled);
@@ -409,6 +439,12 @@ impl VirtualDisplay for KwinDisplay {
 /// closure only when the in-process path reports the compositor didn't answer. Called by the registry
 /// when the display group's last member is torn down (design §6.1), BEFORE that member's output is
 /// reclaimed — so KWin is never momentarily left with zero enabled outputs.
+///
+/// **This is the last line of defence for a physical monitor**, so it reports what actually
+/// happened. It used to discard both `kscreen_ok` verdicts and log restored-everything
+/// unconditionally — including when the call had been killed at [`KSCREEN_BUDGET`], i.e. exactly
+/// the wedged compositor this fallback exists for, with a screen left dark and a green line in the
+/// log saying otherwise.
 fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
     if outputs.is_empty() {
         return;
@@ -420,20 +456,40 @@ fn reenable_outputs_kscreen(outputs: &[(String, String)]) {
         .iter()
         .map(|(name, _)| format!("output.{name}.enable"))
         .collect();
-    let _ = kscreen_ok(&enable_args);
+    let enabled = kscreen_ok(&enable_args);
+    if !enabled {
+        // Nothing further to try: both the in-process path and this one have now declined, so the
+        // outputs stay as `exclusive` left them. Say so loudly — a dark monitor with no line in the
+        // log is what this whole restore chain exists to prevent.
+        tracing::error!(
+            outputs = ?outputs,
+            args = ?enable_args,
+            "KWin: could NOT re-enable the physical/bootstrap outputs (kscreen-doctor failed or hit \
+             its budget after the in-process restore already declined) — a monitor may be left dark"
+        );
+        return;
+    }
     // THEN re-assert each captured mode, best-effort — a bare re-enable lets KWin fall back to the
     // EDID-preferred mode (a 120 Hz panel returns at ~60 Hz); this restores the exact refresh. The
-    // output is enabled now, so the mode set is valid; a rejected mode just leaves KWin's default.
+    // output is enabled now, so the mode set is valid; a rejected mode just leaves KWin's default —
+    // a wrong refresh, not a dark screen, which is why only this half degrades to a warn.
     let mode_args: Vec<String> = outputs
         .iter()
         .filter(|(_, mode)| !mode.is_empty())
         .map(|(name, mode)| format!("output.{name}.mode.{mode}"))
         .collect();
-    if !mode_args.is_empty() {
-        let _ = kscreen_ok(&mode_args);
-    }
+    let modes_restored = mode_args.is_empty() || kscreen_ok(&mode_args);
     std::thread::sleep(Duration::from_millis(200));
-    tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
+    if modes_restored {
+        tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
+    } else {
+        tracing::warn!(
+            reenabled = ?outputs,
+            args = ?mode_args,
+            "KWin: re-enabled the physical/bootstrap outputs but could not re-assert their captured \
+             modes — they are back at KWin's preferred refresh, not the one they were streaming at"
+        );
+    }
 }
 
 /// Resolve the kscreen address of the virtual output the host JUST created: the managed-prefix
@@ -511,24 +567,111 @@ fn kscreen_json() -> Option<serde_json::Value> {
     serde_json::from_slice(&kscreen_json_bytes()?).ok()
 }
 
-/// The `(width, height)` of an output's CURRENT mode from its `kscreen-doctor -j` entry.
-fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
-    let as_id = |v: &serde_json::Value| -> Option<String> {
-        v.as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v.as_u64().map(|n| n.to_string()))
-    };
-    let current = o.get("currentModeId").and_then(as_id)?;
+/// The CURRENT mode of an output from its `kscreen-doctor -j` entry, as `(width, height,
+/// refresh_mHz)`. `None` if the entry names no current mode or that mode carries no size; a mode
+/// with no `refreshRate` reports 0 mHz, which is the "unknown" the monitor type documents.
+fn output_active_mode(o: &serde_json::Value) -> Option<(u32, u32, u32)> {
+    let current = o.get("currentModeId").and_then(json_id)?;
     let mode = o
         .get("modes")?
         .as_array()?
         .iter()
-        .find(|m| m.get("id").and_then(as_id).as_deref() == Some(current.as_str()))?;
+        .find(|m| m.get("id").and_then(json_id).as_deref() == Some(current.as_str()))?;
     let size = mode.get("size")?;
-    Some((
-        size.get("width").and_then(|v| v.as_u64())? as u32,
-        size.get("height").and_then(|v| v.as_u64())? as u32,
-    ))
+    let w = size.get("width").and_then(|v| v.as_u64())? as u32;
+    let h = size.get("height").and_then(|v| v.as_u64())? as u32;
+    // Hz → mHz without an intermediate round: `refreshRate` is a float (59.94, 119.92) and whole
+    // Hz would throw away exactly the distinction `PhysicalMonitor::refresh_mhz` exists to keep.
+    let mhz = mode
+        .get("refreshRate")
+        .and_then(|r| r.as_f64())
+        .map(|hz| (hz * 1000.0).round().max(0.0) as u32)
+        .unwrap_or(0);
+    Some((w, h, mhz))
+}
+
+/// The `(width, height)` of an output's CURRENT mode from its `kscreen-doctor -j` entry.
+fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
+    output_active_mode(o).map(|(w, h, _)| (w, h))
+}
+
+/// Every head KWin reports, for [`crate::monitors::list`] — the in-process enumerate
+/// ([`crate::kwin_output_mgmt::list_monitors`]) with a `kscreen-doctor -j` fallback.
+///
+/// This was the ONE KWin call site with no fallback at all, while the in-process session it depends
+/// on declines for exactly the reasons the other five fall back for: management global absent
+/// (pre-6.x KWin), or a compositor that does not answer in budget. The console's monitor picker and
+/// `PUNKTFUNK_CAPTURE_MONITOR`'s resolve then failed outright on a box whose `kscreen-doctor` was
+/// perfectly able to answer — and a failed `list` is not "no monitors", it is a session that
+/// refuses to start (`monitors::resolve` treats a miss as a hard error, deliberately).
+pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+    let declined = match crate::kwin_output_mgmt::list_monitors() {
+        Ok(monitors) => return Ok(monitors),
+        Err(e) => e,
+    };
+    let Some(doc) = kscreen_json() else {
+        return Err(declined.context(
+            "kscreen-doctor -j did not answer either (not installed, or killed at its budget)",
+        ));
+    };
+    let monitors = monitors_from_kscreen_json(&doc);
+    tracing::info!(
+        count = monitors.len(),
+        reason = %declined,
+        "KWin: enumerated monitors via kscreen-doctor (in-process output management declined)"
+    );
+    Ok(monitors)
+}
+
+/// Parse `kscreen-doctor -j` into the shared monitor type. Split from the process call so it can be
+/// tested against captured JSON — the mapping is where a picker's identity keys come from, and
+/// `x`/`y` are what make two same-sized heads distinguishable at all.
+///
+/// Deliberately mirrors the in-process reader's contract: a disabled output has no current mode and
+/// reports zeroed geometry rather than an invented one, `primary` accepts either the modern
+/// `priority: 1` or the older `primary: true`, and the list is sorted by desktop position so it
+/// reads left-to-right the way the desk looks.
+fn monitors_from_kscreen_json(doc: &serde_json::Value) -> Vec<crate::monitors::PhysicalMonitor> {
+    let Some(outputs) = doc.get("outputs").and_then(|o| o.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<crate::monitors::PhysicalMonitor> = outputs
+        .iter()
+        .filter_map(|o| {
+            let connector = o.get("name").and_then(|n| n.as_str())?.to_string();
+            let mode = output_active_mode(o);
+            let coord = |k: &str| {
+                o.get("pos")
+                    .and_then(|p| p.get(k))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32
+            };
+            Some(crate::monitors::PhysicalMonitor {
+                managed: connector.starts_with(MANAGED_PREFIX),
+                description: crate::monitors::describe(
+                    o.get("vendor").and_then(|v| v.as_str()).unwrap_or(""),
+                    o.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+                    &connector,
+                ),
+                width: mode.map(|m| m.0).unwrap_or(0),
+                height: mode.map(|m| m.1).unwrap_or(0),
+                refresh_mhz: mode.map(|m| m.2).unwrap_or(0),
+                x: coord("x"),
+                y: coord("y"),
+                scale: o
+                    .get("scale")
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| *s > 0.0)
+                    .unwrap_or(1.0),
+                primary: o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
+                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1),
+                enabled: o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
+                connector,
+            })
+        })
+        .collect();
+    out.sort_by_key(|m| (m.x, m.y, m.connector.clone()));
+    out
 }
 
 /// CVT's horizontal cell granularity. KWin generates every custom mode's timing with **libxcvt**,
@@ -542,7 +685,11 @@ fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
 /// birth mode, and the caller falls back to 60 Hz — while KDE's display list shows the perfectly
 /// good 2864x1320@119.92 mode sitting there unselected. Widths like 1920/2560/3840 are all
 /// multiples of 8, which is why only phone-shaped clients ever hit it.
-const CVT_H_GRANULARITY: u32 = 8;
+///
+/// Shared with [`crate::kwin_output_mgmt`], which matches the generated mode back the same way —
+/// it used to keep its own copy under a comment claiming the two "match", which is a claim no
+/// compiler was checking.
+pub(crate) const CVT_H_GRANULARITY: u32 = 8;
 
 /// One row of an output's mode list, as parsed from `kscreen-doctor -j`.
 #[derive(Clone, Debug, PartialEq)]
@@ -762,7 +909,11 @@ fn read_active_mode(output: &str) -> Option<(u32, u32, u32)> {
 /// The prefix EVERY managed KWin output shares — Stage 3 names them `punktfunk` / `punktfunk-<id>`,
 /// which KWin exposes as `Virtual-punktfunk` / `Virtual-punktfunk-<id>`. Group membership (§6.1) is
 /// recognised by this prefix, so we never have to thread the live set through the backend.
-const MANAGED_PREFIX: &str = "Virtual-punktfunk";
+///
+/// Shared with [`crate::kwin_output_mgmt`] rather than copied: both halves of the ladder decide
+/// "is this output one of OURS?" with it, and a drift between two copies would make the in-process
+/// path disable a sibling session's output that the kscreen path deliberately spares.
+pub(crate) const MANAGED_PREFIX: &str = "Virtual-punktfunk";
 
 /// The current mode of an output as a kscreen-doctor mode setter, from its `-j` entry — preferring
 /// the human `WxH@Hz` form (survives a mode-id re-enumeration across disable→enable) and falling back
@@ -875,14 +1026,27 @@ fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
     // the group is unambiguously the desktop — never a sibling session's output (group-aware filter).
     // Each is captured WITH its current mode so teardown restores its real refresh, not KWin's default.
     let others = other_enabled_outputs();
-    if !others.is_empty() {
-        let args: Vec<String> = others
-            .iter()
-            .map(|(o, _mode)| format!("output.{o}.disable"))
-            .collect();
-        let _ = kscreen(&args);
+    if others.is_empty() {
+        tracing::info!("KWin: streamed output set as the sole desktop (nothing else was enabled)");
+        return others;
     }
-    tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
+    let args: Vec<String> = others
+        .iter()
+        .map(|(o, _mode)| format!("output.{o}.disable"))
+        .collect();
+    if kscreen(&args) {
+        tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
+    } else {
+        // Report the request, not a success: the outputs are still enabled, so the client sees the
+        // shell wherever KWin left it. They are returned for the restore regardless — re-enabling an
+        // output that was never disabled is a harmless no-op, and dropping them here would strand a
+        // physical dark if the disable actually landed and only the ack was lost to the budget.
+        tracing::warn!(
+            attempted_disable = ?others,
+            "KWin: could not disable the other outputs for the exclusive topology (kscreen-doctor \
+             failed or hit its budget) — the streamed output is not the sole desktop"
+        );
+    }
     others
 }
 
@@ -919,10 +1083,42 @@ struct State {
     node_id: Option<u32>,
     failed: Option<String>,
     closed: bool,
-    /// Every `wl_output` KWin advertises, keyed by the proxy, with its connector name once the
-    /// `name` event arrives. Only the monitor-mirror path ([`stream_existing_output`]) needs these
-    /// — `stream_output` takes a `wl_output` object, so the connector has to be resolved to one.
-    outputs: Vec<(WlOutput, Option<String>)>,
+    /// Highest `wl_display.sync` serial whose `done` has arrived — the barrier [`roundtrip_within`]
+    /// waits on, so a compositor that accepted the connection and then stopped serving costs a
+    /// budget instead of the thread.
+    sync_done: u32,
+    /// Whether this connection needs `wl_output` objects at all — true ONLY on the monitor-mirror
+    /// path. `stream_virtual_output` names its output by string, so the virtual-output path never
+    /// reads [`State::outputs`]; binding them there was pure accumulation on a connection that
+    /// lives for the whole session, and every managed display this host creates is itself another
+    /// `wl_output` global.
+    want_outputs: bool,
+    /// Every `wl_output` KWin advertises, as (registry global name, proxy, connector once the
+    /// `name` event arrives). Only the monitor-mirror path ([`stream_existing_output`]) needs these —
+    /// `stream_output` takes a `wl_output` object, so the connector has to be resolved to one. The
+    /// global name is carried so `global_remove` can find the entry again ([`State::forget_output`]).
+    outputs: Vec<(u32, WlOutput, Option<String>)>,
+}
+
+impl State {
+    /// Drop the `wl_output` whose registry global just went away.
+    ///
+    /// Both halves matter. The proxy must be `release`d — wayland-rs sends no destructor when a
+    /// proxy is merely dropped, so an unreleased binding is a server-side object leaked for the
+    /// life of a connection that lasts as long as the session. And the ENTRY must go, because
+    /// [`run_existing`]'s connector resolve scans this vector: a stale row for an unplugged head
+    /// would shadow the live output that took its connector name.
+    fn forget_output(&mut self, global: u32) {
+        let Some(pos) = self.outputs.iter().position(|(n, _, _)| *n == global) else {
+            return;
+        };
+        let (_, out, connector) = self.outputs.remove(pos);
+        // `wl_output.release` is `since 3`; below that the object simply has no destructor.
+        if out.version() >= 3 {
+            out.release();
+        }
+        tracing::debug!(?connector, "KWin: a wl_output went away — released it");
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -934,23 +1130,45 @@ impl Dispatch<WlRegistry, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            if interface == Screencast::interface().name {
-                let v = version.min(MAX_VERSION);
-                state.screencast = Some(registry.bind::<Screencast, _, _>(name, v, qh, ()));
-            } else if interface == WlOutput::interface().name {
-                // v4 is where `wl_output.name` (the connector) arrives; bind at least that when the
-                // compositor offers it, else bind what it has and let the resolve fail loudly
-                // rather than mirroring an unidentifiable head.
-                let v = version.min(WL_OUTPUT_MAX_VERSION);
-                let out = registry.bind::<WlOutput, _, _>(name, v, qh, ());
-                state.outputs.push((out, None));
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == Screencast::interface().name {
+                    let v = version.min(MAX_VERSION);
+                    state.screencast = Some(registry.bind::<Screencast, _, _>(name, v, qh, ()));
+                } else if state.want_outputs && interface == WlOutput::interface().name {
+                    // v4 is where `wl_output.name` (the connector) arrives; bind at least that when
+                    // the compositor offers it, else bind what it has and let the resolve fail
+                    // loudly rather than mirroring an unidentifiable head.
+                    let v = version.min(WL_OUTPUT_MAX_VERSION);
+                    let out = registry.bind::<WlOutput, _, _>(name, v, qh, ());
+                    state.outputs.push((name, out, None));
+                }
             }
+            wl_registry::Event::GlobalRemove { name } => state.forget_output(name),
+            _ => {}
+        }
+    }
+}
+
+/// The `wl_display.sync` callback: `done` releases whichever [`roundtrip_within`] is waiting on
+/// this serial. A plain `roundtrip()` would do the same job in one call, but it blocks on the
+/// socket with no ceiling — against a compositor that accepted the connection and then stopped
+/// answering, that is the session's stream thread pinned forever.
+impl Dispatch<WlCallback, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        serial: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.sync_done = state.sync_done.max(*serial);
         }
     }
 }
@@ -969,8 +1187,8 @@ impl Dispatch<WlOutput, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_output::Event::Name { name } = event {
-            if let Some(slot) = state.outputs.iter_mut().find(|(o, _)| o == output) {
-                slot.1 = Some(name);
+            if let Some(slot) = state.outputs.iter_mut().find(|(_, o, _)| o == output) {
+                slot.2 = Some(name);
             }
         }
     }
@@ -1055,7 +1273,13 @@ pub(crate) fn stream_existing_output(
     let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
-        Err(_) => bail!("timed out recording the KWin output {connector:?}"),
+        Err(_) => {
+            // Same leak as the virtual-output opener: `StopOnDrop` only takes ownership of `stop`
+            // on the success path, so without this the mirror thread keeps recording a monitor
+            // nobody is watching until its own budget runs out.
+            stop.store(true, Ordering::Relaxed);
+            bail!("timed out recording the KWin output {connector:?}")
+        }
     };
     Ok(crate::mirror::MirrorStream {
         node_id,
@@ -1187,7 +1411,16 @@ pub fn probe() -> Result<()> {
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
     let mut state = State::default();
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    // Nothing to interrupt a probe: it is a one-shot question, bounded by the roundtrip budget.
+    let never = AtomicBool::new(false);
+    roundtrip_within(
+        &conn,
+        &mut queue,
+        &mut state,
+        &never,
+        1,
+        "registry roundtrip",
+    )?;
     if state.screencast.is_none() {
         bail!(
             "KWin is up but does not expose zkde_screencast_unstable_v1 to this client — KWin gates \
@@ -1227,13 +1460,22 @@ fn run_existing(
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
-    let mut state = State::default();
+    // The one path that resolves a connector to a `wl_output`, so the only one that binds them.
+    let mut state = State {
+        want_outputs: true,
+        ..State::default()
+    };
     // Two roundtrips: the first processes the globals (binding screencast + every wl_output), the
     // second drains each output's property burst — the `name` event we resolve the connector by.
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
-    queue
-        .roundtrip(&mut state)
-        .context("wl_output property roundtrip")?;
+    roundtrip_within(&conn, &mut queue, &mut state, stop, 1, "registry roundtrip")?;
+    roundtrip_within(
+        &conn,
+        &mut queue,
+        &mut state,
+        stop,
+        2,
+        "wl_output property roundtrip",
+    )?;
 
     let screencast = state.screencast.clone().ok_or_else(|| {
         anyhow!(
@@ -1251,19 +1493,19 @@ fn run_existing(
     let named: Vec<&str> = state
         .outputs
         .iter()
-        .filter_map(|(_, n)| n.as_deref())
+        .filter_map(|(_, _, n)| n.as_deref())
         .collect();
     let output = state
         .outputs
         .iter()
-        .find(|(_, n)| n.as_deref() == Some(connector))
+        .find(|(_, _, n)| n.as_deref() == Some(connector))
         .or_else(|| {
-            state.outputs.iter().find(|(_, n)| {
+            state.outputs.iter().find(|(_, _, n)| {
                 n.as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(connector))
             })
         })
-        .map(|(o, _)| o.clone())
+        .map(|(_, o, _)| o.clone())
         .ok_or_else(|| {
             if named.is_empty() {
                 anyhow!(
@@ -1285,20 +1527,7 @@ fn run_existing(
         "KWin: recording an existing output; awaiting PipeWire node"
     );
 
-    let node_id = loop {
-        queue
-            .blocking_dispatch(&mut state)
-            .context("wayland dispatch (awaiting created)")?;
-        if let Some(node) = state.node_id {
-            break node;
-        }
-        if let Some(e) = state.failed.take() {
-            bail!("stream_output failed: {e}");
-        }
-        if state.closed {
-            bail!("KWin closed the stream before it was created");
-        }
-    };
+    let node_id = await_created(&conn, &mut queue, &mut state, stop, "stream_output")?;
     setup_tx
         .send(Ok(node_id))
         .map_err(|_| anyhow!("monitor-mirror opener went away"))?;
@@ -1323,8 +1552,10 @@ fn run(
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
+    // `want_outputs` stays false: `stream_virtual_output` names its output by string, so this
+    // connection never needs a `wl_output` — and it lives for the whole session (see `State`).
     let mut state = State::default();
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    roundtrip_within(&conn, &mut queue, &mut state, stop, 1, "registry roundtrip")?;
 
     let screencast = state.screencast.clone().ok_or_else(|| {
         anyhow!(
@@ -1353,21 +1584,8 @@ fn run(
         "KWin: requested virtual output; awaiting PipeWire node"
     );
 
-    // Pump events until KWin reports the node id (or an error).
-    let node_id = loop {
-        queue
-            .blocking_dispatch(&mut state)
-            .context("wayland dispatch (awaiting created)")?;
-        if let Some(node) = state.node_id {
-            break node;
-        }
-        if let Some(e) = state.failed.take() {
-            bail!("stream_virtual_output failed: {e}");
-        }
-        if state.closed {
-            bail!("KWin closed the stream before it was created");
-        }
-    };
+    // Pump events until KWin reports the node id (or an error, or the budget).
+    let node_id = await_created(&conn, &mut queue, &mut state, stop, "stream_virtual_output")?;
     setup_tx
         .send(Ok(node_id))
         .map_err(|_| anyhow!("virtual-output opener went away"))?;
@@ -1380,25 +1598,66 @@ fn run(
     Ok(())
 }
 
-/// Keep the connection (and thus the stream) alive until told to stop, observing `closed`.
-/// `blocking_dispatch` can't be interrupted, so poll the connection fd with a short timeout and
-/// honor `stop` within ~200 ms. Shared by the virtual-output and monitor-mirror paths — for a
-/// virtual output this connection IS the output's lifetime; for a mirror it is only the
-/// recording's, and the monitor itself is untouched either way.
-fn park_until_stopped(
+/// Poll slice while waiting on the Wayland fd — the granularity at which `stop` and a deadline are
+/// observed (matches `kwin_output_mgmt`'s `POLL_MS`).
+const POLL_MS: i32 = 200;
+
+/// Budget for one compositor roundtrip. Generous next to a healthy one (a few ms); it exists only
+/// so a KWin that accepted the connection and then stopped serving cannot pin the calling thread —
+/// which for [`probe`] is whatever thread the mgmt API answered a `/display/compositors` on, and
+/// for [`run`] is the session's own bring-up.
+const ROUNDTRIP_BUDGET: Duration = Duration::from_secs(3);
+
+/// Budget for the `created` handshake (the PipeWire node id). Deliberately under the opener's own
+/// 20 s `recv_timeout` in [`spawn_vout`](VirtualDisplay::create) / [`stream_existing_output`], so
+/// the worker returns a REASON ("KWin never created the output") rather than the opener reporting a
+/// bare timeout with the worker still parked behind it.
+const CREATE_BUDGET: Duration = Duration::from_secs(15);
+
+/// How a bounded pump ended.
+enum Pumped {
+    /// The predicate held.
+    Done,
+    /// `stop` was set — the caller's output/recording was released while we waited.
+    Stopped,
+    /// The deadline passed first.
+    Expired,
+}
+
+/// Bounded manual event loop: dispatch what's queued, then poll the connection fd for up to
+/// [`POLL_MS`] and read, until `done(&state)` holds, `stop` is set, or `deadline` passes.
+///
+/// This is the only way to wait on this connection. `blocking_dispatch` and `roundtrip` cannot be
+/// interrupted and have no ceiling, so a compositor that stops answering turns any wait into a
+/// permanently stuck thread — and on the host that thread is the session's, whose only way to end a
+/// session is to return. `deadline: None` means "no ceiling", which is correct for exactly one
+/// caller: [`park_until_stopped`], where the wait IS the output's lifetime.
+fn pump_until(
     conn: &Connection,
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
+    deadline: Option<Instant>,
     stop: &AtomicBool,
-    output: &str,
-    node_id: u32,
-) -> Result<()> {
-    while !stop.load(Ordering::Relaxed) {
+    done: impl Fn(&State) -> bool,
+) -> Result<Pumped> {
+    loop {
         queue.dispatch_pending(state).context("dispatch_pending")?;
-        if state.closed {
-            tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
-            break;
+        if done(state) {
+            return Ok(Pumped::Done);
         }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(Pumped::Stopped);
+        }
+        let timeout = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(Pumped::Expired);
+                }
+                (remaining.as_millis() as i64).clamp(0, i64::from(POLL_MS)) as i32
+            }
+            None => POLL_MS,
+        };
         conn.flush().context("wayland flush")?;
         let Some(guard) = conn.prepare_read() else {
             continue; // events already queued — loop dispatches them
@@ -1411,19 +1670,99 @@ fn park_until_stopped(
         // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack, and
         // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes `revents`
         // strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because `conn` (and the
-        // `prepare_read` guard) are alive across the call. `poll` blocks up to 200 ms and writes only
-        // `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
-        let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+        // `prepare_read` guard) are alive across the call. `poll` blocks up to `timeout` ms and writes
+        // only `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
         if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
             let _ = guard.read();
-        } // else: timeout or signal — drop the guard, re-check `stop`
+        } // else: timeout or signal — drop the guard, re-check `stop` and the deadline
+    }
+}
+
+/// A `wl_display.sync` barrier bounded by [`ROUNDTRIP_BUDGET`] — the replacement for
+/// `EventQueue::roundtrip`, which waits on the socket with no ceiling. `serial` must be unique per
+/// connection (callers number theirs from 1); `what` names the wait in the error.
+fn roundtrip_within(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    stop: &AtomicBool,
+    serial: u32,
+    what: &str,
+) -> Result<()> {
+    let qh = queue.handle();
+    let _cb = conn.display().sync(&qh, serial);
+    let deadline = Instant::now() + ROUNDTRIP_BUDGET;
+    match pump_until(conn, queue, state, Some(deadline), stop, |st| {
+        st.sync_done >= serial
+    })? {
+        Pumped::Done => Ok(()),
+        Pumped::Stopped => bail!("{what} abandoned — the stream was released while we waited"),
+        Pumped::Expired => bail!(
+            "KWin accepted the Wayland connection but did not answer the {what} within \
+             {ROUNDTRIP_BUDGET:?} — the compositor is not serving this client"
+        ),
+    }
+}
+
+/// Keep the connection (and thus the stream) alive until told to stop, observing `closed`.
+/// Shared by the virtual-output and monitor-mirror paths — for a virtual output this connection IS
+/// the output's lifetime; for a mirror it is only the recording's, and the monitor itself is
+/// untouched either way. The only deadline-free [`pump_until`] in the file, for that reason.
+fn park_until_stopped(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    stop: &AtomicBool,
+    output: &str,
+    node_id: u32,
+) -> Result<()> {
+    match pump_until(conn, queue, state, None, stop, |st| st.closed)? {
+        Pumped::Done => {
+            tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
+        }
+        // `Expired` cannot happen without a deadline; `Stopped` is the ordinary teardown.
+        Pumped::Stopped | Pumped::Expired => {}
     }
     Ok(())
 }
 
+/// Wait for the `created` event carrying the PipeWire node id, bounded by [`CREATE_BUDGET`] and
+/// interruptible by `stop`.
+///
+/// The loop this replaced was a bare `blocking_dispatch` with no deadline that never read `stop`:
+/// a KWin that acknowledged `stream_virtual_output` and then never answered parked the worker
+/// thread for good, and the opener's `recv_timeout` arm — which did not set `stop` either — left it
+/// there holding a half-built output. `request` names the request in the error.
+fn await_created(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    stop: &AtomicBool,
+    request: &str,
+) -> Result<u32> {
+    let deadline = Instant::now() + CREATE_BUDGET;
+    let settled = |st: &State| st.node_id.is_some() || st.failed.is_some() || st.closed;
+    match pump_until(conn, queue, state, Some(deadline), stop, settled)? {
+        // Node id first: a `closed` that arrives in the same burst as `created` is a stream that
+        // was made and then torn down, not a failure to make one.
+        Pumped::Done => match (state.node_id, state.failed.take()) {
+            (Some(node), _) => Ok(node),
+            (None, Some(e)) => bail!("{request} failed: {e}"),
+            (None, None) => bail!("KWin closed the stream before it was created"),
+        },
+        Pumped::Stopped => bail!("{request} abandoned — released before KWin created the stream"),
+        Pumped::Expired => bail!(
+            "KWin acknowledged {request} but never sent the PipeWire node within {CREATE_BUDGET:?}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{modes_from_json, pick_custom_mode, KModeRow, MANAGED_PREFIX};
+    use super::{
+        modes_from_json, monitors_from_kscreen_json, pick_custom_mode, KModeRow, MANAGED_PREFIX,
+    };
 
     fn row(id: &str, w: u32, h: u32, hz: f64) -> KModeRow {
         KModeRow {
@@ -1504,6 +1843,80 @@ mod tests {
         }
         // Never reads another output's list (the eDP-1 entry carries a matching mode).
         assert!(modes_from_json(&doc, "Virtual-nope").is_empty());
+    }
+
+    /// The kscreen fallback for `monitors::list` must produce the same contract the in-process
+    /// reader promises: geometry from `pos` (the identity key), the mode in PIXELS with refresh in
+    /// mHz precise enough to keep 59.94 apart from 60, a DISABLED head still listed but zeroed
+    /// rather than invented, our own managed output flagged, and the list sorted by position.
+    #[test]
+    fn parses_a_kscreen_monitor_list() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"outputs":[
+                 {"id":2,"name":"HDMI-A-1","enabled":true,"priority":2,"scale":1,
+                  "pos":{"x":1920,"y":0},"vendor":"ACME","model":"U2720Q",
+                  "currentModeId":"m9","modes":[
+                    {"id":"m9","size":{"width":1920,"height":1080},"refreshRate":59.94}]},
+                 {"id":1,"name":"eDP-1","enabled":true,"priority":1,"scale":1.5,
+                  "pos":{"x":0,"y":0},
+                  "currentModeId":7,"modes":[
+                    {"id":7,"size":{"width":3840,"height":2160},"refreshRate":120.0}]},
+                 {"id":3,"name":"DP-3","enabled":false,"scale":1,"pos":{"x":0,"y":0},
+                  "modes":[{"id":"z","size":{"width":2560,"height":1440},"refreshRate":60.0}]},
+                 {"id":4,"name":"Virtual-punktfunk-7","enabled":true,"scale":1,
+                  "pos":{"x":5760,"y":0},"currentModeId":"v1","modes":[
+                    {"id":"v1","size":{"width":2560,"height":1440},"refreshRate":119.98}]}
+               ]}"#,
+        )
+        .expect("fixture parses");
+        let mons = monitors_from_kscreen_json(&doc);
+        let by = |c: &str| {
+            mons.iter()
+                .find(|m| m.connector == c)
+                .unwrap_or_else(|| panic!("{c} missing"))
+                .clone()
+        };
+        // Sorted by desktop position, not by kscreen's own order.
+        let order: Vec<&str> = mons.iter().map(|m| m.connector.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["DP-3", "eDP-1", "HDMI-A-1", "Virtual-punktfunk-7"]
+        );
+        let edp = by("eDP-1");
+        // PIXELS, at the scale the desk actually runs — the whole point of `logical_size`.
+        assert_eq!((edp.width, edp.height), (3840, 2160));
+        assert_eq!(edp.scale, 1.5);
+        assert_eq!(edp.logical_size(), (2560.0, 1440.0));
+        assert!(edp.primary, "priority 1 is KWin's primary");
+        assert_eq!(edp.refresh_mhz, 120_000);
+        // 59.94 must survive as mHz; rounding to whole Hz here is the bug this guards.
+        assert_eq!(by("HDMI-A-1").refresh_mhz, 59_940);
+        assert_eq!(by("HDMI-A-1").description, "ACME U2720Q");
+        assert!(!by("HDMI-A-1").primary);
+        // Disabled: listed (so "why can't I pick it?" has an answer) with no invented mode.
+        let dark = by("DP-3");
+        assert!(!dark.enabled);
+        assert_eq!((dark.width, dark.height, dark.refresh_mhz), (0, 0, 0));
+        // Ours, and labelled by connector when the entry carries no make/model.
+        let ours = by("Virtual-punktfunk-7");
+        assert!(ours.managed);
+        assert_eq!(ours.description, "Virtual-punktfunk-7");
+        assert!(!by("eDP-1").managed);
+    }
+
+    /// A document with no `outputs` array (an error object, or a kscreen-doctor whose schema
+    /// changed) is an empty list, never a panic — the caller's own error path already covers "the
+    /// tool did not answer".
+    #[test]
+    fn a_malformed_kscreen_document_yields_no_monitors() {
+        assert!(monitors_from_kscreen_json(&serde_json::json!({})).is_empty());
+        assert!(monitors_from_kscreen_json(&serde_json::json!({"outputs": 7})).is_empty());
+        // An output with no name cannot be pinned or resolved, so it is dropped rather than
+        // reported under an empty connector.
+        assert!(
+            monitors_from_kscreen_json(&serde_json::json!({"outputs": [{"enabled": true}]}))
+                .is_empty()
+        );
     }
 
     /// Group-aware exclusive (§6.1): with two managed group members + a physical panel enabled,
