@@ -27,15 +27,28 @@
 //! device pulls per-period) whose prime depth the mic pump sets from measured uplink jitter
 //! ([`VirtualMic::set_target_depth`]), filling silence when the client isn't talking. WASAPI
 //! objects are `!Send`, so they live entirely on that thread (mirrors `WasapiLoopbackCapturer`).
+//!
+//! **Idle stop (host must be able to SLEEP).** A RUNNING WASAPI stream makes the audio stack
+//! hold a kernel power request ("An audio stream is currently in use", attributed to the
+//! target device in `powercfg /requests`) that vetoes system sleep — and this pump is
+//! host-lifetime, so rendering silence 24/7 kept every idle Punktfunk box awake forever
+//! (field report 2026-08-12: "doesn't go to sleep anymore; powercfg shows the Steam Streaming
+//! Microphone"). So after [`IDLE_STOP_AFTER`] of silence-only output the render loop stops the
+//! stream (`IAudioClient::Stop` — the client stays initialized, the mic ENDPOINT keeps
+//! existing, only the power request is released) and parks on the queue's condvar; the next
+//! pushed frame resumes it within one device period. During a session the box is kept awake by
+//! the session's own `DisplayWakeRequest` (pf-frame), never by this silence.
+//! `PUNKTFUNK_MIC_ALWAYS_ON=1` restores the old always-running stream in case a virtual audio
+//! driver misbehaves when its render side pauses.
 
 use super::{audio_control, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 
 const CHANNELS: u32 = 2;
@@ -60,9 +73,30 @@ const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 120 / 1000) * BLOCK_ALIGN
 /// Producer-side overflow headroom (~32 ms) over the render loop's prime threshold when the
 /// adaptive target drives the ring.
 const CAP_HEADROOM_BYTES: usize = (SAMPLE_RATE as usize * 32 / 1000) * BLOCK_ALIGN;
+/// Stop the render stream after this long of silence-only output (unprimed, nothing queued), so
+/// an idle host releases the audio stack's sleep-blocking power request (see the module docs).
+/// Long enough that mid-conversation pauses never cycle the stream; resume is one condvar
+/// notify + `IAudioClient::Start`, well under the jitter buffer's prime depth.
+const IDLE_STOP_AFTER: Duration = Duration::from_secs(10);
+/// While the stream is idle-stopped the render thread parks on the queue condvar; this timeout
+/// only bounds how long a host-shutdown `stop` can go unnoticed (same discipline as the pump's
+/// `drain_sleep`).
+const IDLE_WAKE_CHECK: Duration = Duration::from_millis(250);
+
+/// The mic inject ring plus the wake signal for an idle-stopped render thread: `push` notifies
+/// on the empty→non-empty transition, which is exactly the moment a stopped stream must resume.
+type MicQueue = (Mutex<VecDeque<u8>>, Condvar);
+
+/// `PUNKTFUNK_MIC_ALWAYS_ON=1`: never idle-stop the render stream (pre-2026-08 behaviour — the
+/// host then blocks system sleep for its whole life). Escape hatch in case a virtual audio
+/// driver's capture side misbehaves while its render side is paused.
+fn mic_always_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PUNKTFUNK_MIC_ALWAYS_ON").is_some_and(|v| v != "0"))
+}
 
 pub struct WasapiVirtualMic {
-    queue: Arc<Mutex<VecDeque<u8>>>,
+    queue: Arc<MicQueue>,
     stop: Arc<AtomicBool>,
     /// False once the render thread has exited (device error or stop) — the pump's reopen signal.
     alive: Arc<AtomicBool>,
@@ -94,7 +128,7 @@ impl WasapiVirtualMic {
             channels == CHANNELS,
             "virtual mic is stereo-only (got {channels})"
         );
-        let queue = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let queue = Arc::new((Mutex::new(VecDeque::<u8>::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let ring = Arc::new(RingShared::default());
@@ -144,9 +178,11 @@ impl VirtualMic for WasapiVirtualMic {
         if !self.alive.load(Ordering::Acquire) {
             return false;
         }
-        let Ok(mut q) = self.queue.lock() else {
+        let (lock, wake) = &*self.queue;
+        let Ok(mut q) = lock.lock() else {
             return false;
         };
+        let was_empty = q.is_empty();
         q.reserve(pcm.len() * 4);
         for &s in pcm {
             q.extend(s.to_le_bytes());
@@ -171,6 +207,12 @@ impl VirtualMic for WasapiVirtualMic {
                 .overflow
                 .fetch_add((excess / BLOCK_ALIGN) as u64, Ordering::Relaxed);
         }
+        drop(q);
+        if was_empty {
+            // Empty→non-empty is the resume moment for an idle-stopped stream (the waiter
+            // re-checks the queue under the lock, so this cannot be a lost wakeup).
+            wake.notify_one();
+        }
         true
     }
 
@@ -179,7 +221,7 @@ impl VirtualMic for WasapiVirtualMic {
     }
 
     fn discard(&self) {
-        if let Ok(mut q) = self.queue.lock() {
+        if let Ok(mut q) = self.queue.0.lock() {
             q.clear();
         }
     }
@@ -199,7 +241,7 @@ impl VirtualMic for WasapiVirtualMic {
         if prime == 0 {
             return None; // render loop hasn't run yet
         }
-        let q = self.queue.lock().ok()?;
+        let q = self.queue.0.lock().ok()?;
         Some((q.len() / BLOCK_ALIGN, prime / BLOCK_ALIGN))
     }
 
@@ -387,7 +429,7 @@ fn try_install_steam_audio(inf_name: &str) -> bool {
 }
 
 fn render_thread(
-    queue: Arc<Mutex<VecDeque<u8>>>,
+    queue: Arc<MicQueue>,
     stop: Arc<AtomicBool>,
     shared: Arc<RingShared>,
     ready: SyncSender<Result<String>>,
@@ -461,7 +503,40 @@ fn render_thread(
     // the target).
     let mut buf: Vec<u8> = Vec::new();
     let mut primed = false;
-    while !stop.load(Ordering::Relaxed) {
+    // Idle stop (see the module docs): `running` mirrors the stream's Start/Stop state, and
+    // `idle_mark` is the queue length last seen while unprimed plus when it was first seen at
+    // that length — IDLE_STOP_AFTER of unprimed output at an UNCHANGED length is the idle
+    // verdict. Keying on the length (not just emptiness) covers a sub-prime tail a vanished
+    // client left behind, while any genuinely new audio moves the length (a push appends a
+    // whole frame and the drop-oldest cap sits above the prime threshold, so an unprimed queue
+    // can never coincidentally return to its marked length) and restarts the window.
+    let always_on = mic_always_on();
+    let mut running = true;
+    let mut idle_mark: Option<(usize, Instant)> = None;
+    'render: while !stop.load(Ordering::Relaxed) {
+        if !running {
+            // Idle-stopped: park on the condvar until mic audio arrives (push notifies on the
+            // empty→non-empty edge); the timeout only keeps `stop` responsive.
+            {
+                let (lock, wake) = &*queue;
+                let mut q = lock.lock().unwrap();
+                while q.is_empty() {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'render;
+                    }
+                    let (guard, _timed_out) = wake.wait_timeout(q, IDLE_WAKE_CHECK).unwrap();
+                    q = guard;
+                }
+            }
+            // A resume failure means the endpoint died while we slept — propagate, so the
+            // thread exits, `alive` flips, and the pump reopens (fresh plan) as for any death.
+            audio_client
+                .start_stream()
+                .context("resume render stream")?;
+            running = true;
+            idle_mark = None;
+            tracing::debug!("virtual mic stream resumed (client mic audio arrived)");
+        }
         // The device signals when it wants more data; finite timeout keeps `stop` responsive.
         if h_event.wait_for_event(100).is_err() {
             continue;
@@ -486,7 +561,7 @@ fn render_thread(
         // Silence base; overwrite with queued mic PCM once the cushion is primed.
         buf[..need].fill(0);
         {
-            let mut q = queue.lock().unwrap();
+            let mut q = queue.0.lock().unwrap();
             if !primed && q.len() >= prime {
                 primed = true;
             }
@@ -498,6 +573,35 @@ fn render_thread(
                 if q.is_empty() {
                     primed = false; // fully drained — re-prime before producing again
                     shared.reprimes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if primed {
+                idle_mark = None;
+            } else if !always_on {
+                // Unprimed = this period was pure silence. After IDLE_STOP_AFTER of that at an
+                // unchanged queue length, stop the stream so the box can sleep. Decided under
+                // the queue lock, and only when nothing has arrived for the whole window (see
+                // `idle_mark`'s docs) — a burst landing at the boundary moves the length and
+                // resets the window instead of being cleared. What IS cleared is ≥10 s stale
+                // (the pump's stale-gap discard would drop it before the next real frame
+                // anyway), which keeps "queue empty" ⇔ "nothing to play" for the wait above.
+                match idle_mark {
+                    Some((len, since)) if len == q.len() => {
+                        if since.elapsed() >= IDLE_STOP_AFTER {
+                            q.clear();
+                            audio_client
+                                .stop_stream()
+                                .context("idle-stop render stream")?;
+                            running = false;
+                            idle_mark = None;
+                            tracing::debug!(
+                                "virtual mic stream idle-stopped (releases the sleep-blocking \
+                                 audio power request; next mic frame resumes it)"
+                            );
+                            continue 'render;
+                        }
+                    }
+                    _ => idle_mark = Some((q.len(), Instant::now())),
                 }
             }
         }

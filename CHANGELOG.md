@@ -184,6 +184,20 @@ but latches nothing; only the full-length attempts that follow hand down negotia
 classification is a pure function with tests
 (`pf_capture::linux::first_frame_timeout_tests`).
 
+### Windows host — an idle box can sleep again (virtual-mic stream idle-stop)
+
+🛑 **Installing the host blocked system sleep forever, client connected or not.** The
+host-lifetime mic pump kept a WASAPI render stream RUNNING on the virtual-mic device
+(typically the Steam Streaming Microphone), writing silence 24/7 — and any running stream makes
+the Windows audio stack hold a kernel power request ("An audio stream is currently in use" in
+`powercfg /requests`, attributed to that device) that vetoes sleep. The render loop now stops
+the stream (`IAudioClient::Stop`; the client stays initialized and the mic *endpoint* keeps
+existing for apps to bind) after 10 s of silence-only output and resumes on the next mic frame
+within one device period — below the jitter buffer's prime depth, so nothing is audible.
+Streaming sessions still hold the box awake through their own `PowerRequest` assertions, as
+before. New knob: `PUNKTFUNK_MIC_ALWAYS_ON=1` restores the old always-running stream in case a
+third-party virtual audio driver misbehaves while its render side is paused.
+
 ## v0.27.0
 
 87 commits since v0.26.0.

@@ -13,7 +13,7 @@
 //! (portrait paths starting with `/` load from disk), the GPU-only dev path.
 
 use crate::session_main::{
-    arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, window_pos,
+    arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, stats_tier, window_pos,
 };
 use pf_client_core::gamepad::is_steam_deck;
 use pf_client_core::{discovery, library, trust, wol};
@@ -141,11 +141,18 @@ pub fn run(target: Option<&str>) -> u8 {
     let json_status = arg_flag("--json-status");
     let settings_at_start = trust::Settings::load();
     // The console's window and its input models are built ONCE, from the global defaults, and
-    // live across every launch — so the presentation-tier fields below (stats tier, touch and
-    // mouse model, shortcut inhibit, match-window, render scale) are latched here and a per-host
-    // profile cannot move them in this mode. Everything the HOST is told (mode, bitrate, codec,
-    // audio, pad) is re-resolved per launch and does honor the binding. Closing that gap means
-    // rebuilding the presenter's models per launch — profiles P4 territory, not P0.
+    // live across every launch — so the presentation-tier fields below (touch and mouse model,
+    // shortcut inhibit, match-window, render scale) are latched here and a per-host profile
+    // cannot move them in this mode. Everything the HOST is told (mode, bitrate, codec, audio,
+    // pad) is re-resolved per launch and does honor the binding. Closing the rest of that gap
+    // means rebuilding the presenter's models per launch — profiles P4 territory, not P0.
+    //
+    // ⚠ The STATS TIER used to be latched here too, and that was a bug people hit: the console's
+    // own settings screen writes the tier to the file and redraws its row, so the choice looked
+    // taken while every stream kept the tier the process started on — "no matter what I select
+    // the overlay is stuck on Detailed", cured only by restarting the app. It now rides
+    // `SessionParams` per launch (`stats_verbosity`), so the value below only seeds the loop
+    // until the first stream. Anything else moved off this snapshot has to travel the same way.
     let latched_mouse = settings_at_start.mouse_mode();
 
     // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
@@ -162,11 +169,8 @@ pub fn run(target: Option<&str>) -> u8 {
         ),
         fullscreen: fullscreen_mode(),
         window_pos: window_pos(),
-        // `--stats` forces the overlay visible without demoting a richer chosen tier.
-        stats_verbosity: match settings_at_start.stats_verbosity() {
-            trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
-            v => v,
-        },
+        // Seeds the loop only — every launch carries its own freshly resolved tier.
+        stats_verbosity: stats_tier(&settings_at_start),
         touch_mode: settings_at_start.touch_mode(),
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
