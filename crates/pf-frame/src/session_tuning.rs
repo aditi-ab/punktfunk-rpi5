@@ -8,14 +8,16 @@
 //!
 //! Raw C-ABI FFI (winmm/kernel32/dwmapi/avrt) rather than the `windows` crate so it builds without
 //! pulling new windows-rs features. No-op on non-Windows. Per-thread effects (MMCSS, execution
-//! state) auto-revert at thread exit (= session end); the process-wide bits revert at process exit.
+//! state) auto-revert at thread exit (= session end); the process-wide bits are refcounted over
+//! the hot threads and revert when the LAST one exits — the host must not keep HIGH priority and
+//! a 1 ms global timer while a local game runs and nobody streams (2026-08-12 field report).
 //! See `design/host-latency-plan.md` Tier 3A.
 
 #[cfg(target_os = "windows")]
 mod imp {
     #![allow(non_snake_case)]
     use std::ffi::c_void;
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
 
     type Handle = *mut c_void;
     type Bool = i32;
@@ -23,6 +25,7 @@ mod imp {
     #[link(name = "winmm")]
     unsafe extern "system" {
         fn timeBeginPeriod(uPeriod: u32) -> u32;
+        fn timeEndPeriod(uPeriod: u32) -> u32;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -55,6 +58,7 @@ mod imp {
     }
 
     const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
     const ES_CONTINUOUS: u32 = 0x8000_0000;
     const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
     const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
@@ -114,16 +118,19 @@ mod imp {
         }
     }
 
-    static PROCESS_TUNED: OnceLock<()> = OnceLock::new();
+    /// Live hot (session) threads. A Mutex, not an atomic: the 0↔1 transitions carry the
+    /// apply/revert side effects, and an interleaved fetch_add/fetch_sub pair could otherwise
+    /// finish with a running session untuned (transitions are rare — thread start/exit only).
+    static HOT_THREADS: Mutex<usize> = Mutex::new(0);
 
-    /// Process-wide tuning, applied exactly once. Reverts at process exit. Best-effort: each call is
-    /// independent and a failure is ignored (e.g. a non-elevated host may not get HIGH class).
-    fn tune_process_once() {
+    /// Process-wide tuning, applied when the FIRST hot thread registers. Best-effort: each call
+    /// is independent and a failure is ignored (e.g. a non-elevated host may not get HIGH class).
+    fn tune_process() {
         // SAFETY: each call is a C-ABI FFI into winmm/kernel32/dwmapi declared with a matching
         // `extern "system"` signature; every argument is a plain integer (no pointers/buffers escape),
         // and `GetCurrentProcess()` returns the current-process pseudo-handle (a constant, always valid,
-        // never closed). The body runs inside `get_or_init`, so it executes exactly once per process.
-        PROCESS_TUNED.get_or_init(|| unsafe {
+        // never closed).
+        unsafe {
             // 1 ms timer granularity (default ~15.6 ms) — the floor for precise frame pacing and the
             // encode|send split's sub-ms sleeps.
             timeBeginPeriod(1);
@@ -134,16 +141,66 @@ mod imp {
             // control/capture/encode/send threads on the CPU (Apollo does the same).
             SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
             tracing::info!("windows session tuning applied (timer 1ms, DWM MMCSS, HIGH priority)");
-        });
+        }
     }
 
-    /// Call at the start of each capture/encode/send (hot stream) thread. Applies the process-wide
-    /// tuning once, registers the calling thread with MMCSS ("Games"), and asserts the display/system
-    /// must stay awake for as long as this thread lives. The MMCSS handle is intentionally leaked and
-    /// the execution-state assertion is bound to this thread — both are reverted by the OS when the
-    /// thread exits, so a session that ends tears them down without explicit bookkeeping.
+    /// The mirror of [`tune_process`], run when the LAST hot thread exits. Leaving the tuning in
+    /// place used to be the design ("reverts at process exit") — but the host is a 24/7 service,
+    /// so after one stream it competed at HIGH class with a 1 ms global timer against whatever
+    /// the user played locally, forever.
+    fn untune_process() {
+        // SAFETY: same FFI surface as `tune_process` — plain-integer arguments, constant
+        // pseudo-handle, no pointers or buffers.
+        unsafe {
+            timeEndPeriod(1); // pairs the timeBeginPeriod(1)
+            DwmEnableMMCSS(0);
+            SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+            tracing::info!("windows session tuning reverted (timer, DWM MMCSS, NORMAL priority)");
+        }
+    }
+
+    /// One per hot thread, parked in TLS by [`on_hot_thread`]; its Drop runs at thread exit
+    /// (= session teardown), the same lifetime the MMCSS/execution-state effects already ride.
+    struct HotThreadGuard;
+
+    impl Drop for HotThreadGuard {
+        fn drop(&mut self) {
+            // A poisoned lock skips the revert (best-effort, like every call here) instead of
+            // panicking inside a TLS destructor.
+            if let Ok(mut n) = HOT_THREADS.lock() {
+                *n -= 1;
+                if *n == 0 {
+                    untune_process();
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static HOT_THREAD: std::cell::OnceCell<HotThreadGuard> =
+            const { std::cell::OnceCell::new() };
+    }
+
+    /// Call at the start of each capture/encode/send (hot stream) thread. Registers the thread in
+    /// the process-tuning refcount (first in applies, last out reverts), registers it with MMCSS
+    /// ("Games"), and asserts the display/system must stay awake for as long as this thread lives.
+    /// The MMCSS handle is intentionally leaked and the execution-state assertion is bound to this
+    /// thread — both are reverted by the OS when the thread exits, and the refcount guard's TLS
+    /// Drop runs there too, so a session that ends tears everything down without explicit
+    /// bookkeeping.
     pub fn on_hot_thread() {
-        tune_process_once();
+        HOT_THREAD.with(|slot| {
+            if slot.get().is_none() {
+                {
+                    let mut n = HOT_THREADS.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        tune_process();
+                    }
+                }
+                let _ = slot.set(HotThreadGuard);
+            }
+        });
         // SAFETY: C-ABI FFI declared with matching `extern "system"` signatures. SetThreadExecutionState
         // takes only flag bits. `task` is a local NUL-terminated UTF-16 buffer ("Games\0") alive for the
         // whole block, so `task.as_ptr()` is a valid LPCWSTR for the call, and `&mut idx` is a live local
