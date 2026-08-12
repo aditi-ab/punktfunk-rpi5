@@ -30,13 +30,34 @@ That ordering is the whole prerequisite:
 > says so rather than pretending. On every client but the Linux one you can also type the MAC in by
 > hand; see the table below.
 
-The packet goes to every local interface's subnet broadcast address *and* to `255.255.255.255`, on
+The packet goes **out of every one of the client's network interfaces** — from a socket bound to
+that interface's own address, aimed at both its subnet broadcast address and `255.255.255.255` — on
 UDP ports 9 and 7, repeated three times, plus a unicast to the host's last known address. That
-spread is deliberate: a sleeping machine has no ARP entry, so a plain unicast cannot find it.
+spread is deliberate: a sleeping machine has no ARP entry, so a plain unicast cannot find it, and a
+broadcast sent without binding an interface leaves by the default route only, which on a machine
+running a VPN or a mesh network is not the LAN the host sleeps on.
 
 Neither the advert nor a magic packet is authenticated. That is fine here — a wrong address only
 makes the wake fail, and the host's certificate fingerprint still gates the actual connection. See
 [Security](/docs/security).
+
+### Over Wi-Fi
+
+A host on Wi-Fi wakes from the same packet. The mechanism is **WoWLAN** (Wake on Wireless LAN):
+the adapter stays associated to your access point while the machine sleeps, the access point holds
+broadcast frames for its sleeping stations and releases them on the next beacon, and the adapter
+wakes the machine when one of them is a magic packet. Punktfunk publishes a Wi-Fi card's address
+exactly like a wired one, so there is nothing different to do on the client — but the card has to be
+armed for it, which is a different switch from the wired one. See
+[Linux (Wi-Fi)](#linux-wi-fi) and [Windows](#windows) below.
+
+Two things can still stop it, and neither is visible from Punktfunk:
+
+- Some access points and mesh systems drop or rate-limit broadcast traffic to sleeping stations
+  (often as "multicast enhancement", "broadcast filtering" or IGMP snooping). If wired hosts wake
+  and a Wi-Fi one never does, that is the first thing to turn off.
+- Some laptops and adapters cut power to the Wi-Fi card in deeper sleep states, which drops the
+  association and with it any chance of a wake.
 
 ## Waking from a client
 
@@ -135,7 +156,7 @@ whether a machine may be woken off the network is yours to make.
 ### Check the host log first
 
 This is the fastest diagnosis. On **Linux**, the host inspects the card carrying the address it
-advertises, each time it starts advertising, and writes one of two lines:
+advertises, each time it starts advertising, and writes one line about it. A wired card:
 
 ```text
 Wake-on-LAN armed (magic packet) on host NIC
@@ -145,18 +166,29 @@ Wake-on-LAN armed (magic packet) on host NIC
 Wake-on-LAN is NOT armed on this host's NIC — clients cannot wake it from sleep.
 ```
 
+A Wi-Fi card, which is armed through an entirely different mechanism and is asked about separately
+(`iw phy … wowlan show`, not `ethtool`):
+
+```text
+Wake-on-WLAN armed (magic packet) on host Wi-Fi NIC
+```
+
+```text
+Wake-on-WLAN is NOT armed on this host's Wi-Fi NIC — clients cannot wake it from sleep.
+```
+
 The warning line goes on to name the interface and the exact command to fix it. The host only
-reports; it never changes the card's settings. It stays silent when it cannot tell — `ethtool`
-missing, or not enough privilege — rather than guessing, and it says nothing at all when mDNS
-adverts are switched off (`PUNKTFUNK_MDNS=0` or `--no-mdns`), because then no address is published
-either.
+reports; it never changes the card's settings. It stays silent when it cannot tell — `iw` or
+`ethtool` missing, a driver that doesn't answer, or not enough privilege — rather than guessing, and
+it says nothing at all when mDNS adverts are switched off (`PUNKTFUNK_MDNS=0` or `--no-mdns`),
+because then no address is published either.
 
 Read the line on the web console's **Logs** page, or in the journal with
 `journalctl --user -u punktfunk-host`. See [Troubleshooting](/docs/troubleshooting#still-stuck).
 
 **Windows and macOS hosts do not run this check**, so there is no log line to look for there.
 
-### Linux
+### Linux (wired)
 
 Ask the card what it is doing. `Supports Wake-on:` is the capability; `Wake-on:` is the current
 setting. `g` means magic packet, `d` means disabled.
@@ -174,6 +206,42 @@ sudo ethtool -s enp5s0 wol g
 On many systems that does not survive a reboot. Re-run `ethtool enp5s0` after the next boot to check,
 and make it permanent through your distribution's network configuration if it reset.
 
+### Linux (Wi-Fi)
+
+`ethtool` is the wrong tool here — most wireless drivers report `Wake-on: d` whether or not they are
+armed, because the trigger lives in the wireless stack instead. Ask `iw`, using the *phy* behind the
+interface (`/sys/class/net/wlan0/phy80211/name`, usually `phy0`):
+
+```bash
+iw phy phy0 wowlan show
+```
+
+`WoWLAN is disabled` means no wake. Armed looks like this, and the `* wake up on magic packet` line
+is the one that matters:
+
+```text
+WoWLAN is enabled:
+ * wake up on magic packet
+```
+
+Arm it:
+
+```bash
+sudo iw phy phy0 wowlan enable magic-packet
+```
+
+That setting is per-phy and NetworkManager re-applies its own on every connection, so on a
+NetworkManager system make it stick on the connection instead — this survives reboots and
+reconnects:
+
+```bash
+sudo nmcli connection modify <connection> 802-11-wireless.wake-on-wlan magic
+```
+
+`iw phy phy0 wowlan show` reporting `command failed: Operation not supported` means the driver has no
+WoWLAN support at all; that adapter cannot be woken over Wi-Fi. Check `iw list | grep -A5 "WoWLAN"`
+for what the hardware claims to support.
+
 ### Windows
 
 Open **Device Manager**, find the network adapter under **Network adapters**, and open its
@@ -181,10 +249,17 @@ properties. On the **Power Management** tab, allow the device to wake the comput
 **Advanced** tab, enable the adapter's magic-packet wake property if it has one. Exact wording
 depends on the driver.
 
+Wi-Fi adapters use the same two tabs. The **Advanced** property is often called **Wake on Magic
+Packet** there too, sometimes **Wake on Wireless LAN**; many Wi-Fi drivers expose neither, and those
+cannot be woken over Wi-Fi. `powercfg /devicequery wake_armed` lists every device currently allowed
+to wake the machine — if the adapter is not in it, nothing on the network can wake this host.
+
 ## Limits
 
-- **Wired Ethernet is what works.** Waking over Wi-Fi is unreliable and depends entirely on the
-  adapter and the platform.
+- **Wired Ethernet is the sure thing; Wi-Fi works when the adapter supports WoWLAN.** Punktfunk
+  sends the same packet either way and publishes a Wi-Fi card's address like any other, but whether
+  a sleeping adapter is still listening is the adapter's and the access point's decision —
+  see [Over Wi-Fi](#over-wi-fi).
 - **Connect once while the host is awake**, on the same local network, before you rely on waking it.
   A host you only ever added by address, on a network where mDNS never reached it, has no learned
   address — the CLI will tell you so, and the apps will not offer the wake action. Typing the MAC in

@@ -7,14 +7,22 @@
 //!
 //! Reliability (this is the whole point — a sleeping host has no ARP entry, so a plain unicast
 //! can't wake it, and `255.255.255.255` alone leaves only via the default route). For each
-//! known host MAC we send the 102-byte packet to:
-//!   * every non-loopback IPv4 interface's **subnet-directed broadcast** (routes to that NIC's
-//!     segment — this is what covers multi-homed clients on VPN/docker/multiple LANs), and
-//!   * the **limited broadcast** `255.255.255.255`, and
-//!   * optionally a **unicast** to the host's last-known IP (covers the brief window where the
-//!     host is reachable but hasn't re-advertised, and NICs that wake on a directed unicast),
+//! known host MAC we send the 102-byte packet:
+//!   * **out of every non-loopback IPv4 interface**, from a socket bound to that interface's own
+//!     address, to both that NIC's **subnet-directed broadcast** and the **limited broadcast**
+//!     `255.255.255.255` — binding the source is what forces the datagram onto that segment
+//!     instead of whatever the default route happens to be (a VPN/mesh interface, typically), and
+//!   * from an unbound socket to `255.255.255.255` and, when known, a **unicast** to the host's
+//!     last-known IP (covers the brief window where the host is reachable but hasn't
+//!     re-advertised, and NICs that wake on a directed unicast),
 //!
 //! on the two conventional WoL ports (9 and 7), repeated a few times to survive UDP loss.
+//!
+//! **Wi-Fi hosts (WoWLAN) ride the same path**, and the per-interface egress above is what makes
+//! them work: a station in WoWLAN sleep stays associated, and the AP buffers broadcast frames for
+//! its sleeping stations and flushes them on the next DTIM beacon — so the broadcast does reach
+//! the sleeping NIC, but only if the datagram actually leaves via the wireless interface. The
+//! host end of it (arming the NIC's magic-packet trigger) is `punktfunk-host`'s `wol` module.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -64,41 +72,63 @@ pub fn build_magic_packet(mac: Mac) -> [u8; 102] {
 /// directed broadcast with no route) doesn't fail the whole wake. Errors only if no socket
 /// could be opened or nothing could be sent at all.
 pub fn send_magic_packet(macs: &[Mac], last_known_ip: Option<Ipv4Addr>) -> io::Result<()> {
+    send_magic_packet_on(macs, last_known_ip, &WOL_PORTS)
+}
+
+/// [`send_magic_packet`] with the destination ports spelled out. Private because the ports are
+/// not a caller's business — it exists so the tests can aim a real send at a port they're allowed
+/// to bind (9 and 7 are privileged) and assert the bytes that come off the wire.
+fn send_magic_packet_on(
+    macs: &[Mac],
+    last_known_ip: Option<Ipv4Addr>,
+    ports: &[u16],
+) -> io::Result<()> {
     if macs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no MAC addresses",
         ));
     }
+    let packets: Vec<[u8; 102]> = macs.iter().map(|m| build_magic_packet(*m)).collect();
 
-    // Build the target IP set: each interface's directed broadcast, the limited broadcast, and
-    // the optional last-known unicast. Dedup so a single-NIC client doesn't send twice.
-    let mut targets = broadcast_addrs();
-    targets.push(Ipv4Addr::BROADCAST); // 255.255.255.255
+    // Targets that go out the default route (or wherever the routing table sends them): the
+    // limited broadcast as a baseline, plus the optional unicast — destination routing picks the
+    // right NIC for a unicast, so it doesn't need per-interface treatment.
+    let mut routed: Vec<Ipv4Addr> = vec![Ipv4Addr::BROADCAST];
     if let Some(ip) = last_known_ip {
-        targets.push(ip);
+        routed.push(ip);
     }
-    targets.sort_unstable();
-    targets.dedup();
-
-    // One broadcast-enabled socket bound to all interfaces. Directed broadcasts route to the
-    // matching NIC via the routing table; the limited broadcast leaves via the default route.
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    sock.set_broadcast(true)?;
 
     let mut sent_any = false;
-    for _ in 0..BURST {
-        for mac in macs {
-            let pkt = build_magic_packet(*mac);
-            for ip in &targets {
-                for port in WOL_PORTS {
-                    let dst = SocketAddr::V4(SocketAddrV4::new(*ip, port));
-                    if sock.send_to(&pkt, dst).is_ok() {
-                        sent_any = true;
-                    }
-                }
-            }
+
+    // Per-interface pass. One socket per non-loopback IPv4 address, bound to that address so the
+    // datagram leaves on THAT segment: without this, `255.255.255.255` follows the default route
+    // only (a VPN/mesh NIC on most of these machines) and never touches the LAN — or the Wi-Fi
+    // segment the sleeping WoWLAN station is associated to.
+    for (local, bcast) in local_v4_segments() {
+        let Ok(sock) = UdpSocket::bind(SocketAddrV4::new(local, 0)) else {
+            // Bind failed (address just went away, or the OS refuses it) — fall back to the
+            // routed socket below, which still reaches this segment's directed broadcast.
+            routed.push(bcast);
+            continue;
+        };
+        if sock.set_broadcast(true).is_err() {
+            routed.push(bcast);
+            continue;
         }
+        sent_any |= blast(&sock, &packets, &[bcast, Ipv4Addr::BROADCAST], ports);
+    }
+
+    // Routed pass, and the only pass on a machine whose interfaces can't be enumerated.
+    if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        // A refused SO_BROADCAST doesn't abort the pass: the unicast target still goes out, and
+        // the per-interface sockets above may already have carried the broadcast.
+        let _ = sock.set_broadcast(true);
+        routed.sort_unstable();
+        routed.dedup();
+        sent_any |= blast(&sock, &packets, &routed, ports);
+    } else if !sent_any {
+        return Err(io::Error::other("no socket could be opened for the wake"));
     }
 
     if sent_any {
@@ -108,10 +138,33 @@ pub fn send_magic_packet(macs: &[Mac], last_known_ip: Option<Ipv4Addr>) -> io::R
     }
 }
 
-/// Subnet-directed broadcast address of every non-loopback IPv4 interface (`ip | !netmask`,
-/// or the OS-provided broadcast when present). Best-effort: interface enumeration failing
-/// (permissions, exotic platform) yields an empty list, and the limited broadcast still fires.
-fn broadcast_addrs() -> Vec<Ipv4Addr> {
+/// Send every packet to every target, on every port, [`BURST`] times. Returns whether any
+/// single datagram made it out — an unroutable target is expected and never fails the wake.
+fn blast(sock: &UdpSocket, packets: &[[u8; 102]], targets: &[Ipv4Addr], ports: &[u16]) -> bool {
+    let mut sent_any = false;
+    for _ in 0..BURST {
+        for pkt in packets {
+            for ip in targets {
+                // A degenerate 0.0.0.0 (unconfigured NIC) is not a destination.
+                if ip.is_unspecified() {
+                    continue;
+                }
+                for port in ports {
+                    let dst = SocketAddr::V4(SocketAddrV4::new(*ip, *port));
+                    if sock.send_to(pkt, dst).is_ok() {
+                        sent_any = true;
+                    }
+                }
+            }
+        }
+    }
+    sent_any
+}
+
+/// Every non-loopback IPv4 interface as `(its own address, its subnet-directed broadcast)`. The
+/// broadcast is the OS-provided one where present, else `ip | !netmask`. Best-effort: enumeration
+/// failing (permissions, exotic platform) yields an empty list and the routed pass still fires.
+fn local_v4_segments() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     let mut out = Vec::new();
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(i) => i,
@@ -122,14 +175,13 @@ fn broadcast_addrs() -> Vec<Ipv4Addr> {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
+            if v4.ip.is_unspecified() {
+                continue; // nothing to bind to
+            }
             let bcast = v4
                 .broadcast
                 .unwrap_or_else(|| Ipv4Addr::from(u32::from(v4.ip) | !u32::from(v4.netmask)));
-            // Skip a degenerate 0.0.0.0 (unconfigured) and the all-ones limited broadcast we
-            // already add unconditionally.
-            if !bcast.is_unspecified() && bcast != Ipv4Addr::BROADCAST {
-                out.push(bcast);
-            }
+            out.push((v4.ip, bcast));
         }
     }
     out
@@ -183,10 +235,47 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_addrs_never_contains_limited_or_unspecified() {
-        for b in broadcast_addrs() {
-            assert_ne!(b, Ipv4Addr::BROADCAST);
-            assert!(!b.is_unspecified());
+    fn local_segments_are_bindable_and_have_a_broadcast() {
+        for (local, bcast) in local_v4_segments() {
+            // The local address is what we bind the per-interface socket to, so it must be a
+            // real address — and it must never be the loopback (filtered) or unspecified.
+            assert!(!local.is_unspecified());
+            assert!(!local.is_loopback());
+            assert!(!bcast.is_unspecified());
+            // Binding to an address the OS just reported must work; a failure here would mean
+            // the per-interface pass silently degrades to the routed one.
+            assert!(UdpSocket::bind(SocketAddrV4::new(local, 0)).is_ok());
         }
+    }
+
+    #[test]
+    fn blast_reports_nothing_sent_for_an_empty_target_list() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let pkt = [build_magic_packet([1, 2, 3, 4, 5, 6])];
+        assert!(!blast(&sock, &pkt, &[], &WOL_PORTS));
+        // An unconfigured 0.0.0.0 target is skipped rather than sent to.
+        assert!(!blast(&sock, &pkt, &[Ipv4Addr::UNSPECIFIED], &WOL_PORTS));
+        // Loopback is a real destination — this one must go out.
+        assert!(blast(&sock, &pkt, &[Ipv4Addr::LOCALHOST], &[9999]));
+    }
+
+    /// The whole send path, end to end: a real receiver gets a real magic packet with the right
+    /// bytes. Aimed at loopback on an unprivileged port (WoL's own 9 and 7 need root to bind),
+    /// which exercises the routed pass's unicast leg — the one a WoWLAN host is woken by when
+    /// the AP filters broadcast to sleeping stations.
+    #[test]
+    fn send_delivers_the_magic_packet_to_a_listener() {
+        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind receiver");
+        let port = rx.local_addr().expect("local addr").port();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+
+        let mac: Mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        send_magic_packet_on(&[mac], Some(Ipv4Addr::LOCALHOST), &[port]).expect("send");
+
+        let mut buf = [0u8; 256];
+        let (n, _from) = rx.recv_from(&mut buf).expect("a magic packet must arrive");
+        assert_eq!(n, 102);
+        assert_eq!(buf[..102], build_magic_packet(mac));
     }
 }
