@@ -1542,9 +1542,11 @@ async fn display_settings_surface() {
     assert!(enforced.contains(&"mode_conflict"));
     assert!(enforced.contains(&"identity"));
     assert!(enforced.contains(&"layout"));
-    // The experimental DDC/CI + PnP-disable axes are acted on (Windows exclusive-isolate path).
+    // The experimental DDC/CI + PnP-disable + EDID-lock axes are acted on (Windows
+    // exclusive-isolate path; edid_lock additionally needs an AMD driver to do anything).
     assert!(enforced.contains(&"ddc_power_off"));
     assert!(enforced.contains(&"pnp_disable_monitors"));
+    assert!(enforced.contains(&"edid_lock"));
 }
 
 /// The display state/release endpoints are wired + auth-gated. On the test host no backend has

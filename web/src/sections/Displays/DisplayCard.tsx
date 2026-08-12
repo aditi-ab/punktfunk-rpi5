@@ -23,6 +23,7 @@ import {
 	useSetDisplaySettings,
 	useUpdateCustomPreset,
 } from "@/api/gen/display/display";
+import { useListGpus } from "@/api/gen/gpu/gpu";
 import type {
 	ApiDisplayInfo,
 	CustomPreset,
@@ -341,6 +342,11 @@ export const DisplayForm: FC<{
 }) => {
 	const qc = useQueryClient();
 	const { confirm, promptText } = useDialogs();
+	// The EDID-lock toggle is gated on an AMD GPU being present — the axis is the AMD driver's
+	// ADL connector-emulation lever and exists nowhere else. GPUs don't hot-swap; one fetch with
+	// the section's lifetime is plenty (no refetch interval).
+	const gpus = useListGpus();
+	const amdHost = (gpus.data?.gpus ?? []).some((g) => g.vendor === "amd");
 	const createPreset = useCreateCustomPreset();
 	const updatePreset = useUpdateCustomPreset();
 	const deletePreset = useDeleteCustomPreset();
@@ -393,6 +399,7 @@ export const DisplayForm: FC<{
 				game_session: draft.game_session ?? "auto",
 				ddc_power_off: draft.ddc_power_off ?? false,
 				pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
+				edid_lock: draft.edid_lock ?? false,
 				// Which screen we stream is not a display-behavior axis at all — swapping the
 				// streamed screen out from under the operator because they changed a preset would be
 				// the worst kind of surprise. From the SERVER, not the draft (see serverCaptureMonitor).
@@ -415,6 +422,7 @@ export const DisplayForm: FC<{
 			// The experimental axes aren't part of a preset — keep the current settings.
 			ddc_power_off: draft.ddc_power_off ?? false,
 			pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
+			edid_lock: draft.edid_lock ?? false,
 			// Nor is the streamed screen: this builds a FRESH policy object rather than spreading
 			// the draft, so anything not named here is silently dropped — which is exactly how
 			// applying a saved preset used to switch a mirroring host back to a virtual display
@@ -839,6 +847,21 @@ export const DisplayForm: FC<{
 				busy={busy}
 				onSet={(on) => applyAxis({ pnp_disable_monitors: on })}
 			/>
+			{/* AMD hosts only: the axis is the driver's ADL connector-emulation lever, which
+			    exists nowhere else — a toggle NVIDIA/Intel operators could flip but that can
+			    never do anything would be the "saved and then did nothing" trap the enforced
+			    list exists to prevent. */}
+			{amdHost && (
+				<ExperimentalToggle
+					label={m.display_edid()}
+					help={m.display_edid_help()}
+					value={draft.edid_lock ?? false}
+					offLabel={m.display_edid_disabled()}
+					onLabel={m.display_edid_enabled()}
+					busy={busy}
+					onSet={(on) => applyAxis({ edid_lock: on })}
+				/>
+			)}
 
 			{/* What's in force right now — read from the API's `effective`, not from the local draft.
 			    Deriving it from the draft meant the row restated the operator's unsaved edits back to
@@ -873,6 +896,9 @@ export const DisplayForm: FC<{
 				)}
 				{(draft.pnp_disable_monitors ?? false) && (
 					<Badge variant="outline">{m.display_pnp_badge()}</Badge>
+				)}
+				{(draft.edid_lock ?? false) && (
+					<Badge variant="outline">{m.display_edid_badge()}</Badge>
 				)}
 			</div>
 

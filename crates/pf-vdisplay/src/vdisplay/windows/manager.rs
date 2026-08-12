@@ -178,6 +178,10 @@ struct GroupState {
     /// PnP instance ids of monitor devnodes the EXPERIMENTAL `pnp_disable_monitors` axis disabled at
     /// the group's first isolate — last-member teardown re-enables them BEFORE the CCD restore.
     pnp_disabled: Vec<String>,
+    /// Whether the EXPERIMENTAL `edid_lock` axis pinned AMD connector emulation at the group's
+    /// first isolate (`pf_win_display::adl_emul::lock_for_stream`) — last-member teardown owes the
+    /// unlock (pinned emulation outlives the process, so a crash journal backs this flag up).
+    edid_locked: bool,
     /// Whether `ccd_saved` was captured by an EXCLUSIVE isolate (vs `Primary`, which also
     /// snapshots but deliberately keeps the physical displays active) — gates the re-assert
     /// watchdog, which must never "fix" a Primary group's lit panels. Cleared with the restore.
@@ -1400,6 +1404,18 @@ impl VirtualDisplayManager {
                             if crate::policy::prefs().ddc_power_off() {
                                 inner.group.ddc_panels_off = crate::ddc::panel_off_except(n);
                             }
+                            // EXPERIMENTAL `edid_lock` policy axis (AMD only): pin connector EDID
+                            // emulation BEFORE the isolate deactivates the physicals — an awake
+                            // sink still answers the live-EDID read the lock pins (asleep sinks
+                            // fall back to the driver's stored emulation data). With emulation at
+                            // ADL_EMUL_MODE_ALWAYS the KMD stops servicing the sleeping sink's
+                            // HPD/DDC/link — the standby-sink stall class at its source
+                            // (rationale + crash journal in `pf_win_display::adl_emul`). First
+                            // member only, like the DDC leg: the connectors are host-wide.
+                            if crate::policy::prefs().edid_lock() {
+                                inner.group.edid_locked =
+                                    pf_win_display::adl_emul::lock_for_stream();
+                            }
                             inner.group.ccd_saved = isolate_displays_ccd_seam(&keep);
                             // EXPERIMENTAL `pnp_disable_monitors` policy axis: AFTER the isolate took,
                             // additionally disable the deactivated monitors' PnP devnodes (persistent
@@ -1957,6 +1973,15 @@ impl VirtualDisplayManager {
                     "DDC/CI: panel wake commands sent after topology restore"
                 );
                 inner.group.ddc_panels_off = 0;
+            }
+            // EXPERIMENTAL `edid_lock` unlock. AFTER the CCD restore + DDC wake: the re-activated
+            // physical paths do not depend on it (the pinned emulation IS the real monitor's
+            // EDID), and unlocking last keeps the driver from re-probing the sinks mid-restore.
+            // OUTSIDE the `ccd_saved` gate for the same reason as the DDC wake above — the lock
+            // was applied BEFORE the isolate, whose snapshot capture can have failed.
+            if inner.group.edid_locked {
+                pf_win_display::adl_emul::unlock_after_stream();
+                inner.group.edid_locked = false;
             }
         } else {
             match shrink_action(inner.group.ccd_exclusive, inner.group.ccd_saved.is_some()) {
