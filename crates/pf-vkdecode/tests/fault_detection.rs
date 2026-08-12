@@ -268,7 +268,7 @@ fn flagged(flags: &[bool]) -> Vec<usize> {
     flags
         .iter()
         .enumerate()
-        .filter(|(_, &d)| d)
+        .filter(|&(_, &d)| d)
         .map(|(i, _)| i)
         .collect()
 }

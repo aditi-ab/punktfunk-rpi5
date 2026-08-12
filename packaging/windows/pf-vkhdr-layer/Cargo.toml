@@ -1,7 +1,7 @@
 [package]
 name = "pf-vkhdr-layer"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "punktfunk Vulkan implicit layer: inject HDR10/scRGB surface formats on the virtual display so Vulkan games (id Tech, etc.) detect HDR over an IddCx virtual display"
 license = "MIT OR Apache-2.0"
 publish = false

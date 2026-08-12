@@ -23,7 +23,7 @@ const PROBE_RESULT_LEN: usize = 6;
 /// **briefly pausing video**. Non-blocking: poll
 /// [`Java_io_unom_punktfunk_kit_NativeBridge_nativeProbeResult`] until its `done` element is 1.
 /// Starting a probe resets any prior measurement. `false` on a `0` handle or a closed session.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSpeedTest(
     _env: JNIEnv,
     _this: JObject,
@@ -54,7 +54,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSpeedTest(
 ///
 /// Layout (doubles so one array carries both the counts and the percentages):
 /// `[done, throughputKbps, lossPct, hostDropPct, elapsedMs, recvBytes]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbeResult<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,

@@ -200,7 +200,7 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
 /// hold the Wi-Fi `MulticastLock` for the browse lifetime.
 ///
 /// [`nativeDiscoveryStop`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart(
     _env: JNIEnv,
     _this: JObject,
@@ -214,7 +214,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
 /// `NativeBridge.nativeDiscoveryPoll(handle): String` — the current resolved-host snapshot,
 /// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac␟os` (`␟` = U+001F). Empty string = no hosts /
 /// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -245,7 +245,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
 ///
 /// [`nativeDiscoveryStart`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart
 /// [`nativeDiscoveryPoll`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop(
     _env: JNIEnv,
     _this: JObject,

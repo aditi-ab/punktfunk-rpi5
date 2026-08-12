@@ -60,7 +60,7 @@ const TAG_HID_RAW: u8 = 0x05;
 /// closed (all packed values are positive, so `-1` stays unambiguous). Kotlin routes the command
 /// back to the controller holding that wire `pad` index (multi-pad rumble). Run from a Kotlin
 /// poll thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
     _env: JNIEnv,
     _this: JObject,
@@ -99,7 +99,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
 ///   PlayerLeds → `[pad][0x02][bits]`            (len 3)
 ///   Trigger    → `[pad][0x03][which][effect…]`  (len 3 + effect.len())
 /// Returns the byte count written, or `-1` on timeout / session closed / buffer too small.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
     env: JNIEnv,
     _this: JObject,

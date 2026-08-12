@@ -4,7 +4,7 @@
 [package]
 name = "pf-host-config"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Process-wide punktfunk host configuration (env-parsed HostConfig behind a OnceLock)."
 publish = false

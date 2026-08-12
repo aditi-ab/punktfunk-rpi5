@@ -34,7 +34,7 @@ pub(crate) const GL_LINK_STATUS: u32 = 0x8B82;
 
 // libglvnd's libGL dispatches these to the NVIDIA driver based on the current EGL/GL context.
 #[link(name = "GL")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn glGenTextures(n: c_int, textures: *mut u32);
     pub(crate) fn glBindTexture(target: u32, texture: u32);
     pub(crate) fn glTexParameteri(target: u32, pname: u32, param: c_int);
@@ -97,7 +97,7 @@ extern "C" {
 }
 
 #[link(name = "gbm")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn gbm_create_device(fd: c_int) -> *mut c_void;
     pub(crate) fn gbm_device_destroy(device: *mut c_void);
 }

@@ -4,7 +4,7 @@
 [package]
 name = "pf-paths"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Host config-directory resolution + owner-private file/dir creation (0600/0700 or SYSTEM/Admins DACL)."
 publish = false

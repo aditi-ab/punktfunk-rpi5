@@ -169,7 +169,7 @@ mod kmt {
     }
 
     #[link(name = "gdi32")]
-    extern "system" {
+    unsafe extern "system" {
         fn D3DKMTOpenAdapterFromLuid(arg: *mut OpenAdapterFromLuid) -> i32;
         fn D3DKMTQueryAdapterInfo(arg: *mut QueryAdapterInfo) -> i32;
         fn D3DKMTCloseAdapter(arg: *mut CloseAdapter) -> i32;
@@ -500,12 +500,12 @@ pub fn pick(
     env_substr: Option<&str>,
 ) -> Option<(usize, PickSource)> {
     let mut preference_missing = false;
-    if pref.mode == GpuMode::Manual {
-        if let Some(want) = &pref.gpu {
-            match find_preferred(gpus, want) {
-                Some(i) => return Some((i, PickSource::Preference)),
-                None => preference_missing = true,
-            }
+    if pref.mode == GpuMode::Manual
+        && let Some(want) = &pref.gpu
+    {
+        match find_preferred(gpus, want) {
+            Some(i) => return Some((i, PickSource::Preference)),
+            None => preference_missing = true,
         }
     }
     if let Some(sub) = env_substr.filter(|s| !s.is_empty()) {
@@ -560,17 +560,17 @@ pub fn selected_gpu() -> Option<SelectedGpu> {
     let gpus = enumerate();
     let pref = prefs().get();
     let mut preference_missing = false;
-    if pref.mode == GpuMode::Manual {
-        if let Some(want) = &pref.gpu {
-            match find_preferred(&gpus, want) {
-                Some(i) => {
-                    return Some(SelectedGpu {
-                        info: gpus.into_iter().nth(i)?,
-                        source: PickSource::Preference,
-                    })
-                }
-                None => preference_missing = true,
+    if pref.mode == GpuMode::Manual
+        && let Some(want) = &pref.gpu
+    {
+        match find_preferred(&gpus, want) {
+            Some(i) => {
+                return Some(SelectedGpu {
+                    info: gpus.into_iter().nth(i)?,
+                    source: PickSource::Preference,
+                });
             }
+            None => preference_missing = true,
         }
     }
     let source = if preference_missing {
@@ -578,13 +578,13 @@ pub fn selected_gpu() -> Option<SelectedGpu> {
     } else {
         PickSource::Auto
     };
-    if linux_nvidia_present() {
-        if let Some(i) = gpus.iter().position(|g| g.vendor_id == VENDOR_NVIDIA) {
-            return Some(SelectedGpu {
-                info: gpus.into_iter().nth(i)?,
-                source,
-            });
-        }
+    if linux_nvidia_present()
+        && let Some(i) = gpus.iter().position(|g| g.vendor_id == VENDOR_NVIDIA)
+    {
+        return Some(SelectedGpu {
+            info: gpus.into_iter().nth(i)?,
+            source,
+        });
     }
     let node = linux_render_node();
     let i = gpus
@@ -620,10 +620,10 @@ pub fn manual_selection() -> Option<GpuInfo> {
 /// (a deliberate live env read — see `config.rs` module docs) > `/dev/dri/renderD128`.
 #[cfg(target_os = "linux")]
 pub fn linux_render_node() -> PathBuf {
-    if let Some(g) = manual_selection() {
-        if let Some(node) = g.handle.render_node {
-            return node;
-        }
+    if let Some(g) = manual_selection()
+        && let Some(node) = g.handle.render_node
+    {
+        return node;
     }
     std::env::var("PUNKTFUNK_RENDER_NODE")
         .ok()

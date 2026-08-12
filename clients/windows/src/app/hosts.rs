@@ -318,10 +318,10 @@ fn edit_editor(
                 if !addr.is_empty() {
                     h.addr = addr;
                 }
-                if let Ok(p) = port_draft.borrow().trim().parse::<u16>() {
-                    if p != 0 {
-                        h.port = p;
-                    }
+                if let Ok(p) = port_draft.borrow().trim().parse::<u16>()
+                    && p != 0
+                {
+                    h.port = p;
                 }
                 let mac = mac_draft.borrow().trim().to_string();
                 h.mac = if mac.is_empty() {
@@ -1094,12 +1094,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .close_button_text("Cancel")
             .is_open(pending.is_some())
             .on_closed(move |r: ContentDialogResult| {
-                if r == ContentDialogResult::Primary {
-                    if let Some((fp, _)) = &pending {
-                        let mut known = KnownHosts::load();
-                        known.remove_by_fp(fp);
-                        let _ = known.save();
-                    }
+                if r == ContentDialogResult::Primary
+                    && let Some((fp, _)) = &pending
+                {
+                    let mut known = KnownHosts::load();
+                    known.remove_by_fp(fp);
+                    let _ = known.save();
                 }
                 sf.call(None); // re-renders the page; the row is gone on the next load
             })

@@ -16,7 +16,7 @@ mod android_mmsg {
         pub msg_hdr: libc::msghdr,
         pub msg_len: libc::c_uint,
     }
-    extern "C" {
+    unsafe extern "C" {
         pub fn sendmmsg(
             sockfd: libc::c_int,
             msgvec: *mut mmsghdr,

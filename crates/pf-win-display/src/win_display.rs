@@ -1317,11 +1317,14 @@ pub mod isolate_journal {
             let dir = std::env::temp_dir().join(format!("pf-isolate-journal-{name}"));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
-            std::env::set_var("PUNKTFUNK_CONFIG_DIR", &dir);
+            // SAFETY: `_g` holds this module's ENV mutex, which serializes every test that
+            // writes or reads `PUNKTFUNK_CONFIG_DIR` in this binary.
+            unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", &dir) };
             clear(); // reset the LAST cache + any leftover marker from a previous run
             f(&dir);
             clear();
-            std::env::remove_var("PUNKTFUNK_CONFIG_DIR");
+            // SAFETY: still under `_g` — the same serialization as the set above.
+            unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") };
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1529,10 +1532,14 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
         // and confirm no non-keep display survived. Only then is the virtual set truly the sole desktop.
         let survivors = count_other_active(keep_target_ids).unwrap_or(0);
         if survivors == 0 {
-            tracing::info!("display isolate (CCD): target set {keep_target_ids:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})");
+            tracing::info!(
+                "display isolate (CCD): target set {keep_target_ids:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})"
+            );
             return Some(saved);
         }
-        tracing::warn!("display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying");
+        tracing::warn!(
+            "display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying"
+        );
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     // Name the survivors instead of assuming their kind — the field logs showed this path fire
@@ -1932,7 +1939,9 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
         )
     });
     if rc == 0 {
-        tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right");
+        tracing::info!(
+            "display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right"
+        );
     } else {
         tracing::warn!(
             "display primary (CCD): SetDisplayConfig failed rc={rc:#x}{} (virtual {keep_target_id} primary, physicals kept)",

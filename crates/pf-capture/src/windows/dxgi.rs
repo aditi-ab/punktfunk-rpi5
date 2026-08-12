@@ -64,7 +64,7 @@ pub(crate) fn hybrid_hook_hits() -> u64 {
 // on the main thread but DXGI runs the hooked export from the encode/worker thread (possibly a
 // different core), so the "same-thread, no flush needed" assumption was wrong.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn FlushInstructionCache(h: *mut c_void, base: *const c_void, size: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
 }

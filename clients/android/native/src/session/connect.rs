@@ -36,7 +36,7 @@ fn note_error(e: &punktfunk_core::error::PunktfunkError) {
 /// `NativeBridge.nativeTakeLastError(): String` — the machine token of the most recent failed
 /// `nativeConnect`/`nativePair`, cleared on read (`""` when none). Call right after a `0`
 /// handle / `""` fingerprint.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastError<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -51,7 +51,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastErr
 /// `NativeBridge.nativeGenerateIdentity(): String` — mint a fresh persistent self-signed identity.
 /// Returns `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on failure (logged). Kotlin
 /// persists it (Keystore-wrapped) and only calls this again when the store is genuinely empty.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIdentity<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -74,7 +74,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
 /// the media sockets. Must be called BEFORE `nativeConnect` (the tag is applied at socket
 /// creation); Kotlin's one connect choke point (`HostConnect.connectToHost`) does. The rest of the
 /// toggle rides explicit per-session parameters (`nativeStartVideo` / `nativeStartAudio`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLatencyMode(
     _env: JNIEnv,
     _this: JObject,
@@ -120,7 +120,7 @@ fn force_parts_sysprop() -> bool {
 /// budget: the normal path passes a short value, the no-PIN "request access" path a long one (≥ the
 /// host's approval-park window) so a slow operator approval lands on this same parked connection
 /// rather than timing the client out first. Returns an opaque handle, or 0 on failure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'local>(
     mut env: JNIEnv<'local>,
@@ -322,7 +322,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
 /// # Safety contract
 /// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
 /// closed exactly once and not concurrently with other calls on the same handle (Kotlin owns this).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: JNIEnv,
     _this: JObject,
@@ -344,7 +344,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
 /// # Safety contract
 /// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
 /// not freed / closed concurrently with this call (Kotlin still owns it and closes it via `nativeClose`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQuit(
     _env: JNIEnv,
     _this: JObject,
@@ -363,7 +363,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
 /// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
 /// presented on this connection. Valid after a successful `nativeConnect`; Kotlin pins it on a TOFU
 /// connect. `""` on a `0` handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerprint<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -388,7 +388,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
 /// Kotlin's stream watchdog polls this (~1 Hz) to leave a dead stream and return to the menu (where
 /// the user can Wake-on-LAN the host) instead of stranding them on a frozen frame. `false` on a `0`
 /// handle. Cheap (one atomic load); safe on the UI thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnded(
     _env: JNIEnv,
     _this: JObject,
@@ -413,7 +413,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
 /// this existed the watchdog worded them identically ("the host may be asleep"), which is wrong for
 /// every deliberate ending. `0` (NONE) on a `0` handle or before the session ends. Cheap (one
 /// atomic load); safe on the UI thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     _env: JNIEnv,
     _this: JObject,
@@ -433,7 +433,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns
 /// `""` (logged). Blocking — Kotlin calls it off the UI thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local>(
     mut env: JNIEnv<'local>,

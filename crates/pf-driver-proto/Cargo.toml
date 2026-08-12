@@ -9,8 +9,8 @@
 [package]
 name = "pf-driver-proto"
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.82"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Shared host<->driver binary contract for the punktfunk pf-vdisplay virtual display (control IOCTLs + IDD-push frame transport)."
 publish = false

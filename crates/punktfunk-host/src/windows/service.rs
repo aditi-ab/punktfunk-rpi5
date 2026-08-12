@@ -212,7 +212,10 @@ fn load_host_env() {
         if let Some((k, v)) = line.split_once('=') {
             let (k, v) = (k.trim(), v.trim().trim_matches('"'));
             if !k.is_empty() {
-                std::env::set_var(k, v);
+                // SAFETY: called from the service main before this process spawns any thread —
+                // the network-profile warner and the supervisor's host child both start after
+                // `load_host_env` returns, so nothing reads the environment concurrently.
+                unsafe { std::env::set_var(k, v) };
                 n += 1;
             }
         }
@@ -325,11 +328,13 @@ fn run_service() -> Result<()> {
          console (session 0)"
     );
 
+    // BEFORE the warner thread below: `load_host_env` mutates the process env, and the warner
+    // spawns a child process (which snapshots the env block) — the write must not run beside it.
+    load_host_env();
+
     // Best-effort: warn if this network is Public (streaming ports are firewalled off there unless
     // the operator opted in). Own thread — a slow `Get-NetConnectionProfile` never delays the host.
     std::thread::spawn(warn_if_public_network);
-
-    load_host_env();
     let result = supervise(stop, session);
 
     // Report STOPPED regardless of how supervise returned.

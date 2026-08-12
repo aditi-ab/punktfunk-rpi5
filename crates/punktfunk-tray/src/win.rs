@@ -372,7 +372,9 @@ fn notify_on_connect(hwnd: HWND) {
     nid.hBalloonIcon = unsafe {
         LoadImageW(
             Some(GetModuleHandleW(None).unwrap_or_default().into()),
-            PCWSTR(1usize as *const u16),
+            // `without_provenance`, not `ptr::dangling()`: this is MAKEINTRESOURCE(1) — the
+            // ADDRESS is the resource ordinal, and dangling() would yield align_of::<u16>() = 2.
+            PCWSTR(std::ptr::without_provenance(1)),
             IMAGE_ICON,
             sm,
             sm,

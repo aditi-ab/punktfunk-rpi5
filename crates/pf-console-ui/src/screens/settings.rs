@@ -382,13 +382,13 @@ impl SettingsScreen {
                     }
                     ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
                     ListMsg::None => pulse,
-                }
+                };
             }
             RowId::NoProfiles => {
                 return match msg {
                     ListMsg::Adjust(_) | ListMsg::Activate => Some(MenuPulse::Boundary),
                     ListMsg::None => pulse,
-                }
+                };
             }
             _ => {}
         }
@@ -1054,12 +1054,16 @@ mod tests {
     fn fake_home() {
         use std::sync::OnceLock;
         static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let dir = HOME.get_or_init(|| {
+        HOME.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("pf-settings-test-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
+            // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home` callers
+            // block until it returns, and nothing else in this binary mutates `HOME`. (The old
+            // set after the closure ran on EVERY call, so two parallel tests could race the
+            // write; setting once under the OnceLock is what makes this sound.)
+            unsafe { std::env::set_var("HOME", &dir) };
             dir
         });
-        std::env::set_var("HOME", dir);
     }
 
     /// Render the screen once so its strip and list carry real geometry, then hand back a

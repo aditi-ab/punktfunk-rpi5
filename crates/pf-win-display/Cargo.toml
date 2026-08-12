@@ -7,7 +7,7 @@
 [package]
 name = "pf-win-display"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "punktfunk host Windows display-topology helpers: CCD/GDI mode-set + path activation, HDR advanced colour, PnP monitor devnodes, and the display-change event watch."

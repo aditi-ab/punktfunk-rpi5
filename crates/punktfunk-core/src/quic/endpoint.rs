@@ -417,13 +417,21 @@ mod tests {
     /// --nocapture --test-threads=1`.
     #[tokio::test]
     #[ignore = "measurement: sets process env and takes ~15 s of wall clock"]
+    // Test-only exemption from the crate's `deny(unsafe_code)`: mutating the process
+    // environment is `unsafe` in edition 2024, and this measurement's env knob is the
+    // documented single-threaded kind.
+    #[allow(unsafe_code)]
     async fn mtu_discovery_climbs_only_as_high_as_the_peer_advertises() {
         async fn climb(server_jumbo: bool, client_jumbo: bool) -> (u16, u128) {
             let set = |on: bool| {
-                if on {
-                    std::env::set_var("PUNKTFUNK_JUMBO", "1");
-                } else {
-                    std::env::remove_var("PUNKTFUNK_JUMBO");
+                // SAFETY: this `#[ignore]`d measurement is documented above to run alone with
+                // `--test-threads=1`, so no concurrent thread reads or writes the environment.
+                unsafe {
+                    if on {
+                        std::env::set_var("PUNKTFUNK_JUMBO", "1");
+                    } else {
+                        std::env::remove_var("PUNKTFUNK_JUMBO");
+                    }
                 }
             };
             set(server_jumbo);

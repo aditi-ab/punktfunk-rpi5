@@ -19,7 +19,7 @@ use super::{jni_guard, lock_recover, SessionHandle};
 /// presenter's intent (0 = lowest latency / 1 = smoothness; buffer 0 = auto, 1..=3 frames).
 /// No-op if already started.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
     mut env: JNIEnv,
     _this: JObject,
@@ -91,7 +91,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
 /// decoders for it before calling [`Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo`].
 /// Empty string on a `0` handle. Cheap; safe on the UI thread.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -116,7 +116,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
 /// collapses PyroWave onto `video/hevc` and can't name it. Empty string on a `0` handle. Cheap;
 /// safe on the UI thread. Android-gated (reads `crate::decode`), matching `nativeVideoMime`.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecLabel<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -140,7 +140,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecL
 /// One-shot (the decoder is fixed for the session); poll once after the HUD appears. Not
 /// android-gated — pure `jni` + a lock, so it links on the host build too (Kotlin only calls it on
 /// device).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDecoderLabel<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -161,7 +161,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDecode
 
 /// `NativeBridge.nativeStopVideo(handle)` — stop + join the decode thread (without closing the
 /// session). No-op on `0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
     _env: JNIEnv,
     _this: JObject,
@@ -210,7 +210,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
     env: JNIEnv,
     _this: JObject,
@@ -312,7 +312,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
 /// trailing `refreshHz` was appended later — old readers index only 0/1 and never see it. `null`
 /// on a `0` handle. Not android-gated — pure `jni` + a connector read, so it links on the host
 /// build too. Cheap; safe on the UI thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
     env: JNIEnv,
     _this: JObject,
@@ -346,7 +346,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
 /// Enabling resets the measurement window so a later show never reports stale data. Sticky for the
 /// session (survives video stop/start across surface recreation). No-op on `0`. Not android-gated —
 /// pure `jni` + an atomic store, so it links on the host build too.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoStatsEnabled(
     _env: JNIEnv,
     _this: JObject,
@@ -373,7 +373,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
 /// routing. No-op if already started or on a `0` handle. Best-effort: a failure leaves video
 /// streaming.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     _env: JNIEnv,
     _this: JObject,
@@ -398,7 +398,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
 /// `NativeBridge.nativeStopAudio(handle)` — stop + join the audio thread and close AAudio (without
 /// closing the session). No-op on `0`.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
     _env: JNIEnv,
     _this: JObject,
@@ -422,7 +422,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
 /// the running capture's id. Caller MUST hold RECORD_AUDIO; a failure (e.g. no permission) leaves
 /// the rest of the session streaming.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     _env: JNIEnv,
     _this: JObject,
@@ -457,7 +457,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
 /// stream (without closing the session). No-op on `0`. Leaves the session's mute state alone: a
 /// surface recreate stops and restarts the mic, and a user who muted must stay muted through it.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     _env: JNIEnv,
     _this: JObject,
@@ -484,7 +484,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
 /// start. A kernel that refuses the interface claim is NOT reported here — the renderer discovers
 /// that on its own thread and degrades to tier C, because some OEM kernels refuse and there is no
 /// app-side fix worth blocking a session on.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAudio(
     _env: JNIEnv,
@@ -530,7 +530,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
 /// The check a standalone harness cannot make: it owns its descriptor by construction, so it can
 /// never reveal that the client handed the renderer a descriptor something else was already
 /// driving. Returns sample frames written, or negative on failure (see `pad_audio::SelfTest`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSelfTest(
     _env: JNIEnv,
@@ -553,7 +553,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSel
 ///
 /// Returns only once the render thread is joined, which is the point: Kotlin may close the
 /// `UsbDeviceConnection` as soon as this returns and not before.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudio(
     _env: JNIEnv,
@@ -594,7 +594,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
 /// One honest consequence of keeping the stream open: the platform's own recording indicator stays
 /// lit while muted, because the mic really is still open. What stops is the encode and the send —
 /// no captured audio leaves the process.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted(
     _env: JNIEnv,
     _this: JObject,
@@ -617,7 +617,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted
 /// refused every AAudio input rung (or a missing RECORD_AUDIO grant) shows no control instead of a
 /// lie about a mic that is being heard. `false` on a `0` handle. Cheap (one uncontended lock).
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
     _env: JNIEnv,
     _this: JObject,

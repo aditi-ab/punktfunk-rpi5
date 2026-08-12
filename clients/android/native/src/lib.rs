@@ -54,7 +54,7 @@ mod probe;
 /// on via quinn's defaults — forwards them as `log` records since no tracing subscriber is ever
 /// installed. Android-only — there is no JVM (and no logcat) on the host build.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(
     _vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::ffi::c_void,
@@ -74,7 +74,7 @@ pub extern "system" fn JNI_OnLoad(
 /// `NativeBridge.abiVersion(): Int` — the core's C-ABI version. A non-error return is the
 /// scaffold's proof that `System.loadLibrary` found the `.so`, the JNI symbol resolved, and the
 /// linked `punktfunk-core` is the one we expect.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_abiVersion(
     _env: JNIEnv,
     _this: JObject,
@@ -83,7 +83,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_abiVersion(
 }
 
 /// `NativeBridge.coreVersion(): String` — the crate version, proving JNI string marshaling works.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_coreVersion<'local>(
     env: JNIEnv<'local>,
     _this: JObject<'local>,

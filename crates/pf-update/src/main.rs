@@ -398,7 +398,10 @@ mod linux_main {
     }
 
     // One libc symbol, declared directly — not worth a libc dependency in a root helper.
-    extern "C" {
+    // (Edition 2024 spells extern blocks `unsafe extern`, which the `unsafe_code` lint now
+    // counts — the same one-named-exemption rule as `effective_uid` below applies.)
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
         #[link_name = "geteuid"]
         fn libc_geteuid() -> u32;
     }

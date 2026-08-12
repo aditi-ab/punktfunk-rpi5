@@ -21,11 +21,11 @@ mod imp {
     type Bool = i32;
 
     #[link(name = "winmm")]
-    extern "system" {
+    unsafe extern "system" {
         fn timeBeginPeriod(uPeriod: u32) -> u32;
     }
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetCurrentProcess() -> Handle;
         fn SetPriorityClass(hProcess: Handle, dwPriorityClass: u32) -> Bool;
         fn SetThreadExecutionState(esFlags: u32) -> u32;
@@ -46,11 +46,11 @@ mod imp {
         simple_reason: *const u16,
     }
     #[link(name = "dwmapi")]
-    extern "system" {
+    unsafe extern "system" {
         fn DwmEnableMMCSS(fEnableMMCSS: Bool) -> i32; // HRESULT
     }
     #[link(name = "avrt")]
-    extern "system" {
+    unsafe extern "system" {
         fn AvSetMmThreadCharacteristicsW(TaskName: *const u16, TaskIndex: *mut u32) -> Handle;
     }
 

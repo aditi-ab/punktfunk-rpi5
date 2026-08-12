@@ -830,7 +830,9 @@ fn h264_parity_run_against(
 
     // The decoder reads this at session creation (first decode call): pool
     // images grow TRANSFER_SRC so vkCmdCopyImageToBuffer is legal.
-    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
+    // this variable's only writers and readers, and they run one at a time under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
 
     let goldens = golden_hashes(goldens);
     assert_eq!(
@@ -940,7 +942,9 @@ fn h265_parity_run(
     // As the H.264 leg: one codec at a time, `set_var` under the lock.
     let _gpu = common::gpu_lock();
 
-    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
+    // this variable's only writers and readers, and they run one at a time under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
 
     let goldens = golden_hashes(goldens_file);
     assert_eq!(
@@ -1124,7 +1128,9 @@ fn av1_parity_run_against(
     // happens only under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
 
-    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
+    // this variable's only writers and readers, and they run one at a time under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
 
     let goldens = golden_hashes(goldens_file);
     // Non-vacuity, before any hardware is touched: the right number of entries, all
@@ -1265,7 +1271,9 @@ fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_frame0_pixels_say_which_plane_and_how_badly() {
     let _gpu = common::gpu_lock();
-    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
+    // this variable's only writers and readers, and they run one at a time under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
 
     let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
     assert_eq!(
@@ -1338,7 +1346,9 @@ const MAX_LOOP_FILTER_LEVEL: u8 = 63;
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_frame0_probes_whether_the_driver_reads_the_chroma_deblocking_levels() {
     let _gpu = common::gpu_lock();
-    std::env::set_var("PF_VKD_TEST_READBACK", "1");
+    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
+    // this variable's only writers and readers, and they run one at a time under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
 
     let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
     assert_eq!(aus.len(), FRAME_COUNT);

@@ -72,7 +72,7 @@ const _: () = {
 };
 
 #[cfg(target_vendor = "apple")]
-extern "C" {
+unsafe extern "C" {
     /// Darwin batched receive: up to `cnt` datagrams in one syscall; returns the count received and
     /// sets each `msg_datalen` to its byte length. Present in libSystem on all macOS/iOS.
     fn recvmsg_x(

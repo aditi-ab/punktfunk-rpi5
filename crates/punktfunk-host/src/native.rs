@@ -2058,7 +2058,9 @@ mod tests {
             "expected the open-loop pin, got {uncapped}"
         );
         // With the operator ceiling set, the Automatic pin is capped to the link rate...
-        std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500");
+        // SAFETY: this test is the only writer of this variable in the process, so writers can't
+        // race each other; the only reader is `resolve_bitrate_kbps_for` on this same thread.
+        unsafe { std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500") };
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
             4_500_000
@@ -2078,7 +2080,8 @@ mod tests {
             resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
             6_000_000
         );
-        std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS");
+        // SAFETY: as the set above — single writer, and the readers run on this thread.
+        unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
     }
 
     #[test]
@@ -2434,13 +2437,16 @@ mod tests {
         struct EnvGuard(&'static str);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var(self.0);
+                // SAFETY: dropped while SESSION_TEST_LOCK is still held by the owning test, so
+                // env writers stay serialized and only the session path reads this variable.
+                unsafe { std::env::remove_var(self.0) };
             }
         }
         let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
         // Operator policy on. Session tests serialize on SESSION_TEST_LOCK, and only the session
         // path (a session test) reads this env, so the mutation is race-free here.
-        std::env::set_var("PUNKTFUNK_CLIPBOARD", "1");
+        // SAFETY: see the serialization argument directly above.
+        unsafe { std::env::set_var("PUNKTFUNK_CLIPBOARD", "1") };
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {
