@@ -222,13 +222,16 @@ struct Adl {
 /// out-pointers and expects the app to own them.
 unsafe extern "C" fn adl_malloc(size: i32) -> *mut c_void {
     let size = size.max(1) as usize;
+    // Panic-free: a panic here would cross the extern boundary and abort the host. The Err arm
+    // is unreachable in practice (size ≤ i32::MAX can't overflow the layout), and ADL treats a
+    // null from its allocator as an ordinary failure.
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, 16) else {
+        return std::ptr::null_mut();
+    };
     // SAFETY: non-zero size with a fixed valid alignment; the resulting buffers are deliberately
     // never freed — ADL's contract wants an ADL_Main_Memory_Free symmetry, and leaking the <1 KiB
     // of board-layout arrays in a one-shot probe is simpler than proving allocator parity.
-    unsafe {
-        std::alloc::alloc(std::alloc::Layout::from_size_align(size, 16).expect("tiny ADL alloc"))
-            as *mut c_void
-    }
+    unsafe { std::alloc::alloc(layout) as *mut c_void }
 }
 
 impl Adl {

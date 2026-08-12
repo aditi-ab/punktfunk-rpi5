@@ -128,6 +128,8 @@ mod tests {
     /// that is merely capped. One test, one `HOME` — the stores are read from it, so this
     /// deliberately does not split into several that would race over the same env var.
     #[test]
+    // The crate's one test env mutation (the `HOME` scoping below) — see main.rs's deny note.
+    #[allow(unsafe_code)]
     fn the_plan_carries_resolved_settings_not_defaults() {
         use pf_client_core::profiles::{ProfilesFile, SettingsOverlay, StreamProfile};
         use pf_client_core::trust::{KnownHost, KnownHosts, Settings};

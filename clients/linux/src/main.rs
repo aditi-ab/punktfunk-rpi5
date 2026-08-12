@@ -3,7 +3,10 @@
 //! Hosts, pairing/trust, settings, and the desktop library page; every stream (and the
 //! console game library) runs in the spawned `punktfunk-session` Vulkan binary — the
 //! shell never touches video (punktfunk-planning `linux-client-rearchitecture.md`).
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, since edition 2024: clearing Steam's SDL device filter and the spawn
+// test's `HOME` scoping mutate the process env, which is now an unsafe call. Both carry a named
+// `#[allow(unsafe_code)]` with the proof at the site; everything else stays compiler-refused.
+#![deny(unsafe_code)]
 
 // The UI-agnostic plumbing lives in `pf-client-core`, shared with the session binary.
 // Root re-exports keep every `crate::trust`-style path resolving unchanged.
