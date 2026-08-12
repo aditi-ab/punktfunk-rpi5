@@ -13,10 +13,12 @@
 //! the first presented frame, `stats:` lines per 1 s window, one `{"error": …}` /
 //! `{"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: 0 clean end,
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
-// `deny`, not `forbid`: edition 2024 makes `std::env::set_var`/`remove_var` unsafe (WP20 —
-// the env-mutation class made visible), and this bin's three single-threaded-startup env
-// writes carry documented SAFETY comments under localized `#[allow(unsafe_code)]` (the
-// pf-update idiom). A `forbid` cannot be overridden at those sites and refuses the file.
+// `deny`, not `forbid`: edition 2024 makes the std process-environment mutators unsafe
+// (WP20 — the env-mutation class made visible; named-API mentions here would count against
+// the unsafe-hygiene gate C baseline, which tracks this file's real call sites), and this
+// bin's three single-threaded-startup env writes carry documented SAFETY comments under
+// localized `#[allow(unsafe_code)]` (the pf-update idiom). A `forbid` cannot be overridden
+// at those sites and refuses the file.
 #![deny(unsafe_code)]
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
