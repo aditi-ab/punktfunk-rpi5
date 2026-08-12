@@ -27,7 +27,7 @@
 use super::pad_endpoint as pe;
 use super::{audio_control, wiring_plan};
 use anyhow::{bail, Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,6 +40,17 @@ const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
 /// Minimum spacing between provisioning retries once the startup attempt failed
 /// ([`ensure_provisioned`] is called from wiring passes, which recur freely).
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+/// Full passes that ended unlatched before minting gives up for this host lifetime (a service
+/// restart re-arms). An unlatched pass that reaches the PnP surface costs the whole BOX, not
+/// just us: the driver (re)bind raises a device-change broadcast every running app services,
+/// and games rebuild their audio graph on it — a box that cannot mint must not pay that on
+/// every retry forever (field-measured 2026-08-12 as Helldivers 2 hitching to 2–5 FPS 1% lows,
+/// one hitch per mic-pump reopen).
+const MAX_UNLATCHED_ATTEMPTS: u32 = 5;
+/// How long [`ensure_blocking`] waits on a pass another thread already runs before giving the
+/// wiring plan the unlatched answer (a full cold-boot pass worst-cases around two
+/// [`ENDPOINT_WAIT`]s plus the stamp settles).
+const BLOCKING_WAIT: Duration = Duration::from_secs(90);
 
 /// The two minted roles. `value` is the persisted marker; the needles drive
 /// [`discover_driver`].
@@ -107,6 +118,26 @@ static PROVISIONED: OnceLock<Arc<MintedAudio>> = OnceLock::new();
 static PROVISIONING: AtomicBool = AtomicBool::new(false);
 /// When the last attempt STARTED — the [`RETRY_COOLDOWN`] anchor.
 static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+/// Completed passes that did not latch, across the worker and the blocking path — the
+/// [`MAX_UNLATCHED_ATTEMPTS`] give-up counter.
+static UNLATCHED_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+/// Count one finished-but-unlatched pass; the crossing attempt logs the give-up exactly once.
+fn record_unlatched_attempt() {
+    let n = UNLATCHED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+    if n == MAX_UNLATCHED_ATTEMPTS {
+        tracing::warn!(
+            attempts = n,
+            "minted-audio provisioning keeps failing — giving up for this host lifetime so \
+             retries stop broadcasting device changes at the whole box; the wiring plan keeps \
+             the name-based ladder, a service restart re-arms minting"
+        );
+    }
+}
+
+fn gave_up() -> bool {
+    UNLATCHED_ATTEMPTS.load(Ordering::SeqCst) >= MAX_UNLATCHED_ATTEMPTS
+}
 
 /// The wiring plan's tier-0 input: the minted ids, or all-empty while nothing is provisioned.
 ///
@@ -135,7 +166,7 @@ pub(crate) fn provisioned() -> Option<Arc<MintedAudio>> {
 /// Spawn the provisioning worker (idempotent; returns immediately). Called at host start next
 /// to the pad provider, and again from [`ensure_provisioned`] on the retry path.
 pub(crate) fn provision_at_startup() {
-    if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() {
+    if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() || gave_up() {
         return;
     }
     if PROVISIONED.get().is_some() || PROVISIONING.swap(true, Ordering::SeqCst) {
@@ -155,13 +186,19 @@ pub(crate) fn provision_at_startup() {
                     );
                     let _ = PROVISIONED.set(Arc::new(m));
                 }
-                Ok(_) => tracing::info!(
-                    "no minted audio endpoints (Steam's streaming drivers absent?) — the \
-                     wiring plan keeps the name-based ladder"
-                ),
-                Err(e) => tracing::warn!(error = %format!("{e:#}"),
-                    "minted-audio provisioning failed — the wiring plan keeps the name-based \
-                     ladder and a later wiring pass retries"),
+                Ok(_) => {
+                    tracing::info!(
+                        "no minted audio endpoints (Steam's streaming drivers absent?) — the \
+                         wiring plan keeps the name-based ladder"
+                    );
+                    record_unlatched_attempt();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "minted-audio provisioning failed — the wiring plan keeps the name-based \
+                         ladder and a later wiring pass retries");
+                    record_unlatched_attempt();
+                }
             }
             PROVISIONING.store(false, Ordering::SeqCst);
         });
@@ -175,7 +212,7 @@ pub(crate) fn provision_at_startup() {
 /// [`RETRY_COOLDOWN`] — a box where Steam arrives later mints on a later pass instead of at
 /// the next reboot.
 pub(crate) fn ensure_provisioned() {
-    if PROVISIONED.get().is_some() {
+    if PROVISIONED.get().is_some() || gave_up() {
         return;
     }
     {
@@ -219,6 +256,19 @@ fn ensure_all() -> Result<MintedAudio> {
 /// back any default device the fresh endpoint grabbed (measured on the pad program: a newly
 /// registered endpoint can take either default).
 fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
+    // Steady state: a previous run's devnode with all endpoints live — resolve by marker and
+    // return without touching PnP or the default-device policy. The full pass below (re)binds
+    // the driver even over an existing devnode, and that bind raises a device-change broadcast
+    // every running app services — right at first mint, ruinous from a retry path (each
+    // broadcast makes games rebuild their audio graph; see [`MAX_UNLATCHED_ATTEMPTS`]).
+    if let Some((devnode, render, capture)) = find_healthy_role(role)? {
+        stamp_identity(&render, role, false);
+        if let Some(cap) = capture.as_ref() {
+            stamp_identity(cap, role, true);
+        }
+        return Ok((devnode, render, capture));
+    }
+
     let prev_render = audio_control::default_render_id();
     let prev_capture = audio_control::default_capture_id();
 
@@ -282,6 +332,27 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
         }
     }
     Ok((devnode, render, capture))
+}
+
+/// The role's marker devnode with EVERY endpoint the role owes already registered, or `None`
+/// (missing devnode, missing endpoint, or an enumeration error → the caller runs the full
+/// pass). Same endpoint resolvers [`wait_for`] polls, so "healthy" here is exactly the state
+/// the full pass would declare ready.
+fn find_healthy_role(role: Role) -> Result<Option<(String, String, Option<String>)>> {
+    let Some(devnode) = find_role_devnode(role)? else {
+        return Ok(None);
+    };
+    let Some(render) = pe::find_endpoint_for_devnode(&devnode)? else {
+        return Ok(None);
+    };
+    let capture = match role {
+        Role::Mic => match pe::find_capture_endpoint_for_devnode(&devnode)? {
+            Some(cap) => Some(cap),
+            None => return Ok(None),
+        },
+        Role::Speakers => None,
+    };
+    Ok(Some((devnode, render, capture)))
 }
 
 /// How many stamp/settle passes a name gets before we accept "stored but not yet served"
@@ -510,7 +581,6 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
     )
 }
 
-/// `audio-probe mint` devtest body: one synchronous provisioning pass, results printed.
 /// Synchronous provisioning — for the mic pump's resolve and the devtests.
 ///
 /// The pump's FIRST open must not race the startup worker: measured on the target box, the
@@ -520,15 +590,50 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
 /// (existing marker devnodes re-resolve in milliseconds; a cold boot pays the one-time mint)
 /// keeps the pump's target and the plan's verdict the same thing. Latched calls return
 /// immediately; the opt-out env is honoured like everywhere else.
+///
+/// While UNLATCHED this is where the pump's reopen backoff (capped at 60 s) used to meet an
+/// unguarded full pass: one PnP rebind + device-change broadcast roughly every minute, forever,
+/// on any box where minting cannot converge (the 2026-08-12 Helldivers 2 field report). Now a
+/// pass someone else already runs is WAITED for instead of raced, a failed pass repeats at most
+/// every [`RETRY_COOLDOWN`], and [`MAX_UNLATCHED_ATTEMPTS`] failures stop retrying for the
+/// host lifetime.
 pub(crate) fn ensure_blocking() {
-    if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() || PROVISIONED.get().is_some() {
+    if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some()
+        || PROVISIONED.get().is_some()
+        || gave_up()
+    {
         return;
     }
-    if let Ok(m) = ensure_all() {
-        if m.any() {
-            let _ = PROVISIONED.set(Arc::new(m));
+    // A pass is in flight (the startup worker, or a concurrent resolve): wait for its verdict
+    // rather than racing a second SetupAPI/PnP sweep against it — that race is how the pump
+    // once ended up wired to the cable while the worker minted (the dead-mic-air deploy race).
+    if PROVISIONING.swap(true, Ordering::SeqCst) {
+        let deadline = Instant::now() + BLOCKING_WAIT;
+        while PROVISIONING.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        return;
+    }
+    // We own the slot. First-ever resolve runs unconditionally (the cold-boot mint the doc
+    // above insists on); after a failed pass the cooldown answers instead of a re-run.
+    let run = {
+        let mut last = LAST_ATTEMPT.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < RETRY_COOLDOWN) {
+            false
+        } else {
+            *last = Some(Instant::now());
+            true
+        }
+    };
+    if run {
+        match ensure_all() {
+            Ok(m) if m.any() => {
+                let _ = PROVISIONED.set(Arc::new(m));
+            }
+            _ => record_unlatched_attempt(),
         }
     }
+    PROVISIONING.store(false, Ordering::SeqCst);
 }
 
 pub(crate) fn devtest_mint() -> Result<()> {
