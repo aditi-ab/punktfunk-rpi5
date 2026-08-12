@@ -1116,6 +1116,7 @@ dependencies = [
 name = "display-disturb"
 version = "0.27.0"
 dependencies = [
+ "pf-win-display",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
