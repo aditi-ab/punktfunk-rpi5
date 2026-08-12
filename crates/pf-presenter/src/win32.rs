@@ -63,7 +63,17 @@ pub(crate) fn stamp_window_icon(window: &sdl3::video::Window) {
         let module = GetModuleHandleW(std::ptr::null());
         for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
             let px = GetSystemMetrics(metric);
-            let icon = LoadImageW(module, 1 as *const u16, IMAGE_ICON, px, px, LR_DEFAULTCOLOR);
+            // MAKEINTRESOURCE(1): an integer resource ordinal smuggled through the name
+            // pointer, never dereferenced — `without_provenance` says exactly that (and
+            // `1 as *const u16` reads as a dangling pointer to clippy 1.96).
+            let icon = LoadImageW(
+                module,
+                std::ptr::without_provenance(1),
+                IMAGE_ICON,
+                px,
+                px,
+                LR_DEFAULTCOLOR,
+            );
             if !icon.is_null() {
                 SendMessageW(hwnd, WM_SETICON, which as WPARAM, icon as LPARAM);
             }
