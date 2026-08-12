@@ -202,6 +202,19 @@ impl OwnedStdH265Vps {
     pub fn std(&self) -> &hh::StdVideoH265VideoParameterSet {
         &self.std
     }
+
+    /// Lower the profile/tier/level block's `general_level_idc` to `max` when the
+    /// stream declares a higher one. The declared level is a CLAIM, and encoders
+    /// over-claim in the wild (AMF stamps 6.2 — the codec maximum — on streams that
+    /// need 5.2); handing the driver a level above its `maxLevelIdc` is invalid
+    /// usage, while the stream's real demands are enforced by the session's coded
+    /// extent and DPB depth. The "no mutation" ownership contract is about blocks a
+    /// LIVE parameters object points at; this runs before the set is handed over.
+    pub(crate) fn clamp_level(&mut self, max: hh::StdVideoH265LevelIdc) {
+        if self._ptl_backing.general_level_idc > max {
+            self._ptl_backing.general_level_idc = max;
+        }
+    }
 }
 
 /// The converted SPS plus the heap allocations its embedded pointers target.
@@ -228,6 +241,14 @@ impl OwnedStdH265Sps {
     /// The Std struct, valid for as long as `self` lives (see [`crate::OwnedStdSps`]).
     pub fn std(&self) -> &hh::StdVideoH265SequenceParameterSet {
         &self.std
+    }
+
+    /// Lower `general_level_idc` to the device ceiling — [`OwnedStdH265Vps::clamp_level`]
+    /// carries the argument.
+    pub(crate) fn clamp_level(&mut self, max: hh::StdVideoH265LevelIdc) {
+        if self._ptl_backing.general_level_idc > max {
+            self._ptl_backing.general_level_idc = max;
+        }
     }
 }
 
@@ -1999,5 +2020,43 @@ mod tests {
             vps_seen && sps_seen && pps_seen,
             "the vector opens with VPS + SPS + PPS"
         );
+    }
+
+    /// The over-declared-level clamp (the AMF 6.2-on-everything field case):
+    /// lowering writes the ceiling into the PTL backing the driver will read;
+    /// a ceiling at or above the declared level changes nothing.
+    #[test]
+    fn clamp_level_lowers_the_ptl_and_only_lowers() {
+        let sps = full_sps();
+        let declared = level_to_std(sps.profile_tier_level.general_level_idc);
+
+        let mut owned = sps_to_std_h265(&sps).unwrap();
+        // SAFETY: pProfileTierLevel targets `owned`'s boxed backing.
+        assert_eq!(
+            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
+            declared
+        );
+        // A ceiling above the declared level is a no-op.
+        owned.clamp_level(hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_2);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
+            declared
+        );
+        // A ceiling below it is written through — and the pointer still targets
+        // the wrapper's own backing (the clamp mutates in place, never re-points).
+        let ceiling = hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_3_1;
+        assert!(ceiling < declared, "fixture declares above 3.1");
+        owned.clamp_level(ceiling);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
+            ceiling
+        );
+
+        let mut owned_vps = fallback_vps_from_sps(&sps).unwrap();
+        owned_vps.clamp_level(ceiling);
+        // SAFETY: as above, the VPS wrapper's own backing.
+        assert!(unsafe { (*owned_vps.std().pProfileTierLevel).general_level_idc } <= ceiling);
     }
 }

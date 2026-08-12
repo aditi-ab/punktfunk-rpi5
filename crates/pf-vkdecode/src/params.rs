@@ -115,6 +115,17 @@ impl OwnedStdSps {
     pub fn std(&self) -> &hh::StdVideoH264SequenceParameterSet {
         &self.std
     }
+
+    /// Lower `level_idc` to `max` when the stream declares a higher one. The
+    /// declared level is a claim encoders over-state in the wild, and a set above
+    /// the device's `maxLevelIdc` is invalid usage; the stream's real demands are
+    /// enforced by the session's coded extent and DPB depth. The "no mutation"
+    /// contract above is about a LIVE object's blocks — this runs before handover.
+    pub(crate) fn clamp_level(&mut self, max: hh::StdVideoH264LevelIdc) {
+        if self.std.level_idc > max {
+            self.std.level_idc = max;
+        }
+    }
 }
 
 /// The converted PPS plus the scaling-list allocation its `pScalingLists` targets.
@@ -830,5 +841,25 @@ mod tests {
             pps_to_std(&pps).unwrap_err(),
             ParamsError::InvalidWeightedBipredIdc(3)
         );
+    }
+
+    /// The over-declared-level clamp ([`OwnedStdSps::clamp_level`]): lowering
+    /// writes the ceiling into the Std SPS; a ceiling at or above the declared
+    /// level changes nothing.
+    #[test]
+    fn clamp_level_lowers_and_only_lowers() {
+        let sps = full_sps();
+        let declared = level_to_std(sps.level_idc);
+
+        let mut owned = sps_to_std(&sps).unwrap();
+        assert_eq!(owned.std().level_idc, declared);
+        // A ceiling above the declared level is a no-op.
+        owned.clamp_level(hh::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2);
+        assert_eq!(owned.std().level_idc, declared);
+        // A ceiling below it is written through.
+        let ceiling = hh::StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_1;
+        assert!(ceiling < declared, "fixture declares above 3.1");
+        owned.clamp_level(ceiling);
+        assert_eq!(owned.std().level_idc, ceiling);
     }
 }

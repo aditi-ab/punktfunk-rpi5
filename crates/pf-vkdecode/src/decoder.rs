@@ -46,6 +46,7 @@ use pf_bitstream::h264::PlanError;
 use pf_bitstream::h264::PlanWarning;
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
 
 use crate::caps::derive_caps;
 use crate::caps::query_h264_caps;
@@ -685,6 +686,9 @@ pub struct VkH264Decoder {
     /// Session generation: bumped on every rebuild, stamped into frames.
     generation: u64,
     device_lost: bool,
+    /// The over-declared-level warning has fired (once per decoder — the condition
+    /// is a property of the stream's SPS, so repeating it per AU is noise).
+    level_clamp_warned: bool,
 }
 
 impl VkH264Decoder {
@@ -723,6 +727,7 @@ impl VkH264Decoder {
             decoded: 0,
             generation: 0,
             device_lost: false,
+            level_clamp_warned: false,
         })
     }
 
@@ -1365,18 +1370,26 @@ impl VkH264Decoder {
                 unsafe { query_h264_caps(&self.dev, std_profile) }.map_err(VkDecodeError::from)?;
             self.caps = Some((std_profile, derive_caps(&raw)?));
         }
-        // The level gate: a stream above the device's maxLevelIdc is refused up
-        // front (within one codec the Std code points ascend with the level, so
-        // the comparison is numeric), never submitted on a hope. The ceiling came
-        // from an H.264 caps query, so it is compared against an H.264 code point
-        // — the pairing MaxLevelIdc's tag exists to keep honest.
+        // The declared level vs the device ceiling: a DECLARED level above
+        // `maxLevelIdc` is NOT a refusal — encoders over-claim levels in the wild
+        // (the H.265 twin carries the field evidence: AMF stamps the codec
+        // maximum). The stream's REAL demands are enforced where they are
+        // physical facts — coded extent and DPB depth, checked in
+        // `rebuild_state` — and the session's parameter sets are clamped to the
+        // ceiling (`SessionConfig::max_level_idc`) so the driver is never handed
+        // a level above its caps. The comparison stays within one codec's Std
+        // code space (`MaxLevelIdc`'s tag carries that argument).
         let caps_max_level = self.caps.as_ref().expect("queried above").1.max_level_idc;
         let stream_level = level_to_std(plan.picture.level_idc);
-        if stream_level > caps_max_level.code_point() {
-            return Err(VkDecodeError::Unsupported(format!(
-                "stream level (Std code point {stream_level}) above the device's \
-                 maxLevelIdc ({caps_max_level})"
-            )));
+        if stream_level > caps_max_level.code_point() && !self.level_clamp_warned {
+            self.level_clamp_warned = true;
+            warn!(
+                stream_level,
+                ceiling = %caps_max_level,
+                "stream declares an H.264 level above the device ceiling — the \
+                 declared level is advisory (over-declared by some encoders); \
+                 proceeding with the parameter sets clamped to the ceiling"
+            );
         }
         let coded = vk::Extent2D {
             width: plan.picture.coded_width,
@@ -1488,6 +1501,7 @@ impl VkH264Decoder {
             max_dpb_slots: required_slots,
             max_active_references: (required_slots - 1).min(caps.max_active_references),
             std_profile_idc: std_profile,
+            max_level_idc: caps.max_level_idc.code_point(),
         };
         let mut pool_plan = plan_pools(caps, required_slots);
         // TEST-ONLY readback hook: the GPU parity test (tests/gpu_parity.rs)

@@ -168,6 +168,10 @@ pub struct SessionConfig {
     /// The Std profile the session was created against (a profile change is a
     /// renegotiation too).
     pub std_profile_idc: hh::StdVideoH264ProfileIdc,
+    /// The device's `maxLevelIdc` for this profile (Std code point). Every SPS
+    /// handed to the parameters object has its declared level clamped to this —
+    /// see `SessionConfigH265::max_level_idc` for the whole argument.
+    pub max_level_idc: hh::StdVideoH264LevelIdc,
 }
 
 /// Session creation/parameter failures the decoder maps into its error type.
@@ -593,11 +597,14 @@ impl VideoSession {
         match action {
             ParamsAction::Current => Ok(()),
             ParamsAction::Add { add_sps, add_pps } => {
-                let owned_sps = if add_sps {
+                let mut owned_sps = if add_sps {
                     Some(sps_to_std(sps)?)
                 } else {
                     None
                 };
+                if let Some(s) = owned_sps.as_mut() {
+                    s.clamp_level(self.config.max_level_idc);
+                }
                 let owned_pps = if add_pps {
                     Some(pps_to_std(pps)?)
                 } else {
@@ -643,7 +650,8 @@ impl VideoSession {
                     pps_id = pps.pic_parameter_set_id,
                     "recreating session parameters (content change or capacity)"
                 );
-                let owned_sps = sps_to_std(sps)?;
+                let mut owned_sps = sps_to_std(sps)?;
+                owned_sps.clamp_level(self.config.max_level_idc);
                 let owned_pps = pps_to_std(pps)?;
                 // SAFETY: fn contract — live device + live session. The wrappers
                 // are MOVED IN and come back owned by the fresh object, so they
