@@ -260,6 +260,12 @@ pub struct SessionConfigH265 {
     /// format / bit depths, all four of which a stream can renegotiate (an SPS
     /// switching Main→Main 10 mid-stream is a session rebuild, not an update).
     pub profile: H265ProfileKey,
+    /// The device's `maxLevelIdc` for this profile (Std code point). Every VPS/SPS
+    /// handed to the parameters object has its declared level clamped to this —
+    /// over-declared levels are common (AMF stamps 6.2 on 4K streams) and a set
+    /// above the ceiling is invalid usage, while the stream's real demands are
+    /// already enforced by `max_coded_extent` / `max_dpb_slots`.
+    pub max_level_idc: hh::StdVideoH265LevelIdc,
 }
 
 /// A live parameters object **and every Std parameter set it was given**, in one
@@ -525,12 +531,18 @@ impl VideoSessionH265 {
             } => {
                 // Every owned wrapper below stays alive until after the update
                 // call: the Std structs embed pointers into their heap blocks.
-                let owned_vps = if add_vps { Some(vps.to_std()?) } else { None };
-                let owned_sps = if add_sps {
+                let mut owned_vps = if add_vps { Some(vps.to_std()?) } else { None };
+                let mut owned_sps = if add_sps {
                     Some(sps_to_std_h265(sps)?)
                 } else {
                     None
                 };
+                if let Some(v) = owned_vps.as_mut() {
+                    v.clamp_level(self.config.max_level_idc);
+                }
+                if let Some(s) = owned_sps.as_mut() {
+                    s.clamp_level(self.config.max_level_idc);
+                }
                 let owned_pps = if add_pps {
                     Some(pps_to_std_h265(pps)?)
                 } else {
@@ -582,8 +594,10 @@ impl VideoSessionH265 {
                     pps_id = pps.pic_parameter_set_id,
                     "recreating H.265 session parameters (content change or capacity)"
                 );
-                let owned_vps = vps.to_std()?;
-                let owned_sps = sps_to_std_h265(sps)?;
+                let mut owned_vps = vps.to_std()?;
+                let mut owned_sps = sps_to_std_h265(sps)?;
+                owned_vps.clamp_level(self.config.max_level_idc);
+                owned_sps.clamp_level(self.config.max_level_idc);
                 let owned_pps = pps_to_std_h265(pps)?;
                 // SAFETY: fn contract — live device + live session. The wrappers
                 // are MOVED IN and come back owned by the fresh object, so they

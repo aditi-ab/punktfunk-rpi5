@@ -57,6 +57,7 @@ use pf_bitstream::h265::PlanError;
 use pf_bitstream::h265::PlanWarning;
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
 
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
@@ -219,6 +220,9 @@ pub struct VkH265Decoder {
     /// Recovery owed after a failed AU whose planning had already advanced
     /// ([`RecoveryLatch`] docs for the whole argument).
     recovery: RecoveryLatch,
+    /// The over-declared-level warning has fired (once per decoder — the condition
+    /// is a property of the stream's SPS, so repeating it per AU is noise).
+    level_clamp_warned: bool,
 }
 
 impl VkH265Decoder {
@@ -266,6 +270,7 @@ impl VkH265Decoder {
             generation: 0,
             device_lost: false,
             recovery: RecoveryLatch::default(),
+            level_clamp_warned: false,
         })
     }
 
@@ -1004,18 +1009,28 @@ impl VkH265Decoder {
             let raw = unsafe { query_h265_caps(&self.dev, key) }.map_err(VkDecodeError::from)?;
             self.caps = Some((key, derive_caps_h265(&raw, wanted)?));
         }
-        // The level gate: a stream above the device's maxLevelIdc is refused up
-        // front (within one codec the Std code points ascend with the level, so
-        // the comparison is numeric), never submitted on a hope. The ceiling came
-        // from an H.265 caps query, so it is compared against an H.265 code point
-        // — the pairing MaxLevelIdc's tag exists to keep honest.
+        // The declared level vs the device ceiling: a DECLARED level above
+        // `maxLevelIdc` is NOT a refusal. The level in an SPS is a claim, and
+        // encoders over-claim in the wild — AMF stamps 6.2 (the codec maximum)
+        // on 4K120 streams that need 5.2, which on an RTX 5060 (ceiling 6.1)
+        // demoted every HEVC session to D3D11VA (2026-08-12 field report). The
+        // stream's REAL demands are enforced where they are physical facts:
+        // coded extent and DPB depth, checked in `rebuild_state`. The session's
+        // parameter sets are clamped to the ceiling (`SessionConfigH265::
+        // max_level_idc`) so the driver is never handed a level above its caps,
+        // and the comparison stays within one codec's Std code space
+        // (`MaxLevelIdc`'s tag carries that argument).
         let caps_max_level = self.caps.as_ref().expect("queried above").1.max_level_idc;
         let stream_level = level_to_std_h265(plan.picture.level_idc);
-        if stream_level > caps_max_level.code_point() {
-            return Err(VkDecodeError::Unsupported(format!(
-                "stream level (Std code point {stream_level}) above the device's \
-                 maxLevelIdc ({caps_max_level})"
-            )));
+        if stream_level > caps_max_level.code_point() && !self.level_clamp_warned {
+            self.level_clamp_warned = true;
+            warn!(
+                stream_level,
+                ceiling = %caps_max_level,
+                "stream declares an H.265 level above the device ceiling — the \
+                 declared level is advisory (over-declared by some encoders); \
+                 proceeding with the parameter sets clamped to the ceiling"
+            );
         }
         let coded = vk::Extent2D {
             width: plan.picture.coded_width,
@@ -1108,6 +1123,7 @@ impl VkH265Decoder {
             max_dpb_slots: required_slots,
             max_active_references: (required_slots - 1).min(caps.max_active_references),
             profile: key,
+            max_level_idc: caps.max_level_idc.code_point(),
         };
         let mut pool_plan = plan_pools(caps, required_slots);
         // TEST-ONLY readback hook, exactly as the H.264 decoder's: the parity
