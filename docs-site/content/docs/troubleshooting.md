@@ -104,10 +104,11 @@ and capture/display glitches.
 Clients wake a saved host by themselves — auto-wake is on by default — but only once they have seen
 it awake, which is how they learn its MAC address, and only if the machine is armed to answer a magic
 packet. The arming is what's usually missing, and a **Linux** host tells you outright: search the web
-console's **Logs** page for `Wake-on-LAN`, and the line either confirms the card is armed or names
-the interface and the exact command to arm it. Windows and macOS hosts don't run that check, so go
-straight to the BIOS/UEFI and network-card steps in
-[Arming the machine](/docs/wake-on-lan#arming-the-machine).
+console's **Logs** page for `Wake-on-` — `Wake-on-LAN` for a wired card, `Wake-on-WLAN` for a Wi-Fi
+one — and the line either confirms the card is armed or names the interface and the exact command to
+arm it. A Wi-Fi card is armed by a different command than a wired one, and the log line gives the
+right one. Windows and macOS hosts don't run that check, so go straight to the BIOS/UEFI and
+network-card steps in [Arming the machine](/docs/wake-on-lan#arming-the-machine).
 
 ## Video is slow to start, or fails across subnets
 
