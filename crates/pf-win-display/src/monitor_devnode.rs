@@ -217,18 +217,32 @@ fn journal_and_disable(targets: Vec<(String, String)>) -> Vec<String> {
     disabled
 }
 
-/// Re-enable `ids` (teardown / recovery) and clear them from the journal.
+/// Re-enable `ids` (teardown / recovery) and clear the ones that actually re-enabled from the
+/// journal. A FAILED re-enable must keep its journal entry: it is the only record that the
+/// devnode is still disabled, and the next host start's [`startup_recover`] is the only thing
+/// left that will retry it. (The old behavior cleared every requested id unconditionally — a
+/// mid-life re-enable failure erased its own crash-recovery entry, leaving the operator's
+/// monitor invisible to Windows AND to every display listing until they re-enabled it by hand
+/// in Device Manager: the "my displays are gone until I restart everything" field class.)
 pub fn enable_instances(ids: &[String]) -> u32 {
     let mut ok = 0u32;
+    let mut reenabled: Vec<&String> = Vec::with_capacity(ids.len());
     for id in ids {
         if set_devnode(id, false) {
             tracing::info!(id, "PnP-disable: monitor devnode re-enabled");
+            reenabled.push(id);
             ok += 1;
+        } else {
+            tracing::warn!(
+                id,
+                "PnP-disable: monitor devnode re-enable FAILED — keeping its crash-journal \
+                 entry so the next host start retries (until then this monitor stays disabled)"
+            );
         }
     }
     let journal: Vec<String> = read_journal()
         .into_iter()
-        .filter(|j| !ids.contains(j))
+        .filter(|j| !reenabled.contains(&j))
         .collect();
     write_journal(&journal);
     ok

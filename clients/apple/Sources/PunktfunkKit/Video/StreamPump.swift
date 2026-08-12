@@ -116,6 +116,21 @@ final class StreamPump {
                         }
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }
+                    if format == nil {
+                        // No decodable format yet: the opening IDR's parameter sets never
+                        // arrived (or never parsed), and under the host's infinite GOP nothing
+                        // re-delivers them unless we ASK. Without this the format guard below
+                        // drops every AU silently, forever — the field "black stream, zero
+                        // recovery requests" state (2026-08-12). awaitingIDR routes through the
+                        // same 100 ms-throttled recovery.request() at the top of the loop.
+                        if !awaitingIDR {
+                            awaitingSince = Date()
+                            pumpLog.warning(
+                                "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
+                            )
+                        }
+                        awaitingIDR = true
+                    }
                     let failed = layer.status == .failed
                     if failed {
                         // Decode wedged hard (the cold-first-connect case — a lost/corrupt opening
