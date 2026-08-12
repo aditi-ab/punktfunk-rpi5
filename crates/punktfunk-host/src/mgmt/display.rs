@@ -82,6 +82,10 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
         // (`vdisplay/windows/manager.rs`); stored-but-inert elsewhere.
         "ddc_power_off".into(),
         "pnp_disable_monitors".into(),
+        // EXPERIMENTAL, Windows + AMD-driver-only in effect (the ADL connector-emulation lever;
+        // inert wherever `atiadlxx.dll` is absent). The console additionally gates the toggle's
+        // VISIBILITY on an AMD GPU being present, so only the hosts it can act on ever see it.
+        "edid_lock".into(),
     ];
     // `capture_monitor` routes every session to the MIRROR backend, and that backend exists only on
     // Linux — `vdisplay::open`'s mirror arm is `#[cfg(target_os = "linux")]`, because `pf-capture`
@@ -464,6 +468,7 @@ pub(crate) async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutReques
         store.game_session(),
         store.ddc_power_off(),
         store.pnp_disable_monitors(),
+        store.edid_lock(),
         store.get().capture_monitor,
     );
     if let Err(e) = store.set(policy) {

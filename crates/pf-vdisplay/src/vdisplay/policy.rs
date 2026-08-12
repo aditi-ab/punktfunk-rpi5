@@ -267,6 +267,16 @@ pub struct DisplayPolicy {
     /// startup. Orthogonal to `preset` (like `game_session`); `#[serde(default)]` = off.
     #[serde(default)]
     pub pnp_disable_monitors: bool,
+    /// **EXPERIMENTAL, AMD-only in effect: pin connector EDID emulation while streaming** — the
+    /// software equivalent of an HPD-holding dummy plug (`pf_win_display::adl_emul`). Locked at
+    /// the first Exclusive isolate BEFORE the physicals deactivate (an awake sink answers its
+    /// live-EDID read), unlocked at last-member teardown, crash-journaled so a dead host unlocks
+    /// on its next start. Targets the standby-sink stall class at its SOURCE: with emulation
+    /// pinned the KMD stops servicing the sleeping sink's HPD/DDC/link. Inert without an AMD
+    /// driver (`atiadlxx.dll` absent) and on non-Windows. Orthogonal to `preset` (like
+    /// `game_session`); `#[serde(default)]` = off.
+    #[serde(default)]
+    pub edid_lock: bool,
     /// **Mirror a physical monitor instead of creating a virtual display**: the connector name
     /// (`DP-1`, `HDMI-A-2`) sessions should stream, or `None` for the normal virtual-display path.
     ///
@@ -318,6 +328,7 @@ impl Default for DisplayPolicy {
             game_session: GameSession::default(),
             ddc_power_off: false,
             pnp_disable_monitors: false,
+            edid_lock: false,
             capture_monitor: None,
         }
     }
@@ -454,6 +465,7 @@ impl EffectivePolicy {
         game_session: GameSession,
         ddc_power_off: bool,
         pnp_disable_monitors: bool,
+        edid_lock: bool,
         capture_monitor: Option<String>,
     ) -> DisplayPolicy {
         DisplayPolicy {
@@ -474,6 +486,7 @@ impl EffectivePolicy {
             game_session,
             ddc_power_off,
             pnp_disable_monitors,
+            edid_lock,
             capture_monitor,
         }
     }
@@ -737,6 +750,13 @@ impl DisplayPolicyStore {
     /// unconfigured).
     pub fn pnp_disable_monitors(&self) -> bool {
         self.get().pnp_disable_monitors
+    }
+
+    /// The experimental AMD connector-EDID-emulation axis — orthogonal to the preset (like
+    /// [`Self::game_session`]), read directly off the stored policy (default off when
+    /// unconfigured).
+    pub fn edid_lock(&self) -> bool {
+        self.get().edid_lock
     }
 
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
@@ -1318,13 +1338,16 @@ mod tests {
             GameSession::Dedicated,
             true,
             true,
+            true,
             Some("DP-2".into()),
         );
-        // The orthogonal axes (game-session, DDC power-off, PnP disable, capture-monitor pin) are
-        // preserved through the transform — arranging displays must not clear an unrelated setting.
+        // The orthogonal axes (game-session, DDC power-off, PnP disable, EDID lock,
+        // capture-monitor pin) are preserved through the transform — arranging displays must not
+        // clear an unrelated setting.
         assert_eq!(p.game_session, GameSession::Dedicated);
         assert!(p.ddc_power_off);
         assert!(p.pnp_disable_monitors);
+        assert!(p.edid_lock);
         assert_eq!(p.capture_monitor.as_deref(), Some("DP-2"));
         // Preset drops to Custom so the explicit fields (incl. the layout) rule…
         assert_eq!(p.preset, Preset::Custom);
@@ -1405,7 +1428,7 @@ mod tests {
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(
             keys.len(),
-            12,
+            13,
             "a display-policy axis was added or removed: {keys:?} — wire it into the mgmt PUT's \
              per-axis merge (and into `EffectivePolicy` if it is a behavior axis) before bumping this"
         );

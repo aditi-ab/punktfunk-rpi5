@@ -57,6 +57,8 @@ let presentDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_DEBUG"
 /// to Console.app wirelessly with no env var / Xcode attach. Always on for deadline pacing (the
 /// stats are a few arrays + one log line per second); other pacings keep the env-gated print.
 private let presentLog = Logger(subsystem: "io.unom.punktfunk", category: "present")
+/// Pump-side events (loss recovery, format seeding) — the stage-2 sibling of StreamPump's log.
+private let pumpLog = Logger(subsystem: "io.unom.punktfunk", category: "pump")
 
 /// Decoded-frame hand-off between the decode half and the render thread. The POLICY is the
 /// user's presentation intent (design/apple-presentation-rebuild.md — the 2026-07 rebuild that
@@ -921,7 +923,11 @@ public final class Stage2Pipeline {
                     // recovery above stays the backstop for when the recovery frame itself is lost.
                     // The same gap is the earliest, most precise signal to ARM the display freeze —
                     // the following concealed frames are withheld until a clean re-anchor.
-                    if connection.noteFrameIndexGap(au.frameIndex) { reanchorGate.arm() }
+                    // Credited arm: the gap width pre-covers the reassembler's ~120 ms-later
+                    // framesDropped climb for the same loss, so a fast RFI anchor that heals in
+                    // between isn't re-frozen by it (the double-arm race).
+                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
+                    if gapWidth > 0 { reanchorGate.arm(expectingDrops: UInt64(gapWidth)) }
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)
@@ -931,6 +937,21 @@ public final class Stage2Pipeline {
                             onDecodedSize?(Int(dims.width), Int(dims.height))
                         }
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
+                    }
+                    if format == nil {
+                        // No decodable format yet: the opening IDR's parameter sets never
+                        // arrived (or never parsed), and under the host's infinite GOP nothing
+                        // re-delivers them unless we ASK. Without this the guard below drops
+                        // every AU silently, forever — the field "black stream, zero recovery
+                        // requests" state (2026-08-12): the host streams perfectly, the client
+                        // shows nothing and says nothing. awaitingIDR routes through the same
+                        // 100 ms-throttled recovery.request() at the top of the loop.
+                        if !awaitingIDR {
+                            pumpLog.warning(
+                                "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
+                            )
+                        }
+                        awaitingIDR = true
                     }
                     guard let f = format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {

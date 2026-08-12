@@ -1971,29 +1971,173 @@ pub fn restore_displays_ccd(saved: &SavedConfig) {
     isolate_journal::clear();
 }
 
+/// Every display target that still EXISTS right now — `(adapter LUID low, high, target id)` keys
+/// from a full `QDC_ALL_PATHS` sweep, counting a target present when the OS says a monitor is
+/// attached (`targetAvailable`) OR an active path drives it (the flag reads FALSE transiently
+/// right after a removal — same rule as [`target_inventory`]). `None` when the CCD query itself
+/// fails, so the caller can fall back to trusting its snapshot verbatim.
+fn available_target_keys() -> Option<Vec<(u32, i32, u32)>> {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live locals the
+    // OS fills with the counts it wants for these flags.
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm) }.is_err() {
+        return None;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
+    // elements from the sizing call above, and are handed over with those same counts.
+    if unsafe {
+        QueryDisplayConfig(
+            QDC_ALL_PATHS,
+            &mut np,
+            paths.as_mut_ptr(),
+            &mut nm,
+            modes.as_mut_ptr(),
+            None,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    paths.truncate(np as usize);
+    let mut keys: Vec<(u32, i32, u32)> = Vec::new();
+    for p in &paths {
+        let t = &p.targetInfo;
+        let key = (t.adapterId.LowPart, t.adapterId.HighPart, t.id);
+        let present = t.targetAvailable.as_bool() || p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0;
+        if present && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Some(keys)
+}
+
+/// Drop every snapshot path whose TARGET no longer exists (`avail` — the live
+/// [`available_target_keys`] sweep) and rebuild the mode table with only the entries the
+/// survivors reference, remapping their `modeInfoIdx` slots. Both halves matter:
+/// `SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG)` validates the WHOLE submission, so one
+/// stale path — or one orphaned mode entry left behind by a dropped path — fails the entire
+/// restore with 0x57 ERROR_INVALID_PARAMETER. Returns `(paths, modes, dropped_path_count)`;
+/// pure over its inputs so the remap arithmetic is unit-testable without a live CCD.
+fn prune_saved_config_for_targets(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+    avail: &[(u32, i32, u32)],
+) -> (
+    Vec<DISPLAYCONFIG_PATH_INFO>,
+    Vec<DISPLAYCONFIG_MODE_INFO>,
+    usize,
+) {
+    let mut kept: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::with_capacity(paths.len());
+    let mut new_modes: Vec<DISPLAYCONFIG_MODE_INFO> = Vec::with_capacity(modes.len());
+    // old mode index → new mode index, memoized: clone configs legitimately share a source mode
+    // entry between paths, and it must land in the rebuilt table exactly once.
+    let mut remap: Vec<Option<u32>> = vec![None; modes.len()];
+    let take =
+        |idx: u32, new_modes: &mut Vec<DISPLAYCONFIG_MODE_INFO>, remap: &mut Vec<Option<u32>>| {
+            if idx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
+                return DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            }
+            match modes.get(idx as usize) {
+                // An out-of-range index could never have applied — un-pin the mode rather than
+                // shipping a table the whole submission fails on.
+                None => DISPLAYCONFIG_PATH_MODE_IDX_INVALID,
+                Some(m) => match remap[idx as usize] {
+                    Some(n) => n,
+                    None => {
+                        let n = new_modes.len() as u32;
+                        new_modes.push(*m);
+                        remap[idx as usize] = Some(n);
+                        n
+                    }
+                },
+            }
+        };
+    let mut dropped = 0usize;
+    for p in paths {
+        let t = &p.targetInfo;
+        if !avail.contains(&(t.adapterId.LowPart, t.adapterId.HighPart, t.id)) {
+            dropped += 1;
+            continue;
+        }
+        let mut p = *p;
+        // SAFETY: POD union reads (CCD header contract) — `modeInfoIdx` overlays a same-sized
+        // bitfield struct, both valid for every bit pattern; used only as bounds-checked indices.
+        let (src_idx, tgt_idx) = unsafe {
+            (
+                p.sourceInfo.Anonymous.modeInfoIdx,
+                p.targetInfo.Anonymous.modeInfoIdx,
+            )
+        };
+        p.sourceInfo.Anonymous.modeInfoIdx = take(src_idx, &mut new_modes, &mut remap);
+        p.targetInfo.Anonymous.modeInfoIdx = take(tgt_idx, &mut new_modes, &mut remap);
+        kept.push(p);
+    }
+    (kept, new_modes, dropped)
+}
+
 fn restore_displays_ccd_inner(saved: &SavedConfig) {
-    let (paths, modes) = saved;
-    if paths.is_empty() {
+    let (saved_paths, saved_modes) = saved;
+    if saved_paths.is_empty() {
         return;
     }
-    // SAFETY: the CCD contract at the top of this file — the path/mode arrays go over as
-    // slices, so pointer and length cannot disagree, and both outlive this synchronous
-    // call. `retry_set_display_config` binds it to the input desktop, which is the one
-    // precondition a caller of this global-state write could otherwise get wrong.
-    let rc = crate::input_desktop::retry_set_display_config(|| unsafe {
-        SetDisplayConfig(
-            Some(paths.as_slice()),
-            Some(modes.as_slice()),
-            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
-        )
-    });
-    if rc == 0 {
-        tracing::info!("display isolate (CCD): restored original topology");
-    } else {
+    // Prune the snapshot against what is STILL ATTACHED before replaying it. A monitor unplugged
+    // mid-session leaves the snapshot referencing an absent target, and SetDisplayConfig rejects
+    // the WHOLE array with 0x57 ERROR_INVALID_PARAMETER — nothing restores, the desk stays dark,
+    // and the next session snapshots that wreckage (the poisoned-snapshot chain's first link;
+    // field 2026-08-12: rc=0x57 across a mid-session unplug, then sessions flipping between
+    // black/working at random). Dropping the stale paths lets the surviving displays restore
+    // normally; when NOTHING survives there is nothing to replay and the dark-desk backstop
+    // below is the whole answer.
+    let (kept, pruned_modes, dropped);
+    let (paths, modes): (&Vec<_>, &Vec<_>) = match available_target_keys() {
+        Some(avail) => {
+            (kept, pruned_modes, dropped) =
+                prune_saved_config_for_targets(saved_paths, saved_modes, &avail);
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    kept = kept.len(),
+                    "display isolate (CCD): snapshot references target(s) that are no longer \
+                     attached (unplugged mid-session?) — pruned them so the survivors can restore \
+                     (a verbatim replay fails whole with rc=0x57)"
+                );
+            }
+            (&kept, &pruned_modes)
+        }
+        // The availability query itself failed — replay verbatim, exactly the old behavior.
+        None => (saved_paths, saved_modes),
+    };
+    let mut apply_rc = 0i32; // 0 also when the replay was skipped (nothing left to apply)
+    if paths.is_empty() {
         tracing::warn!(
-            "display isolate (CCD): topology restore failed rc={rc:#x}{} — physical displays may be left deactivated",
-            sdc_access_denied_hint(rc)
+            "display isolate (CCD): nothing from the topology snapshot is still attached — \
+             skipping the replay (the dark-desk backstop decides what lights up)"
         );
+    } else {
+        // SAFETY: the CCD contract at the top of this file — the path/mode arrays go over as
+        // slices, so pointer and length cannot disagree, and both outlive this synchronous
+        // call. `retry_set_display_config` binds it to the input desktop, which is the one
+        // precondition a caller of this global-state write could otherwise get wrong.
+        let rc = crate::input_desktop::retry_set_display_config(|| unsafe {
+            SetDisplayConfig(
+                Some(paths.as_slice()),
+                Some(modes.as_slice()),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+            )
+        });
+        apply_rc = rc;
+        if rc == 0 {
+            tracing::info!("display isolate (CCD): restored original topology");
+        } else {
+            tracing::warn!(
+                "display isolate (CCD): topology restore failed rc={rc:#x}{} — physical displays may be left deactivated",
+                sdc_access_denied_hint(rc)
+            );
+        }
     }
     // GUARANTEE the desk is never left all-dark. The saved config can be unappliable (field
     // rc=0x64a ERROR_BAD_CONFIGURATION: it pinned a virtual target incarnation that was since
@@ -2029,7 +2173,7 @@ fn restore_displays_ccd_inner(saved: &SavedConfig) {
             return;
         }
         tracing::warn!(
-            "display isolate (CCD): no external physical display active after the restore (rc={rc:#x}, connected={connected}) — forcing the EXTEND preset so the desk is not left dark"
+            "display isolate (CCD): no external physical display active after the restore (rc={apply_rc:#x}, connected={connected}) — forcing the EXTEND preset so the desk is not left dark"
         );
         force_extend_topology();
         // Measure what the force achieved: a sink still dark AFTER the EXTEND preset can never
@@ -2135,5 +2279,126 @@ mod live_tests {
              makes isolate_displays_ccd yield None on a perfectly healthy machine",
         );
         tracing::info!("live CCD query: {n} active display path(s)");
+    }
+}
+
+#[cfg(test)]
+mod prune_saved_config_tests {
+    //! The snapshot-prune remap arithmetic (`prune_saved_config_for_targets`) — pure over its
+    //! inputs, so the 0x57-poisoned-restore fix is testable without a live CCD: a stale target's
+    //! path must vanish, its modes must not orphan (an orphaned entry fails the whole
+    //! SetDisplayConfig exactly like the stale path did), and clone-shared modes must land once.
+    use super::*;
+
+    fn path(
+        luid_low: u32,
+        target_id: u32,
+        src_mode: u32,
+        tgt_mode: u32,
+    ) -> DISPLAYCONFIG_PATH_INFO {
+        let mut p = DISPLAYCONFIG_PATH_INFO::default();
+        p.targetInfo.adapterId.LowPart = luid_low;
+        p.targetInfo.id = target_id;
+        p.sourceInfo.adapterId.LowPart = luid_low;
+        p.sourceInfo.Anonymous.modeInfoIdx = src_mode;
+        p.targetInfo.Anonymous.modeInfoIdx = tgt_mode;
+        p
+    }
+
+    fn mode(marker: u32) -> DISPLAYCONFIG_MODE_INFO {
+        DISPLAYCONFIG_MODE_INFO {
+            id: marker,
+            ..Default::default()
+        }
+    }
+
+    fn indices(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, u32) {
+        // SAFETY: POD union reads — `modeInfoIdx` overlays a same-sized bitfield struct, both
+        // valid for every bit pattern (the same contract the production reads rely on).
+        unsafe {
+            (
+                p.sourceInfo.Anonymous.modeInfoIdx,
+                p.targetInfo.Anonymous.modeInfoIdx,
+            )
+        }
+    }
+
+    #[test]
+    fn everything_attached_survives_with_dense_indices() {
+        let paths = vec![path(1, 100, 0, 1), path(1, 200, 2, 3)];
+        let modes = vec![mode(10), mode(11), mode(12), mode(13)];
+        let avail = vec![(1, 0, 100), (1, 0, 200)];
+        let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(new_modes.len(), 4);
+        assert_eq!(indices(&kept[0]), (0, 1));
+        assert_eq!(indices(&kept[1]), (2, 3));
+        assert_eq!(new_modes[3].id, 13, "mode entries follow their paths");
+    }
+
+    #[test]
+    fn a_gone_target_drops_its_path_and_modes() {
+        // Target 200 was unplugged mid-session (the field rc=0x57 case): its path AND its two
+        // mode entries must vanish, and the survivor's indices must be remapped dense.
+        let paths = vec![path(1, 100, 0, 1), path(1, 200, 2, 3)];
+        let modes = vec![mode(10), mode(11), mode(12), mode(13)];
+        let avail = vec![(1, 0, 100)];
+        let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].targetInfo.id, 100);
+        assert_eq!(
+            new_modes.len(),
+            2,
+            "the dropped path's modes must not orphan"
+        );
+        assert_eq!((new_modes[0].id, new_modes[1].id), (10, 11));
+        assert_eq!(indices(&kept[0]), (0, 1));
+    }
+
+    #[test]
+    fn a_clone_shared_source_mode_lands_exactly_once() {
+        // Clone configs share one source mode entry between paths — the rebuilt table must
+        // contain it once, referenced by both survivors.
+        let paths = vec![path(1, 100, 0, 1), path(1, 200, 0, 2)];
+        let modes = vec![mode(10), mode(11), mode(12)];
+        let avail = vec![(1, 0, 100), (1, 0, 200)];
+        let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
+        assert_eq!(dropped, 0);
+        assert_eq!(new_modes.len(), 3);
+        let (a_src, _) = indices(&kept[0]);
+        let (b_src, _) = indices(&kept[1]);
+        assert_eq!(a_src, b_src, "shared source mode keeps one table entry");
+    }
+
+    #[test]
+    fn unpinned_and_corrupt_indices_stay_unpinned() {
+        // The INVALID sentinel must pass through, and an out-of-range index (a corrupt snapshot)
+        // must degrade to unpinned rather than shipping a table the whole apply fails on.
+        let paths = vec![path(1, 100, DISPLAYCONFIG_PATH_MODE_IDX_INVALID, 99)];
+        let modes = vec![mode(10)];
+        let avail = vec![(1, 0, 100)];
+        let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
+        assert_eq!(dropped, 0);
+        assert!(new_modes.is_empty());
+        assert_eq!(
+            indices(&kept[0]),
+            (
+                DISPLAYCONFIG_PATH_MODE_IDX_INVALID,
+                DISPLAYCONFIG_PATH_MODE_IDX_INVALID
+            )
+        );
+    }
+
+    #[test]
+    fn different_adapters_do_not_alias_the_same_target_id() {
+        // Target ids are only unique per adapter LUID — a survivor on adapter 2 must not keep a
+        // stale path alive on adapter 1 just because the ids match.
+        let paths = vec![path(1, 100, 0, 1)];
+        let modes = vec![mode(10), mode(11)];
+        let avail = vec![(2, 0, 100)];
+        let (kept, _, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
+        assert_eq!((kept.len(), dropped), (0, 1));
     }
 }

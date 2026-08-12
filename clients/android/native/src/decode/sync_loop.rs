@@ -222,8 +222,13 @@ pub(super) fn run_sync(
                     // recovers with a cheap clean P-frame instead of a full IDR. The same forward gap
                     // arms the freeze gate so the decoder's concealment is held off the screen until the
                     // recovery re-anchors. The frames_dropped keyframe path below stays the backstop.
-                    if client.note_frame_index(frame.frame_index) {
-                        gate.arm(Instant::now());
+                    // Credited arm: the gap width pre-covers the reassembler's ~120 ms-later
+                    // `frames_dropped` climb for the same loss, so a fast RFI anchor that heals in
+                    // between isn't re-frozen by it (the double-arm race — see
+                    // `ReanchorGate::arm_expecting_drops`).
+                    let gap = client.note_frame_index(frame.frame_index);
+                    if gap > 0 {
+                        gate.arm_expecting_drops(Instant::now(), u64::from(gap));
                     }
                     // Park this AU's re-anchor flags for the present side (keyed by the pts the codec
                     // echoes on the output buffer) — unconditional, unlike the HUD's `in_flight` map.

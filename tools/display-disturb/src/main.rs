@@ -11,6 +11,9 @@
 //! * `modeset` — Class 1: a same-mode `ChangeDisplaySettingsExW(CDS_RESET)` re-commit — a
 //!   Level-Two modeset-class DDI entry that idles the whole adapter ("the graphics hardware is
 //!   idle") without changing anything Win32-visible.
+//! * `adl-emul` — not a disturbance but the LEVER probe for the standby-sink class: AMD ADL
+//!   connector-emulation caps/state, and `--lock`/`--unlock` to pin the live EDID +
+//!   `ADL_EMUL_MODE_ALWAYS` (the software HPD-dummy experiment — see `adl.rs`).
 //!
 //! Every operation prints `epoch_ms op target duration_ms result` so stalls in a concurrent
 //! stream's host.log correlate line-for-line. The per-op duration is itself measurement: it is
@@ -18,6 +21,7 @@
 //!
 //! Usage: `display-disturb ddc [--interval-ms 2000] [--caps] [--vcp 0x10]`
 //!        `display-disturb modeset [--interval-ms 2000]`
+//!        `display-disturb adl-emul [--lock|--unlock] [--connector N]`
 
 // Unsafe-proof program: every `unsafe {}` in this tool carries a `// SAFETY:` proof.
 
@@ -31,6 +35,9 @@ fn main() {
 fn main() {
     win::main()
 }
+
+#[cfg(target_os = "windows")]
+mod adl;
 
 #[cfg(target_os = "windows")]
 mod win {
@@ -76,14 +83,17 @@ mod win {
         interval: Duration,
         caps: bool,
         vcp: u8,
+        emul: crate::adl::EmulAction,
+        connector: Option<i32>,
     }
 
     fn parse_args() -> Args {
         let argv: Vec<String> = std::env::args().collect();
         let mode = argv.get(1).cloned().unwrap_or_default();
-        if !matches!(mode.as_str(), "ddc" | "modeset" | "extend") {
+        if !matches!(mode.as_str(), "ddc" | "modeset" | "extend" | "adl-emul") {
             eprintln!(
-                "usage: display-disturb <ddc|modeset|extend> [--interval-ms N] [--caps] [--vcp 0xNN]"
+                "usage: display-disturb <ddc|modeset|extend|adl-emul> [--interval-ms N] [--caps] \
+                 [--vcp 0xNN] [--lock|--unlock] [--connector N]"
             );
             std::process::exit(2);
         }
@@ -92,6 +102,8 @@ mod win {
             interval: Duration::from_millis(2000),
             caps: false,
             vcp: 0x10, // brightness — universally implemented, read-only harmless
+            emul: crate::adl::EmulAction::Probe,
+            connector: None,
         };
         let mut i = 2;
         while i < argv.len() {
@@ -107,6 +119,16 @@ mod win {
                     i += 1;
                     let s = argv.get(i).map(String::as_str).unwrap_or("0x10");
                     a.vcp = u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0x10);
+                }
+                "--lock" => a.emul = crate::adl::EmulAction::Lock,
+                "--unlock" => a.emul = crate::adl::EmulAction::Unlock,
+                "--connector" => {
+                    i += 1;
+                    a.connector = argv.get(i).and_then(|s| s.parse().ok());
+                    if a.connector.is_none() {
+                        eprintln!("--connector needs a numeric connector index");
+                        std::process::exit(2);
+                    }
                 }
                 other => {
                     eprintln!("unknown arg: {other}");
@@ -129,6 +151,7 @@ mod win {
         match args.mode.as_str() {
             "ddc" => ddc_loop(&args),
             "extend" => extend_once(),
+            "adl-emul" => crate::adl::run(args.emul, args.connector),
             _ => modeset_loop(&args),
         }
     }

@@ -533,14 +533,47 @@ impl StallWatch {
                      suspects)"
                 );
             } else {
+                // The two REALTIME GPU-priority opt-ins, as configured in THIS process's
+                // environment (machine env; the WUDFHost driver process resolves the PFVD pair
+                // the same way, so this read mirrors what the driver decided — modulo a machine
+                // env edited after either process started, which a restart heals). The RX 9070
+                // XT field A/B (2026-08-12) convicted EXACTLY this warning's signature twice
+                // over: the driver's swap-chain REALTIME raise beat at ~1.8 s, the host
+                // auto-gate's REALTIME upgrade at ~3.6 s — so a log carrying this warning must
+                // say whether either lever is engaged before anyone chases display hardware.
+                let rt_gpu_driver = if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
+                    "off (PFVD_NO_RT_GPU)"
+                } else {
+                    match std::env::var_os("PFVD_RT_GPU") {
+                        None => "off (default)",
+                        Some(v) if v.eq_ignore_ascii_case("thread") => "gpu-thread (+7)",
+                        Some(_) => "REALTIME (PFVD_RT_GPU)",
+                    }
+                };
+                let rt_gpu_host = match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("off") => "off",
+                    Some("normal") => "normal",
+                    Some("realtime") => "REALTIME (pinned)",
+                    Some("auto") => "auto (gated REALTIME upgrade)",
+                    _ => "high (default)",
+                };
                 tracing::warn!(
                     period_s = format!("{:.2}", period.as_secs_f64()),
                     os_correlated = correlated,
                     connected_inactive = %suspects,
+                    rt_gpu_driver,
+                    rt_gpu_host,
                     verdicts = %verdict_tally,
                     classes = %class_tally,
                     "capture stalls are METRONOMIC with NO coinciding OS display event — \
-                     the disturbance is BELOW Windows: the GPU driver servicing a \
+                     the disturbance is BELOW Windows. FIRST: if rt_gpu_driver or \
+                     rt_gpu_host shows a REALTIME opt-in, clear it (unset PFVD_RT_GPU / \
+                     set PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a punktfunk process holding \
+                     REALTIME GPU priority is the field-proven amplifier of exactly this \
+                     signature on AMD. Otherwise: the GPU driver servicing a \
                      connected-but-asleep sink (standby HPD/DDC/link probing), \
                      display-poller software (the SteelSeries-GG/SignalRGB class — \
                      correlate 'slow display-descriptor poll' lines), or the DWM present \

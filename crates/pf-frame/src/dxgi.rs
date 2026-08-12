@@ -155,18 +155,26 @@ enum PrioMode {
     Off,
     /// A fixed class the operator pinned (`normal`=2 / `high`=4 / `realtime`=5).
     Static(i32),
-    /// The default: HIGH immediately, then upgrade to REALTIME when it is safe — HAGS off, or
+    /// Opt-in (`auto`): HIGH immediately, then upgrade to REALTIME when it is safe — HAGS off, or
     /// HAGS on with comfortable VRAM headroom (with a monitor that downgrades the moment VRAM
-    /// tightens). REALTIME is the proven ceiling-raiser (it is how our brief encode preempts a
-    /// saturating game), but REALTIME + NVIDIA + HAGS + near-full VRAM is a documented NVENC
-    /// hang — the gate takes the win everywhere it cannot hit the hazard.
+    /// tightens). REALTIME is the T2.3 ceiling-raiser (a higher-priority context preempts at
+    /// pixel granularity), but it carries TWO field-proven hazards: REALTIME + NVIDIA + HAGS +
+    /// near-full VRAM is a documented NVENC hang (the VRAM gate covers that one), and on AMD the
+    /// upgrade itself produced a metronomic content-starving stall class (~3.6 s period, RX 9070
+    /// XT, 2026-08-12 A/B: pinning `high` removed it) that no VRAM gate can see — which is why
+    /// `auto` is no longer the default.
     Auto,
 }
 
-/// Resolve `PUNKTFUNK_GPU_PRIORITY_CLASS` (`off|normal|high|realtime|auto`, default **auto**).
+/// Resolve `PUNKTFUNK_GPU_PRIORITY_CLASS` (`off|normal|high|realtime|auto`, default **high**).
 /// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
 /// REALTIME 5. `realtime` pins REALTIME statically (no gate — the operator owns the hazard);
-/// `high` restores the pre-T2.3 static default.
+/// `auto` is the T2.3 gated-REALTIME mode, opt-in since the 2026-08-12 field A/B convicted the
+/// REALTIME upgrade of its own metronomic stall class on AMD (see [`PrioMode::Auto`]) — HIGH is
+/// the Sunshine/Apollo-parity lever that delivered the original decisive win, and the default
+/// must not hold REALTIME anywhere (the same inversion as the vdisplay driver's `PFVD_RT_GPU`
+/// ladder, which fixed the faster ~1.8 s metronome the same day). Unrecognized values read as
+/// the default, not as `auto` — a typo must not opt a box into the hazard.
 fn configured_gpu_priority_mode() -> PrioMode {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()
@@ -174,9 +182,10 @@ fn configured_gpu_priority_mode() -> PrioMode {
     {
         Some("off") => PrioMode::Off,
         Some("normal") => PrioMode::Static(2),
-        Some("high") => PrioMode::Static(4),
         Some("realtime") => PrioMode::Static(5),
-        _ => PrioMode::Auto,
+        Some("auto") => PrioMode::Auto,
+        // `high`, unset, and anything unrecognized all land on the HIGH default.
+        _ => PrioMode::Static(4),
     }
 }
 
@@ -275,14 +284,17 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
 /// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
 /// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
 /// priority class (the strong cross-process lever — far more effective than `SetGPUThreadPriority`
-/// alone, which we measured as no help) lets our brief encode preempt the game. Default is the
-/// T2.3 `auto` mode: HIGH immediately here, then [`auto_priority_gate`] upgrades to REALTIME
-/// where the NVIDIA+HAGS+full-VRAM NVENC-hang hazard cannot bite (and a monitor downgrades when
-/// it could). Runs once per process; best-effort.
-/// `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime|auto` (default auto; `high` = the
-/// pre-gate static behavior; `realtime` = pinned, operator owns the hazard). Best-effort:
-/// silently no-ops under a UAC-filtered token (the process will not hold SE_INC_BASE_PRIORITY,
-/// so the D3DKMT call is a no-op).
+/// alone, which we measured as no help) lets our brief encode preempt the game. Default is a
+/// static HIGH — the class that delivered that win. The T2.3 `auto` mode (HIGH here, then
+/// [`auto_priority_gate`] upgrades to REALTIME behind the NVENC-hang VRAM gate) is opt-in since
+/// the 2026-08-12 field A/B: on AMD the REALTIME upgrade generated its own metronomic
+/// content-starving stall class (~3.6 s period) that the VRAM gate cannot see, and pinning HIGH
+/// removed it. Runs once per process; best-effort.
+/// `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime|auto` (default high; `auto` = the
+/// gated-REALTIME upgrade, operator opts into the AMD stall hazard for the extra ceiling;
+/// `realtime` = pinned, operator owns every hazard). Best-effort: silently no-ops under a
+/// UAC-filtered token (the process will not hold SE_INC_BASE_PRIORITY, so the D3DKMT call is a
+/// no-op).
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -316,17 +328,23 @@ fn elevate_process_gpu_priority() {
     });
 }
 
-// --- REALTIME auto-gate (gpu-contention §5.C / latency plan T2.3) --------------------------------
+// --- REALTIME auto-gate (gpu-contention §5.C / latency plan T2.3) — OPT-IN since 2026-08-12 ------
 //
 // REALTIME GPU scheduling priority is the genuine cross-process ceiling-raiser under a saturating
 // game (a higher-priority context preempts at pixel granularity — the Async-TimeWarp mechanism),
-// and our SYSTEM service uniquely holds the SE_INC_BASE_PRIORITY it needs. The one documented
-// hazard: REALTIME + NVIDIA + HAGS-on + near-full VRAM can hang NVENC. So: probe HAGS once via
-// D3DKMT; HAGS off ⇒ REALTIME unconditionally; HAGS on ⇒ REALTIME gated on LOCAL-segment VRAM
-// headroom, with a monitor thread that downgrades to HIGH the moment usage crosses
-// [`VRAM_DOWNGRADE_PCT`] of the OS budget and restores REALTIME after it has stayed under
-// [`VRAM_RESTORE_PCT`] for [`VRAM_RESTORE_TICKS`] consecutive polls (hysteresis against flapping
-// on the boundary of the hazard window).
+// and our SYSTEM service uniquely holds the SE_INC_BASE_PRIORITY it needs. Two field-proven
+// hazards bound it. (1) REALTIME + NVIDIA + HAGS-on + near-full VRAM can hang NVENC — the VRAM
+// gate below exists for that one: probe HAGS once via D3DKMT; HAGS off ⇒ REALTIME
+// unconditionally; HAGS on ⇒ REALTIME gated on LOCAL-segment VRAM headroom, with a monitor
+// thread that downgrades to HIGH the moment usage crosses [`VRAM_DOWNGRADE_PCT`] of the OS
+// budget and restores REALTIME after it has stayed under [`VRAM_RESTORE_PCT`] for
+// [`VRAM_RESTORE_TICKS`] consecutive polls (hysteresis against flapping on the boundary of the
+// hazard window). (2) On AMD (RX 9070 XT A/B), a punktfunk process holding REALTIME generated a
+// metronomic content-starving stall class — every ~3.6 s ALL processes' presents paused
+// 150–800 ms with the GPU responsive — that no VRAM gate can see, and the vdisplay driver's
+// REALTIME swap-chain raise produced the same pathology on its own ~1.8 s beat. That second
+// hazard is why the whole gate now runs only under an explicit `auto`, and the default stays a
+// static HIGH.
 
 /// Downgrade REALTIME→HIGH when local VRAM usage exceeds this share of the OS budget.
 const VRAM_DOWNGRADE_PCT: u64 = 92;

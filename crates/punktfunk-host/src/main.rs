@@ -400,6 +400,12 @@ fn real_main() -> Result<()> {
             // restored (crash/kill/power loss) — before any new session touches the topology.
             #[cfg(target_os = "windows")]
             monitor_devnode::startup_recover();
+            // The same recovery for the experimental `edid_lock` axis: unpin AMD connector
+            // emulation a previous host locked and never unlocked — pinned emulation outlives
+            // the process (and can outlive a reboot), so this is the only thing standing between
+            // a crash and a permanently-emulated connector.
+            #[cfg(target_os = "windows")]
+            pf_win_display::adl_emul::startup_recover();
             // The same recovery for the DEFAULT Exclusive path: a previous host that died holding a
             // CCD isolate left the operator's panels deactivated with nothing to put them back (the
             // restore snapshot was process memory). Runs AFTER the devnode leg so re-enabled
