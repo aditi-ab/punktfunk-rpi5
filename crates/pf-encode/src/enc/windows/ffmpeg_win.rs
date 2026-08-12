@@ -59,8 +59,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_BT2020,
-    SWS_CS_ITU709, SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFrame, AvSwsContext, PollOutcome,
+    SWS_CS_BT2020, SWS_CS_ITU709, SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -497,10 +497,14 @@ fn immediate_context(device: &ID3D11Device) -> ID3D11DeviceContext {
 
 struct SystemInner {
     enc: encoder::video::Encoder,
+    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced freed `sw_frame`
+    // before `sws`, and field-DECLARATION order is what preserves that now (an offset_of assert
+    // cannot pin this — repr(Rust) may reorder memory independently of declaration order, and
+    // drop order follows declaration).
     /// Reusable software NV12/P010 frame: swscale dst / readback dst, and the `send_frame` src.
-    sw_frame: *mut ffi::AVFrame,
-    /// swscale ctx for the BGRA→NV12 fallback (built lazily; null for the YUV-readback path).
-    sws: *mut ffi::SwsContext,
+    sw_frame: AvFrame,
+    /// swscale ctx for the BGRA→NV12 fallback (built lazily; `None` for the YUV-readback path).
+    sws: Option<AvSwsContext>,
     /// CPU-readable staging texture for the D3D11 readback (built lazily on the captured device).
     staging: Option<ID3D11Texture2D>,
     ctx: Option<ID3D11DeviceContext>,
@@ -547,26 +551,18 @@ impl SystemInner {
                 ptr::null_mut(),
             )?
         };
-        // SAFETY: `av_frame_alloc` returns a freshly-allocated, uniquely-owned `AVFrame` (null-checked
-        // before any deref); writing `format`/`width`/`height` through `*f` stays inside that
-        // allocation. `av_frame_get_buffer(f, 0)` allocates the backing planes — on failure we
-        // `av_frame_free` the sole owner (no double-free) and bail; on success the raw `f` is moved into
-        // `self.sw_frame` and freed exactly once in `Drop`.
-        let sw_frame = unsafe {
-            let f = ffi::av_frame_alloc();
-            if f.is_null() {
-                bail!("av_frame_alloc(sw) failed");
-            }
-            (*f).format = sw_av as c_int;
-            (*f).width = width as c_int;
-            (*f).height = height as c_int;
-            if ffi::av_frame_get_buffer(f, 0) < 0 {
-                let mut f = f;
-                ffi::av_frame_free(&mut f);
+        let sw_frame = AvFrame::alloc().context("av_frame_alloc(sw) failed")?;
+        // SAFETY: writing `format`/`width`/`height` through the owned frame's pointer stays inside
+        // its allocation. `av_frame_get_buffer` allocates the backing planes — on failure the
+        // owned `sw_frame` simply drops (freed once, by the wrapper).
+        unsafe {
+            (*sw_frame.as_ptr()).format = sw_av as c_int;
+            (*sw_frame.as_ptr()).width = width as c_int;
+            (*sw_frame.as_ptr()).height = height as c_int;
+            if ffi::av_frame_get_buffer(sw_frame.as_ptr(), 0) < 0 {
                 bail!("av_frame_get_buffer(sw) failed");
             }
-            f
-        };
+        }
         tracing::info!(
             encoder = vendor.encoder_name(codec),
             "{} encode active ({width}x{height}@{fps}, system-memory {} path)",
@@ -576,7 +572,7 @@ impl SystemInner {
         Ok(SystemInner {
             enc,
             sw_frame,
-            sws: ptr::null_mut(),
+            sws: None,
             staging: None,
             ctx: None,
             format,
@@ -632,13 +628,13 @@ impl SystemInner {
         // frame and `self.enc`'s own context, both live for the call and neither retained by libav
         // (it references the frame's buffers itself).
         unsafe {
-            (*self.sw_frame).pts = pts;
-            (*self.sw_frame).pict_type = if idr {
+            (*self.sw_frame.as_ptr()).pts = pts;
+            (*self.sw_frame.as_ptr()).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
             } else {
                 ffi::AVPictureType::AV_PICTURE_TYPE_NONE
             };
-            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), self.sw_frame);
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), self.sw_frame.as_ptr());
             if r < 0 {
                 bail!("avcodec_send_frame({} system) failed ({r})", "ffmpeg_win");
             }
@@ -703,10 +699,10 @@ impl SystemInner {
             let total = pitch.saturating_mul(h + h.div_ceil(2));
             let mapped = std::slice::from_raw_parts(base, total);
             let chroma_off = pitch * h;
-            let y_dst = (*self.sw_frame).data[0];
-            let y_stride = (*self.sw_frame).linesize[0] as usize;
-            let uv_dst = (*self.sw_frame).data[1];
-            let uv_stride = (*self.sw_frame).linesize[1] as usize;
+            let y_dst = (*self.sw_frame.as_ptr()).data[0];
+            let y_stride = (*self.sw_frame.as_ptr()).linesize[0] as usize;
+            let uv_dst = (*self.sw_frame.as_ptr()).data[1];
+            let uv_stride = (*self.sw_frame.as_ptr()).linesize[1] as usize;
             for y in 0..h {
                 let s = &mapped[y * pitch..y * pitch + row_bytes];
                 ptr::copy_nonoverlapping(s.as_ptr(), y_dst.add(y * y_stride), row_bytes);
@@ -746,7 +742,7 @@ impl SystemInner {
             let pitch = map.RowPitch as usize;
             let h = self.height as usize;
             let base = map.pData as *const u8;
-            self.ensure_sws(
+            let sws = self.ensure_sws(
                 pixel_to_av(Pixel::BGRA),
                 ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 SWS_CS_ITU709,
@@ -754,13 +750,13 @@ impl SystemInner {
             let src_data: [*const u8; 4] = [base, ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [pitch as c_int, 0, 0, 0];
             let r = ffi::sws_scale(
-                self.sws,
+                sws,
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
                 h as c_int,
-                (*self.sw_frame).data.as_ptr(),
-                (*self.sw_frame).linesize.as_ptr(),
+                (*self.sw_frame.as_ptr()).data.as_ptr(),
+                (*self.sw_frame.as_ptr()).linesize.as_ptr(),
             );
             ctx.Unmap(&staging, 0);
             if r < 0 {
@@ -796,7 +792,7 @@ impl SystemInner {
             let h = self.height as usize;
             let base = map.pData as *const u8;
             // RGB(BT.2020 PQ) → YUV(BT.2020 PQ): a matrix-only repack (same PQ transfer), full→limited.
-            self.ensure_sws(
+            let sws = self.ensure_sws(
                 ffi::AVPixelFormat::AV_PIX_FMT_X2BGR10LE,
                 ffi::AVPixelFormat::AV_PIX_FMT_P010LE,
                 SWS_CS_BT2020,
@@ -804,13 +800,13 @@ impl SystemInner {
             let src_data: [*const u8; 4] = [base, ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [pitch as c_int, 0, 0, 0];
             let r = ffi::sws_scale(
-                self.sws,
+                sws,
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
                 h as c_int,
-                (*self.sw_frame).data.as_ptr(),
-                (*self.sw_frame).linesize.as_ptr(),
+                (*self.sw_frame.as_ptr()).data.as_ptr(),
+                (*self.sw_frame.as_ptr()).linesize.as_ptr(),
             );
             ctx.Unmap(&staging, 0);
             if r < 0 {
@@ -842,7 +838,7 @@ impl SystemInner {
         // `width`×`height`). `bytes` is borrowed for the call only and never aliases the owned
         // `sw_frame`. `send` then hands `sw_frame` to the encoder.
         unsafe {
-            self.ensure_sws(
+            let sws = self.ensure_sws(
                 pixel_to_av(sws_src(format)?),
                 ffi::AVPixelFormat::AV_PIX_FMT_NV12,
                 SWS_CS_ITU709,
@@ -850,13 +846,13 @@ impl SystemInner {
             let src_data: [*const u8; 4] = [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [src_row as c_int, 0, 0, 0];
             if ffi::sws_scale(
-                self.sws,
+                sws,
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
                 h as c_int,
-                (*self.sw_frame).data.as_ptr(),
-                (*self.sw_frame).linesize.as_ptr(),
+                (*self.sw_frame.as_ptr()).data.as_ptr(),
+                (*self.sw_frame.as_ptr()).linesize.as_ptr(),
             ) < 0
             {
                 bail!("sws_scale RGB→NV12 failed");
@@ -870,23 +866,24 @@ impl SystemInner {
     /// 10-bit RGB10→P010 BT.2020), so caching a single context is sound.
     ///
     /// Safe: every argument is a plain libav enum/int, and the context it caches belongs to `self`
-    /// (freed once in `Drop`).
+    /// (an owned `AvSwsContext`, freed by its own drop). Returns the borrowed pointer for the
+    /// caller's `sws_scale` — borrowed only, `self.sws` stays the owner.
     fn ensure_sws(
         &mut self,
         src_av: ffi::AVPixelFormat,
         dst_av: ffi::AVPixelFormat,
         cs: c_int,
-    ) -> Result<()> {
-        if !self.sws.is_null() {
-            return Ok(());
+    ) -> Result<*mut ffi::SwsContext> {
+        if let Some(sws) = &self.sws {
+            return Ok(sws.as_ptr());
         }
         // SAFETY: `sws_getContext` takes only scalars plus the documented "no filters, no params"
-        // null trio, and returns an owned context or null — which is checked before use, so
-        // `sws_setColorspaceDetails` and the store below only ever see a live one.
-        // `sws_getCoefficients` returns a pointer into libav's own static tables, valid for the
-        // process, and the call only reads it.
+        // null trio, and returns an owned context or null — `from_raw` rejects the null, so
+        // `sws_setColorspaceDetails` only ever sees a live one, and ownership passes to the
+        // `AvSwsContext`. `sws_getCoefficients` returns a pointer into libav's own static tables,
+        // valid for the process, and the call only reads it.
         let sws = unsafe {
-            let sws = ffi::sws_getContext(
+            let raw = ffi::sws_getContext(
                 self.width as c_int,
                 self.height as c_int,
                 src_av,
@@ -898,36 +895,22 @@ impl SystemInner {
                 ptr::null_mut(),
                 ptr::null(),
             );
-            if sws.is_null() {
+            let Some(owned) = AvSwsContext::from_raw(raw) else {
                 bail!("sws_getContext(RGB→YUV) failed");
-            }
+            };
             // Source full-range RGB → destination limited-range YUV (matches the limited-range VUI
             // we signal). For RGB input the src coefficient table is unused; pass dst for both.
             let coeff = ffi::sws_getCoefficients(cs);
-            ffi::sws_setColorspaceDetails(sws, coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
-            sws
+            ffi::sws_setColorspaceDetails(owned.as_ptr(), coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
+            owned
         };
-        self.sws = sws;
-        Ok(())
+        Ok(self.sws.insert(sws).as_ptr())
     }
 }
 
-impl Drop for SystemInner {
-    fn drop(&mut self) {
-        // SAFETY: `sw_frame` is the `AVFrame` allocated in `open` (or null) — `av_frame_free` drops it
-        // once and nulls the pointer through the `&mut`; `sws` is the cached `SwsContext` (or null) —
-        // `sws_freeContext` frees it once. This `Drop` runs exactly once and `SystemInner` owns both
-        // exclusively, so there is no double-free or use-after-free.
-        unsafe {
-            if !self.sw_frame.is_null() {
-                ffi::av_frame_free(&mut self.sw_frame);
-            }
-            if !self.sws.is_null() {
-                ffi::sws_freeContext(self.sws);
-            }
-        }
-    }
-}
+// No `Drop` for `SystemInner`: `sw_frame` (`AvFrame`) and `sws` (`Option<AvSwsContext>`) free
+// themselves, in field-declaration order — the same sw_frame-then-sws sequence the hand-written
+// `Drop` performed, pinned by the offset_of assert at the struct.
 
 // ---------------------------------------------------------------------------------------------
 // Zero-copy D3D11 path (the AMF default; QSV opt-in — see `zerocopy_enabled`): share the capture
@@ -1212,32 +1195,29 @@ impl ZeroCopyInner {
     }
 
     fn submit(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
-        // SAFETY: `d3d = av_frame_alloc()` is a fresh owned frame (null-checked) and is `av_frame_free`d
-        // exactly once on every path below. `av_hwframe_get_buffer` fills it from the pool — on failure
-        // we free it and bail. `(*d3d).data[0]` is the pool's texture-array and `data[1]` the array
-        // index; `from_raw_borrowed` borrows that `ID3D11Texture2D` WITHOUT taking ownership (no Release
-        // — the frame owns it) and is null-checked. `src` (the captured texture) and `dst` (the pooled
-        // slice) live on the SAME D3D11 device wrapped by `self.hw`, and the caller guarantees
-        // `captured.format == pool_format` before calling, so `CopySubresourceRegion(dst, dst_index, ..,
-        // src, 0, ..)` on the single-threaded immediate context `self.ctx` is a valid same-format GPU
-        // copy. For QSV the mapped `qsv` frame is a fresh owned frame whose `hw_frames_ctx` takes an
-        // `av_buffer_ref` of `self.qsv_frames`; it is `av_frame_free`d (releasing that ref) on both the
-        // map-failure and success paths. `avcodec_send_frame` only internally refs the input frame, so
-        // the `av_frame_free(d3d)`/`av_frame_free(qsv)` afterwards are the sole owning frees — no leak,
-        // no double-free, no use-after-free.
+        // SAFETY: `d3d`/`qsv` are owned `AvFrame`s, so EVERY exit — including the three `?` exits
+        // between the pool pull and the send, which as hand-placed frees previously leaked the
+        // frame plus one of the POOL-sized hwframe surfaces per failure (eight failures wedged
+        // the encoder permanently) — unrefs the pooled surface back to the pool. `(*d3d).data[0]`
+        // is the pool's texture-array and `data[1]` the array index; `from_raw_borrowed` borrows
+        // that `ID3D11Texture2D` WITHOUT taking ownership (no Release — the frame owns it) and is
+        // null-checked. `src` (the captured texture) and `dst` (the pooled slice) live on the
+        // SAME D3D11 device wrapped by `self.hw`, and the caller guarantees `captured.format ==
+        // pool_format` before calling, so `CopySubresourceRegion(dst, dst_index, .., src, 0, ..)`
+        // on the single-threaded immediate context `self.ctx` is a valid same-format GPU copy.
+        // For QSV the mapped `qsv` frame's `hw_frames_ctx` takes an `av_buffer_ref` of
+        // `self.qsv_frames`; its drop at the end of the arm releases that ref at the same point
+        // the hand-written free did. `avcodec_send_frame` only internally refs the input frame,
+        // so the drops are the sole owning frees — no leak, no double-free, no use-after-free.
         unsafe {
             // Pull a pooled D3D11 surface; its data[0] is the pool's texture-ARRAY, data[1] the slice.
-            let mut d3d = ffi::av_frame_alloc();
-            if d3d.is_null() {
-                bail!("av_frame_alloc(d3d11) failed");
-            }
-            let r = ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), d3d, 0);
+            let d3d = AvFrame::alloc().context("av_frame_alloc(d3d11) failed")?;
+            let r = ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), d3d.as_ptr(), 0);
             if r < 0 {
-                ffi::av_frame_free(&mut d3d);
                 bail!("av_hwframe_get_buffer(D3D11) failed ({r})");
             }
-            let dst_ptr = (*d3d).data[0] as *mut c_void;
-            let dst_index = (*d3d).data[1] as usize as u32;
+            let dst_ptr = (*d3d.as_ptr()).data[0] as *mut c_void;
+            let dst_index = (*d3d.as_ptr()).data[1] as usize as u32;
             let dst_tex = ID3D11Texture2D::from_raw_borrowed(&dst_ptr)
                 .ok_or_else(|| anyhow!("pooled D3D11 frame has null texture"))?;
             // GPU-local copy of the captured slice into the pooled array slice (like NVENC's CUDA
@@ -1247,58 +1227,50 @@ impl ZeroCopyInner {
             self.ctx
                 .CopySubresourceRegion(&dst, dst_index, 0, 0, 0, &src, 0, None);
 
-            (*d3d).pts = pts;
-            (*d3d).pict_type = if idr {
+            (*d3d.as_ptr()).pts = pts;
+            (*d3d.as_ptr()).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
             } else {
                 ffi::AVPictureType::AV_PICTURE_TYPE_NONE
             };
 
             let send = match self.vendor {
-                WinVendor::Amf => ffi::avcodec_send_frame(self.enc.as_mut_ptr(), d3d),
+                WinVendor::Amf => ffi::avcodec_send_frame(self.enc.as_mut_ptr(), d3d.as_ptr()),
                 WinVendor::Qsv => {
                     // Map the D3D11 frame to a QSV surface (1:1, no copy), then send the mapped frame.
-                    let mut qsv = ffi::av_frame_alloc();
-                    if qsv.is_null() {
-                        ffi::av_frame_free(&mut d3d);
-                        bail!("av_frame_alloc(qsv) failed");
-                    }
+                    let qsv = AvFrame::alloc().context("av_frame_alloc(qsv) failed")?;
                     // Always `Some` on this arm — `open` fills the pair for `WinVendor::Qsv` and
                     // leaves it `None` only for AMF — but say so with a bail rather than an unwrap,
                     // matching the null check above it. The `Option` is what the raw pointer's
                     // "null means AMF" convention was already encoding.
                     let Some(qsv_frames) = self.qsv_frames.as_ref() else {
-                        ffi::av_frame_free(&mut qsv);
-                        ffi::av_frame_free(&mut d3d);
                         bail!("QSV send path without a derived QSV frames context");
                     };
-                    (*qsv).format = ffi::AVPixelFormat::AV_PIX_FMT_QSV as c_int;
-                    (*qsv).hw_frames_ctx = ffi::av_buffer_ref(qsv_frames.as_ptr());
+                    (*qsv.as_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_QSV as c_int;
+                    (*qsv.as_ptr()).hw_frames_ctx = ffi::av_buffer_ref(qsv_frames.as_ptr());
                     // The map flags are a bindgen enum (no BitOr) — cast each to int before OR-ing.
                     let r = ffi::av_hwframe_map(
-                        qsv,
-                        d3d,
+                        qsv.as_ptr(),
+                        d3d.as_ptr(),
                         ffi::AV_HWFRAME_MAP_DIRECT as c_int | ffi::AV_HWFRAME_MAP_READ as c_int,
                     );
                     if r < 0 {
-                        ffi::av_frame_free(&mut qsv);
-                        ffi::av_frame_free(&mut d3d);
                         bail!("av_hwframe_map(D3D11→QSV) failed ({r})");
                     }
-                    (*qsv).pts = pts;
-                    (*qsv).pict_type = (*d3d).pict_type;
-                    let s = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), qsv);
-                    ffi::av_frame_free(&mut qsv);
-                    s
+                    (*qsv.as_ptr()).pts = pts;
+                    (*qsv.as_ptr()).pict_type = (*d3d.as_ptr()).pict_type;
+                    ffi::avcodec_send_frame(self.enc.as_mut_ptr(), qsv.as_ptr())
+                    // `qsv` drops here — releasing the mapped frame and its frames-ctx ref at the
+                    // same point the hand-written `av_frame_free(&mut qsv)` did.
                 }
             };
-            ffi::av_frame_free(&mut d3d);
             if send < 0 {
                 bail!(
                     "avcodec_send_frame({}) failed ({send})",
                     self.vendor.label()
                 );
             }
+            // `d3d` drops here (and on every early exit above), returning the pooled surface.
         }
         Ok(())
     }

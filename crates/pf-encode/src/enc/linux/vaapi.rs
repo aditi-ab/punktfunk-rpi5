@@ -34,8 +34,8 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFilterGraph, PollOutcome,
-    SWS_CS_ITU709, SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFilterGraph, AvFrame,
+    AvSwsContext, PollOutcome, SWS_CS_ITU709, SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -544,8 +544,13 @@ impl VaapiHw {
 struct CpuInner {
     enc: encoder::video::Encoder,
     hw: VaapiHw,
-    sws: *mut ffi::SwsContext,
-    nv12: *mut ffi::AVFrame, // reusable software NV12 staging frame (swscale dst → upload src)
+    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced freed `nv12` BEFORE
+    // `sws` — the reverse of the old declaration order — and field-DECLARATION order is what
+    // preserves that now (drop order follows declaration; an offset_of assert cannot pin it,
+    // repr(Rust) may lay memory out in any order).
+    /// Reusable software NV12/P010 staging frame (swscale dst → upload src).
+    nv12: AvFrame,
+    sws: AvSwsContext,
     src_format: PixelFormat,
     width: u32,
     height: u32,
@@ -600,10 +605,10 @@ impl CpuInner {
         // `src_av` is a valid `AVPixelFormat` (from `pixel_to_av` of the `vaapi_sws_src`-validated
         // `src_pixel`), the dst is NV12/P010. The three trailing pointers (srcFilter, dstFilter,
         // param) are explicitly null = "use defaults", which the API documents as accepted. No Rust
-        // memory is borrowed — only by-value ints/enums — and the returned pointer is null-checked
-        // just below.
+        // memory is borrowed — only by-value ints/enums — and ownership of the returned context
+        // passes to the `AvSwsContext` (null rejected by `from_raw`).
         let sws = unsafe {
-            ffi::sws_getContext(
+            AvSwsContext::from_raw(ffi::sws_getContext(
                 width as c_int,
                 height as c_int,
                 src_av,
@@ -614,16 +619,15 @@ impl CpuInner {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null(),
-            )
+            ))
         };
-        if sws.is_null() {
+        let Some(sws) = sws else {
             bail!(
                 "sws_getContext(RGB→{})",
                 if ten_bit { "P010" } else { "NV12" }
             );
-        }
-        // SAFETY: `sws` is the non-null `SwsContext` from `sws_getContext` above (the `is_null()`
-        // check immediately preceding returned false). The coefficient table from
+        };
+        // SAFETY: `sws` is the live owned context from above. The coefficient table from
         // `sws_getCoefficients` (ITU-709, or BT.2020 NCL for the HDR path — matching the VUI) is a
         // libswscale static const valid for the whole process, reused here for both the inverse
         // (src) and forward (dst) matrices. `sws_setColorspaceDetails` only reads those tables and
@@ -635,32 +639,22 @@ impl CpuInner {
             } else {
                 SWS_CS_ITU709
             });
-            ffi::sws_setColorspaceDetails(sws, cs, 1, cs, 0, 0, 1 << 16, 1 << 16);
+            ffi::sws_setColorspaceDetails(sws.as_ptr(), cs, 1, cs, 0, 0, 1 << 16, 1 << 16);
         }
-        // SAFETY: `av_frame_alloc` returns a fresh, uniquely-owned heap `AVFrame` (null-checked — on
-        // null we free the already-built `sws` and bail). We then write the plain `format`/`width`/
-        // `height` fields through the non-null, properly-aligned `f` (sole owner, not yet shared).
-        // `av_frame_get_buffer(f, 0)` allocates backing storage for those dims/format; on failure we
-        // free `f` and `sws` (unwinding the half-built state) and bail. On success `f` is a fully-owned
-        // NV12/P010 frame stored in `CpuInner.nv12` and freed once in `CpuInner::drop`. `f` is a
-        // unique fresh pointer, so none of these writes alias anything.
-        let nv12 = unsafe {
-            let f = ffi::av_frame_alloc();
-            if f.is_null() {
-                ffi::sws_freeContext(sws);
-                bail!("av_frame_alloc(staging) failed");
-            }
-            (*f).format = staging_av as c_int;
-            (*f).width = width as c_int;
-            (*f).height = height as c_int;
-            if ffi::av_frame_get_buffer(f, 0) < 0 {
-                let mut f = f;
-                ffi::av_frame_free(&mut f);
-                ffi::sws_freeContext(sws);
+        let nv12 = AvFrame::alloc().context("av_frame_alloc(staging) failed")?;
+        // SAFETY: writing the plain `format`/`width`/`height` fields through the owned frame's
+        // pointer stays inside its allocation (sole owner, not yet shared).
+        // `av_frame_get_buffer` allocates backing storage for those dims/format; on failure the
+        // owned `nv12` (and the `sws` above it) simply drop — the hand-written unwind this
+        // replaced had to free both by hand on every branch.
+        unsafe {
+            (*nv12.as_ptr()).format = staging_av as c_int;
+            (*nv12.as_ptr()).width = width as c_int;
+            (*nv12.as_ptr()).height = height as c_int;
+            if ffi::av_frame_get_buffer(nv12.as_ptr(), 0) < 0 {
                 bail!("av_frame_get_buffer(staging) failed");
             }
-            f
-        };
+        }
         tracing::info!(
             encoder = codec.vaapi_name(),
             "VAAPI encode active ({width}x{height}@{fps}, CPU→{} upload path)",
@@ -669,8 +663,8 @@ impl CpuInner {
         Ok(CpuInner {
             enc,
             hw,
-            sws,
             nv12,
+            sws,
             src_format: format,
             width,
             height,
@@ -691,49 +685,43 @@ impl CpuInner {
         // `bytes.len() >= src_row * h`. `sws_scale` reads `h` rows of `src_row` bytes from
         // `src_data[0] = bytes.as_ptr()` (the other planes null/0 — packed RGB is single-plane), all
         // in bounds; `bytes`, `src_data`, `src_stride` are live locals for this synchronous call.
-        // `self.sws` is the non-null context built in `open`; it writes into `self.nv12` (a non-null
-        // owned frame whose `data`/`linesize` in-struct arrays were sized by `av_frame_get_buffer`).
-        // `av_frame_alloc` (null-checked) yields a fresh `hwf`; `av_hwframe_get_buffer` pulls a pooled
-        // VAAPI surface from the live non-null `self.hw.frames_ref`; `av_hwframe_transfer_data` uploads
-        // the staged NV12 into it — both frames live, failures free `hwf` and bail. We then write
-        // `pts`/`pict_type` through the non-null `hwf` and `avcodec_send_frame` it into the live
-        // owned `self.enc` context (which takes its own ref), then free our `hwf` ref exactly once.
-        // The encoder runs only on this thread (see `unsafe impl Send`), so no aliasing/data race.
+        // `self.sws` is the owned context built in `open`; it writes into `self.nv12` (an owned
+        // frame whose `data`/`linesize` in-struct arrays were sized by `av_frame_get_buffer`).
+        // `hwf` is an owned `AvFrame` — every exit below drops it exactly once, releasing its ref
+        // on the pooled VAAPI surface. `av_hwframe_get_buffer` pulls that surface from the live
+        // non-null `self.hw.frames_ref`; `av_hwframe_transfer_data` uploads the staged NV12 into
+        // it. `avcodec_send_frame` takes its own ref, so the drop afterwards is the sole owning
+        // free. The encoder runs only on this thread (see `unsafe impl Send`), so no
+        // aliasing/data race.
         unsafe {
             let src_data: [*const u8; 4] = [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [src_row as c_int, 0, 0, 0];
             if ffi::sws_scale(
-                self.sws,
+                self.sws.as_ptr(),
                 src_data.as_ptr(),
                 src_stride.as_ptr(),
                 0,
                 h as c_int,
-                (*self.nv12).data.as_ptr(),
-                (*self.nv12).linesize.as_ptr(),
+                (*self.nv12.as_ptr()).data.as_ptr(),
+                (*self.nv12.as_ptr()).linesize.as_ptr(),
             ) < 0
             {
                 bail!("sws_scale RGB→NV12 failed");
             }
-            let mut hwf = ffi::av_frame_alloc();
-            if hwf.is_null() {
-                bail!("av_frame_alloc(hw) failed");
-            }
-            if ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), hwf, 0) < 0 {
-                ffi::av_frame_free(&mut hwf);
+            let hwf = AvFrame::alloc().context("av_frame_alloc(hw) failed")?;
+            if ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), hwf.as_ptr(), 0) < 0 {
                 bail!("av_hwframe_get_buffer(VAAPI) failed");
             }
-            if ffi::av_hwframe_transfer_data(hwf, self.nv12, 0) < 0 {
-                ffi::av_frame_free(&mut hwf);
+            if ffi::av_hwframe_transfer_data(hwf.as_ptr(), self.nv12.as_ptr(), 0) < 0 {
                 bail!("av_hwframe_transfer_data(→VAAPI) failed");
             }
-            (*hwf).pts = pts;
-            (*hwf).pict_type = if idr {
+            (*hwf.as_ptr()).pts = pts;
+            (*hwf.as_ptr()).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
             } else {
                 ffi::AVPictureType::AV_PICTURE_TYPE_NONE
             };
-            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), hwf);
-            ffi::av_frame_free(&mut hwf);
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), hwf.as_ptr());
             if r < 0 {
                 bail!("avcodec_send_frame(VAAPI) failed ({r})");
             }
@@ -742,24 +730,10 @@ impl CpuInner {
     }
 }
 
-impl Drop for CpuInner {
-    fn drop(&mut self) {
-        // SAFETY: `self.nv12` (an owned `AVFrame`) and `self.sws` (an owned `SwsContext`) are each
-        // freed exactly once here, guarded by `is_null()` so a never-set pointer is skipped (no double
-        // free). `CpuInner` owns both exclusively and `Drop` runs once. `av_frame_free` takes `&mut`
-        // and nulls the pointer. `self.enc`/`self.hw` are freed afterward by their own `Drop` impls;
-        // the encoder holds its own `av_buffer_ref`'d device/frames copies, so field-drop order is
-        // irrelevant to soundness.
-        unsafe {
-            if !self.nv12.is_null() {
-                ffi::av_frame_free(&mut self.nv12);
-            }
-            if !self.sws.is_null() {
-                ffi::sws_freeContext(self.sws);
-            }
-        }
-    }
-}
+// No `Drop` for `CpuInner`: `nv12` (`AvFrame`) and `sws` (`AvSwsContext`) free themselves, in
+// field-declaration order — the same nv12-then-sws sequence the hand-written `Drop` performed
+// (see the field-order note on the struct). The encoder holds its own `av_buffer_ref`'d
+// device/frames copies, so their order against `enc`/`hw` is irrelevant to soundness.
 
 // ---------------------------------------------------------------------------------------------
 // Zero-copy dmabuf path: DRM-PRIME → hwmap(vaapi) → scale_vaapi(nv12) filter graph → encode.
@@ -1041,16 +1015,20 @@ impl DmabufInner {
         //    whole synchronous `submit`; we describe one object/layer/plane from its
         //    fourcc/modifier/offset/stride and its `lseek`-queried size. `libc::lseek` on that live
         //    fd only reads the description's size and returns it (or -1); it touches no Rust memory.
-        //  * `av_frame_alloc` → `drm` (null-checked); we set its scalar fields and
-        //    `hw_frames_ctx = av_buffer_ref(self.drm_frames)` (new ref of the live owned ctx).
+        //  * `drm`/`nv12` are owned `AvFrame`s — every exit drops each exactly once (the
+        //    hand-placed frees this replaced were branch-clean, but only by inspection). We set
+        //    `drm`'s scalar fields and `hw_frames_ctx = av_buffer_ref(self.drm_frames)` (new ref
+        //    of the live owned ctx).
         //  * `data[0] = Box::into_raw(desc)` transfers the box into the frame; `buf[0] =
         //    av_buffer_create(.., free_desc, ..)` registers a destructor that reclaims it exactly once
         //    when the buffer's refcount hits zero — matched alloc/free, no leak/double-free.
         //  * `av_buffersrc_add_frame_flags(self.src, drm, KEEP_REF)` pushes a ref into the live
-        //    buffersrc; KEEP_REF keeps our own `drm` ref, which we then `av_frame_free`. We pull the
-        //    converted surface with `av_buffersink_get_frame(self.sink, nv12)` BEFORE returning, so the
-        //    dmabuf (owned by the caller) is read while still valid. `nv12` is sent into the live owned
-        //    `self.enc` (takes its own ref) and our ref freed once. Single-threaded encoder → no race.
+        //    buffersrc; KEEP_REF keeps our own `drm` ref, dropped explicitly right after the push
+        //    (the same point the hand-written free sat, kept so the descriptor's release timing
+        //    across the pull does not change). We pull the converted surface with
+        //    `av_buffersink_get_frame(self.sink, nv12)` BEFORE returning, so the dmabuf (owned by
+        //    the caller) is read while still valid. `nv12` is sent into the live owned `self.enc`
+        //    (takes its own ref) and dropped. Single-threaded encoder → no race.
         unsafe {
             // Build a DRM-PRIME AVFrame describing the dmabuf (one object/fd, one layer/plane).
             let mut desc: Box<ffi::AVDRMFrameDescriptor> = Box::new(std::mem::zeroed());
@@ -1075,21 +1053,18 @@ impl DmabufInner {
             desc.layers[0].planes[0].offset = dmabuf.offset as isize;
             desc.layers[0].planes[0].pitch = dmabuf.stride as isize;
 
-            let mut drm = ffi::av_frame_alloc();
-            if drm.is_null() {
-                bail!("av_frame_alloc(drm) failed");
-            }
-            (*drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
-            (*drm).width = self.width as c_int;
-            (*drm).height = self.height as c_int;
+            let drm = AvFrame::alloc().context("av_frame_alloc(drm) failed")?;
+            (*drm.as_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
+            (*drm.as_ptr()).width = self.width as c_int;
+            (*drm.as_ptr()).height = self.height as c_int;
             // The dmabuf is the compositor's rendered desktop: full-range RGB. Tag the frame so
             // the VPP's colour negotiation sees the real input instead of "unspecified" (an
             // untagged input lets the driver pick its own default for the RGB→NV12 conversion —
             // Mesa's is BT.601, contradicting the BT.709-limited VUI the encoder signals).
-            (*drm).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
-            (*drm).colorspace = ffi::AVColorSpace::AVCOL_SPC_RGB;
-            (*drm).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames.as_ptr());
-            (*drm).data[0] = Box::into_raw(desc) as *mut u8;
+            (*drm.as_ptr()).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
+            (*drm.as_ptr()).colorspace = ffi::AVColorSpace::AVCOL_SPC_RGB;
+            (*drm.as_ptr()).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames.as_ptr());
+            (*drm.as_ptr()).data[0] = Box::into_raw(desc) as *mut u8;
             // Own the descriptor so it frees with the frame (the fd is owned by the DmabufFrame,
             // which outlives this call — the graph reads the surface before submit returns).
             extern "C" fn free_desc(_opaque: *mut std::ffi::c_void, data: *mut u8) {
@@ -1100,8 +1075,8 @@ impl DmabufInner {
                 // reclaims it exactly once — no double-free. `_opaque` is unused (we passed null).
                 unsafe { drop(Box::from_raw(data as *mut ffi::AVDRMFrameDescriptor)) };
             }
-            (*drm).buf[0] = ffi::av_buffer_create(
-                (*drm).data[0],
+            (*drm.as_ptr()).buf[0] = ffi::av_buffer_create(
+                (*drm.as_ptr()).data[0],
                 std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
                 Some(free_desc),
                 ptr::null_mut(),
@@ -1111,45 +1086,40 @@ impl DmabufInner {
             // Push through hwmap → scale_vaapi; pull the NV12 surface back out.
             let r = ffi::av_buffersrc_add_frame_flags(
                 self.src,
-                drm,
+                drm.as_ptr(),
                 ffi::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
             );
-            ffi::av_frame_free(&mut drm);
-            // These two stages ARE the import: the push hands libav our DRM-PRIME descriptor, and
-            // the pull is where `hwmap` actually maps it into a VA surface (and `scale_vaapi` runs
-            // the CSC). A failure here means this driver would not take this compositor's dmabuf —
-            // which no encoder rebuild can fix — so tell the process-wide latch, and capture
-            // negotiates CPU frames from the next session on. `avcodec_send_frame` below is
-            // deliberately NOT counted: that one is the encoder stalling, which the in-place
-            // rebuild above us exists to recover, and disabling zero-copy over it would be a
-            // permanent penalty for a transient fault.
+            drop(drm); // release our ref where the hand-written free sat (see the SAFETY note)
+                       // These two stages ARE the import: the push hands libav our DRM-PRIME descriptor, and
+                       // the pull is where `hwmap` actually maps it into a VA surface (and `scale_vaapi` runs
+                       // the CSC). A failure here means this driver would not take this compositor's dmabuf —
+                       // which no encoder rebuild can fix — so tell the process-wide latch, and capture
+                       // negotiates CPU frames from the next session on. `avcodec_send_frame` below is
+                       // deliberately NOT counted: that one is the encoder stalling, which the in-place
+                       // rebuild above us exists to recover, and disabling zero-copy over it would be a
+                       // permanent penalty for a transient fault.
             if r < 0 {
                 let e = format!("av_buffersrc_add_frame failed ({r})");
                 pf_zerocopy::note_raw_dmabuf_import_failure(&e);
                 bail!("{e}");
             }
             t_push = t0.elapsed();
-            let mut nv12 = ffi::av_frame_alloc();
-            if nv12.is_null() {
-                bail!("av_frame_alloc(nv12) failed");
-            }
-            let r = ffi::av_buffersink_get_frame(self.sink, nv12);
+            let nv12 = AvFrame::alloc().context("av_frame_alloc(nv12) failed")?;
+            let r = ffi::av_buffersink_get_frame(self.sink, nv12.as_ptr());
             if r < 0 {
-                ffi::av_frame_free(&mut nv12);
                 let e = format!("av_buffersink_get_frame failed ({r})");
                 pf_zerocopy::note_raw_dmabuf_import_failure(&e);
                 bail!("{e}");
             }
             pf_zerocopy::note_raw_dmabuf_import_ok();
             t_pull = t0.elapsed() - t_push;
-            (*nv12).pts = pts;
-            (*nv12).pict_type = if idr {
+            (*nv12.as_ptr()).pts = pts;
+            (*nv12.as_ptr()).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
             } else {
                 ffi::AVPictureType::AV_PICTURE_TYPE_NONE
             };
-            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), nv12);
-            ffi::av_frame_free(&mut nv12);
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), nv12.as_ptr());
             if r < 0 {
                 bail!("avcodec_send_frame(VAAPI) failed ({r})");
             }

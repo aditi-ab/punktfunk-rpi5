@@ -119,6 +119,88 @@ impl Drop for AvFilterGraph {
     }
 }
 
+/// An owned `AVFrame`, freed exactly once when it drops.
+///
+/// The house pattern (`AvBuffer` above): `alloc` rejects the allocator's null once, `as_ptr`
+/// lends, `Drop` frees, no `Clone`. Before this type existed the crate held 8 `av_frame_alloc`
+/// sites matched by 22 hand-placed `av_frame_free`s — an ownership contract upheld by nobody,
+/// and broken in practice: the Windows zero-copy submit path leaked the frame AND a pooled
+/// hwframe surface on three `?` exits, under a comment asserting the opposite (fixed in the
+/// same change that introduced this type).
+///
+/// Why not ffmpeg-next's own RAII frame (`frame::Video::empty()`, already used as `VideoFrame`
+/// in the Linux NVENC path): `Frame::empty()` does not null-check — on allocator failure it
+/// wraps null and the next field write through it is UB — whereas every open-coded site here
+/// null-checked. This type keeps that: `alloc` returns `Option`, mirroring
+/// `AvFilterGraph::alloc`.
+pub(crate) struct AvFrame(std::ptr::NonNull<ffi::AVFrame>);
+
+impl AvFrame {
+    /// Allocate a frame, rejecting the null `av_frame_alloc` returns on OOM.
+    ///
+    /// Safe: the call takes no arguments and has no precondition a caller could violate — the
+    /// only contract is what happens to the result, and that is exactly what this type owns.
+    pub(crate) fn alloc() -> Option<Self> {
+        // SAFETY: parameterless allocator; it returns either a fresh, uniquely-owned frame whose
+        // ownership passes to the value returned here, or null (rejected by NonNull::new).
+        std::ptr::NonNull::new(unsafe { ffi::av_frame_alloc() }).map(AvFrame)
+    }
+
+    /// The borrowed pointer, for the ffmpeg calls that fill or read the frame without taking
+    /// ownership of it. Borrowed only — the `AvFrame` stays the owner, so callers must not free
+    /// or move-from what this returns.
+    pub(crate) fn as_ptr(&self) -> *mut ffi::AVFrame {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for AvFrame {
+    fn drop(&mut self) {
+        let mut p = self.0.as_ptr();
+        // SAFETY: `p` is the non-null frame `alloc` took ownership of, and this type is its
+        // sole owner (neither `Clone` nor `Copy`; `as_ptr` only lends), so this runs exactly
+        // once. `av_frame_free` unrefs any buffers the frame holds (returning pooled hwframe
+        // surfaces to their pool) and frees the frame; it nulls only the local copy.
+        unsafe { ffi::av_frame_free(&mut p) };
+    }
+}
+
+/// An owned swscale context, freed exactly once when it drops.
+///
+/// Same ownership question as the frame above — `sws_getContext` at 3 sites was matched by 5
+/// hand-placed `sws_freeContext`s, two of them inside hand-written `Drop` impls whose real job
+/// this type absorbs.
+pub(crate) struct AvSwsContext(std::ptr::NonNull<ffi::SwsContext>);
+
+impl AvSwsContext {
+    /// Take ownership of a freshly-created `SwsContext`, rejecting the null `sws_getContext`
+    /// returns on failure (unsupported conversion or OOM).
+    ///
+    // unsafe-fn-no-op-ok: contract-deferring constructor (`Vec::set_len` shape) — the body is
+    // safe; the ownership transfer promised here is what Drop/as_ptr later rely on.
+    /// # Safety
+    /// `p` must be null, or a live `SwsContext` whose ownership passes to the returned value —
+    /// nothing else may free it.
+    pub(crate) unsafe fn from_raw(p: *mut ffi::SwsContext) -> Option<Self> {
+        std::ptr::NonNull::new(p).map(AvSwsContext)
+    }
+
+    /// The borrowed pointer, for `sws_scale` calls. Borrowed only — the `AvSwsContext` stays
+    /// the owner.
+    pub(crate) fn as_ptr(&self) -> *mut ffi::SwsContext {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for AvSwsContext {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the non-null context `from_raw` took ownership of, and this type
+        // is its sole owner (neither `Clone` nor `Copy`; `as_ptr` only lends), so this runs
+        // exactly once.
+        unsafe { ffi::sws_freeContext(self.0.as_ptr()) };
+    }
+}
+
 /// One `receive_packet` attempt, with the not-ready states kept distinct so a blocking drain can
 /// tell "still encoding" (retry) from "stream over" (stop). The Linux NVENC/VAAPI polls collapse
 /// `Again`/`Eof` to `None`; the Windows AMF/QSV path keeps them apart for its deadline-driven loop.

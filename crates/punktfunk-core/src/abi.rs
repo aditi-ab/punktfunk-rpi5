@@ -506,8 +506,10 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
 
 /// Client: serialize and send one input event to the host.
 ///
+/// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+///
 /// # Safety
-/// `s` is a valid client handle; `ev` points to a valid [`InputEvent`].
+/// `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_send_input(
     s: *mut PunktfunkSession,
@@ -521,18 +523,42 @@ pub unsafe extern "C" fn punktfunk_send_input(
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
-        let ev = match unsafe { ev.as_ref() } {
-            Some(e) => e,
-            None => return PunktfunkStatus::NullPointer,
+        // SAFETY: `read_input_event` upholds this file's failures-become-status-codes principle
+        // for the one field where a reference formed too early would be UB instead.
+        let ev = match unsafe { read_input_event(ev) } {
+            Ok(e) => e,
+            Err(status) => return status,
         };
         match s.inner.send_input(ev) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(e) => e.status(),
         }
     })
+}
+
+/// Validate caller memory as an [`InputEvent`] WITHOUT forming the reference first.
+///
+/// `InputEvent.kind` is a `#[repr(u8)]` enum with 16 valid discriminants, and a C embedder
+/// writing `ev->kind = 42` is not a decodable error once `&InputEvent` exists — forming the
+/// reference IS the UB, by the language's validity rule. So the tag is read as a raw byte and
+/// validated through the same `InputKind::from_u8` the wire path uses (`input.rs::decode`),
+/// and the typed reference comes into existence only afterwards. Every other field is a plain
+/// integer (or the `[u8; 3]` pad), valid for any bit pattern.
+///
+/// # Safety
+/// `ev` is null (reported as a status) or readable for `size_of::<InputEvent>()` bytes.
+unsafe fn read_input_event<'a>(ev: *const InputEvent) -> Result<&'a InputEvent, PunktfunkStatus> {
+    if ev.is_null() {
+        return Err(PunktfunkStatus::NullPointer);
+    }
+    // SAFETY: non-null per the check above, readable per this fn's contract; a one-byte read
+    // at offset 0 (the `kind` tag — repr(C) puts it first) cannot itself be UB for any value.
+    if crate::input::InputKind::from_u8(unsafe { ev.cast::<u8>().read() }).is_none() {
+        return Err(PunktfunkStatus::InvalidArg);
+    }
+    // SAFETY: non-null, readable, and the discriminant byte was just validated — every field
+    // of the repr(C) struct now holds a valid bit pattern for its type.
+    Ok(unsafe { &*ev })
 }
 
 /// Register the host-side input callback (pass a NULL fn pointer to clear). The callback
@@ -3372,8 +3398,10 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
 
 /// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 ///
+/// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+///
 /// # Safety
-/// `c` is a valid connection handle; `ev` points to a valid [`InputEvent`].
+/// `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connection_send_input(
@@ -3388,12 +3416,11 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
-        let ev = match unsafe { ev.as_ref() } {
-            Some(e) => e,
-            None => return PunktfunkStatus::NullPointer,
+        // SAFETY: `read_input_event` upholds this file's failures-become-status-codes principle
+        // for the one field where a reference formed too early would be UB instead.
+        let ev = match unsafe { read_input_event(ev) } {
+            Ok(e) => e,
+            Err(status) => return status,
         };
         match c.inner.send_input(ev) {
             Ok(()) => PunktfunkStatus::Ok,
@@ -4817,6 +4844,30 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
+
+    /// A C embedder writing `ev->kind = 42` must come back as a status code, not UB. The test
+    /// stages the event in `MaybeUninit` storage so no `&InputEvent` to an invalid value ever
+    /// exists on the test's own side either.
+    #[test]
+    fn read_input_event_rejects_null_and_bad_discriminant() {
+        // SAFETY: null is the documented reported-not-UB case.
+        let null_result = unsafe { read_input_event(std::ptr::null()) };
+        assert_eq!(null_result.unwrap_err(), PunktfunkStatus::NullPointer);
+
+        let mut slot = core::mem::MaybeUninit::<InputEvent>::zeroed();
+        let p = slot.as_mut_ptr();
+        // SAFETY: writing one byte at offset 0 of aligned, sized storage.
+        unsafe { p.cast::<u8>().write(42) };
+        // SAFETY: `p` is aligned and readable for the full struct.
+        let bad_tag = unsafe { read_input_event(p) };
+        assert_eq!(bad_tag.unwrap_err(), PunktfunkStatus::InvalidArg);
+
+        // SAFETY: as above; tag 0 (KeyDown) + zeroed fields is a fully valid event.
+        unsafe { p.cast::<u8>().write(0) };
+        // SAFETY: as above.
+        let ev = unsafe { read_input_event(p) }.expect("valid tag must pass");
+        assert_eq!(ev.kind, crate::input::InputKind::KeyDown);
+    }
 
     /// The `AudioCtl` → `PunktfunkHidOutput` mapping: kind 5, pad narrowed, `which` carries the
     /// flags byte, `effect[0..6]` the raw audio region with `effect_len = 6` (the TrackpadHaptic

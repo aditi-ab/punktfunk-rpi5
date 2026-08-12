@@ -24,8 +24,8 @@ use std::os::raw::c_int;
 use std::ptr;
 
 use super::libav::{
-    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, PollOutcome, SWS_CS_ITU709,
-    SWS_POINT,
+    apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFrame, AvSwsContext, PollOutcome,
+    SWS_CS_ITU709, SWS_POINT,
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -191,6 +191,17 @@ struct OpenArgs {
 }
 
 pub struct NvencEncoder {
+    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced ran before any field
+    // drop, freeing `sws_csc` ahead of `enc`/`frame`/`cuda` — and this path runs on every
+    // stall-watchdog recovery via `*self = fresh` in `reset`. Declaration order is what
+    // preserves that sequence now (drop order follows declaration; an offset_of assert cannot
+    // pin it — repr(Rust) may lay memory out in any order).
+    /// CPU CSC paths only: swscale context converting the captured packed source into
+    /// [`Self::frame`] — RGB/BGR → planar YUV444P for a 4:4:4 session (`hevc_nvenc` only emits
+    /// 4:4:4 from a YUV444 *input*; RGB-in is always 4:2:0), or X2RGB10/X2BGR10 → P010 (BT.2020
+    /// limited) for an HDR session. `None` on the plain RGB paths AND on the zero-copy paths (the
+    /// worker's GPU convert delivers ready CUDA frames).
+    sws_csc: Option<AvSwsContext>,
     enc: encoder::video::Encoder,
     /// Reusable 4-bpp CPU input frame (CPU path only; `None` for the zero-copy/CUDA path).
     /// Mutating it in place across frames is sound only because the encoder is opened with
@@ -199,12 +210,6 @@ pub struct NvencEncoder {
     frame: Option<VideoFrame>,
     /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
     cuda: Option<CudaHw>,
-    /// CPU CSC paths only: swscale context converting the captured packed source into
-    /// [`Self::frame`] — RGB/BGR → planar YUV444P for a 4:4:4 session (`hevc_nvenc` only emits
-    /// 4:4:4 from a YUV444 *input*; RGB-in is always 4:2:0), or X2RGB10/X2BGR10 → P010 (BT.2020
-    /// limited) for an HDR session. `None` on the plain RGB paths AND on the zero-copy paths (the
-    /// worker's GPU convert delivers ready CUDA frames). Freed in `Drop`.
-    sws_csc: Option<*mut ffi::SwsContext>,
     /// This session opened as full-chroma 4:4:4 (FREXT) — via either input path.
     want_444: bool,
     src_format: PixelFormat,
@@ -226,7 +231,7 @@ pub struct NvencEncoder {
     args: OpenArgs,
 }
 
-// `CudaHw` holds raw `AVBufferRef`s and `sws_csc` a raw `SwsContext`; the encoder lives on a single
+// `CudaHw` holds raw `AVBufferRef`s and `sws_csc` an owned `SwsContext`; the encoder lives on a single
 // thread. The CPU encoder is already `Send` via ffmpeg-next; assert it for the raw fields too.
 // SAFETY: `NvencEncoder` owns an ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus a `CudaHw`
 // holding raw `AVBufferRef`s and an optional raw `SwsContext`, none of which are `Send` by default.
@@ -608,14 +613,13 @@ impl NvencEncoder {
             );
         }
 
-        // Built HERE, below the fallible encoder open, NOT above it. `sws_getContext` returns a raw
-        // pointer whose only free is `Drop for NvencEncoder` — and `Drop` needs a CONSTRUCTED
-        // `Self`, which does not exist on `open`'s early returns (the intra-refresh-unsupported
-        // retry, which recurses into `Self::open`, and the plain error return). Creating the
-        // context above them leaked one per failed attempt, and `open_nvenc_probed`'s EINVAL
-        // bitrate ladder calls `open` up to ~10 times, so a host stepping its bitrate down leaked a
-        // context per step. Nothing between here and the `Ok(NvencEncoder { … })` below can return,
-        // so this placement makes the leak unrepresentable rather than merely unlikely.
+        // Built HERE, below the fallible encoder open, NOT above it — historically because the
+        // context's only free was `Drop for NvencEncoder`, which needs a CONSTRUCTED `Self` that
+        // does not exist on `open`'s early returns; creating it above them leaked one per failed
+        // attempt, and `open_nvenc_probed`'s EINVAL bitrate ladder calls `open` up to ~10 times.
+        // The owned `AvSwsContext` now frees itself on any exit, but the placement stays: it
+        // documents the dependency on the post-open `nvenc_pixel`, and there is no reason to
+        // build a context an early return would just throw away.
         // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
         // input frame. THREE users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag), HDR
         // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
@@ -640,10 +644,10 @@ impl NvencEncoder {
             // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
             // valid `AVPixelFormat` (from the `sws_src_pixel`-validated packed-RGB source), the dst is
             // YUV444P (4:4:4) or P010LE (HDR). The trailing filter/param pointers are null = "use
-            // defaults" (documented as accepted). No Rust memory is borrowed; the returned pointer is
-            // null-checked below.
+            // defaults" (documented as accepted). No Rust memory is borrowed; ownership of the
+            // returned context passes to the `AvSwsContext` (null rejected by `from_raw`).
             let sws = unsafe {
-                ffi::sws_getContext(
+                AvSwsContext::from_raw(ffi::sws_getContext(
                     width as c_int,
                     height as c_int,
                     src_av,
@@ -654,11 +658,11 @@ impl NvencEncoder {
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null(),
-                )
+                ))
             };
-            if sws.is_null() {
+            let Some(sws) = sws else {
                 bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
-            }
+            };
             // Colour math applies to the CSC users ONLY. The expand is a pure byte shuffle —
             // packed 3-bpp RGB/BGR to the same channels in 4 bytes, `nvenc_pixel` being `rgb0`/
             // `bgr0` — and NVENC does the RGB→YUV itself downstream. Handing it a matrix + range
@@ -678,7 +682,16 @@ impl NvencEncoder {
                         SWS_CS_ITU709
                     });
                     let dst_range = i32::from(full_range_444);
-                    ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
+                    ffi::sws_setColorspaceDetails(
+                        sws.as_ptr(),
+                        cs,
+                        1,
+                        cs,
+                        dst_range,
+                        0,
+                        1 << 16,
+                        1 << 16,
+                    );
                 }
             }
             Some(sws)
@@ -692,10 +705,10 @@ impl NvencEncoder {
             Some(VideoFrame::new(nvenc_pixel, width, height))
         };
         Ok(NvencEncoder {
+            sws_csc,
             enc,
             frame,
             cuda: cuda_hw,
-            sws_csc,
             want_444,
             src_format: format,
             width,
@@ -838,7 +851,7 @@ impl NvencEncoder {
         // three CSC users (see `open`): 4:4:4 → planar YUV444P, HDR → P010, and the packed 3-bpp
         // expand → `rgb0`/`bgr0`. The remaining branch below is the 4-bpp source, which needs no
         // conversion at all — just a row copy honouring the destination stride.
-        if let Some(sws) = self.sws_csc {
+        if let Some(sws) = self.sws_csc.as_ref().map(AvSwsContext::as_ptr) {
             let frame = self
                 .frame
                 .as_mut()
@@ -927,27 +940,23 @@ impl NvencEncoder {
         // SAFETY: `frames_ref` is the non-null CUDA frames ctx from `self.cuda` (unwrapped via
         // `.context(..)?` above), and the shared CUDA context was just made current on THIS thread
         // (`make_current()?`), the precondition for the device-pointer copies below.
-        //  * `av_frame_alloc` → `f` (null-checked). `av_hwframe_get_buffer(frames_ref, f, 0)` fills `f`
-        //    with a pooled CUDA surface (sets `data[]`/`linesize[]`/`buf[0]`/`hw_frames_ctx`); on
-        //    failure we free `f` and bail.
-        //  * For NV12 we read `(*f).data[0..2]` / `linesize[0..2]` (Y + interleaved UV), else
-        //    `data[0]`/`linesize[0]` — in-struct fields of the non-null `f`, valid for the surface dims
-        //    ffmpeg allocated — and pass them to the cuda copy helpers, which device→device copy `buf`
-        //    (the imported `DeviceBuffer`, owned by the caller and live for this call) into the surface.
-        //  * On copy error we free `f` and return. Otherwise we write `pts`/`pict_type` through `f` and
-        //    `avcodec_send_frame` it into the live owned `self.enc` context (which takes its own ref of
-        //    the pooled surface), then free our `f` ref exactly once. Single-threaded encoder → no race.
+        //  * `f` is an owned `AvFrame` — every exit below (bail, copy error, success) drops it
+        //    exactly once, releasing its ref on the pooled surface. `av_hwframe_get_buffer` fills
+        //    it with a pooled CUDA surface (sets `data[]`/`linesize[]`/`buf[0]`/`hw_frames_ctx`).
+        //  * For NV12 we read `data[0..2]` / `linesize[0..2]` (Y + interleaved UV), else
+        //    `data[0]`/`linesize[0]` — in-struct fields of the live frame, valid for the surface
+        //    dims ffmpeg allocated — and pass them to the cuda copy helpers, which device→device
+        //    copy `buf` (the imported `DeviceBuffer`, owned by the caller and live for this call)
+        //    into the surface.
+        //  * `avcodec_send_frame` takes its own ref of the pooled surface, so the drop afterwards
+        //    is the sole owning free. Single-threaded encoder → no race.
         unsafe {
-            let mut f = ffi::av_frame_alloc();
-            if f.is_null() {
-                bail!("av_frame_alloc failed");
-            }
+            let f = AvFrame::alloc().context("av_frame_alloc failed")?;
             // Pooled CUDA surface: sets format, width/height, data[0]/linesize[0], buf[0] and
             // hw_frames_ctx. Reused across frames (the pool recycles), keeping NVENC's
             // registration cache warm.
-            let r = ffi::av_hwframe_get_buffer(frames_ref, f, 0);
+            let r = ffi::av_hwframe_get_buffer(frames_ref, f.as_ptr(), 0);
             if r < 0 {
-                ffi::av_frame_free(&mut f);
                 bail!("av_hwframe_get_buffer(CUDA) failed ({r})");
             }
             // NV12 surfaces are two-plane (Y in data[0], interleaved UV in data[1]); YUV444
@@ -958,41 +967,36 @@ impl NvencEncoder {
             let copy_res = if buf.yuv444 {
                 let dsts = core::array::from_fn(|i| {
                     (
-                        (*f).data[i] as pf_zerocopy::cuda::CUdeviceptr,
-                        (*f).linesize[i] as usize,
+                        (*f.as_ptr()).data[i] as pf_zerocopy::cuda::CUdeviceptr,
+                        (*f.as_ptr()).linesize[i] as usize,
                     )
                 });
                 pf_zerocopy::cuda::copy_yuv444_to_device(buf, dsts, true)
             } else if self.want_444 {
-                ffi::av_frame_free(&mut f);
                 bail!(
                     "4:4:4 session but the zero-copy frame is not YUV444 (LINEAR/gamescope \
                      capture has no GPU 4:4:4 convert) — unset PUNKTFUNK_ZEROCOPY to use the \
                      CPU 4:4:4 path on this compositor"
                 );
             } else if buf.is_nv12() {
-                let y_ptr = (*f).data[0] as pf_zerocopy::cuda::CUdeviceptr;
-                let y_pitch = (*f).linesize[0] as usize;
-                let uv_ptr = (*f).data[1] as pf_zerocopy::cuda::CUdeviceptr;
-                let uv_pitch = (*f).linesize[1] as usize;
+                let y_ptr = (*f.as_ptr()).data[0] as pf_zerocopy::cuda::CUdeviceptr;
+                let y_pitch = (*f.as_ptr()).linesize[0] as usize;
+                let uv_ptr = (*f.as_ptr()).data[1] as pf_zerocopy::cuda::CUdeviceptr;
+                let uv_pitch = (*f.as_ptr()).linesize[1] as usize;
                 pf_zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch, true)
             } else {
-                let dst_ptr = (*f).data[0] as pf_zerocopy::cuda::CUdeviceptr;
-                let dst_pitch = (*f).linesize[0] as usize;
+                let dst_ptr = (*f.as_ptr()).data[0] as pf_zerocopy::cuda::CUdeviceptr;
+                let dst_pitch = (*f.as_ptr()).linesize[0] as usize;
                 pf_zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch, true)
             };
-            if let Err(e) = copy_res {
-                ffi::av_frame_free(&mut f);
-                return Err(e).context("copy imported buffer into NVENC surface");
-            }
-            (*f).pts = pts;
-            (*f).pict_type = if idr {
+            copy_res.context("copy imported buffer into NVENC surface")?;
+            (*f.as_ptr()).pts = pts;
+            (*f.as_ptr()).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
             } else {
                 ffi::AVPictureType::AV_PICTURE_TYPE_NONE
             };
-            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), f);
-            ffi::av_frame_free(&mut f);
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), f.as_ptr());
             if r < 0 {
                 bail!("avcodec_send_frame(CUDA) failed ({r})");
             }
@@ -1001,16 +1005,9 @@ impl NvencEncoder {
     }
 }
 
-impl Drop for NvencEncoder {
-    fn drop(&mut self) {
-        if let Some(sws) = self.sws_csc.take() {
-            // SAFETY: `sws` is the non-null `SwsContext` allocated by `sws_getContext` in `open` and
-            // owned exclusively by this encoder (taken out of the field so it can't be freed twice).
-            // `sws_freeContext` frees it; nothing else references it after this single-threaded drop.
-            unsafe { ffi::sws_freeContext(sws) };
-        }
-    }
-}
+// No `Drop` for `NvencEncoder`: `sws_csc` (`Option<AvSwsContext>`) frees itself, and as field #1
+// it does so ahead of `enc`/`frame`/`cuda` — the same sequence the hand-written `Drop` performed
+// (see the field-order note on the struct).
 
 /// Serialises the save → `AV_LOG_FATAL` → restore window that every capability probe opens around
 /// an encoder open it *expects* to fail.
