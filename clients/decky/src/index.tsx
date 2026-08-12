@@ -46,15 +46,23 @@ import { OsMark } from "./os-icon";
 import { ensureGamepadUiShortcut, launchGamepadUi, recreateShortcuts, stopStream } from "./steam";
 import { TrustSheet } from "./trust";
 
-// Recovery action for "the Punktfunk library entry vanished" — recreates the visible shortcut.
+// Recovery action for "the Punktfunk library entry vanished" — recreates the visible shortcut
+// and sweeps duplicate entries (the piles a boot race used to mint, one per Steam start).
 // Deleting the shortcut (optionally + reinstalling the plugin) leaves a stale appId in Steam's
 // CEF localStorage that self-heal fixes on the next mount, but this gives an in-session button
 // that works even without a reload. Always ends in a toast so the tap has feedback.
 async function recreatePunktfunkShortcut(): Promise<void> {
-  const appId = await recreateShortcuts();
+  const { appId, removedDuplicates } = await recreateShortcuts();
   toaster.toast({
     title: "Punktfunk",
-    body: appId != null ? "Shortcut restored to your library" : "Couldn't create the shortcut",
+    body:
+      appId == null
+        ? "Couldn't create the shortcut"
+        : removedDuplicates > 0
+          ? `Shortcut restored — removed ${removedDuplicates} duplicate ${
+              removedDuplicates === 1 ? "entry" : "entries"
+            }`
+          : "Shortcut restored to your library",
   });
 }
 
@@ -222,12 +230,16 @@ const QamPanel: FC = () => {
               label={
                 problem === "client-unavailable"
                   ? "Punktfunk isn’t installed"
-                  : "Update the Punktfunk client"
+                  : problem === "list-failed"
+                    ? "Couldn’t scan for hosts"
+                    : "Update the Punktfunk client"
               }
               description={
                 problem === "client-unavailable"
                   ? "This panel launches the Punktfunk app, which isn’t on this Deck yet. Install it in Desktop Mode."
-                  : "This client is too old to find hosts on your network. Saved hosts still work."
+                  : problem === "list-failed"
+                    ? "Something went wrong while scanning — Refresh tries again."
+                    : "This client is too old to find hosts on your network. Saved hosts still work."
               }
             />
           </PanelSectionRow>
@@ -313,7 +325,7 @@ const QamPanel: FC = () => {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            description="Missing the Punktfunk entry in your library? This puts it back."
+            description="Missing the Punktfunk entry in your library, or seeing several? This puts one back and removes the rest."
             onClick={() => void recreatePunktfunkShortcut()}
           >
             <FaPlus style={{ marginRight: "0.5em" }} />

@@ -44,6 +44,7 @@ declare const SteamClient: {
     ): Promise<unknown>;
     RunGame(gameId: string, _unused: string, _i: number, _j: number): void;
     TerminateApp(gameId: string, _b: boolean): void;
+    RemoveShortcut(appId: number): void;
   };
 };
 
@@ -62,29 +63,114 @@ declare const collectionStore:
 // that the reuse path below silently repoints (SetShortcut* on a dead id is a no-op), and the
 // entry never comes back.
 declare const appStore:
-  | { GetAppOverviewByAppID?: (appId: number) => unknown | null }
+  | {
+      GetAppOverviewByAppID?: (appId: number) => unknown | null;
+      allApps?: SteamAppOverviewLike[];
+    }
   | undefined;
 
-/** True if a remembered appId still maps to a live Steam shortcut. When appStore is unavailable
- *  we can't tell, so assume it exists — better to keep reusing than risk a duplicate library
- *  entry from a false "missing". A confident null means the shortcut was deleted → recreate. */
-function shortcutStillExists(appId: number): boolean {
+// The overview surface we read when scanning the library — Steam internals, so everything is
+// optional and accessed defensively.
+interface SteamAppOverviewLike {
+  appid?: number;
+  display_name?: string;
+  BIsShortcut?: () => boolean;
+}
+
+// Steam-injected global whose WaitForServicesInitialized resolves once the client's app
+// services are up (the MoonDeck-verified readiness signal). Services-init alone doesn't
+// guarantee the overview map is populated, so it's paired with the hydration witness below.
+declare const App:
+  | { WaitForServicesInitialized?: () => Promise<boolean> }
+  | undefined;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+let servicesInitialized: Promise<void> | undefined;
+function waitForServicesInitialized(): Promise<void> {
+  servicesInitialized ??= (async () => {
+    try {
+      if (typeof App !== "undefined" && App?.WaitForServicesInitialized) {
+        await App.WaitForServicesInitialized();
+      }
+    } catch {
+      /* no signal — the hydration witness still gates the verdict */
+    }
+  })();
+  return servicesInitialized;
+}
+
+/** Has appStore demonstrably finished its initial load? An empty `allApps` means "not yet":
+ *  any account that ever had our shortcut has at least one app, so a populated map is the
+ *  witness that a null overview lookup is an ANSWER rather than a not-loaded-yet. null =
+ *  can't tell (missing global, API drift). */
+function appStoreHydrated(): boolean | null {
+  try {
+    if (typeof appStore === "undefined" || !appStore) {
+      return null;
+    }
+    const apps = appStore.allApps;
+    return Array.isArray(apps) ? apps.length > 0 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One overview lookup: true = live, false = absent, null = can't tell. */
+function queryShortcutAlive(appId: number): boolean | null {
   try {
     // Call it as a METHOD on appStore — NEVER as an extracted function. Its implementation
     // reads the store's own state (`this.m_mapApps`), so `const get = appStore.GetAppOverview…;
     // get(id)` throws on the lost `this`, and the catch below turns that into a permanent
-    // "true". That is not a stale-data bug but a total one: the guard then answers "still
-    // exists" for EVERY appId, so a dangling id is never dropped, the reuse path repoints a
-    // dead shortcut (silent no-ops), and "recreate" reports success having done nothing.
-    // `typeof` first: `appStore` is a Steam-injected global, and a bare reference to a missing
-    // one is a ReferenceError that optional chaining does NOT prevent.
+    // "can't tell". `typeof` first: `appStore` is a Steam-injected global, and a bare
+    // reference to a missing one is a ReferenceError that optional chaining does NOT prevent.
     if (typeof appStore === "undefined" || !appStore?.GetAppOverviewByAppID) {
-      return true; // no way to verify — preserve the reuse path
+      return null;
     }
     return appStore.GetAppOverviewByAppID(appId) != null;
   } catch {
+    return null;
+  }
+}
+
+// How long to wait for the app store before conceding liveness can't be verified. A Deck boot
+// hydrates the store within a few seconds of plugin mount; 30 s is comfortably past any real
+// boot, and the wait only burns on the absent/unverifiable paths — a live overview answers on
+// the first query. Overview registration can trail the bulk hydration by a beat, so a
+// "hydrated but absent" verdict gets one grace recheck before it counts as deleted.
+const STORE_WAIT_MS = 30_000;
+const STORE_POLL_MS = 1_000;
+const STORE_GRACE_MS = 2_000;
+
+/** True if a remembered appId still maps to a live Steam shortcut.
+ *
+ *  The dangerous verdict is FALSE — it sends the caller to AddShortcut, so a wrong "deleted"
+ *  mints a duplicate library entry. And a bare null-overview check gets it wrong on EVERY
+ *  boot: the plugin mounts while Steam is still starting up, before appStore has registered
+ *  its overviews, so the remembered (perfectly live) appId looks up as null and each boot
+ *  added another visible "Punktfunk" — the field-reported duplicate pile. Absent is therefore
+ *  only believed once the store is demonstrably hydrated; if that can't be established within
+ *  budget the answer is true, because a false "alive" merely no-ops Set-calls until the next
+ *  ask (and the recreate button re-asks when the store IS ready) while a false "dead"
+ *  duplicates forever. */
+async function shortcutStillExists(appId: number): Promise<boolean> {
+  if (queryShortcutAlive(appId) === true) {
     return true;
   }
+  // Race the init signal against the same budget the poll loop gets: a signal that never
+  // resolves must not wedge the guard (the single-flight ensure would stay occupied forever).
+  await Promise.race([waitForServicesInitialized(), sleep(STORE_WAIT_MS)]);
+  for (let waited = 0; waited < STORE_WAIT_MS; waited += STORE_POLL_MS) {
+    if (queryShortcutAlive(appId) === true) {
+      return true;
+    }
+    if (appStoreHydrated() === true) {
+      await sleep(STORE_GRACE_MS);
+      return queryShortcutAlive(appId) !== false; // null = unverifiable → reuse
+    }
+    await sleep(STORE_POLL_MS);
+  }
+  return true; // store never became inspectable — reusing beats duplicating
 }
 
 /** Set a shortcut's library visibility (best-effort, deferred — the overview registers a moment
@@ -156,6 +242,67 @@ async function applyArtwork(appId: number, isRetry = false): Promise<void> {
 // share it so Steam keys them to the SAME controller config (configset key = lowercase name).
 const SHORTCUT_NAME = "Punktfunk";
 
+/** Find an existing "Punktfunk" shortcut to ADOPT instead of minting a new library entry — the
+ *  healing path for a lost/wiped appId, and for the duplicate piles the boot race left behind
+ *  in the field: rebind one of the existing entries to the role rather than adding an N+1th.
+ *  (The caller rewrites exe/dir/opts/visibility anyway, so any of them serves.) Only overviews
+ *  Steam itself says are shortcuts qualify, and the other role's remembered id is excluded so
+ *  the two roles never collapse onto one shortcut. */
+function findAdoptableShortcut(excludeAppId: number | null): number | null {
+  try {
+    if (typeof appStore === "undefined" || !Array.isArray(appStore?.allApps)) {
+      return null;
+    }
+    for (const app of appStore.allApps) {
+      if (
+        app?.display_name === SHORTCUT_NAME &&
+        typeof app.appid === "number" &&
+        app.appid !== excludeAppId &&
+        app.BIsShortcut?.() === true
+      ) {
+        return app.appid;
+      }
+    }
+  } catch {
+    /* Steam internals drifted — AddShortcut is the fallback */
+  }
+  return null;
+}
+
+/** Remove every "Punktfunk" shortcut beyond the two remembered role ids — the cleanup for
+ *  piles already minted by the boot race. Deliberately reachable ONLY from the user-pressed
+ *  recreate button, never from mount: automatic library deletion at boot is a bigger hazard
+ *  than the mess it would tidy. Returns how many entries were removed. */
+function removeDuplicateShortcuts(): number {
+  let removed = 0;
+  try {
+    if (typeof appStore === "undefined" || !Array.isArray(appStore?.allApps)) {
+      return 0;
+    }
+    const keep = [recall(STORAGE_KEY_STREAM), recall(STORAGE_KEY_UI)];
+    // Snapshot before removing — RemoveShortcut mutates the store's list under the iteration.
+    const surplus = appStore.allApps.filter(
+      (app) =>
+        app?.display_name === SHORTCUT_NAME &&
+        typeof app.appid === "number" &&
+        !keep.includes(app.appid) &&
+        app.BIsShortcut?.() === true,
+    );
+    for (const app of surplus) {
+      SteamClient.Apps.RemoveShortcut(app.appid as number);
+      try {
+        localStorage.removeItem(artKey(app.appid as number));
+      } catch {
+        /* ignore */
+      }
+      removed++;
+    }
+  } catch (e) {
+    console.warn("punktfunk: duplicate-shortcut sweep incomplete", e);
+  }
+  return removed;
+}
+
 // The shortcut's exe is /bin/sh, NOT the script itself: Decky extracts plugin zips without
 // preserving the exec bit, and ~/homebrew/plugins is root-owned so the unprivileged plugin
 // backend can't chmod it back on. Passing the script as an argument to the always-executable
@@ -223,7 +370,7 @@ async function ensureControllerConfig(): Promise<void> {
  * the current runner path. Reuses/repoints the remembered shortcut (the plugin dir can change
  * across reinstalls, and pre-two-shortcut installs had this one visible).
  */
-async function ensureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
+async function doEnsureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
   const info = await runnerInfo();
   if (!info.exists) {
     throw new Error(`launch wrapper missing at ${info.runner}`);
@@ -232,23 +379,36 @@ async function ensureStreamShortcut(): Promise<{ appId: number; runner: string; 
   void ensureControllerConfig(); // fire-and-forget — never blocks the launch
 
   // Reuse the remembered shortcut only if it still exists — a stale appId (shortcut deleted, key
-  // outlived it across a reinstall) must fall through to AddShortcut, not be silently repointed.
+  // outlived it across a reinstall) must fall through, not be silently repointed. On a lost id,
+  // ADOPT an existing same-named shortcut before AddShortcut so a wiped key never duplicates.
   const remembered = recall(STORAGE_KEY_STREAM);
-  if (remembered != null && shortcutStillExists(remembered)) {
-    SteamClient.Apps.SetShortcutExe(remembered, SHELL);
-    SteamClient.Apps.SetShortcutStartDir(remembered, startDir);
-    SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
-    setShortcutHidden(remembered, true); // migrate pre-two-shortcut installs (were visible)
-    void applyArtwork(remembered);
-    return { appId: remembered, runner: info.runner, clientBin: info.client_bin ?? "" };
+  let appId =
+    remembered != null && (await shortcutStillExists(remembered)) ? remembered : null;
+  if (appId == null) {
+    appId =
+      findAdoptableShortcut(recall(STORAGE_KEY_UI)) ??
+      (await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, ""));
+    remember(STORAGE_KEY_STREAM, appId);
   }
-
-  const appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
+  SteamClient.Apps.SetShortcutExe(appId, SHELL);
+  SteamClient.Apps.SetShortcutStartDir(appId, startDir);
   SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-  setShortcutHidden(appId, true);
+  setShortcutHidden(appId, true); // also migrates pre-two-shortcut installs (were visible)
   void applyArtwork(appId);
-  remember(STORAGE_KEY_STREAM, appId);
   return { appId, runner: info.runner, clientBin: info.client_bin ?? "" };
+}
+
+// Concurrent ensure calls share one run per role — two ensures racing past the liveness check
+// would each AddShortcut, which is exactly the duplicate class this file exists to prevent (and
+// the store-readiness wait makes the window real: mount's fire-and-forget ensure can be mid-wait
+// when a QAM press arrives). Sequential calls still re-run, so per-launch repointing is kept.
+let streamEnsureInFlight: Promise<{ appId: number; runner: string; clientBin: string }> | null =
+  null;
+function ensureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
+  streamEnsureInFlight ??= doEnsureStreamShortcut().finally(() => {
+    streamEnsureInFlight = null;
+  });
+  return streamEnsureInFlight;
 }
 
 /**
@@ -258,7 +418,7 @@ async function ensureStreamShortcut(): Promise<{ appId: number; runner: string; 
  * kept VISIBLE. Idempotent — call on plugin mount so the library entry always exists and stays
  * repointed to the current plugin dir. Best-effort: returns null on any failure.
  */
-export async function ensureGamepadUiShortcut(): Promise<number | null> {
+async function doEnsureGamepadUiShortcut(): Promise<number | null> {
   try {
     const info = await runnerInfo();
     if (!info.exists) {
@@ -275,18 +435,20 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
 
     // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
-    // localStorage key survived a plugin reinstall) falls through to AddShortcut so the visible
-    // library entry actually comes back instead of repointing a dead id.
+    // localStorage key survived a plugin reinstall) falls through so the visible library entry
+    // actually comes back instead of repointing a dead id. On a lost id, ADOPT an existing
+    // same-named shortcut (a boot-race duplicate, or the entry whose key was wiped) before
+    // AddShortcut — creation is the last resort, never the response to a mere lookup miss.
     let appId = recall(STORAGE_KEY_UI);
-    if (appId != null && shortcutStillExists(appId)) {
-      SteamClient.Apps.SetShortcutExe(appId, SHELL);
-      SteamClient.Apps.SetShortcutStartDir(appId, startDir);
-      SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-    } else {
-      appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
-      SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
+    if (appId == null || !(await shortcutStillExists(appId))) {
+      appId =
+        findAdoptableShortcut(recall(STORAGE_KEY_STREAM)) ??
+        (await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, ""));
       remember(STORAGE_KEY_UI, appId);
     }
+    SteamClient.Apps.SetShortcutExe(appId, SHELL);
+    SteamClient.Apps.SetShortcutStartDir(appId, startDir);
+    SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
     SteamClient.Apps.SetAppLaunchOptions(appId, launchOpts);
     setShortcutHidden(appId, false); // the visible library entry
     void applyArtwork(appId);
@@ -297,18 +459,32 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
   }
 }
 
+// Same single-flight rule as the stream role (see ensureStreamShortcut).
+let uiEnsureInFlight: Promise<number | null> | null = null;
+export function ensureGamepadUiShortcut(): Promise<number | null> {
+  uiEnsureInFlight ??= doEnsureGamepadUiShortcut().finally(() => {
+    uiEnsureInFlight = null;
+  });
+  return uiEnsureInFlight;
+}
+
 /**
  * Force the visible "Punktfunk" library entry back into existence — the recovery button for
  * "my shortcut disappeared". Drops any remembered appId that no longer maps to a live shortcut
  * (so it can't shadow a fresh AddShortcut), then re-ensures. Safe to press anytime: a shortcut
  * that still exists is left in place (no duplicate); a missing one is recreated. Covers the case
  * self-heal-on-mount can't — deleting the shortcut WITHOUT reinstalling (no mount → no ensure).
- * Returns the (new or existing) visible appId, or null on failure.
+ * Also sweeps surplus "Punktfunk" entries (the piles the boot race minted before the store-
+ * readiness gate existed) — the button is where that cleanup lives, never mount. Returns the
+ * (new or existing) visible appId (null on failure) plus how many duplicates were removed.
  */
-export async function recreateShortcuts(): Promise<number | null> {
+export async function recreateShortcuts(): Promise<{
+  appId: number | null;
+  removedDuplicates: number;
+}> {
   for (const key of [STORAGE_KEY_STREAM, STORAGE_KEY_UI]) {
     const id = recall(key);
-    if (id != null && !shortcutStillExists(id)) {
+    if (id != null && !(await shortcutStillExists(id))) {
       try {
         localStorage.removeItem(artKey(id)); // stale art marker for the dead appId
         localStorage.removeItem(key);
@@ -317,8 +493,13 @@ export async function recreateShortcuts(): Promise<number | null> {
       }
     }
   }
-  // Recreate the visible entry now; the hidden stream shortcut re-registers lazily on next launch.
-  return ensureGamepadUiShortcut();
+  // Recreate the visible entry now; the hidden stream shortcut re-registers lazily on next
+  // launch. Sweep AFTER the ensure so the remembered ids are fresh — and only when the ensure
+  // succeeded: on a failed ensure the "keep" list can't be trusted, and deleting candidates a
+  // later ensure would adopt could leave the library with no entry at all.
+  const appId = await ensureGamepadUiShortcut();
+  const removedDuplicates = appId != null ? removeDuplicateShortcuts() : 0;
+  return { appId, removedDuplicates };
 }
 
 /** Launch the stateless gamepad-UI shortcut (console home) from the plugin, e.g. a QAM button. */
