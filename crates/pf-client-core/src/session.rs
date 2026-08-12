@@ -104,6 +104,19 @@ pub struct SessionParams {
     /// above; it rides along so the stats overlay can answer "which profile am I on?" without
     /// re-reading any store (design/client-settings-profiles.md §5.2).
     pub profile: Option<String>,
+    /// The stats-overlay tier THIS launch resolved to — the globals, or the profile bound to
+    /// this host. Presentation-tier, like [`profile`](Self::profile): the session controller
+    /// never reads it, it rides along so the presenter can adopt it when a browse-mode launch
+    /// starts.
+    ///
+    /// That adoption is the whole point. The console (Gaming Mode / Decky) builds its window
+    /// and its run loop ONCE and streams many sessions through them, so a tier taken only from
+    /// the loop's start-of-process options could never change again — a user picking a tier in
+    /// the console's settings screen saw the row move, the file updated, and every stream keep
+    /// the old overlay until the app was restarted. Carrying it per launch is what lets the
+    /// choice land on the next stream, and it makes a profile's `stats_verbosity` reach the
+    /// console too. The in-stream cycle chord still wins for the rest of the stream it moved.
+    pub stats_verbosity: crate::trust::StatsVerbosity,
     /// Advertise `quic::CLIENT_CAP_PHASE_LOCK`: this embedder's presenter has REAL on-glass
     /// latch stamps (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid),
     /// so the pump sends the ~1 Hz `PhaseReport`s the host phase-locks its capture tick to

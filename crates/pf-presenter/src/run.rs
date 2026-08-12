@@ -1280,6 +1280,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                         opts.render_scale_max_dim,
                                     );
                                 }
+                                // Adopt the tier this launch RESOLVED (globals or the host's
+                                // profile) instead of keeping the one the process started on.
+                                // `opts.stats_verbosity` only ever seeds the loop: the console
+                                // outlives every stream, so without this a settings change
+                                // reached the file and the settings row and nothing else until
+                                // the app was restarted.
+                                //
+                                // Deliberately HERE and not in `StreamState::new`: the
+                                // codec-fallback retry rebuilds the state from a clone of these
+                                // params mid-stream, and doing it there would snap the overlay
+                                // back every time a session fell down the codec ladder, undoing
+                                // a cycle the user had just made with the chord.
+                                stats_verbosity = params.stats_verbosity;
                                 // A live pump here would be DETACHED by the assignment
                                 // below — `StreamState` has no `Drop`, so its thread
                                 // would keep decoding onto the shared Vulkan device that

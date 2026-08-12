@@ -116,6 +116,28 @@ mod session_main {
         std::env::args().any(|a| a == flag)
     }
 
+    /// The stats-overlay tier a session starts on: the resolved setting, except that
+    /// `--stats` (tooling/debug runs) forces the overlay VISIBLE without demoting an
+    /// explicitly chosen richer tier.
+    ///
+    /// One helper because three callers need the identical rule — both run modes' presenter
+    /// options and the per-launch [`session_params`] — and a fourth reading of it would be
+    /// the bug this is here to prevent.
+    pub(crate) fn stats_tier(settings: &trust::Settings) -> trust::StatsVerbosity {
+        stats_tier_with(settings.stats_verbosity(), arg_flag("--stats"))
+    }
+
+    /// [`stats_tier`]'s rule, with argv lifted out so it is testable.
+    pub(crate) fn stats_tier_with(
+        chosen: trust::StatsVerbosity,
+        stats_flag: bool,
+    ) -> trust::StatsVerbosity {
+        match chosen {
+            trust::StatsVerbosity::Off if stats_flag => trust::StatsVerbosity::Normal,
+            v => v,
+        }
+    }
+
     /// Running under Gaming Mode (a Deck, or any gamescope session): the environment
     /// where the local Steam UI owns the physical Steam/QAM buttons — the system-button
     /// "auto" policy keys off this.
@@ -420,6 +442,12 @@ mod session_main {
             connect_timeout: connect_timeout(),
             force_software,
             profile,
+            // Presentation-tier, carried per launch rather than read once by the run loop:
+            // the console streams many sessions through ONE loop, so this is the only way a
+            // tier the user picked between streams (or one a host's profile carries) reaches
+            // the overlay before the app is restarted. Single mode passes the same value its
+            // presenter options already hold, so it changes nothing there.
+            stats_verbosity: stats_tier(settings),
             // Phase-locked capture (design/phase-locked-capture.md, Apple/Android parity):
             // advertised only when the presenter has real on-glass latch stamps
             // (VK_KHR_present_wait) — without them there is no latch grid to report. The
@@ -926,12 +954,7 @@ mod session_main {
             window_title: format!("Punktfunk · {title}"),
             fullscreen,
             window_pos: window_pos(),
-            // `--stats` forces the overlay visible (tooling/debug runs) without
-            // demoting an explicitly chosen richer tier.
-            stats_verbosity: match settings.stats_verbosity() {
-                trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
-                v => v,
-            },
+            stats_verbosity: stats_tier(&settings),
             touch_mode: settings.touch_mode(),
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
@@ -997,6 +1020,37 @@ mod session_main {
             Err(e) => {
                 json_line("error", &format!("presenter: {e:#}"), None);
                 EXIT_PRESENTER_FAILED
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use trust::StatsVerbosity as V;
+
+        /// `--stats` is a floor, never a ceiling: it lifts Off to Normal and leaves every
+        /// richer chosen tier alone. Both run modes' presenter options AND the per-launch
+        /// params read this one rule, which is the point of having it.
+        #[test]
+        fn the_stats_flag_lifts_off_and_demotes_nothing() {
+            assert_eq!(stats_tier_with(V::Off, true), V::Normal);
+            assert_eq!(stats_tier_with(V::Off, false), V::Off);
+            for chosen in [V::Compact, V::Normal, V::Detailed] {
+                assert_eq!(stats_tier_with(chosen, true), chosen);
+                assert_eq!(stats_tier_with(chosen, false), chosen);
+            }
+        }
+
+        /// The console reads the file ONCE for its window, so a tier changed between streams
+        /// can only reach the overlay by riding the launch. Guards the wiring the field exists
+        /// for: whatever settings a launch resolved is what the params carry.
+        #[test]
+        fn a_launch_carries_the_tier_its_settings_resolved() {
+            let mut s = trust::Settings::default();
+            for chosen in [V::Off, V::Compact, V::Normal, V::Detailed] {
+                s.set_stats_verbosity(chosen);
+                assert_eq!(stats_tier_with(s.stats_verbosity(), false), chosen);
             }
         }
     }
