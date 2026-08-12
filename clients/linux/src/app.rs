@@ -870,6 +870,23 @@ fn deliver_deep_link(url: String) {
     }
 }
 
+/// The crate's one runtime env mutation, isolated so `main.rs`'s `deny(unsafe_code)` covers
+/// everything else and the exemption is a named function rather than a whole call site.
+#[allow(unsafe_code)]
+fn clear_steam_sdl_device_filter() {
+    for var in [
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
+            // SAFETY: called at the top of `run()`, before GTK init or any other thread
+            // exists in this process — nothing reads the environment concurrently.
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+}
+
 pub fn run() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -879,17 +896,7 @@ pub fn run() -> glib::ExitCode {
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).
-    for var in [
-        "SDL_GAMECONTROLLER_IGNORE_DEVICES",
-        "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
-    ] {
-        if let Ok(v) = std::env::var(var) {
-            tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-            // SAFETY: top of `run()`, before GTK init or any other thread exists in this
-            // process — nothing reads the environment concurrently.
-            unsafe { std::env::remove_var(var) };
-        }
-    }
+    clear_steam_sdl_device_filter();
     // Headless paths (no GTK window).
     if let Some(pin) = crate::cli::arg_value("--pair") {
         return crate::cli::headless_pair(&pin);
