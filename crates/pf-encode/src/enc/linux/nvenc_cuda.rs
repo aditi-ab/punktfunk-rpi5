@@ -1652,7 +1652,7 @@ impl NvencCudaEncoder {
                             return Err(nvenc_status::call_err(
                                 "register_resource (CUDADEVICEPTR)",
                                 e,
-                            ))
+                            ));
                         }
                     }
                     self.ring.push(RingSlot {
@@ -2779,6 +2779,20 @@ mod tests {
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
     use pf_zerocopy::cuda::DeviceBuffer;
 
+    /// Env knob for the `#[ignore]`d hardware spikes, which every caller's doc says to run ALONE
+    /// with `--test-threads=1` (they mutate process env and own the GPU).
+    fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: only reached from the manually-run `--test-threads=1` hardware tests, so no
+        // other thread exists in this process to read or write the environment concurrently.
+        unsafe { std::env::set_var(key, val) };
+    }
+
+    /// [`set_env`]'s companion; the same single-threaded-run contract.
+    fn remove_env(key: &str) {
+        // SAFETY: as `set_env` — single-threaded manual test run, no concurrent env access.
+        unsafe { std::env::remove_var(key) };
+    }
+
     /// The 10-bit input mapping is load-bearing in a way a smoke test can't reach: pick the wrong
     /// NVENC format for a packed 2:10:10:10 capture and the encoder reads the words as 8-bit
     /// `ARGB` — a picture that decodes, looks *almost* right, and is silently 8-bit with the
@@ -3315,8 +3329,8 @@ mod tests {
 
         // Isolate the split variable: sub-frame off, and open explicitly split-DISABLED so the
         // switch below is a real change rather than a no-op.
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
-        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        set_env("PUNKTFUNK_SPLIT_ENCODE", "0");
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
@@ -3428,8 +3442,8 @@ mod tests {
         }
 
         enc.flush().ok();
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// ON-HARDWARE — **spike S1b**, the other half of S1: an in-place `splitEncodeMode` change that
@@ -3468,7 +3482,7 @@ mod tests {
         const SETTLE: u32 = 16;
         let two = M::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
 
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
 
         // Separate buffers rotated per frame, so identical content can't let the encoder
         // skip-code everything and erase the difference we are trying to measure.
@@ -3482,7 +3496,7 @@ mod tests {
 
         // Returns (early-half p50 µs, late-half p50 µs, median bytes/AU).
         let run_leg = |open_split: &str, switch_to: Option<u32>| -> (u128, u128, usize) {
-            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", open_split);
+            set_env("PUNKTFUNK_SPLIT_ENCODE", open_split);
             let mut enc = NvencCudaEncoder::open(
                 Codec::H265,
                 PixelFormat::Nv12,
@@ -3554,9 +3568,15 @@ mod tests {
 
         println!("S1b @ {W}x{H}@60 HEVC 8-bit, {} Mbps CBR:", BPS / 1_000_000);
         println!("  (early = first half of the measured window, late = second half)");
-        println!("  A fresh DISABLE      : early {a_early:>6} late {a_late:>6} us/frame, {a_bytes:>8} B/AU");
-        println!("  B fresh TWO_FORCED   : early {b_early:>6} late {b_late:>6} us/frame, {b_bytes:>8} B/AU");
-        println!("  C DISABLE→TWO in situ: early {c_early:>6} late {c_late:>6} us/frame, {c_bytes:>8} B/AU");
+        println!(
+            "  A fresh DISABLE      : early {a_early:>6} late {a_late:>6} us/frame, {a_bytes:>8} B/AU"
+        );
+        println!(
+            "  B fresh TWO_FORCED   : early {b_early:>6} late {b_late:>6} us/frame, {b_bytes:>8} B/AU"
+        );
+        println!(
+            "  C DISABLE→TWO in situ: early {c_early:>6} late {c_late:>6} us/frame, {c_bytes:>8} B/AU"
+        );
         if c_early > c_late + c_late / 8 {
             println!(
                 "  ⇒ leg C SETTLES ({c_early} → {c_late} us): the in-place switch is not \
@@ -3583,8 +3603,8 @@ mod tests {
             }
         );
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
         let _ = (a_bytes, b_bytes, c_bytes);
     }
 
@@ -3618,8 +3638,8 @@ mod tests {
 
         // Open split-DISABLED, and leave sub-frame at its Linux default (ON where the GPU
         // advertises SUBFRAME_READBACK) — that is the fleet shape the arbitration starts from.
-        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        set_env("PUNKTFUNK_SPLIT_ENCODE", "0");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
@@ -3664,7 +3684,7 @@ mod tests {
                 "S1c SKIPPED: sub-frame is off at open on this GPU/driver, so there is no pair to \
                  flip — the arbitration reduces to S1a's plain split switch here."
             );
-            std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+            remove_env("PUNKTFUNK_SPLIT_ENCODE");
             return;
         }
 
@@ -3715,7 +3735,7 @@ mod tests {
         }
 
         enc.flush().ok();
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
     }
 
     /// ON-HARDWARE — **the D5 confirm** (design §2 defect D5), the one claim in that list that was
@@ -3755,12 +3775,12 @@ mod tests {
         // produced a spurious "D5 REFUTED" on the first run of this test.
         let run = |split: Option<&str>, subframe: Option<&str>| -> (u128, bool) {
             match split {
-                Some(v) => std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", v),
-                None => std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE"),
+                Some(v) => set_env("PUNKTFUNK_SPLIT_ENCODE", v),
+                None => remove_env("PUNKTFUNK_SPLIT_ENCODE"),
             }
             match subframe {
-                Some(v) => std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", v),
-                None => std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME"),
+                Some(v) => set_env("PUNKTFUNK_NVENC_SUBFRAME", v),
+                None => remove_env("PUNKTFUNK_NVENC_SUBFRAME"),
             }
             let mut enc = NvencCudaEncoder::open(
                 Codec::H265,
@@ -3841,8 +3861,8 @@ mod tests {
             }
         );
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// ON-HARDWARE — **what is the real split ceiling on this GPU?** Feeds WP1.1: we want to use
@@ -3870,13 +3890,13 @@ mod tests {
         const WARMUP: u32 = 8;
         const MEASURED: u32 = 24;
 
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
 
         // → (requested mode, mode actually opened, p50 µs, engines the driver reports)
         let run = |split: &str| -> (u32, u128, i32) {
-            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+            set_env("PUNKTFUNK_SPLIT_ENCODE", split);
             let mut enc = NvencCudaEncoder::open(
                 Codec::H265,
                 PixelFormat::Nv12,
@@ -3940,11 +3960,7 @@ mod tests {
             };
             println!(
                 "  req {label} → opened_mode={opened:<2} {} {us:>6} us/frame{vs}  [engines={engines}]",
-                if honoured {
-                    "HONOURED"
-                } else {
-                    "FELL BACK"
-                }
+                if honoured { "HONOURED" } else { "FELL BACK" }
             );
         }
         println!(
@@ -3952,8 +3968,8 @@ mod tests {
              HONOURED but no faster than DISABLE was accepted and did nothing."
         );
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// ON-HARDWARE — the live split arbitration end to end (WP3). Opens a 4K session that the
@@ -3975,9 +3991,9 @@ mod tests {
         const H: u32 = 2160;
         let disable = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
 
-        std::env::set_var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE", "1");
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+        set_env("PUNKTFUNK_NVENC_SPLIT_ARBITRATE", "1");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let frames: Vec<CapturedFrame> = (0..4).map(|i| nv12_frame(W, H, i)).collect();
@@ -4045,8 +4061,8 @@ mod tests {
             max_forced_split_mode(enc_engines)
         );
 
-        std::env::remove_var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_NVENC_SPLIT_ARBITRATE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
         // The verdict cache is process-global: leaving this session's result in it would steer
         // every later test that opens the same config with the split env unset (the D5 legs do
         // exactly that).
@@ -4086,14 +4102,14 @@ mod tests {
             })
             .unwrap_or((3840, 2160, 60));
 
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         // 10-bit input: the packed 2:10:10:10 PQ path is how a Main10 session is actually fed here
         // (`bit_depth`/`hdr` are DERIVED from the input format, never trusted from the args).
         let frames: Vec<CapturedFrame> = (0..4).map(|i| rgb10_frame(w, h, i)).collect();
 
         let run = |split: &str| -> (u128, u8, usize) {
-            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+            set_env("PUNKTFUNK_SPLIT_ENCODE", split);
             let mut enc = NvencCudaEncoder::open(
                 Codec::H265,
                 PixelFormat::X2Rgb10,
@@ -4157,8 +4173,8 @@ mod tests {
             }
         );
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// ON-HARDWARE — **THE BITS/FRAME CURVE**, the measurement this whole programme has been blind
@@ -4190,7 +4206,7 @@ mod tests {
             })
             .unwrap_or((3840, 2160, 60));
 
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         // Sweep CONTENT DETAIL, not nominal bitrate. Pure noise is incompressible, so a low
         // bitrate target simply overshoots (measured: 719 KB/AU against a 104 KB quota) and every
@@ -4207,7 +4223,7 @@ mod tests {
             let frames: Vec<CapturedFrame> =
                 (0..4).map(|i| noise_nv12_frame(w, h, i, block)).collect();
             let run = |split: &str| -> (u128, usize) {
-                std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", split);
+                set_env("PUNKTFUNK_SPLIT_ENCODE", split);
                 let mut enc = NvencCudaEncoder::open(
                     Codec::H265,
                     PixelFormat::Nv12,
@@ -4250,8 +4266,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_SPLIT_ENCODE");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
     }
 
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).
@@ -4658,12 +4674,12 @@ mod tests {
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+                remove_env("PUNKTFUNK_NVENC_SLICES");
+                remove_env("PUNKTFUNK_NVENC_SUBFRAME");
             }
         }
-        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "4");
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "1");
+        set_env("PUNKTFUNK_NVENC_SLICES", "4");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "1");
         let _guard = EnvGuard;
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
@@ -4770,8 +4786,8 @@ mod tests {
         const W: u32 = 1920;
         const H: u32 = 1080;
         // Defaults under test — make sure another test's knobs aren't leaking in.
-        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_NVENC_SLICES");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
@@ -4866,8 +4882,8 @@ mod tests {
         const W: u32 = 1920;
         const H: u32 = 1080;
         // The ceiling under test is the negotiated one, not the operator override.
-        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        remove_env("PUNKTFUNK_NVENC_SLICES");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
             Codec::H265,
@@ -4911,16 +4927,16 @@ mod tests {
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+                remove_env("PUNKTFUNK_NVENC_SLICES");
+                remove_env("PUNKTFUNK_NVENC_SUBFRAME");
             }
         }
         let _guard = EnvGuard;
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
 
         // Escape 1: explicit single slice — no boundaries to cut, chunked poll disarmed.
-        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "1");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        set_env("PUNKTFUNK_NVENC_SLICES", "1");
+        remove_env("PUNKTFUNK_NVENC_SUBFRAME");
         let mut enc = open_h265();
         let frame = nv12_frame(W, H, 0);
         enc.submit_indexed(&frame, 0).expect("submit");
@@ -4943,8 +4959,8 @@ mod tests {
 
         // Escape 2: sub-frame readback vetoed — slices stay (default 4) but chunked poll
         // disarms and the plain poll path carries the session.
-        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        remove_env("PUNKTFUNK_NVENC_SLICES");
+        set_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         let mut enc = open_h265();
         let frame = nv12_frame(W, H, 0);
         enc.submit_indexed(&frame, 0).expect("submit");

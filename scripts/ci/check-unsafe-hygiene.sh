@@ -22,12 +22,14 @@
 #      above the fn.
 #
 #   C. Safe-but-process-global APIs: `env::set_var`/`remove_var`, `sigaction`, `setlocale`,
-#      `set_current_dir`. Each is safe to call and unsound (or racy) from a live multithreaded
-#      process — the 972af299 environ data race lived in a file with ZERO occurrences of the word
-#      `unsafe`, invisible to the census. Edition 2024 makes `env::set_var` unsafe; until that
-#      migration this count-ratchet is the control. The baseline below enumerates today's debt
-#      per file; ANY increase (or a new file) fails. Shrink a file's count? Lower its baseline in
-#      the same commit.
+#      `set_current_dir`. Each is (or was) callable without `unsafe` and unsound (or racy) from a
+#      live multithreaded process — the 972af299 environ data race lived in a file with ZERO
+#      occurrences of the word `unsafe`, invisible to the census. Since the edition-2024
+#      migration the env pair is `unsafe fn` (compiler-enforced, SAFETY proof per site, counted
+#      by the census); this ratchet stays for the still-safe APIs (`sigaction`, `setlocale`,
+#      `set_current_dir`) and as a growth brake on env mutation generally. The baseline below
+#      enumerates today's debt per file; ANY increase (or a new file) fails. Shrink a file's
+#      count? Lower its baseline in the same commit.
 #
 # All three gates were shown to FAIL on deliberately planted instances before being made blocking
 # (the gate-of-the-gate rule that caught cd72f77a's `0 * SLOT`).
@@ -167,8 +169,8 @@ clients/linux/src/app.rs:1
 clients/linux/src/spawn.rs:1
 clients/session/src/main.rs:4
 crates/pf-console-ui/src/screens/settings.rs:1
-crates/pf-console-ui/src/shell/tests.rs:2
-crates/pf-encode/src/enc/linux/nvenc_cuda.rs:49
+crates/pf-console-ui/src/shell/tests.rs:1
+crates/pf-encode/src/enc/linux/nvenc_cuda.rs:2
 crates/pf-encode/src/enc/linux/worker.rs:1
 crates/pf-encode/src/enc/windows/nvenc.rs:4
 crates/pf-inject/src/inject/linux/steam_gadget.rs:5

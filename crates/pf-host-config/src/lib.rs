@@ -84,17 +84,17 @@ impl AudioOutputMode {
     /// first (it is the more restrictive promise — "do not touch my devices" must not be overridden
     /// by a stale `PUNKTFUNK_HOST_AUDIO` in the same `host.env`).
     fn from_env() -> AudioOutputMode {
-        if let Ok(raw) = std::env::var("PUNKTFUNK_AUDIO_OUTPUT_MODE") {
-            if !raw.trim().is_empty() {
-                if let Some(m) = AudioOutputMode::parse(&raw) {
-                    return m;
-                }
-                // Never silently fall through to a different routing than the operator asked for.
-                eprintln!(
-                    "punktfunk: PUNKTFUNK_AUDIO_OUTPUT_MODE={raw:?} is not one of \
-                     client_only/host_and_client/follow_default — using client_only"
-                );
+        if let Ok(raw) = std::env::var("PUNKTFUNK_AUDIO_OUTPUT_MODE")
+            && !raw.trim().is_empty()
+        {
+            if let Some(m) = AudioOutputMode::parse(&raw) {
+                return m;
             }
+            // Never silently fall through to a different routing than the operator asked for.
+            eprintln!(
+                "punktfunk: PUNKTFUNK_AUDIO_OUTPUT_MODE={raw:?} is not one of \
+                 client_only/host_and_client/follow_default — using client_only"
+            );
         }
         if std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some() {
             return AudioOutputMode::FollowDefault;

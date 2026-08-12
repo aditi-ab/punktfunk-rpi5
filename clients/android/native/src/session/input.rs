@@ -35,7 +35,7 @@ fn send_event(handle: jlong, kind: InputKind, code: u32, x: i32, y: i32, flags: 
 }
 
 /// `NativeBridge.nativeSendPointerMove(handle, dx, dy)` — relative mouse motion (screen +y down).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerMove(
     _env: JNIEnv,
     _this: JObject,
@@ -51,7 +51,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 /// normalizing against the size packed into `flags` as `(w << 16) | h` and mapping into the output
 /// region (it drops the event if that size is zero). This is the touch "direct pointing" path — the
 /// cursor jumps to the finger — and matches the Apple client's absolute touch forwarding.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerAbs(
     _env: JNIEnv,
     _this: JObject,
@@ -68,7 +68,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 
 /// `NativeBridge.nativeSendPointerButton(handle, button, down)` — one button transition.
 /// `button`: GameStream id (1=left, 2=middle, 3=right, 4=X1, 5=X2). `down`: 1=press, 0=release.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerButton(
     _env: JNIEnv,
     _this: JObject,
@@ -86,7 +86,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 
 /// `NativeBridge.nativeSendScroll(handle, axis, delta)` — one scroll step. `axis`: 0=vertical,
 /// 1=horizontal. `delta`: signed, WHEEL_DELTA(120)-scaled, +=up/right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
     _env: JNIEnv,
     _this: JObject,
@@ -103,7 +103,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
 /// surface, whose size rides in `flags` so the host can rescale into the output (identical
 /// packing to MouseMoveAbs). On up only the id matters. The host injects a real touch contact
 /// (libei touchscreen / wlroots / SendInput).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendTouch(
     _env: JNIEnv,
     _this: JObject,
@@ -128,7 +128,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendTouch(
 /// `NativeBridge.nativeSendKey(handle, vk, down, mods)` — one key transition. `vk`: Windows
 /// Virtual-Key code (0 = unmapped → dropped). `down`: 1=press, 0=release. `mods`: VK modifier
 /// bitmask (0 for now — the host folds modifiers from the L/R modifier key events themselves).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
     _env: JNIEnv,
     _this: JObject,
@@ -151,7 +151,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
 /// `NativeBridge.nativeTextInputSupported(handle)` — whether the host advertised
 /// `HOST_CAP_TEXT_INPUT` (its inject backend types committed text), so the Kotlin side can pick
 /// the real IME `InputConnection` over the TYPE_NULL raw-key fallback. `0` handle → false.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported(
     _env: JNIEnv,
     _this: JObject,
@@ -168,7 +168,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSu
 /// `NativeBridge.nativeHostSupportsPen(handle)` — the host advertised `HOST_CAP_PEN`, so the
 /// Kotlin side splits stylus pointers out of the touch path onto the pen plane
 /// (design/pen-tablet-input.md §7). `0` handle → false.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupportsPen(
     _env: JNIEnv,
     _this: JObject,
@@ -197,7 +197,7 @@ const PEN_JNI_MAX_SAMPLES: usize = PEN_BATCH_MAX * 8;
 /// normalized 0..1; `distance`/`tilt_deg`/`azimuth_deg`/`roll_deg` < 0 = unknown. Call only
 /// against a [`nativeHostSupportsPen`] host; the client heartbeats the last sample ≤100 ms
 /// while in range (Kotlin side — see `StylusStream`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
     env: JNIEnv,
     _this: JObject,
@@ -264,7 +264,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
 /// Unicode scalar (`code` = the scalar; multi-char commits are consecutive events in order).
 /// Control characters are skipped — Enter/Backspace/Tab ride the VK key path. Call only when
 /// [`Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported`] returned true.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendText(
     mut env: JNIEnv,
     _this: JObject,
@@ -296,7 +296,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendText(
 /// `NativeBridge.nativeSendGamepadButton(handle, bit, down, pad)` — one gamepad button transition on
 /// wire pad index `pad`. `bit`: a `gamepad::BTN_*` bit (e.g. BTN_A = 0x1000). `down`: 1=press,
 /// 0=release. `pad`: wire pad index 0..15 (rides `flags`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadButton(
     _env: JNIEnv,
     _this: JObject,
@@ -318,7 +318,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// `NativeBridge.nativeSendGamepadAxis(handle, axisId, value, pad)` — one gamepad axis update on wire
 /// pad index `pad`. `axisId`: a `gamepad::AXIS_*` id (LS_X=0..RT=5). `value`: stick i16
 /// (−32768..32767, +y=up) or trigger 0..255. `pad`: wire pad index 0..15 (rides `flags`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadAxis(
     _env: JNIEnv,
     _this: JObject,
@@ -343,7 +343,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// index 0..15 (rides `flags`). Sent ONCE when a pad opens, BEFORE any of its input; the core re-sends
 /// it a few times against datagram loss, and an older host ignores the unknown tag (that pad then uses
 /// the session-default kind from the handshake — the pre-existing single-pad behaviour on pad 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadArrival(
     _env: JNIEnv,
     _this: JObject,
@@ -373,7 +373,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 ///
 /// A `0` handle answers `true` — "don't suppress" is the safe answer when we cannot tell, matching
 /// the `Auto` rule inside the predicate itself.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionReaches(
     _env: JNIEnv,
     _this: JObject,
@@ -399,7 +399,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
 /// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
 /// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the
 /// pad) and arms a re-send burst against datagram loss. An older host ignores the unknown tag.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadRemove(
     _env: JNIEnv,
     _this: JObject,
@@ -415,7 +415,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// `len` bytes are the report, id byte first (`0x42`/`0x45`/`0x47` state, `0x43` battery, …);
 /// `len` is clamped to the 64-byte wire body. Called from the capture thread at the controller's
 /// own report rate (~250–500 Hz) — the direct-buffer read avoids a JNI array copy per report.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidReport(
     env: JNIEnv,
     _this: JObject,
@@ -455,7 +455,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
 /// SCREEN convention (+y down — the wire's fixed meaning); `active` 0 lifts the finger. The
 /// host's DualSense-family backends scale onto the virtual pad's touch surface. On-change only —
 /// the capture diffs, the host holds per-slot state.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouch(
     _env: JNIEnv,
     _this: JObject,
@@ -485,7 +485,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouc
 /// raw signed-16 values in the pad's own units, passed straight into the host's virtual
 /// DualSense report (the wire is a unit passthrough). Called from the capture thread at the
 /// controller's report rate.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMotion(
     _env: JNIEnv,

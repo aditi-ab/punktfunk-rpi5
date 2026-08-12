@@ -82,10 +82,11 @@ fn main() {
     // where the user's hosts already are. A hand-off that finds nobody falls through and this
     // process becomes the shell that opens it, so the link is never simply lost.
     let link = deeplink::positional_url(&args);
-    if let Some(url) = &link {
-        if !deeplink::claim_primary() && deeplink::forward_to_primary(url) {
-            return;
-        }
+    if let Some(url) = &link
+        && !deeplink::claim_primary()
+        && deeplink::forward_to_primary(url)
+    {
+        return;
     }
 
     if flag("--discover") {

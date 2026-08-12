@@ -787,8 +787,11 @@ async fn paired_clients_list_and_unpair() {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(v) => std::env::set_var("PUNKTFUNK_CONFIG_DIR", v),
-                None => std::env::remove_var("PUNKTFUNK_CONFIG_DIR"),
+                // SAFETY: dropped while this test still holds CONFIG_DIR_TEST_LOCK, which
+                // serializes every test that writes or reads this variable in the binary.
+                Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
+                // SAFETY: as above.
+                None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
             }
         }
     }
@@ -797,7 +800,9 @@ async fn paired_clients_list_and_unpair() {
         .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
-    std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path());
+    // SAFETY: `_serial` holds CONFIG_DIR_TEST_LOCK (taken above), serializing every test that
+    // writes or reads this variable in the binary.
+    unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path()) };
 
     let state = test_state();
     let app = test_app(state.clone(), None);
@@ -1363,9 +1368,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
     // 1. Every LIVE route has a classification row. A new route fails here until it gets one.
     for (method, path) in &live {
         assert!(
-            expected
-                .iter()
-                .any(|(m, p, _, _)| m == method && p == path),
+            expected.iter().any(|(m, p, _, _)| m == method && p == path),
             "route {method} {path} has no lane classification — add a row to EXPECTED in this test \
              and decide, deliberately, whether the plugin token and a paired streaming cert may \
              reach it"

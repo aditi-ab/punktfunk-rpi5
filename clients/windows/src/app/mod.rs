@@ -515,35 +515,37 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         move || {
             std::thread::Builder::new()
                 .name("pf-probe".into())
-                .spawn(move || loop {
-                    // A spawned session/browse child is running: the shell is hidden
-                    // (nobody sees the pips) and one of these hosts is mid-stream —
-                    // probing it is pure noise. Sleep through and sweep after it ends.
-                    if shared.session.lock().unwrap().is_running() {
-                        std::thread::sleep(Duration::from_secs(12));
-                        continue;
-                    }
-                    let handles: Vec<_> = KnownHosts::load()
-                        .hosts
-                        .into_iter()
-                        .filter(|h| !h.addr.is_empty())
-                        .map(|h| {
-                            std::thread::spawn(move || {
-                                (
-                                    h.fp_hex,
-                                    NativeClient::probe(
-                                        &h.addr,
-                                        h.port,
-                                        Duration::from_millis(2500),
-                                    ),
-                                )
+                .spawn(move || {
+                    loop {
+                        // A spawned session/browse child is running: the shell is hidden
+                        // (nobody sees the pips) and one of these hosts is mid-stream —
+                        // probing it is pure noise. Sleep through and sweep after it ends.
+                        if shared.session.lock().unwrap().is_running() {
+                            std::thread::sleep(Duration::from_secs(12));
+                            continue;
+                        }
+                        let handles: Vec<_> = KnownHosts::load()
+                            .hosts
+                            .into_iter()
+                            .filter(|h| !h.addr.is_empty())
+                            .map(|h| {
+                                std::thread::spawn(move || {
+                                    (
+                                        h.fp_hex,
+                                        NativeClient::probe(
+                                            &h.addr,
+                                            h.port,
+                                            Duration::from_millis(2500),
+                                        ),
+                                    )
+                                })
                             })
-                        })
-                        .collect();
-                    let map: HashMap<String, bool> =
-                        handles.into_iter().filter_map(|h| h.join().ok()).collect();
-                    set_probed.call(map);
-                    std::thread::sleep(Duration::from_secs(12));
+                            .collect();
+                        let map: HashMap<String, bool> =
+                            handles.into_iter().filter_map(|h| h.join().ok()).collect();
+                        set_probed.call(map);
+                        std::thread::sleep(Duration::from_secs(12));
+                    }
                 })
                 .ok();
         }
@@ -560,14 +562,15 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let anim_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let (anim, set_anim) = cx.use_async_state((Option::<Screen>::None, 1.0f64));
     cx.use_effect(screen.clone(), {
-        let (s, set_anim, gen) = (screen.clone(), set_anim.clone(), anim_gen.borrow().clone());
+        let (s, set_anim, generation) =
+            (screen.clone(), set_anim.clone(), anim_gen.borrow().clone());
         move || {
             use std::sync::atomic::Ordering::SeqCst;
-            let mine = gen.fetch_add(1, SeqCst) + 1;
+            let mine = generation.fetch_add(1, SeqCst) + 1;
             std::thread::spawn(move || {
                 const STEPS: u32 = 14;
                 for i in 0..=STEPS {
-                    if gen.load(SeqCst) != mine {
+                    if generation.load(SeqCst) != mine {
                         return; // a newer navigation superseded this tween
                     }
                     let p = f64::from(i) / f64::from(STEPS);
@@ -593,18 +596,18 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let nav_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let (nav_anim, set_nav_anim) = cx.use_async_state((String::new(), 1.0f64));
     cx.use_effect(settings_nav.clone(), {
-        let (s, set_nav_anim, gen) = (
+        let (s, set_nav_anim, generation) = (
             settings_nav.clone(),
             set_nav_anim.clone(),
             nav_gen.borrow().clone(),
         );
         move || {
             use std::sync::atomic::Ordering::SeqCst;
-            let mine = gen.fetch_add(1, SeqCst) + 1;
+            let mine = generation.fetch_add(1, SeqCst) + 1;
             std::thread::spawn(move || {
                 const STEPS: u32 = 14;
                 for i in 0..=STEPS {
-                    if gen.load(SeqCst) != mine {
+                    if generation.load(SeqCst) != mine {
                         return; // a newer section switch superseded this tween
                     }
                     let p = f64::from(i) / f64::from(STEPS);
@@ -628,10 +631,10 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let add_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let (add_anim, set_add_anim) = cx.use_async_state(0.0f64);
     cx.use_effect(show_add, {
-        let (set_add_anim, gen) = (set_add_anim.clone(), add_gen.borrow().clone());
+        let (set_add_anim, generation) = (set_add_anim.clone(), add_gen.borrow().clone());
         move || {
             use std::sync::atomic::Ordering::SeqCst;
-            let mine = gen.fetch_add(1, SeqCst) + 1;
+            let mine = generation.fetch_add(1, SeqCst) + 1;
             if !show_add {
                 set_add_anim.call(0.0);
                 return;
@@ -639,7 +642,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             std::thread::spawn(move || {
                 const STEPS: u32 = 12;
                 for i in 0..=STEPS {
-                    if gen.load(SeqCst) != mine {
+                    if generation.load(SeqCst) != mine {
                         return; // reopened/closed mid-tween — a newer run owns the value
                     }
                     let p = f64::from(i) / f64::from(STEPS);

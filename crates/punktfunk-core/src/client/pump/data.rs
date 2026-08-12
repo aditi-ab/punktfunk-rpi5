@@ -176,9 +176,9 @@ impl DataPump {
             let clock_offset_ns = pump_clock_offset.load(Ordering::Relaxed);
             // An applied re-sync invalidates the staleness run measured under the OLD offset:
             // reset the counters and re-arm the clock-based detector if a step had disarmed it.
-            let gen = pump_clock_gen.load(Ordering::Relaxed);
-            if gen != seen_clock_gen {
-                seen_clock_gen = gen;
+            let clock_gen = pump_clock_gen.load(Ordering::Relaxed);
+            if clock_gen != seen_clock_gen {
+                seen_clock_gen = clock_gen;
                 stale_since = None;
                 noop_clock_flushes = 0;
                 // Every OWD reading shifted with the offset — the standing-latency floor and

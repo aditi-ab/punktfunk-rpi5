@@ -162,7 +162,7 @@ impl ErasureCoder for Gf16Coder {
             .iter()
             .zip(have)
             .enumerate()
-            .filter(|(_, (_, &h))| h)
+            .filter(|&(_, (_, &h))| h)
             .map(|(i, (s, _))| (i, &**s))
             .collect();
         let restored = reed_solomon_simd::decode(

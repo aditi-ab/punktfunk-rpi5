@@ -135,7 +135,10 @@ mod tests {
         let home = std::env::temp_dir().join(format!("pf-spawn-test-{}", std::process::id()));
         let cfg = home.join(".config/punktfunk");
         std::fs::create_dir_all(&cfg).unwrap();
-        std::env::set_var("HOME", &home);
+        // SAFETY: the only env-mutating test in this binary (see the doc above — one test, one
+        // `HOME`, deliberately not split). Parallel tests may `getenv` concurrently; glibc keeps
+        // replaced environ storage alive, and every reader tolerates either value.
+        unsafe { std::env::set_var("HOME", &home) };
 
         // A device whose owner has set a bitrate, and a host bound to a profile that raises it
         // further — the two layers the spec has to carry.

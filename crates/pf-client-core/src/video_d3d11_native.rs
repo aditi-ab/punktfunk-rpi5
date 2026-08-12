@@ -2241,7 +2241,7 @@ mod parity {
             // `desc.Height` rows at `RowPitch` and the chroma plane follows at byte
             // offset `RowPitch * desc.Height`, so `total` below is exactly the mapped
             // extent and every sub-slice read is inside it. `Unmap` pairs the `Map`.
-            let out = unsafe {
+            unsafe {
                 let src: ID3D11Resource = pool.cast().expect("pool -> resource");
                 let dst: ID3D11Resource = staging.cast().expect("staging -> resource");
                 self.ctx
@@ -2268,8 +2268,7 @@ mod parity {
                 }
                 self.ctx.Unmap(&staging, 0);
                 out
-            };
-            out
+            }
         }
     }
 

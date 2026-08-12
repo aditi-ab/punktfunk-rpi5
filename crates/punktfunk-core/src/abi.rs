@@ -253,7 +253,7 @@ fn new_handle(session: Session) -> *mut PunktfunkSession {
 }
 
 /// Current ABI version. Mismatch with [`crate::ABI_VERSION`] means incompatible core.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_abi_version() -> u32 {
     crate::ABI_VERSION
 }
@@ -271,7 +271,7 @@ pub extern "C" fn punktfunk_abi_version() -> u32 {
 /// # Safety
 /// `macs` must point to at least `mac_count * 6` readable bytes. `last_known_ip`, if non-NULL,
 /// must be a NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_wake_on_lan(
     macs: *const u8,
     mac_count: usize,
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
 ///
 /// # Safety
 /// `cfg`, `local`, `peer` must be valid pointers; the strings must be NUL-terminated.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_session_new(
     cfg: *const PunktfunkConfig,
     local: *const c_char,
@@ -366,7 +366,7 @@ pub unsafe extern "C" fn punktfunk_session_new(
 ///
 /// # Safety
 /// All four pointers must be valid; the two out-params receive owned handles.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_test_loopback_pair(
     host_cfg: *const PunktfunkConfig,
     client_cfg: *const PunktfunkConfig,
@@ -413,7 +413,7 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
 ///
 /// # Safety
 /// `s` must be a handle from `punktfunk_session_new`/`punktfunk_test_loopback_pair`, freed once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
     guard_void(|| {
         if !s.is_null() {
@@ -428,7 +428,7 @@ pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
 ///
 /// # Safety
 /// `s` is a valid host handle; `data` points to `len` readable bytes (or `len == 0`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_host_submit_frame(
     s: *mut PunktfunkSession,
     data: *const u8,
@@ -466,7 +466,7 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
 ///
 /// # Safety
 /// `s` is a valid client handle; `out` points to a writable `PunktfunkFrame`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_client_poll_frame(
     s: *mut PunktfunkSession,
     out: *mut PunktfunkFrame,
@@ -510,7 +510,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
 ///
 /// # Safety
 /// `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_send_input(
     s: *mut PunktfunkSession,
     ev: *const InputEvent,
@@ -566,7 +566,7 @@ unsafe fn read_input_event<'a>(ev: *const InputEvent) -> Result<&'a InputEvent, 
 ///
 /// # Safety
 /// `s` is a valid host handle; `user` is passed back verbatim to `cb`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_set_input_callback(
     s: *mut PunktfunkSession,
     // Written as an explicit `Option<fn>` (not the `PunktfunkInputCb` alias) so cbindgen
@@ -592,7 +592,7 @@ pub unsafe extern "C" fn punktfunk_set_input_callback(
 ///
 /// # Safety
 /// `s` is a valid host handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut count = 0i32;
@@ -633,7 +633,7 @@ pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> 
 ///
 /// # Safety
 /// `s` is a valid handle; `out` points to a writable `PunktfunkStats`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_get_stats(
     s: *mut PunktfunkSession,
     out: *mut PunktfunkStats,
@@ -1427,7 +1427,7 @@ const _: () = {
 /// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes;
 /// `client_cert_pem`/`client_key_pem` are each NULL or NUL-terminated UTF-8.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -1468,7 +1468,7 @@ pub unsafe extern "C" fn punktfunk_connect(
 /// # Safety
 /// Same as [`punktfunk_connect`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_ex(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -1512,7 +1512,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
 /// # Safety
 /// Same as [`punktfunk_connect`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_ex2(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -1557,7 +1557,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
 /// # Safety
 /// Same as [`punktfunk_connect`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_ex3(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -1605,7 +1605,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
 /// # Safety
 /// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_ex4(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -1658,7 +1658,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
 /// # Safety
 /// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn punktfunk_connect_ex5(
     host: *const std::os::raw::c_char,
@@ -1711,7 +1711,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
 /// # Safety
 /// Same as [`punktfunk_connect`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn punktfunk_connect_ex6(
     host: *const std::os::raw::c_char,
@@ -1767,7 +1767,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
 /// # Safety
 /// Same as [`punktfunk_connect`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn punktfunk_connect_ex7(
     host: *const std::os::raw::c_char,
@@ -1828,7 +1828,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
 /// # Safety
 /// Same as [`punktfunk_connect`]; `status_out`, when non-null, must point to a writable `i32`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn punktfunk_connect_ex8(
     host: *const std::os::raw::c_char,
@@ -1889,7 +1889,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
 /// # Safety
 /// Same as [`punktfunk_connect_ex8`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn punktfunk_connect_ex9(
     host: *const std::os::raw::c_char,
@@ -2122,7 +2122,7 @@ unsafe fn connect_ex_impl(
 /// # Safety
 /// `cert_pem_out` is writable for `cert_cap` bytes; `key_pem_out` for `key_cap`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_generate_identity(
     cert_pem_out: *mut std::os::raw::c_char,
     cert_cap: usize,
@@ -2165,7 +2165,7 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
 /// # Safety
 /// `host` must be a NUL-terminated UTF-8 string.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_probe(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -2200,7 +2200,7 @@ pub unsafe extern "C" fn punktfunk_probe(
 /// `host`/`client_cert_pem`/`client_key_pem`/`pin`/`name` are NUL-terminated UTF-8;
 /// `host_sha256_out` is writable for 32 bytes.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_pair(
     host: *const std::os::raw::c_char,
     port: u16,
@@ -2264,7 +2264,7 @@ pub unsafe extern "C" fn punktfunk_pair(
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls video —
 /// it may run concurrently with one audio-pulling and one rumble-pulling thread.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_au(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkFrame,
@@ -2329,7 +2329,7 @@ pub struct PunktfunkAudioPacket {
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
 /// it may run concurrently with the video/rumble pullers.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_audio(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkAudioPacket,
@@ -2380,7 +2380,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     c: *mut PunktfunkConnection,
     out: *mut u8,
@@ -2420,7 +2420,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_end_reason(
     c: *mut PunktfunkConnection,
     out: *mut u8,
@@ -2478,7 +2478,7 @@ pub struct PunktfunkAudioPcm {
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkAudioPcm,
@@ -2544,7 +2544,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
 /// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs are skipped);
 /// `buf` is writable for `buf_len` bytes.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
     c: *mut PunktfunkConnection,
     out_pad: *mut u8,
@@ -2618,7 +2618,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
     c: *mut PunktfunkConnection,
     pad: u8,
@@ -2649,7 +2649,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
 /// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     c: *mut PunktfunkConnection,
     pad: *mut u16,
@@ -2706,7 +2706,7 @@ pub const PUNKTFUNK_RUMBLE_NO_TTL: u32 = 0xFFFF_FFFF;
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
 /// thread pulls rumble — it may run concurrently with the video/audio pullers.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     c: *mut PunktfunkConnection,
     pad: *mut u16,
@@ -2786,7 +2786,7 @@ pub const PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER: u32 = 1;
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
 /// thread pulls rumble — it may run concurrently with the video/audio pullers.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
     c: *mut PunktfunkConnection,
     pad: *mut u16,
@@ -2867,7 +2867,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
 /// thread pulls rumble — it may run concurrently with the video/audio pullers.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
     c: *mut PunktfunkConnection,
     pad: *mut u16,
@@ -2933,7 +2933,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     c: *mut PunktfunkConnection,
     pad: u16,
@@ -2970,7 +2970,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_hidout(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkHidOutput,
@@ -3018,7 +3018,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHdrMeta`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkHdrMeta,
@@ -3086,7 +3086,7 @@ pub struct PunktfunkCursorState {
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
 /// shapes; it may run concurrently with every other plane's puller.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkCursorShape,
@@ -3138,7 +3138,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
 /// state; it may run concurrently with every other plane's puller.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkCursorState,
@@ -3187,7 +3187,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
     c: *mut PunktfunkConnection,
     client_draws: bool,
@@ -3218,7 +3218,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHostTiming`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkHostTiming,
@@ -3265,7 +3265,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
 /// # Safety
 /// `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_color_info(
     c: *mut PunktfunkConnection,
     primaries: *mut u8,
@@ -3315,7 +3315,7 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     c: *mut PunktfunkConnection,
     out: *mut u8,
@@ -3345,7 +3345,7 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_codec(
     c: *mut PunktfunkConnection,
     out: *mut u8,
@@ -3375,7 +3375,7 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_shard_payload(
     c: *mut PunktfunkConnection,
     out: *mut u32,
@@ -3403,7 +3403,7 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
 /// # Safety
 /// `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_input(
     c: *mut PunktfunkConnection,
     ev: *const InputEvent,
@@ -3437,7 +3437,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
 /// # Safety
 /// `c` is a valid connection handle; `opus_data` is valid for `len` bytes (or `len == 0`).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_mic(
     c: *mut PunktfunkConnection,
     opus_data: *const u8,
@@ -3478,7 +3478,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
 /// # Safety
 /// `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
     c: *mut PunktfunkConnection,
     rich: *const PunktfunkRichInput,
@@ -3516,7 +3516,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
 /// `c` is a valid connection handle; `rich` is null or points to at least its declared
 /// `struct_size` bytes.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     c: *mut PunktfunkConnection,
     rich: *const PunktfunkRichInputEx,
@@ -3566,7 +3566,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
 /// `c` is a valid connection handle; `samples` is null or points to `count` valid
 /// [`PunktfunkPenSample`]s.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_pen(
     c: *mut PunktfunkConnection,
     samples: *const PunktfunkPenSample,
@@ -3609,7 +3609,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
 /// # Safety
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_mode(
     c: *const PunktfunkConnection,
     width: *mut u32,
@@ -3650,7 +3650,7 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
 /// # Safety
 /// `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_gamepad(
     c: *const PunktfunkConnection,
     gamepad: *mut u32,
@@ -3835,7 +3835,7 @@ fn build_clip_event(
 /// # Safety
 /// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_host_caps(
     c: *const PunktfunkConnection,
     caps: *mut u8,
@@ -3866,7 +3866,7 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
     c: *const PunktfunkConnection,
     enabled: bool,
@@ -3895,7 +3895,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
 /// `c` is a valid connection handle; `kinds` points to `n` `PunktfunkClipKind`s (NULL allowed only
 /// when `n == 0`), each `mime` a valid NUL-terminated UTF-8 string.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
     c: *const PunktfunkConnection,
     seq: u32,
@@ -3951,7 +3951,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
 /// `c` is a valid connection handle; `mime` is a valid NUL-terminated UTF-8 string; `xfer_id_out`
 /// is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
     c: *const PunktfunkConnection,
     seq: u32,
@@ -4000,7 +4000,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
 /// `c` is a valid connection handle; `data` points to `len` bytes (NULL allowed only when
 /// `len == 0`).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
     c: *const PunktfunkConnection,
     req_id: u32,
@@ -4039,7 +4039,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
     c: *const PunktfunkConnection,
     id: u32,
@@ -4067,7 +4067,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkClipEvent`.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkClipEvent,
@@ -4118,7 +4118,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
 /// # Safety
 /// `c` is a valid connection handle; `compositor` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_compositor(
     c: *const PunktfunkConnection,
     compositor: *mut u32,
@@ -4149,7 +4149,7 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
 /// # Safety
 /// `c` is a valid connection handle; `bitrate_kbps` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_bitrate(
     c: *const PunktfunkConnection,
     bitrate_kbps: *mut u32,
@@ -4184,7 +4184,7 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
 /// # Safety
 /// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
     c: *const PunktfunkConnection,
     offset_ns: *mut i64,
@@ -4218,7 +4218,7 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
 /// # Safety
 /// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
     c: *const PunktfunkConnection,
     offset_ns: *mut i64,
@@ -4252,7 +4252,7 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_request_mode(
     c: *const PunktfunkConnection,
     width: u32,
@@ -4288,7 +4288,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     c: *const PunktfunkConnection,
 ) -> PunktfunkStatus {
@@ -4320,7 +4320,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     c: *const PunktfunkConnection,
     first_frame: u32,
@@ -4355,7 +4355,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
 /// # Safety
 /// `c` is a valid connection handle; `gap_out` is writable or NULL.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
     c: *const PunktfunkConnection,
     frame_index: u32,
@@ -4389,7 +4389,7 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
 /// # Safety
 /// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
     c: *const PunktfunkConnection,
     frame_index: u32,
@@ -4423,7 +4423,7 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
     c: *const PunktfunkConnection,
     out: *mut u64,
@@ -4468,7 +4468,7 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     c: *const PunktfunkConnection,
     us: u32,
@@ -4495,7 +4495,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
 /// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
 /// error, not UB).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_report_phase(
     c: *const PunktfunkConnection,
     next_latch_host_ns: u64,
@@ -4531,7 +4531,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
     c: *const PunktfunkConnection,
     out: *mut bool,
@@ -4603,7 +4603,7 @@ pub struct PunktfunkProbeResult {
 /// # Safety
 /// `c` is a valid connection handle.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_speed_test(
     c: *const PunktfunkConnection,
     target_kbps: u32,
@@ -4631,7 +4631,7 @@ pub unsafe extern "C" fn punktfunk_connection_speed_test(
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult` (NULL is an
 /// error).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_probe_result(
     c: *const PunktfunkConnection,
     out: *mut PunktfunkProbeResult,
@@ -4678,7 +4678,7 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
 /// # Safety
 /// `c` was returned by [`punktfunk_connect`] and remains valid (closed via `punktfunk_connection_close`).
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkConnection) {
     guard_void(|| {
         // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
@@ -4695,7 +4695,7 @@ pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkC
 /// # Safety
 /// `c` was returned by [`punktfunk_connect`] and is not used after this call.
 #[cfg(feature = "quic")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection) {
     guard_void(|| {
         if !c.is_null() {
@@ -4721,7 +4721,7 @@ pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection)
 /// Create a re-anchor gate seeded with the session's current `frames_dropped` (so the first
 /// [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss). Free with
 /// [`punktfunk_reanchor_gate_free`]. Never returns NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut ReanchorGate {
     Box::into_raw(Box::new(ReanchorGate::new(frames_dropped)))
 }
@@ -4730,7 +4730,7 @@ pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut Reanc
 ///
 /// # Safety
 /// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
     guard_void(|| {
         if !g.is_null() {
@@ -4746,7 +4746,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
 ///
 /// # Safety
 /// `g` is a valid gate handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
     guard_void(|| {
         // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
@@ -4768,7 +4768,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
 ///
 /// # Safety
 /// `g` is a valid gate handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_arm_expecting_drops(
     g: *mut ReanchorGate,
     expected_drops: u64,
@@ -4791,7 +4791,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_arm_expecting_drops(
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_present` is writable or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
     g: *mut ReanchorGate,
     flags: u32,
@@ -4823,7 +4823,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
     g: *mut ReanchorGate,
     out_request_kf: *mut bool,
@@ -4852,7 +4852,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
     g: *mut ReanchorGate,
     frames_dropped: u64,
@@ -4881,7 +4881,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_holding` is writable or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
     g: *const ReanchorGate,
     out_holding: *mut bool,

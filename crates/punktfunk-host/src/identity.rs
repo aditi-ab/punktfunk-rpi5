@@ -163,15 +163,20 @@ mod tests {
     impl EnvGuard {
         fn set(dir: &std::path::Path) -> EnvGuard {
             let prev = std::env::var_os("PUNKTFUNK_CONFIG_DIR");
-            std::env::set_var("PUNKTFUNK_CONFIG_DIR", dir);
+            // SAFETY: only called by tests that hold CONFIG_DIR_TEST_LOCK, which serializes
+            // every test that writes or reads this variable across the whole test binary.
+            unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", dir) };
             EnvGuard(prev)
         }
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(v) => std::env::set_var("PUNKTFUNK_CONFIG_DIR", v),
-                None => std::env::remove_var("PUNKTFUNK_CONFIG_DIR"),
+                // SAFETY: dropped while the owning test still holds CONFIG_DIR_TEST_LOCK — the
+                // same serialization as `EnvGuard::set`.
+                Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
+                // SAFETY: as above.
+                None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
             }
         }
     }

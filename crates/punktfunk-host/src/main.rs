@@ -56,8 +56,10 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
-// Network-facing on the secure default host (see the forbid block at `mod mgmt` below).
-#[forbid(unsafe_code)]
+// Network-facing on the secure default host (see the forbid block at `mod mgmt` below). Test
+// builds carve out like `native`: the identity tests scope `PUNKTFUNK_CONFIG_DIR` via
+// `env::set_var`, which edition 2024 makes an unsafe fn; shipped code keeps the forbid.
+#[cfg_attr(not(test), forbid(unsafe_code))]
 mod identity;
 // The input-injection backends live in the `pf-inject` subsystem crate (plan §W6); this shim keeps
 // every existing `crate::inject::*` path valid (the native/gamestream input planes + devtest consume
@@ -81,8 +83,10 @@ mod log_capture;
 // exposes — are safe Rust by compiler-enforced invariant (rust-safety programme): `forbid`
 // here means a future edit cannot quietly introduce unsafe into a network-facing module.
 // (`native` carves out its `#[cfg(test)]` C-ABI roundtrip tests, which exercise the CLIENT
-// side of punktfunk-core against this host in-process and are unsafe by nature.)
-#[forbid(unsafe_code)]
+// side of punktfunk-core against this host in-process and are unsafe by nature; `mgmt` and
+// `identity` carve out test builds too — their tests scope `PUNKTFUNK_CONFIG_DIR` via
+// `env::set_var`, an unsafe fn since edition 2024.)
+#[cfg_attr(not(test), forbid(unsafe_code))]
 mod mgmt;
 #[forbid(unsafe_code)]
 mod mgmt_token;

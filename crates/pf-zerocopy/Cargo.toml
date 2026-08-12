@@ -6,7 +6,7 @@
 [package]
 name = "pf-zerocopy"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 # Inherit the workspace MSRV: clippy keys MSRV-gated lints off it (without this, e.g.
 # `manual_is_multiple_of` fires on code the host crate compiles clean).
 rust-version.workspace = true

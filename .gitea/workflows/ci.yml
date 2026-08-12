@@ -187,7 +187,17 @@ jobs:
 
       - name: Verify generated header is committed & up to date
         run: |
-          cargo build -p punktfunk-core --locked
+          cargo build -p punktfunk-core --locked >/tmp/core-build.log 2>&1 \
+            || { cat /tmp/core-build.log; exit 1; }
+          cat /tmp/core-build.log
+          # build.rs demotes a cbindgen failure to a warning and then writes NOTHING — the
+          # checked-in header stays untouched and the drift check below stays green while the
+          # header is silently stale. So first assert the regeneration actually happened.
+          # (cargo replays build-script warnings from cache, so this holds on cached builds too.)
+          grep -q "punktfunk-core: wrote" /tmp/core-build.log
+          if grep -q "cbindgen failed" /tmp/core-build.log; then
+            echo "cbindgen failed to parse the ABI surface — header NOT regenerated" && exit 1
+          fi
           git config --global --add safe.directory "$PWD"
           git diff --exit-code include/punktfunk_core.h \
             || (echo "include/punktfunk_core.h is stale — commit the regenerated header" && exit 1)

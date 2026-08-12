@@ -3,7 +3,7 @@ name = "punktfunk-client-windows"
 description = "Native Windows punktfunk/1 client — WinUI 3 (windows-reactor) shell, SDL3 gamepads; streaming runs in the spawned punktfunk-session binary"
 version.workspace = true
 edition.workspace = true
-# Not workspace-inherited (1.82): windows-reactor at the pinned rev declares rust-version 1.95+
+# Not workspace-inherited (1.85): windows-reactor at the pinned rev declares rust-version 1.95+
 # and edition 2024. rust-toolchain.toml pins 1.96, so this records reality rather than raising it.
 rust-version = "1.96"
 license.workspace = true

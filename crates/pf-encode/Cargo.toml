@@ -6,7 +6,7 @@
 [package]
 name = "pf-encode"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "punktfunk host video encode: NVENC/VAAPI/AMF/QSV/Vulkan-Video/PyroWave/openh264 backends behind one Encoder trait."

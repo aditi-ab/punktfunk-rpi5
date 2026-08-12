@@ -8,7 +8,7 @@
 [package]
 name = "pf-clipboard"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "punktfunk host shared clipboard: per-OS session-clipboard backends behind one HostClipboard + the QUIC clipboard-plane coordinator."

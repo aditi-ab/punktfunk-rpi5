@@ -734,7 +734,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         // Confine the proxy to `dir` for the duration of this test.
-        std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir);
+        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
+        // that writes or reads this variable in the binary.
+        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
 
         // A real image inside the root: served, with the content type SNIFFED from the bytes.
         let cover = dir.join("cover.png");
@@ -810,7 +812,8 @@ mod tests {
         // A UNC path is refused outright (outbound SMB auth coercion), before any filesystem hit.
         assert!(!art_path_is_servable(r"\\attacker\share\a.png"));
 
-        std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS");
+        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
+        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -878,7 +881,9 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("pf-art-wr-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir);
+        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
+        // that writes or reads this variable in the binary.
+        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
 
         let cover = dir.join("cover.png");
         std::fs::write(&cover, PNG).unwrap();
@@ -930,7 +935,8 @@ mod tests {
             "an out-of-root file:// cover is still refused"
         );
 
-        std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS");
+        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
+        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }

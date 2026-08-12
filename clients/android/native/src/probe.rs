@@ -14,7 +14,7 @@ use std::time::Duration;
 /// `NativeBridge.nativeProbe(host, port, timeoutMs): Boolean` — true if `host:port` completed a
 /// QUIC handshake within `timeoutMs`. No pin/identity presented (trust-agnostic), mDNS-independent.
 /// Blocking (builds its own runtime) — Kotlin runs it on `Dispatchers.IO`, never the main thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbe<'local>(
     mut env: JNIEnv<'local>,
     _this: JObject<'local>,

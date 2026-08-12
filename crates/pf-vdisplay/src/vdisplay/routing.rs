@@ -161,7 +161,10 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) -> Option<Gam
         // injector as sway/river, no code change.
         Compositor::Wlroots | Compositor::Hyprland => "wlr",
     };
-    std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
+    // SAFETY: `_env_guard` holds [`ENV_LOCK`] — the crate-wide discipline (lib.rs) serializing
+    // every process-env writer on the session-setup path; steady-state threads read cached
+    // config, not the environment.
+    unsafe { std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend) };
     drop(_env_guard);
     resolve_gamescope_route(chosen, dedicated_launch)
 }
@@ -464,11 +467,15 @@ mod tests {
         use super::operator_gamescope;
         let first = operator_gamescope();
         let restore = crate::with_env_lock(|| std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE"));
-        crate::with_env_lock(|| std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto"));
+        // SAFETY: both mutations run under `with_env_lock` — the crate's env-writer
+        // serialization (ENV_LOCK, lib.rs); the readers under test sample once at startup.
+        crate::with_env_lock(|| unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto") });
         let second = operator_gamescope();
         crate::with_env_lock(|| match &restore {
-            Some(v) => std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v),
-            None => std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE"),
+            // SAFETY: as above — the restore also runs under the same env-writer lock.
+            Some(v) => unsafe { std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", v) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE") },
         });
         assert_eq!(
             second.node, first.node,

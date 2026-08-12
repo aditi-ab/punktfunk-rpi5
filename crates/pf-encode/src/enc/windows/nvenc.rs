@@ -1616,7 +1616,9 @@ impl Encoder for NvencD3d11Encoder {
         let frame = match &captured.payload {
             FramePayload::D3d11(f) => f,
             FramePayload::Cpu(_) => {
-                bail!("NVENC D3D11 encoder needs a GPU texture frame (use the software encoder for CPU frames)")
+                bail!(
+                    "NVENC D3D11 encoder needs a GPU texture frame (use the software encoder for CPU frames)"
+                )
             }
         };
         // The capturer recreates its D3D11 device on a desktop switch (secure/Winlogon) and may come
@@ -2882,8 +2884,12 @@ mod tests {
         let two = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32;
 
         // Isolate the split variable exactly as the Linux spike does.
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
-        std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+        // SAFETY: this `#[ignore]`d hardware spike is run alone (manual RTX-box run, one test),
+        // so no other thread exists to read or write the environment concurrently.
+        unsafe {
+            std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+            std::env::set_var("PUNKTFUNK_SPLIT_ENCODE", "0");
+        }
 
         // SAFETY: (test-only) the same straight-line D3D11/DXGI setup as `nvenc_reconfigure_no_idr`.
         unsafe {
@@ -3007,8 +3013,11 @@ mod tests {
             enc.flush().ok();
         }
 
-        std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        // SAFETY: as the set above — single-threaded manual test run, no concurrent env access.
+        unsafe {
+            std::env::remove_var("PUNKTFUNK_SPLIT_ENCODE");
+            std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        }
     }
 
     /// ON-GLASS (RTX box): the measurement gating the AYUV 4:4:4 work — encodes the probe

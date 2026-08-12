@@ -425,11 +425,11 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
 /// the priority intent (it arrives explicitly in `Hello`) and the worker path itself (nothing here
 /// spawns a worker, and a stale value in a core dump is just noise).
 fn sanitize_env() {
-    // Single-threaded — this runs before anything in this process creates a thread, which is the
-    // one situation where mutating the environment is sound (the `getenv` race the house rule
-    // about `set_var` is about needs a second thread).
     for k in ["PYROWAVE_QUEUE_PRIORITY", "PUNKTFUNK_ENCODE_WORKER"] {
-        std::env::remove_var(k);
+        // SAFETY: single-threaded — this runs before anything in this process creates a thread,
+        // which is the one situation where mutating the environment is sound (the `getenv` race
+        // `remove_var`'s contract is about needs a second thread).
+        unsafe { std::env::remove_var(k) };
     }
 }
 

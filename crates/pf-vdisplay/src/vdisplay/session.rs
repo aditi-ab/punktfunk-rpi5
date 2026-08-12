@@ -585,41 +585,49 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
 pub fn apply_session_env(active: &ActiveSession) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = &active.env;
-    std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
-    std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
-    if let Some(w) = &e.wayland_display {
-        std::env::set_var("WAYLAND_DISPLAY", w);
-    }
-    if let Some(d) = &e.xdg_current_desktop {
-        std::env::set_var("XDG_CURRENT_DESKTOP", d);
-    }
-    // Hyprland: export the discovered instance signature so `hyprctl` reaches the live compositor
-    // (fixes G4 for the systemd `--user` host, which never inherited it). Only set when detection
-    // found a Hyprland session; a stale value from a previous connect is cleared otherwise so a
-    // Hyprland→sway switch can't leave `hyprctl` pointed at a dead instance.
-    match &e.hyprland_signature {
-        Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
-        None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
-    }
-    // sway: same treatment, and for the same reason — `swaymsg` (output enumeration, the capture
-    // chooser) is unreachable without it, so a systemd `--user` host that never inherited the login
-    // environment had no sway backend at all. Cleared when nothing sway-shaped is live, so a
-    // sway→Hyprland switch can't leave `swaymsg` aimed at a dead socket. `wlroots::is_available()`
-    // keys off this variable, so setting it here is also what makes the backend visible at all.
-    match &e.sway_socket {
-        Some(sock) => std::env::set_var("SWAYSOCK", sock),
-        None => std::env::remove_var("SWAYSOCK"),
-    }
-    // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
-    // connect's retarget, and the availability probes read them: after a gnome-shell crash
-    // (observed 2026-07-10: SIGSEGV → GDM greeter) a stale `XDG_CURRENT_DESKTOP=GNOME` kept
-    // `mutter::is_available()` true, so a client's explicit backend request routed into the dead
-    // session — 45 s create timeouts and a libei error loop instead of the crisp "no live
-    // graphical session" handshake error. Clear them so `available()` reports the truth and the
-    // client fails fast (and, when configured, `try_recover_session` can bring the desktop back).
-    if active.kind == ActiveKind::None {
-        std::env::remove_var("XDG_CURRENT_DESKTOP");
-        std::env::remove_var("WAYLAND_DISPLAY");
+    // SAFETY: `_env_guard` holds [`ENV_LOCK`] — the crate-wide discipline (see its doc in lib.rs)
+    // that serializes every process-env writer on the session-setup path; steady-state streaming
+    // threads read cached config, not the environment (security-review 2026-06-28 #7).
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
+        if let Some(w) = &e.wayland_display {
+            std::env::set_var("WAYLAND_DISPLAY", w);
+        }
+        if let Some(d) = &e.xdg_current_desktop {
+            std::env::set_var("XDG_CURRENT_DESKTOP", d);
+        }
+        // Hyprland: export the discovered instance signature so `hyprctl` reaches the live
+        // compositor (fixes G4 for the systemd `--user` host, which never inherited it). Only set
+        // when detection found a Hyprland session; a stale value from a previous connect is
+        // cleared otherwise so a Hyprland→sway switch can't leave `hyprctl` pointed at a dead
+        // instance.
+        match &e.hyprland_signature {
+            Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        // sway: same treatment, and for the same reason — `swaymsg` (output enumeration, the
+        // capture chooser) is unreachable without it, so a systemd `--user` host that never
+        // inherited the login environment had no sway backend at all. Cleared when nothing
+        // sway-shaped is live, so a sway→Hyprland switch can't leave `swaymsg` aimed at a dead
+        // socket. `wlroots::is_available()` keys off this variable, so setting it here is also
+        // what makes the backend visible at all.
+        match &e.sway_socket {
+            Some(sock) => std::env::set_var("SWAYSOCK", sock),
+            None => std::env::remove_var("SWAYSOCK"),
+        }
+        // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
+        // connect's retarget, and the availability probes read them: after a gnome-shell crash
+        // (observed 2026-07-10: SIGSEGV → GDM greeter) a stale `XDG_CURRENT_DESKTOP=GNOME` kept
+        // `mutter::is_available()` true, so a client's explicit backend request routed into the
+        // dead session — 45 s create timeouts and a libei error loop instead of the crisp "no
+        // live graphical session" handshake error. Clear them so `available()` reports the truth
+        // and the client fails fast (and, when configured, `try_recover_session` can bring the
+        // desktop back).
+        if active.kind == ActiveKind::None {
+            std::env::remove_var("XDG_CURRENT_DESKTOP");
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
     }
     // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
     // [`effective_topology`] directly at create time — the console policy, else the legacy

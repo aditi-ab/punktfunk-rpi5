@@ -885,7 +885,9 @@ pub fn run() -> glib::ExitCode {
     ] {
         if let Ok(v) = std::env::var(var) {
             tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-            std::env::remove_var(var);
+            // SAFETY: top of `run()`, before GTK init or any other thread exists in this
+            // process — nothing reads the environment concurrently.
+            unsafe { std::env::remove_var(var) };
         }
     }
     // Headless paths (no GTK window).

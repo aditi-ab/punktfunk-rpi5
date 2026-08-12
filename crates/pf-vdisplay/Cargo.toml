@@ -8,7 +8,7 @@
 [package]
 name = "pf-vdisplay"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "punktfunk host virtual-display orchestration: per-compositor Linux backends + the Windows IddCx driver backend behind one VirtualDisplay trait."

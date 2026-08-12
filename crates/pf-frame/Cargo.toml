@@ -6,7 +6,7 @@
 [package]
 name = "pf-frame"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "punktfunk host shared frame/format vocabulary: CapturedFrame, PixelFormat, HDR metadata, thread QoS, and the Windows DXGI capture identity."

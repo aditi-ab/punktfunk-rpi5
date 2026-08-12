@@ -40,7 +40,7 @@ fn client(handle: jlong) -> Option<&'static SessionHandle> {
 }
 
 /// `NativeBridge.nativeClipSupported(handle)` — the host advertised `HOST_CAP_CLIPBOARD`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipSupported(
     _env: JNIEnv,
     _this: JObject,
@@ -53,7 +53,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipSupport
 
 /// `NativeBridge.nativeClipControl(handle, enabled)` — session-level opt-in/out. Nothing
 /// clipboard-related happens on either side until an `enabled: true` crosses.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipControl(
     _env: JNIEnv,
     _this: JObject,
@@ -68,7 +68,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipControl
 /// `NativeBridge.nativeClipOfferText(handle, seq)` — announce "the Android clipboard now holds
 /// text" (format list only; bytes cross when the host fetches). `seq` is Kotlin's monotonic
 /// counter, newest wins.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipOfferText(
     _env: JNIEnv,
     _this: JObject,
@@ -88,7 +88,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipOfferTe
 
 /// `NativeBridge.nativeClipFetchText(handle, seq)` — pull the text of the host's offer `seq`.
 /// Returns the transfer id echoed on the matching `data:`/`error:` event, or −1.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipFetchText(
     _env: JNIEnv,
     _this: JObject,
@@ -106,7 +106,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipFetchTe
 
 /// `NativeBridge.nativeClipServeText(handle, reqId, text)` — answer a `fetch:` event with the
 /// clipboard's current text (the host is pasting our offer).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipServeText(
     mut env: JNIEnv,
     _this: JObject,
@@ -125,7 +125,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipServeTe
 }
 
 /// `NativeBridge.nativeClipCancel(handle, id)` — abort a transfer (either direction).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipCancel(
     _env: JNIEnv,
     _this: JObject,
@@ -144,7 +144,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipCancel(
 /// Text payloads ride `data:<xfer_id>:<text>` decoded lossily — safe because the phase-0
 /// clipboard task delivers a whole payload in ONE event (`last = true`), so a chunk boundary
 /// can never split a UTF-8 sequence.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextClip(
     env: JNIEnv,
     _this: JObject,

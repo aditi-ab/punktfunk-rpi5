@@ -380,7 +380,7 @@ mod hdr {
     }
 
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn MonitorFromWindow(h: HWND, flags: u32) -> HMONITOR;
         fn GetMonitorInfoW(h: HMONITOR, mi: *mut MonitorInfoExW) -> i32;
         fn GetDisplayConfigBufferSizes(flags: u32, np: *mut u32, nm: *mut u32) -> i32;
@@ -513,7 +513,7 @@ fn should_inject(surface: vk::SurfaceKHR) -> bool {
 /// `p` must be null or point to a live `NegotiateLayerInterface` the caller has exclusive access
 /// to for the duration of the call. The Vulkan loader — the only intended caller of this
 /// export — guarantees exactly that for the negotiate handshake.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
     p: *mut NegotiateLayerInterface,
 ) -> vk::Result {
@@ -767,12 +767,12 @@ unsafe extern "system" fn destroy_instance(inst: vk::Instance, p_alloc: *const c
         // SAFETY: `inst` is non-null, and vkDestroyInstance requires a live instance handle —
         // still live during this call — whose first word is the dispatch key.
         .and_then(|mut g| g.remove(&unsafe { key(inst.as_raw()) }));
-    if let Some(d) = data {
-        if let Some(f) = d.destroy_instance {
-            // SAFETY: `f` is the down-chain vkDestroyInstance resolved for this very instance at
-            // create time; forwarding the caller's own arguments unchanged.
-            unsafe { f(inst, p_alloc) };
-        }
+    if let Some(d) = data
+        && let Some(f) = d.destroy_instance
+    {
+        // SAFETY: `f` is the down-chain vkDestroyInstance resolved for this very instance at
+        // create time; forwarding the caller's own arguments unchanged.
+        unsafe { f(inst, p_alloc) };
     }
 }
 

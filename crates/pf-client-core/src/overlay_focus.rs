@@ -164,10 +164,10 @@ fn read_appid(conn: &RustConnection, root: Window, atom: Atom) -> Option<u32> {
         .ok()?
         .reply()
         .ok()?;
-    // Bound rather than returned inline: the iterator borrows `reply`, and as a tail
-    // expression its temporary would outlive it.
-    let id = reply.value32()?.next();
-    id
+    // Inline is sound since edition 2024: tail-expression temporaries now drop BEFORE the
+    // block's locals, so the iterator borrowing `reply` no longer outlives it (the 2021 rule
+    // forced a `let` binding here).
+    reply.value32()?.next()
 }
 
 /// The whole decision, separated from X so it can be tested: an overlay is up exactly when

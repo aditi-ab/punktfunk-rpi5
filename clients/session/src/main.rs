@@ -537,8 +537,13 @@ mod session_main {
         const TOKEN: &str = "video_decode";
         match std::env::var("RADV_PERFTEST") {
             Ok(v) if v.split(',').any(|t| t == TOKEN) => return,
-            Ok(v) if !v.is_empty() => std::env::set_var("RADV_PERFTEST", format!("{v},{TOKEN}")),
-            _ => std::env::set_var("RADV_PERFTEST", TOKEN),
+            // SAFETY: called at the very top of `run()`, before this process creates any
+            // thread — the Vulkan loader, SDL, and the session runtime all start later.
+            Ok(v) if !v.is_empty() => unsafe {
+                std::env::set_var("RADV_PERFTEST", format!("{v},{TOKEN}"))
+            },
+            // SAFETY: as above — single-threaded startup.
+            _ => unsafe { std::env::set_var("RADV_PERFTEST", TOKEN) },
         }
         tracing::info!(
             radv_perftest = %std::env::var("RADV_PERFTEST").unwrap_or_default(),
@@ -832,7 +837,10 @@ mod session_main {
                 ("PUNKTFUNK_AUDIO_SOURCE", &s.mic_device),
             ] {
                 if std::env::var_os(var).is_none() && !value.is_empty() {
-                    std::env::set_var(var, value);
+                    // SAFETY: still the single-threaded startup stretch of `run()` — the
+                    // early-exit probes above return out of the process, and everything that
+                    // spawns threads (the session, the console, SDL) only starts below.
+                    unsafe { std::env::set_var(var, value) };
                 }
             }
         }
@@ -846,7 +854,9 @@ mod session_main {
         ] {
             if let Ok(v) = std::env::var(var) {
                 tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
-                std::env::remove_var(var);
+                // SAFETY: as the settings block above — single-threaded startup, before SDL
+                // (the reader of these variables) or any other thread exists.
+                unsafe { std::env::remove_var(var) };
             }
         }
 

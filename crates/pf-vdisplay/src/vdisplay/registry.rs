@@ -16,7 +16,7 @@
 //! lands — a runtime gate on `remote_fd.is_some()`.
 //!
 //! The ownership split: the session's capturer no longer owns the real keepalive — the registry does.
-//! [`acquire`] hands the session a `VirtualOutput` whose `keepalive` is a lightweight, gen-stamped
+//! [`acquire`] hands the session a `VirtualOutput` whose `keepalive` is a lightweight, generation-stamped
 //! `DisplayLease` (mirrors the Windows `MonitorLease`); dropping it releases the registry refcount,
 //! and the lifecycle machine decides linger / teardown. `capture_virtual_output`'s signature is
 //! unchanged — it just holds a lease instead of the real keepalive.
@@ -85,7 +85,7 @@ fn topology_str() -> String {
 /// with the quit application code — a user "stop", not a network drop), the display is torn down
 /// **immediately**, skipping the keep-alive linger. A bare disconnect leaves it `false` → normal linger.
 ///
-/// `supersedes`: the pool gen of a display this acquire REPLACES (a mid-stream mode switch creates
+/// `supersedes`: the pool generation of a display this acquire REPLACES (a mid-stream mode switch creates
 /// the new display before retiring the old — create-before-drop). The replacement inherits group
 /// topology ownership: without this, the dying predecessor counts as a live sibling and the new
 /// display "extends" behind it, losing a Primary/Exclusive topology on every resize. `None`
@@ -151,7 +151,7 @@ pub fn snapshot() -> Snapshot {
             .into_iter()
             .enumerate()
             .map(|(idx, i)| DisplayInfo {
-                slot: i.gen,
+                slot: i.generation,
                 backend: i.backend.to_string(),
                 mode: i.mode,
                 state: i.state.to_string(),
@@ -185,7 +185,7 @@ pub fn snapshot() -> Snapshot {
 /// released.
 pub fn release(slot: Option<u64>) -> usize {
     #[cfg(target_os = "windows")]
-    // Windows slots (Stage W1): `slot` selects one kept monitor by its gen stamp
+    // Windows slots (Stage W1): `slot` selects one kept monitor by its generation stamp
     // ([`DisplayInfo::slot`]); `None` releases every kept one.
     let released = super::manager::force_release(slot);
     #[cfg(target_os = "linux")]
@@ -211,12 +211,12 @@ pub fn release(slot: Option<u64>) -> usize {
 /// Tear down a **reused-but-dead** pool entry by its generation stamp (A2). Called by the pipeline
 /// builder when the first frame fails on a display [`acquire`] handed back as REUSED — so the retry
 /// loop's next `acquire` creates fresh instead of re-wedging on the same corpse. No-op off Linux / if
-/// the entry is already gone (idempotent — the subsequent stale-gen lease drop no-ops too).
-pub fn mark_failed(gen: u64) {
+/// the entry is already gone (idempotent — the subsequent stale-generation lease drop no-ops too).
+pub fn mark_failed(generation: u64) {
     #[cfg(target_os = "linux")]
-    linux::mark_failed(gen);
+    linux::mark_failed(generation);
     #[cfg(not(target_os = "linux"))]
-    let _ = gen;
+    let _ = generation;
 }
 
 /// Force-release a **superseded** kept display by its generation stamp
@@ -225,13 +225,13 @@ pub fn mark_failed(gen: u64) {
 /// keep-alive policy every resize would accumulate kept monitors at stale modes. The mode-switch
 /// arm calls this once the new pipeline is up and the old capturer is dropped. Only a KEPT
 /// (lingering/pinned) entry is released — an Active one is refused, like `/display/release` — and
-/// a gen that's already gone (immediate teardown) is a no-op. No-op off Linux (Windows
+/// a generation that's already gone (immediate teardown) is a no-op. No-op off Linux (Windows
 /// reconfigures the same monitor in place — nothing is superseded).
-pub fn retire(gen: u64) {
+pub fn retire(generation: u64) {
     #[cfg(target_os = "linux")]
-    linux::retire(gen);
+    linux::retire(generation);
     #[cfg(not(target_os = "linux"))]
-    let _ = gen;
+    let _ = generation;
 }
 
 /// Invalidate every kept display of `backend` — its compositor instance is gone (a Game↔Desktop switch
@@ -320,9 +320,9 @@ mod pool {
         /// The session epoch at creation (A4). Reuse requires an epoch match; the linger timer reaps
         /// entries whose epoch is stale (their compositor instance was replaced under them).
         pub(super) epoch: u64,
-        /// Generation stamp: a `DisplayLease` only releases if its gen still matches (a stale lease
+        /// Generation stamp: a `DisplayLease` only releases if its generation still matches (a stale lease
         /// — its entry was reused + re-stamped — is a no-op).
-        pub(super) gen: u64,
+        pub(super) generation: u64,
         /// The out-of-band-cursor mode this display was CREATED with (Phase B): metadata-pointer
         /// (cursor-channel session) vs compositor-embedded. Reuse requires an exact match — a kept
         /// embedded display has no cursor metadata for a channel session to forward, and a kept
@@ -344,15 +344,15 @@ mod pool {
     /// gamescope **spawn** is an independent nested session per client (no shared desktop), so each
     /// gamescope display is its OWN group — never auto-rowed against, or topology-/restore-grouped with,
     /// another gamescope session.
-    pub(super) fn group_key(backend: &str, gen: u64) -> String {
+    pub(super) fn group_key(backend: &str, generation: u64) -> String {
         if backend == "gamescope" {
-            format!("gamescope#{gen}")
+            format!("gamescope#{generation}")
         } else {
             backend.to_string()
         }
     }
 
-    /// Is the pooled entry `(e_backend, e_gen)` a member of the group the display `(backend, gen)`
+    /// Is the pooled entry `(e_backend, e_gen)` a member of the group the display `(backend, generation)`
     /// belongs to — the ONE definition of membership, shared by the restore hand-off, the
     /// first-in-group probe and the layout collection.
     ///
@@ -370,10 +370,10 @@ mod pool {
         e_backend: &str,
         e_gen: u64,
         backend: &str,
-        gen: u64,
+        generation: u64,
         supersedes: Option<u64>,
     ) -> bool {
-        Some(e_gen) != supersedes && group_key(e_backend, e_gen) == group_key(backend, gen)
+        Some(e_gen) != supersedes && group_key(e_backend, e_gen) == group_key(backend, generation)
     }
 
     /// Hand off a torn-down display's topology restore (design §6.1 — per-group restore): if a
@@ -382,20 +382,20 @@ mod pool {
     /// reclaimed display's keepalive, so the physical is re-enabled while our output still exists —
     /// the compositor never sees zero outputs). `None` in → `None` out.
     ///
-    /// `backend`+`gen` identify the DEPARTING display, and both are needed: keyed on the backend name
+    /// `backend`+`generation` identify the DEPARTING display, and both are needed: keyed on the backend name
     /// alone, one gamescope spawn's restore floated onto an unrelated client's spawn — where it would
     /// run when THAT session ended and never when its own did.
     pub(super) fn hand_off_restore(
         remaining: &mut [Entry],
         backend: &'static str,
-        gen: u64,
+        generation: u64,
         restore: Option<Restore>,
     ) -> Option<Restore> {
         let action = restore?;
         // At most one restore per group, so any surviving sibling has `None` to receive it.
         match remaining
             .iter_mut()
-            .find(|e| in_group(e.backend, e.gen, backend, gen, None))
+            .find(|e| in_group(e.backend, e.generation, backend, generation, None))
         {
             Some(sibling) => {
                 sibling.topology_restore = Some(action);
@@ -441,8 +441,9 @@ mod pool {
                 && !matches!(entries[i].life, lifecycle::State::Active { .. });
             if entries[i].life.poll_expiry(now) || dead_epoch {
                 let mut e = entries.remove(i);
-                let (backend, gen) = (e.backend, e.gen);
-                if let Some(r) = hand_off_restore(entries, backend, gen, e.topology_restore.take())
+                let (backend, generation) = (e.backend, e.generation);
+                if let Some(r) =
+                    hand_off_restore(entries, backend, generation, e.topology_restore.take())
                 {
                     restores.push(r);
                 }
@@ -470,7 +471,7 @@ mod pool {
     /// One live/kept display, flattened out of the pool under the lock — so the group + arrangement
     /// math (which calls the layout engine) runs OUTSIDE the lock.
     pub(super) struct Row {
-        pub(super) gen: u64,
+        pub(super) generation: u64,
         pub(super) backend: &'static str,
         pub(super) mode: Mode,
         pub(super) identity_slot: Option<u32>,
@@ -480,7 +481,7 @@ mod pool {
     }
 
     /// The desktop position for a display just appended to its group (design §6.2): the group's
-    /// `existing` members (each with its acquire `gen`) plus `new` last, ordered by `gen`, arranged by
+    /// `existing` members (each with its acquire `generation`) plus `new` last, ordered by `generation`, arranged by
     /// the pure [`layout`](crate::layout) engine, taking the new member's placement. Pure — so the
     /// append-in-acquire-order + auto-row/manual arrangement is unit-tested independent of the
     /// pool/global.
@@ -503,10 +504,10 @@ mod pool {
     /// is dropped. Pure over its `known`/`next` state — the caller owns the process-lifetime copy.
     ///
     /// Ids used to be the index into the sorted key list, which meant a new group could RENUMBER an
-    /// untouched one: with one KWin desktop at group 1, a gamescope spawn at gen 3 sorts ahead of
+    /// untouched one: with one KWin desktop at group 1, a gamescope spawn at generation 3 sorts ahead of
     /// `"kwin"` and silently moved the unchanged desktop to group 2 on the next `/display/state` poll.
     /// A monotonic counter, remembered per key, cannot do that. Pruning to the live keys is what keeps
-    /// the map bounded: the per-spawn keys (`gamescope#<gen>`, one per dedicated session) would
+    /// the map bounded: the per-spawn keys (`gamescope#<generation>`, one per dedicated session) would
     /// otherwise accumulate for the host's lifetime — an id is retired with its group.
     pub(super) fn assign_group_ids(
         known: &mut std::collections::BTreeMap<String, u32>,
@@ -523,7 +524,7 @@ mod pool {
     }
 
     /// Group the flattened rows into the mgmt `/display/state` view (design §6.1/§6.2) by
-    /// [`group_key`], ordered by acquire (`gen`), with each member's position from the pure
+    /// [`group_key`], ordered by acquire (`generation`), with each member's position from the pure
     /// [`layout`](crate::layout) engine. `ids` maps each group key to its reported group id (see
     /// [`group_ids`]). Pure — no I/O, no global — so the grouping / ordering / position assignment is
     /// unit-tested against synthetic rows.
@@ -535,20 +536,23 @@ mod pool {
     ) -> Vec<DisplayInfo> {
         use crate::layout::{self, Member};
 
-        let mut keys: Vec<String> = rows.iter().map(|r| group_key(r.backend, r.gen)).collect();
+        let mut keys: Vec<String> = rows
+            .iter()
+            .map(|r| group_key(r.backend, r.generation))
+            .collect();
         keys.sort();
         keys.dedup();
 
         let mut out: Vec<DisplayInfo> = Vec::new();
         for key in keys.iter() {
-            // This group's members in acquire order (gen ascending) → display_index + arrangement.
+            // This group's members in acquire order (generation ascending) → display_index + arrangement.
             let mut idx: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| &group_key(row.backend, row.gen) == key)
+                .filter(|(_, row)| &group_key(row.backend, row.generation) == key)
                 .map(|(i, _)| i)
                 .collect();
-            idx.sort_by_key(|&i| rows[i].gen);
+            idx.sort_by_key(|&i| rows[i].generation);
             let members: Vec<Member> = idx
                 .iter()
                 .map(|&i| Member {
@@ -561,7 +565,7 @@ mod pool {
                 let row = &rows[i];
                 let p = places[ord];
                 out.push(DisplayInfo {
-                    slot: row.gen,
+                    slot: row.generation,
                     backend: row.backend.to_string(),
                     mode: (row.mode.width, row.mode.height, row.mode.refresh_hz),
                     state: row.state.to_string(),
@@ -590,8 +594,8 @@ mod pool {
         use std::sync::Arc;
 
         /// A minimal pool entry for the pure teardown/restore tests (dummy keepalive; the
-        /// `hand_off_restore` logic only reads `backend` + `gen` + `topology_restore`).
-        fn test_entry(backend: &'static str, gen: u64, restore: Option<Restore>) -> Entry {
+        /// `hand_off_restore` logic only reads `backend` + `generation` + `topology_restore`).
+        fn test_entry(backend: &'static str, generation: u64, restore: Option<Restore>) -> Entry {
             Entry {
                 life: lifecycle::State::default(),
                 keepalive: Box::new(()),
@@ -607,7 +611,7 @@ mod pool {
                 topology_restore: restore,
                 launch: None,
                 epoch: 0,
-                gen,
+                generation,
                 hw_cursor: false,
                 hdr: false,
             }
@@ -631,7 +635,10 @@ mod pool {
         /// `ids_for` against a CARRIED map — for the stability test, which needs the same state
         /// across two assemblies.
         fn ids_into(known: &mut BTreeMap<String, u32>, next: &mut u32, rows: &[Row]) {
-            let mut keys: Vec<String> = rows.iter().map(|r| group_key(r.backend, r.gen)).collect();
+            let mut keys: Vec<String> = rows
+                .iter()
+                .map(|r| group_key(r.backend, r.generation))
+                .collect();
             keys.sort();
             keys.dedup();
             assign_group_ids(known, next, &keys);
@@ -659,7 +666,7 @@ mod pool {
         #[test]
         fn topology_restore_floats_to_a_sibling_then_runs_on_the_last_teardown() {
             let ran = Arc::new(AtomicBool::new(false));
-            // Two KWin displays in one group; the first (gen 1) carries the group's restore.
+            // Two KWin displays in one group; the first (generation 1) carries the group's restore.
             let mut pool = vec![
                 test_entry("kwin", 1, Some(flag_restore(&ran))),
                 test_entry("kwin", 2, None),
@@ -697,7 +704,7 @@ mod pool {
         #[test]
         fn tearing_down_a_non_carrier_first_leaves_the_restore_for_last() {
             let ran = Arc::new(AtomicBool::new(false));
-            // gen 2 carries the restore; gen 1 does not (a later exclusive session found the physical
+            // generation 2 carries the restore; generation 1 does not (a later exclusive session found the physical
             // already disabled).
             let mut pool = vec![
                 test_entry("kwin", 1, None),
@@ -706,7 +713,7 @@ mod pool {
             // Tear down the non-carrier first → nothing to hand off, carrier untouched.
             let mut e1 = pool.remove(0);
             assert!(hand_off_restore(&mut pool, "kwin", 1, e1.topology_restore.take()).is_none());
-            // The carrier (gen 2) still holds the group's restore.
+            // The carrier (generation 2) still holds the group's restore.
             assert!(pool[0].topology_restore.is_some());
             // Now the carrier (last member) → run.
             let mut e2 = pool.remove(0);
@@ -755,9 +762,9 @@ mod pool {
             assert!(in_group("kwin", 3, "kwin", 2, Some(1)));
         }
 
-        fn row(gen: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
+        fn row(generation: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
-                gen,
+                generation,
                 backend,
                 mode: Mode {
                     width: w,
@@ -773,7 +780,7 @@ mod pool {
 
         #[test]
         fn groups_by_backend_and_auto_rows_in_acquire_order() {
-            // Two KWin displays (acquired gen 5 then gen 2 — deliberately out of vec order) + a Mutter one.
+            // Two KWin displays (acquired generation 5 then generation 2 — deliberately out of vec order) + a Mutter one.
             let rows = vec![
                 row(5, "kwin", 2560, Some(1)),
                 row(2, "kwin", 1920, Some(7)),
@@ -784,12 +791,12 @@ mod pool {
 
             let kwin: Vec<&DisplayInfo> = out.iter().filter(|d| d.backend == "kwin").collect();
             assert_eq!(kwin.len(), 2);
-            assert_eq!(kwin[0].slot, 2); // lower gen (earlier acquire) sorts to index 0
+            assert_eq!(kwin[0].slot, 2); // lower generation (earlier acquire) sorts to index 0
             assert_eq!(kwin[0].display_index, 0);
             assert_eq!(kwin[0].position, (0, 0));
             assert_eq!(kwin[1].slot, 5);
             assert_eq!(kwin[1].display_index, 1);
-            assert_eq!(kwin[1].position, (1920, 0)); // auto-row: after the 1920px gen-2 display
+            assert_eq!(kwin[1].position, (1920, 0)); // auto-row: after the 1920px generation-2 display
             assert_eq!(kwin[0].topology, "exclusive");
 
             // A distinct backend is a distinct group.
@@ -830,7 +837,7 @@ mod pool {
                 identity_slot: slot,
                 width: w,
             };
-            // Existing group (given out of gen order): gen 8 @ 1920 acquired AFTER gen 3 @ 2560.
+            // Existing group (given out of generation order): generation 8 @ 1920 acquired AFTER generation 3 @ 2560.
             let existing = vec![(8, m(Some(2), 1920)), (3, m(Some(1), 2560))];
             // A new 1280-wide display appends to the right of 2560 + 1920.
             let pos = position_for_new(existing, m(Some(5), 1280), &Layout::default());
@@ -900,30 +907,30 @@ mod pool {
             use std::time::Duration;
             let t0 = Instant::now();
             let mut es = Vec::new();
-            // gen 1: lingering, deadline passed.
+            // generation 1: lingering, deadline passed.
             let mut e1 = test_entry("kwin", 1, None);
             e1.life = lifecycle::State::Lingering {
                 until: t0 - Duration::from_millis(1),
             };
             es.push(e1);
-            // gen 2: lingering, deadline in the future, current epoch → survives.
+            // generation 2: lingering, deadline in the future, current epoch → survives.
             let mut e2 = test_entry("kwin", 2, None);
             e2.life = lifecycle::State::Lingering {
                 until: t0 + Duration::from_secs(60),
             };
             e2.epoch = 5;
             es.push(e2);
-            // gen 3: pinned, but from a DEAD epoch → reaped (its compositor is gone).
+            // generation 3: pinned, but from a DEAD epoch → reaped (its compositor is gone).
             let mut e3 = test_entry("kwin", 3, None);
             e3.life = lifecycle::State::Pinned;
             e3.epoch = 4;
             es.push(e3);
-            // gen 4: ACTIVE from a dead epoch → left to its own session's rebuild.
+            // generation 4: ACTIVE from a dead epoch → left to its own session's rebuild.
             let mut e4 = test_entry("kwin", 4, None);
             e4.life = lifecycle::State::Active { refs: 1 };
             e4.epoch = 4;
             es.push(e4);
-            // gen 5: a gamescope spawn from a "dead" epoch — exempt (independent nested session).
+            // generation 5: a gamescope spawn from a "dead" epoch — exempt (independent nested session).
             let mut e5 = test_entry("gamescope", 5, None);
             e5.life = lifecycle::State::Pinned;
             e5.epoch = 1;
@@ -931,9 +938,9 @@ mod pool {
 
             let (expired, restores) = take_expired(&mut es, t0, 5);
             assert!(restores.is_empty());
-            let gone: Vec<u64> = expired.iter().map(|e| e.gen).collect();
+            let gone: Vec<u64> = expired.iter().map(|e| e.generation).collect();
             assert_eq!(gone, vec![1, 3]);
-            let left: Vec<u64> = es.iter().map(|e| e.gen).collect();
+            let left: Vec<u64> = es.iter().map(|e| e.generation).collect();
             assert_eq!(left, vec![2, 4, 5]);
         }
     }
@@ -974,7 +981,7 @@ mod linux {
 
     struct Reg {
         entries: Mutex<Vec<Entry>>,
-        gen: AtomicU64,
+        generation: AtomicU64,
     }
 
     static REG: OnceLock<Reg> = OnceLock::new();
@@ -982,7 +989,7 @@ mod linux {
     fn reg() -> &'static Reg {
         REG.get_or_init(|| Reg {
             entries: Mutex::new(Vec::new()),
-            gen: AtomicU64::new(1),
+            generation: AtomicU64::new(1),
         })
     }
 
@@ -1029,25 +1036,27 @@ mod linux {
         }
         match std::thread::Builder::new()
             .name("vdisplay-linger".into())
-            .spawn(|| loop {
-                std::thread::sleep(Duration::from_millis(500));
-                let (expired, restores) = {
-                    let mut es = reg().entries.lock().unwrap();
-                    take_expired(&mut es, Instant::now(), crate::session_epoch())
-                };
-                // Re-enable physicals (group emptied) BEFORE dropping the outputs — outside the lock.
-                for restore in restores {
-                    restore();
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let (expired, restores) = {
+                        let mut es = reg().entries.lock().unwrap();
+                        take_expired(&mut es, Instant::now(), crate::session_epoch())
+                    };
+                    // Re-enable physicals (group emptied) BEFORE dropping the outputs — outside the lock.
+                    for restore in restores {
+                        restore();
+                    }
+                    let reaped = expired.len();
+                    for e in expired {
+                        tracing::info!(
+                            backend = e.backend,
+                            "virtual display: linger expired — torn down"
+                        );
+                        drop(e); // outside the lock
+                    }
+                    emit_released(reaped);
                 }
-                let reaped = expired.len();
-                for e in expired {
-                    tracing::info!(
-                        backend = e.backend,
-                        "virtual display: linger expired — torn down"
-                    );
-                    drop(e); // outside the lock
-                }
-                emit_released(reaped);
             }) {
             Ok(_) => *started = true,
             Err(e) => tracing::error!(
@@ -1069,27 +1078,27 @@ mod linux {
         }
     }
 
-    /// Build the session-facing [`VirtualOutput`]: the kept node + a fresh gen-stamped lease. Only
+    /// Build the session-facing [`VirtualOutput`]: the kept node + a fresh generation-stamped lease. Only
     /// the poolable (`remote_fd == None`) backends reach here, so `remote_fd` is always `None`.
     fn output_for(
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
-        gen: u64,
+        generation: u64,
         quit: Arc<AtomicBool>,
         reused: bool,
     ) -> VirtualOutput {
-        // The pooled display is registry-owned; the session holds a gen-stamped lease as its keepalive.
+        // The pooled display is registry-owned; the session holds a generation-stamped lease as its keepalive.
         let mut out = VirtualOutput::owned(
             node_id,
             preferred_mode,
-            Box::new(DisplayLease { gen, quit }),
+            Box::new(DisplayLease { generation, quit }),
         );
         // A2: tell the pipeline builder this was a REUSED kept display, so a first-frame failure can
-        // `mark_failed(gen)` (tear the corpse down) rather than re-wedge the retry loop on the same node.
-        out.reused_gen = reused.then_some(gen);
-        // H4: every pooled display carries its gen, so a mode-switch rebuild can `retire` the entry
+        // `mark_failed(generation)` (tear the corpse down) rather than re-wedge the retry loop on the same node.
+        out.reused_gen = reused.then_some(generation);
+        // H4: every pooled display carries its generation, so a mode-switch rebuild can `retire` the entry
         // this output's successor supersedes.
-        out.pool_gen = Some(gen);
+        out.pool_gen = Some(generation);
         out
     }
 
@@ -1129,9 +1138,9 @@ mod linux {
             // gamescope spawns are independent nested sessions, exempt from the active-session epoch —
             // see `epoch_matches`). The liveness probe (`kept_display_alive`, which may shell `pw-dump`
             // for gamescope) must NOT run under the pool lock (it can block / hang the daemon), so:
-            //   1. find the candidate + snapshot (gen, node_id) UNDER the lock, then release it;
+            //   1. find the candidate + snapshot (generation, node_id) UNDER the lock, then release it;
             //   2. probe liveness OUTSIDE the lock;
-            //   3. re-lock and re-find the SAME entry by its gen (another thread may have reused/removed
+            //   3. re-lock and re-find the SAME entry by its generation (another thread may have reused/removed
             //      it meanwhile — then we just miss and create fresh).
             let candidate = {
                 let es = r.entries.lock().unwrap();
@@ -1147,16 +1156,16 @@ mod linux {
                             && e.hdr == vd.hdr()
                             && epoch_matches(e.backend, e.epoch, cur_epoch)
                     })
-                    .map(|e| (e.gen, e.node_id))
+                    .map(|e| (e.generation, e.node_id))
             };
             if let Some((cand_gen, node_id)) = candidate {
                 let alive = vd.kept_display_alive(node_id); // OUTSIDE the lock (may block)
                 let reuse = {
                     let mut es = r.entries.lock().unwrap();
-                    // Re-find the SAME entry by its snapshot gen; skip if it's gone or no longer kept
+                    // Re-find the SAME entry by its snapshot generation; skip if it's gone or no longer kept
                     // (a concurrent reconnect adopted it) — we then miss and create fresh.
                     match es.iter().position(|e| {
-                        e.gen == cand_gen
+                        e.generation == cand_gen
                             && matches!(
                                 e.life,
                                 lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
@@ -1164,8 +1173,8 @@ mod linux {
                     }) {
                         Some(idx) if alive => {
                             es[idx].life.acquire();
-                            let gen = r.gen.fetch_add(1, Ordering::Relaxed);
-                            es[idx].gen = gen;
+                            let generation = r.generation.fetch_add(1, Ordering::Relaxed);
+                            es[idx].generation = generation;
                             let preferred_mode = es[idx].preferred_mode;
                             tracing::info!(
                                 backend,
@@ -1175,7 +1184,7 @@ mod linux {
                             ReuseOutcome::Reused(output_for(
                                 node_id,
                                 preferred_mode,
-                                gen,
+                                generation,
                                 quit.clone(),
                                 true,
                             ))
@@ -1183,7 +1192,7 @@ mod linux {
                         Some(idx) => {
                             // Dead kept display: remove it, hand off its group restore, create fresh.
                             let mut dead = es.remove(idx);
-                            let (b, g) = (dead.backend, dead.gen);
+                            let (b, g) = (dead.backend, dead.generation);
                             let restore =
                                 hand_off_restore(&mut es, b, g, dead.topology_restore.take());
                             ReuseOutcome::Dead(dead, restore)
@@ -1213,9 +1222,9 @@ mod linux {
 
         // The new display's generation stamp, taken BEFORE the group questions below: it is this
         // display's identity for the rest of the acquire, and `group_key` needs it — a gamescope
-        // spawn's group IS its gen. A gen burned by a failed create is harmless (they are opaque
+        // spawn's group IS its generation. A generation burned by a failed create is harmless (they are opaque
         // and monotonic, never an index).
-        let gen = r.gen.fetch_add(1, Ordering::Relaxed);
+        let generation = r.generation.fetch_add(1, Ordering::Relaxed);
 
         // NOTE: the operator's `max_displays` ceiling is NOT enforced here. It belongs at
         // admission (`admission::admit`), which is where Windows has always applied it, and the
@@ -1240,7 +1249,7 @@ mod linux {
         let first_in_group = {
             let es = r.entries.lock().unwrap();
             !es.iter().any(|e| {
-                in_group(e.backend, e.gen, backend, gen, supersedes)
+                in_group(e.backend, e.generation, backend, generation, supersedes)
                     && matches!(e.life, lifecycle::State::Active { .. })
             })
         };
@@ -1292,7 +1301,7 @@ mod linux {
             topology_restore,
             launch: launch.clone(),
             epoch: cur_epoch,
-            gen,
+            generation,
             hw_cursor: vd.hw_cursor(),
             hdr: vd.hdr(),
         };
@@ -1314,10 +1323,10 @@ mod linux {
             // width to the right on every mode switch.
             let existing: Vec<(u64, Member)> = es
                 .iter()
-                .filter(|e| in_group(e.backend, e.gen, backend, gen, supersedes))
+                .filter(|e| in_group(e.backend, e.generation, backend, generation, supersedes))
                 .map(|e| {
                     (
-                        e.gen,
+                        e.generation,
                         Member {
                             identity_slot: e.identity_slot,
                             width: e.mode.width as i32,
@@ -1340,7 +1349,7 @@ mod linux {
         if (position.x, position.y) != (0, 0) {
             vd.apply_position(position.x, position.y);
         }
-        let mut out = output_for(node_id, preferred_mode, gen, quit, false);
+        let mut out = output_for(node_id, preferred_mode, generation, quit, false);
         out.expect_exact_dims = expect_exact_dims;
         Ok(out)
     }
@@ -1348,18 +1357,18 @@ mod linux {
     /// The [`DisplayLease`] `Drop` path: release the session's hold on the pooled display. The
     /// lifecycle machine decides linger / pin / teardown; a torn-down entry's keepalive drops *after*
     /// the lock is released.
-    fn release(gen: u64, force_immediate: bool) {
+    fn release(generation: u64, force_immediate: bool) {
         let Some(r) = REG.get() else { return };
         let linger = effective_linger(force_immediate, linger());
         let (torn_down, restore) = {
             let mut es = r.entries.lock().unwrap();
-            let Some(idx) = es.iter().position(|e| e.gen == gen) else {
+            let Some(idx) = es.iter().position(|e| e.generation == generation) else {
                 return; // stale lease (entry reused + re-stamped, or already gone) — no-op
             };
             match es[idx].life.release(Instant::now(), linger) {
                 Release::Teardown => {
                     let mut e = es.remove(idx);
-                    let (backend, g) = (e.backend, e.gen);
+                    let (backend, g) = (e.backend, e.generation);
                     // Per-group restore (§6.1): hand the physical re-enable to a surviving sibling, or run
                     // it now if this was the group's last member.
                     let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
@@ -1368,8 +1377,8 @@ mod linux {
                 // A release against a slot with NO live hold — a stale or duplicate lease drop. The
                 // machine's contract for it is "do nothing", and it was wired to the teardown arm:
                 // the one outcome that means the caller has no claim on this display would have torn
-                // the display down. Unreachable today (a lease's gen is unique per acquire and the
-                // lookup above is by gen, so a stale lease misses the pool entirely and returns
+                // the display down. Unreachable today (a lease's generation is unique per acquire and the
+                // lookup above is by generation, so a stale lease misses the pool entirely and returns
                 // early), which is exactly why it has to be right by construction rather than by
                 // luck — matching the Windows manager's own Noop arm.
                 Release::Noop => (None, None),
@@ -1434,7 +1443,7 @@ mod linux {
                         lifecycle::State::Idle => return None,
                     };
                     Some(Row {
-                        gen: e.gen,
+                        generation: e.generation,
                         backend: e.backend,
                         mode: e.mode,
                         identity_slot: e.identity_slot,
@@ -1455,7 +1464,10 @@ mod linux {
         // Stable per-group ids, carried across polls (see `assign_group_ids`) — a new group must
         // never renumber an existing one under the console. The state is process-lifetime and this
         // is the only thing that touches it, so it lives here rather than in the pure core.
-        let mut keys: Vec<String> = rows.iter().map(|r| group_key(r.backend, r.gen)).collect();
+        let mut keys: Vec<String> = rows
+            .iter()
+            .map(|r| group_key(r.backend, r.generation))
+            .collect();
         keys.sort();
         keys.dedup();
         static GROUP_IDS: Mutex<Option<(std::collections::BTreeMap<String, u32>, u32)>> =
@@ -1475,13 +1487,13 @@ mod linux {
     }
 
     /// H4 — force-release a display superseded by a mid-stream mode switch. Same machinery as
-    /// [`force_release`] (kept entries only — an Active entry is refused, and a gen already torn
+    /// [`force_release`] (kept entries only — an Active entry is refused, and a generation already torn
     /// down under `immediate` is a no-op), distinct log line.
-    pub(super) fn retire(gen: u64) {
-        release_kept(Some(gen), "retired (superseded by a mode switch)");
+    pub(super) fn retire(generation: u64) {
+        release_kept(Some(generation), "retired (superseded by a mode switch)");
     }
 
-    /// Remove + tear down KEPT (lingering/pinned) entries — all of them, or one by gen — running /
+    /// Remove + tear down KEPT (lingering/pinned) entries — all of them, or one by generation — running /
     /// handing off group topology restores, with keepalive drops outside the lock. The shared core
     /// of [`force_release`] (mgmt) and [`retire`] (mode-switch supersede).
     fn release_kept(slot: Option<u64>, why: &'static str) -> usize {
@@ -1492,10 +1504,10 @@ mod linux {
             let mut restores = Vec::new();
             let mut i = 0;
             while i < es.len() {
-                let selected = slot.is_none_or(|s| es[i].gen == s);
+                let selected = slot.is_none_or(|s| es[i].generation == s);
                 if selected && es[i].life.force_release() {
                     let mut e = es.remove(i);
-                    let (backend, g) = (e.backend, e.gen);
+                    let (backend, g) = (e.backend, e.generation);
                     let restore = e.topology_restore.take();
                     if let Some(rst) = hand_off_restore(&mut es, backend, g, restore) {
                         restores.push(rst);
@@ -1522,15 +1534,15 @@ mod linux {
 
     /// A2 — tear down a reused-but-dead pool entry by its generation stamp. Removes it (hand off /
     /// run its group restore), drops the keepalive outside the lock. Idempotent (already gone → no-op).
-    pub(super) fn mark_failed(gen: u64) {
+    pub(super) fn mark_failed(generation: u64) {
         let Some(r) = REG.get() else { return };
         let (torn, restore) = {
             let mut es = r.entries.lock().unwrap();
-            let Some(idx) = es.iter().position(|e| e.gen == gen) else {
-                return; // already gone — the subsequent stale-gen lease drop no-ops too
+            let Some(idx) = es.iter().position(|e| e.generation == generation) else {
+                return; // already gone — the subsequent stale-generation lease drop no-ops too
             };
             let mut e = es.remove(idx);
-            let (backend, g) = (e.backend, e.gen);
+            let (backend, g) = (e.backend, e.generation);
             let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
             (e, restore)
         };
@@ -1559,7 +1571,7 @@ mod linux {
             while i < es.len() {
                 if es[i].backend == backend {
                     let mut e = es.remove(i);
-                    let (b, g) = (e.backend, e.gen);
+                    let (b, g) = (e.backend, e.generation);
                     if let Some(rst) = hand_off_restore(&mut es, b, g, e.topology_restore.take()) {
                         restores.push(rst);
                     }
@@ -1591,7 +1603,7 @@ mod linux {
     /// The session's refcount handle — the `keepalive` the capturer holds. `Drop` releases the
     /// registry hold; a stale lease (its entry was reused + re-stamped, or torn down) is a no-op.
     struct DisplayLease {
-        gen: u64,
+        generation: u64,
         /// The session's deliberate-quit flag: set when the client closes with the quit application
         /// code (a user "stop", not a network drop), so this lease's `Drop` tears the display down
         /// immediately instead of lingering. `false` on a bare disconnect → normal keep-alive.
@@ -1600,7 +1612,7 @@ mod linux {
 
     impl Drop for DisplayLease {
         fn drop(&mut self) {
-            release(self.gen, self.quit.load(Ordering::SeqCst));
+            release(self.generation, self.quit.load(Ordering::SeqCst));
         }
     }
 }
