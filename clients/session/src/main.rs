@@ -13,7 +13,11 @@
 //! the first presented frame, `stats:` lines per 1 s window, one `{"error": …}` /
 //! `{"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: 0 clean end,
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: edition 2024 makes `std::env::set_var`/`remove_var` unsafe (WP20 —
+// the env-mutation class made visible), and this bin's three single-threaded-startup env
+// writes carry documented SAFETY comments under localized `#[allow(unsafe_code)]` (the
+// pf-update idiom). A `forbid` cannot be overridden at those sites and refuses the file.
+#![deny(unsafe_code)]
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod console;
@@ -533,6 +537,7 @@ mod session_main {
     /// initialises, so a call placed after them leaves the triage tool describing a device
     /// that cannot decode while the streaming path decodes on it.
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)] // the two SAFETY-commented single-threaded-startup env writes below
     fn enable_radv_video_decode() {
         const TOKEN: &str = "video_decode";
         match std::env::var("RADV_PERFTEST") {
@@ -840,7 +845,10 @@ mod session_main {
                     // SAFETY: still the single-threaded startup stretch of `run()` — the
                     // early-exit probes above return out of the process, and everything that
                     // spawns threads (the session, the console, SDL) only starts below.
-                    unsafe { std::env::set_var(var, value) };
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        std::env::set_var(var, value)
+                    };
                 }
             }
         }
@@ -856,7 +864,10 @@ mod session_main {
                 tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
                 // SAFETY: as the settings block above — single-threaded startup, before SDL
                 // (the reader of these variables) or any other thread exists.
-                unsafe { std::env::remove_var(var) };
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::remove_var(var)
+                };
             }
         }
 
