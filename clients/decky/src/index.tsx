@@ -230,12 +230,16 @@ const QamPanel: FC = () => {
               label={
                 problem === "client-unavailable"
                   ? "Punktfunk isn’t installed"
-                  : "Update the Punktfunk client"
+                  : problem === "list-failed"
+                    ? "Couldn’t scan for hosts"
+                    : "Update the Punktfunk client"
               }
               description={
                 problem === "client-unavailable"
                   ? "This panel launches the Punktfunk app, which isn’t on this Deck yet. Install it in Desktop Mode."
-                  : "This client is too old to find hosts on your network. Saved hosts still work."
+                  : problem === "list-failed"
+                    ? "Something went wrong while scanning — Refresh tries again."
+                    : "This client is too old to find hosts on your network. Saved hosts still work."
               }
             />
           </PanelSectionRow>

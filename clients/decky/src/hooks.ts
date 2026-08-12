@@ -215,9 +215,10 @@ export function useHosts() {
   const [views, setViews] = useState<HostView[]>([]);
   const [scanning, setScanning] = useState(false);
   // Why the list is empty, when it is empty for a reason other than an empty LAN. Rendering
-  // either of these as "No hosts yet" would blame the user's network for the plugin's problem:
+  // any of these as "No hosts yet" would blame the user's network for the plugin's problem:
   //   "client-outdated"    — the installed client predates `punktfunk discover`
   //   "client-unavailable" — there is no client installed at all
+  //   "list-failed"        — the refresh itself blew up (backend down, call threw)
   const [problem, setProblem] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -236,7 +237,11 @@ export function useHosts() {
       );
       setViews(mergeHosts(s.hosts ?? [], d.hosts ?? []));
     } catch (e) {
-      toaster.toast({ title: "Punktfunk", body: `Couldn't list hosts: ${e}` });
+      // Inline, not a toast: the panel remounts (and refreshes) on every QAM open, so while
+      // the backend is unhappy a toast here nagged on each open. The panel row also sits next
+      // to the Refresh button that retries it, which is where the eyes already are.
+      console.warn("punktfunk: host list refresh failed", e);
+      setProblem("list-failed");
     } finally {
       setScanning(false);
     }
@@ -454,9 +459,12 @@ export async function startStream(
 ): Promise<void> {
   try {
     await launchStream(v.ref, opts);
+    // No success toast: the user just pressed the button that names this host/card, the QAM
+    // closes, and Steam's own launch UI takes over — a toast here fired on EVERY launch and
+    // then sat on top of the starting stream. Failure still toasts (the QAM may already be
+    // closed, so inline error state would go unseen).
     Navigation.CloseSideMenus();
-    toaster.toast({ title: "Punktfunk", body: `Starting ${label ?? "stream"} — ${v.name}` });
   } catch (e) {
-    toaster.toast({ title: "Punktfunk", body: `Launch failed: ${e}` });
+    toaster.toast({ title: "Punktfunk", body: `Launch failed${label ? ` (${label})` : ""}: ${e}` });
   }
 }
