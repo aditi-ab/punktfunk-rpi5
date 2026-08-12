@@ -198,6 +198,28 @@ Streaming sessions still hold the box awake through their own `PowerRequest` ass
 before. New knob: `PUNKTFUNK_MIC_ALWAYS_ON=1` restores the old always-running stream in case a
 third-party virtual audio driver misbehaves while its render side is paused.
 
+### Windows host — audio no longer costs local-game frame time
+
+🛑 **The host could tank a locally-played game's frame lows** (field-reported 2026-08-12:
+Helldivers 2 at 1% lows of 2–5 FPS, cured by uninstalling). Two mechanisms, both fixed:
+
+- **The minted-endpoint retry storm.** The virtual-mic resolve ran a FULL provisioning pass on
+  every reopen with no cooldown, no in-flight guard, and no give-up — and the pass reached
+  `UpdateDriverForPlugAndPlayDevicesW` even over an already-existing devnode. On a box where
+  minting cannot converge, the pump's reopen backoff (capped 60 s) turned that into a SetupAPI
+  sweep + PnP driver re-bind + default-device writes roughly once a minute, forever — each
+  raising the system-wide device-change broadcast games service by rebuilding their audio
+  graphs. Provisioning now short-circuits to a no-PnP fast path while the minted devices are
+  healthy, waits on an in-flight pass instead of racing a second one, honours the 60 s retry
+  cooldown from the blocking path too, and stops for the host lifetime after five unlatched
+  passes (a service restart re-arms minting).
+- **Session tuning never reverted.** The first streaming session put the whole host process at
+  HIGH priority class with a 1 ms global timer (`timeBeginPeriod`) and DWM MMCSS, documented as
+  "reverts at process exit" — but the host is a 24/7 service, so after one stream it competed
+  at HIGH priority against whatever the user played locally, forever. The process-wide tuning
+  is now refcounted across the hot stream threads and reverts when the last one exits
+  (= session teardown), the same lifetime the per-thread MMCSS effects already ride.
+
 ## v0.27.0
 
 87 commits since v0.26.0.
