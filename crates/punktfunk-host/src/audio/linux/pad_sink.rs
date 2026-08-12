@@ -198,12 +198,21 @@ impl crate::audio::AudioCapturer for PadSinkCapturer {
     }
 }
 
-/// SPA channel positions for the pad quad: FL FR RL RR (`enum spa_audio_channel`: FL=3 FR=4
-/// RL=12 RR=13). NOT the session capturer's 4-ch order — the pad layout has no center/LFE; the
-/// rear pair is the voice coils.
+/// SPA channel positions for the pad quad: AUX0..AUX3 (`enum spa_audio_channel`:
+/// `SPA_AUDIO_CHANNEL_START_Aux` = 0x1000), NOT a positioned FL FR RL RR layout. This is the
+/// shape a REAL DualSense exposes on the PipeWire path GE-Proton's haptics were built and
+/// field-validated against: its `open_dualsense_haptic_pcm` targets the node through the
+/// bundled pipewire-alsa plugin with `aux_channels=1` — "the hidden PipeWire parent for a
+/// DualSense output exposes AUX0 through AUX3" (proton-ds5-haptic patch 0115) — and its pulse
+/// fallback forces a `PA_CHANNEL_POSITION_AUX0..3` map. On a real pad that shape is the card's
+/// Pro Audio profile (the community-reported requirement for GE ≥11-4). Aux positions carry no
+/// spatial meaning, so nothing in the graph position-remixes into (or out of) the sink —
+/// writers land by INDEX, exactly the raw quad the pad speaks: ch0/1 = speaker, ch2/3 = voice
+/// coils (the same order the Windows endpoint is stamped with and `split_quad` assumes).
 fn pad_positions() -> [u32; 64] {
+    const AUX0: u32 = 0x1000;
     let mut pos = [0u32; 64];
-    pos[..4].copy_from_slice(&[3, 4, 12, 13]);
+    pos[..4].copy_from_slice(&[AUX0, AUX0 + 1, AUX0 + 2, AUX0 + 3]);
     pos
 }
 

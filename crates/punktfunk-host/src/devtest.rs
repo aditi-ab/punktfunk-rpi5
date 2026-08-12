@@ -261,22 +261,30 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
         cap.node_name, cap.node_name
     );
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let (mut chunks, mut samples, mut peak) = (0u64, 0u64, 0f32);
+    let (mut chunks, mut samples) = (0u64, 0u64);
+    // Per-pair peaks: ch0/1 = speaker, ch2/3 = voice coils — the split_quad contract. Proving
+    // the pairs separately is the point of this devtest: a positional remix upstream would
+    // smear or zero one pair while a global peak still looks healthy.
+    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
     let mut last_report = Instant::now();
     while Instant::now() < deadline {
         let c = cap.next_chunk().context("pad sink capture")?;
         if !c.is_empty() {
             chunks += 1;
             samples += c.len() as u64;
-            peak = c.iter().fold(peak, |p, s| p.max(s.abs()));
+            for f in c.chunks_exact(4) {
+                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
+                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
+            }
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();
             println!(
-                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) peak={peak:.4}",
+                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
+                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
                 samples as f64 / (4.0 * 48.0)
             );
-            (chunks, samples, peak) = (0, 0, 0.0);
+            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
         }
     }
     println!("pad-sink-test: done");
