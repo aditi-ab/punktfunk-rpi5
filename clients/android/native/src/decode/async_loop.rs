@@ -43,10 +43,12 @@ struct OutputReady {
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
 enum DecodeEvent {
-    /// A received access unit from the feeder, ready to queue into the decoder. The `bool` is the
-    /// feeder's [`NativeClient::note_frame_index`] verdict — `true` when this AU revealed a forward
-    /// frame-index gap, so the loop arms the freeze gate (the feeder already fired the RFI request).
-    Au(Frame, bool),
+    /// A received access unit from the feeder, ready to queue into the decoder. The `u32` is the
+    /// feeder's [`NativeClient::note_frame_index`] verdict — the forward frame-index gap's WIDTH
+    /// (0 = none), so the loop arms the freeze gate with the same signal and pre-credits the
+    /// reassembler's later `frames_dropped` climb for the loss (the feeder already fired the RFI
+    /// request).
+    Au(Frame, u32),
     /// An input buffer slot freed (index) — we can queue an AU into it.
     InputAvailable(usize),
     /// A decoded frame is ready (buffer index + echoed pts + the callback-time `decoded` stamp).
@@ -603,7 +605,11 @@ fn feeder_loop(
                 // AU's first piece (or a whole delivery), so the RFI gap detector keeps
                 // counting AUs.
                 let au_first = frame.part.is_none_or(|p| p.first);
-                let gap = au_first && client.note_frame_index(frame.frame_index);
+                let gap = if au_first {
+                    client.note_frame_index(frame.frame_index)
+                } else {
+                    0
+                };
                 // Park the receipt stamp (keyed by the pts the codec echoes) whenever the `decode`
                 // stage is consumed: the HUD, or the ABR decode signal (`measure_decode`). The
                 // HUD-only `received` point + host/network split stay gated on the overlay.
@@ -691,9 +697,12 @@ fn dispatch_event(
     match ev {
         DecodeEvent::Au(f, gap) => {
             // A forward frame-index gap arms the freeze; park this AU's flags for the present side to
-            // fold `on_decoded` (keyed by the pts the codec will echo).
-            if gap {
-                gate.arm(Instant::now());
+            // fold `on_decoded` (keyed by the pts the codec will echo). Credited arm: the gap width
+            // pre-covers the reassembler's ~120 ms-later `frames_dropped` climb for the same loss,
+            // so a fast RFI anchor that heals in between isn't re-frozen by it (the double-arm
+            // race — see `ReanchorGate::arm_expecting_drops`).
+            if gap > 0 {
+                gate.arm_expecting_drops(Instant::now(), u64::from(gap));
             }
             // One entry per AU (parts share the pts): the completing delivery carries it.
             if f.complete {

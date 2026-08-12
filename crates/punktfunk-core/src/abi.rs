@@ -4346,7 +4346,41 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
         if !gap_out.is_null() {
             // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
             // written once by value.
-            unsafe { *gap_out = gap };
+            unsafe { *gap_out = gap > 0 };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// [`punktfunk_connection_note_frame_index`] with the gap WIDTH instead of a yes/no: writes to
+/// `gap_width_out` how many frames this arrival revealed as missing (0 = contiguous/straggler).
+/// A client with a post-loss display freeze passes the width to
+/// [`punktfunk_reanchor_gate_arm_expecting_drops`] so the reassembler's later `frames_dropped`
+/// climb for the SAME loss cannot re-freeze a stream an RFI anchor already healed (the double-arm
+/// race — see the gate function's doc).
+///
+/// # Safety
+/// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
+    c: *const PunktfunkConnection,
+    frame_index: u32,
+    gap_width_out: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let gap = c.inner.note_frame_index(frame_index);
+        if !gap_width_out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
+            unsafe { *gap_width_out = gap };
         }
         PunktfunkStatus::Ok
     })
@@ -4693,6 +4727,31 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
         // handles.
         if let Some(g) = unsafe { g.as_mut() } {
             g.arm(std::time::Instant::now());
+        }
+    });
+}
+
+/// [`punktfunk_reanchor_gate_arm`] for a loss detected as a **frame-index gap**, where the caller
+/// knows how many frames the gap skipped ([`punktfunk_connection_note_frame_index_ex`]). On top of
+/// arming, the gate pre-credits the reassembler's `frames_dropped` climb those same lost frames
+/// will produce up to ~120 ms later, so [`punktfunk_reanchor_gate_poll`] does not treat that
+/// delayed bookkeeping as a SECOND loss — without the credit, a fast LTR-RFI anchor lifts the
+/// freeze between the two signals and the stale climb re-freezes a healed stream (the double-arm
+/// race). Use the plain arm for non-gap loss signals (decoder wedge/demotion). NULL is a no-op.
+///
+/// # Safety
+/// `g` is a valid gate handle.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_arm_expecting_drops(
+    g: *mut ReanchorGate,
+    expected_drops: u64,
+) {
+    guard_void(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
+        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
+        // handles.
+        if let Some(g) = unsafe { g.as_mut() } {
+            g.arm_expecting_drops(std::time::Instant::now(), expected_drops);
         }
     });
 }

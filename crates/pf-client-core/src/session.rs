@@ -885,7 +885,12 @@ fn pump(
                     Some(exp) => {
                         if let Some(gap) = index_gap(exp, frame.frame_index) {
                             let now = Instant::now();
-                            gate.arm(now);
+                            // Credited arm: the reassembler books these same lost frames into
+                            // `frames_dropped` up to ~120 ms from now; the credit keeps that
+                            // delayed climb from re-freezing a stream the RFI anchor healed in
+                            // between (the double-arm race — see
+                            // `ReanchorGate::arm_expecting_drops`).
+                            gate.arm_expecting_drops(now, u64::from(gap));
                             next_expected_index = Some(frame.frame_index.wrapping_add(1));
                             // The gap carries the PRECISE lost range — [first missing, newest
                             // received - 1] — so this is the one recovery signal that can drive true

@@ -3320,6 +3320,21 @@ PunktfunkStatus punktfunk_connection_note_frame_index(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_connection_note_frame_index`] with the gap WIDTH instead of a yes/no: writes to
+// `gap_width_out` how many frames this arrival revealed as missing (0 = contiguous/straggler).
+// A client with a post-loss display freeze passes the width to
+// [`punktfunk_reanchor_gate_arm_expecting_drops`] so the reassembler's later `frames_dropped`
+// climb for the SAME loss cannot re-freeze a stream an RFI anchor already healed (the double-arm
+// race — see the gate function's doc).
+//
+// # Safety
+// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
+PunktfunkStatus punktfunk_connection_note_frame_index_ex(const PunktfunkConnection *c,
+                                                         uint32_t frame_index,
+                                                         uint32_t *gap_width_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
 // rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
 // when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable
@@ -3441,6 +3456,18 @@ void punktfunk_reanchor_gate_free(ReanchorGate *g);
 // # Safety
 // `g` is a valid gate handle.
 void punktfunk_reanchor_gate_arm(ReanchorGate *g);
+
+// [`punktfunk_reanchor_gate_arm`] for a loss detected as a **frame-index gap**, where the caller
+// knows how many frames the gap skipped ([`punktfunk_connection_note_frame_index_ex`]). On top of
+// arming, the gate pre-credits the reassembler's `frames_dropped` climb those same lost frames
+// will produce up to ~120 ms later, so [`punktfunk_reanchor_gate_poll`] does not treat that
+// delayed bookkeeping as a SECOND loss — without the credit, a fast LTR-RFI anchor lifts the
+// freeze between the two signals and the stale climb re-freezes a healed stream (the double-arm
+// race). Use the plain arm for non-gap loss signals (decoder wedge/demotion). NULL is a no-op.
+//
+// # Safety
+// `g` is a valid gate handle.
+void punktfunk_reanchor_gate_arm_expecting_drops(ReanchorGate *g, uint64_t expected_drops);
 
 // Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
 // a post-loss concealment (`false`). `flags` is the AU's `user_flags` word ([`PunktfunkFrame::flags`]):

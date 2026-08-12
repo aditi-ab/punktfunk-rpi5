@@ -55,6 +55,16 @@ final class ReanchorGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// `arm()` for a loss detected as a frame-index gap of a known width
+    /// (`PunktfunkConnection.noteFrameIndexGapWidth`). Pre-credits the reassembler's later
+    /// `framesDropped` climb for the same lost frames, so `poll` doesn't re-freeze a stream an
+    /// RFI anchor already healed (the double-arm race — the Rust gate's docs tell the story).
+    func arm(expectingDrops: UInt64) {
+        lock.lock()
+        punktfunk_reanchor_gate_arm_expecting_drops(ptr, expectingDrops)
+        lock.unlock()
+    }
+
     /// Fold one decoded frame. `flags` is the AU's wire `user_flags`. Returns true to PRESENT the
     /// frame, false to WITHHOLD it as a post-loss concealment (hold the last good picture). Pass
     /// `decoderKeyframe: false` — VideoToolbox doesn't flag IDRs, so the wire `FLAG_SOF` covers it.
