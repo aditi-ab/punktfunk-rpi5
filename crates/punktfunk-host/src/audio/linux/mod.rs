@@ -27,6 +27,7 @@
 //! surround session can replace a stereo capturer without leaking a PipeWire consumer (see
 //! CLAUDE.md: a wedged link head-blocks the daemon).
 
+pub(crate) mod pad_sink;
 mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
