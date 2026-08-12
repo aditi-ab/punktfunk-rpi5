@@ -97,6 +97,7 @@ head-tracked remote spatial audio that no streaming stack does today.
   simply has no 4:4:4 path yet, and it waits on hardware that advertises a HEVC 4:4:4 encode
   entrypoint to build and validate against. On either vendor, [PyroWave](/docs/pyrowave) already
   carries full chroma today.
-- **DualSense voice-coil haptics.** Scoped and shelved — it rides the controller's USB audio
-  interface and has near-zero game support on Linux. Rumble, adaptive triggers and the lightbar
-  already work.
+- **DualSense voice-coil haptics over Bluetooth client pads.** The controller exposes no audio
+  interface over Bluetooth, so the audio-haptics plane is USB-only on the client side — a BT
+  DualSense keeps classic rumble. (Hosts stream pad audio on both Windows and Linux; rumble,
+  adaptive triggers and the lightbar work everywhere regardless.)

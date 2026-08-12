@@ -1,6 +1,8 @@
-//! Per-pad DualSense audio (the 0xD1 pad-audio plane): WASAPI loopback of a pre-provisioned pad
-//! endpoint ([`crate::audio::pad_endpoint`]) → 4-ch de-interleave into the speaker (front) and
-//! voice-coil haptics (back) pairs → per-kind silence gate → stereo Opus (48 kHz, CBR, LowDelay)
+//! Per-pad DualSense audio (the 0xD1 pad-audio plane): capture of the pad's own audio device —
+//! Windows: WASAPI loopback of a pre-provisioned endpoint ([`crate::audio::pad_endpoint`]);
+//! Linux: the per-pad PipeWire sink we mint (`crate::audio::pad_sink`) — → 4-ch de-interleave
+//! into the speaker (front) and voice-coil haptics (back) pairs → per-kind silence gate →
+//! stereo Opus (48 kHz, CBR, LowDelay)
 //! → [`PAD_AUDIO_MAGIC`](punktfunk_core::quic::PAD_AUDIO_MAGIC) datagrams. One thread per
 //! arriving pad, spawned/reaped by the input thread ([`super::input`]) as arrivals declare
 //! renderers and pads leave. Modeled on the session audio thread ([`super::audio`]): the same
@@ -11,45 +13,45 @@ use super::*;
 
 /// `kinds` bit for the haptics stream (bit N = wire kind N — the same packing the arrival's
 /// audio-caps bits use, see [`punktfunk_core::input::decode_gamepad_arrival`]).
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(super) const KIND_BIT_HAPTICS: u8 = 1 << punktfunk_core::quic::PAD_AUDIO_KIND_HAPTICS;
 /// `kinds` bit for the speaker stream.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(super) const KIND_BIT_SPEAKER: u8 = 1 << punktfunk_core::quic::PAD_AUDIO_KIND_SPEAKER;
 
 /// Haptics frames are 5 ms (the session-audio cadence — haptics are felt latency); speaker
 /// frames are 10 ms (speaker content tolerates the buffering for the coding efficiency). Both
 /// are the wire contract's cadences (`punktfunk_core::quic::PAD_AUDIO_KIND_*`).
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const HAPTICS_FRAME_MS: u32 = 5;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const SPEAKER_FRAME_MS: u32 = 10;
 /// Samples per frame (per channel) at 48 kHz: 240 / 480.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const HAPTICS_FRAME_SAMPLES: usize =
     crate::audio::SAMPLE_RATE as usize * HAPTICS_FRAME_MS as usize / 1000;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const SPEAKER_FRAME_SAMPLES: usize =
     crate::audio::SAMPLE_RATE as usize * SPEAKER_FRAME_MS as usize / 1000;
 /// The capture's channel count — the pad endpoint is stamped quad (FL FR BL BR: front pair =
 /// speaker, back pair = voice coils). Mirrors `pad_endpoint::PAD_CHANNELS` (Windows-gated, so
 /// the pure splitter logic keeps its own copy).
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const CAP_CHANNELS: usize = 4;
 
 /// Peak (absolute sample) at or above which a frame counts as signal — the gate OPENS on that
 /// very frame (haptics are felt latency; the first active frame must ship). ≈ −60 dBFS.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const GATE_OPEN_PEAK: f32 = 1e-3;
 /// How long the gate keeps sending after the last signal frame before it CLOSES (hangover):
 /// long enough that a decaying haptic tail (and the client decoder's own tail) is never
 /// clipped, short enough that an idle pad costs nothing in steady state.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const GATE_HANGOVER_MS: u32 = 250;
 
 /// Per-kind Opus bitrate — a stereo voice-coil / pad-speaker pair needs far less than the
 /// session plane's 128 kbps; 64 kbps CBR keeps every frame comfortably under one MTU.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const PAD_AUDIO_BITRATE: i32 = 64_000;
 
 /// The per-kind silence gate — the steady-state-cost feature: an idle pad endpoint (games
@@ -57,7 +59,7 @@ const PAD_AUDIO_BITRATE: i32 = 64_000;
 /// stream of coded silence. Opens the instant a frame carries signal ([`GATE_OPEN_PEAK`]);
 /// closes only after [`GATE_HANGOVER_MS`] of continuous sub-threshold frames. Pure logic,
 /// unit-tested below.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 struct SilenceGate {
     /// Consecutive sub-threshold frames that close the gate ([`GATE_HANGOVER_MS`] ÷ frame ms).
     hangover_frames: u32,
@@ -67,7 +69,7 @@ struct SilenceGate {
     open: bool,
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 impl SilenceGate {
     fn new(frame_ms: u32) -> SilenceGate {
         SilenceGate {
@@ -101,13 +103,13 @@ impl SilenceGate {
 /// loss by seq continuity (the mic-mute discipline, pf-client-core/src/audio.rs). It is also
 /// kept across capture reopens (the session audio thread's discipline, audio.rs): the client
 /// sees a gap, not a restart.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 struct LaneCtl {
     gate: SilenceGate,
     seq: u32,
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 impl LaneCtl {
     fn new(frame_ms: u32) -> LaneCtl {
         LaneCtl {
@@ -133,7 +135,7 @@ impl LaneCtl {
 /// speaker (channels 0/1), back = voice-coil haptics (channels 2/3). A ragged tail (not a
 /// multiple of 4 — the capturer only ever delivers whole frames) is dropped, never smeared
 /// across channels.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn split_quad(block: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut front = Vec::with_capacity(block.len() / 2);
     let mut back = Vec::with_capacity(block.len() / 2);
@@ -148,7 +150,7 @@ fn split_quad(block: &[f32]) -> (Vec<f32>, Vec<f32>) {
 /// frames — haptics every 5 ms from the back pair, speaker every 10 ms from the front pair —
 /// emitting ONLY the kinds enabled in `kinds` (a disabled kind is never even split out, so it
 /// can never reach an encoder). Pure logic, unit-tested; the capture thread wraps it.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 struct PadFramer {
     kinds: u8,
     /// Raw interleaved 4-ch accumulation, drained in 5 ms blocks.
@@ -157,7 +159,7 @@ struct PadFramer {
     front: Vec<f32>,
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 impl PadFramer {
     fn new(kinds: u8) -> PadFramer {
         PadFramer {
@@ -238,11 +240,12 @@ impl Drop for PadAudioHandle {
 
 /// Whether this session's Welcome should advertise
 /// [`HOST_CAP_PAD_AUDIO`](punktfunk_core::quic::HOST_CAP_PAD_AUDIO): the client asked
-/// ([`CLIENT_CAP_PAD_AUDIO`](punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO)), this is a Windows
-/// host with the feature on (`PUNKTFUNK_PAD_AUDIO` != "0"), and startup provisioning published
-/// at least one endpoint (`pad_endpoint::provision_at_startup`). Still-running provisioning
-/// reads as "none yet": a session racing host startup simply negotiates without pad audio and
-/// picks it up on its next connect.
+/// ([`CLIENT_CAP_PAD_AUDIO`](punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO)), the feature is on
+/// (`PUNKTFUNK_PAD_AUDIO` != "0"), and the pad audio source exists — Windows: startup
+/// provisioning published at least one endpoint (`pad_endpoint::provision_at_startup`; a
+/// still-running provisioning reads as "none yet" and the next connect picks it up); Linux: a
+/// PipeWire daemon is reachable (the per-pad sinks are minted lazily at spawn, so reachability
+/// IS the existence question).
 pub(super) fn host_cap(client_caps: u8) -> bool {
     let asked = client_caps & punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO != 0;
     #[cfg(target_os = "windows")]
@@ -257,9 +260,15 @@ pub(super) fn host_cap(client_caps: u8) -> bool {
             && crate::audio::pad_endpoint::provisioned_endpoints()
                 .is_some_and(|eps| !eps.is_empty())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        // Only the Windows virtual DualSense exposes pad audio endpoints today.
+        asked
+            && std::env::var_os("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
+            && crate::audio::pad_sink::pipewire_reachable()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // No pad audio source on this host OS.
         let _ = asked;
         false
     }
@@ -276,6 +285,7 @@ pub(super) fn spawn(
     conn: quinn::Connection,
     pad: u8,
     kinds: u8,
+    _edge: bool,
     stop: Arc<AtomicBool>,
 ) -> Option<PadAudioHandle> {
     if kinds & (KIND_BIT_HAPTICS | KIND_BIT_SPEAKER) == 0 {
@@ -310,10 +320,18 @@ pub(super) fn spawn(
         return None;
     }
     let stop_t = stop.clone();
+    let endpoint_id = ep.endpoint_id;
     match std::thread::Builder::new()
         .name(format!("punktfunk1-pad{pad}"))
-        .spawn(move || pad_audio_thread(conn, pad, kinds, ep.endpoint_id, stop_t))
-    {
+        .spawn(move || {
+            pad_audio_thread(
+                conn,
+                pad,
+                kinds,
+                move || crate::audio::pad_endpoint::PadLoopbackCapturer::open(&endpoint_id),
+                stop_t,
+            )
+        }) {
         Ok(join) => Some(PadAudioHandle {
             stop,
             join: Some(join),
@@ -325,13 +343,60 @@ pub(super) fn spawn(
     }
 }
 
-/// Stub — pad endpoints exist only behind the Windows virtual DualSense; other hosts run pads
-/// without the audio side (and never advertise the cap, see [`host_cap`]).
-#[cfg(not(target_os = "windows"))]
+/// Linux: mint the pad's PipeWire sink lazily inside the streamer thread (the same
+/// open-with-backoff loop the Windows capture rides — a PipeWire hiccup at arrival time starts
+/// pad audio late, not never). `edge` picks the DualSense Edge identity for the sink. `None`
+/// only for empty kinds, a slot past `PUNKTFUNK_PAD_AUDIO_SLOTS`, or a failed thread spawn;
+/// the pad itself keeps working either way, just without audio.
+#[cfg(target_os = "linux")]
+pub(super) fn spawn(
+    conn: quinn::Connection,
+    pad: u8,
+    kinds: u8,
+    edge: bool,
+    stop: Arc<AtomicBool>,
+) -> Option<PadAudioHandle> {
+    if kinds & (KIND_BIT_HAPTICS | KIND_BIT_SPEAKER) == 0 {
+        return None;
+    }
+    if pad >= crate::audio::pad_sink::pad_audio_slots() {
+        tracing::debug!(
+            pad,
+            "pad-audio arrival past PUNKTFUNK_PAD_AUDIO_SLOTS — not streaming"
+        );
+        return None;
+    }
+    let stop_t = stop.clone();
+    match std::thread::Builder::new()
+        .name(format!("punktfunk1-pad{pad}"))
+        .spawn(move || {
+            pad_audio_thread(
+                conn,
+                pad,
+                kinds,
+                move || crate::audio::pad_sink::PadSinkCapturer::open(pad, edge),
+                stop_t,
+            )
+        }) {
+        Ok(join) => Some(PadAudioHandle {
+            stop,
+            join: Some(join),
+        }),
+        Err(e) => {
+            tracing::warn!(pad, error = %e, "pad-audio thread spawn failed — pad streams without audio");
+            None
+        }
+    }
+}
+
+/// Stub — pad audio sources exist only behind the Windows and Linux virtual DualSense; other
+/// hosts run pads without the audio side (and never advertise the cap, see [`host_cap`]).
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub(super) fn spawn(
     _conn: quinn::Connection,
     _pad: u8,
     _kinds: u8,
+    _edge: bool,
     _stop: Arc<AtomicBool>,
 ) -> Option<PadAudioHandle> {
     None
@@ -339,7 +404,7 @@ pub(super) fn spawn(
 
 /// One enabled kind's encoder lane: admission/seq control + its stereo Opus encoder + the
 /// power-of-two warn throttle (a stuck encoder would otherwise fail ~200 times a second).
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 struct Lane {
     kind: u8,
     ctl: LaneCtl,
@@ -349,7 +414,7 @@ struct Lane {
 
 /// Build one stereo encoder per enabled kind: 48 kHz LowDelay hard-CBR like the session audio
 /// plane ([`super::audio`]), at the pad plane's 64 kbps.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn build_lanes(kinds: u8) -> Result<Vec<Lane>, opus::Error> {
     let mut lanes = Vec::new();
     for (bit, kind, frame_ms) in [
@@ -384,18 +449,19 @@ fn build_lanes(kinds: u8) -> Result<Vec<Lane>, opus::Error> {
     Ok(lanes)
 }
 
-/// The per-pad streaming thread: loopback capture → framer → per-kind gate/encode → 0xD1
-/// datagrams. Capture death reopens with the session-audio backoff ([`INJECTOR_REOPEN_BACKOFF`],
-/// encoders + seq kept); a send error ends the thread (the connection — the session — is gone).
-#[cfg(target_os = "windows")]
-fn pad_audio_thread(
+/// The per-pad streaming thread: capture of the pad's audio device (`open` builds the
+/// platform's capturer — Windows loopback / Linux minted sink) → framer → per-kind gate/encode
+/// → 0xD1 datagrams. Capture death reopens with the session-audio backoff
+/// ([`INJECTOR_REOPEN_BACKOFF`], encoders + seq kept); a send error ends the thread (the
+/// connection — the session — is gone).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn pad_audio_thread<C: crate::audio::AudioCapturer>(
     conn: quinn::Connection,
     pad: u8,
     kinds: u8,
-    endpoint_id: String,
+    open: impl Fn() -> anyhow::Result<C>,
     stop: Arc<AtomicBool>,
 ) {
-    use crate::audio::AudioCapturer as _;
     let mut lanes = match build_lanes(kinds) {
         Ok(l) => l,
         Err(e) => {
@@ -413,7 +479,7 @@ fn pad_audio_thread(
     // Reopen-with-backoff (the audio.rs discipline): a capture death (endpoint invalidated,
     // audio-engine restart) reopens instead of muting the pad for the rest of the session. The
     // first open ALSO rides this loop, so an open lost to endpoint churn starts late, not never.
-    let mut capturer: Option<crate::audio::pad_endpoint::PadLoopbackCapturer> = None;
+    let mut capturer: Option<C> = None;
     let mut last_failed: Option<std::time::Instant> = None;
     tracing::info!(
         pad,
@@ -427,7 +493,7 @@ fn pad_audio_thread(
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
-            match crate::audio::pad_endpoint::PadLoopbackCapturer::open(&endpoint_id) {
+            match open() {
                 Ok(c) => {
                     if last_failed.take().is_some() {
                         tracing::info!(pad, "pad-audio capture reopened");

@@ -231,6 +231,66 @@ pub fn dualsense_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Mint one pad-audio PipeWire sink (the Linux 0xD1 source, `audio::pad_sink`) and capture
+/// from it — the WP3 on-glass gate with no client involved. Verify the identity with
+/// `pactl list sinks` (name/description/proplist) and drive it with
+/// `pw-play --target <node.name> <file>` (or `paplay -d <node.name>`); captured chunks print
+/// a per-second summary here. `--pad N` (default 0), `--edge`, `--seconds N` (default 30).
+#[cfg(target_os = "linux")]
+pub fn pad_sink_test(args: &[String]) -> Result<()> {
+    use crate::audio::AudioCapturer as _;
+    use std::time::{Duration, Instant};
+    let secs: u64 = args
+        .iter()
+        .skip_while(|a| *a != "--seconds")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let pad: u8 = args
+        .iter()
+        .skip_while(|a| *a != "--pad")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let edge = args.iter().any(|a| a == "--edge");
+    let mut cap = crate::audio::pad_sink::PadSinkCapturer::open(pad, edge)
+        .context("mint pad-audio sink (is PipeWire running in this session?)")?;
+    println!(
+        "pad sink minted: node.name = {}\n  inspect: pactl list sinks | grep -A20 punktfunk-pad\n  \
+         drive it: pw-play --target '{}' <48k-file>\nCapturing for {secs}s…",
+        cap.node_name, cap.node_name
+    );
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let (mut chunks, mut samples) = (0u64, 0u64);
+    // Per-pair peaks: ch0/1 = speaker, ch2/3 = voice coils — the split_quad contract. Proving
+    // the pairs separately is the point of this devtest: a positional remix upstream would
+    // smear or zero one pair while a global peak still looks healthy.
+    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
+    let mut last_report = Instant::now();
+    while Instant::now() < deadline {
+        let c = cap.next_chunk().context("pad sink capture")?;
+        if !c.is_empty() {
+            chunks += 1;
+            samples += c.len() as u64;
+            for f in c.chunks_exact(4) {
+                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
+                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            println!(
+                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
+                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
+                samples as f64 / (4.0 * 48.0)
+            );
+            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
+        }
+    }
+    println!("pad-sink-test: done");
+    Ok(())
+}
+
 /// Create a virtual Switch Pro Controller via UHID and exercise it (validation, no
 /// streaming session): answers the full hid-nintendo probe conversation, then cycles the
 /// A/B buttons (positionally swapped) + sweeps the left stick, printing rumble / player-

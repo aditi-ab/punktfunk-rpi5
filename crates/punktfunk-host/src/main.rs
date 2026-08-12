@@ -623,6 +623,9 @@ fn real_main() -> Result<()> {
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => devtest::dualsense_test(&args),
+        // Mint one pad-audio PipeWire sink and capture from it — the Linux 0xD1 source gate.
+        #[cfg(target_os = "linux")]
+        Some("pad-sink-test") => devtest::pad_sink_test(&args),
         // Create a virtual Switch Pro Controller via UHID and exercise it (validation, no session).
         #[cfg(target_os = "linux")]
         Some("switchpro-test") => devtest::switchpro_test(&args),

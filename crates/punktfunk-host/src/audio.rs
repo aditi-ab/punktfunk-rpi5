@@ -183,6 +183,10 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
 mod audio_control;
 #[cfg(target_os = "linux")]
 mod linux;
+// DualSense pad-audio sink + capture, the Linux analogue of `pad_endpoint` below: the session
+// layer mints per-pad sinks and the CLI exposes the `pad-sink-test` devtest.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::pad_sink;
 // DualSense pad-audio endpoint provisioning + loopback capture (design: pad haptics/audio).
 // pub(crate): the session layer queries endpoints by pad index and the CLI exposes the
 // `pad-endpoint` devtest.

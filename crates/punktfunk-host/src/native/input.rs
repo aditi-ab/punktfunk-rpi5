@@ -616,8 +616,10 @@ impl PadAudioSlots {
 
     /// Idempotent spawn: same kinds → keep the running streamer; changed kinds → restart with
     /// the new mask; not running → spawn (a slot without an endpoint stays empty — bounded
-    /// retries, since arrivals are only re-sent a few times per slot open).
-    fn ensure(&mut self, conn: &quinn::Connection, pad: u8, kinds: u8) {
+    /// retries, since arrivals are only re-sent a few times per slot open). `edge` picks the
+    /// DualSense Edge identity for the Linux sink (ignored on Windows — endpoints are
+    /// pre-stamped).
+    fn ensure(&mut self, conn: &quinn::Connection, pad: u8, kinds: u8, edge: bool) {
         let idx = pad as usize;
         if idx >= MAX_WIRE_PADS {
             return;
@@ -648,7 +650,7 @@ impl PadAudioSlots {
             self.stop(idx);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        if let Some(h) = pad_audio::spawn(conn.clone(), pad, kinds, stop) {
+        if let Some(h) = pad_audio::spawn(conn.clone(), pad, kinds, edge, stop) {
             self.slots[idx] = Some((kinds, h));
         }
     }
@@ -1087,7 +1089,12 @@ pub(super) fn input_thread(
                             0
                         };
                         if want != 0 {
-                            pad_streams.ensure(&conn, pad, want);
+                            pad_streams.ensure(
+                                &conn,
+                                pad,
+                                want,
+                                matches!(kind, GamepadPref::DualSenseEdge),
+                            );
                         } else {
                             pad_streams.stop(idx);
                         }
