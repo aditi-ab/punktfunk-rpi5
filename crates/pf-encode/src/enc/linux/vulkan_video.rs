@@ -586,6 +586,12 @@ struct Frame {
     pts_ns: u64,
     keyframe: bool,
     recovery_anchor: bool,
+    /// The captured dmabuf's deferred-requeue hold ([`pf_frame::FrameHold`]), cloned at submit and
+    /// dropped when this slot retires (fence signaled — `poll`/backpressure/`reset`). This is what
+    /// extends "the producer must not rewrite the buffer" across the whole asynchronous GPU read:
+    /// the host's own clone only lives until it takes the NEXT frame, which with a ring of 2 is
+    /// before this slot's encode finished. `None` for non-dmabuf sources or un-held frames.
+    src_hold: Option<pf_frame::FrameHold>,
 }
 
 pub struct VulkanVideoEncoder {
@@ -2274,7 +2280,9 @@ impl VulkanVideoEncoder {
                     // First import: acquire from the foreign producer (UNDEFINED preserves the modifier-tiled
                     // bytes). Cached re-read: we still own it, so no queue-family transfer — just a visibility
                     // barrier so the shader read sees the content the producer wrote out-of-band this frame
-                    // (single-GPU coherent; the capture layer guarantees the buffer is ready at hand-off).
+                    // (single-GPU coherent). The barrier orders nothing against the PRODUCER — content
+                    // stability across this read is the frame's deferred-requeue hold (`Frame::src_hold`):
+                    // the producer does not get the buffer back to rewrite until this slot's fence retires.
                     let (old, src_qf, dst_qf) = if fresh {
                         (
                             vk::ImageLayout::UNDEFINED,
@@ -3875,11 +3883,24 @@ impl VulkanVideoEncoder {
                 ),
                 Err(e) => return Err(e.into()),
             }
+            // Fence signaled ⟹ the GPU is done reading this slot's captured dmabuf — release
+            // its hold so the capture layer requeues the producer's buffer.
+            self.frames[slot].src_hold = None;
             let done = self.read_slot(slot)?;
             self.pending.push_back(done);
         }
         let slot = self.ring;
         self.ring = (self.ring + 1) % self.frames.len();
+        // Take over the frame's deferred-requeue hold for this occupancy BEFORE recording: the
+        // producer must not get the buffer back until this slot's fence retires (poll /
+        // backpressure / reset), because the encode reads the imported dmabuf for its whole
+        // duration — the host's own clone drops as soon as it takes the next frame. Assigned
+        // even if `record_submit` then fails: an over-hold until the slot's next tenant is
+        // harmless, a released-while-referenced buffer is the exact race this closes.
+        self.frames[slot].src_hold = match &frame.payload {
+            FramePayload::Dmabuf(d) => d.hold.clone(),
+            _ => None,
+        };
         self.record_submit(slot, frame, wire)?;
         self.in_flight.push_back(slot);
         Ok(())
@@ -4002,6 +4023,9 @@ impl Encoder for VulkanVideoEncoder {
             Err(e) => return Err(e.into()),
         }
         self.in_flight.pop_front();
+        // Fence signaled ⟹ the GPU is done reading this slot's captured dmabuf — release its
+        // hold so the capture layer requeues the producer's buffer.
+        self.frames[slot].src_hold = None;
         // SAFETY: fence signaled ⟹ this slot's CSC+encode is complete; read its bitstream.
         Ok(Some(unsafe { self.read_slot(slot)? }))
     }
@@ -4064,6 +4088,11 @@ impl Encoder for VulkanVideoEncoder {
         }
         self.in_flight.clear();
         self.pending.clear();
+        // The waits above proved every slot's GPU read is done — release the captured-dmabuf
+        // holds so the capture layer (possibly mid-rebuild itself) gets its buffers back.
+        for f in &mut self.frames {
+            f.src_hold = None;
+        }
         self.ring = 0;
         self.first_frame = true;
         self.force_kf = false;

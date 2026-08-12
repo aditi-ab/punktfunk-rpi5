@@ -936,6 +936,7 @@ mod tests {
                 plane1: None,
                 offset: 0,
                 stride: 1920 * 4,
+                hold: None,
             }),
             cursor,
         }
