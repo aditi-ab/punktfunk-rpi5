@@ -2032,31 +2032,26 @@ mod tests {
 
         let mut owned = sps_to_std_h265(&sps).unwrap();
         // SAFETY: pProfileTierLevel targets `owned`'s boxed backing.
-        assert_eq!(
-            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
-            declared
-        );
+        let level = unsafe { (*owned.std().pProfileTierLevel).general_level_idc };
+        assert_eq!(level, declared);
         // A ceiling above the declared level is a no-op.
         owned.clamp_level(hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_2);
         // SAFETY: as above.
-        assert_eq!(
-            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
-            declared
-        );
+        let level = unsafe { (*owned.std().pProfileTierLevel).general_level_idc };
+        assert_eq!(level, declared);
         // A ceiling below it is written through — and the pointer still targets
         // the wrapper's own backing (the clamp mutates in place, never re-points).
         let ceiling = hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_3_1;
         assert!(ceiling < declared, "fixture declares above 3.1");
         owned.clamp_level(ceiling);
         // SAFETY: as above.
-        assert_eq!(
-            unsafe { (*owned.std().pProfileTierLevel).general_level_idc },
-            ceiling
-        );
+        let level = unsafe { (*owned.std().pProfileTierLevel).general_level_idc };
+        assert_eq!(level, ceiling);
 
         let mut owned_vps = fallback_vps_from_sps(&sps).unwrap();
         owned_vps.clamp_level(ceiling);
         // SAFETY: as above, the VPS wrapper's own backing.
-        assert!(unsafe { (*owned_vps.std().pProfileTierLevel).general_level_idc } <= ceiling);
+        let vps_level = unsafe { (*owned_vps.std().pProfileTierLevel).general_level_idc };
+        assert!(vps_level <= ceiling);
     }
 }
