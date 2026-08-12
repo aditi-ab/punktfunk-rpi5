@@ -881,14 +881,20 @@ impl NativeClient {
     ///
     /// Call it for EVERY received frame; it is cheap and idempotent, and the
     /// [`frames_dropped`](Self::frames_dropped)-driven [`request_keyframe`](Self::request_keyframe)
-    /// loop stays the backstop for when the recovery frame itself is lost. Returns `true` when a
-    /// forward gap was detected on this call (whether or not the RFI was throttled), so a client with
-    /// a post-loss display freeze can (re-)arm it on the same signal.
+    /// loop stays the backstop for when the recovery frame itself is lost. Returns the gap WIDTH —
+    /// how many frames this arrival revealed as missing, `0` when none (contiguous or straggler),
+    /// whether or not the RFI was throttled — so a client with a post-loss display freeze can
+    /// (re-)arm it on the same signal AND pre-credit the reassembler's later `frames_dropped` climb
+    /// for the same loss ([`ReanchorGate::arm_expecting_drops`] — without the credit, a fast
+    /// LTR-RFI anchor lifts the freeze before the climb books the loss, and the stale climb then
+    /// re-freezes the healed stream).
     ///
     /// This centralizes the loss-range detection so every embedder gets identical behavior. (The
     /// in-process Vulkan session pump keeps its own copy because it gates a display freeze on the same
     /// signal and shares one throttle across RFI + keyframe requests.)
-    pub fn note_frame_index(&self, frame_index: u32) -> bool {
+    ///
+    /// [`ReanchorGate::arm_expecting_drops`]: crate::reanchor::ReanchorGate::arm_expecting_drops
+    pub fn note_frame_index(&self, frame_index: u32) -> u32 {
         // Decide (and update state) under the lock; fire the request after releasing it.
         let (gap, ask) = self
             .rfi

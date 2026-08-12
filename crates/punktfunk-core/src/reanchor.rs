@@ -64,6 +64,26 @@ pub const REANCHOR_MARKS_TO_LIFT: u32 = 2;
 /// floor fires, so a real stall still recovers.
 pub const RECOVERY_MARK_PATIENCE: Duration = Duration::from_millis(1500);
 
+/// How long a frame-index-gap arm's expected `frames_dropped` climb stays pre-credited in
+/// [`ReanchorGate::poll`]. One loss arms the gate through TWO signals: the frame-index gap the
+/// instant the AU after the loss is delivered ([`ReanchorGate::arm_expecting_drops`]), and the
+/// reassembler's `frames_dropped` climb once the lost frame ages out of its loss window (~120 ms
+/// later, and only when at least one of its packets arrived). Without the credit, a *fast* recovery
+/// — an LTR-RFI anchor typically lands within ~60 ms — lifts the freeze between the two signals,
+/// and the stale climb then re-freezes a stream that is already bit-exact healed; the host swallows
+/// the resulting keyframe request as an echo of the very RFI that healed it, so the picture stays
+/// frozen until the [`REANCHOR_FREEZE_MAX`] overdue re-ask extracts a full IDR (the field
+/// "H265 freezes on every loss, AV1 fine" signature — the slower IDR path usually lands after the
+/// climb and dodged the race).
+///
+/// Sized to cover the reassembler's 120 ms loss window plus delivery jitter with a wide margin,
+/// while staying short enough that a leftover credit (a straggler that filled the gap late, so no
+/// climb ever came; or a whole-frame vanish the reassembler never saw a packet of) cannot mask a
+/// genuinely unrelated future climb for long. A masked climb is also never silent in practice:
+/// every unrecoverable loss reveals itself as a frame-index gap on the next delivered frame, which
+/// re-arms (and re-credits) through [`ReanchorGate::arm_expecting_drops`] on its own.
+pub const DROP_CREDIT_WINDOW: Duration = Duration::from_millis(1000);
+
 /// Frames skipped when `got` arrives while `expected` was the next index, or `None` if `got` is
 /// contiguous (`== expected`) or a straggler we have already passed. Frame indices are u32 counters
 /// that wrap, so the "ahead" test is a wrapping subtraction split at the half-space: a small positive
@@ -185,6 +205,14 @@ pub struct ReanchorGate {
     /// a client stamps the decoder's decode-order watermark whenever this counter moves and
     /// discards the local recovery of anything older. Every other client ignores it.
     arms: u64,
+    /// `frames_dropped` climb still expected from losses that already armed via a frame-index gap
+    /// ([`Self::arm_expecting_drops`]). [`Self::poll`] consumes climbs against this before treating
+    /// them as a NEW loss, so the reassembler's delayed bookkeeping of a gap-armed (and possibly
+    /// already anchor-healed) loss cannot re-freeze the stream — see [`DROP_CREDIT_WINDOW`].
+    drop_credit: u64,
+    /// When the outstanding [`Self::drop_credit`] lapses ([`DROP_CREDIT_WINDOW`] after the latest
+    /// credited arm). `None` when no credit is outstanding.
+    drop_credit_expiry: Option<Instant>,
 }
 
 impl ReanchorGate {
@@ -199,6 +227,8 @@ impl ReanchorGate {
             last_dropped: frames_dropped,
             local_sei_since_arm: false,
             arms: 0,
+            drop_credit: 0,
+            drop_credit_expiry: None,
         }
     }
 
@@ -228,6 +258,20 @@ impl ReanchorGate {
         // from here on may be trusted ([`LocalRecovery`]).
         self.local_sei_since_arm = false;
         self.deadline = Some(now + REANCHOR_FREEZE_MAX);
+    }
+
+    /// [`arm`](Self::arm) for a loss detected as a **frame-index gap**, where the caller knows how
+    /// many frames the gap skipped. On top of arming, it pre-credits the reassembler's
+    /// `frames_dropped` climb those same lost frames will produce up to ~120 ms later (its
+    /// loss-window age-out), so [`poll`](Self::poll) does not treat that delayed bookkeeping as a
+    /// SECOND loss. Without the credit a fast LTR-RFI anchor lifts the freeze between the two
+    /// signals and the stale climb re-freezes a healed stream — the double-arm race
+    /// ([`DROP_CREDIT_WINDOW`] tells the whole story). Use plain [`arm`](Self::arm) for every
+    /// non-gap loss signal (decoder wedge/demotion), which has no climb to credit.
+    pub fn arm_expecting_drops(&mut self, now: Instant, expected_drops: u64) {
+        self.arm(now);
+        self.drop_credit = self.drop_credit.saturating_add(expected_drops);
+        self.drop_credit_expiry = Some(now + DROP_CREDIT_WINDOW);
     }
 
     /// Fold the client's OWN recovery-point observation for one decoded frame, BEFORE handing that
@@ -333,16 +377,36 @@ impl ReanchorGate {
     }
 
     /// Periodic fold of the session's `frames_dropped` counter plus the overdue backstop. Returns
-    /// `true` when the client should (throttled) request a keyframe: either the drop count climbed (a
-    /// fresh unrecoverable loss — arm the freeze) or the freeze has held a full [`REANCHOR_FREEZE_MAX`]
-    /// window with no re-anchor (re-ask and keep holding — NEVER resume to the concealed picture; a
-    /// genuinely dead stream is the QUIC idle-timeout watchdog's job, not the gate's).
+    /// `true` when the client should (throttled) request a keyframe: either the drop count climbed by
+    /// more than the outstanding gap-arm credit (a fresh unrecoverable loss — arm the freeze) or the
+    /// freeze has held a full [`REANCHOR_FREEZE_MAX`] window with no re-anchor (re-ask and keep
+    /// holding — NEVER resume to the concealed picture; a genuinely dead stream is the QUIC
+    /// idle-timeout watchdog's job, not the gate's).
+    ///
+    /// A climb covered by [`arm_expecting_drops`](Self::arm_expecting_drops)' credit is the
+    /// reassembler's delayed bookkeeping of a loss this gate already armed for — it must neither
+    /// re-arm (an LTR-RFI anchor may have healed the stream in the meantime; re-freezing it is the
+    /// double-arm race) nor ask again (the gap already fired the precise RFI, and if THAT recovery
+    /// was lost the overdue backstop still re-asks at the [`REANCHOR_FREEZE_MAX`] deadline the
+    /// gap-arm set — which is also sooner than the deadline a re-arm here would push out to).
     pub fn poll(&mut self, frames_dropped: u64, now: Instant) -> bool {
         let mut want_keyframe = false;
         if frames_dropped > self.last_dropped {
+            let climb = frames_dropped - self.last_dropped;
             self.last_dropped = frames_dropped;
-            self.arm(now);
-            want_keyframe = true;
+            if self.drop_credit_expiry.is_some_and(|e| now >= e) {
+                self.drop_credit = 0;
+                self.drop_credit_expiry = None;
+            }
+            let credited = climb.min(self.drop_credit);
+            self.drop_credit -= credited;
+            if self.drop_credit == 0 {
+                self.drop_credit_expiry = None;
+            }
+            if climb > credited {
+                self.arm(now);
+                want_keyframe = true;
+            }
         }
         if self.awaiting && self.deadline.is_some_and(|d| now >= d) {
             self.deadline = Some(now + REANCHOR_FREEZE_MAX);
@@ -540,6 +604,84 @@ mod tests {
             !g.poll(6, now),
             "same value → no repeat ask from the drop path"
         );
+    }
+
+    #[test]
+    fn an_rfi_anchor_is_not_refrozen_by_the_same_losss_drop_climb() {
+        // The double-arm race (field: "H265 freezes on every loss, AV1 fine"): a loss arms via
+        // the frame-index gap at T+10ms, the LTR-RFI anchor heals at T+60ms, and the reassembler
+        // books the SAME loss into frames_dropped at ~T+130ms. The credited arm must keep that
+        // stale climb from re-freezing the healed stream (and from re-asking — the host would
+        // swallow the ask as an RFI echo and the picture would freeze until a forced IDR).
+        let mut g = ReanchorGate::new(0);
+        let t = t0();
+        g.arm_expecting_drops(t + Duration::from_millis(10), 1); // gap of one lost frame + RFI
+        assert_eq!(
+            g.on_decoded(ANCHOR, false, t + Duration::from_millis(60)),
+            GateVerdict::Present,
+            "the anchor lifts"
+        );
+        assert!(
+            !g.poll(1, t + Duration::from_millis(130)),
+            "the credited climb must not ask again"
+        );
+        assert!(!g.is_holding(), "and must not re-freeze the healed stream");
+        assert_eq!(
+            g.on_decoded(0, false, t + Duration::from_millis(141)),
+            GateVerdict::Present,
+            "healthy P-frames keep presenting"
+        );
+    }
+
+    #[test]
+    fn a_climb_beyond_the_credit_is_a_fresh_loss_and_arms() {
+        // The credit covers exactly the gap's frames; a bigger climb means MORE loss than the gap
+        // accounted for (an interleaved partial-frame loss) — that part must still arm and ask.
+        let mut g = ReanchorGate::new(0);
+        let t = t0();
+        g.arm_expecting_drops(t, 2);
+        g.on_decoded(ANCHOR, false, t + Duration::from_millis(50)); // healed the credited loss
+        assert!(
+            g.poll(3, t + Duration::from_millis(130)),
+            "one uncredited drop → ask"
+        );
+        assert!(g.is_holding(), "and re-arm for the uncredited part");
+    }
+
+    #[test]
+    fn the_drop_credit_expires_so_a_late_climb_still_arms() {
+        // A straggler can fill the gap late (no climb ever comes) — the leftover credit must not
+        // linger and mask a genuinely NEW loss later. Past DROP_CREDIT_WINDOW the credit is void.
+        let mut g = ReanchorGate::new(0);
+        let t = t0();
+        g.arm_expecting_drops(t, 1);
+        g.on_decoded(ANCHOR, false, t + Duration::from_millis(50));
+        let late = t + DROP_CREDIT_WINDOW + Duration::from_millis(1);
+        assert!(
+            g.poll(1, late),
+            "an expired credit no longer absorbs climbs"
+        );
+        assert!(g.is_holding());
+    }
+
+    #[test]
+    fn a_credited_climb_keeps_the_unhealed_freezes_original_deadline() {
+        // When the recovery never arrives, consuming the climb must not silence the gate: the
+        // overdue backstop still re-asks — at the deadline the GAP arm set, which is sooner than
+        // the deadline a climb re-arm would have pushed out to.
+        let mut g = ReanchorGate::new(0);
+        let t = t0();
+        g.arm_expecting_drops(t, 1); // RFI fired here; assume its anchor is lost in transit
+        assert!(
+            !g.poll(1, t + Duration::from_millis(130)),
+            "credited climb: no early re-ask"
+        );
+        assert!(g.is_holding(), "still frozen — nothing healed it");
+        assert!(
+            g.poll(1, t + REANCHOR_FREEZE_MAX + Duration::from_millis(1)),
+            "the overdue backstop still re-asks on the gap-arm's own deadline"
+        );
+        assert!(g.is_holding(), "and keeps holding, never resuming to gray");
     }
 
     #[test]

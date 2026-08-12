@@ -100,7 +100,11 @@ final class StreamPump {
                     // with a cheap clean P-frame instead of a full IDR. The framesDropped-driven
                     // recovery above stays the backstop for when the recovery frame itself is lost.
                     // The same gap is the earliest, most precise signal to ARM the display freeze.
-                    if connection.noteFrameIndexGap(au.frameIndex) { gate.arm() }
+                    // Credited arm: the gap width pre-covers the reassembler's ~120 ms-later
+                    // framesDropped climb for the same loss, so a fast RFI anchor that heals in
+                    // between isn't re-frozen by it (the double-arm race).
+                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
+                    if gapWidth > 0 { gate.arm(expectingDrops: UInt64(gapWidth)) }
                     onFrame?(au)
                     let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
                     if let f = idrFormat {

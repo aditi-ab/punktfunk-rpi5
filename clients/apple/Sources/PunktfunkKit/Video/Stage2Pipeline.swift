@@ -923,7 +923,11 @@ public final class Stage2Pipeline {
                     // recovery above stays the backstop for when the recovery frame itself is lost.
                     // The same gap is the earliest, most precise signal to ARM the display freeze —
                     // the following concealed frames are withheld until a clean re-anchor.
-                    if connection.noteFrameIndexGap(au.frameIndex) { reanchorGate.arm() }
+                    // Credited arm: the gap width pre-covers the reassembler's ~120 ms-later
+                    // framesDropped climb for the same loss, so a fast RFI anchor that heals in
+                    // between isn't re-frozen by it (the double-arm race).
+                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
+                    if gapWidth > 0 { reanchorGate.arm(expectingDrops: UInt64(gapWidth)) }
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)

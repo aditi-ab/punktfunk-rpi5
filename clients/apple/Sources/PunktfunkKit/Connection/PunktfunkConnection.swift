@@ -774,12 +774,22 @@ public final class PunktfunkConnection {
     /// `noteFrameIndex` (the throttled RFI request); call it for every received AU. Returns false
     /// after close.
     public func noteFrameIndexGap(_ frameIndex: UInt32) -> Bool {
+        noteFrameIndexGapWidth(frameIndex) > 0
+    }
+
+    /// Like `noteFrameIndexGap`, but reports the gap's WIDTH — how many frames this arrival revealed
+    /// as missing (0 = none). The post-loss re-anchor gate arms with the width
+    /// (`ReanchorGate.arm(expectingDrops:)`) so the reassembler's later `framesDropped` climb for
+    /// the SAME loss cannot re-freeze a stream an RFI anchor already healed (the double-arm race).
+    /// Same core side effect as `noteFrameIndex` (the throttled RFI request); call it for every
+    /// received AU. Returns 0 after close.
+    public func noteFrameIndexGapWidth(_ frameIndex: UInt32) -> UInt32 {
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return false }
-        var gap = false
-        _ = punktfunk_connection_note_frame_index(h, frameIndex, &gap)
-        return gap
+        guard let h = handle, !closeRequested else { return 0 }
+        var width: UInt32 = 0
+        _ = punktfunk_connection_note_frame_index_ex(h, frameIndex, &width)
+        return width
     }
 
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
