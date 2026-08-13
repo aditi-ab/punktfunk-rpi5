@@ -1410,7 +1410,9 @@ mod tests {
 
         static EXITS: AtomicUsize = AtomicUsize::new(0);
         EXITS.store(0, Ordering::SeqCst);
-        let child = std::process::Command::new("/bin/true")
+        // Resolved through PATH, not `/bin/true`: NixOS ships only `/bin/sh` in `/bin`, so the
+        // absolute path made this test — and nothing else about the code under test — fail there.
+        let child = std::process::Command::new("true")
             .spawn()
             .expect("spawn the fake launcher");
         let lease = open(
