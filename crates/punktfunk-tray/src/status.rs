@@ -310,10 +310,10 @@ pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-/// A sync HTTPS agent over the same rustls(ring) stack the rest of the workspace uses, with a
+/// A sync HTTPS agent over the same rustls(aws-lc-rs) stack the rest of the workspace uses, with a
 /// pin-or-accept-any verifier (the Linux client's `PinVerify` pattern, `library.rs`).
 fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("rustls default protocol versions")

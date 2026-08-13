@@ -18,7 +18,15 @@ publish = false
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 anyhow = "1"
 tracing = "0.1"
-quinn = "0.11"
+# Backend features mirror punktfunk-core's quinn exactly — quinn's default `rustls-ring` would
+# drag a second crypto stack into every build that links this crate.
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # CF_DIB <-> PNG conversion (winfmt) - most Windows apps paste bitmaps, not the "PNG" format.
 # Unconditional (not windows-gated) so winfmt's pure-conversion unit tests run on every host.

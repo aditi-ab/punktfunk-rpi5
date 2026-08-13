@@ -52,13 +52,22 @@ zeroize = "1"
 # not just the default route. Tiny, cross-platform (getifaddrs / GetAdaptersAddresses), no cmake.
 if-addrs = "0.13"
 
-quinn = { version = "0.11", optional = true }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
-# Crypto backend pinned to `ring` (matching rustls/quinn above) so the whole quic tree is
-# ring-only: no aws-lc-rs/aws-lc-sys (heavy C dep, needs cmake) is pulled in. Keeps the
-# Android/iOS cdylib lean and the cross-compile cmake-free. `generate_simple_self_signed`
-# is backend-agnostic, so the swap is transparent.
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring", "pem"] }
+# Crypto backend is aws-lc-rs, and rustls/quinn/rcgen must all name it: they each select a
+# backend independently, so one dissenter pulls a SECOND crypto stack in via feature unification.
+# `prefer-post-quantum` puts the X25519MLKEM768 hybrid key exchange first in the TLS 1.3
+# handshake, which is the reason the old `ring` pin is gone — ring has no ML-KEM.
+# Windows needs no NASM: rustls's `aws_lc_rs` feature enables `aws-lc-rs/prebuilt-nasm`.
+# quinn's feature list is its own default set with `rustls-ring` swapped out, nothing more.
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
+# `generate_simple_self_signed` is backend-agnostic, so the swap is transparent here.
+rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pki-types = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }

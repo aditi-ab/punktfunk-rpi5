@@ -234,7 +234,7 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
 
 fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("open for hashing: {e}"))?;
-    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     let mut buf = [0u8; 128 * 1024];
     loop {
         let n = file
@@ -366,7 +366,7 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
         // cert context above; the slice is consumed (hashed) before the state is closed.
         let der =
             unsafe { std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize) };
-        let fp = hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref());
+        let fp = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref());
         if !pins.iter().any(|p| p.eq_ignore_ascii_case(&fp)) {
             return Err(format!(
                 "installer signing-leaf fingerprint {fp} matches none of the manifest's \

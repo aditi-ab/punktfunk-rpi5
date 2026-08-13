@@ -22,16 +22,15 @@ anyhow = "1"
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Loopback HTTPS poll of GET /api/v1/local/summary. Same sync ureq + rustls(ring) stack and
-# custom-verifier pattern as the Linux client's library fetch (crates/pf-client-core/src/library.rs) —
-# but ring-only (no default aws-lc-rs provider: it needs a C toolchain per target and the agent
-# pins the ring provider explicitly anyway).
+# Loopback HTTPS poll of GET /api/v1/local/summary. Same sync ureq + rustls stack and
+# custom-verifier pattern as the Linux client's library fetch (crates/pf-client-core/src/library.rs),
+# on the same aws-lc-rs backend as the rest of the tree (the agent pins the provider explicitly).
 ureq = { version = "2", default-features = false, features = ["tls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
 # The one shared cert-fingerprint pin verifier (`punktfunk_core::tls::PinVerify`) + fingerprint
 # hash, instead of the tray hand-rolling its own copy on a trust boundary. The light `tls` feature
-# is rustls + sha2 only (no QUIC runtime / tokio), so this stays a lean helper; core is a pure-Rust
-# leaf (no C toolchain), unlike the host dependency ruled out above.
+# is rustls + sha2 only (no QUIC runtime / tokio), so this stays a lean helper — much smaller than
+# the host dependency ruled out above, though rustls's aws-lc-rs backend does mean a C compiler.
 punktfunk-core = { path = "../punktfunk-core", default-features = false, features = ["tls"] }
 
 [target.'cfg(windows)'.dependencies]

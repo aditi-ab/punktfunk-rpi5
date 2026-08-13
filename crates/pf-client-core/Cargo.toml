@@ -105,7 +105,9 @@ ureq = "2"
 # Signed update-manifest fetch/verify + the install-kind ladder, shared with the host so one
 # trust rule serves both (crates/pf-update-check).
 pf-update-check = { path = "../pf-update-check" }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# aws-lc-rs backend + PQ hybrid key exchange, matching punktfunk-core (see its Cargo.toml for
+# why every crate that names a rustls backend has to name the same one).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

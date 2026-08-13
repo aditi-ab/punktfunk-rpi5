@@ -40,7 +40,8 @@ pub fn verify_signature(bytes: &[u8], sig_text: &str, keys: &[PublicKey]) -> Res
         .decode(sig_text.trim())
         .context("signature file is not valid base64")?;
     for key in keys {
-        let pk = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key.0);
+        let pk =
+            aws_lc_rs::signature::UnparsedPublicKey::new(&aws_lc_rs::signature::ED25519, &key.0);
         if pk.verify(bytes, &sig).is_ok() {
             return Ok(());
         }
@@ -52,14 +53,14 @@ pub fn verify_signature(bytes: &[u8], sig_text: &str, keys: &[PublicKey]) -> Res
 pub(crate) mod tests {
     use super::*;
 
-    /// A fresh ring keypair as `(pinned key string, signer)` — the format contract with the
+    /// A fresh keypair as `(pinned key string, signer)` — the format contract with the
     /// CI signers (raw 32-byte key, `ed25519:<base64>`; raw 64-byte signature, base64).
-    pub(crate) fn keypair() -> (String, ring::signature::Ed25519KeyPair) {
+    pub(crate) fn keypair() -> (String, aws_lc_rs::signature::Ed25519KeyPair) {
+        use aws_lc_rs::signature::KeyPair as _;
         use base64::Engine as _;
-        use ring::signature::KeyPair as _;
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let key_str = format!(
             "ed25519:{}",
             base64::engine::general_purpose::STANDARD.encode(kp.public_key().as_ref())

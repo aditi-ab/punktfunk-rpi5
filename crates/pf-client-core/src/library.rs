@@ -171,9 +171,9 @@ pub fn agent(
     use rustls::pki_types::pem::PemObject;
     let bad =
         |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
-    // The ring provider, explicitly — the same one core's QUIC endpoints install, so the
+    // The aws-lc-rs provider, explicitly — the same one core's QUIC endpoints install, so the
     // process never mixes rustls crypto providers.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| bad("tls config", &e))?
@@ -224,6 +224,10 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
     let resp = if url.starts_with(base) {
         pinned.get(url).call()
     } else {
+        // ureq's default agent builds its own rustls config, which panics unless a provider is
+        // already installed (two backends are compiled in — see `tls::install_default_provider`).
+        // Done here rather than trusting the binary, since this crate is linked by several.
+        punktfunk_core::tls::install_default_provider();
         ureq::get(url).timeout(Duration::from_secs(10)).call()
     }
     .map_err(classify)?;

@@ -22,9 +22,17 @@ publish = false
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Ed25519 over the exact manifest bytes. The workspace is ring-only (no aws-lc-sys — it fails
-# on the Windows CI runner), and this is the same primitive the plugin-store index uses.
-ring = "0.17"
+# Ed25519 over the exact manifest bytes — the same primitive the plugin-store index uses, on the
+# workspace's one crypto backend. aws-lc-rs's API is ring-compatible, so the call sites are
+# unchanged apart from the crate name.
+#
+# `prebuilt-nasm` is what lets aws-lc-sys build on Windows x86_64 without NASM installed. rustls
+# enables it for its own dependents, but a build that selects THIS crate without one that turns on
+# rustls's `aws_lc_rs` feature — `cargo test -p pf-update-check` is exactly that, since its only
+# rustls comes from ureq's ring-flavoured dependency — would get no enabler and fail on the CI
+# runner. Naming it here makes the crate build standalone instead of relying on who else is in
+# the selection.
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 base64 = "0.22"
 # Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
 # Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).

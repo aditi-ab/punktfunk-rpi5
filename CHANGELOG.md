@@ -32,6 +32,30 @@ pairing + the legacy GCM path, security-review #5/#9) are enabled only by an exp
   the old flag is still accepted as explicit-off).
 - Windows was already opt-in (unchecked installer task) and is unchanged.
 
+### TLS moved to aws-lc-rs, with post-quantum key exchange (⚠ build-visible for packagers/embedders)
+
+The rustls backend across the whole workspace — host, tray, clients and `punktfunk-core` — is now
+**aws-lc-rs** instead of `ring`, which enables rustls's `prefer-post-quantum`: every TLS 1.3
+handshake (management API, the native `punktfunk/1` control plane, QUIC) now offers the
+**X25519MLKEM768** hybrid key exchange first. Ring has no ML-KEM, which is why the backend had to
+move. This is negotiation-only and additive — the classical curves stay in the list, so any client
+that does not implement ML-KEM connects exactly as before, and no wire format, ABI or pairing
+record changes. The session AEAD (AES-128-GCM / ChaCha20-Poly1305) is a separate mechanism and is
+untouched.
+
+⚠ **Building from source now needs a working C compiler**, because `aws-lc-sys` compiles AWS-LC.
+No CMake, Go, or NASM is required for the default (non-FIPS) build — on Windows x86_64 rustls turns
+on `aws-lc-rs/prebuilt-nasm`, so no NASM has to be installed. If you add a crate that depends on
+`aws-lc-rs` *directly*, name `features = ["prebuilt-nasm"]` on it: a package selection that pulls
+`aws-lc-rs` without also enabling rustls's `aws_lc_rs` feature otherwise fails on Windows.
+
+`ring` is still compiled in, because `ureq 2` pins `rustls/ring` inside its own dependency
+declaration and cargo features are additive. Two backends present means rustls will not infer one,
+so anything constructing a config through `ClientConfig::builder()` panics unless a provider was
+installed first. **Embedders of `punktfunk-core` that build their own rustls configs should call
+`punktfunk_core::tls::install_default_provider()` at startup**, or use `builder_with_provider`.
+Every first-party binary already does.
+
 ### The ENet control port now exists only while a pairing does (rust-safety WP0)
 
 `rusty_enet` — a c2rust-style transpile of C ENet, and the host's only pre-auth-reachable unsafe
