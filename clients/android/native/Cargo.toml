@@ -31,7 +31,13 @@ mdns-sd = "0.20"
 # compiles this crate (as a host cdylib) — the Android-framework glue (logging, AMediaCodec + AAudio
 # via `ndk`, the Opus codec) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
+# Default features only, DELIBERATELY: 0.15 added an opt-in `android-api-30` feature that routes
+# level filtering through `__android_log_is_loggable_len` so logcat's system-wide/process-wide
+# level overrides (`setprop log.tag.*`) are honoured. That symbol is API 30 and the feature
+# HARD-LINKS it — on our minSdk-28 floor (Android 9/10) `System.loadLibrary` would fail outright,
+# the same way ndk 0.9.0 hard-linking `AMediaCodec_setOnFrameRenderedCallback` broke every
+# pre-Android-13 device (see the `ndk-sys` note below). Do not enable it while minSdk is 28.
+android_logger = "0.15"
 # Feature bridge, no code here: punktfunk-core logs through `tracing`, but this client only
 # installs `android_logger` (a `log` backend). Core transport warnings (e.g. "UDP socket buffer
 # capped well below target") reach logcat only via tracing's "log" feature, which forwards events
