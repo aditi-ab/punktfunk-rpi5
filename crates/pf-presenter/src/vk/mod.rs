@@ -43,6 +43,24 @@ mod setup;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
+/// The Vulkan version every instance this crate creates declares in
+/// `VkApplicationInfo::apiVersion`.
+///
+/// 1.3 because Vulkan Video decode and PyroWave's compute kernels both need a 1.3 device.
+/// It is deliberately a CEILING as well as a floor: the loader is routinely newer (Mesa 26
+/// answers `vkEnumerateInstanceVersion` with 1.4), but we only ever promised 1.3, so the
+/// entry points above it are not ours to call. Anything that must know how far the device
+/// side reaches — notably an overlay renderer sizing its own function table — reads this
+/// through [`crate::overlay::SharedDevice::api_version`] rather than asking the loader.
+pub const INSTANCE_API_VERSION: u32 = vk::API_VERSION_1_3;
+
+/// The clamp behind [`Presenter::overlay_api_version`], split out so the decision is provable
+/// without a device: the answer is the lower of what we declared and what the loader reports,
+/// and a loader too old to answer at all (`None`) can only be a 1.0 one.
+fn overlay_api_version_of(declared: u32, loader: Option<u32>) -> u32 {
+    declared.min(loader.unwrap_or(vk::API_VERSION_1_0))
+}
+
 /// The video-format probe behind [`AdapterDecode::formats`], re-exported so a caller
 /// that prints the report does not need its own `pf-vkdecode` dependency (and cannot
 /// end up printing a DIFFERENT crate version's idea of the flag names).
@@ -387,7 +405,29 @@ impl Presenter {
             queue: self.queue,
             queue_family_index: self.qfi,
             queue_lock: self.queue_lock.clone(),
+            api_version: self.overlay_api_version(),
         }
+    }
+
+    /// The Vulkan version an overlay renderer may size its function table to: the LOWER of
+    /// what our instance declared ([`INSTANCE_API_VERSION`]) and what the loader actually
+    /// provides.
+    ///
+    /// Both halves are load-bearing, in opposite directions. Taking only the loader's number
+    /// is the bug that killed the console UI in 0.28.0 — Mesa answers 1.4 where we asked for
+    /// 1.3, and the entry points in between resolve to null. Taking only ours would break the
+    /// mirror case: a loader older than 1.3 still accepts our 1.3 instance (1.1+ loaders treat
+    /// `apiVersion` as intent, not a contract), and claiming 1.3 to a renderer there promises
+    /// functions the loader has never heard of. The minimum is the only number that is true on
+    /// both sides.
+    fn overlay_api_version(&self) -> u32 {
+        // SAFETY: per the Vulkan contract above - `vkEnumerateInstanceVersion` is a global
+        // command taking no handles, resolved through the loaded entry that owns it; it writes
+        // one `u32` local. Absent (a 1.0 loader) it reports `None` rather than failing.
+        let loader = unsafe { self.entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten();
+        overlay_api_version_of(INSTANCE_API_VERSION, loader)
     }
 }
 
@@ -447,5 +487,44 @@ impl Drop for Presenter {
         }
         // `entry` (the libvulkan handle) drops last, after every vk call is done.
         let _ = &self.entry;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 0.28.0 regression, as an assertion: a loader NEWER than the version we declared
+    /// must not raise the cap. Skia sized its function table to the loader's 1.4 here, then
+    /// could not resolve the entry points our 1.3 instance never exposed, and the console UI
+    /// refused to start (Steam Deck, Mesa loader 1.4.321).
+    #[test]
+    fn a_newer_loader_never_raises_the_cap() {
+        let loader = vk::make_api_version(0, 1, 4, 321);
+        assert_eq!(
+            overlay_api_version_of(INSTANCE_API_VERSION, Some(loader)),
+            INSTANCE_API_VERSION
+        );
+    }
+
+    /// The mirror case, which is why this is a `min` and not "just use ours": a 1.1+ loader
+    /// accepts our 1.3 `apiVersion` as intent even when it cannot deliver 1.3, so promising
+    /// 1.3 to the overlay there would name functions the loader has never heard of.
+    #[test]
+    fn an_older_loader_lowers_the_cap() {
+        let loader = vk::make_api_version(0, 1, 2, 198);
+        assert_eq!(
+            overlay_api_version_of(INSTANCE_API_VERSION, Some(loader)),
+            loader
+        );
+    }
+
+    /// No `vkEnumerateInstanceVersion` at all is the one thing it can mean: a 1.0 loader.
+    #[test]
+    fn a_loader_that_cannot_answer_is_1_0() {
+        assert_eq!(
+            overlay_api_version_of(INSTANCE_API_VERSION, None),
+            vk::API_VERSION_1_0
+        );
     }
 }
