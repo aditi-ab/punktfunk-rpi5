@@ -180,6 +180,23 @@ pub struct Stats {
     /// decoder's submission returning in ~0.1 ms is not "decoded"); software measures
     /// the synchronous CPU decode.
     pub decode_ms: f32,
+    /// Whether `decode_ms` OVERLAPS the presenter's `display` stage instead of tiling
+    /// with it — true on the asynchronous native-Vulkan rung, false everywhere else.
+    ///
+    /// The other stages are a per-frame partition of `e2e`: `pts →(host+net)→ received
+    /// →(decode)→ decoded →(display)→ displayed`. That holds while `decoded` is a
+    /// COMPLETION stamp, which it is on the synchronous rungs. On the native-Vulkan rung
+    /// `receive_frame` returns at SUBMISSION (~0.1 ms) and the stamp shipped to the
+    /// presenter is taken there, so the GPU decode happens INSIDE the `display` stage —
+    /// `host+net` and `display` already tile `e2e` between them, and `decode` (measured
+    /// received → fence-complete) re-counts the GPU work that `display` contains.
+    ///
+    /// A 2026-08-13 field report read the row as a breakdown and asked why the parts did
+    /// not add up: `host 5.4 · net 0.3 · decode 6.6 · display 1.4` against `e2e 8.1`. They
+    /// do add up — without `decode` (5.4 + 0.3 + 1.4 ≈ 8.1). The figure is a true reading
+    /// of a real quantity sitting in a row that reads like a partition, so the OSD renders
+    /// it off that line rather than beside stages it does not tile with.
+    pub decode_overlaps_display: bool,
     /// Unrecoverable network frame drops this window, and their share of
     /// received+lost (%). The OSD renders the counter line only when nonzero.
     pub lost: u32,
@@ -770,6 +787,10 @@ fn pump(
     // corrected), `decode` = received→decoded (client-local). p50 per 1 s window.
     let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
     let mut decode_us: Vec<u64> = Vec::with_capacity(256);
+    // Whether this window's decode samples came from the async (submission-stamped) rung, so
+    // the OSD keeps them off the partition line. Latches per window alongside the samples,
+    // rather than being read off the rung name — a demote mid-window changes both together.
+    let mut decode_overlaps = false;
     // Adaptive bitrate: report the decode stage back to the core controller only when it's armed
     // (Automatic, non-PyroWave). Constant for the session — resolve once, gate the per-frame call.
     let wants_decode = connector.wants_decode_latency();
@@ -1118,6 +1139,12 @@ fn pump(
                         // `decode` stage: received→decode COMPLETE, single clock.
                         match hw_fence {
                             Some((sem, value)) => {
+                                // A fence means `decoded_ns` above was stamped at SUBMISSION, so
+                                // the GPU decode lands inside the presenter's `display` stage and
+                                // this figure re-counts it: it does NOT tile with the others.
+                                // Recorded so the OSD can render it off the partition line
+                                // (`Stats::decode_overlaps_display`).
+                                decode_overlaps = true;
                                 if decode_us.is_empty()
                                     && decoder.wait_hw_decoded(sem, value, 50_000_000)
                                 {
@@ -1433,6 +1460,7 @@ fn pump(
                 host_pace_ms: pace_p50 as f32 / 1000.0,
                 staged,
                 decode_ms: dec_p50 as f32 / 1000.0,
+                decode_overlaps_display: decode_overlaps,
                 lost,
                 lost_pct: if lost > 0 {
                     lost as f32 * 100.0 / (frames_n + lost) as f32
@@ -1461,6 +1489,7 @@ fn pump(
             bytes_n = 0;
             hostnet_us.clear();
             decode_us.clear();
+            decode_overlaps = false;
             host_us_win.clear();
             net_us_win.clear();
             queue_us_win.clear();
