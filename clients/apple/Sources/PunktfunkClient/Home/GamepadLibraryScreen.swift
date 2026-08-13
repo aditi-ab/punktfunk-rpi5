@@ -10,7 +10,10 @@ import SwiftUI
 #if os(iOS)
 
 struct GamepadLibraryScreen: View {
-    @Environment(\.gamepadInk) private var ink
+    /// Resolved from the stored palette, NOT from `\.gamepadInk` — this screen publishes that
+    /// value itself and so sits above its own copy (see `GamepadInk.stored`).
+    @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
+    private var ink: GamepadInk { .stored(paletteID) }
     @ObservedObject var store: HostStore
     let target: LibraryTarget
     let onLaunch: (String) -> Void

@@ -45,7 +45,10 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
 }
 
 struct GamepadSettingsView: View {
-    @Environment(\.gamepadInk) private var ink
+    /// Resolved from `paletteID` below, NOT from `\.gamepadInk` — this screen publishes that value
+    /// itself and so sits above its own copy (see `GamepadInk.stored`). Reading the environment
+    /// here is what left the title, the tab pills and every row label white-on-pale on tvOS.
+    private var ink: GamepadInk { .stored(paletteID) }
     @Environment(\.gamepadMetrics) private var metrics
     @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
