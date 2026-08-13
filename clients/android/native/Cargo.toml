@@ -25,7 +25,7 @@ log = "0.4"
 # `NsdManager` system daemon with one tested browse path. Pure Rust (socket2/if-addrs/mio), so it
 # cross-compiles to the Android targets AND builds on the host (the JNI seam links into
 # `cargo build --workspace`). Kotlin keeps only the Wi-Fi `MulticastLock` + permission UX.
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 
 # Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
 # compiles this crate (as a host cdylib) — the Android-framework glue (logging, AMediaCodec + AAudio

@@ -68,11 +68,14 @@ tracing-log = "0.2"
 # tracing-log bridge with `ignore_crate("wasapi")`). Already in the tree transitively.
 log = "0.4"
 axum = "0.8"
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 # Wake-on-LAN: report the host's wake-capable NIC MAC(s) to clients via the mDNS `mac` TXT record.
 # `mac_address` reads a NIC's hardware address; `if-addrs` maps the routed IP to its interface name.
 mac_address = "1"
-if-addrs = "0.13"
+# `link-local` named explicitly for the same reason as in punktfunk-core: mdns-sd (right above)
+# turns it on by unification anyway, and `wake_macs` should not enumerate a different set of NICs
+# depending on which other crates share the build.
+if-addrs = { version = "0.15", features = ["link-local"] }
 tokio = { version = "1", features = ["full"] }
 # GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).

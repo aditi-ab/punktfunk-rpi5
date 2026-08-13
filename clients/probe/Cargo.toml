@@ -24,7 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # LAN host discovery (`--discover`): browse the native `_punktfunk._udp` mDNS service the host
 # advertises (same crate/version the host advertises with).
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 # Opus: multistream DECODE of the host's audio plane (the surround validator) + `--mic-test`'s
 # encoder. libopus is already in the graph via `punktfunk-core`'s quic feature; this exposes the
 # name directly. Cross-platform (cmake-vendored), so the probe builds + validates everywhere.
