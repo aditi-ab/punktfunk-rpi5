@@ -487,7 +487,15 @@ in
         ]
         # The HDR-capable gamescope, if enabled. On PATH rather than pinned through
         # PUNKTFUNK_GAMESCOPE_BIN so an operator's own override of that env still wins.
-        ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
+        ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage
+        # The plugin runner, if enabled. Package ops (`plugins add`, and the console's store jobs,
+        # which run INSIDE this service) exec `punktfunk-scripting`; its resolution order is
+        # PUNKTFUNK_SCRIPTING -> beside the host binary -> PATH -> the /usr and ~/.local layouts.
+        # On NixOS only the PATH rung can ever match: the runner is a derivation of its OWN, so it
+        # is never beside the host binary and nothing lands in /usr. `environment.systemPackages`
+        # covers an operator's interactive shell but NOT this unit, whose PATH is exactly this
+        # list — without it the console reports a running, enabled runner as "not installed".
+        ++ optional cfg.scripting.enable cfg.scripting.package;
         # Point the host at the WRAPPED encode worker (see `security.wrappers` above). The host's
         # own resolution order is PUNKTFUNK_ENCODE_WORKER -> alongside /proc/self/exe -> PATH, and
         # on NixOS the sibling of the store binary is the UNCAPPED store copy — it would run, and

@@ -76,8 +76,10 @@ let
       ];
     }).config;
 
-  # Every scenario keeps `gamescopeHdr = false`: it is the one option whose default would pull a
-  # real (stub, here) gamescope onto the unit PATH, and nothing below is about that.
+  # Every scenario keeps `gamescopeHdr = false`: its default would pull a real (stub, here)
+  # gamescope onto the host unit's PATH, and nothing below is about that. `scripting` is left at
+  # its default (on with the host) precisely BECAUSE the runner belongs on that PATH — see the
+  # "not just in systemPackages" check.
   desktop = evalWith {
     services.punktfunk.host = {
       enable = true;
@@ -106,6 +108,15 @@ let
       gamestream = false;
       gamescopeHdr = false;
     };
+  };
+
+  # A host that has opted out of the runner — the negative half of the PATH check.
+  noScripting = evalWith {
+    services.punktfunk.host = {
+      enable = true;
+      gamescopeHdr = false;
+    };
+    services.punktfunk.scripting.enable = false;
   };
 
   clientOnly = evalWith { services.punktfunk.client.enable = true; };
@@ -242,6 +253,24 @@ let
       # no obvious reason why — which is why deb+rpm `systemctl --global enable` it.
       name = "the plugin runner is started by default, like every other channel";
       ok = has appliance "punktfunk-scripting" "WantedBy=default.target";
+    }
+    {
+      # The runner has to be on the HOST unit's PATH, not merely in systemPackages. Package ops
+      # (`plugins add`, and the console's store jobs, which run inside the host process) locate
+      # `punktfunk-scripting` as an executable, and on NixOS PATH is the only rung that can ever
+      # match — the runner is its own derivation, so it is never beside the host binary and never
+      # under /usr. systemPackages covers an operator's shell and NOT this unit, which is exactly
+      # how a running, enabled runner reported itself "not installed" through the console.
+      name = "the plugin runner is on the host unit's PATH, not just in systemPackages";
+      ok =
+        has appliance "punktfunk-host" "/pf-stub/punktfunk-scripting/bin"
+        && has desktop "punktfunk-host" "/pf-stub/punktfunk-scripting/bin";
+    }
+    {
+      # …and only when it is actually installed, so `scripting.enable = false` does not put a
+      # package the machine never built onto a unit's PATH.
+      name = "a host without the runner does not carry it on PATH";
+      ok = !(has noScripting "punktfunk-host" "/pf-stub/punktfunk-scripting/bin");
     }
 
     # --- the client half must not drag the host's system wiring in -----------------------------

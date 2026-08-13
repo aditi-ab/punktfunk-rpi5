@@ -1016,11 +1016,27 @@ mod tests {
         );
     }
 
-    /// Ladder rung: the binary exists and runs but is not a worker. `/bin/false` exits at once, so
-    /// the handshake reads EOF — the same rung a worker that dies during Vulkan bring-up takes.
+    /// A binary that exists, execs, and exits at once. Resolved off `PATH` rather than hardcoded
+    /// to `/bin/false`: NixOS ships only `/bin/sh` in `/bin`, and `PinnedExe::open` needs a real
+    /// path (so a bare name cannot stand in for one — it would fail the OPEN and take the
+    /// spawn-failure rung instead of the handshake rung this exercises).
+    fn a_binary_that_exits_immediately() -> PathBuf {
+        std::env::var_os("PATH")
+            .as_deref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .map(|d| d.join("false"))
+            .find(|p| p.is_file())
+            .expect("a `false` binary on PATH")
+    }
+
+    /// Ladder rung: the binary exists and runs but is not a worker. It exits at once, so the
+    /// handshake reads EOF — the same rung a worker that dies during Vulkan bring-up takes.
     #[test]
     fn a_worker_that_exits_immediately_is_a_handshake_failure() {
-        let err = spawn_link(Path::new("/bin/false"), &params(), 40_000_000).unwrap_err();
+        let err =
+            spawn_link(&a_binary_that_exits_immediately(), &params(), 40_000_000).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("handshake"),
