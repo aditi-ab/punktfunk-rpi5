@@ -33,6 +33,12 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # pdf; 0.99: + jpeg). We take defaults, so the JPEG codecs came along with the bump. That is a
 # feature here rather than bloat: `screens/library.rs` feeds host poster art straight to
 # `Image::from_encoded`, which silently returned `None` for JPEG posters before.
+#
+# 🛑 BUMPING THIS LINE IS ONLY HALF THE BUMP. packaging/flatpak/io.unom.Punktfunk.yml pins the
+# archive above by URL + sha256 BY HAND (the offline sandbox can't fetch it) and nothing derives
+# that pin from this file. Leave it stale and the flatpak leg unpacks the OLD archive's
+# pre-generated bindings.rs under the NEW crate, failing with `no variant, associated function,
+# or constant named 'Default' found for enum SkPathFillType`. That is exactly how #193 shipped.
 skia-safe = { version = "0.99", features = ["vulkan", "textlayout"] }
 ash = { version = "0.38", features = ["loaded"] }
 
