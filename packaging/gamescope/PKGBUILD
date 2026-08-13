@@ -19,7 +19,7 @@ pkgname=punktfunk-gamescope
 # bump it with the marker so pacman sees a new version when only our patches moved.
 _gsver=3.16.25
 _gsrev=5fb8dce4a09d0a68d097b9faf9513782106bc843
-pkgver="${_gsver}.pfhdr6"
+pkgver="${_gsver}.pfhdr7"
 # 2: patch 0006 (never destroy the Vulkan device/output at exit). No capability moved, so the
 # `.pfhdrN` level deliberately stays put — see README.md.
 # 3: pin moved 8c676c39 -> 5fb8dce4 (3.16.25-1 -> 3.16.25-11), which brings upstream's own
@@ -39,6 +39,12 @@ pkgver="${_gsver}.pfhdr6"
 # the composite (and the stream) black while every health signal stayed green. No capability the
 # host probes for, but a field box's banner has to distinguish a build that can lose its composite
 # this way from one that cannot.
+#
+# pfhdr7 / rel 1: patch 0009 (reported + written by luxus, punktfunk-overlay#9) moves capture-buffer
+# destruction off the PipeWire thread: remove_buffer used to drop the last CVulkanTexture ref there,
+# racing steamcompmgr's vulkan_screenshot on the same device — a SIGSEGV precisely in the linger
+# window, so a kept display was dead and reconnect lost the game session. No capability the host
+# probes for, but "reconnect lost my game" triage has to read the difference off the banner.
 pkgrel=1
 pkgdesc="gamescope with 10-bit BT.2020/PQ PipeWire capture, for punktfunk HDR streaming"
 arch=('x86_64' 'aarch64')
