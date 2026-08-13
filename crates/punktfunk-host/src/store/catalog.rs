@@ -14,7 +14,6 @@
 
 use super::index::{Index, MAX_INDEX_BYTES};
 use super::sources::Source;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,19 +40,20 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
     if !source.url.starts_with("https://") {
         return Fetched::Failed("source url must be https".into());
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(FETCH_TIMEOUT)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(FETCH_TIMEOUT))
         // A signed document doesn't need many hops to reach us; a redirect chain is a good way to
         // waste a host's time.
-        .redirects(3)
-        .user_agent(&format!("punktfunk-host/{}", super::index::host_version()))
-        .build();
+        .max_redirects(3)
+        .user_agent(format!("punktfunk-host/{}", super::index::host_version()))
+        .build()
+        .into();
 
     let mut req = agent.get(&source.url);
     if let Some(tag) = etag {
-        req = req.set("If-None-Match", tag);
+        req = req.header("If-None-Match", tag);
     }
-    let resp = match req.call() {
+    let mut resp = match req.call() {
         // `ureq` only turns status >= 400 into `Err(Status)`, so a conditional request's 304
         // arrives here as **Ok with an empty body** — not as an error. Reading it as an error arm
         // (the intuitive reading) means every refresh after the first one verifies a signature
@@ -61,13 +61,17 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         // never picking up a new entry. Found on-glass; pinned by `ureq_returns_304_as_ok`.
         Ok(r) if r.status() == 304 => return Fetched::NotModified,
         Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::StatusCode(code)) => {
             return Fetched::Failed(format!("index fetch returned HTTP {code}"))
         }
         Err(e) => return Fetched::Failed(format!("index fetch failed: {e}")),
     };
-    let new_etag = resp.header("etag").map(str::to_string);
-    let body = match read_capped(resp) {
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = match read_capped(&mut resp) {
         Ok(b) => b,
         Err(e) => return Fetched::Failed(e),
     };
@@ -76,7 +80,7 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
     let keys = source.keys();
     if !keys.is_empty() {
         let sig = match agent.get(&source.sig_url()).call() {
-            Ok(r) => match read_capped(r) {
+            Ok(mut r) => match read_capped(&mut r) {
                 Ok(b) => b,
                 Err(e) => return Fetched::Failed(format!("signature: {e}")),
             },
@@ -105,11 +109,16 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
 }
 
 /// Read a response body, refusing anything past the cap without buffering it.
-fn read_capped(resp: ureq::Response) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take((MAX_INDEX_BYTES + 1) as u64)
-        .read_to_end(&mut buf)
+fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
+    // Limit is cap+1 so a body of exactly cap+1 comes back intact and is rejected by the length
+    // check below with our own message; anything larger trips ureq's own limit error. Either way it
+    // is an Err — unlike ureq 2's `take()`, which truncated silently and then failed the signature
+    // check with a message that pointed at the wrong thing.
+    let buf = resp
+        .body_mut()
+        .with_config()
+        .limit((MAX_INDEX_BYTES + 1) as u64)
+        .read_to_vec()
         .map_err(|e| format!("reading the response body failed: {e}"))?;
     if buf.len() > MAX_INDEX_BYTES {
         return Err(format!("response exceeds the {MAX_INDEX_BYTES}-byte cap"));
@@ -268,7 +277,7 @@ mod tests {
         });
 
         let resp = ureq::get(&format!("http://{addr}/index.json"))
-            .set("If-None-Match", "\"x\"")
+            .header("If-None-Match", "\"x\"")
             .call();
         let _ = server.join();
 

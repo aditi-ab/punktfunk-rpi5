@@ -7,7 +7,6 @@
 
 use serde::Deserialize;
 use std::collections::VecDeque;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -186,11 +185,15 @@ pub fn agent(
     let cfg = builder
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| bad("client auth", &e))?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_config(Arc::new(cfg))
-        .timeout_connect(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build())
+    // ureq's own `TlsConfig` has no hook for a custom verifier, so the agent is built around this
+    // `ClientConfig` verbatim (punktfunk-core owns that glue — see `tls::ureq_agent`).
+    Ok(punktfunk_core::tls::ureq_agent::agent(
+        Arc::new(cfg),
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build(),
+    ))
 }
 
 /// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
@@ -204,8 +207,9 @@ pub fn fetch_games(
     let agent = agent(identity, pin)?;
     let url = format!("{}/api/v1/library", base_url(addr, mgmt_port));
     let body = match agent.get(&url).call() {
-        Ok(resp) => resp
-            .into_string()
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_to_string()
             .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?,
         Err(e) => return Err(classify(e)),
     };
@@ -221,22 +225,26 @@ const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// a public CDN URL on a custom entry — uses ureq's default agent with normal webpki
 /// trust and no client cert (Apple's `LibraryTLSDelegate` does the same split).
 pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>, LibraryError> {
-    let resp = if url.starts_with(base) {
+    let mut resp = if url.starts_with(base) {
         pinned.get(url).call()
     } else {
-        // ureq's default agent builds its own rustls config, which panics unless a provider is
-        // already installed (two backends are compiled in — see `tls::install_default_provider`).
-        // Done here rather than trusting the binary, since this crate is linked by several.
+        // ureq's default agent builds its own rustls config from the process-default provider.
+        // Installed here rather than trusting the binary, since several link this crate.
         punktfunk_core::tls::install_default_provider();
-        ureq::get(url).timeout(Duration::from_secs(10)).call()
+        ureq::get(url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .call()
     }
     .map_err(classify)?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(ART_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|e| LibraryError::Unreachable(format!("read image: {e}")))?;
-    Ok(bytes)
+    // `limit` replaces the old `take()` — ureq 3 caps body reads itself, and its default cap is
+    // lower than the largest legitimate hero asset.
+    resp.body_mut()
+        .with_config()
+        .limit(ART_MAX_BYTES)
+        .read_to_vec()
+        .map_err(|e| LibraryError::Unreachable(format!("read image: {e}")))
 }
 
 /// Concurrent poster fetches — a handful is plenty for a LAN art proxy without turning a
@@ -292,19 +300,15 @@ pub fn spawn_art_fetch(
 
 fn classify(e: ureq::Error) -> LibraryError {
     match e {
-        ureq::Error::Status(401 | 403, _) => LibraryError::NotPaired,
-        ureq::Error::Status(code, _) => LibraryError::Http(code),
-        ureq::Error::Transport(t) => {
-            // A pin rejection surfaces as a TLS alert wrapped in a transport error; the
-            // verifier's error kind survives in the message.
-            let msg = t.to_string();
-            if msg.contains("ApplicationVerificationFailure") || msg.contains("InvalidCertificate")
-            {
-                LibraryError::PinMismatch
-            } else {
-                LibraryError::Unreachable(msg)
-            }
-        }
+        ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
+        ureq::Error::StatusCode(code) => LibraryError::Http(code),
+        // Exactly the rejection `PinVerify` raises on a fingerprint mismatch. ureq 3 carries the
+        // typed `rustls::Error`, so this is a real match instead of the substring sniff the 2.x
+        // `Transport(t)` string forced — which would also have fired on unrelated cert errors.
+        ureq::Error::Rustls(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        )) => LibraryError::PinMismatch,
+        other => LibraryError::Unreachable(other.to_string()),
     }
 }
 

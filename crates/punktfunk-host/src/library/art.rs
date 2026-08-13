@@ -86,14 +86,21 @@ fn warm_art_once() {
 /// HTTP GET + parse JSON with a bounded timeout. `None` on any network/parse failure (best-effort —
 /// art is non-essential, so a failure just leaves the title-only card).
 fn fetch_json(url: &str) -> Option<serde_json::Value> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(10))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
         // Don't follow redirects — a redirect target (`3xx` → `http://169.254.169.254/…` or an
         // internal host) would be an SSRF pivot from the privileged host. Matches the webhook path
         // (security-review 2026-07-17). A rare legitimately-redirecting CDN just yields no art.
-        .redirects(0)
-        .build();
-    let body = agent.get(url).call().ok()?.into_string().ok()?;
+        .max_redirects(0)
+        .build()
+        .into();
+    let body = agent
+        .get(url)
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
     serde_json::from_str(&body).ok()
 }
 
@@ -103,7 +110,6 @@ fn fetch_json(url: &str) -> Option<serde_json::Value> {
 /// network/decoder error, or empty body. Blocking (ureq) — call off the async runtime.
 pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
     use base64::Engine as _;
-    use std::io::Read as _;
     if let Some(rest) = url.strip_prefix("data:") {
         // data:[<mediatype>][;base64],<payload>
         let (meta, data) = rest.split_once(',')?;
@@ -125,22 +131,27 @@ pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return None;
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(10))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
         // Don't follow redirects (SSRF pivot): this is called on launcher-cache- and custom-entry-
         // supplied URLs, so a `3xx` to an internal/metadata endpoint must not be chased by the
         // privileged host. Matches the webhook path (security-review 2026-07-17).
-        .redirects(0)
-        .build();
-    let resp = agent.get(url).call().ok()?;
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut resp = agent.get(url).call().ok()?;
     let ctype = resp
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
         .unwrap_or("image/jpeg")
         .to_string();
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(8 * 1024 * 1024)
-        .read_to_end(&mut bytes)
+    // The 8 MiB cap is now the body reader's own limit rather than a `take()` on the stream.
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(8 * 1024 * 1024)
+        .read_to_vec()
         .ok()?;
     (!bytes.is_empty()).then_some((bytes, ctype))
 }

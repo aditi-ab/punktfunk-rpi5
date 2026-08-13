@@ -254,7 +254,7 @@ fn poll_loop(
 fn probe_console(agent: &ureq::Agent, url: &str) -> bool {
     match agent.get(url).call() {
         Ok(_) => true,
-        Err(ureq::Error::Status(..)) => true,
+        Err(ureq::Error::StatusCode(..)) => true,
         Err(_) => false,
     }
 }
@@ -262,7 +262,13 @@ fn probe_console(agent: &ureq::Agent, url: &str) -> bool {
 // ── Summary fetch (loopback HTTPS) ──────────────────────────────────────────────────────────────
 
 fn fetch_summary(agent: &ureq::Agent, url: &str) -> Option<Summary> {
-    let body = agent.get(url).call().ok()?.into_string().ok()?;
+    let body = agent
+        .get(url)
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
     serde_json::from_str(&body).ok()
 }
 
@@ -320,15 +326,19 @@ fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)))
         .with_no_client_auth();
-    ureq::AgentBuilder::new()
-        .tls_config(Arc::new(cfg))
-        .timeout_connect(Duration::from_secs(2))
-        .timeout(Duration::from_secs(2))
-        // No redirect-following. Neither user of this agent wants it: the summary is a terminal
-        // JSON route, and the console probe treats any HTTP answer (302 included) as "up", so
-        // chasing the hop only spends the 2 s budget re-rendering a page nobody reads.
-        .redirects(0)
-        .build()
+    // ureq's `TlsConfig` cannot install a custom verifier, so the agent wraps this `ClientConfig`
+    // directly (the glue lives in punktfunk-core, shared with the desktop client's library fetch).
+    punktfunk_core::tls::ureq_agent::agent(
+        Arc::new(cfg),
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(2)))
+            .timeout_global(Some(Duration::from_secs(2)))
+            // No redirect-following. Neither user of this agent wants it: the summary is a
+            // terminal JSON route, and the console probe treats any HTTP answer (302 included) as
+            // "up", so chasing the hop only spends the 2 s budget re-rendering a page nobody reads.
+            .max_redirects(0)
+            .build(),
+    )
 }
 
 // ── Service-manager probe ───────────────────────────────────────────────────────────────────────

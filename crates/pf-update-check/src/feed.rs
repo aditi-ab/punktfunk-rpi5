@@ -79,17 +79,18 @@ pub fn fetch_manifest_blocking(
             "no update key is pinned in this build".into(),
         ));
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(FETCH_TIMEOUT)
-        .redirects(3)
-        .user_agent(user_agent)
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(FETCH_TIMEOUT))
+        .max_redirects(3)
+        .user_agent(user_agent.to_string())
+        .build()
+        .into();
     let url = format!("{base}/{channel}/manifest.json");
     let sig_url = format!("{url}.sig");
 
     // Only the MANIFEST leg can report an empty channel; see [`FeedError::NotPublished`].
-    let body = read_capped(agent.get(&url).call().map_err(manifest_err)?)?;
-    let sig = read_capped(agent.get(&sig_url).call().map_err(fetch_err)?)?;
+    let body = read_capped(&mut agent.get(&url).call().map_err(manifest_err)?)?;
+    let sig = read_capped(&mut agent.get(&sig_url).call().map_err(fetch_err)?)?;
     let sig_text = String::from_utf8(sig)
         .map_err(|_| FeedError::Failed("signature file is not text".into()))?;
 
@@ -100,24 +101,26 @@ pub fn fetch_manifest_blocking(
 /// The manifest leg: a 404 here means the channel is empty, not broken.
 fn manifest_err(e: ureq::Error) -> FeedError {
     match e {
-        ureq::Error::Status(404, _) => FeedError::NotPublished,
+        ureq::Error::StatusCode(404) => FeedError::NotPublished,
         other => fetch_err(other),
     }
 }
 
 fn fetch_err(e: ureq::Error) -> FeedError {
     FeedError::Failed(match e {
-        ureq::Error::Status(code, _) => format!("feed returned HTTP {code}"),
+        ureq::Error::StatusCode(code) => format!("feed returned HTTP {code}"),
         other => format!("feed fetch failed: {other}"),
     })
 }
 
-fn read_capped(resp: ureq::Response) -> Result<Vec<u8>, FeedError> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    let mut reader = resp.into_reader().take(MAX_MANIFEST_BYTES as u64 + 1);
-    reader
-        .read_to_end(&mut buf)
+fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, FeedError> {
+    // cap+1 so an over-cap body is rejected by the length check rather than silently truncated
+    // into something that would then fail signature verification for the wrong reason.
+    let buf = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_vec()
         .map_err(|e| FeedError::Failed(format!("read failed: {e}")))?;
     if buf.len() > MAX_MANIFEST_BYTES {
         return Err(FeedError::Failed(
@@ -143,7 +146,7 @@ mod tests {
     }
 
     fn status(code: u16) -> ureq::Error {
-        ureq::Error::Status(code, ureq::Response::new(code, "status", "").unwrap())
+        ureq::Error::StatusCode(code)
     }
 
     /// The whole point of the split: an empty channel is not a broken feed.

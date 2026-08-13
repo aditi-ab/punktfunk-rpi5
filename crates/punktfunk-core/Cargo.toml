@@ -24,6 +24,12 @@ tls = ["dep:rustls", "dep:sha2", "dep:rustls-pki-types"]
 # Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
 # never on the per-frame hot path. Off by default so the core stays runtime-free.
 quic = ["tls", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:hmac", "dep:spake2", "dep:opus"]
+# Blocking-HTTP clients that must speak the SAME pinned TLS as the QUIC plane: `tls::ureq_agent`
+# hands ureq a caller-built `rustls::ClientConfig` (which is how `PinVerify` gets installed —
+# ureq's own `TlsConfig` has no hook for a custom verifier). Separate from `tls` because the
+# cdylib/staticlib embedders (Apple, Android) pin the host themselves over QUIC and have no use
+# for an HTTP stack; only the desktop clients and the tray turn this on.
+ureq-tls = ["tls", "dep:ureq"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
@@ -69,6 +75,14 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # `generate_simple_self_signed` is backend-agnostic, so the swap is transparent here.
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pki-types = { version = "1", optional = true }
+# `rustls-no-provider`, NOT the default `rustls` feature — ureq's `rustls` feature body pulls
+# `_ring`, which would drag the whole ring backend back into a tree that has deliberately moved to
+# aws-lc-rs. `rustls-webpki-roots` supplies the CA set for the non-pinned origins (cover-art CDNs).
+ureq = { version = "3", optional = true, default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
 sha2 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
 spake2 = { version = "0.4", optional = true }

@@ -811,11 +811,12 @@ fn webhook_host_is_internal(url: &str) -> bool {
 fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
     // TLS is verified (ureq's default rustls roots); redirects are never followed, so a
     // compromised receiver can't bounce the POST cross-origin (RFC §9.5).
-    let agent = ureq::builder()
-        .redirects(0)
-        .timeout(WEBHOOK_TIMEOUT)
-        .build();
-    let mut req = agent.post(url).set("Content-Type", "application/json");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .timeout_global(Some(WEBHOOK_TIMEOUT))
+        .build()
+        .into();
+    let mut req = agent.post(url).header("Content-Type", "application/json");
     if let Some(path) = secret_file {
         match std::fs::read(path) {
             Ok(secret) => {
@@ -829,7 +830,7 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
                 };
                 mac.update(json.as_bytes());
                 let sig = hex::encode(mac.finalize().into_bytes());
-                req = req.set("X-Punktfunk-Signature", &format!("sha256={sig}"));
+                req = req.header("X-Punktfunk-Signature", &format!("sha256={sig}"));
             }
             Err(e) => {
                 // A configured-but-unreadable secret means the operator WANTS signing —
@@ -840,9 +841,9 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
             }
         }
     }
-    match req.send_string(json) {
-        Ok(resp) => tracing::debug!(url, status = resp.status(), "webhook delivered"),
-        Err(ureq::Error::Status(code, _)) => {
+    match req.send(json) {
+        Ok(resp) => tracing::debug!(url, status = resp.status().as_u16(), "webhook delivered"),
+        Err(ureq::Error::StatusCode(code)) => {
             tracing::warn!(url, status = code, "webhook rejected by receiver")
         }
         Err(e) => tracing::warn!(url, error = %e, "webhook delivery failed"),

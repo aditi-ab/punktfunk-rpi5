@@ -8,16 +8,21 @@
 
 use std::sync::{Arc, Mutex};
 
+/// A blocking HTTP agent over a caller-built `rustls::ClientConfig` — the only way to give an
+/// HTTP client the [`PinVerify`] verifier below.
+#[cfg(feature = "ureq-tls")]
+pub mod ureq_agent;
+
 /// Install aws-lc-rs as this process's rustls provider. Call once, early, from `main`.
 ///
-/// Two rustls backends are compiled in, and NOT by choice: ours is aws-lc-rs, but `ureq 2` names
-/// `features = ["ring", ...]` in its own rustls dependency line, and cargo features are additive —
-/// no dependent can switch that off. With both present rustls refuses to guess which one a config
-/// meant, so anything built through `ClientConfig::builder()` (rather than
-/// `builder_with_provider`) **panics** instead of picking one. ureq's default agent builds exactly
-/// such a config on its first HTTPS request, so any binary that can reach one of those must have
-/// called this first. Idempotent: losing the race to another installer is the expected outcome,
-/// not an error, since every caller in this workspace installs the same provider.
+/// aws-lc-rs is currently the ONLY backend in the tree, so rustls can infer it and this call is
+/// belt-and-braces rather than load-bearing. It is kept because the inference is what breaks
+/// first: the moment any dependency drags a second backend in — which is exactly what `ureq 2`
+/// used to do, naming `rustls/ring` in its own dependency line where no dependent could switch it
+/// off — rustls stops guessing, and every config built through `ClientConfig::builder()` rather
+/// than `builder_with_provider` **panics** instead of picking one. Calling this makes the choice
+/// explicit and survives that. Idempotent: losing the race to another installer is the expected
+/// outcome, not an error, since every caller in this workspace installs the same provider.
 pub fn install_default_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }

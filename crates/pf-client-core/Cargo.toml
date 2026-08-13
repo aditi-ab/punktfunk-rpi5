@@ -14,7 +14,7 @@ repository.workspace = true
 # the old main.rs. Audio is the one per-OS swap: PipeWire on Linux, WASAPI on Windows
 # (same public surface — see lib.rs).
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+punktfunk-core = { path = "../punktfunk-core", features = ["quic", "ureq-tls"] }
 # Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
 # WP-2, AV1 by M7): auto's TOP rung on both desktop OSes since M9 — for every codec it
 # speaks, AV1 included — also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
@@ -101,7 +101,13 @@ ash = { version = "0.38", optional = true }
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
 # `ureq` is small + sync (the host uses it too) and its rustls unifies with the
 # workspace's (quinn's) 0.23; the pinning verifier mirrors core's private `PinVerify`.
-ureq = "2"
+# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature: that one pulls `_ring`, which would
+# put the ring backend back into a tree that has moved to aws-lc-rs. Same spelling everywhere.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
 # Signed update-manifest fetch/verify + the install-kind ladder, shared with the host so one
 # trust rule serves both (crates/pf-update-check).
 pf-update-check = { path = "../pf-update-check" }

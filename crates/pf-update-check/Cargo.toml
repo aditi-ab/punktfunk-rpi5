@@ -36,7 +36,13 @@ aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 base64 = "0.22"
 # Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
 # Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
-ureq = "2"
+# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
+# put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
 
 [lints]
 workspace = true

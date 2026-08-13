@@ -93,7 +93,13 @@ base64 = "0.22"
 # run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
 # webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
 # checked everywhere even though only the Windows GOG/Xbox providers need it today.
-ureq = "2"
+# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
+# put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.16"
 # Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
