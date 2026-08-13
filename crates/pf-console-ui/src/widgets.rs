@@ -9,7 +9,7 @@ use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{accent, fg, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Paint, Path, RRect, Rect};
+use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
 // --- Menu list -----------------------------------------------------------------------------
 
@@ -479,11 +479,11 @@ fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     p.set_stroke_width((1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     p.set_anti_alias(true);
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to(((x - dir * r / 2.0) as f32, (cy - r) as f32));
     path.line_to(((x + dir * r / 2.0) as f32, cy as f32));
     path.line_to(((x - dir * r / 2.0) as f32, (cy + r) as f32));
-    canvas.draw_path(&path, &p);
+    canvas.draw_path(&path.detach(), &p);
 }
 
 // --- On-screen keyboard ----------------------------------------------------------------------
@@ -785,12 +785,12 @@ fn draw_space_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Co
     // ⎵ — an underline bracket.
     let (w, h) = (16.0 * k, 5.0 * k);
     let p = stroke_paint(ink, (1.6 * k) as f32);
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to(((cx - w / 2.0) as f32, (cy - h / 2.0) as f32));
     path.line_to(((cx - w / 2.0) as f32, (cy + h / 2.0) as f32));
     path.line_to(((cx + w / 2.0) as f32, (cy + h / 2.0) as f32));
     path.line_to(((cx + w / 2.0) as f32, (cy - h / 2.0) as f32));
-    canvas.draw_path(&path, &p);
+    canvas.draw_path(&path.detach(), &p);
 }
 
 fn draw_backspace_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Color4f) {
@@ -799,14 +799,14 @@ fn draw_backspace_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe
     let nose = 6.0 * k;
     let p = stroke_paint(ink, (1.6 * k) as f32);
     let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to(((l + nose) as f32, t as f32));
     path.line_to((r as f32, t as f32));
     path.line_to((r as f32, b as f32));
     path.line_to(((l + nose) as f32, b as f32));
     path.line_to((l as f32, cy as f32));
     path.close();
-    canvas.draw_path(&path, &p);
+    canvas.draw_path(&path.detach(), &p);
     let (xc, xr) = (cx + nose / 2.0, 2.6 * k);
     canvas.draw_line(
         ((xc - xr) as f32, (cy - xr) as f32),
@@ -823,11 +823,11 @@ fn draw_backspace_icon(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe
 fn draw_check(canvas: &Canvas, cx: f64, cy: f64, k: f64, ink: skia_safe::Color4f) {
     let p = stroke_paint(ink, (1.8 * k) as f32);
     let r = 5.0 * k;
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to(((cx - r) as f32, cy as f32));
     path.line_to(((cx - r * 0.25) as f32, (cy + r * 0.7) as f32));
     path.line_to(((cx + r) as f32, (cy - r * 0.7) as f32));
-    canvas.draw_path(&path, &p);
+    canvas.draw_path(&path.detach(), &p);
 }
 
 #[cfg(test)]

@@ -236,21 +236,25 @@ impl Overlay for SkiaOverlay {
                 }
             }
         };
+        let backend_builder = skvk::BackendContext::new_builder(
+            shared.instance.handle().as_raw() as _,
+            shared.physical_device.as_raw() as _,
+            shared.device.handle().as_raw() as _,
+            (
+                shared.queue.as_raw() as _,
+                shared.queue_family_index as usize,
+            ),
+            &get_proc,
+            // `None` leaves Skia's `fMaxAPIVersion` at its `0` sentinel, so it caps entry-point
+            // validation at whatever `vkEnumerateInstanceVersion()` reports — byte-for-byte what
+            // the (now removed) `BackendContext::new` did. The presenter owns the instance and its
+            // `VkApplicationInfo`, so pinning a version here would just duplicate its choice.
+            None,
+        );
         // SAFETY: the instance/physical-device/device handles come from `shared`, which owns them
         // and outlives this backend context, and `get_proc` above resolves through those same
         // handles. Skia stores them but does not take ownership — teardown stays ours.
-        let backend = unsafe {
-            skvk::BackendContext::new(
-                shared.instance.handle().as_raw() as _,
-                shared.physical_device.as_raw() as _,
-                shared.device.handle().as_raw() as _,
-                (
-                    shared.queue.as_raw() as _,
-                    shared.queue_family_index as usize,
-                ),
-                &get_proc,
-            )
-        };
+        let backend = unsafe { backend_builder.build() };
         let mut context = gpu::direct_contexts::make_vulkan(&backend, None)
             .ok_or_else(|| anyhow!("Skia DirectContext over the shared device"))?;
         context.set_resource_cache_limit(RESOURCE_CACHE_BYTES);

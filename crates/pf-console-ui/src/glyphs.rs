@@ -7,7 +7,7 @@
 
 use crate::theme::{fg, Fonts, W};
 use punktfunk_core::config::GamepadPref;
-use skia_safe::{Canvas, Paint, Path, Point, RRect, Rect};
+use skia_safe::{Canvas, Paint, PathBuilder, Point, RRect, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlyphStyle {
@@ -294,12 +294,12 @@ fn draw_glyph(
             let r = BADGE_D * k / 2.0;
             let (cx, cyf) = ((x + r) as f32, cy as f32);
             let (tw, th) = ((5.5 * k) as f32, (4.5 * k) as f32);
-            let mut up = Path::new();
+            let mut up = PathBuilder::new();
             up.move_to((cx, cyf - th));
             up.line_to((cx - tw, cyf + th));
             up.line_to((cx + tw, cyf + th));
             up.close();
-            canvas.draw_path(&up, &Paint::new(fg(0.85), None));
+            canvas.draw_path(&up.detach(), &Paint::new(fg(0.85), None));
         }
         Resolved::Adjust => {
             // ◀ ▶ — two small solid triangles.
@@ -308,18 +308,18 @@ fn draw_glyph(
             let (tw, th) = ((4.5 * k) as f32, (5.5 * k) as f32);
             let gap = (2.6 * k) as f32;
             let paint = Paint::new(fg(0.85), None);
-            let mut left = Path::new();
+            let mut left = PathBuilder::new();
             left.move_to((cx - gap, cyf - th));
             left.line_to((cx - gap - tw, cyf));
             left.line_to((cx - gap, cyf + th));
             left.close();
-            canvas.draw_path(&left, &paint);
-            let mut right = Path::new();
+            canvas.draw_path(&left.detach(), &paint);
+            let mut right = PathBuilder::new();
             right.move_to((cx + gap, cyf - th));
             right.line_to((cx + gap + tw, cyf));
             right.line_to((cx + gap, cyf + th));
             right.close();
-            canvas.draw_path(&right, &paint);
+            canvas.draw_path(&right.detach(), &paint);
         }
         Resolved::Key(text) => {
             let w = keycap_w(fonts, text, k);
@@ -377,12 +377,12 @@ fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, stroke: f32
         }
         Face::Y => {
             // △
-            let mut tri = Path::new();
+            let mut tri = PathBuilder::new();
             tri.move_to((cx, cy - r * 1.2));
             tri.line_to((cx + r * 1.15, cy + r * 0.85));
             tri.line_to((cx - r * 1.15, cy + r * 0.85));
             tri.close();
-            canvas.draw_path(&tri, &p);
+            canvas.draw_path(&tri.detach(), &p);
         }
     }
 }

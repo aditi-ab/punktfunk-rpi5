@@ -13,7 +13,7 @@ use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, fg, Fonts, PanelStroke, ONLINE_GREEN, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, MaskFilter, Paint, Path, Point, RRect, Rect};
+use skia_safe::{Canvas, Color4f, MaskFilter, Paint, PathBuilder, Point, RRect, Rect};
 
 const TILE_W: f64 = 340.0;
 const TILE_H: f64 = 224.0;
@@ -526,18 +526,20 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
     let rr = RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32);
     if filled {
         let mut p = Paint::default();
-        p.set_shader(skia_safe::gradient_shader::linear(
+        let colors = [accent(1.0), accent(0.68)];
+        p.set_shader(skia_safe::gradient::shaders::linear_gradient(
             (
                 Point::new(badge.left, badge.top),
                 Point::new(badge.left, badge.bottom),
             ),
-            skia_safe::gradient_shader::GradientShaderColors::Colors(&[
-                accent(1.0).to_color(),
-                accent(0.68).to_color(),
-            ]),
-            None,
-            skia_safe::TileMode::Clamp,
-            None,
+            &skia_safe::gradient::Gradient::new(
+                skia_safe::gradient::Colors::new_evenly_spaced(
+                    &colors,
+                    skia_safe::TileMode::Clamp,
+                    None,
+                ),
+                skia_safe::gradient::Interpolation::default(),
+            ),
             None,
         ));
         canvas.draw_rrect(rr, &p);
@@ -586,7 +588,7 @@ fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
     p.set_style(skia_safe::PaintStyle::Stroke);
     p.set_stroke_width((1.6 * k) as f32);
     p.set_anti_alias(true);
-    let mut shackle = Path::new();
+    let mut shackle = PathBuilder::new();
     let (cx, r) = (x + body_w / 2.0, 3.2 * k);
     shackle.move_to(((cx - r) as f32, body_top as f32));
     shackle.arc_to(
@@ -600,7 +602,7 @@ fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
         180.0,
         false,
     );
-    canvas.draw_path(&shackle, &p);
+    canvas.draw_path(&shackle.detach(), &p);
 }
 
 #[cfg(test)]
