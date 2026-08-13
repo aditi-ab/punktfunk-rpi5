@@ -19,7 +19,10 @@ import SwiftUI
 import GameController
 
 struct LibraryCoverflowView: View {
-    @Environment(\.gamepadInk) private var ink
+    /// Resolved from the stored palette, NOT from `\.gamepadInk` — this screen publishes that
+    /// value itself and so sits above its own copy (see `GamepadInk.stored`).
+    @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
+    private var ink: GamepadInk { .stored(paletteID) }
     let games: [GameEntry]
     let artLoader: LibraryArtLoader?
     var onLaunch: ((String) -> Void)?

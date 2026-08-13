@@ -67,6 +67,24 @@ struct GamepadInk: Equatable, Sendable {
     /// The shipped dark look — what a preview or a test composition gets.
     static let dark = GamepadInk.of(GamepadPalette.named("violet"))
 
+    /// The ink for a stored `ui_palette` id, resolved WITHOUT the environment.
+    ///
+    /// For the screens that publish their own ink with `gamepadPaletteInk()`. A view's
+    /// `@Environment` resolves against its PARENT — the modifier a screen applies to its own body
+    /// covers its descendants, never the body's own `ink.…` references — so such a screen reads
+    /// whatever was published ABOVE it. Nested inside another gamepad screen (the iOS shell's
+    /// layers) that happens to be right; presented as a cover or a sheet (tvOS, macOS) there is
+    /// nothing above it and it gets the bare dark default. That is precisely how a pale palette
+    /// came out with a WHITE title, white row labels and a violet focus wash on an Apple TV, while
+    /// the child views in the same screen — the hint bar, the host tiles, the glass — were
+    /// correctly dark-on-pale.
+    ///
+    /// Declare it beside an `@AppStorage(DefaultsKey.uiPalette)`, which is what re-renders the
+    /// screen when the setting changes (`GamepadInkModifier` reads the same key).
+    static func stored(_ paletteID: String) -> GamepadInk {
+        .of(GamepadPalette.named(paletteID))
+    }
+
     /// The online pip — deliberately NOT palette-derived: a status colour must not change
     /// meaning with the wallpaper (the console's rule; this is its `ONLINE_GREEN` verbatim).
     static let onlineGreen = Color(red: 0.20, green: 0.84, blue: 0.29)

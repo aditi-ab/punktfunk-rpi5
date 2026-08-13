@@ -453,6 +453,10 @@ struct ContentView: View {
                 LibraryView(store: store, target: shelf, onLaunch: { launchTitle(shelf, $0) })
             }
             .frame(minWidth: 940, minHeight: 620)
+            // The stack draws the title, and it sits outside LibraryView's own ink — see the tvOS
+            // cover. Gated, because this sheet is BOTH modes' library on macOS and the touch
+            // grid's title belongs to the system background.
+            .gamepadPaletteInk(gamepadUIActive)
         }
         #else
         // iOS: the cover is the TOUCH UI's presentation only. In gamepad mode the library is one
@@ -851,12 +855,29 @@ struct ContentView: View {
                 .fullScreenCover(item: $pairingTarget) { host in
                     PairSheet(host: host) { fingerprint in handlePaired(host, fingerprint: fingerprint) }
                         .onExitCommand { pairingTarget = nil }
+                        // A tvOS cover draws NO background of its own, and this one is attached
+                        // outside the launcher's `gamepadPaletteInk` — so the pairing screen used
+                        // to render the system's dark chrome directly over the launcher showing
+                        // through it, which under a pale palette is white text on a bright field
+                        // (the PIN prompt was all but invisible). Give it the console's own field
+                        // and the palette's ink, like every other screen the launcher opens. Only
+                        // this branch: `HomeView`'s route to the same sheet is the TOUCH UI, which
+                        // sits on the system background and has no palette.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background { GamepadFormBackground() }
+                        .gamepadPaletteInk()
                 }
                 .fullScreenCover(item: $libraryTarget) { shelf in
                     NavigationStack {
                         LibraryView(store: store, target: shelf, onLaunch: { launchTitle(shelf, $0) })
                     }
                     .onExitCommand { libraryTarget = nil }
+                    // On the STACK, not just inside LibraryView: the navigation title is drawn by
+                    // the stack, which wraps that view from outside its own `gamepadPaletteInk` —
+                    // so the shelf's name stayed white over a pale field while the content below
+                    // it had already gone dark. Unconditional here because this cover only exists
+                    // in the launcher's branch, where the console UI is by definition drawing.
+                    .gamepadPaletteInk()
                 }
                 #endif
             } else {

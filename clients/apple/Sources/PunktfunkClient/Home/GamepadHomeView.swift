@@ -64,7 +64,10 @@ private struct HomeTile: Identifiable {
 }
 
 struct GamepadHomeView: View {
-    @Environment(\.gamepadInk) private var ink
+    /// Resolved from the stored palette, NOT from `\.gamepadInk` — this screen publishes that
+    /// value itself and so sits above its own copy (see `GamepadInk.stored`).
+    @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
+    private var ink: GamepadInk { .stored(paletteID) }
     /// Published by ContentView at the app ROOT, so this reads its own window's tier — this screen
     /// applies `gamepadPaletteInk` itself and so sits above its own copy of the environment.
     @Environment(\.gamepadMetrics) private var metrics
@@ -657,6 +660,12 @@ private struct GamepadHostTile: View {
 
     private var monogramBadge: some View {
         let shape = RoundedRectangle(cornerRadius: Self.badgeCorner, style: .continuous)
+        // What the glyph is drawn ON: a filled badge IS the accent, so its mark takes `onAccent`
+        // — the colour picked by the accent's own luminance — exactly as the settings screen's
+        // selected tab pill does. It used to take `fg`, which is chosen against the FIELD, and the
+        // two disagree at both ends of the set: a pale palette put near-black on a deep accent, and
+        // Graphite (accent luma ≈ 0.80) put white on a light grey.
+        let glyph = tile.filled ? ink.onAccent : ink.accent
         return ZStack {
             shape.fill(tile.filled
                 ? AnyShapeStyle(LinearGradient(
@@ -664,7 +673,7 @@ private struct GamepadHostTile: View {
                     startPoint: .top, endPoint: .bottom))
                 : AnyShapeStyle(ink.accent(0.16)))
             if tile.isConnecting {
-                ProgressView().tint(ink.fg)
+                ProgressView().tint(glyph)
             } else if let icon = tile.icon {
                 Image(systemName: icon)
                     .font(.system(size: Self.iconFont, weight: .semibold))
@@ -676,12 +685,12 @@ private struct GamepadHostTile: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: Self.monogramFont, height: Self.monogramFont)
-                    .foregroundStyle(tile.filled ? ink.fg : ink.accent)
+                    .foregroundStyle(glyph)
                     .accessibilityLabel(tile.osChain ?? "")
             } else {
                 Text(monogram(tile.title))
                     .font(.geistFixed(Self.monogramFont, .bold))
-                    .foregroundStyle(tile.filled ? ink.fg : ink.accent)
+                    .foregroundStyle(glyph)
             }
         }
         .frame(width: Self.badgeSide, height: Self.badgeSide)

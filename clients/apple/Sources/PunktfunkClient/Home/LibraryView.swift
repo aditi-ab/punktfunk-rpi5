@@ -94,6 +94,9 @@ struct LibraryView: View {
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled,
             mode: gamepadUIMode)
     }
+    /// True when the iOS shell already draws one persistent field behind its layers — mounting a
+    /// second would double the mesh (the same rule the coverflow and the settings screen follow).
+    @Environment(\.gamepadHostedInShell) private var hostedInShell
     #endif
 
     var body: some View {
@@ -150,12 +153,13 @@ struct LibraryView: View {
 
     @ViewBuilder private var content: some View {
         if loading && games.isEmpty {
-            ProgressView("Loading library…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            consoleField(
+                ProgressView("Loading library…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity))
         } else if let errorText, games.isEmpty {
-            errorState(errorText)
+            consoleField(errorState(errorText))
         } else if games.isEmpty {
-            emptyState
+            consoleField(emptyState)
         } else {
             if gamepadUIActive {
                 LibraryCoverflowView(
@@ -166,6 +170,24 @@ struct LibraryView: View {
                 grid
             }
         }
+    }
+
+    /// The console field behind the three states that are NOT the coverflow — loading, error,
+    /// empty. The coverflow mounts its own backdrop; these mounted nothing, so wherever this view
+    /// is a COVER over the launcher (tvOS, macOS) they drew straight onto it: the spinner and its
+    /// label sat on the launcher's own aurora with the host tiles still showing through. The same
+    /// field as the coverflow's (not the calmed form one), so nothing shifts under the content when
+    /// the titles land and the coverflow takes over.
+    ///
+    /// Only in gamepad mode: the plain grid's states belong on the system background, as before.
+    @ViewBuilder private func consoleField(_ view: some View) -> some View {
+        #if os(iOS) || os(macOS) || os(tvOS)
+        view.background {
+            if gamepadUIActive, !hostedInShell { GamepadScreenBackground() }
+        }
+        #else
+        view
+        #endif
     }
 
     private var grid: some View {

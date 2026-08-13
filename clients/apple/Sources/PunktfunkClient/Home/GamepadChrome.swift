@@ -430,7 +430,12 @@ private struct HintCellStyle: ButtonStyle {
 /// can't inflate the caller's layout past the safe area (see the layout note in GamepadHomeView's
 /// header). Honors Reduce Motion by freezing the field at a fixed phase.
 struct GamepadScreenBackground: View {
-    @Environment(\.gamepadInk) private var ink
+    /// Resolved from `paletteID` below rather than `\.gamepadInk`: this is mounted as a screen's
+    /// `.background { }`, which the screen attaches BEFORE its own `gamepadPaletteInk()`, so the
+    /// environment here is the screen's parent's — the dark default under a cover or a sheet. It
+    /// only feeds a pale palette's scrim, so the symptom was subtle: the field bleached toward
+    /// white instead of settling onto its own ink. (see `GamepadInk.stored`)
+    private var ink: GamepadInk { .stored(paletteID) }
     /// How far toward the form screens' quiet the field sits: 0 = the launcher's full aurora,
     /// 1 = calm, fractional mid-chase. Continuous (not a Bool) so the in-place shell can CHASE
     /// it during a push/pop — the console does the same with its `bg_mix` — and every
