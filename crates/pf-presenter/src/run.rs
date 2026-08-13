@@ -2847,10 +2847,21 @@ fn stats_text(
         } else {
             text.push_str(&format!(" · host+net {:.1}", s.host_net_ms));
         }
-        text.push_str(&format!(
-            " · decode {:.1} · display {:.1} ms",
-            s.decode_ms, p.display_ms
-        ));
+        // `decode` joins the partition line ONLY where it is one. The stages tile `e2e`
+        // per frame — pts →(host+net)→ received →(decode)→ decoded →(display)→ displayed —
+        // and that holds while `decoded` is a completion stamp. On the async native-Vulkan
+        // rung it is a SUBMISSION stamp, so the GPU decode sits inside `display` and this
+        // figure re-counts it; printing the two side by side invited exactly the reading a
+        // 2026-08-13 field report made ("decode 6.6 next to display 1.4 and e2e 8.1 — the
+        // parts don't add up"). They add up without it. See `Stats::decode_overlaps_display`.
+        if s.decode_overlaps_display {
+            text.push_str(&format!(" · display {:.1} ms", p.display_ms));
+        } else {
+            text.push_str(&format!(
+                " · decode {:.1} · display {:.1} ms",
+                s.decode_ms, p.display_ms
+            ));
+        }
         // The display split (WP4). Only with true on-glass stamps — without them the
         // two halves are not separable and the unsplit figure stands alone rather than
         // implying a zero latch.
@@ -2858,6 +2869,19 @@ fn stats_text(
             text.push_str(&format!(
                 " (pace {:.1} + latch {:.1})",
                 p.pace_ms, p.latch_ms
+            ));
+        }
+        // …and gets its own line there, qualified. Two things a reader has to know before
+        // the number means anything: it is ONE frame per window on this rung (a per-frame
+        // fence wait would serialise the decode pipeline — see the sampling comment in
+        // `pf_client_core::session`), so it is a single sample rather than the p50 every
+        // other figure here is; and it is already inside `display`, so adding it double-
+        // counts. Suppressed at 0, which is the "every fence wait timed out" case rather
+        // than a real zero.
+        if s.decode_overlaps_display && s.decode_ms > 0.0 {
+            text.push_str(&format!(
+                "\ndecode {:.1} ms (1 sample, inside display — not additive)",
+                s.decode_ms
             ));
         }
         // Extended 0xCF host-stage split (T0.1): its own line so the per-stage attribution
@@ -3275,6 +3299,10 @@ mod tests {
                 host_pace_ms: 0.3,
                 staged: true,
                 decode_ms: 1.8,
+                // The fixture is the SYNCHRONOUS shape, so `decode` stays on the partition
+                // line and the existing assertions keep their meaning; the async rung's
+                // split-out rendering is exercised separately below.
+                decode_overlaps_display: false,
                 lost: 3,
                 lost_pct: 0.4,
                 mic_sent: 0,
@@ -3412,6 +3440,70 @@ mod tests {
             None,
         );
         assert!(!normal.contains("present:") && !normal.contains("pace"));
+    }
+
+    /// The stage line must stay a PARTITION of `e2e`. On the synchronous rungs `decode` is
+    /// one of its terms; on the asynchronous native-Vulkan rung the shipped `decoded` stamp
+    /// is taken at submission, so the GPU decode is inside `display` and `decode` re-counts
+    /// it. A 2026-08-13 field report read `host 5.4 · net 0.3 · decode 6.6 · display 1.4`
+    /// against `e2e 8.1` as a breakdown and asked why it did not add up — it adds up without
+    /// `decode`. So the figure leaves that line and says what it is instead of sitting beside
+    /// stages it does not tile with.
+    #[test]
+    fn an_overlapping_decode_figure_leaves_the_stage_line_and_says_so() {
+        let (mut s, p) = sample();
+
+        // Synchronous: unchanged, and specifically still INLINE on the stage line.
+        assert!(!s.decode_overlaps_display, "the fixture is the sync shape");
+        let sync = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(sync.contains("host 1.2 · net 0.9 · decode 1.8 · display 1.1 ms"));
+        assert!(!sync.contains("not additive"));
+
+        // Asynchronous: off the stage line, which still reads as a partition…
+        s.decode_overlaps_display = true;
+        let async_ = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            async_.contains("host 1.2 · net 0.9 · display 1.1 ms"),
+            "the stage line keeps only terms that tile e2e: {async_}"
+        );
+        // …and the number survives, qualified by BOTH caveats a reader needs.
+        assert!(async_.contains("\ndecode 1.8 ms (1 sample, inside display — not additive)"));
+
+        // A window whose every fence wait timed out reports 0, which is an absence of
+        // measurement rather than an instant decode — it must not render as either.
+        s.decode_ms = 0.0;
+        let none = stats_text(
+            StatsVerbosity::Detailed,
+            "m",
+            &s,
+            &p,
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            !none.contains("decode"),
+            "a 0 sample renders nothing: {none}"
+        );
     }
 
     /// The decode-integrity line (M4) — the whole point of which is that it can tell
