@@ -179,9 +179,6 @@ struct GamepadSettingsView: View {
                 // The picker and the About reading pages are one layer deeper — their rows aren't
                 // sections of anything, so the strip would be a control that does nothing.
                 if pinTarget == nil, aboutPage == nil { tabStrip }
-                // The identity card belongs to the About section, so it appears with it and goes
-                // away on its reading pages (which carry their own title instead).
-                if pinTarget == nil, aboutPage == nil, tab == .about { aboutIdentity }
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
@@ -356,9 +353,6 @@ struct GamepadSettingsView: View {
         static let source = URL(string: "https://git.unom.io/unom/punktfunk")!
     }
 
-    private static let tagline =
-        "Low-latency desktop and game streaming with first-class Linux and Windows hosts."
-
     /// "Version 0.29.0 (100000)" — the build number only when it says something the version does
     /// not. Mirrors `AboutView.versionLine`; a bug report is worth more with it.
     private static var versionLine: String {
@@ -367,55 +361,6 @@ struct GamepadSettingsView: View {
         let build = info?["CFBundleVersion"] as? String
         guard let build, !build.isEmpty, build != short else { return "Version \(short)" }
         return "Version \(short) (\(build))"
-    }
-
-    /// The identity card, shown under the tab strip while About is the section. Laid out sideways
-    /// (icon leading, text trailing) rather than centred like the touch page: this sits inside a
-    /// settings header that already carries a title and a tab strip, and a centred stack of
-    /// icon-name-version-tagline would leave no room for the rows underneath it.
-    private var aboutIdentity: some View {
-        HStack(alignment: .center, spacing: compact ? 12 : 16) {
-            // The icon gets the row first: the tagline beside it is happy to wrap or shorten,
-            // and a TV icon is 5:3, so it is the element that suffers first if the text takes
-            // the width it asks for.
-            AppIconView(side: aboutIconSide)
-                .layoutPriority(1)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Punktfunk")
-                    .font(.geist(metrics.labelFont, .bold, relativeTo: .headline))
-                    .foregroundStyle(ink.fg)
-                Text(Self.versionLine)
-                    .font(.geist(metrics.detailFont, .medium, relativeTo: .caption))
-                    .monospacedDigit()
-                    .foregroundStyle(ink.fg(0.7))
-                if !compact {
-                    Text(Self.tagline)
-                        .font(.geist(metrics.detailFont, relativeTo: .caption))
-                        .foregroundStyle(ink.fg(0.5))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: metrics.rowMaxWidth * 0.62, alignment: .leading)
-                        .padding(.top, 1)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        // Line up with the ROWS, not the screen. They are a centred column of `rowMaxWidth`
-        // (920 on a TV, against a 1920-wide screen), so a full-width identity card started a few
-        // hundred points to the left of every row under it and read as a separate banner. Same
-        // column, same inner inset as a row's contents, so the icon sits directly above the row
-        // icons — then centred in the header the way the list centres its rows.
-        .padding(.horizontal, metrics.rowHPad)
-        .frame(maxWidth: metrics.rowMaxWidth, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .padding(.horizontal, 24)
-    }
-
-    private var aboutIconSide: CGFloat {
-        #if os(tvOS)
-        return 84
-        #else
-        return compact ? 38 : 52
-        #endif
     }
 
     /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
@@ -517,6 +462,14 @@ struct GamepadSettingsView: View {
     private func rowView(_ row: Row, focused: Bool) -> some View {
         switch row.kind {
         case .control: controlRow(row, focused: focused)
+        case .footer:
+            Text(row.label)
+                .font(.geist(metrics.detailFont, .medium, relativeTo: .caption))
+                .monospacedDigit()
+                .foregroundStyle(ink.fg(focused ? 0.7 : 0.45))
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 18)
+                .animation(.smooth(duration: 0.18), value: focused)
         case .heading:
             Text(row.label)
                 .font(.geist(metrics.labelFont, .bold, relativeTo: .headline))
@@ -677,6 +630,8 @@ struct GamepadSettingsView: View {
             case control
             case heading
             case prose
+            /// Quiet, centred trailing text — the About tab's version line.
+            case footer
         }
     }
 
@@ -735,6 +690,17 @@ struct GamepadSettingsView: View {
                 id: "source", icon: "chevron.left.forwardslash.chevron.right",
                 label: "Source code", url: Destination.source),
         ])
+        // The version sits UNDER the rows rather than in a header card above them. The card that
+        // used to head this tab carried the app icon, and on tvOS that icon is a 400x240
+        // rectangle that would not survive contact with a layout built for square art — three
+        // attempts at framing it were still cropping it on the real TV. A version string answers
+        // the only question anyone actually opens About to ask, and has no aspect ratio to get
+        // wrong. `.footer` draws it quiet and centred, so it reads as a footer and not a row you
+        // failed to press.
+        list.append(Row(
+            id: "version", tab: .about, icon: "", label: Self.versionLine, value: "",
+            detail: "", adjustable: false, enabled: true, kind: .footer,
+            adjust: { _ in false }, activate: {}))
         return list
     }
 
