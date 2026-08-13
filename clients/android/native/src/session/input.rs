@@ -6,9 +6,10 @@
 //! conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
 //! signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{
     PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP_PEN, HOST_CAP_TEXT_INPUT,
@@ -37,7 +38,7 @@ fn send_event(handle: jlong, kind: InputKind, code: u32, x: i32, y: i32, flags: 
 /// `NativeBridge.nativeSendPointerMove(handle, dx, dy)` — relative mouse motion (screen +y down).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerMove(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     dx: jint,
@@ -53,7 +54,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 /// cursor jumps to the finger — and matches the Apple client's absolute touch forwarding.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerAbs(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     x: jint,
@@ -70,13 +71,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 /// `button`: GameStream id (1=left, 2=middle, 3=right, 4=X1, 5=X2). `down`: 1=press, 0=release.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerButton(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     button: jint,
     down: jboolean,
 ) {
-    let kind = if down != 0 {
+    let kind = if down {
         InputKind::MouseButtonDown
     } else {
         InputKind::MouseButtonUp
@@ -88,7 +89,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
 /// 1=horizontal. `delta`: signed, WHEEL_DELTA(120)-scaled, +=up/right.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     axis: jint,
@@ -105,7 +106,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
 /// (libei touchscreen / wlroots / SendInput).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendTouch(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     id: jint,
@@ -130,7 +131,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendTouch(
 /// bitmask (0 for now — the host folds modifiers from the L/R modifier key events themselves).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     vk: jint,
@@ -140,7 +141,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
     if vk == 0 {
         return;
     }
-    let kind = if down != 0 {
+    let kind = if down {
         InputKind::KeyDown
     } else {
         InputKind::KeyUp
@@ -153,16 +154,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
 /// the real IME `InputConnection` over the TYPE_NULL raw-key fallback. `0` handle → false.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
     if handle == 0 {
-        return 0;
+        return false;
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
     let h = unsafe { &*(handle as *const SessionHandle) };
-    u8::from(h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
+    h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0
 }
 
 /// `NativeBridge.nativeHostSupportsPen(handle)` — the host advertised `HOST_CAP_PEN`, so the
@@ -170,16 +171,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSu
 /// (design/pen-tablet-input.md §7). `0` handle → false.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupportsPen(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
     if handle == 0 {
-        return 0;
+        return false;
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
     let h = unsafe { &*(handle as *const SessionHandle) };
-    u8::from(h.client.host_caps() & HOST_CAP_PEN != 0)
+    h.client.host_caps() & HOST_CAP_PEN != 0
 }
 
 /// Floats per sample in the `nativeSendPen` flat array.
@@ -199,65 +200,69 @@ const PEN_JNI_MAX_SAMPLES: usize = PEN_BATCH_MAX * 8;
 /// while in range (Kotlin side — see `StylusStream`).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     samples: JFloatArray,
     count: jint,
 ) {
-    if handle == 0 || count <= 0 {
-        return;
-    }
-    let count = (count as usize).min(PEN_JNI_MAX_SAMPLES);
-    let mut buf = [0f32; PEN_JNI_MAX_SAMPLES * PEN_JNI_STRIDE];
-    let flat = &mut buf[..count * PEN_JNI_STRIDE];
-    if env.get_float_array_region(&samples, 0, flat).is_err() {
-        return; // short array — a bridge bug, never worth a crash on the input path
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_pen is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    let mut batch = [PenSample::default(); PEN_BATCH_MAX];
-    for run in flat.chunks(PEN_BATCH_MAX * PEN_JNI_STRIDE) {
-        let n = run.len() / PEN_JNI_STRIDE;
-        for (slot, s) in batch.iter_mut().zip(run.chunks_exact(PEN_JNI_STRIDE)) {
-            if !s[2].is_finite() || !s[3].is_finite() {
-                return; // never forward a NaN coordinate
-            }
-            *slot = PenSample {
-                state: s[0] as u8,
-                tool: if s[1] as u8 == 1 {
-                    PenTool::Eraser
-                } else {
-                    PenTool::Pen
-                },
-                x: s[2].clamp(0.0, 1.0),
-                y: s[3].clamp(0.0, 1.0),
-                pressure: (s[4].clamp(0.0, 1.0) * 65535.0) as u16,
-                distance: if s[5] < 0.0 {
-                    PEN_DISTANCE_UNKNOWN
-                } else {
-                    (s[5].clamp(0.0, 1.0) * 65534.0) as u16
-                },
-                tilt_deg: if s[6] < 0.0 {
-                    PEN_TILT_UNKNOWN
-                } else {
-                    (s[6].clamp(0.0, 90.0)) as u8
-                },
-                azimuth_deg: if s[7] < 0.0 {
-                    PEN_ANGLE_UNKNOWN
-                } else {
-                    (s[7] as u16) % 360
-                },
-                roll_deg: if s[8] < 0.0 {
-                    PEN_ANGLE_UNKNOWN
-                } else {
-                    (s[8] as u16) % 360
-                },
-                dt_us: s[9].clamp(0.0, 65535.0) as u16,
-            };
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if handle == 0 || count <= 0 {
+            return Ok(());
         }
-        let _ = h.client.send_pen(&batch[..n]);
-    }
+        let count = (count as usize).min(PEN_JNI_MAX_SAMPLES);
+        let mut buf = [0f32; PEN_JNI_MAX_SAMPLES * PEN_JNI_STRIDE];
+        let flat = &mut buf[..count * PEN_JNI_STRIDE];
+        if samples.get_region(env, 0, flat).is_err() {
+            return Ok(()); // short array — a bridge bug, never worth a crash on the input path
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract; send_pen is &self.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let mut batch = [PenSample::default(); PEN_BATCH_MAX];
+        for run in flat.chunks(PEN_BATCH_MAX * PEN_JNI_STRIDE) {
+            let n = run.len() / PEN_JNI_STRIDE;
+            for (slot, s) in batch.iter_mut().zip(run.chunks_exact(PEN_JNI_STRIDE)) {
+                if !s[2].is_finite() || !s[3].is_finite() {
+                    return Ok(()); // never forward a NaN coordinate
+                }
+                *slot = PenSample {
+                    state: s[0] as u8,
+                    tool: if s[1] as u8 == 1 {
+                        PenTool::Eraser
+                    } else {
+                        PenTool::Pen
+                    },
+                    x: s[2].clamp(0.0, 1.0),
+                    y: s[3].clamp(0.0, 1.0),
+                    pressure: (s[4].clamp(0.0, 1.0) * 65535.0) as u16,
+                    distance: if s[5] < 0.0 {
+                        PEN_DISTANCE_UNKNOWN
+                    } else {
+                        (s[5].clamp(0.0, 1.0) * 65534.0) as u16
+                    },
+                    tilt_deg: if s[6] < 0.0 {
+                        PEN_TILT_UNKNOWN
+                    } else {
+                        (s[6].clamp(0.0, 90.0)) as u8
+                    },
+                    azimuth_deg: if s[7] < 0.0 {
+                        PEN_ANGLE_UNKNOWN
+                    } else {
+                        (s[7] as u16) % 360
+                    },
+                    roll_deg: if s[8] < 0.0 {
+                        PEN_ANGLE_UNKNOWN
+                    } else {
+                        (s[8] as u16) % 360
+                    },
+                    dt_us: s[9].clamp(0.0, 65535.0) as u16,
+                };
+            }
+            let _ = h.client.send_pen(&batch[..n]);
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeSendText(handle, text)` — committed IME text, one `TextInput` event per
@@ -266,20 +271,24 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
 /// [`Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported`] returned true.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendText(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     text: JString,
 ) {
-    if handle == 0 {
-        return;
-    }
-    let Ok(s) = env.get_string(&text) else {
-        return;
-    };
-    for ch in String::from(s).chars().filter(|c| !c.is_control()) {
-        send_event(handle, InputKind::TextInput, ch as u32, 0, 0, 0);
-    }
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if handle == 0 {
+            return Ok(());
+        }
+        let Ok(s) = text.try_to_string(env) else {
+            return Ok(());
+        };
+        for ch in s.chars().filter(|c| !c.is_control()) {
+            send_event(handle, InputKind::TextInput, ch as u32, 0, 0, 0);
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 // ---- Gamepad: Kotlin captures (KeyEvent/MotionEvent) → NativeClient::send_input ---------------
@@ -298,7 +307,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendText(
 /// 0=release. `pad`: wire pad index 0..15 (rides `flags`).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadButton(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     bit: jint,
@@ -309,7 +318,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
         handle,
         InputKind::GamepadButton,
         bit as u32,
-        i32::from(down != 0),
+        i32::from(down),
         0,
         pad as u32,
     );
@@ -320,7 +329,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// (−32768..32767, +y=up) or trigger 0..255. `pad`: wire pad index 0..15 (rides `flags`).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadAxis(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     axis_id: jint,
@@ -345,7 +354,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// the session-default kind from the handshake — the pre-existing single-pad behaviour on pad 0).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadArrival(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pref: jint,
@@ -375,24 +384,24 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// the `Auto` rule inside the predicate itself.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionReaches(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     declared_pref: jint,
 ) -> jboolean {
     if handle == 0 {
-        return 1;
+        return true;
     }
     // SAFETY: live handle per the nativeConnect/nativeClose contract; both fields are plain Copy
     // values read behind `&self`.
     let h = unsafe { &*(handle as *const SessionHandle) };
     let declared =
         punktfunk_core::config::GamepadPref::from_u8(declared_pref.clamp(0, u8::MAX as jint) as u8);
-    u8::from(punktfunk_core::config::pad_motion_reaches(
+    punktfunk_core::config::pad_motion_reaches(
         declared,
         h.client.requested_gamepad,
         h.client.resolved_gamepad,
-    ))
+    )
 }
 
 /// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
@@ -401,7 +410,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
 /// pad) and arms a re-send burst against datagram loss. An older host ignores the unknown tag.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadRemove(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jint,
@@ -417,36 +426,40 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
 /// own report rate (~250–500 Hz) — the direct-buffer read avoids a JNI array copy per report.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidReport(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jint,
     buf: JByteBuffer,
     len: jint,
 ) {
-    if handle == 0 || len <= 0 {
-        return;
-    }
-    let cap = match env.get_direct_buffer_capacity(&buf) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let ptr = match env.get_direct_buffer_address(&buf) {
-        Ok(p) if !p.is_null() => p,
-        _ => return,
-    };
-    let n = (len as usize).min(cap).min(HID_REPORT_MAX);
-    let mut data = [0u8; HID_REPORT_MAX];
-    // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call;
-    // `n` is bounded by both the buffer capacity and the fixed wire body.
-    data[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    let _ = h.client.send_rich_input(RichInput::HidReport {
-        pad: (pad as u32 & 0xF) as u8,
-        len: n as u8,
-        data,
-    });
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if handle == 0 || len <= 0 {
+            return Ok(());
+        }
+        let cap = match env.get_direct_buffer_capacity(&buf) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let ptr = match env.get_direct_buffer_address(&buf) {
+            Ok(p) if !p.is_null() => p,
+            _ => return Ok(()),
+        };
+        let n = (len as usize).min(cap).min(HID_REPORT_MAX);
+        let mut data = [0u8; HID_REPORT_MAX];
+        // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call;
+        // `n` is bounded by both the buffer capacity and the fixed wire body.
+        data[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
+        // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let _ = h.client.send_rich_input(RichInput::HidReport {
+            pad: (pad as u32 & 0xF) as u8,
+            len: n as u8,
+            data,
+        });
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeSendPadTouch(handle, pad, finger, active, x, y)` — one touchpad contact
@@ -457,7 +470,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
 /// the capture diffs, the host holds per-slot state.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouch(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jint,
@@ -474,7 +487,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouc
     let _ = h.client.send_rich_input(RichInput::Touchpad {
         pad: (pad as u32 & 0xF) as u8,
         finger: (finger as u32 & 0x1) as u8,
-        active: active != 0,
+        active,
         x: (x as i64).clamp(0, 65535) as u16,
         y: (y as i64).clamp(0, 65535) as u16,
     });
@@ -488,7 +501,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouc
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMotion(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jint,

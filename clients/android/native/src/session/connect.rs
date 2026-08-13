@@ -1,9 +1,10 @@
 //! Connect lifecycle + the trust surface: identity mint, connect (TOFU / pinned), close,
 //! host-fingerprint read, and the SPAKE2 PIN pairing ceremony.
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
@@ -38,14 +39,12 @@ fn note_error(e: &punktfunk_core::error::PunktfunkError) {
 /// handle / `""` fingerprint.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastError<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
-) -> jni::sys::jstring {
+) -> JString<'local> {
     let token = std::mem::take(&mut *lock_recover(&LAST_ERROR));
-    match env.new_string(token) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
-    }
+    env.with_env(|env| env.new_string(token))
+        .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeGenerateIdentity(): String` — mint a fresh persistent self-signed identity.
@@ -53,9 +52,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastErr
 /// persists it (Keystore-wrapped) and only calls this again when the store is genuinely empty.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIdentity<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
-) -> jni::sys::jstring {
+) -> JString<'local> {
     let out = match punktfunk_core::quic::endpoint::generate_identity() {
         Ok((cert, key)) => format!("{cert}\n-----PUNKTFUNK-KEY-----\n{key}"),
         Err(e) => {
@@ -63,10 +62,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
             String::new()
         }
     };
-    match env.new_string(out) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
-    }
+    env.with_env(|env| env.new_string(out))
+        .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeSetLowLatencyMode(enabled)` — apply the user's "Low-latency mode
@@ -76,11 +73,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
 /// toggle rides explicit per-session parameters (`nativeStartVideo` / `nativeStartAudio`).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLatencyMode(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     enabled: jboolean,
 ) {
-    punktfunk_core::transport::set_dscp_default(enabled != 0);
+    punktfunk_core::transport::set_dscp_default(enabled);
 }
 
 /// `debug.punktfunk.force_parts` = 1: arm slice-progressive parts delivery even when the
@@ -123,7 +120,7 @@ fn force_parts_sysprop() -> bool {
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     host: JString<'local>,
     port: jint,
@@ -147,31 +144,44 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     device_name: JString<'local>,
     pad_audio_ok: jboolean,
 ) -> jlong {
-    let host: String = match env.get_string(&host) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
+    // Every JNI string this method needs, read up front in the one `Env` scope jni 0.22 grants a
+    // native method; everything below is pure Rust over owned `String`s. `None` = the mandatory
+    // `host` could not be read, which is the old `Err(_) => return 0` arm.
+    type ConnectStrings = Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )>;
+    let strings: ConnectStrings = env
+        .with_env(|env| -> jni::errors::Result<ConnectStrings> {
+            let Ok(host) = host.try_to_string(env) else {
+                return Ok(None);
+            };
+            let cert: String = cert_pem.try_to_string(env).unwrap_or_default();
+            let key: String = key_pem.try_to_string(env).unwrap_or_default();
+            let pin_hex: String = pin_hex.try_to_string(env).unwrap_or_default();
+            // A store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a
+            // game; null / empty ⇒ None (a plain desktop connect). Rides the Hello as `launch`.
+            let launch: Option<String> = launch
+                .try_to_string(env)
+                .ok()
+                .filter(|s: &String| !s.is_empty());
+            // The host's approval-list / trust-store label for this device; null / blank ⇒ None (the
+            // host falls back to its fingerprint-derived "device abcd1234" placeholder).
+            let device_name: Option<String> = device_name
+                .try_to_string(env)
+                .ok()
+                .map(|s: String| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Ok(Some((host, cert, key, pin_hex, launch, device_name)))
+        })
+        .resolve::<LogErrorAndDefault>();
+    let Some((host, cert, key, pin_hex, launch, device_name)) = strings else {
+        return 0;
     };
-    let cert: String = env
-        .get_string(&cert_pem)
-        .map(Into::into)
-        .unwrap_or_default();
-    let key: String = env.get_string(&key_pem).map(Into::into).unwrap_or_default();
-    let pin_hex: String = env.get_string(&pin_hex).map(Into::into).unwrap_or_default();
-    // A store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game;
-    // null / empty ⇒ None (a plain desktop connect). Rides the Hello as `launch`.
-    let launch: Option<String> = env
-        .get_string(&launch)
-        .map(Into::into)
-        .ok()
-        .filter(|s: &String| !s.is_empty());
-    // The host's approval-list / trust-store label for this device; null / blank ⇒ None (the host
-    // falls back to its fingerprint-derived "device abcd1234" placeholder).
-    let device_name: Option<String> = env
-        .get_string(&device_name)
-        .map(Into::into)
-        .ok()
-        .map(|s: String| s.trim().to_string())
-        .filter(|s| !s.is_empty());
 
     let identity: Option<(String, String)> = if cert.is_empty() || key.is_empty() {
         None
@@ -184,16 +194,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     // the feature? (`adb shell setprop debug.punktfunk.force_parts 1` + stream restart; a codec
     // that can't take parts errors recoverably and the reanchor gate + keyframe path recovers.)
     let force_parts = force_parts_sysprop();
-    let frame_parts = frame_parts_ok != 0 || force_parts;
+    let frame_parts = frame_parts_ok || force_parts;
     // The connect-time capability readout (`adb logcat -s pf.caps`): the P2 slice pipeline is
     // inert client-side unless BOTH probes pass — this line is the one place that says which.
     log::info!(
         target: "pf.caps",
         "decoder caps: multi_slice={} partial_frame={}{} hdr={} codec_bits={:#x}",
-        multi_slice_ok != 0,
-        frame_parts_ok != 0,
+        multi_slice_ok,
+        frame_parts_ok,
         if force_parts { " (FORCED by sysprop)" } else { "" },
-        hdr_enabled != 0,
+        hdr_enabled,
         video_codecs,
     );
     let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
@@ -229,11 +239,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // decoder this device would use (`VideoDecoders.multiSliceTolerant` — Amlogic wedges the
         // whole device on multi-slice AUs, the 0.17.0 field regression) and only then may the
         // host default to >1 slice per frame (its sub-frame readback / the P2 slice pipeline).
-        (if hdr_enabled != 0 {
+        (if hdr_enabled {
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
         } else {
             0
-        }) | (if multi_slice_ok != 0 {
+        }) | (if multi_slice_ok {
             punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
         } else {
             0
@@ -274,7 +284,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
         // settings so a user with pad audio off does not make the host provision endpoints.
         punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
-            | if pad_audio_ok != 0 {
+            | if pad_audio_ok {
                 punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
             } else {
                 0
@@ -324,7 +334,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
 /// closed exactly once and not concurrently with other calls on the same handle (Kotlin owns this).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
@@ -346,7 +356,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
 /// not freed / closed concurrently with this call (Kotlin still owns it and closes it via `nativeClose`).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQuit(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
@@ -365,10 +375,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
 /// connect. `""` on a `0` handle.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerprint<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
-) -> jni::sys::jstring {
+) -> JString<'local> {
     let out = if handle == 0 {
         String::new()
     } else {
@@ -376,10 +386,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
         let h = unsafe { &*(handle as *const SessionHandle) };
         hex32(&h.client.host_fingerprint)
     };
-    match env.new_string(out) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
-    }
+    env.with_env(|env| env.new_string(out))
+        .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeSessionEnded(handle): Boolean` — has the underlying QUIC session ended?
@@ -390,17 +398,17 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
 /// handle. Cheap (one atomic load); safe on the UI thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnded(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    jni_guard(0, || {
+    jni_guard(false, || {
         if handle == 0 {
-            return 0;
+            return false;
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        jboolean::from(h.client.is_session_ended())
+        h.client.is_session_ended()
     })
 }
 
@@ -415,7 +423,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
 /// atomic load); safe on the UI thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jint {
@@ -436,7 +444,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     host: JString<'local>,
     port: jint,
@@ -444,40 +452,40 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
     key_pem: JString<'local>,
     pin: JString<'local>,
     name: JString<'local>,
-) -> jni::sys::jstring {
-    let g = |e: &mut JNIEnv<'local>, j: &JString<'local>| -> String {
-        e.get_string(j).map(Into::into).unwrap_or_default()
-    };
-    let host = g(&mut env, &host);
-    let cert = g(&mut env, &cert_pem);
-    let key = g(&mut env, &key_pem);
-    let pin = g(&mut env, &pin);
-    let name = g(&mut env, &name);
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let g = |e: &jni::Env<'local>, j: &JString<'local>| -> String {
+            j.try_to_string(e).unwrap_or_default()
+        };
+        let host = g(env, &host);
+        let cert = g(env, &cert_pem);
+        let key = g(env, &key_pem);
+        let pin = g(env, &pin);
+        let name = g(env, &name);
 
-    let out = if host.is_empty() || cert.is_empty() || key.is_empty() {
-        log::error!("nativePair: missing host/identity");
-        String::new()
-    } else {
-        match NativeClient::pair(
-            &host,
-            port as u16,
-            (&cert, &key), // borrowed identity
-            &pin,
-            &name,
-            Duration::from_secs(60),
-        ) {
-            Ok(host_fp) => hex32(&host_fp),
-            Err(e) => {
-                // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
-                // The token lets Kotlin say WHICH (`nativeTakeLastError`).
-                log::error!("nativePair to {host}:{port} failed: {e}");
-                note_error(&e);
-                String::new()
+        let out = if host.is_empty() || cert.is_empty() || key.is_empty() {
+            log::error!("nativePair: missing host/identity");
+            String::new()
+        } else {
+            match NativeClient::pair(
+                &host,
+                port as u16,
+                (&cert, &key), // borrowed identity
+                &pin,
+                &name,
+                Duration::from_secs(60),
+            ) {
+                Ok(host_fp) => hex32(&host_fp),
+                Err(e) => {
+                    // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
+                    // The token lets Kotlin say WHICH (`nativeTakeLastError`).
+                    log::error!("nativePair to {host}:{port} failed: {e}");
+                    note_error(&e);
+                    String::new()
+                }
             }
-        }
-    };
-    match env.new_string(out) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
-    }
+        };
+        env.new_string(out)
+    })
+    .resolve::<LogErrorAndDefault>()
 }

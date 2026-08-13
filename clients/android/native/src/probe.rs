@@ -5,9 +5,10 @@
 //! advertise on mDNS (reached over Tailscale / VPN / another subnet) — the display-side companion
 //! to the dial-first connect fix.
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint};
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use punktfunk_core::client::NativeClient;
 use std::time::Duration;
 
@@ -16,21 +17,17 @@ use std::time::Duration;
 /// Blocking (builds its own runtime) — Kotlin runs it on `Dispatchers.IO`, never the main thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbe<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     host: JString<'local>,
     port: jint,
     timeout_ms: jint,
 ) -> jboolean {
-    let host: String = match env.get_string(&host) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
-    };
-    let port = port.clamp(0, u16::MAX as jint) as u16;
-    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
-    if NativeClient::probe(&host, port, timeout) {
-        1
-    } else {
-        0
-    }
+    env.with_env(|env| -> jni::errors::Result<bool> {
+        let host: String = host.try_to_string(env)?;
+        let port = port.clamp(0, u16::MAX as jint) as u16;
+        let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+        Ok(NativeClient::probe(&host, port, timeout))
+    })
+    .resolve::<LogErrorAndDefault>()
 }

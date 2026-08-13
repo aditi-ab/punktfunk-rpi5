@@ -16,9 +16,10 @@
 //! wrong, and 1 Hz is plenty for a host picker.
 
 use crate::session::jni_guard;
-use jni::objects::JObject;
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{JObject, JString};
 use jni::sys::jlong;
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -202,7 +203,7 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
 /// [`nativeDiscoveryStop`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
 ) -> jlong {
     jni_guard(0, || match Discovery::start() {
@@ -216,11 +217,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
 /// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
-) -> jni::sys::jstring {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JString<'local> {
+    // `with_env` subsumes the `jni_guard` this used to carry: it catches panics at the boundary and
+    // `LogErrorAndDefault` logs then yields `JString::default()` — the null reference the old
+    // `std::ptr::null_mut()` default returned. Kotlin still sees a null String on failure.
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         let out = if handle == 0 {
             String::new()
         } else {
@@ -229,11 +233,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
             let d = unsafe { &*(handle as *const Discovery) };
             d.snapshot()
         };
-        match env.new_string(out) {
-            Ok(s) => s.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        env.new_string(out)
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeDiscoveryStop(handle)` — stop the browse, shut the daemon down and join its
@@ -247,7 +249,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
 /// [`nativeDiscoveryPoll`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
