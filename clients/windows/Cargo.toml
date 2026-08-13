@@ -47,8 +47,15 @@ pf-client-core = { path = "../../crates/pf-client-core", default-features = fals
 # Unpublished (version 0.0.0) and fast-moving, so pinned to a verified commit. Pin bumped
 # 2026-07-29 (from the 2026-07-01 rev) for: reconciler keyed-child-order fix (#4728), widget
 # validation (#4727), DPI collision fix (#4751), icon elements (#4736), multi-window (#4730),
-# scroll virtualization (#4710). All three windows-rs deps here MUST share this rev, and it
-# must match pf-client-core's `windows` pin, so the workspace builds ONE windows-rs.
+# scroll virtualization (#4710). All three windows-rs deps here MUST share this rev, and it must
+# match pf-client-core's `windows` pin — that is what makes the `IDXGISwapChain1` handed to reactor
+# satisfy reactor's own `windows_core::Interface`.
+# ⚠ This is NOT "the workspace builds ONE windows-rs", which an earlier version of this note
+# claimed. `wasapi` (via pf-client-core) pulls the crates.io `windows 0.62.2` alongside this git
+# copy, so both are in the lock and both compile. That costs build time and binary size, not
+# correctness. ⛔ Do NOT try to collapse it with a blanket `[patch.crates-io] windows`: this rev
+# uses header-named features (`dxgi`, `combaseapi`) while a dozen other manifests still use the
+# old `Win32_*` namespace features, and the patch would break every one of them.
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
 # Win32 / DXGI for the GPU picker and the shell's window plumbing. Pulled from the SAME
 # windows-rs commit as windows-reactor so their `windows-core` unifies — the `IDXGISwapChain1`
@@ -84,7 +91,6 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # pf-client-core with the same `build-from-source,hidapi` features, so it is not a direct dep here.
 mdns-sd = "0.20"
 async-channel = "2"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

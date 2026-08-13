@@ -21,7 +21,6 @@ crate-type = ["cdylib"]
 wdk-build.workspace = true
 
 [dependencies]
-wdk.workspace = true
 wdk-sys.workspace = true
 pf-driver-proto.workspace = true
 pf-umdf-util.workspace = true
@@ -29,7 +28,7 @@ pf-umdf-util.workspace = true
 [features]
 default = ["hid"]
 hid = ["wdk-sys/hid"]
-nightly = ["wdk-sys/nightly", "wdk/nightly"]
+nightly = ["wdk-sys/nightly"]
 
 [lints]
 workspace = true

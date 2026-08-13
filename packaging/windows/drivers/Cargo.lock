@@ -407,7 +407,6 @@ version = "0.0.1"
 dependencies = [
  "pf-driver-proto",
  "pf-umdf-util",
- "wdk",
  "wdk-build",
  "wdk-sys",
 ]
@@ -418,7 +417,6 @@ version = "0.0.1"
 dependencies = [
  "pf-driver-proto",
  "pf-umdf-util",
- "wdk",
  "wdk-build",
  "wdk-sys",
 ]
@@ -437,7 +435,6 @@ version = "0.0.1"
 dependencies = [
  "pf-driver-proto",
  "thiserror",
- "wdk",
  "wdk-build",
  "wdk-iddcx",
  "wdk-sys",
@@ -450,7 +447,6 @@ version = "0.0.1"
 dependencies = [
  "pf-driver-proto",
  "pf-umdf-util",
- "wdk",
  "wdk-build",
  "wdk-sys",
 ]
@@ -755,19 +751,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "wdk"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd496a19ec75c3d98f8be805f62ebde4651fc01babf681b832d8bae9c584d25"
-dependencies = [
- "cfg-if",
- "tracing",
- "tracing-subscriber",
- "wdk-build",
- "wdk-sys",
-]
-
-[[package]]
 name = "wdk-build"
 version = "0.5.1"
 dependencies = [
@@ -818,7 +801,6 @@ name = "wdk-probe"
 version = "0.0.1"
 dependencies = [
  "pf-driver-proto",
- "wdk",
  "wdk-build",
  "wdk-sys",
 ]

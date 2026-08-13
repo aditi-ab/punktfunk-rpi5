@@ -45,7 +45,6 @@ aes-gcm = "0.10"               # AES-128-GCM session crypto, matches GameStream
 # cross-compiles like aes-gcm (no cmake). See design/chacha20-session-cipher.md.
 chacha20poly1305 = "0.10"
 zerocopy = { version = "0.8", features = ["derive"] }
-bytes = "1"
 socket2 = { version = "0.6", features = [
     "all",
 ] } # SO_SNDBUF/SO_RCVBUF growth (default UDP buffers too small for 4K/5K bursts) + DSCP/SO_PRIORITY media QoS
