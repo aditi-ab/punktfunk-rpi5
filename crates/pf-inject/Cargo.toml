@@ -46,7 +46,7 @@ futures-util = "0.3"
 # unrelated crate dropping it would have broken this one.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
-xkbcommon = "0.8"
+xkbcommon = "0.9"
 # Vendored + trimmed usbip server core — presents a virtual Steam Deck over USB/IP for Steam Input.
 usbip-sim = { path = "../punktfunk-host/vendor/usbip-sim" }
 
