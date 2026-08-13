@@ -24,7 +24,7 @@ use {
     super::AUDIO_PORT,
     crate::audio::{self, AudioCapturer},
     anyhow::{Context, Result},
-    cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit},
+    cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit},
     std::net::UdpSocket,
     std::sync::atomic::{AtomicBool, Ordering},
     std::sync::Arc,
@@ -429,7 +429,7 @@ fn audio_body(
             let mut iv = [0u8; 16];
             iv[0..4].copy_from_slice(&iv_seq.to_be_bytes());
             let ct = Aes128CbcEnc::new(gcm_key.into(), (&iv).into())
-                .encrypt_padded_vec_mut::<Pkcs7>(&out[..n]);
+                .encrypt_padded_vec::<Pkcs7>(&out[..n]);
             let pkt = build_rtp(seq, timestamp, &ct);
             if sock.send(&pkt).is_err() {
                 tracing::info!(sent, "audio: client unreachable — ending session");

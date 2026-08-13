@@ -38,12 +38,12 @@ reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the w
 # parity is decodable by a stock Moonlight client. (reed-solomon-erasure is Vandermonde and is
 # NOT interoperable.) See vendor/fec-rs/LICENSE (BSD-2-Clause).
 fec-rs = { path = "vendor/fec-rs" }
-aes-gcm = "0.10"               # AES-128-GCM session crypto, matches GameStream
+aes-gcm = "0.11"               # AES-128-GCM session crypto, matches GameStream
 # ChaCha20-Poly1305 session crypto, negotiated by clients without hardware AES (the soft-AES
 # armv7 targets — webOS TVs — where GCM caps decrypt at ~100 Mbps; ARX runs 4-7x faster there).
-# Same RustCrypto `aead 0.5` generation as aes-gcm: identical trait/nonce/tag shapes, pure Rust,
+# Same RustCrypto `aead 0.6` generation as aes-gcm: identical trait/nonce/tag shapes, pure Rust,
 # cross-compiles like aes-gcm (no cmake). See design/chacha20-session-cipher.md.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 zerocopy = { version = "0.8", features = ["derive"] }
 socket2 = { version = "0.6", features = [
     "all",
@@ -82,8 +82,8 @@ ureq = { version = "3", optional = true, default-features = false, features = [
     "rustls-webpki-roots",
     "gzip",
 ] }
-sha2 = { version = "0.10", optional = true }
-hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.11", optional = true }
+hmac = { version = "0.13", optional = true }
 spake2 = { version = "0.4", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "macros"] }
 # In-core Opus (multistream) DECODE for the C-ABI `punktfunk_connection_next_audio_pcm` path —

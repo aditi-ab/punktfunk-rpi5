@@ -30,8 +30,8 @@
 
 use crate::config::Role;
 use crate::error::{PunktfunkError, Result};
-use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, Payload};
-use aes_gcm::{Aes128Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, AeadInOut, KeyInit, Payload};
+use aes_gcm::Aes128Gcm;
 use chacha20poly1305::ChaCha20Poly1305;
 use zeroize::Zeroize;
 
@@ -95,7 +95,7 @@ impl Zeroize for SessionKey {
 }
 
 /// The two negotiated AEADs behind one seal/open surface. Both are the same RustCrypto
-/// `aead 0.5` generation (identical trait shapes, nonce/tag types), so each call below is a
+/// `aead 0.6` generation (identical trait shapes, nonce/tag types), so each call below is a
 /// two-arm match right next to the cipher work itself.
 // AES's precomputed round keys (~0.7 KB) dwarf ChaCha's 32-byte state, but there is exactly
 // one long-lived `SessionCrypto` per session — boxing the variant would trade that one-off
@@ -117,12 +117,12 @@ pub struct SessionCrypto {
 impl SessionCrypto {
     pub fn new(key: &SessionKey, salt: [u8; 4], role: Role) -> Self {
         let cipher = match key {
-            SessionKey::Aes128Gcm(k) => {
-                Cipher::Aes128Gcm(Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(k)))
+            // `&[u8; N] -> &Array<u8, UN>` is a checked-at-compile-time reference cast (the
+            // `hybrid_array` successor to `generic-array`'s runtime-length `from_slice`).
+            SessionKey::Aes128Gcm(k) => Cipher::Aes128Gcm(Aes128Gcm::new(k.into())),
+            SessionKey::ChaCha20Poly1305(k) => {
+                Cipher::ChaCha20Poly1305(ChaCha20Poly1305::new(k.into()))
             }
-            SessionKey::ChaCha20Poly1305(k) => Cipher::ChaCha20Poly1305(ChaCha20Poly1305::new(
-                Key::<ChaCha20Poly1305>::from_slice(k),
-            )),
         };
         let own = direction(role);
         SessionCrypto {
@@ -142,8 +142,8 @@ impl SessionCrypto {
             aad: &aad,
         };
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => c.encrypt(Nonce::from_slice(&nonce), payload),
-            Cipher::ChaCha20Poly1305(c) => c.encrypt(Nonce::from_slice(&nonce), payload),
+            Cipher::Aes128Gcm(c) => c.encrypt((&nonce).into(), payload),
+            Cipher::ChaCha20Poly1305(c) => c.encrypt((&nonce).into(), payload),
         }
         .map_err(|_| PunktfunkError::Crypto)
     }
@@ -160,10 +160,10 @@ impl SessionCrypto {
         let aad = seq.to_be_bytes();
         let tag = match &self.cipher {
             Cipher::Aes128Gcm(c) => {
-                c.encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, plaintext)
+                c.encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
             }
             Cipher::ChaCha20Poly1305(c) => {
-                c.encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, plaintext)
+                c.encrypt_inout_detached((&nonce).into(), &aad, plaintext.into())
             }
         }
         .map_err(|_| PunktfunkError::Crypto)?;
@@ -180,8 +180,8 @@ impl SessionCrypto {
             aad: &aad,
         };
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => c.decrypt(Nonce::from_slice(&nonce), payload),
-            Cipher::ChaCha20Poly1305(c) => c.decrypt(Nonce::from_slice(&nonce), payload),
+            Cipher::Aes128Gcm(c) => c.decrypt((&nonce).into(), payload),
+            Cipher::ChaCha20Poly1305(c) => c.decrypt((&nonce).into(), payload),
         }
         .map_err(|_| PunktfunkError::Crypto)
     }
@@ -201,19 +201,18 @@ impl SessionCrypto {
         let split = buf.len() - TAG_LEN;
         let (ciphertext, tag) = buf.split_at_mut(split);
         let aad = seq.to_be_bytes();
+        // `split_at_mut` above already fixed this at exactly TAG_LEN, and the two AEADs share the
+        // one 16-byte tag type (the const asserts at the top of the module), so this reference cast
+        // is infallible and serves both arms — mapped rather than unwrapped to keep the hot path
+        // panic-free.
+        let tag: &aes_gcm::Tag = (&*tag).try_into().map_err(|_| PunktfunkError::Crypto)?;
         match &self.cipher {
-            Cipher::Aes128Gcm(c) => c.decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &aad,
-                ciphertext,
-                aes_gcm::Tag::from_slice(tag),
-            ),
-            Cipher::ChaCha20Poly1305(c) => c.decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &aad,
-                ciphertext,
-                chacha20poly1305::Tag::from_slice(tag),
-            ),
+            Cipher::Aes128Gcm(c) => {
+                c.decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag)
+            }
+            Cipher::ChaCha20Poly1305(c) => {
+                c.decrypt_inout_detached((&nonce).into(), &aad, ciphertext.into(), tag)
+            }
         }
         .map_err(|_| PunktfunkError::Crypto)?;
         Ok(split)

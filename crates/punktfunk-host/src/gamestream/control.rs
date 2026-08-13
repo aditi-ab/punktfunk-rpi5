@@ -798,19 +798,19 @@ fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<
 /// AES-128-GCM seal (companion to [`gcm_open`]); returns `ciphertext || tag`.
 fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
     use aes_gcm::aead::consts::{U12, U16};
-    use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{aes::Aes128, AesGcm};
 
     let p = Payload { msg: pt, aad };
+    // Each arm's `try_into` is guarded by the length it matched on.
     match nonce.len() {
         12 => AesGcm::<Aes128, U12>::new_from_slice(key)
             .unwrap()
-            .encrypt(GenericArray::from_slice(nonce), p)
+            .encrypt(nonce.try_into().expect("12-byte nonce"), p)
             .expect("GCM seal"),
         16 => AesGcm::<Aes128, U16>::new_from_slice(key)
             .unwrap()
-            .encrypt(GenericArray::from_slice(nonce), p)
+            .encrypt(nonce.try_into().expect("16-byte nonce"), p)
             .expect("GCM seal"),
         _ => unreachable!("nonce length"),
     }
@@ -820,7 +820,6 @@ fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
 /// the tag authenticates. `ct_tag` is `ciphertext || tag` (aes-gcm's expected order).
 fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     use aes_gcm::aead::consts::{U12, U16};
-    use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{aes::Aes128, AesGcm};
 
@@ -828,11 +827,11 @@ fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<V
     match nonce.len() {
         12 => AesGcm::<Aes128, U12>::new_from_slice(key)
             .ok()?
-            .decrypt(GenericArray::from_slice(nonce), p)
+            .decrypt(nonce.try_into().ok()?, p)
             .ok(),
         16 => AesGcm::<Aes128, U16>::new_from_slice(key)
             .ok()?
-            .decrypt(GenericArray::from_slice(nonce), p)
+            .decrypt(nonce.try_into().ok()?, p)
             .ok(),
         _ => None,
     }

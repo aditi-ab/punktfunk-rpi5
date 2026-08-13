@@ -1,7 +1,7 @@
 //! SPAKE2 password-authenticated key exchange for pairing: derive a shared key from the PIN and
 //! confirm it against both certificate fingerprints.
 use crate::error::{PunktfunkError, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
 /// In-progress SPAKE2 state plus the identity transcript for key confirmation.
@@ -36,8 +36,9 @@ pub fn start(
 /// Key confirmation MAC for one direction (`label` distinguishes host vs client), keyed
 /// by the SPAKE2 shared key and bound to the fingerprint transcript.
 fn confirm(key: &[u8], label: &[u8], transcript: &[u8]) -> [u8; 32] {
+    // `new_from_slice` moved from `Mac` to `KeyInit` in the digest 0.11 / crypto-common 0.2 wave.
     let mut mac =
-        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("hmac takes any key length");
+        <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("hmac takes any key length");
     mac.update(label);
     mac.update(transcript);
     mac.finalize().into_bytes().into()
