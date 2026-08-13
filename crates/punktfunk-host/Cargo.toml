@@ -97,7 +97,13 @@ rand = "0.9"
 hex = "0.4"
 # Cover-art delivery in the game library: encode Lutris's local JPEGs into `data:` URLs and decode
 # the Epic launcher's base64 `catcache.bin`. Cross-platform (Linux Lutris art + Windows Epic art).
-base64 = "0.22"
+# `default-features = false` + `std` deliberately: 0.23 added a default-ON `simd-unsafe` feature
+# (hand-written AVX2/NEON engines). ureq already declares base64 exactly this way, so taking the
+# defaults here would unify the feature ON and pull that unsafe code into every build as a side
+# effect of a version bump. Turning it on is a perf decision worth making on purpose, with a
+# measurement — not one to inherit silently. `std` covers everything we call (`Engine::encode`,
+# `decode` to a `Vec`).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Blocking HTTP for the library cover-art warmer (no-auth GOG api.gog.com + Xbox displaycatalog),
 # run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
 # webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
