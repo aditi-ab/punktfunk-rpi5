@@ -819,7 +819,8 @@ async fn paired_clients_list_and_unpair() {
     {
         let mut p = state.paired.lock().unwrap();
         p.clear();
-        p.push(der);
+        // Cloned, not moved: the unpair-all section at the end of this test re-seeds it.
+        p.push(der.clone());
     }
 
     let (status, body) = send(&app, get_req("/api/v1/clients")).await;
@@ -888,6 +889,71 @@ async fn paired_clients_list_and_unpair() {
         serde_json::from_slice::<Vec<Vec<u8>>>(&disk).unwrap(),
         Vec::<Vec<u8>>::new()
     );
+
+    // ---- the COLLECTION delete: unpair everything at once -----------------------------------
+    //
+    // Re-seed two clients (the store was just emptied) and clear the teardown flags, so what the
+    // bulk delete does to a live session is attributable to IT and not left over from above.
+    let second = crate::identity::ephemeral().unwrap();
+    let (_, second_pem) = x509_parser::pem::parse_x509_pem(second.cert_pem.as_bytes()).unwrap();
+    let second_der = second_pem.contents.clone();
+    let second_fp = hex::encode(Sha256::digest(&second_der));
+    {
+        use std::sync::atomic::Ordering;
+        let mut p = state.paired.lock().unwrap();
+        p.clear();
+        p.push(der.clone());
+        p.push(second_der);
+        state.quit.store(false, Ordering::SeqCst);
+        state.streaming.store(true, Ordering::SeqCst);
+        // A live session owned by the SECOND client — the bulk delete must end whichever of the
+        // removed certs owns it, not just the first one it happens to walk past.
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&hex::decode(&second_fp).unwrap());
+        *state.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: Some(owner),
+        });
+    }
+
+    let del_all = || {
+        axum::http::Request::delete("/api/v1/clients")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = send(&app, del_all()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["unpaired"], 2, "both clients must be reported removed");
+
+    let (_, body) = send(&app, get_req("/api/v1/clients")).await;
+    assert_eq!(body, serde_json::json!([]));
+    {
+        use std::sync::atomic::Ordering;
+        assert!(
+            state.launch.lock().unwrap().is_none(),
+            "unpair-all must end the live session of any client it revokes"
+        );
+        assert!(state.quit.load(Ordering::SeqCst));
+    }
+    // Persisted, for the same reason the single unpair is: a resurrected pairing would re-open
+    // the control port on the next boot.
+    let disk = std::fs::read(tmp.path().join("paired.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<Vec<u8>>>(&disk).unwrap(),
+        Vec::<Vec<u8>>::new()
+    );
+
+    // Idempotent: emptying an empty store is a 200 with a zero count, NOT the single delete's 404.
+    // ("unpair everything" is already satisfied — there is no missing resource to report.)
+    let (status, body) = send(&app, del_all()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["unpaired"], 0);
 }
 
 #[cfg(feature = "gamestream")]
@@ -1248,8 +1314,13 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // ---- paired-device rosters: readable by a plugin, never by another paired client, and
         // removal is pairing administration in both lanes.
         ("GET", "/api/v1/clients", true, false),
+        // The bulk form is the same authority as the single one — and, sharing its path with a
+        // plugin-readable GET, worth an explicit row: both gates match on (method, path), so the
+        // roster's read permission must never carry over to emptying it.
+        ("DELETE", "/api/v1/clients", false, false),
         ("DELETE", "/api/v1/clients/{fingerprint}", false, false),
         ("GET", "/api/v1/native/clients", true, false),
+        ("DELETE", "/api/v1/native/clients", false, false),
         (
             "DELETE",
             "/api/v1/native/clients/{fingerprint}",
@@ -1665,6 +1736,56 @@ async fn native_pairing_arm_show_and_unpair() {
     assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
     let (_, b) = send(&app, get_req("/api/v1/native/pair")).await;
     assert_eq!(b["armed"], false);
+}
+
+/// The collection delete on the native plane: one call empties the trust store, and repeating it
+/// is a zero-count success rather than an error.
+#[tokio::test]
+async fn native_unpair_all_empties_the_trust_store() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(std::env::temp_dir().join(format!("pf-mgmt-np-all-{}.json", std::process::id()))),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+
+    np.add("Living room TV", "aa11").unwrap();
+    np.add("Studio Deck", "bb22").unwrap();
+    assert_eq!(np.list().len(), 2);
+
+    let del_all = || {
+        axum::http::Request::delete("/api/v1/native/clients")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = send(&app, del_all()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["unpaired"], 2);
+
+    // Gone from both the API and the store behind it (one persisted write, not two).
+    let (_, body) = send(&app, get_req("/api/v1/native/clients")).await;
+    assert_eq!(body, serde_json::json!([]));
+    assert!(np.list().is_empty());
+    assert!(!np.is_paired("aa11") && !np.is_paired("bb22"));
+
+    // Idempotent — unlike the single delete, which 404s on a fingerprint it cannot find.
+    let (status, body) = send(&app, del_all()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["unpaired"], 0);
+}
+
+/// Without a native plane there is no trust store to empty — 503, matching every other
+/// `/native/*` route (and NOT a silent 200 that would tell the console it had unpaired something).
+#[tokio::test]
+async fn native_unpair_all_without_a_native_host_is_unavailable() {
+    let app = test_app(test_state(), None);
+    let req = axum::http::Request::delete("/api/v1/native/clients")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, req).await.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

@@ -159,6 +159,12 @@ impl NativePairing {
         self.store.remove(fp_hex)
     }
 
+    /// Remove EVERY paired client in one persisted write. Returns the fingerprints removed, so the
+    /// caller can end the sessions they own. On a persist failure nothing is removed.
+    pub fn remove_all(&self) -> Result<Vec<String>> {
+        self.store.remove_all()
+    }
+
     // -- Delegated approval (roadmap §8b-1) ---------------------------------
 
     /// Record an unpaired device's knock for delegated approval. Re-knocks from the same fingerprint
