@@ -997,7 +997,7 @@
           "library"
         ],
         "summary": "List the game library",
-        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns; `?platform=` to one platform (case-insensitive —\ninstalled-store titles are `PC`, custom/provider entries carry whatever was authored).\n\n**The operator's own lane additionally sees the titles they have HIDDEN**, each carrying\n`hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The\nconsole needs them to offer \"un-hide\", and it is the only surface that does.",
+        "description": "Every title this host knows about, sorted by title: the entries each installed library plugin\nhas synced (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …) plus the user's\nown custom entries. Artwork fields are URLs the client fetches directly, except local files on\nthe host, which are rewritten to this API's own art proxy. `?provider=` narrows to the entries a\ngiven external provider owns; `?platform=` to one platform (case-insensitive — whatever the\nsource authored, conventionally `PC` for desktop stores).\n\n**The operator's own lane additionally sees the titles they have HIDDEN**, each carrying\n`hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The\nconsole needs them to offer \"un-hide\", and it is the only surface that does.",
         "operationId": "getLibrary",
         "parameters": [
           {
@@ -1052,7 +1052,7 @@
           "library"
         ],
         "summary": "Fetch one cover-art image for a library entry",
-        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,\nand a library plugin's claimed-store entries) serves its local art file. A Steam title falls back\nto the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the\nuser's Steam client already shows for it), the public Steam CDN's flat URL convention second\n(newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case\nthis 404s and the client falls through to its next art candidate).",
+        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,\nand a library plugin's claimed-store entries) serves its local art file; anything else 404s and\nthe client falls through to its next art candidate.\n\nThe host fetches nothing here. Art a plugin published as an `http(s)` URL is fetched by the\nclient directly — this proxy exists for the *local* files a plugin finds on the host's own disk\n(a launcher's cover cache), which a client has no way to read.",
         "operationId": "getLibraryArt",
         "parameters": [
           {
@@ -1380,7 +1380,7 @@
           "library"
         ],
         "summary": "Replace a provider's library entries (declarative reconcile)",
-        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.\n\n`?store=` additionally **claims** that store for the provider: its entries then surface with\ndeterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque\n`custom:<id>` ones — which is what lets a library plugin reproduce the entries an in-host scanner\nused to produce, right down to the GameStream app ids and client-side art caches. One provider\nper store; a second claimant gets 409. While a claim is held the matching built-in scanner is\nsuppressed, so the two never double-list. The claim is released by `DELETE`, not by an empty\nreconcile (a store can legitimately have zero installed titles).",
+        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.\n\n`?store=` additionally **claims** that store for the provider: its entries then surface with\ndeterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque\n`custom:<id>` ones — which is what let a library plugin reproduce the entries the in-host scanner\nused to produce, right down to the GameStream app ids and client-side art caches, and is why\nremoving those scanners changed nothing downstream. One provider per store; a second claimant\ngets 409. The claim is released by `DELETE`, not by an empty reconcile (a store can legitimately\nhave zero installed titles).",
         "operationId": "reconcileProviderEntries",
         "parameters": [
           {
@@ -1538,8 +1538,8 @@
         "tags": [
           "library"
         ],
-        "summary": "List the library scanners",
-        "description": "The installed-store scanners this host supports — the list is platform-dependent (Steam\neverywhere; Lutris + Heroic on Linux; Epic, GOG, and Xbox/Game Pass on Windows), so the console\nrenders a toggle only for scanners that can do anything here. Scanners default to enabled;\ndisabling one hides its titles from every library surface from the next read. The user-curated\ncustom store is not a scanner and is always on.",
+        "summary": "List the library sources",
+        "description": "Every game source on this host with its enable state — one row per installed library plugin\n(Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …), so the list reflects what\nthe operator has actually installed rather than what this build happens to support. Sources\ndefault to enabled; disabling one hides its titles from every library surface from the next\nread. The user-curated custom store is not a source and is always on.\n\nOlder hosts (≤ v0.27.x) also listed the six scanners built into the host binary, with\n`origin: \"builtin\"`. Those are gone; every row now reports `origin: \"plugin\"`.",
         "operationId": "listLibraryScanners",
         "responses": {
           "200": {
@@ -1573,8 +1573,8 @@
         "tags": [
           "library"
         ],
-        "summary": "Enable or disable a library scanner",
-        "description": "Persists the toggle and applies it from the next library read (no restart). Disabling a scanner\nhides its titles everywhere — the console grid, native clients, and the GameStream app list —\nand re-enabling brings them straight back (nothing is deleted; the scan just runs again). Emits\n`library.changed` with the scanner id as `source` when the state changed.",
+        "summary": "Enable or disable a library source",
+        "description": "Persists the toggle and applies it from the next library read (no restart). Disabling a source\nhides its titles everywhere — the console grid, native clients, and the GameStream app list —\nand re-enabling brings them straight back. Nothing is deleted: the plugin may keep reconciling\nwhile its source is off, and those entries simply aren't surfaced. Emits `library.changed` with\nthe source id as `source` when the state changed.",
         "operationId": "setLibraryScanner",
         "parameters": [
           {
@@ -5397,7 +5397,7 @@
                   "string",
                   "null"
                 ],
-                "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
+                "description": "The external provider owning this entry (entries synced by a provider plugin, RFC §8) —\n`None` only for the manual entries the operator typed in. The console uses it for\nattribution; `GET /library?provider=` filters on it."
               },
               "role": {
                 "$ref": "#/components/schemas/GameRole",
@@ -7143,7 +7143,7 @@
           },
           "origin": {
             "$ref": "#/components/schemas/SourceOrigin",
-            "description": "Where the source comes from: `builtin` (a scanner in this host build) or `plugin`."
+            "description": "Where the source comes from. Always `plugin` from this host build onward — see\n[`SourceOrigin`]."
           },
           "provider": {
             "type": [
@@ -7163,7 +7163,7 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether the scanner should run on this host."
+            "description": "Whether this source should contribute titles on this host."
           }
         }
       },
@@ -7958,7 +7958,7 @@
     },
     {
       "name": "library",
-      "description": "Game library: installed-store titles (Steam) plus user-curated custom entries"
+      "description": "Game library: the titles each installed library plugin syncs, plus user-curated custom entries"
     },
     {
       "name": "stats",

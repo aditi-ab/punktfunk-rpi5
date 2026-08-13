@@ -325,7 +325,7 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
 
 /// Windows: the default Steam install's `steam.exe`, if present. A non-default Steam install dir
 /// (registry `Valve\Steam\InstallPath`) isn't covered — the explorer.exe protocol fallback handles
-/// that case. Mirrors [`steam_roots`]' "default Program Files dirs" approach.
+/// that case. Probes the default Program Files dirs, in `ProgramFiles(x86)`-first order.
 #[cfg(windows)]
 fn steam_exe() -> Option<std::path::PathBuf> {
     for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
@@ -337,6 +337,47 @@ fn steam_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Resolve a package's PackageFamilyName by finding its
+/// `AppRepository\Packages\<PackageFullName>` dir (machine-wide, SYSTEM-readable) and reducing the
+/// full name to `Name_PublisherHash`. This READS the authoritative PFN — never compute the hash.
+///
+/// **Readable by the host, NOT by the plugin runner.** Measured on 2026-08-06: that directory is
+/// `UnauthorizedAccessException` for `NT AUTHORITY\LocalService` (which the runner is), while the
+/// host service runs as LocalSystem and enumerates all 348 entries. That asymmetry is the entire
+/// reason the `xbox` launch kind exists — a library plugin sends the package Identity it CAN read
+/// out of `MicrosoftGame.config`, and this resolves the rest at launch time.
+///
+/// It lives here rather than beside a scanner because it is **launch** vocabulary: the in-host Xbox
+/// scanner that used to share it was removed with the rest of the built-ins, and the plugin that
+/// replaced it depends on exactly this resolution step.
+#[cfg(windows)]
+fn xbox_pfn(identity: &str) -> Option<String> {
+    let pkgs = std::path::PathBuf::from(std::env::var_os("ProgramData")?)
+        .join("Microsoft")
+        .join("Windows")
+        .join("AppRepository")
+        .join("Packages");
+    let prefix = format!("{identity}_");
+    for e in std::fs::read_dir(&pkgs).ok()?.flatten() {
+        let dn = e.file_name().to_string_lossy().into_owned();
+        if dn.starts_with(&prefix) {
+            if let Some(pfn) = pfn_from_full(&dn, identity) {
+                return Some(pfn);
+            }
+        }
+    }
+    None
+}
+
+/// PackageFamilyName from a PackageFullName dir name
+/// (`Name_Version_Arch_ResourceId_PublisherHash`) → `Name_PublisherHash`. The hash is the last
+/// `_`-segment; `Name` is the caller's identity.
+#[cfg(windows)]
+fn pfn_from_full(dir_name: &str, identity: &str) -> Option<String> {
+    let hash = dir_name.rsplit('_').next()?;
+    (!hash.is_empty() && hash != dir_name).then(|| format!("{identity}_{hash}"))
 }
 
 // ------------------------------------------------------- per-kind launch values (host-owned ABI)
@@ -939,6 +980,24 @@ mod tests {
         assert_eq!(cmd2, "\"C:\\g.exe\"");
         assert!(wd2.is_none());
         assert!(gog_spawn("").is_none());
+    }
+
+    /// Moved here with `xbox_pfn` when the built-in scanners were removed: reducing a
+    /// PackageFullName to its family name is what the `xbox` launch kind does with the Identity a
+    /// de-privileged plugin sends it, so the guard belongs to the launch path now.
+    #[cfg(windows)]
+    #[test]
+    fn pfn_reduces_a_package_full_name_to_its_family() {
+        assert_eq!(
+            pfn_from_full(
+                "Microsoft.624F8B84B80_1.0.0.0_x64__8wekyb3d8bbwe",
+                "Microsoft.624F8B84B80"
+            )
+            .as_deref(),
+            Some("Microsoft.624F8B84B80_8wekyb3d8bbwe")
+        );
+        // No `_` at all → nothing to reduce, and we must not invent a hash.
+        assert!(pfn_from_full("NoUnderscore", "NoUnderscore").is_none());
     }
 
     #[cfg(windows)]

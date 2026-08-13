@@ -2136,11 +2136,16 @@ async fn hooks_get_shape_and_put_validation() {
 
 // ------------------------------------------------------------------ library scanners
 
-/// The scanner list is platform-shaped and read-only-safe; the toggle rejects unknown ids
+/// The source list is plugin-shaped and read-only-safe; the toggle rejects unknown ids
 /// with 404. (A successful toggle PUT would write the developer's real
 /// `library-scanners.json`, so the write path is exercised only through the unknown-id
 /// rejection here — the settings round-trip itself is unit-tested in `library::scanners`
 /// against pure shapes.)
+///
+/// This used to assert that `steam` is present on every platform, which was the defining property
+/// while the scanners were compiled in. It is deliberately gone: the list is now derived entirely
+/// from what the operator has installed, so on a host with no library plugins it is legitimately
+/// empty. What replaces it is the invariant that outlives the built-ins — **every** row is a plugin.
 #[tokio::test]
 async fn library_scanner_list_and_unknown_toggle() {
     let app = test_app(test_state(), None);
@@ -2149,12 +2154,16 @@ async fn library_scanner_list_and_unknown_toggle() {
     assert_eq!(s, StatusCode::OK);
     let scanners = json.as_array().expect("a scanner array");
     assert!(
-        scanners
-            .iter()
-            .any(|sc| sc["id"] == "steam" && sc["label"].is_string() && sc["enabled"].is_boolean()),
-        "steam must be a scanner on every platform: {json}"
+        scanners.iter().all(|sc| sc["origin"] == "plugin"),
+        "no host build reports a builtin source any more: {json}"
     );
-    // Only platform-available scanners appear (`custom` is a store, never a scanner).
+    assert!(
+        scanners.iter().all(|sc| sc["id"].is_string()
+            && sc["label"].is_string()
+            && sc["enabled"].is_boolean()),
+        "every source row must carry the shape the console renders: {json}"
+    );
+    // `custom` is a store, never a source — the toggle surface must not offer it.
     assert!(scanners.iter().all(|sc| sc["id"] != "custom"));
 
     let (s, json) = send(
@@ -2170,7 +2179,7 @@ async fn library_scanner_list_and_unknown_toggle() {
     assert_eq!(
         s,
         StatusCode::NOT_FOUND,
-        "unknown scanner id must 404: {json}"
+        "unknown source id must 404: {json}"
     );
 }
 

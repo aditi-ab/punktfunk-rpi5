@@ -404,10 +404,10 @@ pub(crate) async fn serve(
     crate::vdisplay::preflight_takeover_privilege();
     // …and the other end of that: give the box its session back when WE are the ones going away.
     install_shutdown_restore();
-    // Host-lifetime cover-art warmer: fetches + caches GOG/Xbox cover art (no-auth api.gog.com /
-    // displaycatalog) off the hot path so `all_games()` (the library list + launch resolve) never
-    // blocks on the network. A no-op on a host whose stores all carry their own art.
-    let _art_warmer = crate::library::start_art_warmer();
+    // (No cover-art warmer any more: it existed to fetch GOG/Xbox art off the hot path for the two
+    // built-in scanners that had to ask a network catalog what a cover was. Those scanners are gone,
+    // and a library plugin resolves art while it scans and publishes it on the entry — so `all_games()`
+    // never touches the network to begin with.)
     // Pairing state (arming PIN + trust store) is shared with the management API. If it was armed
     // at startup (the CLI flags), surface the PIN the headless operator reads from the log; the
     // web console arms it on demand instead (a fresh, time-limited PIN).

@@ -44,8 +44,8 @@ fn parse_compositor(s: &str) -> Option<crate::vdisplay::Compositor> {
 }
 
 /// The GameStream catalog Moonlight sees in `/applist`: the operator base ([`base_catalog`] — Desktop +
-/// apps.json) with the host's auto-detected game library ([`append_library`]) layered on top, so a
-/// Moonlight client sees the same Steam/Epic/GOG/Xbox titles the native clients do instead of just Desktop.
+/// apps.json) with the host's game library ([`append_library`]) layered on top, so a Moonlight client
+/// sees the same titles the native clients do instead of just Desktop.
 pub fn catalog() -> Vec<AppEntry> {
     let mut apps = base_catalog();
     append_library(&mut apps);
@@ -128,7 +128,7 @@ fn base_catalog() -> Vec<AppEntry> {
 /// the small Desktop/apps.json ids so the two never collide.
 const LIBRARY_ID_BASE: u32 = 0x4000_0000;
 
-/// Append the host's installed game library ([`crate::library::all_games`] — Steam/Epic/GOG/Xbox/custom)
+/// Append the host's game library ([`crate::library::all_games`] — every enabled source's titles)
 /// to `apps`. Each title gets a STABLE GameStream `<ID>` derived from its store-qualified library id
 /// (Moonlight caches appids, so a title keeps its id across host restarts), carries that library id so
 /// the launch path resolves it against the host's own library, and is de-duplicated (by id) against the
@@ -251,7 +251,7 @@ mod tests {
     /// pins that the claimed shape is that shape, and that an unclaimed one would NOT have been.
     #[test]
     fn a_claimed_plugin_entry_keeps_the_scanners_gamestream_id() {
-        // What the built-in scanner produced, and what the steam plugin produces once it claims.
+        // What the built-in scanner produced, and what the steam plugin produces now that it claims.
         assert_eq!(stable_app_id("steam:440"), stable_app_id("steam:440"));
         // The same title reconciled WITHOUT a claim gets an opaque `custom:` id — a different app
         // id, i.e. exactly the breakage the claim prevents.

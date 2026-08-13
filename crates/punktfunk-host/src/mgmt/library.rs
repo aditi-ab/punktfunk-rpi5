@@ -1,5 +1,5 @@
-//! Library-tagged management endpoints: installed-store + custom game entries and box art.
-//! Split out of the `mgmt` facade (plan §W5).
+//! Library-tagged management endpoints: the game catalog (plugin-synced + custom entries), the
+//! source toggles, the provider reconcile API and box art. Split out of the `mgmt` facade (plan §W5).
 
 use super::auth::AuthLane;
 use super::shared::*;
@@ -70,11 +70,12 @@ pub(crate) struct LibraryQuery {
 
 /// List the game library
 ///
-/// Every installed-store title (Steam, read from the host's local files — no Steam API key)
-/// merged with the user's custom entries, sorted by title. Artwork fields are URLs the client
-/// fetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the
-/// entries a given external provider owns; `?platform=` to one platform (case-insensitive —
-/// installed-store titles are `PC`, custom/provider entries carry whatever was authored).
+/// Every title this host knows about, sorted by title: the entries each installed library plugin
+/// has synced (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …) plus the user's
+/// own custom entries. Artwork fields are URLs the client fetches directly, except local files on
+/// the host, which are rewritten to this API's own art proxy. `?provider=` narrows to the entries a
+/// given external provider owns; `?platform=` to one platform (case-insensitive — whatever the
+/// source authored, conventionally `PC` for desktop stores).
 ///
 /// **The operator's own lane additionally sees the titles they have HIDDEN**, each carrying
 /// `hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The
@@ -222,17 +223,20 @@ pub(crate) async fn set_library_entry_hidden(
 /// Request body for `setLibraryScanner`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ScannerToggle {
-    /// Whether the scanner should run on this host.
+    /// Whether this source should contribute titles on this host.
     enabled: bool,
 }
 
-/// List the library scanners
+/// List the library sources
 ///
-/// The installed-store scanners this host supports — the list is platform-dependent (Steam
-/// everywhere; Lutris + Heroic on Linux; Epic, GOG, and Xbox/Game Pass on Windows), so the console
-/// renders a toggle only for scanners that can do anything here. Scanners default to enabled;
-/// disabling one hides its titles from every library surface from the next read. The user-curated
-/// custom store is not a scanner and is always on.
+/// Every game source on this host with its enable state — one row per installed library plugin
+/// (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …), so the list reflects what
+/// the operator has actually installed rather than what this build happens to support. Sources
+/// default to enabled; disabling one hides its titles from every library surface from the next
+/// read. The user-curated custom store is not a source and is always on.
+///
+/// Older hosts (≤ v0.27.x) also listed the six scanners built into the host binary, with
+/// `origin: "builtin"`. Those are gone; every row now reports `origin: "plugin"`.
 #[utoipa::path(
     get,
     path = "/library/scanners",
@@ -247,12 +251,13 @@ pub(crate) async fn list_library_scanners() -> Json<Vec<crate::library::ScannerI
     Json(crate::library::list_scanners())
 }
 
-/// Enable or disable a library scanner
+/// Enable or disable a library source
 ///
-/// Persists the toggle and applies it from the next library read (no restart). Disabling a scanner
+/// Persists the toggle and applies it from the next library read (no restart). Disabling a source
 /// hides its titles everywhere — the console grid, native clients, and the GameStream app list —
-/// and re-enabling brings them straight back (nothing is deleted; the scan just runs again). Emits
-/// `library.changed` with the scanner id as `source` when the state changed.
+/// and re-enabling brings them straight back. Nothing is deleted: the plugin may keep reconciling
+/// while its source is off, and those entries simply aren't surfaced. Emits `library.changed` with
+/// the source id as `source` when the state changed.
 #[utoipa::path(
     put,
     path = "/library/scanners/{id}",
@@ -436,11 +441,11 @@ pub(crate) struct ReconcileQuery {
 ///
 /// `?store=` additionally **claims** that store for the provider: its entries then surface with
 /// deterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque
-/// `custom:<id>` ones — which is what lets a library plugin reproduce the entries an in-host scanner
-/// used to produce, right down to the GameStream app ids and client-side art caches. One provider
-/// per store; a second claimant gets 409. While a claim is held the matching built-in scanner is
-/// suppressed, so the two never double-list. The claim is released by `DELETE`, not by an empty
-/// reconcile (a store can legitimately have zero installed titles).
+/// `custom:<id>` ones — which is what let a library plugin reproduce the entries the in-host scanner
+/// used to produce, right down to the GameStream app ids and client-side art caches, and is why
+/// removing those scanners changed nothing downstream. One provider per store; a second claimant
+/// gets 409. The claim is released by `DELETE`, not by an empty reconcile (a store can legitimately
+/// have zero installed titles).
 #[utoipa::path(
     put,
     path = "/library/provider/{provider}",
@@ -551,11 +556,12 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
 ///
 /// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
 /// the image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,
-/// and a library plugin's claimed-store entries) serves its local art file. A Steam title falls back
-/// to the in-host scanner's resolver: the host's own local Steam cache first (exact — it's what the
-/// user's Steam client already shows for it), the public Steam CDN's flat URL convention second
-/// (newer titles' CDN assets can live at a per-asset-hash path the host can't predict, in which case
-/// this 404s and the client falls through to its next art candidate).
+/// and a library plugin's claimed-store entries) serves its local art file; anything else 404s and
+/// the client falls through to its next art candidate.
+///
+/// The host fetches nothing here. Art a plugin published as an `http(s)` URL is fetched by the
+/// client directly — this proxy exists for the *local* files a plugin finds on the host's own disk
+/// (a launcher's cover cache), which a client has no way to read.
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -575,10 +581,11 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
-    // `library.json` FIRST, for ANY id (WP1.2). Stored entries — manual, provider-synced, and (once
-    // store claims land) a scanner plugin's `steam:570` — all serve their local art file from here,
-    // so the proxy never has to know which store an id belongs to. Steam ids aren't stored today, so
-    // this misses and the legacy branch below still answers them.
+    // `library.json`, for ANY id (WP1.2): manual entries, provider-synced entries and a library
+    // plugin's claimed-store `steam:570` all serve their local art file from here, so the proxy never
+    // has to know which store an id belongs to. This was one of two branches — the second resolved a
+    // `steam:` id through the in-host Steam scanner's own cache/CDN ladder, and was retired with that
+    // scanner (M6). Steam ids now arrive here like every other claimed store's.
     let stored = {
         let id = id.clone();
         tokio::task::spawn_blocking(move || crate::library::library_local_art_bytes(&id, kind))
@@ -586,21 +593,6 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     };
     if let Ok(Some((bytes, ctype))) = stored {
         return ([(header::CONTENT_TYPE, ctype)], bytes).into_response();
-    }
-    // Legacy in-host Steam scanner: local Steam cache, then the flat CDN URL. Retired with the
-    // scanner itself once the steam plugin claims the store (M6).
-    if let Some(appid) = id
-        .strip_prefix("steam:")
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        return match tokio::task::spawn_blocking(move || {
-            crate::library::steam_art_bytes(appid, kind)
-        })
-        .await
-        {
-            Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
-            _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
-        };
     }
     api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
 }

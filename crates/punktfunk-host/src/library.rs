@@ -1,15 +1,25 @@
-//! Game library (plan: "surface the user's games"). A small adapter layer over the *stores*
-//! installed on the host — today **Steam** (read from local files, no API key) and a
-//! user-curated **custom** store (CRUD'd via the management API / web console). Every store
-//! produces the same [`GameEntry`], so a client renders one uniform grid and never has to know
-//! which launcher a title came from. Future stores (Heroic/Epic, GOG, Lutris, EmuDeck) are just
-//! more [`LibraryProvider`]s.
+//! Game library (plan: "surface the user's games"). One uniform [`GameEntry`] grid over every
+//! source of titles on this host, so a client never has to know which launcher a title came from.
 //!
-//! Artwork is keyed only by Steam appid against the public Steam CDN (no auth) — the client
-//! fetches the posters directly. Custom entries carry user-supplied art URLs.
+//! **Every source is a plugin.** The host itself scans nothing: library plugins (Steam, Lutris,
+//! Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …) reconcile their titles into the stored
+//! catalog over the provider API, each claiming its store so its entries keep the stable
+//! `<store>:<external_id>` ids everything downstream already pins (`custom.rs`, design D2). The
+//! user-curated **custom** store — entries the operator typed in via the management API / web
+//! console — lives in the same catalog and is the one source that is not a plugin.
+//!
+//! Until v0.28.0 the host also carried six built-in scanners that read the launchers' local files
+//! directly. They were the bridge while the plugins were written; the plugins are the product now,
+//! and the scanners are gone. What survives them is deliberate: the entry model here, the whole of
+//! `launch.rs` (a plugin publishes a validated *value*, the host builds the command — design D1),
+//! and the source toggles in `scanners.rs`, whose ids match the claims by construction so an
+//! operator's disabled state carried across the extraction untouched.
+//!
+//! Artwork rides on the entries themselves — a plugin supplies URLs or local files, and the host's
+//! art proxy serves the local ones ([`art`]) so a client never receives an unreachable `C:\…` path.
 //!
 //! This module is read-mostly metadata; *launching* a chosen title (mapping [`LaunchSpec`] onto a
-//! gamescope session) is a later step — the launch hint is carried here so that wiring is trivial.
+//! gamescope session) is `launch.rs`.
 
 // Shared vocabulary re-exported to the submodules (each is `use super::*`).
 pub(crate) use anyhow::{Context, Result};
@@ -23,40 +33,18 @@ pub(crate) use utoipa::ToSchema;
 mod art;
 mod custom;
 mod detect;
-#[cfg(windows)]
-mod epic;
-#[cfg(windows)]
-mod gog;
-#[cfg(target_os = "linux")]
-mod heroic;
 mod hidden;
 mod launch;
-#[cfg(target_os = "linux")]
-mod lutris;
 mod plugin_launch;
 mod scanners;
-mod steam;
-#[cfg(windows)]
-mod xbox;
 
 pub use art::*;
 pub use custom::*;
 pub use detect::*;
-#[cfg(windows)]
-pub use epic::*;
-#[cfg(windows)]
-pub use gog::*;
-#[cfg(target_os = "linux")]
-pub use heroic::*;
 pub use hidden::*;
 pub use launch::*;
-#[cfg(target_os = "linux")]
-pub use lutris::*;
 pub use plugin_launch::*;
 pub use scanners::*;
-pub use steam::*;
-#[cfg(windows)]
-pub use xbox::*;
 
 /// Cover art for a title. All fields are URLs (the Steam CDN for Steam titles, user-supplied for
 /// custom). The client prefers `portrait` for a grid and falls back to `header` when a title has
@@ -127,17 +115,6 @@ pub struct GameMeta {
     /// Maximum simultaneous (local) players.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub players: Option<u8>,
-}
-
-impl GameMeta {
-    /// The one field an installed-store scanner can assert about its own titles: they run on this
-    /// host, i.e. on a PC. Everything else stays absent (the launchers' local files don't carry it).
-    pub(crate) fn pc() -> Self {
-        GameMeta {
-            platform: Some("PC".into()),
-            ..Default::default()
-        }
-    }
 }
 
 /// What a library entry *is* — an ordinary title, or the launcher application itself (Steam Big
@@ -233,9 +210,9 @@ pub struct GameEntry {
     /// How the host would launch it, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
-    /// The external provider owning this entry (custom-store entries synced by a provider
-    /// plugin, RFC §8) — `None` for installed-store titles and manual custom entries. The
-    /// console uses it for attribution; `GET /library?provider=` filters on it.
+    /// The external provider owning this entry (entries synced by a provider plugin, RFC §8) —
+    /// `None` only for the manual entries the operator typed in. The console uses it for
+    /// attribution; `GET /library?provider=` filters on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// How to recognize this title's process(es) once it is running ([`DetectSpec`]) — filled in by
@@ -278,21 +255,8 @@ fn is_not_hidden(hidden: &bool) -> bool {
     !*hidden
 }
 
-/// A store that contributes titles to the library. The trait is the extension point for future
-/// launchers; today only [`SteamProvider`] implements it.
-pub trait LibraryProvider {
-    /// Stable store id (`"steam"`, …).
-    fn store(&self) -> &'static str;
-    /// Enumerate installed/owned titles. Best-effort: returns empty (not an error) when the store
-    /// isn't present, so one missing launcher never fails the whole library.
-    fn list(&self) -> Vec<GameEntry>;
-}
-
-/// Steam art, keyed to one of the four [`Artwork`] fields. Newer/recently-updated titles serve
-/// their CDN assets from a per-asset-hash path the client can't predict (e.g.
-/// `.../apps/<id>/<hash>/header.jpg`), so the flat legacy URL [`steam_art`] guesses 404s for them —
-/// [`steam_art_bytes`] is the robust resolver: local Steam cache (exact, no guessing) first, the
-/// flat CDN URL as a fallback (still correct for the many titles that haven't been re-hashed).
+/// Which of the four [`Artwork`] fields an art request names — the `<kind>` in
+/// `GET /library/art/<id>/<kind>`, and the preference order the GameStream cover proxy walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtKind {
     Portrait,
@@ -311,51 +275,26 @@ impl ArtKind {
             _ => None,
         }
     }
-
-    /// Filenames Steam itself caches this kind under in `appcache/librarycache/<appid>/<hash>/`,
-    /// tried in order (the 2x portrait, when present, is the sharper asset).
-    fn local_filenames(self) -> &'static [&'static str] {
-        match self {
-            Self::Portrait => &["library_600x900_2x.jpg", "library_600x900.jpg"],
-            Self::Hero => &["library_hero.jpg"],
-            Self::Logo => &["logo.png"],
-            // Steam's local cache names the header asset differently from the store CDN's
-            // `header.jpg` (see `cdn_filename`).
-            Self::Header => &["library_header.jpg"],
-        }
-    }
-
-    /// The legacy flat-URL filename on the public Steam CDN (works for any title the CDN hasn't
-    /// migrated to a per-asset hash path).
-    fn cdn_filename(self) -> &'static str {
-        match self {
-            Self::Portrait => "library_600x900.jpg",
-            Self::Hero => "library_hero.jpg",
-            Self::Logo => "logo.png",
-            Self::Header => "header.jpg",
-        }
-    }
 }
 
-/// The full library: every *enabled* source's titles merged + the custom entries, sorted by title.
+/// The full library: every *enabled* source's titles, sorted by title.
 ///
-/// Two independent gates run here, both at READ time so neither ever mutates stored state:
+/// Two gates run here, both at READ time so neither ever mutates stored state:
 ///
 /// * **The operator's source toggles** (`scanners.rs`, persisted as a disabled-set in
 ///   `library-scanners.json`) hide a source's titles from every surface — this grid, native clients,
-///   `/applist`, and launch resolution. They apply to built-in scanners *and* to plugin sources,
-///   which is what lets one toggle keep working verbatim across the whole migration: the ids match
-///   (provider id = claimed store id = old scanner id).
-/// * **Store claims** (D2): while a library plugin holds a store's claim, the matching built-in
-///   scanner is skipped so the two never double-list the same titles during the bridge releases.
-///   Removing the plugin releases the claim and the built-in comes straight back.
+///   `/applist`, and launch resolution. The plugin may keep reconciling while its source is off; the
+///   entries stay stored and simply aren't surfaced.
+/// * **The operator's per-entry hides** (`hidden.rs`), applied here rather than at each call site so
+///   a hidden title is gone from every surface by construction. [`all_games_for_operator`] is the
+///   single deliberate exception.
 ///
-/// The user-curated custom store is not a source and always contributes.
+/// Manual custom entries — the ones the operator typed in — carry no source and always contribute.
 ///
-/// A **third** gate rides on top of these two: the operator's per-entry hides (`hidden.rs`). It is
-/// applied here rather than at each call site so a hidden title is gone from every surface by
-/// construction — the grid, native clients, `/applist`, and launch resolution — exactly as a
-/// disabled source's titles are. [`all_games_for_operator`] is the single deliberate exception.
+/// There is no longer a third gate. Store claims used to suppress the built-in scanner a plugin had
+/// taken over; with the built-ins gone there is nothing left to suppress, so a claim now only fixes
+/// the ids a provider's entries surface under (`custom.rs::library_id_for`) and names its row in the
+/// sources list.
 pub fn all_games() -> Vec<GameEntry> {
     let hidden = hidden_ids();
     let mut games = collect_games();
@@ -385,47 +324,12 @@ pub fn all_games_for_operator() -> Vec<OperatorGameEntry> {
 /// the hidden set, never in what they collect.
 fn collect_games() -> Vec<GameEntry> {
     let off = disabled_scanners();
-    let claimed = claimed_stores();
-    // A built-in scanner runs when the operator hasn't disabled it AND no plugin has claimed its
-    // store out from under it.
-    let on = |id: &str| !off.contains(id) && !claimed.contains_key(id);
-    let mut games = Vec::new();
-    if on("steam") {
-        games.extend(SteamProvider.list());
-    }
-    // The Lutris + Heroic providers are Linux-only (their launchers are); on other hosts the library
-    // is Steam + custom. Each provider is best-effort (empty when its store isn't present).
-    #[cfg(target_os = "linux")]
-    {
-        if on("lutris") {
-            games.extend(LutrisProvider.list());
-        }
-        if on("heroic") {
-            games.extend(HeroicProvider.list());
-        }
-    }
-    // Windows store providers (their launchers are Windows-only): Epic + GOG + Xbox/Game Pass.
-    #[cfg(windows)]
-    {
-        if on("epic") {
-            games.extend(EpicProvider.list());
-        }
-        if on("gog") {
-            games.extend(GogProvider.list());
-        }
-        if on("xbox") {
-            games.extend(XboxProvider.list());
-        }
-    }
-    // Stored entries: manual ones always contribute; a provider's are subject to the same source
-    // toggle a built-in scanner is (WP2.6). The plugin may keep reconciling while it is off — the
-    // entries stay stored and simply aren't surfaced, exactly like a disabled scanner's titles.
-    games.extend(
-        load_custom()
-            .into_iter()
-            .filter(|e| !source_id_for(e).is_some_and(|src| off.contains(src)))
-            .map(GameEntry::from),
-    );
+    // Manual entries always contribute; a provider's are subject to the operator's source toggle.
+    let mut games: Vec<GameEntry> = load_custom()
+        .into_iter()
+        .filter(|e| !source_id_for(e).is_some_and(|src| off.contains(src)))
+        .map(GameEntry::from)
+        .collect();
     games.sort_by_key(|g| g.title.to_lowercase());
     games
 }
