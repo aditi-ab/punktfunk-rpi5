@@ -21,9 +21,10 @@
 //! surface, the per-plane pumps (video → AMediaCodec, audio ↔ AAudio, mic uplink), input, and
 //! rumble/HID feedback ([`feedback`]). Mode renegotiation is still TODO (see [`session`]).
 
-use jni::objects::JObject;
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{JObject, JString};
 use jni::sys::jint;
-use jni::JNIEnv;
+use jni::EnvUnowned;
 
 #[cfg(target_os = "android")]
 mod adpf;
@@ -76,7 +77,7 @@ pub extern "system" fn JNI_OnLoad(
 /// linked `punktfunk-core` is the one we expect.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_abiVersion(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
 ) -> jint {
     punktfunk_core::ABI_VERSION as jint
@@ -85,11 +86,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_abiVersion(
 /// `NativeBridge.coreVersion(): String` — the crate version, proving JNI string marshaling works.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_coreVersion<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
-) -> jni::sys::jstring {
-    match env.new_string(env!("CARGO_PKG_VERSION")) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
-    }
+) -> JString<'local> {
+    env.with_env(|env| env.new_string(env!("CARGO_PKG_VERSION")))
+        .resolve::<LogErrorAndDefault>()
 }
