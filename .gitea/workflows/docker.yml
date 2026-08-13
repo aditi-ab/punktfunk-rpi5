@@ -96,6 +96,12 @@ jobs:
           # (rust-ci's 26.04 build is uninstallable there). Consumed by deb.yml's build-publish-host job.
           - image: punktfunk-rust-ci-noble
             dockerfile: ci/rust-ci-noble.Dockerfile
+          # Debian 13 gamescope builder. The gamescope .deb used to be built in the noble image
+          # and NEVER once succeeded there — noble's wayland is 1.22.0 and the vendored wlroots
+          # 0.19.3 floors it at 1.23.1, so two releases shipped without the package. trixie is the
+          # oldest apt distro the tree configures on. Consumed by deb.yml's build-publish-gamescope.
+          - image: punktfunk-gamescope-trixie
+            dockerfile: ci/gamescope-trixie.Dockerfile
           - image: punktfunk-fedora-rpm
             dockerfile: ci/fedora-rpm.Dockerfile
           # Fedora 44 builder (Fedora KDE spin): same Dockerfile, newer base → libavcodec.so.62.

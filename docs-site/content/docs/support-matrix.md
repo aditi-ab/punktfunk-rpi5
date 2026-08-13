@@ -71,6 +71,7 @@ mechanics. The one exception is a gamescope the host only *attaches* to, which k
 | gamescope (SteamOS · Bazzite) | ✅ ⁴ | ⚠️ ⁵ | ✅ ⁶ |
 | sway ⁹ | ✅ | ✅ | ⚠️ ⁷ |
 | Hyprland | ⚠️ ⁸ | ✅ | ⚠️ ⁷ |
+| Cinnamon (Mint · LMDE) | ❌ ¹⁰ | ❌ ¹⁰ | ❌ ¹⁰ |
 | macOS / anything else | ❌ | ❌ | ❌ |
 
 1. Punktfunk's own IddCx display driver. It requires **Windows 11 22H2 (build 22621) or newer** —
@@ -108,6 +109,12 @@ mechanics. The one exception is a gamescope the host only *attaches* to, which k
    (River, dwl, …) cannot host — the session fails at `swaymsg get_outputs`. Their input would work
    (they do have the wlroots virtual pointer and keyboard protocols), but with no video there is no
    stream. See [Sway / wlroots](/docs/sway).
+10. Cinnamon's compositor **Muffin** exposes no virtual-output API and no monitor-capture route we
+    can reach: it forked from Mutter 3.36, so `org.cinnamon.Muffin.ScreenCast` has only
+    `RecordMonitor` / `RecordWindow` and never Mutter 42's `RecordVirtual`, and its portal backend
+    (`xdg-desktop-portal-xapp`) implements no ScreenCast at all. Nothing in Punktfunk can change
+    this. A Mint or LMDE box can still stream **games** through a headless gamescope, which needs no
+    desktop compositor — see [Debian → Cinnamon](/docs/debian#cinnamon-linux-mint-and-lmde).
 
 ### Input, cursor and HDR
 

@@ -17,6 +17,7 @@ On **Windows**, the host ships as a signed installer instead — see [Windows](#
 | Distro | Package manager | One-command happy path | Guide |
 |--------|-----------------|------------------------|-------|
 | **Ubuntu** | apt | `sudo apt install punktfunk-host` | [Ubuntu](/docs/ubuntu) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
+| **Debian 13** (incl. LMDE) | apt | `sudo apt install punktfunk-host` | [Debian](/docs/debian) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
 | **Bazzite / Fedora Atomic** | systemd-sysext | `curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh && sudo bash punktfunk-sysext.sh install` (no layering, no reboot) | [Bazzite](/docs/bazzite) · [packaging/bazzite](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/bazzite/README.md) |
 | **Fedora (dnf)** | dnf / rpm-ostree | `sudo dnf install punktfunk` | [Fedora](/docs/fedora) · [packaging/rpm](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/rpm/README.md) |
 | **Arch** | pacman | `sudo pacman -Syu punktfunk-host` (binary repo — always a full `-Syu`, never `-Sy`) | [Arch Linux](/docs/arch) · [packaging/arch](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md) |

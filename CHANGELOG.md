@@ -220,6 +220,42 @@ Helldivers 2 at 1% lows of 2–5 FPS, cured by uninstalling). Two mechanisms, bo
   is now refcounted across the hot stream threads and reverts when the last one exits
   (= session teardown), the same lifetime the per-thread MMCSS effects already ride.
 
+### Debian 13 is a supported target, and `punktfunk-gamescope` reaches apt for the first time
+
+🛑 **The `punktfunk-gamescope` .deb had never been published — not once, in any release.** It was
+built inside the host job's Ubuntu 24.04 image, where it cannot build: our pin vendors wlroots
+0.19.3, which floors `wayland-server` at 1.23.1, and noble ships 1.22.0 (it also has no
+`libxcb-errors-dev` and only libdisplay-info 0.1.1). Every rung of that path was a `::warning::`
+returning 0, and the one hard gate ran last by design so good artifacts still shipped — so
+**v0.26.0 and v0.27.0 both released with the package missing** while the release notes and
+docs-site told Debian/Ubuntu users to `apt install` it. The same tag shipped it fine for Arch,
+Fedora 44 and Bazzite; apt was the only platform affected.
+
+It now has its own job on **Debian 13** (`ci/gamescope-trixie.Dockerfile`), the oldest apt base the
+tree configures on. One package serves Debian 13 **and** Ubuntu 26.04 — verified by installing and
+running it on both — because the build additionally vendors libdisplay-info
+(`build-punktfunk-gamescope.sh --extra-fallback libdisplay-info`, opt-in so the Arch/Fedora/nix
+outputs are unchanged): linked against the distro copy it would demand `libdisplay-info2` on trixie,
+which Ubuntu 26.04 does not have (it carries `libdisplay-info3`). **Ubuntu 24.04 gets no gamescope
+package** — its wayland is too old to run one, however it is built.
+
+⭐ **Debian 13 is now a documented, CI-tested host target** ([docs](https://docs.punktfunk.unom.io/docs/debian)).
+It required no packaging change: the host .deb's glibc-2.39 floor and bundled FFmpeg already made
+it installable, and it had been working for a long time while docs-site said Debian was unsupported
+and unverified. The desktop **client** remains Ubuntu-26.04-only (built there, floors at
+`libc6 >= 2.43`; Debian 13 has 2.41).
+
+⚠ **Cinnamon (Linux Mint, LMDE) cannot host a virtual display**, and compositor detection now says
+so instead of advising a `PUNKTFUNK_COMPOSITOR` value that cannot help. Muffin forked from Mutter
+3.36: `org.cinnamon.Muffin.ScreenCast` has only `RecordMonitor`/`RecordWindow`, never
+`RecordVirtual`, and `xdg-desktop-portal-xapp` implements no ScreenCast at all. The error names the
+route that does work on those boxes — a headless gamescope, which needs no desktop compositor.
+
+New CI job **`smoke-install`** installs every published package from the registry in pristine
+`ubuntu:24.04`, `ubuntu:26.04` and `debian:trixie` images and asserts the version served is the one
+the run just built. Nothing in `deb.yml` had ever installed a package it produced, which is how
+both facts above survived for so long.
+
 ## v0.27.0
 
 87 commits since v0.26.0.

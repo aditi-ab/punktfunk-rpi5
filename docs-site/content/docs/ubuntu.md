@@ -18,11 +18,10 @@ desktop on the [configure pages](#configure-your-desktop) afterward rather than 
 > and needs GTK4 ≥ 4.20 and SDL3, so it installs on **26.04 or newer** only — the host has no such
 > limit.
 
-> **Debian isn't a supported target.** The packages are built on Ubuntu images and their dependencies
-> are resolved against Ubuntu's package names, and nothing in CI builds or tests on Debian. Debian 12
-> (bookworm) is below the glibc floor and cannot install them at all. A newer Debian may work, but
-> it's untested — build from source ([appendix](#appendix--build-from-source)) if you want to try.
-> The `debian` in the repository URL below is the *package format*, not a supported distro.
+> **On Debian**, see [Debian](/docs/debian) — the host, console and plugin runner are supported and
+> CI-tested on **Debian 13**; the desktop client is not packaged for it yet. Debian 12 (bookworm) is
+> below the glibc floor and cannot install anything here. Note that the `debian` in the repository
+> URL below is the *package format*, and is the same URL for both distros.
 
 ## 1. GPU driver
 

@@ -16,6 +16,7 @@ is also available. Setup splits along two axes: you **install** the package per 
 **Distros — install the package:**
 
 - [Ubuntu](/docs/ubuntu)
+- [Debian](/docs/debian) — Debian 13 or newer, including LMDE
 - [Fedora](/docs/fedora)
 - [Arch](/docs/arch)
 - [Bazzite](/docs/bazzite)

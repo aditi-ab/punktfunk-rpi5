@@ -338,20 +338,52 @@ pub fn detect() -> Result<Compositor> {
         let desktop = with_env_lock(|| std::env::var("XDG_CURRENT_DESKTOP"))
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if desktop.contains("KDE") {
-            Ok(Compositor::Kwin)
-        } else if desktop.contains("GNOME") {
-            Ok(Compositor::Mutter)
-        } else if desktop.contains("HYPRLAND") {
-            Ok(Compositor::Hyprland)
-        } else if desktop.contains("SWAY") || desktop.contains("WLROOTS") {
-            Ok(Compositor::Wlroots)
-        } else {
-            anyhow::bail!(
-                "could not detect compositor: no live graphical session for this uid and \
-                 XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
-            )
-        }
+        compositor_from_xdg(&desktop)
+    }
+}
+
+/// The last-resort `XDG_CURRENT_DESKTOP` sniff, as a **pure function of the (uppercased) value** so
+/// its branches — including the two that only ever produce an error — are testable without mutating
+/// process-global env. Called only by [`detect`], after both the operator pin and live-session
+/// detection have come up empty.
+#[cfg(target_os = "linux")]
+fn compositor_from_xdg(desktop: &str) -> Result<Compositor> {
+    // CINNAMON is tested FIRST, ahead of GNOME, and the order is load-bearing rather than
+    // stylistic: Cinnamon is a GNOME derivative, so a session that advertises both (`X-Cinnamon`
+    // alongside a GNOME-compatibility token) would otherwise match the GNOME arm and be handed the
+    // Mutter backend — which then fails deep in a `org.gnome.Mutter.ScreenCast` call that Muffin
+    // does not serve, i.e. an obscure D-Bus error instead of the explanation below. The more
+    // specific desktop wins.
+    if desktop.contains("CINNAMON") {
+        // Linux Mint / LMDE report `X-Cinnamon`. Cinnamon is NOT a missing backend we could add —
+        // its compositor (Muffin) exposes no virtual-output API at all: the fork base is Mutter
+        // 3.36, and `org.cinnamon.Muffin.ScreenCast` carries only `RecordMonitor` / `RecordWindow`,
+        // never Mutter 42+'s `RecordVirtual`. Its portal backend (xdg-desktop-portal-xapp)
+        // implements no ScreenCast either, so the sway/Hyprland portal route is closed too. The
+        // generic message below would send a Cinnamon user hunting for the setting that turns it
+        // on; there isn't one. Name the ONE route that does work on that box — a headless
+        // gamescope, which needs no desktop compositor at all — instead of a dead end.
+        anyhow::bail!(
+            "Cinnamon (XDG_CURRENT_DESKTOP='{desktop}') cannot host a virtual display: its \
+             compositor Muffin has no virtual-output API, so Punktfunk cannot create a screen \
+             for a client on it. Stream games instead by setting PUNKTFUNK_COMPOSITOR=gamescope \
+             in host.env — the host then spawns its own headless gamescope per connect and needs \
+             no desktop session. See \
+             https://docs.punktfunk.unom.io/docs/debian#cinnamon-linux-mint-and-lmde"
+        )
+    } else if desktop.contains("KDE") {
+        Ok(Compositor::Kwin)
+    } else if desktop.contains("GNOME") {
+        Ok(Compositor::Mutter)
+    } else if desktop.contains("HYPRLAND") {
+        Ok(Compositor::Hyprland)
+    } else if desktop.contains("SWAY") || desktop.contains("WLROOTS") {
+        Ok(Compositor::Wlroots)
+    } else {
+        anyhow::bail!(
+            "could not detect compositor: no live graphical session for this uid and \
+             XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
+        )
     }
 }
 
@@ -810,6 +842,52 @@ mod wlroots;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The XDG sniff is the last thing standing between an unrecognized desktop and a useless
+    /// error, and `mgmt/display.rs` puts that error VERBATIM in the console's `/display/monitors`
+    /// response — so its exact wording is a user-facing surface, tested as one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_sniff_maps_known_desktops() {
+        // Real-world values, uppercased the way `detect` hands them over.
+        assert_eq!(compositor_from_xdg("KDE").unwrap(), Compositor::Kwin);
+        assert_eq!(compositor_from_xdg("GNOME").unwrap(), Compositor::Mutter);
+        assert_eq!(
+            compositor_from_xdg("UBUNTU:GNOME").unwrap(),
+            Compositor::Mutter
+        );
+        assert_eq!(
+            compositor_from_xdg("HYPRLAND").unwrap(),
+            Compositor::Hyprland
+        );
+        assert_eq!(compositor_from_xdg("SWAY").unwrap(), Compositor::Wlroots);
+    }
+
+    /// Cinnamon must NOT fall into the generic "set PUNKTFUNK_COMPOSITOR" arm: Muffin has no
+    /// virtual-output API, so there is no value of that variable which makes a Cinnamon desktop
+    /// host a virtual display. The error has to name gamescope — the one route that works on an
+    /// LMDE/Mint box — or the user is sent hunting for a setting that does not exist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cinnamon_is_told_to_use_gamescope_not_to_pick_a_backend() {
+        // `X-Cinnamon` is what Mint and LMDE actually set.
+        for v in ["X-CINNAMON", "CINNAMON", "X-CINNAMON:GNOME-FLASHBACK"] {
+            let err = compositor_from_xdg(v)
+                .expect_err("Cinnamon cannot host a virtual display")
+                .to_string();
+            assert!(err.contains("gamescope"), "no gamescope route named: {err}");
+            assert!(err.contains("Muffin"), "does not say why: {err}");
+        }
+    }
+
+    /// An unknown desktop keeps the generic advice — the Cinnamon arm must not swallow it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_desktop_keeps_the_generic_error() {
+        let err = compositor_from_xdg("XFCE").unwrap_err().to_string();
+        assert!(err.contains("PUNKTFUNK_COMPOSITOR"), "{err}");
+        assert!(!err.contains("Muffin"), "{err}");
+    }
 
     #[test]
     fn active_kind_maps_to_its_backend() {

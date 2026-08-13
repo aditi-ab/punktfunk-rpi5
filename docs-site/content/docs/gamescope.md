@@ -189,7 +189,11 @@ own name and does **not** replace your system gamescope — your Gaming Mode kee
 - **Bazzite / Fedora Atomic** — included in the Punktfunk sysext; `punktfunk-sysext update` gets it.
 - **Fedora, Nobara and other RPM boxes** — `sudo dnf install punktfunk-gamescope` from the same
   Punktfunk repo the host comes from.
-- **Debian / Ubuntu** — `sudo apt install punktfunk-gamescope` from the Punktfunk apt repo.
+- **Debian 13 and Ubuntu 26.04** — `sudo apt install punktfunk-gamescope` from the Punktfunk apt
+  repo. It is the only gamescope those two have: Debian packages none at all, and Ubuntu 26.04's
+  is 3.16.20 — below the [3.16.22 floor](/docs/requirements), so headless capture deadlocks
+  against the PipeWire 1.6 that same release ships. **Ubuntu 24.04 cannot run it**: the build needs
+  wayland ≥ 1.23.1 and noble has 1.22.0, so build from source or move to a newer release.
 - **Arch** — the `punktfunk-gamescope` package.
 - **SteamOS (Steam Deck installer)** — built and wired automatically by
   `scripts/steamdeck/install.sh` / `update.sh`.
