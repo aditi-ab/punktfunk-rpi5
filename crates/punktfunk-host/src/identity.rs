@@ -113,8 +113,9 @@ pub fn ephemeral() -> Result<NativeIdentity> {
     Ok(NativeIdentity { cert_pem, key_pem })
 }
 
-/// Generate the P-256 identity: ring CAN generate EC keys (unlike RSA — see `gamestream::cert`'s
-/// note), so rcgen's ring backend does the whole thing. SANs cover the names a browser or a
+/// Generate the P-256 identity: rcgen CAN generate EC keys, so it does the whole thing here —
+/// unlike RSA, which no rcgen backend will generate (see `gamestream::cert`'s note, where the key
+/// comes from the `rsa` crate and rcgen only self-signs it). SANs cover the names a browser or a
 /// loopback poller actually dials; LAN IPs are deliberately absent (they change, and the native
 /// clients pin the fingerprint rather than verify names).
 fn generate() -> Result<(String, String)> {
