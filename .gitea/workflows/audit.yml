@@ -369,9 +369,10 @@ jobs:
       # way — Miri does not implement it — so the gfni branch is simply not covered here.
       #
       # ⚠ x86_64 ONLY, and it must stay that way. A RUSTFLAGS env var OVERRIDES config rustflags
-      # ENTIRELY (.cargo/config.toml:11-13 says so), and that config carries `--cfg aes_armv8` /
-      # `--cfg polyval_armv8` for aarch64 — worth a measured ~3x decrypt-throughput cliff if
-      # dropped. Harmless here because this job pins ubuntu-24.04/x86_64; fatal on mac-mini-1.
+      # ENTIRELY — it does not merge. That used to cost the aarch64 `--cfg aes_armv8` /
+      # `--cfg polyval_armv8` decrypt flags; the aes 0.9 / polyval 0.7 bump retired those cfgs
+      # (see the tombstone in .cargo/config.toml), so there is nothing left for an override to
+      # drop here. Keep the pin anyway: these target-features are meaningless off x86_64.
       # Narrow selection is mandatory, not an optimisation: see the punktfunk-core note above.
       - name: miri — punktfunk-core fec::gf8, taking the real AVX2/SSSE3 branches
         env:

@@ -7,7 +7,9 @@ use pf_paths::config_dir;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
-use sha2::Sha256;
+// `rsa`'s own re-export: this `Sha256` is a TYPE PARAMETER to `SigningKey`, so it has to be the
+// one `rsa 0.9`'s `digest 0.10` traits speak — not the crate-wide `sha2 0.11`. See Cargo.toml.
+use rsa::sha2::Sha256;
 use std::fs;
 
 pub struct ServerIdentity {

@@ -198,7 +198,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # for `video_d3d11_native::parity`, now `cfg(linux)` as well for
 # `video_vaapi_native::parity`. A DEV dependency, so no shipped binary gains anything —
 # which is also part of why the VAAPI readback cannot reach the production video path.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [features]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
