@@ -33,15 +33,18 @@ virtual display and injects input is desktop-specific, so pick your desktop on t
 
 ## 1. GPU driver
 
-On **NVIDIA**, the driver lives in Debian's `non-free-firmware` / `non-free` components, which a
-default install does not enable. Add them, then install the driver:
+On **NVIDIA**, the driver lives in Debian's `contrib` / `non-free` / `non-free-firmware`
+components, which a default install does not enable. Debian 13 keeps its sources in the deb822
+format, so add them there and refresh:
 
 ```sh
-sudo apt install software-properties-common
-sudo apt-add-repository contrib non-free non-free-firmware
+sudo sed -i 's/^Components: .*/Components: main contrib non-free non-free-firmware/' \
+  /etc/apt/sources.list.d/debian.sources
 sudo apt update
 sudo apt install nvidia-driver firmware-misc-nonfree
 ```
+
+Debian 13 ships driver 550, comfortably above the [535 floor](/docs/requirements).
 
 Reboot, then confirm the driver and KMS modeset — Wayland on NVIDIA needs `modeset=1`:
 
