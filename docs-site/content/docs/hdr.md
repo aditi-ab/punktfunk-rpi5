@@ -76,12 +76,13 @@ available, and offers it. The attached session can't answer that negotiation, so
 with no picture, the host latches an SDR downgrade for the rest of its life, and the next connect
 streams — in SDR.
 
-That is exactly what the [Bazzite](/docs/bazzite) template ships: it pins attach *and* the sysext
-installs `punktfunk-gamescope`. Either comment `PUNKTFUNK_GAMESCOPE_ATTACH=1` out and let the managed
-default take over (you get HDR and the compositor-drawn cursor), or stay on attach and set
-`PUNKTFUNK_GAMESCOPE_HDR=0` so the failed attempt never happens. Staying on attach also leaves the
-stream with no cursor; [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the fix for that
-half.
+That combination bites on [Bazzite](/docs/bazzite), where the sysext installs `punktfunk-gamescope`
+alongside a stock session gamescope. No template pins attach any more, so the managed default gets
+you HDR and the compositor-drawn cursor — but an older template did, and an upgrade never rewrites a
+`host.env` you already have, so check yours for `PUNKTFUNK_GAMESCOPE_ATTACH=1` and delete the line.
+If you deliberately stay on attach, set `PUNKTFUNK_GAMESCOPE_HDR=0` so the failed attempt never
+happens. Staying on attach also leaves the stream with no cursor;
+[HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the fix for that half.
 
 SDR content rides the same PQ container — the desktop, the Steam overlay, an SDR game — mapped in at
 `PUNKTFUNK_GAMESCOPE_SDR_NITS` (gamescope's own default is 400). That is the knob when white looks
