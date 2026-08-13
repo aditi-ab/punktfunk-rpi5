@@ -78,12 +78,14 @@ impl ServerIdentity {
 }
 
 fn generate() -> Result<(String, String)> {
-    // The workspace is ring-only (aws-lc-sys breaks Windows CI — see the rustls/rcgen pins), and
-    // `ring` can *sign* with an existing RSA key but cannot *generate* one: rcgen's ring backend
-    // returns `KeyGenerationUnavailable` for `generate_for(&PKCS_RSA_SHA256)`. Moonlight requires an
-    // RSA-2048 identity, so generate the key with the pure-Rust `rsa` crate (already a dep for the
-    // pairing signer) and hand the PKCS#8 PEM to rcgen, whose ring backend *can* load + self-sign
-    // with it. Returning that same PEM keeps it byte-identical to what `from_pems` re-parses.
+    // rcgen cannot *generate* an RSA key on either backend — `generate_for(&PKCS_RSA_SHA256)`
+    // returns `KeyGenerationUnavailable`. Moonlight requires an RSA-2048 identity, so generate the
+    // key with the pure-Rust `rsa` crate (already a dep for the pairing signer) and hand the PKCS#8
+    // PEM to rcgen, which *can* load an existing RSA key and self-sign with it. Returning that same
+    // PEM keeps it byte-identical to what `from_pems` re-parses.
+    //
+    // This path runs ONLY when no cert exists yet — a fresh install — so an upgraded box never
+    // re-executes it.
     let mut rng = rand::thread_rng();
     let priv_key = RsaPrivateKey::new(&mut rng, 2048).context("generate RSA-2048 host key")?;
     let key_pem = priv_key
@@ -108,4 +110,195 @@ fn cert_signature(cert_pem: &str) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("parse cert pem: {e}"))?;
     let x509 = pem.parse_x509().context("parse x509")?;
     Ok(x509.signature_value.data.to_vec())
+}
+
+/// Coverage for what the aws-lc-rs migration (#192) changed here but shipped unverified.
+///
+/// `generate()` was already reached by other tests via `ServerIdentity::ephemeral()`, but only ever
+/// as an unasserted fixture — nothing checked that what came back was still an RSA-2048 identity,
+/// which is the one property Moonlight requires. The handshake behaviour had no coverage at all,
+/// and the GameStream TLS path is the single place where a legacy peer meets the new backend, so
+/// a backend or feature regression there would surface first in the field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::{
+        ClientConfig, ClientConnection, DigitallySignedStruct, ServerConnection, SignatureScheme,
+    };
+    use std::sync::Arc;
+
+    /// Moonlight does not chain-verify the host: it pins the cert by SHA-256 out of band, exactly
+    /// as our own `AcceptAnyClientCert` does in the other direction. Modelling that is what makes
+    /// this a Moonlight-shaped peer rather than a webpki-clean one.
+    #[derive(Debug)]
+    struct PinsOutOfBand(Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for PinsOutOfBand {
+        fn verify_server_cert(
+            &self,
+            _e: &CertificateDer,
+            _i: &[CertificateDer],
+            _s: &ServerName,
+            _o: &[u8],
+            _n: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer,
+            d: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer,
+            d: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn parts(
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("cert pem")
+            .into_iter()
+            .map(|c| c.into_owned())
+            .collect();
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .expect("key pem")
+            .clone_key();
+        (certs, key)
+    }
+
+    /// Shuttle handshake bytes between the two ends until both stop handshaking.
+    fn pump(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..40 {
+            while client.wants_write() {
+                let mut buf = Vec::new();
+                client.write_tls(&mut buf).expect("client write");
+                let mut cur = &buf[..];
+                while !cur.is_empty() {
+                    if server.read_tls(&mut cur).expect("server read") == 0 {
+                        break;
+                    }
+                    server.process_new_packets().expect("server handshake");
+                }
+            }
+            while server.wants_write() {
+                let mut buf = Vec::new();
+                server.write_tls(&mut buf).expect("server write");
+                let mut cur = &buf[..];
+                while !cur.is_empty() {
+                    if client.read_tls(&mut cur).expect("client read") == 0 {
+                        break;
+                    }
+                    client.process_new_packets().expect("client handshake");
+                }
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+        }
+        panic!("handshake did not converge");
+    }
+
+    /// Run a mutual handshake against the real `tls::server_config` and return the negotiated
+    /// (protocol version, key exchange group, number of client certs the server saw).
+    fn handshake_against_host(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> (String, String, usize) {
+        let (host_cert, host_key) = generate().expect("host identity");
+        // A Moonlight client's own identity is an RSA-2048 self-signed cert — the same shape.
+        let (peer_cert, peer_key) = generate().expect("peer identity");
+
+        let server_cfg =
+            crate::gamestream::tls::server_config(&host_cert, &host_key).expect("server config");
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let (pc, pk) = parts(&peer_cert, &peer_key);
+        let client_cfg = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(versions)
+            .expect("client versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinsOutOfBand(provider)))
+            .with_client_auth_cert(pc, pk)
+            .expect("client auth cert");
+
+        let mut server = ServerConnection::new(server_cfg).expect("server conn");
+        let mut client = ClientConnection::new(
+            Arc::new(client_cfg),
+            ServerName::try_from("punktfunk").unwrap(),
+        )
+        .expect("client conn");
+        pump(&mut client, &mut server);
+
+        let version = format!("{:?}", client.protocol_version().expect("version"));
+        let kx = client
+            .negotiated_key_exchange_group()
+            .map(|g| format!("{:?}", g.name()))
+            .unwrap_or_default();
+        let seen = server.peer_certificates().map(|c| c.len()).unwrap_or(0);
+        (version, kx, seen)
+    }
+
+    /// The fresh-install path. rcgen cannot generate an RSA key, so this leans on `rsa` for the key
+    /// and rcgen only to self-sign — a split that must keep working across a crypto-backend change.
+    #[test]
+    fn generate_mints_a_loadable_rsa2048_identity() {
+        let (cert_pem, key_pem) = generate().expect("generate");
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"), "cert is not PEM");
+        assert!(
+            key_pem.contains("BEGIN PRIVATE KEY"),
+            "key is not PKCS#8 PEM"
+        );
+
+        // Everything downstream (pairing hashes, the TLS server cert) goes through from_pems.
+        let identity = ServerIdentity::from_pems(cert_pem, key_pem).expect("from_pems");
+        // An RSA-2048 signature is exactly 256 bytes; this pins the key size that Moonlight needs
+        // without depending on an `rsa` accessor that could change shape.
+        assert_eq!(
+            identity.signature.len(),
+            256,
+            "host cert signature should be RSA-2048 (256 bytes)"
+        );
+    }
+
+    /// GAP 1 from the #192 handoff: a legacy peer negotiating TLS 1.2 against the new backend.
+    #[test]
+    fn moonlight_shaped_peer_completes_a_tls12_mutual_handshake() {
+        let (version, _kx, client_certs_seen) = handshake_against_host(&[&rustls::version::TLS12]);
+        assert_eq!(version, "TLSv1_2", "Moonlight negotiates TLS 1.2");
+        assert_eq!(
+            client_certs_seen, 1,
+            "mutual TLS: the host must receive the peer's client cert"
+        );
+    }
+
+    /// GAP 3 from the #192 handoff: `prefer-post-quantum` was asserted from the rustls source and
+    /// never observed. Pin it, so a provider or feature regression that silently drops ML-KEM back
+    /// to a classical group fails here instead of in the field.
+    #[test]
+    fn tls13_negotiates_the_post_quantum_group() {
+        let (version, kx, client_certs_seen) = handshake_against_host(&[&rustls::version::TLS13]);
+        assert_eq!(version, "TLSv1_3");
+        assert_eq!(
+            kx, "X25519MLKEM768",
+            "post-quantum key exchange must be preferred"
+        );
+        assert_eq!(client_certs_seen, 1);
+    }
 }
