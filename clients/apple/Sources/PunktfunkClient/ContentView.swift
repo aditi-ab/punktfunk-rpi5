@@ -83,14 +83,6 @@ struct ContentView: View {
     /// never covers the video.
     @State private var isFullscreen = false
     #endif
-    #if os(macOS) || os(tvOS)
-    /// Shows the start-of-stream shortcut banner (the Windows client's discoverability
-    /// pattern): raised on every transition to `.streaming`, dropped by the banner's own
-    /// 6-second task. Independent of the stats HUD so the keys are discoverable even with
-    /// statistics off. On tvOS it carries the ONLY exits (hold Back / the pad chord) plus
-    /// the remote-as-pointer controls, so it must be seen at least once per session.
-    @State private var showShortcutHint = false
-    #endif
     #if os(iOS)
     /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
     /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
@@ -347,9 +339,6 @@ struct ContentView: View {
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
-                #if os(macOS) || os(tvOS)
-                showShortcutHint = true // the 6 s shortcut banner, per session start
-                #endif
                 #if os(iOS)
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
                 #endif
@@ -826,6 +815,7 @@ struct ContentView: View {
                     onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     launchTitle: launchTitle,
+                    wakeOnly: { wakeOnly($0) },
                     promptActive: consolePromptShowing)
             } else {
                 HomeView(
@@ -845,6 +835,7 @@ struct ContentView: View {
                     onPaired: handlePaired, waker: waker,
                     connect: { connect($0, profile: $1) }, connectDiscovered: connectDiscovered,
                     launchTitle: launchTitle,
+                    wakeOnly: { wakeOnly($0) },
                     promptActive: consolePromptShowing)
                 // On tvOS pairing/library normally present from HomeView's navigationDestinations
                 // — which aren't mounted while the gamepad launcher is up. Give the launcher its
@@ -1069,31 +1060,15 @@ struct ContentView: View {
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
                         #endif
-                        #if os(macOS) || os(tvOS)
-                        // The start-of-stream shortcut banner (Windows-client parity): the
+                        // The start-of-stream shortcut banner used to sit here (macOS/tvOS): the
                         // platform's reserved controls on a glass pill for the first 6 seconds of
-                        // every session — independent of the stats HUD, so the keys are
-                        // discoverable even with statistics off. The banner's own task drops it
-                        // (cancelled cleanly if the session view goes away first). On tvOS it
-                        // carries the ONLY exits — Menu/B is swallowed during a session (the
-                        // `.onExitCommand {}` in the tvOS session branch), so the hold gestures
-                        // must be told to the user.
-                        if captureEnabled && showShortcutHint {
-                            Text(shortcutHintText)
-                                .font(.geist(Self.shortcutHintFont, relativeTo: .caption))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .glassBackground(Capsule())
-                                .transition(.opacity)
-                                .task {
-                                    try? await Task.sleep(for: .seconds(6))
-                                    withAnimation(.easeOut(duration: 0.6)) {
-                                        showShortcutHint = false
-                                    }
-                                }
-                        }
-                        #endif
+                        // every session. It is now a page you can OPEN — About ▸ Shortcuts, on
+                        // both the touch and the controller surface (ShortcutsCatalog) — because
+                        // a message that shows once, over the stream you have just connected to,
+                        // is unavailable at the moment the question is actually asked. It also
+                        // put a composited overlay above the stream for those 6 seconds, which on
+                        // this path costs a refresh of display latency (see the iOS exit disc's
+                        // note below); the reference page costs nothing during a session.
                     }
                     .padding(.bottom, 24)
                     .animation(.easeOut(duration: 0.2), value: model.micMuted)
@@ -1160,23 +1135,10 @@ struct ContentView: View {
     }
     #endif
 
-    #if os(macOS)
-    /// The reserved combos, told once per session. The mute segment appears only when the session
-    /// actually sends a microphone — teaching a shortcut for a mic that isn't on would be a lie.
-    private var shortcutHintText: String {
-        let base =
-            "Click the stream to capture · ⌃⌥⇧Q releases the mouse · ⌃⌥⇧D disconnects · ⌃⌥⇧S stats"
-        return model.micAvailable ? base + " · ⌃⌥⇧A mutes the mic" : base
-    }
-    private static let shortcutHintFont: CGFloat = 12
-    #elseif os(tvOS)
-    private var shortcutHintText: String {
-        "Hold the remote's Back button — or L1+R1+Start+Select on a controller — to disconnect"
-        + " · Touch surface moves the pointer · press clicks · Play/Pause right-clicks"
-        + " · Hold Play/Pause, or Select+X on a controller, for statistics"
-    }
-    private static let shortcutHintFont: CGFloat = 22 // read from the couch
-    #endif
+    // The two `shortcutHintText` strings that used to live here — one per platform, told once per
+    // session by the banner above — are now `ShortcutsCatalog.groups`, which both About pages
+    // render. The mic line is still conditional there for the same reason it was here: teaching a
+    // shortcut for a microphone that isn't on would be a lie.
 
     // MARK: - Connect
 

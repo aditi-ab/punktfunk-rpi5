@@ -28,6 +28,10 @@ struct AboutView: View {
 
     #if !os(tvOS)
     @State private var showAcknowledgements = false
+    /// The in-session controls. They used to announce themselves in a 6-second banner at the start
+    /// of every stream; that banner is gone, so this page is where they live now — including for
+    /// touch users on a Mac, who saw it too.
+    @State private var showShortcuts = false
     #endif
 
     var body: some View {
@@ -43,6 +47,9 @@ struct AboutView: View {
                     // fighting the centring.
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
+            }
+            Section {
+                shortcutsRow
             }
             Section {
                 linkRow("Documentation", systemImage: "book", url: Destination.docs)
@@ -63,6 +70,21 @@ struct AboutView: View {
         // A SHEET, not a push — on iPad the settings detail column is deliberately not a
         // NavigationStack (an inner one doubles the title bar), so a NavigationLink from here
         // pushed into a context with no back button and stranded the licenses on screen.
+        // A sheet for the same reason Acknowledgements is one — see that modifier's note on the
+        // iPad detail column not being a NavigationStack.
+        .sheet(isPresented: $showShortcuts) {
+            NavigationStack {
+                ShortcutsView(micAvailable: ShortcutsCatalog.micPlausible)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showShortcuts = false }
+                        }
+                    }
+            }
+            #if os(macOS)
+            .frame(width: 560, height: 460)
+            #endif
+        }
         .sheet(isPresented: $showAcknowledgements) {
             NavigationStack {
                 AcknowledgementsView()
@@ -135,6 +157,24 @@ struct AboutView: View {
         .foregroundStyle(.primary)
     }
 
+    private var shortcutsRow: some View {
+        Button {
+            showShortcuts = true
+        } label: {
+            HStack {
+                Label("Shortcuts", systemImage: "command")
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+    }
+
     private var acknowledgementsRow: some View {
         Button {
             showAcknowledgements = true
@@ -167,6 +207,11 @@ struct AboutView: View {
                     tvAddress("Documentation", Destination.docs)
                     tvAddress("Community", Destination.community)
                     tvAddress("Source code", Destination.source)
+                }
+                // Both push here: this page really is inside a navigation stack on tvOS, which is
+                // the case the sheets above exist to work around elsewhere.
+                NavigationLink("Shortcuts") {
+                    ShortcutsView(micAvailable: false) // tvOS has no app-accessible mic
                 }
                 NavigationLink("Acknowledgements") { AcknowledgementsView() }
                 Text("Punktfunk's source is open under MIT or Apache-2.0.")

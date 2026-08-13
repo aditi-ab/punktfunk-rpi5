@@ -28,6 +28,18 @@ struct GamepadAddHostView: View {
     /// Whether this screen owns the controller — false while the shell is mid-transition or the
     /// connect takeover is up (see GamepadSettingsView's twin).
     var controllerActive = true
+    /// Non-nil ⇒ this screen is EDITING that saved host rather than registering a new one: the
+    /// fields start on its values and `onAdd` receives it back with only name/address/port
+    /// changed, so the fingerprint, pins, binding and MACs it carries survive the edit. A
+    /// re-typed address is the whole point of the screen (a host that moved), so nothing here
+    /// re-derives identity from it — that is the trust store's job, not this form's.
+    ///
+    /// Declared after the closures for the same trailing-closure reason as `close`, and it is a
+    /// plain value besides, so it can never capture one.
+    var editingHost: StoredHost?
+    /// One-shot seed guard: `@State` cannot be initialised from a property without a custom init,
+    /// and a custom init would break every existing trailing-closure call site.
+    @State private var seeded = false
 
     #if os(iOS)
     /// `.compact` in a landscape phone window — tighter chrome so the keyboard tray still fits.
@@ -60,12 +72,15 @@ struct GamepadAddHostView: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: gamepadHeaderSpacing(compact: compact)) {
                 // Leading, like every gamepad heading — and no close chrome (B is the exit).
-                Text("Add Host")
+                Text(editingHost == nil ? "Add Host" : "Edit Host")
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
                 if !compact {
-                    Text("Hosts on this network appear automatically — add one by address "
-                        + "for everything else.")
+                    Text(editingHost == nil
+                        ? "Hosts on this network appear automatically — add one by address "
+                            + "for everything else."
+                        : "Rename this host, or point it at a new address — its pairing and "
+                            + "pinned cards are kept.")
                         .font(.geist(metrics.detailFont, relativeTo: .caption))
                         .foregroundStyle(ink.fg(0.55))
                         .multilineTextAlignment(.leading)
@@ -100,6 +115,17 @@ struct GamepadAddHostView: View {
         // A port can't exceed 5 digits — cap while typing so the row can't grow absurd.
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
+        }
+        // Seed the fields from the host being edited, exactly once: re-seeding on a later appear
+        // (the shell re-mounts a layer when the app returns from the background) would silently
+        // throw away whatever had been typed.
+        .onAppear {
+            guard !seeded else { return }
+            seeded = true
+            guard let host = editingHost else { return }
+            name = host.name
+            address = host.address
+            port = String(host.port)
         }
         #if !os(tvOS)
         // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
@@ -205,7 +231,9 @@ struct GamepadAddHostView: View {
             Row(id: "name", label: "Name", value: name, placeholder: "Optional — e.g. Living Room"),
             Row(id: "address", label: "Address", value: address, placeholder: "IP or hostname"),
             Row(id: "port", label: "Port", value: port, placeholder: "9777"),
-            Row(id: "add", label: "Add Host", isAction: true),
+            Row(
+                id: "add", label: editingHost == nil ? "Add Host" : "Save Changes",
+                isAction: true),
         ]
     }
 
@@ -264,10 +292,21 @@ struct GamepadAddHostView: View {
                 openKeyboard("address")
                 return
             }
-            onAdd(StoredHost(
-                name: name.trimmingCharacters(in: .whitespaces),
-                address: address.trimmingCharacters(in: .whitespaces),
-                port: UInt16(port) ?? 9777))
+            let typedName = name.trimmingCharacters(in: .whitespaces)
+            let typedAddress = address.trimmingCharacters(in: .whitespaces)
+            let typedPort = UInt16(port) ?? 9777
+            if var host = editingHost {
+                // Mutate a COPY of the stored record rather than building a fresh one: everything
+                // this form does not show — the pinned fingerprint, WoL MACs, pinned profile
+                // cards, the default binding, `addedAt` — has to survive a rename.
+                host.name = typedName
+                host.address = typedAddress
+                host.port = typedPort
+                onAdd(host)
+            } else {
+                onAdd(StoredHost(
+                    name: typedName, address: typedAddress, port: typedPort))
+            }
             performClose()
         default:
             openKeyboard(id)

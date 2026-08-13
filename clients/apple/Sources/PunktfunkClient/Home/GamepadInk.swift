@@ -88,6 +88,11 @@ struct GamepadInk: Equatable, Sendable {
     /// The online pip — deliberately NOT palette-derived: a status colour must not change
     /// meaning with the wallpaper (the console's rule; this is its `ONLINE_GREEN` verbatim).
     static let onlineGreen = Color(red: 0.20, green: 0.84, blue: 0.29)
+    /// An armed destructive action (the host menu's Remove). Palette-independent for exactly the
+    /// same reason as the pip above, and the more strongly so: the one colour on this UI that
+    /// means "this does not come back" cannot be allowed to drift toward the wallpaper on a warm
+    /// palette, or read as a highlight on a red one.
+    static let warningRed = Color(red: 0.94, green: 0.28, blue: 0.26)
 }
 
 private struct GamepadInkKey: EnvironmentKey {

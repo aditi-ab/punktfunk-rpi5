@@ -21,6 +21,8 @@ import SwiftUI
 enum GamepadScreen: Identifiable {
     case settings
     case addHost
+    case hostOptions(HostOptionsTarget)
+    case editHost(StoredHost)
     case pair(StoredHost)
     case library(LibraryTarget)
 
@@ -28,6 +30,10 @@ enum GamepadScreen: Identifiable {
         switch self {
         case .settings: return "settings"
         case .addHost: return "addHost"
+        // Keyed on the CARD (host + pinned profile), for the same reason the library is keyed on
+        // the shelf — see `HostOptionsTarget.id`.
+        case .hostOptions(let target): return "hostOptions-\(target.id)"
+        case .editHost(let host): return "editHost-\(host.id.uuidString)"
         case .pair(let host): return "pair-\(host.id.uuidString)"
         // Keyed on the SHELF, not the host: a host and each of its pinned cards open different
         // libraries, and sharing an id would let one stand in for another mid-transition.
@@ -39,7 +45,7 @@ enum GamepadScreen: Identifiable {
     /// (`Bg::Form` in the console); the library keeps the launcher's full aurora.
     var isForm: Bool {
         switch self {
-        case .settings, .addHost, .pair: return true
+        case .settings, .addHost, .hostOptions, .editHost, .pair: return true
         case .library: return false
         }
     }

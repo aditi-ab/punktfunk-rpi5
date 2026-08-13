@@ -64,6 +64,9 @@ struct GamepadSettingsView: View {
     /// console's input drop) and while the connect takeover is up; a system presentation never
     /// needs the gate and keeps the default.
     var controllerActive = true
+    /// Whether this device has a microphone at all — passed through to the About page's shortcuts
+    /// reference, which must not list a mute key on a device that can't mute anything.
+    var micAvailable = true
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
@@ -135,8 +138,24 @@ struct GamepadSettingsView: View {
     /// The direction of the last value step (+1 right/forward, -1 left) — picks which edge the
     /// changed value slides in from, so the animation follows the user's motion.
     @State private var lastAdjustDelta = 1
+    /// The About page (identity, licenses, and the shortcuts reference) is up over this screen.
+    @State private var showAbout = false
 
     var body: some View {
+        // About replaces this screen's content rather than pushing over it — one layer deeper,
+        // the same rule the pin picker follows, so B peels back here exactly as it does there.
+        // It carries its own header and legend, which is why it takes the whole frame.
+        if showAbout {
+            GamepadAboutView(
+                close: { showAbout = false },
+                controllerActive: controllerActive,
+                micAvailable: micAvailable)
+        } else {
+            settingsBody
+        }
+    }
+
+    private var settingsBody: some View {
         GamepadMenuList(
             items: rows,
             focusID: $focusID,
@@ -327,6 +346,13 @@ struct GamepadSettingsView: View {
     /// the environment dismiss under a macOS sheet / tvOS cover.
     private func performClose() {
         if let close { close() } else { dismiss() }
+    }
+
+    /// Just the marketing version for the About row's value — the build number that
+    /// `GamepadAboutView` also shows would not fit a settings row, and the page itself is one
+    /// press away for anyone who needs it.
+    private static var shortVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
     }
 
     /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
@@ -690,6 +716,15 @@ struct GamepadSettingsView: View {
                 label: "Controller-optimized UI",
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
+            // Not a setting, so it adjusts to nothing (left/right is a boundary thud) and A opens
+            // it — the same shape the Profiles rows use to reach the pin picker.
+            Row(
+                id: "about", tab: .interface, icon: "info.circle", label: "About Punktfunk",
+                value: Self.shortVersion,
+                detail: "Version and licenses, and the shortcuts for streaming on this device.",
+                adjustable: false,
+                adjust: { _ in false },
+                activate: { showAbout = true }),
         ]
         // WHEN the switch above takes over. Built only while it is on: with the switch off this
         // screen is unreachable in the first place (no gamepad UI to open it from), so a row
