@@ -7,7 +7,7 @@
 # Gitea has NO flatpak/ostree registry, so the bundle lives in the generic registry:
 #   PUT  https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/<version>/<file>
 #   GET  https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/<version>/<file>
-# On tags the bundle is ALSO attached to the Gitea release (mirrors release.yml's DMG).
+# On tags the bundle is ALSO attached to the Gitea release (mirrors apple.yml's DMG).
 #
 # PRIVILEGED-BUILD CONSTRAINT: flatpak-builder runs bubblewrap, which needs user namespaces.
 # In a Gitea/act_runner Docker executor that means the job container must be --privileged
@@ -37,7 +37,7 @@ on:
     # binary's dependency closure must be listed here — including the native decode rungs, or a
     # commit that only touches the decoder never rebuilds the bundle and the Deck canary quietly
     # stops tracking it. pf-dxvadec is absent on purpose: it is `cfg(windows)` in pf-client-core
-    # and never enters the Linux closure (windows.yml / windows-msix.yml carry it instead).
+    # and never enters the Linux closure (windows-client.yml carries it instead).
     paths:
       - 'clients/linux/**'
       - 'clients/session/**'

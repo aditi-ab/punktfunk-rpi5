@@ -274,7 +274,7 @@ jobs:
           retention-days: 30
 
       # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.
-      # Generic registry is public for reads — matches windows-msix.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
+      # Generic registry is public for reads — matches windows-client.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
       # main = canary store + `canary/` sideload alias; a `vX.Y.Z` tag = `latest/` alias + attached
       # to the unified Gitea Release.
       - name: Publish to generic registry + attach to Gitea release

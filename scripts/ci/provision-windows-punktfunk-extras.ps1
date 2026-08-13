@@ -1,6 +1,6 @@
 # Layers punktfunk-specific tooling onto the shared unom Windows CI runner: FFmpeg (the HOST's
 # amf-qsv encode leg, x64 only), Inno Setup (the host installer), and the aarch64-pc-windows-msvc
-# rustup target (windows-msix.yml's ARM64 leg). The runner itself - act_runner, Node, rustup,
+# rustup target (windows-client.yml's ARM64 leg). The runner itself - act_runner, Node, rustup,
 # VS Build Tools/NASM/CMake/LLVM - is provisioned generically by unom/infra
 # (windows-runner/windows-runner.pkr.hcl + proxmox/windows-runner's Terraform clone); this script
 # is what punktfunk adds on top, since FFmpeg/Inno Setup/the ARM64 target aren't every project's
@@ -15,7 +15,7 @@ function info($m) { Write-Host "[provision-punktfunk-extras] $m" }
 $env:RUSTUP_HOME = "C:\Users\Public\.rustup"
 $env:CARGO_HOME  = "C:\Users\Public\.cargo"
 
-# --- ARM64 cross-compile target (windows.yml / windows-msix.yml build aarch64-pc-windows-msvc off
+# --- ARM64 cross-compile target (windows-client.yml builds aarch64-pc-windows-msvc off
 # this x64 box; the ARM64 MSVC cross compiler itself comes from unom/infra's generic VS Build
 # Tools provisioning, which already includes the ARM64 component). ---
 $rustup = "C:\Users\Public\.cargo\bin\rustup.exe"
@@ -33,7 +33,7 @@ if (Test-Path $rustup) {
 # bundled DLLs LGPL-2.1+ (dynamic linking satisfies the relink duty) rather than GPL, so the
 # shipped installer/MSIX stay consistent with punktfunk's MIT OR Apache-2.0 posture.
 # ⚠ The CLIENT no longer links FFmpeg at all (M10, design/client-native-decode.md §6): it decodes
-# with pf-vkdecode / pf-dxvadec / openh264 + rav1d. windows.yml and windows-msix.yml set no
+# with pf-vkdecode / pf-dxvadec / openh264 + rav1d. windows-client.yml sets no
 # FFMPEG_DIR and the MSIX bundles no libav* DLLs, so only the x64 tree is fetched now - the ARM64
 # one existed solely for the ARM64 client leg. Delete a stale C:\Users\Public\ffmpeg-arm64 by
 # hand; this script does not remove what it no longer installs.

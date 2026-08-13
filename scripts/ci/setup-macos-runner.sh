@@ -94,7 +94,7 @@ fi
 # Deliberately NO DEVELOPER_DIR here: cargo (rust ld) must stay on the system default —
 # a newer-than-OS Xcode's ld emits dylibs the running dyld rejects ("mis-aligned
 # LINKEDIT string pool"), breaking every proc-macro build. Steps that need a full Xcode
-# (xcodebuild) resolve it themselves (build-xcframework.sh, release.yml).
+# (xcodebuild) resolve it themselves (build-xcframework.sh, apple.yml's `distribute` job).
 
 PLIST_STAGE="$RUNNER_HOME/io.gitea.act_runner.plist"
 PLIST_SYSTEM="/Library/LaunchDaemons/io.gitea.act_runner.plist"

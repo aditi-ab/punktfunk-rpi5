@@ -67,7 +67,7 @@ jobs:
           . scripts/ci/gitea-release.sh
           RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
           upsert_asset "$RID" "$SBOM_FILE"
-      # v3, not v4: Gitea's artifact backend rejects upload-artifact@v4 (see release.yml).
+      # v3, not v4: Gitea's artifact backend rejects upload-artifact@v4 (see apple.yml).
       - name: Upload artifact (non-tag runs)
         if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/upload-artifact@v3
