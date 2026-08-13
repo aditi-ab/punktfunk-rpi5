@@ -39,7 +39,7 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
 # libei (EI sender) for the portable input path on KWin/GNOME (RemoteDesktop portal) + gamescope-EI.
-reis = { version = "0.6.1", features = ["tokio"] }
+reis = { version = "0.7.1", features = ["tokio"] }
 futures-util = "0.3"
 # `macros` is for the `tokio::select!` in the libei and steam_usbip worker loops. It used to be
 # absent and compile anyway, borrowed from punktfunk-core's `quic` feature via unification — i.e. an
