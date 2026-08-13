@@ -153,12 +153,20 @@ never the `RecordVirtual` that Mutter gained in 42. Its portal backend
 (`xdg-desktop-portal-xapp`) implements no ScreenCast either, so the route that serves Sway and
 Hyprland is closed too. This is upstream's to fix, not a Punktfunk setting.
 
-What **does** work on a Mint or LMDE box is **gamescope**: the host starts its own headless
-gamescope for each connecting client and runs the game inside it, so it needs no desktop compositor
-at all. Your Cinnamon session keeps running untouched; the stream is the game, not the desktop.
+**Which Mint you run decides whether there is any route at all:**
+
+| Edition | Base | Can it host? |
+|---|---|---|
+| **LMDE 7 "Gigi"** | Debian 13 | ✅ Yes — via gamescope (below) |
+| **Linux Mint 22.x** ("Wilma"…"Zena") | Ubuntu 24.04 | ❌ No — see [below](#linux-mint-22x-cannot-host-yet) |
+| **Linux Mint 23** | Ubuntu 26.04 | ✅ Expected — due December 2026 |
+
+On **LMDE 7**, what works is **gamescope**: the host starts its own headless gamescope for each
+connecting client and runs the game inside it, so it needs no desktop compositor at all. Your
+Cinnamon session keeps running untouched; the stream is the game, not the desktop.
 
 ```sh
-sudo apt install punktfunk-gamescope
+sudo apt install punktfunk-gamescope      # LMDE 7 / Debian 13 — not available on Mint 22.x
 echo 'PUNKTFUNK_COMPOSITOR=gamescope' >> ~/.config/punktfunk/host.env
 systemctl --user restart punktfunk-host
 ```
@@ -172,8 +180,28 @@ rather than guessing. Set a game to launch with
 > and the patched build is what gives the stream HDR, a visible cursor, and the client's real
 > refresh rate instead of a hardcoded 60 Hz.
 
-If you want to stream the **desktop** from a Mint box, the answer today is to run a KDE, GNOME, Sway
-or Hyprland session instead — all four expose a virtual-output API.
+If you want to stream the **desktop** from an LMDE box, the answer today is to log into a GNOME or
+Sway session instead — Debian 13 ships GNOME 48.7 and sway 1.10, both above the
+[floors](/docs/requirements). (Debian 13's KDE is KWin **6.3.6**, below the 6.5.6 floor, so Plasma
+is not an option there yet.)
+
+### Linux Mint 22.x cannot host yet
+
+**On Linux Mint 22.x — the current mainstream release, and every version until Mint 23 in December
+2026 — there is no working configuration.** `punktfunk-host` will install, which makes this easy to
+miss, but nothing on the box can produce a stream:
+
+- **Cinnamon** cannot host a virtual display (above).
+- **gamescope is not available and cannot be made available.** Ubuntu 24.04 packages no gamescope,
+  and the patched `punktfunk-gamescope` cannot run there either: 24.04 is short of what the build
+  needs on *five* libraries — wayland 1.22.0 (needs ≥ 1.23.1), libinput 1.25 (≥ 1.26), libavif
+  1.0.4 (≥ 1.2.1), pixman 0.42 (≥ 0.44), and no `libdisplay-info2` or `libxcb-errors0` at all.
+- **Switching desktop does not rescue it.** Ubuntu 24.04 ships KWin **5.27** (floor 6.5.6) and GNOME
+  Shell **46** (floor 48). Only `sway` 1.9 is even a candidate, and that means giving up Cinnamon.
+
+If you want to run a host on Mint hardware today, use **LMDE 7** — it is the same desktop on a
+Debian 13 base, where gamescope works. Otherwise wait for **Mint 23** (Ubuntu 26.04 base), where
+both the patched gamescope and the newer compositors are available.
 
 ## Configure your desktop
 

@@ -18,6 +18,14 @@ desktop on the [configure pages](#configure-your-desktop) afterward rather than 
 > and needs GTK4 ≥ 4.20 and SDL3, so it installs on **26.04 or newer** only — the host has no such
 > limit.
 
+> ⚠ **On 24.04 LTS, the package installs but the distro gives it no compositor to drive.** The
+> host `.deb` is built for 24.04 and installs cleanly — but streaming needs a compositor that meets
+> the [version floors](/docs/requirements), and stock 24.04 meets none of them: KWin **5.27** (floor
+> 6.5.6), GNOME Shell **46** (floor 48), and no `gamescope` package at all (nor can the patched one
+> run there — 24.04 is too old on wayland, libinput, libavif and pixman). `sway` 1.9 is the only
+> candidate. **For a working host, use 26.04**, where the patched gamescope and current KDE/GNOME
+> are all available. This is why [Linux Mint 22.x cannot host](/docs/debian#linux-mint-22x-cannot-host-yet).
+
 > **On Debian**, see [Debian](/docs/debian) — the host, console and plugin runner are supported and
 > CI-tested on **Debian 13**; the desktop client is not packaged for it yet. Debian 12 (bookworm) is
 > below the glibc floor and cannot install anything here. Note that the `debian` in the repository
