@@ -35,6 +35,12 @@ const UNIT: &str = "punktfunk-scripting";
 #[cfg(target_os = "windows")]
 const TASK: &str = "PunktfunkScripting";
 
+/// The runner executable's name. Every non-Windows package installs a wrapper under exactly this
+/// name — the deb/rpm at `/usr/bin`, the SteamOS installer at `~/.local/bin`, Nix at
+/// `$out/bin` — so one name covers every layout the resolver walks.
+#[cfg(not(target_os = "windows"))]
+const RUNNER_BIN: &str = "punktfunk-scripting";
+
 pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("add") | Some("remove") | Some("rm") | Some("uninstall") | Some("list")
@@ -161,39 +167,101 @@ pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // The scripting package ships /usr/bin/punktfunk-scripting, a wrapper that runs the bundled
-        // bun on the runner bundle and forwards "$@" (packaging/debian/build-scripting-deb.sh).
-        let wrapper = std::path::PathBuf::from("/usr/bin/punktfunk-scripting");
-        if wrapper.exists() {
-            return Ok((wrapper, Vec::new()));
-        }
-        // Fall back to the package's private layout in case the wrapper is absent.
-        let bun = std::path::PathBuf::from("/usr/lib/punktfunk-scripting/bun");
-        let runner = std::path::PathBuf::from("/usr/share/punktfunk-scripting/runner-cli.js");
-        if bun.exists() && runner.exists() {
-            return Ok((bun, vec![runner.to_string_lossy().into_owned()]));
-        }
-        // Immutable-/usr distros (SteamOS): scripts/steamdeck/install.sh lays the SAME payload
-        // out user-scoped under ~/.local — wrapper, private bun, and bundle mirroring the deb's
-        // /usr layout — because a system package can't exist there.
-        if let Ok(home) = std::env::var("HOME") {
-            let home = std::path::Path::new(&home);
-            let wrapper = home.join(".local/bin/punktfunk-scripting");
-            if wrapper.exists() {
-                return Ok((wrapper, Vec::new()));
-            }
-            let bun = home.join(".local/lib/punktfunk-scripting/bun");
-            let runner = home.join(".local/share/punktfunk-scripting/runner-cli.js");
-            if bun.exists() && runner.exists() {
-                return Ok((bun, vec![runner.to_string_lossy().into_owned()]));
-            }
-        }
-        bail!(
-            "the plugin runner isn't installed — install it first (Debian/Ubuntu: \
-             `sudo apt install punktfunk-scripting`; SteamOS: re-run \
-             scripts/steamdeck/install.sh)"
+        let exe = std::env::current_exe().ok();
+        let path_var = std::env::var("PATH").ok();
+        let home = std::env::var("HOME").ok();
+        resolve_runner_in(
+            std::env::var("PUNKTFUNK_SCRIPTING").ok().as_deref(),
+            exe.as_deref().and_then(std::path::Path::parent),
+            path_var.as_deref(),
+            home.as_deref().map(std::path::Path::new),
+            &|p| p.is_file(),
         )
+        .ok_or_else(|| anyhow::anyhow!("{RUNNER_MISSING}"))
     }
+}
+
+/// What to say when no rung matched. Shared with [`runtime_status`], so the CLI and the console
+/// tell an operator the same thing.
+#[cfg(not(target_os = "windows"))]
+pub(crate) const RUNNER_MISSING: &str =
+    "the plugin runner isn't installed — install it first (Debian/Ubuntu: `sudo apt install \
+     punktfunk-scripting`; SteamOS: re-run scripts/steamdeck/install.sh; NixOS: enable \
+     `services.punktfunk.scripting`). If it is installed somewhere else, point PUNKTFUNK_SCRIPTING \
+     at the punktfunk-scripting executable.";
+
+/// The rungs, in order: `PUNKTFUNK_SCRIPTING` → beside the host binary → `PATH` → the packaged
+/// `/usr` layout → the user-scoped SteamOS layout. Pure and fully injected so the table can be
+/// tested without mutating process env, which races `getenv` in parallel tests.
+///
+/// `PATH` is load-bearing rather than a nicety: it is the ONLY rung a Nix install can land on.
+/// `punktfunk-scripting` is a derivation of its own there (packaging/nix/packages.nix), so its
+/// wrapper is neither beside the host binary nor anywhere under `/usr` — the layouts this
+/// resolver used to check exclusively, which is why a fully working NixOS box reported the runner
+/// as not installed.
+#[cfg(not(target_os = "windows"))]
+fn resolve_runner_in(
+    env: Option<&str>,
+    exe_dir: Option<&std::path::Path>,
+    path_var: Option<&str>,
+    home: Option<&std::path::Path>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<(std::path::PathBuf, Vec<String>)> {
+    use std::path::{Path, PathBuf};
+
+    // The two-file layout: a private bun plus the runner bundle, which the deb/rpm and the SteamOS
+    // installer both lay down beside their wrapper. Only a rung when BOTH halves are present.
+    let pair = |bun: PathBuf, runner: PathBuf| -> Option<(PathBuf, Vec<String>)> {
+        (exists(&bun) && exists(&runner))
+            .then(|| (bun, vec![runner.to_string_lossy().into_owned()]))
+    };
+
+    // The operator's own override, and deliberately NOT existence-checked: whoever names a path is
+    // entitled to a failure that names it back, where falling through to a runner that happens to
+    // be installed would hide the typo behind a working install.
+    if let Some(v) = env.map(str::trim).filter(|v| !v.is_empty()) {
+        return Some((PathBuf::from(v), Vec::new()));
+    }
+    // Beside the host binary — a source tree or any relocatable layout shipping both in one prefix.
+    if let Some(p) = exe_dir.map(|d| d.join(RUNNER_BIN)).filter(|p| exists(p)) {
+        return Some((p, Vec::new()));
+    }
+    if let Some(p) = path_var
+        .into_iter()
+        .flat_map(|v| v.split(':'))
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(RUNNER_BIN))
+        .find(|p| exists(p))
+    {
+        return Some((p, Vec::new()));
+    }
+    // The packaged /usr layout (packaging/debian/build-scripting-deb.sh). Still checked explicitly
+    // after `PATH` because a systemd unit can carry a PATH that does not include /usr/bin.
+    let wrapper = Path::new("/usr/bin").join(RUNNER_BIN);
+    if exists(&wrapper) {
+        return Some((wrapper, Vec::new()));
+    }
+    if let Some(cmd) = pair(
+        Path::new("/usr/lib").join(RUNNER_BIN).join("bun"),
+        Path::new("/usr/share")
+            .join(RUNNER_BIN)
+            .join("runner-cli.js"),
+    ) {
+        return Some(cmd);
+    }
+    // Immutable-/usr distros (SteamOS): scripts/steamdeck/install.sh lays the SAME payload out
+    // user-scoped under ~/.local, because a system package can't exist there.
+    let home = home?;
+    let wrapper = home.join(".local/bin").join(RUNNER_BIN);
+    if exists(&wrapper) {
+        return Some((wrapper, Vec::new()));
+    }
+    pair(
+        home.join(".local/lib").join(RUNNER_BIN).join("bun"),
+        home.join(".local/share")
+            .join(RUNNER_BIN)
+            .join("runner-cli.js"),
+    )
 }
 
 // ---- service ops ------------------------------------------------------------------------------
@@ -277,9 +345,7 @@ pub(crate) fn runtime_status() -> RuntimeStatus {
         detail: if installed {
             String::new()
         } else {
-            "the plugin runner package isn't installed (Debian/Ubuntu: `sudo apt install \
-             punktfunk-scripting`)"
-                .into()
+            RUNNER_MISSING.into()
         },
     }
 }
@@ -806,4 +872,152 @@ fn enable() -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn disable() -> Result<()> {
     bail!("the plugin runner is only available on Linux and Windows hosts")
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Build an `exists` probe over a fixed set of paths.
+    fn present(ps: Vec<PathBuf>) -> impl Fn(&Path) -> bool {
+        move |p: &Path| ps.iter().any(|q| q == p)
+    }
+
+    /// Every layout the resolver has to serve, in one table — the regression guard for the NixOS
+    /// report (a runner on `PATH` and nowhere else read as "not installed").
+    #[test]
+    fn runner_resolution_table() {
+        let beside = Path::new("/opt/punktfunk/bin");
+        let nix = Path::new("/run/current-system/sw/bin");
+        let home = Path::new("/home/deck");
+
+        // The rung a Nix install lands on: NOT beside the host binary, NOT under /usr — `PATH`
+        // only. This is the whole bug.
+        let exists = present(vec![nix.join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(
+                None,
+                Some(beside),
+                Some(nix.to_str().unwrap()),
+                None,
+                &exists
+            ),
+            Some((nix.join(RUNNER_BIN), Vec::new()))
+        );
+
+        // An explicit override wins over every discovery…
+        let exists = present(vec![beside.join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(
+                Some("/nix/store/abc/bin/punktfunk-scripting"),
+                Some(beside),
+                Some("/usr/bin"),
+                Some(home),
+                &exists
+            ),
+            Some(("/nix/store/abc/bin/punktfunk-scripting".into(), Vec::new()))
+        );
+        // …and is not existence-checked, so a typo surfaces as a spawn failure naming the path
+        // rather than silently running some other runner.
+        assert_eq!(
+            resolve_runner_in(Some("/nope/pf"), Some(beside), None, None, &exists),
+            Some(("/nope/pf".into(), Vec::new()))
+        );
+        // Empty/whitespace reads as unset, not as a path.
+        assert_eq!(
+            resolve_runner_in(Some("  "), Some(beside), None, None, &exists),
+            Some((beside.join(RUNNER_BIN), Vec::new()))
+        );
+        // Beside the host binary beats PATH.
+        let exists = present(vec![beside.join(RUNNER_BIN), nix.join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(
+                None,
+                Some(beside),
+                Some(nix.to_str().unwrap()),
+                None,
+                &exists
+            ),
+            Some((beside.join(RUNNER_BIN), Vec::new()))
+        );
+        // PATH is walked entry by entry, skipping empties.
+        let exists = present(vec![nix.join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(
+                None,
+                Some(Path::new("/nowhere")),
+                Some(":/nope:/run/current-system/sw/bin"),
+                None,
+                &exists
+            ),
+            Some((nix.join(RUNNER_BIN), Vec::new()))
+        );
+
+        // The deb/rpm wrapper, found even when the unit's PATH omits /usr/bin.
+        let exists = present(vec![PathBuf::from("/usr/bin").join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(
+                None,
+                Some(Path::new("/nowhere")),
+                Some("/nope"),
+                None,
+                &exists
+            ),
+            Some((PathBuf::from("/usr/bin").join(RUNNER_BIN), Vec::new()))
+        );
+        // …and its private two-file layout when the wrapper is absent.
+        let bun = PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun");
+        let cli = PathBuf::from("/usr/share")
+            .join(RUNNER_BIN)
+            .join("runner-cli.js");
+        let exists = present(vec![bun.clone(), cli.clone()]);
+        assert_eq!(
+            resolve_runner_in(None, None, None, None, &exists),
+            Some((bun, vec![cli.to_string_lossy().into_owned()]))
+        );
+        // Half of that layout is not a rung — a partial install must fall through, not spawn a
+        // bun with no script.
+        let exists = present(vec![PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun")]);
+        assert_eq!(resolve_runner_in(None, None, None, None, &exists), None);
+
+        // SteamOS: the same payload, user-scoped. Reached only via HOME.
+        let exists = present(vec![home.join(".local/bin").join(RUNNER_BIN)]);
+        assert_eq!(
+            resolve_runner_in(None, None, None, Some(home), &exists),
+            Some((home.join(".local/bin").join(RUNNER_BIN), Vec::new()))
+        );
+        assert_eq!(resolve_runner_in(None, None, None, None, &exists), None);
+        let bun = home.join(".local/lib").join(RUNNER_BIN).join("bun");
+        let cli = home
+            .join(".local/share")
+            .join(RUNNER_BIN)
+            .join("runner-cli.js");
+        let exists = present(vec![bun.clone(), cli.clone()]);
+        assert_eq!(
+            resolve_runner_in(None, None, None, Some(home), &exists),
+            Some((bun, vec![cli.to_string_lossy().into_owned()]))
+        );
+
+        // Nothing anywhere: the "not installed" rung the error text speaks for.
+        let exists = present(vec![]);
+        assert_eq!(
+            resolve_runner_in(None, Some(beside), Some("/nope"), Some(home), &exists),
+            None
+        );
+    }
+
+    /// The operator-facing miss must name NixOS — the report's second half was that the error
+    /// pointed a NixOS operator at `apt`.
+    #[test]
+    fn the_missing_runner_error_names_every_platform_it_can_be_installed_on() {
+        for hint in [
+            "apt install",
+            "steamdeck/install.sh",
+            "NixOS",
+            "PUNKTFUNK_SCRIPTING",
+        ] {
+            assert!(RUNNER_MISSING.contains(hint), "missing hint: {hint}");
+        }
+    }
 }

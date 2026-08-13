@@ -305,7 +305,16 @@ installer's `PATH` change, or call the exe by full path. On Linux the host packa
 [same RPM repo you installed the host from](/docs/fedora). On Arch:
 `sudo pacman -Syu punktfunk-scripting` (a full `-Syu`, like every other install from that repo).
 On SteamOS, re-run `scripts/steamdeck/install.sh` (or
-`scripts/steamdeck/update.sh`). On Windows, re-run the installer and keep the scripting component.
+`scripts/steamdeck/update.sh`). On NixOS it comes with `services.punktfunk.scripting.enable` (on by
+default whenever the host is). On Windows, re-run the installer and keep the scripting component.
+
+If the runner *is* installed and the host still says it isn't, the host could not find the
+`punktfunk-scripting` executable. It looks beside its own binary, then on `PATH`, then in the
+packaged `/usr` and `~/.local` layouts — so a runner installed somewhere else needs
+`PUNKTFUNK_SCRIPTING` pointed at it (see [Configuration](/docs/configuration)). Note that the
+console installs plugins from inside the host *service*, whose `PATH` is usually much shorter than
+your shell's: a runner that `punktfunk-host plugins add` finds and the console does not is that
+difference, and the env var is the fix.
 
 **Where a plugin's log output goes** — the console's **Logs** page, under the **Plugins** filter.
 The runner ships everything your plugins print to the host, so a plugin's own lines sit next to the
