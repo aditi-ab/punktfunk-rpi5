@@ -48,7 +48,15 @@ pf-vdisplay = { path = "../pf-vdisplay" }
 # compiles everywhere; the backends are cfg-gated inside it.
 pf-clipboard = { path = "../pf-clipboard" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
-quinn = "0.11"
+# Feature list = quinn's own defaults with `rustls-ring` swapped for `rustls-aws-lc-rs`; every
+# crate selecting a rustls backend must agree or feature unification builds both (see core).
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -66,7 +74,6 @@ mdns-sd = "0.20"
 mac_address = "1"
 if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
-parking_lot = "0.12"
 # GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
 # The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
@@ -85,21 +92,28 @@ base64 = "0.22"
 # run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
 # webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
 # checked everywhere even though only the Windows GOG/Xbox providers need it today.
-ureq = "2"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
+# put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.16"
 # Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
 # tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
 # feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
 axum-server = "0.8"
-# Ring backend, NOT the (default) aws-lc-rs one — matches punktfunk-core + the client so the whole
-# tree stays ring-only (no aws-lc-sys: a heavy C dep that fails to build on the Windows CI runner).
+# aws-lc-rs backend, matching punktfunk-core + the clients (a dissenting crate would pull a
+# second crypto stack in). `prefer-post-quantum` offers X25519MLKEM768 first on the mgmt/native
+# TLS 1.3 listeners; classical curves stay in the list, so a client without ML-KEM still connects.
 # Keep `tls12` for GameStream/Moonlight clients that negotiate TLS 1.2.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
 # Manual HTTPS+mTLS serve loop for the mgmt API (axum-server can't surface the peer cert): a
 # tokio-rustls handshake exposes the client cert, then hyper serves the axum Router with the
 # verified fingerprint injected as a request extension. Versions match the workspace lock.
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
@@ -122,10 +136,12 @@ serde_json = "1"
 # utoipa into axum 0.8 extractors; utoipa-axum collects `#[utoipa::path]` routes into the
 # spec; utoipa-scalar serves the interactive docs. Codegen-friendly: the spec is emitted
 # verbatim by the `openapi` subcommand. Control plane only — never the per-frame path.
-# Plugin-store index signatures: ed25519 verification of a catalog document before any field of
-# it is read (store/index.rs). Already in the tree via rustls — the workspace is ring-only, so this
-# is the one signature primitive available without pulling aws-lc-sys (which fails on Windows CI).
-ring = "0.17"
+# SHA-256 over the downloaded installer and its signing-leaf DER (update/windows.rs) — Windows-only
+# in practice, the plugin-store's ed25519 path re-exports pf-update-check's verifier. Already in the
+# tree via rustls; its API is ring-compatible by design, which is what made the swap mechanical.
+# `prebuilt-nasm`: see pf-update-check's copy — it keeps aws-lc-sys building on Windows x86_64
+# with no NASM on the box, whatever else the build happens to select.
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 # Semver comparisons for the plugin store: `minHost` gating and the revocation list's version
 # ranges (`<0.3.2`). Already in the lockfile transitively.
 semver = "1"
@@ -134,8 +150,9 @@ utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
-# Drive the management API router in-process (no socket) in the handler tests.
-tower = { version = "0.5", features = ["util"] }
+# (`tower` drives the management API router in-process in the handler tests, but it is already a
+# normal dependency above and those are visible to tests — the dev-dependency re-declaration was
+# redundant.)
 http-body-util = "0.1"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
@@ -157,51 +174,21 @@ libc = "0.2"
 # Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
 # unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
 pipewire = "0.9"
-# ashpd 0.13 uses the tokio runtime; a current-thread runtime drives the one-time
-# portal handshake (control plane — never the per-frame path).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
-# Input injection into headless Sway via the wlroots virtual-input Wayland protocols
-# (uinput won't reach a compositor running with WLR_LIBINPUT_NO_DEVICES=1).
-wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-wayland-protocols-misc = { version = "0.3", features = ["client"] }
-# `xdg-output` (zxdg_output_v1): the per-output *logical* geometry (post-scale size + global
-# position), used by the KWin fake_input backend to map absolute coordinates under display scaling.
-wayland-protocols = { version = "0.32", features = ["client"] }
-# Codegen for KDE's `zkde_screencast_unstable_v1` (vendored in `protocols/`): create a KWin
-# virtual output sized to the client's resolution and get its PipeWire node (KRdp's path).
-# `wayland-backend` is referenced by the generated interface tables.
-wayland-scanner = "0.31"
-wayland-backend = "0.3"
-# Parse `pw-dump` JSON to find gamescope's PipeWire node (gamescope backend).
-serde_json = "1"
+# (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
+# in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
+# NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),
+# `xkbcommon`, `reis`, `khronos-egl`, `ash` and `usbip-sim` used to be declared here. The code that
+# used them moved to `pf-inject` (virtual input, libei, USB/IP) and `pf-zerocopy` (EGL/Vulkan dmabuf)
+# in the subsystem extraction, and each of those crates declares them itself — only the manifest
+# entries were left behind, along with comments describing code this crate no longer contains.
+# Verified unused before removal: zero `use`/path references across src/ + build.rs.
 # Read the Lutris library DB (`pga.db`) for the Lutris store provider. `bundled` vendors + compiles
 # SQLite (cc, already needed for ffmpeg/opus) so there's no system libsqlite3 runtime dependency —
 # clean for the deb/rpm/flatpak packaging. Opened read-only/immutable (Lutris may hold it open).
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
-xkbcommon = "0.8"
-# libei (EI sender) for the portable input path on KWin/GNOME (RemoteDesktop portal).
-# The `tokio` feature wires reis's event stream into tokio's reactor.
-reis = { version = "0.6.1", features = ["tokio"] }
-# `StreamExt::next` on reis's tokio event stream in the libei worker loop.
-futures-util = "0.3"
-# Zero-copy capture (plan §9): EGL imports the PipeWire dmabuf, CUDA maps it, NVENC encodes
-# it with no CPU roundtrip. `khronos-egl` (dynamic = load the NVIDIA libEGL at runtime) gives
-# eglCreateImage + the dma_buf import; the CUDA driver API (EGL interop) and libgbm are linked
-# via hand-rolled FFI in `src/zerocopy/` (no Rust crate exposes the EGL-interop driver calls).
-khronos-egl = { version = "6", features = ["dynamic"] }
-# Vulkan bridge for LINEAR dmabufs (gamescope): import via VK_EXT_external_memory_dma_buf,
-# GPU-copy into an exportable allocation, export OPAQUE_FD → cuImportExternalMemory (the
-# officially-supported CUDA pairing; raw dmabuf fds are rejected by the desktop driver).
-ash = "0.38"
 # `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
 # (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `zerocopy::cuda`.
 libloading = "0.8"
-# Vendored + trimmed `usbip` server core (no libusb) — presents a virtual Steam Deck over USB/IP
-# so the local `vhci_hcd` attaches it: the shippable, Secure-Boot-clean, Steam-Input-promotable
-# virtual-Deck transport on non-SteamOS hosts (`inject/linux/steam_usbip.rs`). See the crate's NOTICE.
-usbip-sim = { path = "vendor/usbip-sim" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows host backends. `windows` covers the Win32/CCD APIs the SudoVDA virtual-display backend
@@ -300,12 +287,12 @@ winreg = "0.56"
 roxmltree = "0.21"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.23"
-# Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend
-# (vdisplay/pf_vdisplay.rs): the control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs,
-# defined ONCE so host<->driver ABI drift is a compile error. `bytemuck` serializes those structs
-# to/from the DeviceIoControl byte buffers.
+# Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the
+# control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs, defined ONCE so host<->driver
+# ABI drift is a compile error (used from `capture.rs`). The `bytemuck` that serializes those
+# structs into the DeviceIoControl buffers is pf-vdisplay's dependency, not this crate's — it was
+# declared here too, unused.
 pf-driver-proto = { path = "../pf-driver-proto" }
-bytemuck = { version = "1.19", features = ["derive"] }
 
 # The encode feature flags now FORWARD to the pf-encode subsystem crate (the heavy encoder deps —
 # ffmpeg-next, the NVENC SDK, openh264, pyrowave-sys — moved there, plan §W6). Selecting a feature

@@ -8,6 +8,25 @@
 
 use std::sync::{Arc, Mutex};
 
+/// A blocking HTTP agent over a caller-built `rustls::ClientConfig` — the only way to give an
+/// HTTP client the [`PinVerify`] verifier below.
+#[cfg(feature = "ureq-tls")]
+pub mod ureq_agent;
+
+/// Install aws-lc-rs as this process's rustls provider. Call once, early, from `main`.
+///
+/// aws-lc-rs is currently the ONLY backend in the tree, so rustls can infer it and this call is
+/// belt-and-braces rather than load-bearing. It is kept because the inference is what breaks
+/// first: the moment any dependency drags a second backend in — which is exactly what `ureq 2`
+/// used to do, naming `rustls/ring` in its own dependency line where no dependent could switch it
+/// off — rustls stops guessing, and every config built through `ClientConfig::builder()` rather
+/// than `builder_with_provider` **panics** instead of picking one. Calling this makes the choice
+/// explicit and survives that. Idempotent: losing the race to another installer is the expected
+/// outcome, not an error, since every caller in this workspace installs the same provider.
+pub fn install_default_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// SHA-256 of a certificate's DER encoding — the fingerprint clients pin. Re-exported as
 /// `crate::quic::endpoint::cert_fingerprint` for callers that already reach it there.
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
@@ -91,7 +110,7 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
@@ -105,12 +124,12 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

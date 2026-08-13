@@ -32,6 +32,47 @@ pairing + the legacy GCM path, security-review #5/#9) are enabled only by an exp
   the old flag is still accepted as explicit-off).
 - Windows was already opt-in (unchecked installer task) and is unchanged.
 
+### TLS moved to aws-lc-rs, with post-quantum key exchange (⚠ build-visible for packagers/embedders)
+
+The rustls backend across the whole workspace — host, tray, clients and `punktfunk-core` — is now
+**aws-lc-rs** instead of `ring`, which enables rustls's `prefer-post-quantum`: every TLS 1.3
+handshake (management API, the native `punktfunk/1` control plane, QUIC) now offers the
+**X25519MLKEM768** hybrid key exchange first. Ring has no ML-KEM, which is why the backend had to
+move. This is negotiation-only and additive — the classical curves stay in the list, so any client
+that does not implement ML-KEM connects exactly as before, and no wire format, ABI or pairing
+record changes. The session AEAD (AES-128-GCM / ChaCha20-Poly1305) is a separate mechanism and is
+untouched.
+
+⚠ **Building from source now needs a working C compiler**, because `aws-lc-sys` compiles AWS-LC.
+No CMake, Go, or NASM is required for the default (non-FIPS) build — on Windows x86_64 rustls turns
+on `aws-lc-rs/prebuilt-nasm`, so no NASM has to be installed. If you add a crate that depends on
+`aws-lc-rs` *directly*, name `features = ["prebuilt-nasm"]` on it: a package selection that pulls
+`aws-lc-rs` without also enabling rustls's `aws_lc_rs` feature otherwise fails on Windows.
+
+`punktfunk-core` gains an off-by-default **`ureq-tls`** feature (`tls::ureq_agent`) that builds a
+blocking HTTP agent around a caller-supplied `rustls::ClientConfig` — the only way to install the
+fingerprint-pinning verifier, since ureq's own `TlsConfig` has no hook for one. The desktop client
+and the tray enable it; the Apple/Android cdylib embedders do not, and pull no HTTP stack.
+
+**`ring` is gone from the tree entirely** — aws-lc-rs is now the only crypto backend on every
+target we ship. Getting there needed the `ureq 2 → 3` upgrade in the same change, because ureq 2
+named `rustls/ring` inside its own dependency declaration where no dependent could switch it off.
+ureq 3 declares rustls with `default-features = false` and picks no backend, so the choice is
+finally ours. ⚠ Spell that dependency `features = ["rustls-no-provider", "rustls-webpki-roots"]`:
+ureq 3's convenience `rustls` feature pulls `_ring` and would quietly restore the second backend.
+
+The ureq upgrade is otherwise internal, but two behaviours are worth knowing. Response size caps
+are now enforced by the body reader, so an over-cap response is an **error** instead of ureq 2's
+silent truncation (which used to surface as a confusing signature failure). And a fingerprint
+mismatch is now matched on ureq 3's typed `Error::Rustls(..)` rather than by sniffing a substring
+out of a transport error message — the old test could also fire on unrelated certificate errors.
+Conditional requests are unchanged: ureq 3 still returns 304 as `Ok`, only 4xx/5xx become `Err`.
+
+**Embedders of `punktfunk-core` that build their own rustls configs** should still call
+`punktfunk_core::tls::install_default_provider()` at startup, or use `builder_with_provider`. With
+one backend present rustls can infer it, so this is now insurance rather than a requirement — but
+it is what stops a future second backend from turning config construction into a panic.
+
 ### The ENet control port now exists only while a pairing does (rust-safety WP0)
 
 `rusty_enet` — a c2rust-style transpile of C ENet, and the host's only pre-auth-reachable unsafe

@@ -21,7 +21,6 @@ path = "src/main.rs"
 pf-client-core = { path = "../../crates/pf-client-core", default-features = false }
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 serde_json = "1"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]

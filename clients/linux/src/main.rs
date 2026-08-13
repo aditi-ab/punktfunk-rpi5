@@ -33,6 +33,7 @@ mod ui_trust;
 
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {
+    punktfunk_core::tls::install_default_provider();
     app::run()
 }
 

@@ -1389,6 +1389,7 @@ from the config directory for a true factory reset."
 
 #[cfg(any(target_os = "linux", windows))]
 fn main() -> std::process::ExitCode {
+    punktfunk_core::tls::install_default_provider();
     // Logs to stderr; stdout is the machine interface (TSV/JSON), exactly like the session
     // binary's contract.
     tracing_subscriber::fmt()

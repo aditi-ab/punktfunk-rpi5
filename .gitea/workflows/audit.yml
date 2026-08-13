@@ -2,6 +2,9 @@
 # license-allowlist gate (CRA Annex I Part II: know your components; catch a bad dep the moment
 # it lands).
 #   * cargo-audit → the (network-facing, crypto-heavy) Rust tree, against the RustSec advisory DB.
+#                   ⚠ ALL FIVE Rust lockfiles, each named with its own `--file`: a bare `cargo audit`
+#                   reads only the root one, which is how the drivers lock went unscanned for so
+#                   long despite already being in this job's `paths:` filter.
 #   * bun audit   → each Bun-managed tree that ships or publishes: web (the mgmt console BFF —
 #                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
 #                   plugin-kit (@punktfunk/plugin-kit).
@@ -11,7 +14,7 @@
 #                   build chain (node-tar, brace-expansion); clearing them needs coordinated bumps
 #                   verified against the LIVE site (the docs don't build standalone) — tracked in
 #                   punktfunk-planning design/cra-readiness.md. Flip to blocking once clean.
-#   * cargo-about → license-allowlist gate over BOTH Rust workspaces (about.toml `accepted`);
+#   * cargo-about → license-allowlist gate over the host + driver workspaces (about.toml `accepted`);
 #                   fails if any crate carries a license outside the allowlist — the regression
 #                   guard about.toml always promised. (The Android Gradle tree has no lockfile, so
 #                   nothing scans it — see the CRA roadmap.)
@@ -47,6 +50,9 @@ on:
     paths:
       - 'Cargo.lock'
       - 'packaging/windows/drivers/Cargo.lock'
+      - 'packaging/windows/pf-vkhdr-layer/Cargo.lock'
+      - 'tools/win-input-matrix/Cargo.lock'
+      - 'tools/hid-descriptor-dump/Cargo.lock'
       - 'web/bun.lock'
       - 'docs-site/bun.lock'
       - 'sdk/bun.lock'
@@ -83,7 +89,15 @@ jobs:
         run: |
           git config --global --add safe.directory "$PWD"
           command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit
+          # Bare `cargo audit` scans ONLY the root Cargo.lock. The other three Rust workspaces are
+          # separate locks and were silently never scanned — the drivers one despite already being
+          # in this job's `paths:` filter, so edits to it triggered a run that then ignored it.
+          # Each needs its own `--file`. `pf-vkhdr-layer` had no lockfile at all until 2026-08-13.
           cargo audit
+          cargo audit --file packaging/windows/drivers/Cargo.lock
+          cargo audit --file packaging/windows/pf-vkhdr-layer/Cargo.lock
+          cargo audit --file tools/win-input-matrix/Cargo.lock
+          cargo audit --file tools/hid-descriptor-dump/Cargo.lock
 
   bun-audit:
     strategy:

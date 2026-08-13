@@ -168,27 +168,34 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
     if !url.starts_with("https://") {
         return Err("installer url must be https".into());
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(15))
-        .redirects(3)
-        .user_agent(&format!(
+    // Connect timeout only, deliberately no global one: this streams an installer that is tens of
+    // MB, and a whole-request deadline would abort a slow-but-healthy download.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .max_redirects(3)
+        .user_agent(format!(
             "punktfunk-host/{} (update-apply)",
             env!("PUNKTFUNK_VERSION")
         ))
-        .build();
+        .build()
+        .into();
 
     let existing = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
     let mut req = agent.get(url);
     if existing > 0 {
-        req = req.set("Range", &format!("bytes={existing}-"));
+        req = req.header("Range", &format!("bytes={existing}-"));
     }
     let resp = req.call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => format!("download returned HTTP {code}"),
+        ureq::Error::StatusCode(code) => format!("download returned HTTP {code}"),
         other => format!("download failed: {other}"),
     })?;
 
     let resumed = resp.status() == 206;
-    let content_len: Option<u64> = resp.header("content-length").and_then(|v| v.parse().ok());
+    let content_len: Option<u64> = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
     let total = content_len.map(|l| if resumed { existing + l } else { l });
     if let Some(t) = total {
         preflight_disk(part, t.saturating_mul(DISK_MARGIN))?;
@@ -211,7 +218,9 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
     };
     progress(received, total);
 
-    let mut reader = resp.into_reader();
+    // Unlimited reader, not `read_to_vec` — the installer is streamed to disk in 64 KiB chunks so
+    // it never lands in memory, and ureq 3's body-read caps do not apply to this path.
+    let mut reader = resp.into_body().into_reader();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
@@ -234,7 +243,7 @@ fn download(url: &str, part: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Resu
 
 fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("open for hashing: {e}"))?;
-    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     let mut buf = [0u8; 128 * 1024];
     loop {
         let n = file
@@ -366,7 +375,7 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
         // cert context above; the slice is consumed (hashed) before the state is closed.
         let der =
             unsafe { std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize) };
-        let fp = hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref());
+        let fp = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref());
         if !pins.iter().any(|p| p.eq_ignore_ascii_case(&fp)) {
             return Err(format!(
                 "installer signing-leaf fingerprint {fp} matches none of the manifest's \

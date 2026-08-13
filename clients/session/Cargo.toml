@@ -37,7 +37,6 @@ pf-client-core = { path = "../../crates/pf-client-core", default-features = fals
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 # The fake-library dev hook (`PUNKTFUNK_FAKE_LIBRARY`, browse mode) parses GameEntry JSON.
 serde_json = { version = "1", optional = true }
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

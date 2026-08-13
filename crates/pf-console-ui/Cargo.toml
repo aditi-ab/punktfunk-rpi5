@@ -12,7 +12,11 @@ repository.workspace = true
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 pf-presenter = { path = "../pf-presenter" }
 # MenuEvent/MenuPulse (the gamepad service's menu mode drives the library).
-pf-client-core = { path = "../pf-client-core" }
+# `default-features = false` like every other consumer (pf-presenter, cli, session, clients/windows):
+# pf-client-core's default is `pyrowave`, which compiles the vendored PyroWave C++ — fatal on
+# Windows ARM64. Whether that backend is on is the session binary's call (it forwards a `pyrowave`
+# feature); this crate needs none of it, and taking defaults here quietly turned it on.
+pf-client-core = { path = "../pf-client-core", default-features = false }
 
 # Skia on the presenter's VkDevice (`vulkan`); `textlayout` = skparagraph/harfbuzz for
 # the typography the console library needs (~15 MB stripped, prebuilt binaries exist for

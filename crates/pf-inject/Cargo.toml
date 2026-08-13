@@ -41,7 +41,10 @@ wayland-backend = "0.3"
 # libei (EI sender) for the portable input path on KWin/GNOME (RemoteDesktop portal) + gamescope-EI.
 reis = { version = "0.6.1", features = ["tokio"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# `macros` is for the `tokio::select!` in the libei and steam_usbip worker loops. It used to be
+# absent and compile anyway, borrowed from punktfunk-core's `quic` feature via unification — i.e. an
+# unrelated crate dropping it would have broken this one.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
 xkbcommon = "0.8"
 # Vendored + trimmed usbip server core — presents a virtual Steam Deck over USB/IP for Steam Input.

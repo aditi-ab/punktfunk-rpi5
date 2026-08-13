@@ -4,12 +4,21 @@
 # or an accepted, documented risk. Keep this list TIGHT and justify every entry — an ignore here
 # means the audit job stops flagging it, so the reasoning must hold up.
 #
-# NOTE: `cargo audit` (no `--deny warnings`) fails only on *vulnerabilities*, not on the
-# `unmaintained` warnings (audiopus_sys via opus, paste via utoipa-axum). Both are transitive, at
-# their latest published version with no successor, so there's nothing to bump — left visible on
-# purpose so we keep getting the maintenance signal; they do not fail CI. (rustls-pemfile was dropped
-# 2026-06-29 by removing axum-server's unused tls-rustls feature + moving our own PEM parsing to
-# rustls-pki-types; memmap2's unsoundness was fixed by the 0.9.11 bump.)
+# ⚠ NOTE: `cargo audit` (no `--deny warnings`) fails only on *vulnerabilities* — `unmaintained` AND
+# `unsound` advisories are warnings that do NOT fail CI. That is deliberate for the two unmaintained
+# crates below, but it does mean an unsoundness can sit here unnoticed: RUSTSEC-2026-0221
+# (event-listener) did exactly that until the 2026-08-13 sweep. Read the job's warnings, not just
+# its exit code.
+#
+# The two unmaintained ones, both transitive with no successor to bump to, left visible on purpose
+# so we keep getting the maintenance signal:
+#   * audiopus_sys via opus (opus itself IS maintained; only its -sys layer is stuck).
+#   * paste via BOTH utoipa-axum (host) and rav1d (client decode path) — an earlier version of this
+#     note named only utoipa-axum, which would have made dropping utoipa-axum look like it cleared
+#     paste. It would not: every client pulls it through rav1d.
+# (rustls-pemfile was dropped 2026-06-29 by removing axum-server's unused tls-rustls feature +
+# moving our own PEM parsing to rustls-pki-types; memmap2's unsoundness was fixed by the 0.9.11
+# bump.)
 
 [advisories]
 ignore = [
@@ -34,17 +43,8 @@ ignore = [
     # a constant-time rsa ships (then drop this), the host ever signs an attacker-chosen message with
     # this key, or any RSA decryption / key-transport using the private key is added.
     "RUSTSEC-2023-0071",
-
-    # quick-xml DoS advisories (RUSTSEC-2026-0194 quadratic-time duplicate-attribute check;
-    # RUSTSEC-2026-0195 unbounded namespace-declaration allocation in NsReader). Both are
-    # exploited by feeding attacker-controlled XML to a running parser. In this tree quick-xml is
-    # a BUILD-TIME-ONLY, transitive dependency of `wayland-scanner` (a proc-macro that parses the
-    # TRUSTED wayland protocol XML files shipped with the wayland-rs crates at compile time). It is
-    # never linked into any shipped binary and never parses runtime/attacker-controlled input, so
-    # neither DoS is reachable. There is no fix to bump to: wayland-scanner 0.31.10 (latest) pins
-    # `quick-xml ^0.39`, and the fixes only exist in quick-xml >=0.41. Revisit (drop these) when
-    # wayland-scanner releases against quick-xml >=0.41, or if quick-xml is ever pulled onto a
-    # runtime path that parses untrusted XML.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # The quick-xml DoS pair (RUSTSEC-2026-0194/0195) used to be ignored here, with the note
+    # "revisit when wayland-scanner releases against quick-xml >=0.41". It has: wayland-scanner
+    # 0.31.11 moved to `quick-xml ^0.41` and the lock is on 0.41.0 as of 2026-08-13, so both
+    # entries were dropped rather than left as permanent exceptions.
 ]

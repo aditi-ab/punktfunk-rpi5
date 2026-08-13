@@ -20,7 +20,6 @@ crate-type = ["cdylib"]
 wdk-build.workspace = true
 
 [dependencies]
-wdk.workspace = true
 wdk-sys = { workspace = true, features = ["iddcx"] }
 wdk-iddcx.workspace = true
 pf-driver-proto.workspace = true

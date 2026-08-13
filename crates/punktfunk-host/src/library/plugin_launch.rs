@@ -32,7 +32,6 @@
 //! itself would land it outside the captured session and outside that lifetime.
 
 use super::*;
-use std::io::Read;
 use std::time::Duration;
 
 /// The whole ask, end to end. A plugin resolving one of its own entries is a local lookup against
@@ -96,23 +95,26 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
         );
         return None;
     };
-    let agent = ureq::AgentBuilder::new().timeout(ASK_TIMEOUT).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(ASK_TIMEOUT))
+        .build()
+        .into();
     // Loopback + the plugin's own per-boot secret, exactly what the console proxy presents. The
     // registration stores a PORT, never an address (mgmt::plugins D5), so this can only ever dial
     // this machine.
-    // `send_string` + an explicit content type rather than `send_json`: that one needs ureq's `json`
+    // `send` with an explicit content type rather than `send_json`: that one needs ureq's `json`
     // feature, and the body is one field.
     let body = serde_json::json!({ "entry": key }).to_string();
     let resp = match agent
         .post(&format!("http://127.0.0.1:{}/__launch", cred.port))
-        .set("Authorization", &format!("Bearer {}", cred.secret))
-        .set("Content-Type", "application/json")
-        .send_string(&body)
+        .header("Authorization", &format!("Bearer {}", cred.secret))
+        .header("Content-Type", "application/json")
+        .send(&body)
     {
         Ok(r) => r,
         // A plugin that does not know the entry says so with a 404 — the answer a FORGED entry gets,
         // and the reason planting one is not enough to make the host run anything.
-        Err(ureq::Error::Status(404, _)) => {
+        Err(ureq::Error::StatusCode(404)) => {
             tracing::warn!(
                 plugin,
                 entry = key,
@@ -120,7 +122,7 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
             );
             return None;
         }
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::StatusCode(code)) => {
             tracing::warn!(
                 plugin,
                 entry = key,
@@ -139,15 +141,20 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
             return None;
         }
     };
-    let mut buf = Vec::new();
-    if let Err(e) = resp
-        .into_reader()
-        .take((MAX_BODY + 1) as u64)
-        .read_to_end(&mut buf)
+    let mut resp = resp;
+    // cap+1 so an over-cap answer is caught by the length check below rather than truncated.
+    let buf = match resp
+        .body_mut()
+        .with_config()
+        .limit((MAX_BODY + 1) as u64)
+        .read_to_vec()
     {
-        tracing::warn!(plugin, entry = key, error = %e, "plugin launch: reading the answer failed");
-        return None;
-    }
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(plugin, entry = key, error = %e, "plugin launch: reading the answer failed");
+            return None;
+        }
+    };
     if buf.len() > MAX_BODY {
         tracing::warn!(
             plugin,
@@ -226,7 +233,7 @@ fn validate_reply(plugin: &str, key: &str, reply: LaunchReply) -> Option<PluginL
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     /// A one-shot HTTP/1.1 stub on an ephemeral loopback port. Returns the port and a handle that
     /// yields the raw request text — so the assertions about what the HOST sent (method, path,
@@ -274,13 +281,27 @@ mod tests {
 
     #[test]
     fn asks_the_registered_plugin_and_takes_its_answer() {
-        let (port, server) =
-            stub_plugin(200, r#"{"command":"retroarch 'smw.sfc'","cwd":"/opt/emu"}"#);
+        // The cwd has to be absolute FOR THE HOST PLATFORM: `/opt/emu` has no drive letter, so
+        // `Path::is_absolute` is false on Windows and `validate_reply` refuses the recipe — this
+        // test could never pass there. Same split as `a_working_directory_must_be_absolute`.
+        // (The `\\` is JSON escaping; the decoded value is `C:\emu`.)
+        let (answer, cwd) = if cfg!(windows) {
+            (
+                r#"{"command":"retroarch 'smw.sfc'","cwd":"C:\\emu"}"#,
+                r"C:\emu",
+            )
+        } else {
+            (
+                r#"{"command":"retroarch 'smw.sfc'","cwd":"/opt/emu"}"#,
+                "/opt/emu",
+            )
+        };
+        let (port, server) = stub_plugin(200, answer);
         crate::mgmt::register_ui_for_test("stub-launcher", port, "s3cr3t");
 
         let got = ask_plugin_launch("stub-launcher", "snes/smw.sfc").expect("a recipe");
         assert_eq!(got.command, "retroarch 'smw.sfc'");
-        assert_eq!(got.cwd.as_deref(), Some(std::path::Path::new("/opt/emu")));
+        assert_eq!(got.cwd.as_deref(), Some(std::path::Path::new(cwd)));
 
         let req = server.join().expect("stub thread");
         assert!(req.starts_with("POST /__launch "), "request was {req:?}");

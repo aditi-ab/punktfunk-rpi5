@@ -21,7 +21,6 @@ crate-type = ["cdylib"]
 wdk-build.workspace = true
 
 [dependencies]
-wdk.workspace = true
 # `iddcx` feature → wdk-sys runs the IddCx bindgen pass (generate_iddcx) + compiles `wdk_sys::iddcx`.
 # This is the M1 make-or-break: does IddCx.h bindgen in wdk-sys's config without a header conflict, and
 # do its WDF/DXGI types resolve to wdk-sys's (so the generated module compiles)?

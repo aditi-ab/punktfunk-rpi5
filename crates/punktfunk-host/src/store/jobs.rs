@@ -26,7 +26,7 @@ use super::index::{scope_of, Entry};
 use super::manifest::{self, Record, Tier};
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -564,25 +564,27 @@ fn registry_integrity(registry: &str, pkg: &str, version: &str) -> Result<String
     let base = registry.trim_end_matches('/');
     // npm registry convention: the scope separator is percent-encoded in the packument path.
     let url = format!("{base}/{}", pkg.replace('/', "%2f"));
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(20))
-        .redirects(3)
-        .user_agent(&format!("punktfunk-host/{}", super::index::host_version()))
-        .build();
-    let resp = agent
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .max_redirects(3)
+        .user_agent(format!("punktfunk-host/{}", super::index::host_version()))
+        .build()
+        .into();
+    let mut resp = agent
         .get(&url)
-        .set("Accept", "application/json")
+        .header("Accept", "application/json")
         .call()
         .map_err(|e| match e {
-            ureq::Error::Status(404, _) => {
+            ureq::Error::StatusCode(404) => {
                 anyhow::anyhow!("the registry does not know this package")
             }
             other => anyhow::anyhow!("registry request failed: {other}"),
         })?;
-    let mut body = Vec::new();
-    resp.into_reader()
-        .take(16 * 1024 * 1024)
-        .read_to_end(&mut body)
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(16 * 1024 * 1024)
+        .read_to_vec()
         .context("read the registry response")?;
     let doc: serde_json::Value =
         serde_json::from_slice(&body).context("registry returned invalid JSON")?;

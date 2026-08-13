@@ -79,6 +79,10 @@ fn parse_args() -> anyhow::Result<Args> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // punktfunk-core is a Windows/Linux-only dependency here (the macOS build is a stub), so the
+    // provider install follows the same cfg as `run`.
+    #[cfg(any(windows, target_os = "linux"))]
+    punktfunk_core::tls::install_default_provider();
     let args = parse_args()?;
     run(args)
 }

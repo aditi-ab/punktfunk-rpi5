@@ -29,7 +29,9 @@ ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
 pipewire = "0.9"
 libc = "0.2"
 # ashpd 0.13 uses the tokio runtime for the one-time portal handshake (control plane).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# `sync` is for the `tokio::sync::oneshot` quit channels in the portal/linux capture paths. It used
+# to be absent and compile anyway, borrowed from ashpd→zbus via feature unification.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync"] }
 # XFixes cursor source for gamescope (remote-desktop-sweep Phase C): gamescope paints no
 # `SPA_META_Cursor`, so the pointer never reaches the PipeWire node. We read the shape/hotspot/
 # visibility from gamescope's nested Xwayland via XFixes instead and feed the existing cursor slot.

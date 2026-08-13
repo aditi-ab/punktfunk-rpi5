@@ -176,7 +176,7 @@ fn server_from_der(
     addr: std::net::SocketAddr,
     idle: std::time::Duration,
 ) -> anyhow_result::Result<quinn::Endpoint> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Client auth is OFFERED but optional: a client that presents its self-signed
     // identity is fingerprinted post-handshake (pairing / --require-pairing checks);
     // one that presents none still connects (and is rejected at the app layer when
@@ -254,7 +254,7 @@ pub fn client_pinned_with_identity(
 ) -> PinnedClient {
     let observed = Arc::new(Mutex::new(None));
     let ep = (|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let builder = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(crate::tls::PinVerify::with_observed(
@@ -354,7 +354,7 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
@@ -368,12 +368,12 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

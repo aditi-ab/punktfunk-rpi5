@@ -58,6 +58,7 @@ fn main() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
     set_app_user_model_id();
+    punktfunk_core::tls::install_default_provider();
 
     // Everything logs to stderr AND `%LOCALAPPDATA%\punktfunk\logs\client.log` (see [`logfile`]):
     // a GUI/MSIX launch has no console, so without the file the client side of any field report

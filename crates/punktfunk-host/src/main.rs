@@ -148,6 +148,9 @@ use spike::{Options, Source};
 use std::path::PathBuf;
 
 fn main() {
+    // Before anything can reach an HTTPS call (the cover-art warmer, webhooks, the plugin-store
+    // catalog, the update downloader all build default `ureq` agents).
+    punktfunk_core::tls::install_default_provider();
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // `service run` is launched by the SCM with no console — log to a file instead of stderr.

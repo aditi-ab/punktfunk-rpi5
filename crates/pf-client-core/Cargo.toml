@@ -14,7 +14,7 @@ repository.workspace = true
 # the old main.rs. Audio is the one per-OS swap: PipeWire on Linux, WASAPI on Windows
 # (same public surface — see lib.rs).
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+punktfunk-core = { path = "../punktfunk-core", features = ["quic", "ureq-tls"] }
 # Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
 # WP-2, AV1 by M7): auto's TOP rung on both desktop OSes since M9 — for every codec it
 # speaks, AV1 included — also pinnable via `PUNKTFUNK_DECODER=native-vulkan` —
@@ -101,11 +101,19 @@ ash = { version = "0.38", optional = true }
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
 # `ureq` is small + sync (the host uses it too) and its rustls unifies with the
 # workspace's (quinn's) 0.23; the pinning verifier mirrors core's private `PinVerify`.
-ureq = "2"
+# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature: that one pulls `_ring`, which would
+# put the ring backend back into a tree that has moved to aws-lc-rs. Same spelling everywhere.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+    "gzip",
+] }
 # Signed update-manifest fetch/verify + the install-kind ladder, shared with the host so one
 # trust rule serves both (crates/pf-update-check).
 pf-update-check = { path = "../pf-update-check" }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# aws-lc-rs backend + PQ hybrid key exchange, matching punktfunk-core (see its Cargo.toml for
+# why every crate that names a rustls backend has to name the same one).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -166,6 +174,11 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "handleapi",
     # RECT/HMONITOR for DXGI_OUTPUT_DESC1 (the display-HDR volume query).
     "windef",
+    # HGLOBAL (clipboard.rs) + HINSTANCE (video_d3d11.rs), and the NT `HANDLE` the shared-surface
+    # hand-off uses. Both headers were used without being declared — they resolved only because
+    # clients/windows enables them on the same pinned rev, so this crate did not build standalone.
+    "minwindef",
+    "winnt",
     # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES.
     "minwinbase",
     # The GlobalAlloc block the clipboard takes ownership of (clipboard.rs).
