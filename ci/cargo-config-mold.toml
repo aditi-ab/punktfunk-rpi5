@@ -1,0 +1,42 @@
+# Installed as $CARGO_HOME/config.toml in every Linux CI builder image (ci/*.Dockerfile).
+#
+# WHAT: link the x86_64 Linux targets with mold instead of GNU ld. Linking is the one phase of a
+# Rust build that sccache CANNOT cache — every job relinks punktfunk-host, punktfunk-client-linux,
+# punktfunk-client-session, punktfunk-cli, pf-update and punktfunk-encode-worker from scratch on
+# every run, and the packaging legs (deb/rpm/arch) do it for release binaries with full debug info.
+# mold is the only lever that touches that phase.
+#
+# ⚠ THE TRAP THIS FILE HAS TO STAY CLEAR OF — read before editing, and before adding rustflags
+# anywhere else in this repo:
+#
+#   1. A `RUSTFLAGS` ENVIRONMENT VARIABLE OVERRIDES CONFIG RUSTFLAGS ENTIRELY. It does not merge
+#      and it does not append. Any job that sets RUSTFLAGS silently loses mold here (it still
+#      builds — just with the default linker), and, far worse, would lose the aarch64
+#      `--cfg aes_armv8` / `--cfg polyval_armv8` flags from the workspace's own .cargo/config.toml,
+#      which are worth a measured ~3x on the decrypt path. audit.yml's miri gf8 step is the one
+#      place in the repo that sets RUSTFLAGS, and its comment already carries this warning; keep it
+#      that way. Never "simplify" this file into a RUSTFLAGS export.
+#
+#   2. CONFIG FILES MERGE PER KEY, HIGHEST-PRECEDENCE FILE WINS — they do not concatenate. The
+#      workspace's .cargo/config.toml outranks this one ($CARGO_HOME is the LOWEST precedence).
+#      Today that is harmless because the two files touch DISJOINT keys: the workspace file defines
+#      only `target.'cfg(target_arch = "aarch64")'.rustflags`, this one only
+#      `target.x86_64-unknown-linux-gnu.rustflags`, and cargo JOINS a matching cfg-spec table with
+#      the triple table rather than picking one. But the moment someone adds an x86_64 rustflags
+#      entry to the workspace .cargo/config.toml, IT WINS and mold silently stops being used here.
+#      If that ever happens, move the link-arg into that file instead of duplicating it.
+#
+#   3. aarch64 IS DELIBERATELY NOT WIRED. The cross image links with aarch64-linux-gnu-gcc against a
+#      multiarch sysroot (ci/rust-ci-arm64cross.Dockerfile); pointing that driver at mold is a
+#      separate thing to prove, and those legs are already the fast ones (~1.5 min of clippy, ~5 min
+#      for the arm64 .deb). Add it only with a measurement, and in a commit of its own.
+#
+# Requires GCC >= 12.1 (or clang) for `-fuse-ld=mold`; every base here ships far newer. mold itself
+# is installed in the same Dockerfile layer that copies this file, so an image can never carry the
+# flag without the linker — see the `mold --version` assertion there.
+#
+# NOTE this affects the HOST-targeted compiles of build scripts and proc macros too (they are
+# x86_64-unknown-linux-gnu), which is exactly what we want: those link constantly and are pure
+# overhead.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

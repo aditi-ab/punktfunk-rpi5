@@ -85,17 +85,10 @@ jobs:
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin
 
-      # Shared compile cache. ~/.local/bin is on the runner daemon's PATH; GITHUB_PATH is
-      # belt-and-braces. bsdtar (macOS) globs by default — no --wildcards.
+      # Shared compile cache. The script handles the macOS side (user-prefix install +
+      # GITHUB_PATH, bsdtar globbing) — see scripts/ci/ensure-sccache.sh.
       - name: sccache (self-healing install)
-        run: |
-          if ! command -v sccache >/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-aarch64-apple-darwin.tar.gz \
-              | tar -xz --strip-components=1 -C "$HOME/.local/bin" '*/sccache'
-          fi
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # `punktfunk-core` now decodes Opus in-core for the Apple client (surround), pulling
       # `audiopus_sys`, which builds a vendored static libopus via CMake when pkg-config can't find a
@@ -155,17 +148,10 @@ jobs:
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      # Shared compile cache. ~/.local/bin is on the runner daemon's PATH; GITHUB_PATH is
-      # belt-and-braces. bsdtar (macOS) globs by default — no --wildcards.
+      # Shared compile cache. The script handles the macOS side (user-prefix install +
+      # GITHUB_PATH, bsdtar globbing) — see scripts/ci/ensure-sccache.sh.
       - name: sccache (self-healing install)
-        run: |
-          if ! command -v sccache >/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-aarch64-apple-darwin.tar.gz \
-              | tar -xz --strip-components=1 -C "$HOME/.local/bin" '*/sccache'
-          fi
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # See the swift job: audiopus_sys (via the in-core Opus decode) builds vendored libopus with CMake.
       - name: CMake (for the vendored libopus audiopus_sys builds)

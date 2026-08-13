@@ -51,6 +51,14 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, the vendored libopus, openh264's C++). Safe at
+  # workflow level here: unlike ci.yml/deb.yml this workflow has no cross-compiling job whose
+  # image sets its own CC_x86_64_unknown_linux_gnu. See ci.yml's `rust` job for that trap.
+  # This matters twice per push — the f43 and f44 legs are the two longest jobs in the fleet.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
   # sccache and incremental compilation are mutually exclusive; CI wants the shared
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"
@@ -80,14 +88,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # rpmbuild + git archive need the checkout trusted; cache the crates download.
       # The client link deps are also baked into the fedora-rpm image, but this job runs
@@ -150,6 +153,12 @@ jobs:
         # punktfunk-scripting runner subpackages (the publish loop globs them in; the host RPM
         # Recommends both). Both need bun (ensured in Prep).
         run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 bash packaging/rpm/build-rpm.sh
+
+      # Visibility only — the two RPM legs are the longest jobs in the fleet, so a cache
+      # regression here is the most expensive one to leave undetected.
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
       # Signs with packages@unom.io (org secret) and self-verifies before publish. On a v* tag a
       # missing key FAILS the build rather than publishing unsigned RPMs into a gpgcheck=1 repo.

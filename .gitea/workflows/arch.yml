@@ -81,6 +81,14 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, vendored libopus, openh264's C++). Safe at workflow
+  # level — no cross-compiling job here (see ci.yml's `rust` job for that trap). NOTE these ALSO
+  # have to be named in the makepkg step's `sudo -u builder env …` list: sudo's env_reset drops
+  # everything not listed, which is why the sccache vars are already spelled out there.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -252,8 +260,19 @@ jobs:
             SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
             SCCACHE_REGION="$SCCACHE_REGION" \
             AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            CMAKE_C_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER" \
+            CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_CXX_COMPILER_LAUNCHER" \
+            CC_x86_64_unknown_linux_gnu="$CC_x86_64_unknown_linux_gnu" \
+            CXX_x86_64_unknown_linux_gnu="$CXX_x86_64_unknown_linux_gnu" \
             makepkg -f -d --holdver
           ls -lh "$GITHUB_WORKSPACE/dist"
+          # Visibility only. The stats have to be read as the SAME user that ran the compiles —
+          # sccache keeps its stats in a per-user server process, so a root `--show-stats` here
+          # would report an idle server and zero everything.
+          sudo -u builder env SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+            SCCACHE_REGION="$SCCACHE_REGION" \
+            AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            sccache --show-stats || true
 
       # The host must ship a VERSIONED libav soname dep, and nothing else in this pipeline proves
       # it. packaging/arch/PKGBUILD lists bare `libavcodec.so` etc. and relies on makepkg rewriting

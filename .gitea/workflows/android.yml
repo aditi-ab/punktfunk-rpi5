@@ -63,6 +63,15 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache. The one that pays here is the CMake-built vendored libopus
+  # (audiopus_sys), which kit/build.gradle.kts drives through cargo-ndk once per ABI — three
+  # from-scratch libopus builds per run until now. The per-ABI compilers come from the NDK via
+  # cargo-ndk's own CC_<android-triple> vars, which this does not touch; CC_x86_64_unknown_linux_gnu
+  # covers only the HOST build scripts and proc macros.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
   # sccache and incremental compilation are mutually exclusive; CI wants the shared
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"

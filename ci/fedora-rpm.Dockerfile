@@ -22,6 +22,12 @@ RUN dnf -y install \
       rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs unzip \
       # build toolchain + bindgen
       gcc gcc-c++ clang clang-devel cmake nasm pkgconf-pkg-config curl ca-certificates \
+      # mold: link-phase accelerator (sccache cannot cache linking). This image links the release
+      # host, client, worker and tray on every rpm.yml run, TWICE per push (f43 + f44). Wired via
+      # cargo-config-mold.toml below. Note the linker DRIVER is unchanged — still gcc, so Fedora's
+      # default `-Wl,--build-id` still reaches the link and rpmbuild's debuginfo extraction (which
+      # hard-requires a build-id) behaves exactly as before; mold implements --build-id natively.
+      mold \
       # ffmpeg (NVENC), capture/audio/display link deps
       ffmpeg-devel pipewire-devel wayland-devel libxkbcommon-devel opus-devel \
       mesa-libGL-devel mesa-libgbm-devel \
@@ -76,3 +82,8 @@ ARG SCCACHE_VERSION=0.10.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
     && sccache --version
+
+# Link x86_64 with mold — see cargo-config-mold.toml's header for the rustflags traps, and
+# rust-ci.Dockerfile for why the `mold --version` assertion sits next to the COPY.
+COPY cargo-config-mold.toml /usr/local/cargo/config.toml
+RUN mold --version && test -r /usr/local/cargo/config.toml

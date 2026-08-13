@@ -26,6 +26,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # toolchain + bindgen; nodejs runs the JS actions (checkout/cache); unzip for the rustup installer's deps
     build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs unzip \
+    # mold: link-phase accelerator (sccache cannot cache linking). This image links the release
+    # host + encode worker on every deb.yml run. Wired via cargo-config-mold.toml below.
+    mold \
     # .deb assembly: dpkg-shlibdeps/dpkg-deb; patchelf repoints the binary's rpath at the bundled FFmpeg
     dpkg-dev patchelf \
     # FFmpeg 8 build deps: nasm (asm), VAAPI (libva/libdrm) so the built libav* keep the AMD/Intel
@@ -99,3 +102,10 @@ ARG SCCACHE_VERSION=0.10.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
     && sccache --version
+
+# Link x86_64 with mold — see cargo-config-mold.toml's header for the rustflags traps, and
+# rust-ci.Dockerfile for why the `mold --version` assertion sits next to the COPY.
+# ⚠ This does NOT touch the from-source FFmpeg built above: that is a plain ./configure && make in
+# an earlier layer, linked by GNU ld exactly as before. Only cargo's links move to mold.
+COPY cargo-config-mold.toml /usr/local/cargo/config.toml
+RUN mold --version && test -r /usr/local/cargo/config.toml
