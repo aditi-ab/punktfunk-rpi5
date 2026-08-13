@@ -42,6 +42,9 @@ enum GpSettingsTab: String, CaseIterable, Hashable {
     case controller = "Controller"
     case interface = "Interface"
     case profiles = "Profiles"
+    /// Trailing, like Profiles: both are built from something other than the settings store, and
+    /// About is where the strip ends because it is the one section that changes nothing.
+    case about = "About"
 }
 
 struct GamepadSettingsView: View {
@@ -53,6 +56,8 @@ struct GamepadSettingsView: View {
     @Environment(\.displayBottomInset) private var displayBottomInset
     @Environment(\.dismiss) private var dismiss
     @Environment(\.gamepadHostedInShell) private var hostedInShell
+    /// The About section's link rows (never used on tvOS, which has no browser).
+    @Environment(\.openURL) private var openURL
     /// The saved-host store — the pin picker writes `setPinned` through it and the profile rows
     /// count pins from its live hosts. Threaded in from GamepadHomeView like the home screen
     /// itself (ContentView owns the instance).
@@ -138,24 +143,16 @@ struct GamepadSettingsView: View {
     /// The direction of the last value step (+1 right/forward, -1 left) — picks which edge the
     /// changed value slides in from, so the animation follows the user's motion.
     @State private var lastAdjustDelta = 1
-    /// The About page (identity, licenses, and the shortcuts reference) is up over this screen.
-    @State private var showAbout = false
-
-    var body: some View {
-        // About replaces this screen's content rather than pushing over it — one layer deeper,
-        // the same rule the pin picker follows, so B peels back here exactly as it does there.
-        // It carries its own header and legend, which is why it takes the whole frame.
-        if showAbout {
-            GamepadAboutView(
-                close: { showAbout = false },
-                controllerActive: controllerActive,
-                micAvailable: micAvailable)
-        } else {
-            settingsBody
-        }
+    /// A reading surface opened from the About tab, replacing the row list the way the pin picker
+    /// does. Depth is 1: neither page opens anything further.
+    private enum AboutPage: Equatable {
+        case shortcuts
+        case licenses
     }
 
-    private var settingsBody: some View {
+    @State private var aboutPage: AboutPage?
+
+    var body: some View {
         GamepadMenuList(
             items: rows,
             focusID: $focusID,
@@ -179,9 +176,12 @@ struct GamepadSettingsView: View {
                     .foregroundStyle(ink.fg)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 24)
-                // The picker is one layer deeper — its rows aren't sections of anything, so the
-                // strip would be a control that does nothing while it's up.
-                if pinTarget == nil { tabStrip }
+                // The picker and the About reading pages are one layer deeper — their rows aren't
+                // sections of anything, so the strip would be a control that does nothing.
+                if pinTarget == nil, aboutPage == nil { tabStrip }
+                // The identity card belongs to the About section, so it appears with it and goes
+                // away on its reading pages (which carry their own title instead).
+                if pinTarget == nil, aboutPage == nil, tab == .about { aboutIdentity }
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, gamepadTitleBottomPadding(compact: compact))
@@ -348,23 +348,102 @@ struct GamepadSettingsView: View {
         if let close { close() } else { dismiss() }
     }
 
-    /// Just the marketing version for the About row's value — the build number that
-    /// `GamepadAboutView` also shows would not fit a settings row, and the page itself is one
-    /// press away for anyone who needs it.
-    private static var shortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+    /// Where the product actually lives — kept together so the three can be checked against the
+    /// README in one glance (the touch `AboutView` holds the same three).
+    private enum Destination {
+        static let docs = URL(string: "https://docs.punktfunk.unom.io")!
+        static let community = URL(string: "https://discord.gg/kaPNvzMuGU")!
+        static let source = URL(string: "https://git.unom.io/unom/punktfunk")!
+    }
+
+    private static let tagline =
+        "Low-latency desktop and game streaming with first-class Linux and Windows hosts."
+
+    /// "Version 0.29.0 (100000)" — the build number only when it says something the version does
+    /// not. Mirrors `AboutView.versionLine`; a bug report is worth more with it.
+    private static var versionLine: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String
+        guard let build, !build.isEmpty, build != short else { return "Version \(short)" }
+        return "Version \(short) (\(build))"
+    }
+
+    /// The identity card, shown under the tab strip while About is the section. Laid out sideways
+    /// (icon leading, text trailing) rather than centred like the touch page: this sits inside a
+    /// settings header that already carries a title and a tab strip, and a centred stack of
+    /// icon-name-version-tagline would leave no room for the rows underneath it.
+    private var aboutIdentity: some View {
+        HStack(alignment: .center, spacing: compact ? 12 : 16) {
+            AppIconView(side: aboutIconSide)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Punktfunk")
+                    .font(.geist(metrics.labelFont, .bold, relativeTo: .headline))
+                    .foregroundStyle(ink.fg)
+                Text(Self.versionLine)
+                    .font(.geist(metrics.detailFont, .medium, relativeTo: .caption))
+                    .monospacedDigit()
+                    .foregroundStyle(ink.fg(0.7))
+                if !compact {
+                    Text(Self.tagline)
+                        .font(.geist(metrics.detailFont, relativeTo: .caption))
+                        .foregroundStyle(ink.fg(0.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: metrics.rowMaxWidth * 0.62, alignment: .leading)
+                        .padding(.top, 1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private var aboutIconSide: CGFloat {
+        #if os(tvOS)
+        return 84
+        #else
+        return compact ? 38 : 52
+        #endif
     }
 
     /// "Settings", or "Pin “Work”" while the pin picker is up — the title is what says which
     /// layer the row list currently is.
     private var title: String {
-        pinTarget.map { "Pin “\($0.name)”" } ?? "Settings"
+        if let profile = pinTarget { return "Pin “\(profile.name)”" }
+        switch aboutPage {
+        case .shortcuts: return "Shortcuts"
+        case .licenses: return "Acknowledgements"
+        case nil: return "Settings"
+        }
     }
 
     /// The legend follows the layer: value-editing hints on the settings rows, pin/unpin on the
     /// picker — where B reads "Back" (it peels to the settings rows, GamepadAddHostView's "one
     /// layer" rule), and a hostless picker has nothing to pin, so only Back remains.
     private var hints: [GamepadHint] {
+        // A reading page is scrolled, not operated: offering A would be the same lie a dimmed row
+        // used to tell. Only Back remains.
+        if aboutPage != nil {
+            return [.init(
+                glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+                action: { back() })]
+        }
+        // The About rows open things rather than change them, so A reads "Open" and there is no
+        // Adjust cell — left/right genuinely does nothing there.
+        if pinTarget == nil, tab == .about {
+            let sections: [GamepadHint] = showsSectionHint
+                ? [.init(glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
+                         text: "Section", action: { step(tabBy: 1) })]
+                : []
+            return sections + [
+                .init(
+                    glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Open",
+                    action: { if let focusID { activate(id: focusID) } }),
+                .init(
+                    glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                    action: { back() }),
+            ]
+        }
         guard pinTarget != nil else {
             // The shoulders change section, so that cell leads — where it fits and where the
             // shoulders exist at all (see `showsSectionHint`).
@@ -412,6 +491,9 @@ struct GamepadSettingsView: View {
         if let profile = pinTarget {
             pinTarget = nil
             focusID = "profile-\(profile.id)"
+        } else if let page = aboutPage {
+            aboutPage = nil
+            focusID = page == .shortcuts ? "shortcuts" : "licenses"
         } else {
             performClose()
         }
@@ -419,7 +501,45 @@ struct GamepadSettingsView: View {
 
     // MARK: - Row rendering
 
+    @ViewBuilder
     private func rowView(_ row: Row, focused: Bool) -> some View {
+        switch row.kind {
+        case .control: controlRow(row, focused: focused)
+        case .heading:
+            Text(row.label)
+                .font(.geist(metrics.labelFont, .bold, relativeTo: .headline))
+                .foregroundStyle(ink.fg(0.75))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, metrics.rowHPad)
+                .padding(.top, 14)
+                .padding(.bottom, 2)
+        case .prose:
+            // Focus here means "this is the part you are scrolled to", not "press A" — so it is a
+            // quiet wash rather than the control rows' full glass.
+            VStack(alignment: .leading, spacing: 4) {
+                Text(row.label)
+                    .font(.geistFixed(metrics.valueFont, .medium))
+                    .foregroundStyle(ink.fg(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+                if !row.value.isEmpty {
+                    Text(row.value)
+                        .font(.geist(metrics.detailFont, relativeTo: .caption))
+                        .foregroundStyle(ink.fg(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, metrics.rowHPad)
+            .padding(.vertical, metrics.rowVPad * 0.7)
+            .background {
+                RoundedRectangle(cornerRadius: metrics.rowCorner, style: .continuous)
+                    .fill(ink.fg(focused ? 0.08 : 0))
+            }
+            .animation(.smooth(duration: 0.18), value: focused)
+        }
+    }
+
+    private func controlRow(_ row: Row, focused: Bool) -> some View {
         let m = metrics
         // No section header: the tab strip names the section now, and repeating it above the
         // first row of every tab was just a second label saying the same word.
@@ -531,10 +651,21 @@ struct GamepadSettingsView: View {
         /// `activate(id:)`, not per closure, so no row builder can forget it.
         /// (Android's `GpRow.enabled` and `pf-console-ui`'s `RowSpec.enabled` are the twins.)
         var enabled = true
+        /// How this row DRAWS. Every tab but About is `.control` — the glass row with a label and
+        /// a value. About is a reading surface as much as a menu, so it also has a heading and a
+        /// block of prose, which are rows only so the focus list can scroll them (the same trick
+        /// `Licenses.chunked` plays for tvOS focus).
+        var kind: Kind = .control
         /// Left/right step; returns whether the value actually changed (false ⇒ boundary thud).
         let adjust: (Int) -> Bool
         /// A — cycle forward (wrapping) / flip.
         let activate: () -> Void
+
+        enum Kind {
+            case control
+            case heading
+            case prose
+        }
     }
 
     /// Dispatch by id so the focus list's stored input callbacks always act on freshly built rows
@@ -556,7 +687,120 @@ struct GamepadSettingsView: View {
     /// controller wiring and the tvOS focus engine carry over as is).
     private var rows: [Row] {
         if let profile = pinTarget { return pinRows(for: profile) }
+        if let page = aboutPage {
+            switch page {
+            case .shortcuts: return shortcutRows
+            case .licenses: return licenseRows
+            }
+        }
+        if tab == .about { return aboutRows }
         return allRows.filter { $0.tab == tab }
+    }
+
+    // MARK: - About
+
+    /// The About section: the ways out, plus the two reading surfaces. The identity itself (icon,
+    /// name, version, tagline) is the HEADER while this tab is up — see `aboutIdentity` — not a
+    /// row, so the list holds no focus stop that does nothing when pressed.
+    private var aboutRows: [Row] {
+        var list: [Row] = [
+            aboutAction(
+                id: "shortcuts", icon: "command", label: "Shortcuts", value: "While streaming",
+                detail: "What to press during a session on this device — and on a controller.",
+                open: .shortcuts),
+            aboutAction(
+                id: "licenses", icon: "text.document", label: "Acknowledgements",
+                value: "MIT or Apache-2.0",
+                detail: "Punktfunk's own licence and the third-party components it uses.",
+                open: .licenses),
+        ]
+        list.append(contentsOf: [
+            aboutLink(id: "docs", icon: "book", label: "Documentation", url: Destination.docs),
+            aboutLink(
+                id: "community", icon: "bubble.left.and.bubble.right", label: "Community",
+                url: Destination.community),
+            aboutLink(
+                id: "source", icon: "chevron.left.forwardslash.chevron.right",
+                label: "Source code", url: Destination.source),
+        ])
+        return list
+    }
+
+    private func aboutAction(
+        id: String, icon: String, label: String, value: String, detail: String, open: AboutPage
+    ) -> Row {
+        Row(
+            id: id, tab: .about, icon: icon, label: label, value: value, detail: detail,
+            adjustable: false,
+            adjust: { _ in false },
+            activate: {
+                // Focus lands on the page's first row — the focus list's reconcile follows this
+                // id when the row set swaps underneath it (the pin picker's pattern).
+                focusID = open == .shortcuts ? shortcutRows.first?.id : licenseRows.first?.id
+                aboutPage = open
+            })
+    }
+
+    /// tvOS has no browser and no `openURL`, so an address there is text to read off the screen
+    /// rather than a link to nowhere — the same call the touch About page makes.
+    private func aboutLink(id: String, icon: String, label: String, url: URL) -> Row {
+        let shown = url.absoluteString.replacingOccurrences(of: "https://", with: "")
+        #if os(tvOS)
+        return Row(
+            id: id, tab: .about, icon: icon, label: label, value: shown,
+            detail: "Open this address on a phone or computer.",
+            adjustable: false, adjust: { _ in false }, activate: {})
+        #else
+        return Row(
+            id: id, tab: .about, icon: icon, label: label, value: shown,
+            detail: "Opens in your browser.",
+            adjustable: false, adjust: { _ in false }, activate: { openURL(url) })
+        #endif
+    }
+
+    /// The shortcuts reference — the same `ShortcutsCatalog` the touch About page renders, so the
+    /// two can never drift.
+    private var shortcutRows: [Row] {
+        ShortcutsCatalog.groups(micAvailable: micAvailable).flatMap { group -> [Row] in
+            [aboutText(id: "group-\(group.title)", label: group.title, kind: .heading)]
+                + group.items.map { item in
+                    aboutText(
+                        id: "sc-\(group.title)-\(item.keys)", label: item.keys, value: item.text,
+                        kind: .prose)
+                }
+        }
+    }
+
+    /// The licence wall, one row per pre-chunked page (`Licenses.chunked`, which exists so tvOS
+    /// can page it by focus steps) — so it scrolls with the stick and needs no machinery here.
+    private var licenseRows: [Row] {
+        var list: [Row] = [
+            aboutText(id: "lic-heading", label: "Punktfunk", kind: .heading),
+            aboutText(
+                id: "lic-summary",
+                label: "Punktfunk's source is open under MIT or Apache-2.0. It ships the Geist "
+                    + "typeface under the SIL Open Font License 1.1, and uses the third-party "
+                    + "components below, each under its own license.",
+                kind: .prose),
+        ]
+        for (i, chunk) in Licenses.chunked(Licenses.appLicense).enumerated() {
+            list.append(aboutText(id: "lic-app-\(i)", label: chunk, kind: .prose))
+        }
+        list.append(aboutText(
+            id: "lic-third-heading", label: "Third-party software", kind: .heading))
+        for (i, chunk) in Licenses.thirdPartyNoticesChunks.enumerated() {
+            list.append(aboutText(id: "lic-third-\(i)", label: chunk, kind: .prose))
+        }
+        return list
+    }
+
+    private func aboutText(
+        id: String, label: String, value: String = "", kind: Row.Kind
+    ) -> Row {
+        Row(
+            id: id, tab: .about, icon: "", label: label, value: value, detail: "",
+            adjustable: false, enabled: true, kind: kind,
+            adjust: { _ in false }, activate: {})
     }
 
     /// Every row on the screen, tagged with its section. Built as one list (not per tab) so the
@@ -716,15 +960,6 @@ struct GamepadSettingsView: View {
                 label: "Controller-optimized UI",
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
-            // Not a setting, so it adjusts to nothing (left/right is a boundary thud) and A opens
-            // it — the same shape the Profiles rows use to reach the pin picker.
-            Row(
-                id: "about", tab: .interface, icon: "info.circle", label: "About Punktfunk",
-                value: Self.shortVersion,
-                detail: "Version and licenses, and the shortcuts for streaming on this device.",
-                adjustable: false,
-                adjust: { _ in false },
-                activate: { showAbout = true }),
         ]
         // WHEN the switch above takes over. Built only while it is on: with the switch off this
         // screen is unreachable in the first place (no gamepad UI to open it from), so a row
