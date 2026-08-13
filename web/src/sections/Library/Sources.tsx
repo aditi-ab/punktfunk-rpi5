@@ -33,6 +33,10 @@ import { SourceSettingsDialog } from "./SourceSettings";
  * one list of sources whose ids match whether they came from a built-in scanner or the plugin that
  * replaced it — so one surface is both simpler and the only honest presentation (design D6).
  *
+ * A host from v0.28.0 on has no built-in scanners left and reports every source as `plugin`. The
+ * `builtin` handling below is kept deliberately: the console ships as its own package and is
+ * expected to drive an N-1 host, which still reports them.
+ *
  * Deliberately kept under the existing "Game sources" label rather than a new "Plugins" heading:
  * `store_title` and `nav_plugins` are both already "Plugins", and a third would be worse than the
  * merge is good.
@@ -117,6 +121,10 @@ export const SourcesSection: FC<{
 	// The bridge-release nudge (design D9): a built-in scanner still doing the work, with its
 	// replacement plugin sitting uninstalled in the catalog. One click per scanner, and NEVER a
 	// silent auto-install — installing code stays an explicit operator act.
+	//
+	// Against a v0.28.0+ host this is always empty (no source reports `builtin` any more) and the
+	// banner never renders. It stays for the N-1 host this console may be driving, where it is still
+	// the migration path.
 	const migratable = scanners.data
 		.filter((s) => s.origin === "builtin" && s.enabled)
 		.map((s) => ({

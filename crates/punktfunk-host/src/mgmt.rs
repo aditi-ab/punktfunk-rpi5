@@ -314,7 +314,7 @@ pub fn openapi_json() -> String {
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
         (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
-        (name = "library", description = "Game library: installed-store titles (Steam) plus user-curated custom entries"),
+        (name = "library", description = "Game library: the titles each installed library plugin syncs, plus user-curated custom entries"),
         (name = "stats", description = "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"),
         (name = "logs", description = "Host log stream: the newest in-memory log entries, cursor-paged for live following"),
         (name = "events", description = "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"),

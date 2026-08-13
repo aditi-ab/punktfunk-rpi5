@@ -4,37 +4,42 @@ description: How Punktfunk finds your installed games, how to add one by hand, a
 ---
 
 Every Punktfunk host keeps one **game library** — a single list of titles that every surface reads
-from. It has three sources: the launchers the host scans on disk, entries you add by hand in the
-[web console](/docs/web-console), and titles a [plugin](/docs/plugins) syncs in.
+from. It has two sources: the [plugins](/docs/plugins) you install for the launchers you actually
+use, and entries you add by hand in the [web console](/docs/web-console).
 
 Whichever source a title came from, it looks the same everywhere: a poster, a name, and a stable id
 like `steam:570` or `custom:9f2a1c…`. Pick one on a client and the host launches it into the stream.
 
 ## Where your games come from
 
-The host reads your launchers' **own local files**. There are no accounts to connect and no API
-keys — nothing leaves the machine to build the list. Each scanner is best-effort: a launcher that
-isn't installed simply contributes nothing. Cover art is the one exception, and it needs no account
-either — see [Cover art](#cover-art).
+**Install a plugin for each launcher you want in the library.** A fresh host holds no games until
+you do — go to the console's **Library** page, open **Game sources**, and install the ones you use.
+It takes a click each.
 
-Which scanners exist depends on the host's operating system:
+Each plugin reads that launcher's **own local files** on the host. There are no accounts to connect
+and no API keys — nothing leaves the machine to build the list. A launcher that isn't installed
+contributes nothing, so installing a plugin you turn out not to need costs you an empty source and
+nothing else.
 
-| Source | Linux host | Windows host | What it reads |
+| Plugin | Linux host | Windows host | What it reads |
 |---|---|---|---|
 | **Steam** | ✅ | ✅ | Installed titles from `appmanifest_<appid>.acf` in every Steam library folder, plus your own **non-Steam shortcuts** |
 | **Lutris** | ✅ | — | The local Lutris database (`pga.db`) |
 | **Heroic (Epic / GOG / Amazon)** | ✅ | — | Heroic Games Launcher's local library cache, all three of its backends |
 | **Epic Games Launcher** | — | ✅ | The launcher's install manifests |
-| **GOG Galaxy** | — | ✅ | The GOG install registry and each game's `.info` file |
-| **Xbox / Game Pass** | — | ✅ | GDK games in each drive's default `XboxGames` folder |
+| **GOG** | — | ✅ | The GOG install registry and each game's `.info` file |
+| **Playnite** | — | ✅ | Your Playnite library, whichever stores it aggregates |
+| **ROM Manager** | ✅ | ✅ | Your ROM folders, matched against a metadata source |
 
-Every scanner is **on by default**.
+> Through v0.27.x six of these scanners were built into the host itself and ran whether you wanted
+> them or not. From **v0.28.0** they are plugins like any other. If you were already running the
+> plugin for a launcher, nothing changes — the ids, art and app ids are identical by design. If you
+> were relying on the built-in scanner, install that launcher's plugin once and your grid comes back
+> exactly as it was, including anything you had switched off or hidden.
 
 A few things are deliberately left out. Steam's tooling — Proton, the Steam Linux Runtimes, Steamworks
 Common Redistributables, SteamVR — is filtered out, so your grid holds games rather than plumbing. A
-non-Steam shortcut you have hidden inside Steam stays hidden here too. On Windows, an Xbox game
-installed outside the default `XboxGames` folder isn't found, and a Microsoft Store game that isn't a
-GDK title isn't listed at all.
+non-Steam shortcut you have hidden inside Steam stays hidden here too.
 
 To see exactly what the host resolved, run [`punktfunk-host library`](/docs/host-cli) on the host: it
 prints the whole library as JSON. That answers "does the host see my games?" without involving a
@@ -42,19 +47,19 @@ client.
 
 ## Turning a source off
 
-The console's **Library** page has a **Game sources** card with one chip per scanner this host
-supports. A chip is highlighted when the host scans that launcher; click it to turn the scanner off.
+The console's **Library** page has a **Game sources** card with one chip per source this host has.
+A chip is highlighted when that source is contributing titles; click it to turn the source off.
 
 Turning a source off hides its titles from **everywhere at once** — the console grid, every native
-client, the Moonlight app list, and launching. Nothing is deleted, the change needs no restart, and
-turning the source back on brings the titles straight back on the next read.
+client, the Moonlight app list, and launching. Nothing is deleted and the change needs no restart:
+the plugin keeps its titles, they simply stop being shown, and turning the source back on brings
+them straight back on the next read. (To remove a source's titles for good, uninstall its plugin.)
 
-The list of chips is built from what the host can actually do, so a Windows host never offers you a
-Lutris toggle. Your hand-added entries are not a scanner and have no chip — they are always shown.
+Your hand-added entries are not a source and have no chip — they are always shown.
 
 The choice is stored per host in `library-scanners.json`, next to the rest of the host config
 (`~/.config/punktfunk/` on Linux, `%ProgramData%\punktfunk\` on Windows). Only the sources you turned
-*off* are written down, so a scanner added by a future release starts enabled.
+*off* are written down, so a source added later starts enabled.
 
 ## Adding a game by hand
 

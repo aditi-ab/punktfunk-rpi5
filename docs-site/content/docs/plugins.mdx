@@ -1,19 +1,25 @@
 ---
 title: Plugins
-description: First-party plugins — sync your ROM collection or Playnite library into the game library, or hand a real USB device on the couch to the host — and how to install them.
+description: First-party plugins — bring each of your game launchers into the library, sync a ROM collection or Playnite library, or hand a real USB device on the couch to the host — and how to install them.
 ---
 
 Plugins extend the host through the **scripting runner** (see [Events & hooks](/docs/automation)). A
 plugin runs alongside the host, reconciles titles into your [game library](/docs/game-library) as a
 provider — so they appear in the grid on every client — and can add its own page to the [web console](/docs/web-console).
 
-Three first-party plugins today:
+**Your game library is built from plugins.** From v0.28.0 the host scans no launcher on its own, so
+install the one for each launcher you use — that is what puts games in the grid.
 
-| Plugin | What it does |
-|---|---|
-| **ROM Manager** | Scans your ROM directories, matches each platform to an installed emulator, and syncs them into the library with box art. |
-| **Playnite** | Mirrors your [Playnite](https://playnite.link) library — every store and emulator it manages — into the library, launched back through Playnite. |
-| **VirtualHere** | Hands a real USB device on the couch — wheel, HOTAS, pad — to the host while you play, and gives it back after. Needs [VirtualHere](https://www.virtualhere.com/), sold separately. |
+| Plugin | Host | What it does |
+|---|---|---|
+| **Steam** | Linux, Windows | Your installed Steam titles and non-Steam shortcuts, with Steam's own art, plus a Big Picture tile. |
+| **Lutris** | Linux | Your Lutris games, with art, and a tile that opens Lutris itself. |
+| **Heroic** | Linux | Everything Heroic manages — Epic, GOG and Amazon — plus a tile that opens Heroic. |
+| **Epic Games Store** | Windows | Your installed Epic titles, from the launcher's own manifests. |
+| **GOG** | Windows | Your installed GOG games, launched directly — Galaxy is never involved. |
+| **Playnite** | Windows | Mirrors your [Playnite](https://playnite.link) library — every store and emulator it manages — into the library, launched back through Playnite. |
+| **ROM Manager** | Linux, Windows | Scans your ROM directories, matches each platform to an installed emulator, and syncs them into the library with box art. |
+| **VirtualHere** | Linux, Windows | Hands a real USB device on the couch — wheel, HOTAS, pad — to the host while you play, and gives it back after. Needs [VirtualHere](https://www.virtualhere.com/), sold separately. |
 
 ## Installing from the console
 

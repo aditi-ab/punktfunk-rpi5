@@ -14,6 +14,53 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.27.1 — in development
 
+### The six built-in library scanners are gone — every game source is a plugin (⚠ operator-visible)
+
+The host no longer scans any launcher itself. `library/{steam,epic,gog,heroic,lutris,xbox}.rs` and
+the `scanner_defs()` table are deleted; `GET /library/scanners` now lists exactly what the operator
+has installed, and every row reports `origin: "plugin"`. This is M6/WP6.4, the end of the migration
+whose bridge half shipped in v0.26.0 — the plugins have been published and index-pinned since
+2026-08-08.
+
+**A host with no library plugins installed has an empty grid.** That is the upgrade note: the
+console's Library page offers one-click install per source (the D9 nudge, still there and still
+never auto-installing), and nothing about a title changes when its plugin takes over.
+
+Why that last part is true, and why this was safe to do as a deletion rather than a rewrite: a
+plugin **claims** its store (D2), and a claimed entry surfaces under the deterministic
+`<store>:<external_id>` id the scanner used to produce. Entry ids, GameStream FNV-1a app ids,
+client-side art caches, Moonlight pins, the operator's per-source toggles and their per-entry hides
+are all keyed on that id and none of them move. `library-scanners.json` keeps its name, its shape
+and its contents — an operator who had `steam` switched off still has it switched off, with no
+migration step.
+
+What survives the scanners, deliberately:
+
+- **`launch.rs` in full.** Launch is host-owned by design D1 — a plugin publishes a validated
+  *value* and the host builds the command — so every typed kind (`steam_appid`, `steam_ui`,
+  `launcher_ui`, `epic`, `gog`, `aumid`, `xbox`, `lutris_id`, `playnite`) stays exactly as it was.
+  `xbox_pfn()` moved here from the deleted `xbox.rs`: resolving a package Identity to its
+  PackageFamilyName needs `AppRepository` enumeration, which is readable by the host (LocalSystem)
+  and denied to the plugin runner (LocalService), and that measured asymmetry is the entire reason
+  the `xbox` launch kind exists.
+- **`SourceOrigin::Builtin`.** No host build emits it, but the web console ships as its own package
+  and is expected to drive an N-1 host that still does, so the variant stays in the schema and the
+  console keeps its `builtin` handling.
+- **The store-label table.** Six ids keep their display names (`steam` → "Steam", …) so a source row
+  does not rename itself to a bare id the day its plugin takes over.
+
+Removed with them: the background cover-art warmer and its on-disk cache (they existed only for the
+GOG and Xbox scanners, the two sources that had to ask a network catalog what a cover was — a
+plugin resolves art while it scans), the legacy `steam:` branch of the art proxy, and the
+`GameMeta::pc()` helper. **The host now makes no outbound HTTP request to build a library at all.**
+
+⚠ **Dependency drop (packager-visible):** `rusqlite` (with its bundled, `cc`-compiled SQLite) and
+`roxmltree` leave the host's dependency graph — they had no other users. `winreg` stays: `launch.rs`,
+`procscan/windows.rs` and the two `audio/windows/` modules still need it. `base64`/`ureq` stay, as
+the M6 plan predicted.
+
+A stale `library-art-cache.json` from an older host is ignored, not migrated.
+
 ### GameStream is now opt-in on EVERY route (⚠ packager-visible default change)
 
 The secure native-only host is the default everywhere; the Moonlight-compat planes (plain-HTTP

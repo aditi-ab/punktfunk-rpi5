@@ -219,10 +219,6 @@ pipewire = "0.9"
 # in the subsystem extraction, and each of those crates declares them itself — only the manifest
 # entries were left behind, along with comments describing code this crate no longer contains.
 # Verified unused before removal: zero `use`/path references across src/ + build.rs.
-# Read the Lutris library DB (`pga.db`) for the Lutris store provider. `bundled` vendors + compiles
-# SQLite (cc, already needed for ffmpeg/opus) so there's no system libsqlite3 runtime dependency —
-# clean for the deb/rpm/flatpak packaging. Opened read-only/immutable (Lutris may hold it open).
-rusqlite = { version = "0.40", features = ["bundled"] }
 # `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
 # (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `zerocopy::cuda`.
 libloading = "0.9"
@@ -319,12 +315,12 @@ windows = { version = "0.62", features = [
 # kept a fourth windows-sys major compiling. 0.8.1 moves to `windows-sys 0.61`, which the tree
 # already builds, and that duplicate is gone. (0.8.0 is NOT enough — it lands on 0.59.)
 windows-service = "0.8"
-# Read the GOG.com install registry (HKLM\SOFTWARE\WOW6432Node\GOG.com\Games) for the GOG store
-# provider — ergonomic + correct-by-construction vs. hand-rolled Reg* FFI for subkey enumeration.
+# Registry reads the host does on Windows — ergonomic + correct-by-construction vs. hand-rolled
+# Reg* FFI for subkey enumeration. Survived the removal of the built-in store scanners (which is
+# what first pulled it in): `library/launch.rs` resolves launcher install paths for the typed launch
+# kinds a plugin publishes, `procscan/windows.rs` maps processes, and the two `audio/windows/`
+# modules read and clean up device nodes.
 winreg = "0.56"
-# Parse each Xbox/Game-Pass game's MicrosoftGame.config (GDK manifest XML) for the Xbox store
-# provider — a small read-only DOM is all we need (Identity/Executable/ShellVisuals/StoreId).
-roxmltree = "0.21"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.24"
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the

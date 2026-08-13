@@ -1,14 +1,18 @@
-//! Library-scanner settings: which installed-store scanners run on this host. Every scanner is
-//! **on by default** (the shipped behavior before this existed); the operator can turn one off in
-//! the web console, which hides its titles from every library surface (console grid, native
-//! clients, the GameStream app list, launch resolution) from the next read. Only the *disabled*
-//! set is persisted, so a scanner added in a future build starts enabled without a migration.
+//! Game-source settings: which of this host's library sources contribute titles. Every source is
+//! **on by default**; the operator can turn one off in the web console, which hides its titles from
+//! every library surface (console grid, native clients, the GameStream app list, launch resolution)
+//! from the next read. Only the *disabled* set is persisted, so a source that appears later starts
+//! enabled without a migration.
 //!
-//! The user-curated **custom** store is not a scanner (nothing is scanned — the operator typed the
-//! entries in) and cannot be disabled here; provider plugins (RFC §8) likewise own their entries
-//! through the reconcile API. Down the road the scanners themselves are slated to become plugins —
-//! the stable per-scanner ids this module fixes (`steam`, `lutris`, …, matching each entry's
-//! `store` field) are the forward seam for that migration.
+//! **Every source here is a plugin now.** Through v0.27.x this module also enumerated the six
+//! scanners compiled into the host; that list is gone with the scanners themselves. The forward seam
+//! it was built for did its job exactly as designed — the ids never changed (provider id = claimed
+//! store id = old scanner id), so an operator who had `steam` switched off before the migration
+//! still has it switched off after, with nothing to carry over and no migration step. That property
+//! is the reason `library-scanners.json` keeps its name and its shape.
+//!
+//! The user-curated **custom** store is not a source (nothing is scanned — the operator typed the
+//! entries in) and cannot be disabled here.
 
 use super::*;
 
@@ -27,8 +31,9 @@ pub struct ScannerInfo {
     pub label: String,
     /// Whether this host runs the source (default true).
     pub enabled: bool,
-    /// Where the source comes from: `builtin` (a scanner in this host build) or `plugin`.
-    #[schema(example = "builtin")]
+    /// Where the source comes from. Always `plugin` from this host build onward — see
+    /// [`SourceOrigin`].
+    #[schema(example = "plugin")]
     pub origin: SourceOrigin,
     /// The provider id backing a `plugin` source — absent for a built-in scanner.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,30 +48,31 @@ pub struct ScannerInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceOrigin {
-    /// A scanner compiled into this host build.
+    /// A scanner compiled into the host build.
+    ///
+    /// **No host build emits this any more** — the built-in scanners were removed in v0.28.0. The
+    /// variant is kept deliberately, because it is still part of the API's vocabulary: the web
+    /// console ships as its own package and is expected to drive an N-1 host, which does still
+    /// report `builtin` sources. Deleting it here would drop `builtin` from the OpenAPI enum and
+    /// narrow the console's generated union out from under that pairing.
+    #[allow(dead_code)]
     Builtin,
     /// A plugin reconciling entries over the provider API.
     Plugin,
 }
 
-/// The scanners compiled into THIS host build: (id, label). Steam is cross-platform; the rest are
-/// platform-gated exactly like their provider modules in `library.rs` — keep the two in sync when
-/// adding a store.
-fn scanner_defs() -> Vec<(&'static str, &'static str)> {
-    let mut defs = vec![("steam", "Steam")];
-    #[cfg(target_os = "linux")]
-    {
-        defs.push(("lutris", "Lutris"));
-        defs.push(("heroic", "Heroic (Epic / GOG / Amazon)"));
-    }
-    #[cfg(windows)]
-    {
-        defs.push(("epic", "Epic Games Launcher"));
-        defs.push(("gog", "GOG Galaxy"));
-        defs.push(("xbox", "Xbox / Game Pass"));
-    }
-    defs
-}
+/// Display names for the stores that used to have a built-in scanner, so a source keeps the label
+/// the operator has been toggling for releases instead of renaming itself to a bare id the day its
+/// plugin takes over. Anything not listed (rom-manager, playnite, a third-party provider) falls back
+/// to its own id, which is what those sources have always shown.
+const STORE_LABELS: &[(&str, &str)] = &[
+    ("steam", "Steam"),
+    ("lutris", "Lutris"),
+    ("heroic", "Heroic (Epic / GOG / Amazon)"),
+    ("epic", "Epic Games Launcher"),
+    ("gog", "GOG Galaxy"),
+    ("xbox", "Xbox / Game Pass"),
+];
 
 /// Persisted shape (`library-scanners.json`): only the ids the operator turned OFF. Absent file =
 /// nothing disabled = the pre-existing all-scanners-on behavior.
@@ -104,48 +110,25 @@ fn save_settings(settings: &ScannerSettings) -> Result<()> {
     Ok(())
 }
 
-/// The disabled-scanner ids, loaded once per library read ([`all_games`] consults it per store).
+/// The disabled source ids, loaded once per library read ([`all_games`] filters each entry on it).
 pub(crate) fn disabled_scanners() -> HashSet<String> {
     load_settings().disabled.into_iter().collect()
 }
 
 /// Every game source on this host with its current enable state (WP2.6):
 ///
-/// 1. the built-in scanners this build compiled in, **minus** any whose store a plugin has claimed
-///    (the plugin replaces it, so showing both would offer two toggles for one thing);
-/// 2. the claimed stores themselves, as plugin sources;
-/// 3. any other provider that has entries — the *emergent* case (rom-manager, playnite), which has
-///    never had a toggle before and gets one for free here.
+/// 1. every **claimed store** — a library plugin that took a store's id, so its entries surface as
+///    `steam:570` rather than `custom:<opaque>`;
+/// 2. every other provider that has entries — the *emergent* case (rom-manager, playnite), which
+///    never claimed a store but still owns a set of titles the operator may want to switch off.
 ///
-/// Built-ins keep their fixed definition order (stable for the console); plugin sources follow,
-/// sorted by id.
+/// Sorted by id, which is a stable order for the console. This used to lead with the built-in
+/// scanners compiled into the host, minus any store a plugin had claimed out from under them; with
+/// the scanners gone the subtraction has nothing left to subtract and the list is plugins only.
 pub fn list_scanners() -> Vec<ScannerInfo> {
     let off = disabled_scanners();
     let claims = crate::library::claimed_stores();
     let entries = crate::library::load_custom();
-
-    let mut out: Vec<ScannerInfo> = scanner_defs()
-        .into_iter()
-        .filter(|(id, _)| !claims.contains_key(*id))
-        .map(|(id, label)| ScannerInfo {
-            id: id.to_string(),
-            label: label.to_string(),
-            enabled: !off.contains(id),
-            origin: SourceOrigin::Builtin,
-            provider: None,
-            entries: None,
-        })
-        .collect();
-
-    // A claimed store shows under the SCANNER's label where we know one, so the row a user has been
-    // toggling for releases doesn't rename itself out from under them mid-migration.
-    let label_for = |id: &str| {
-        scanner_defs()
-            .into_iter()
-            .find(|(sid, _)| *sid == id)
-            .map(|(_, label)| label.to_string())
-            .unwrap_or_else(|| id.to_string())
-    };
 
     let mut plugin_ids: Vec<(String, String)> = claims
         .iter()
@@ -163,27 +146,43 @@ pub fn list_scanners() -> Vec<ScannerInfo> {
     plugin_ids.sort();
     plugin_ids.dedup();
 
-    out.extend(plugin_ids.into_iter().map(|(id, provider)| {
-        let count = entries
-            .iter()
-            .filter(|e| crate::library::source_id_for(e) == Some(id.as_str()))
-            .count();
-        ScannerInfo {
-            label: label_for(&id),
-            enabled: !off.contains(&id),
-            origin: SourceOrigin::Plugin,
-            provider: Some(provider),
-            entries: Some(count),
-            id,
-        }
-    }));
-    out
+    plugin_ids
+        .into_iter()
+        .map(|(id, provider)| {
+            let count = entries
+                .iter()
+                .filter(|e| crate::library::source_id_for(e) == Some(id.as_str()))
+                .count();
+            ScannerInfo {
+                label: store_label(&id),
+                enabled: !off.contains(&id),
+                origin: SourceOrigin::Plugin,
+                provider: Some(provider),
+                entries: Some(count),
+                id,
+            }
+        })
+        .collect()
 }
 
-/// Whether `id` names a source that exists on this host right now — a compiled-in scanner, a claimed
-/// store, or a provider with entries. The toggle accepts exactly these (an unknown id still 404s).
+/// A source's display name — see [`STORE_LABELS`]; its own id when we know no nicer name.
+fn store_label(id: &str) -> String {
+    STORE_LABELS
+        .iter()
+        .find(|(sid, _)| *sid == id)
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Whether `id` names a source that exists on this host right now — a claimed store or a provider
+/// with entries. The toggle accepts exactly these (an unknown id still 404s).
+///
+/// Note this is now strictly "a source that is really here". While the built-ins existed it also
+/// accepted any compiled-in scanner id, which was the same thing for them; a plugin that has never
+/// reconciled has no entries and no claim, so there is nothing to toggle and 404 is the honest
+/// answer.
 fn is_known_source(id: &str) -> bool {
-    scanner_defs().iter().any(|(sid, _)| *sid == id) || list_scanners().iter().any(|s| s.id == id)
+    list_scanners().iter().any(|s| s.id == id)
 }
 
 /// Enable/disable one source. `None` when `id` names no source on this host (the mgmt layer maps
@@ -221,14 +220,19 @@ pub fn set_scanner_enabled(id: &str, enabled: bool) -> Result<Option<Vec<Scanner
 mod tests {
     use super::*;
 
+    /// The label table is what keeps a source row named "Steam" instead of "steam" now that the
+    /// scanner which used to supply that name is gone. Pin both halves: the ids are unique, and an
+    /// id we know nothing about degrades to itself rather than to an empty or panicking label.
     #[test]
-    fn steam_is_always_a_scanner_and_ids_are_unique() {
-        let defs = scanner_defs();
-        assert!(defs.iter().any(|(id, _)| *id == "steam"));
-        let ids: HashSet<_> = defs.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids.len(), defs.len(), "scanner ids must be unique");
-        // `custom` is a store but never a scanner — the toggle surface must not offer it.
+    fn store_labels_are_unique_and_unknown_ids_degrade_to_themselves() {
+        let ids: HashSet<_> = STORE_LABELS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), STORE_LABELS.len(), "source ids must be unique");
+        // `custom` is a store but never a source — the toggle surface must not offer it.
         assert!(!ids.contains("custom"));
+
+        assert_eq!(store_label("steam"), "Steam");
+        assert_eq!(store_label("rom-manager"), "rom-manager");
+        assert_eq!(store_label(""), "");
     }
 
     #[test]

@@ -166,7 +166,7 @@ pub struct Catalog {
     ///
     /// The map — not the entries — is the authority for a claim, which is exactly why it survives an
     /// **empty reconcile**: a store the plugin legitimately owns can have zero installed titles, and
-    /// the built-in scanner it suppresses must stay suppressed anyway. Releasing is explicit
+    /// it must keep owning the store's id space regardless. Releasing is explicit
     /// (`DELETE /library/provider/{p}`, or the plugin claiming a different store).
     #[serde(default)]
     pub claims: BTreeMap<String, String>,
@@ -573,7 +573,7 @@ fn reconcile_entries(
 ///
 /// Claiming is idempotent for the holder and refused for anyone else. A provider holds at most one
 /// store, so claiming a new one releases whatever it held before — otherwise an abandoned claim would
-/// go on suppressing a built-in scanner with nothing to replace it.
+/// go on holding a store id that no plugin is filling any more, locking out the next claimant.
 pub fn reconcile_provider(
     provider: &str,
     store: Option<&str>,
@@ -712,8 +712,9 @@ mod tests {
         assert_eq!(g.meta.platform.as_deref(), Some("PS2"));
     }
 
-    /// D2's core promise: a **claimed** entry is indistinguishable from what the built-in scanner
-    /// produced. Same id, same store badge — plus the provider attribution the scanner never had.
+    /// D2's core promise, and the reason removing the built-in scanners was invisible downstream: a
+    /// **claimed** entry is indistinguishable from what the scanner produced. Same id, same store
+    /// badge — plus the provider attribution the scanner never had.
     #[test]
     fn a_claimed_entry_reproduces_the_scanner_identity() {
         let mut e = manual("host-assigned", "Portal 2");

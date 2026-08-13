@@ -1,108 +1,14 @@
-//! Artwork cache + background warmer: the on-disk poster cache, the per-store fetchers, and the
+//! Artwork serving: the local-file confinement rules, the art-proxy rewrite, and the
 //! `fetch_box_art` dispatch the management art proxy serves from. Split out of the `library` facade (plan §W5).
+//!
+//! There is no art *cache* or background *warmer* here any more. Both existed for the built-in GOG
+//! and Xbox scanners, the only two sources that had to reach a network catalog to learn what a
+//! title's cover was; every other source carried its own art. Those scanners were removed in
+//! v0.28.0, and the library plugins that replaced them resolve art while they scan and publish it on
+//! the entry — so the host now only ever *serves* art it was handed, and never fetches any on its
+//! own schedule. A stale `library-art-cache.json` left by an older host is simply ignored.
 
 use super::*;
-
-/// The persisted art cache: GameEntry id → resolved [`Artwork`]. An entry's PRESENCE means "already
-/// resolved" (even an empty Artwork = fetched, none found) so the warmer never re-fetches it.
-fn art_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Artwork>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Artwork>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        let loaded = std::fs::read_to_string(art_cache_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        std::sync::Mutex::new(loaded)
-    })
-}
-
-/// The art cache lives in the canonical HOST config dir (`%ProgramData%\punktfunk` on Windows /
-/// `~/.config/punktfunk` on Linux — `pf_paths::config_dir`, NOT the legacy XDG/HOME `config_dir`
-/// below that the custom store still uses).
-fn art_cache_path() -> PathBuf {
-    pf_paths::config_dir().join("library-art-cache.json")
-}
-
-/// The cached art for a library id, if it has been resolved (positive or negative). `None` = not yet
-/// warmed → the provider shows title-only until the warmer fills it in.
-pub(crate) fn cached_art(id: &str) -> Option<Artwork> {
-    art_cache().lock().unwrap().get(id).cloned()
-}
-
-/// Record resolved art for a library id + persist the cache (write-then-rename; best-effort).
-fn store_art(id: &str, art: Artwork) {
-    let mut cache = art_cache().lock().unwrap();
-    cache.insert(id.to_string(), art);
-    if let Ok(json) = serde_json::to_string(&*cache) {
-        let path = art_cache_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-}
-
-/// Start the host-lifetime cover-art warmer: every few minutes, fetch + cache art for any library
-/// entry whose store needs a network lookup (GOG / Xbox) and isn't cached yet. Idempotent — once
-/// everything is cached a pass makes no network calls (and a host with only self-art stores never
-/// fetches at all). Call once from `serve()`; the returned handle can be dropped to detach it.
-pub fn start_art_warmer() -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("pf-art-warmer".into())
-        .spawn(|| loop {
-            warm_art_once();
-            std::thread::sleep(std::time::Duration::from_secs(300));
-        })
-        .expect("spawn art warmer thread")
-}
-
-/// One warming pass: resolve uncached GOG/Xbox art. Other stores carry their own art (Steam CDN
-/// template, Heroic CDN URLs, Lutris data: URLs, custom user URLs) and are skipped.
-fn warm_art_once() {
-    for g in all_games() {
-        if cached_art(&g.id).is_some() {
-            continue;
-        }
-        let Some((store, localid)) = g.id.split_once(':') else {
-            continue;
-        };
-        let art = match store {
-            "gog" => fetch_gog_art(localid),
-            // The xbox id is the StoreId when present, else the PFN (contains '_', no displaycatalog
-            // entry) → cache empty for those so they aren't retried every pass.
-            "xbox" if !localid.contains('_') => fetch_xbox_art(localid),
-            "xbox" => Artwork::default(),
-            _ => continue, // steam/heroic/lutris/custom resolve their own art
-        };
-        store_art(&g.id, art);
-    }
-}
-
-/// HTTP GET + parse JSON with a bounded timeout. `None` on any network/parse failure (best-effort —
-/// art is non-essential, so a failure just leaves the title-only card).
-fn fetch_json(url: &str) -> Option<serde_json::Value> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
-        // Don't follow redirects — a redirect target (`3xx` → `http://169.254.169.254/…` or an
-        // internal host) would be an SSRF pivot from the privileged host. Matches the webhook path
-        // (security-review 2026-07-17). A rare legitimately-redirecting CDN just yields no art.
-        .max_redirects(0)
-        .build()
-        .into();
-    let body = agent
-        .get(url)
-        .call()
-        .ok()?
-        .body_mut()
-        .read_to_string()
-        .ok()?;
-    serde_json::from_str(&body).ok()
-}
 
 /// Fetch one image URL for the GameStream `/appasset` cover proxy, as `(bytes, content-type)`. Handles
 /// `data:` URLs (Lutris inlines art that way) by decoding inline, and `http(s)` URLs by a bounded GET
@@ -169,11 +75,11 @@ pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
 ///   Playnite back-compat (it predates the `file://` contract).
 /// * POSIX absolute (`/home/u/covers/x.jpg`) — Lutris covers and Steam's `librarycache`.
 ///
-/// The POSIX widening is why the two `/`-leading shapes the **host itself emits** must be excluded
-/// explicitly: its own art-proxy path (`/api/v1/library/art/…`, which [`proxy_local_art`] writes and
-/// which must survive a second pass unchanged) and a protocol-relative URL (`//cdn/…`, what GOG's and
-/// Microsoft's catalogs return — see [`abs_url`]). Mistaking either for a file would break the proxy
-/// round-trip or silently drop CDN art.
+/// The POSIX widening is why the two `/`-leading shapes must be excluded explicitly: the host's own
+/// art-proxy path (`/api/v1/library/art/…`, which [`proxy_local_art`] writes and which must survive a
+/// second pass unchanged) and a protocol-relative URL (`//cdn/…`, which GOG's and Microsoft's
+/// catalogs return and a plugin may pass straight through). Mistaking either for a file would break
+/// the proxy round-trip or silently drop CDN art.
 pub fn is_local_art_path(v: &str) -> bool {
     if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("data:") {
         return false;
@@ -475,107 +381,20 @@ pub fn proxy_local_art(id: &str, art: &mut Artwork) {
 /// `(bytes, content-type)`. Resolves the id against the host's OWN library. Blocking — call off the
 /// async runtime (e.g. `spawn_blocking`).
 pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
-    // Same resolution order as the management art proxy (WP1.2): the stored catalog first, for ANY
-    // id, so a library plugin's entries resolve without the warmer knowing its store.
-    if let Some(entry) = entry_for_library_id(id) {
-        return [
-            ArtKind::Portrait,
-            ArtKind::Header,
-            ArtKind::Hero,
-            ArtKind::Logo,
-        ]
-        .into_iter()
-        .filter_map(|kind| art_field(&entry.art, kind))
-        .find_map(|v| resolve_art_bytes(&v));
-    }
-    // Legacy in-host Steam scanner: its `Artwork` fields are relative proxy paths (see `steam_art`)
-    // the *client* resolves against the host — meaningless to `fetch_image`, which expects an
-    // absolute URL. Resolve those kinds directly instead of going through the URL fields.
-    if let Some(appid) = id
-        .strip_prefix("steam:")
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        return [
-            ArtKind::Portrait,
-            ArtKind::Header,
-            ArtKind::Hero,
-            ArtKind::Logo,
-        ]
-        .into_iter()
-        .find_map(|kind| steam_art_bytes(appid, kind));
-    }
-    // The remaining in-host scanners (heroic/lutris/epic/gog/xbox) carry absolute CDN URLs.
-    let g = all_games().into_iter().find(|g| g.id == id)?;
-    [g.art.portrait, g.art.header, g.art.hero, g.art.logo]
-        .into_iter()
-        .flatten()
-        .find_map(|url| resolve_art_bytes(&url))
-}
-
-/// Make a protocol-relative URL (`//host/...`, common in GOG + MS catalog responses) absolute https.
-fn abs_url(u: &str) -> String {
-    u.strip_prefix("//")
-        .map(|rest| format!("https://{rest}"))
-        .unwrap_or_else(|| u.to_string())
-}
-
-/// GOG cover art via the public (no-auth) product API. Field names / URL shapes are GOG-specific and
-/// best-effort (worth on-box confirmation); a wrong URL just degrades to the title card client-side.
-fn fetch_gog_art(product_id: &str) -> Artwork {
-    let Some(v) = fetch_json(&format!(
-        "https://api.gog.com/products/{product_id}?expand=images"
-    )) else {
-        return Artwork::default();
-    };
-    let img = |k: &str| {
-        v.get("images")
-            .and_then(|i| i.get(k))
-            .and_then(|u| u.as_str())
-            .map(abs_url)
-    };
-    Artwork {
-        portrait: img("verticalCover"),
-        hero: img("background"),
-        logo: img("logo2x"),
-        header: img("logo"),
-    }
-}
-
-/// Xbox cover art via the (unofficial, no-auth) Microsoft display catalog, keyed by StoreId. Best-
-/// effort: the endpoint is internal/unstable, so on drift this just yields no art (title-only).
-fn fetch_xbox_art(store_id: &str) -> Artwork {
-    let Some(v) = fetch_json(&format!(
-        "https://displaycatalog.mp.microsoft.com/v7.0/products/{store_id}?market=US&languages=en-us&fieldsTemplate=Details"
-    )) else {
-        return Artwork::default();
-    };
-    let images = v
-        .get("Products")
-        .and_then(|p| p.as_array())
-        .and_then(|a| a.first())
-        .and_then(|p| p.get("LocalizedProperties"))
-        .and_then(|l| l.as_array())
-        .and_then(|a| a.first())
-        .and_then(|lp| lp.get("Images"))
-        .and_then(|i| i.as_array());
-    let mut art = Artwork::default();
-    for img in images.into_iter().flatten() {
-        let (Some(purpose), Some(uri)) = (
-            img.get("ImagePurpose").and_then(|v| v.as_str()),
-            img.get("Uri").and_then(|v| v.as_str()),
-        ) else {
-            continue;
-        };
-        let url = abs_url(uri);
-        match purpose {
-            "Poster" => art.portrait = Some(url),
-            "SuperHeroArt" | "Hero" => art.hero = Some(url),
-            "Logo" => art.logo = Some(url),
-            "BoxArt" => art.header = Some(url),
-            _ => {}
-        }
-    }
-    art
+    // Same resolution as the management art proxy (WP1.2): the stored catalog, for ANY id, so a
+    // library plugin's entries resolve without this ever knowing which store they came from. That
+    // used to be the first of three branches — the other two served the built-in scanners (a
+    // `steam:` id whose art was a relative proxy path, and the CDN-URL scanners) and went with them.
+    let entry = entry_for_library_id(id)?;
+    [
+        ArtKind::Portrait,
+        ArtKind::Header,
+        ArtKind::Hero,
+        ArtKind::Logo,
+    ]
+    .into_iter()
+    .filter_map(|kind| art_field(&entry.art, kind))
+    .find_map(|v| resolve_art_bytes(&v))
 }
 
 #[cfg(test)]
@@ -627,7 +446,7 @@ mod tests {
             "/api/v1/library/art/custom:abc/portrait"
         ));
         assert!(!is_local_art_path("/api/v1/library/art/steam:570/hero"));
-        // …nor a protocol-relative CDN URL (what GOG / the MS catalog return — see `abs_url`).
+        // …nor a protocol-relative CDN URL (what GOG / the MS catalog return).
         assert!(!is_local_art_path("//images.gog.com/abc_vertical.jpg"));
         // A relative path is not absolute — nothing to serve.
         assert!(!is_local_art_path("covers/x.jpg"));
