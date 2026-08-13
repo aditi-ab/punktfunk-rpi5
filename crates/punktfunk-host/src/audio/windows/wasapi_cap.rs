@@ -747,9 +747,10 @@ enum DefaultKind {
     Unknown,
 }
 
-/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
-/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
-/// docs), and a spurious miss here silently downgrades a capturable default to `Unknown`.
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`] rather than the `wasapi` crate's
+/// `DeviceEnumerator::get_device`: that one handed `GetDevice` a freed string through 0.23, and a
+/// spurious miss here silently downgrades a capturable default to `Unknown`. `wasapi 0.24` fixed
+/// that, but we keep the one resolution path — see the helper's docs.
 fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
     let Ok(dev) = super::pad_endpoint::open_wasapi_device(id) else {
         return DefaultKind::Unknown;

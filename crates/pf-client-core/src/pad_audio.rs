@@ -920,9 +920,10 @@ fn pad_render_thread(
     let res = (|| -> anyhow::Result<()> {
         const BLOCK_ALIGN: usize = PAD_CHANNELS * 4; // f32 interleaved
         let enumerator = wasapi::DeviceEnumerator::new().context("DeviceEnumerator")?;
-        // Not `get_device`: that helper resolves through a freed string — see
-        // [`crate::audio::device_by_id`] (audio_wasapi.rs, mounted as `crate::audio` on
-        // Windows by lib.rs's `#[path]` swap — there is no `audio_wasapi` module name).
+        // Not `get_device`: that helper resolved through a freed string through wasapi 0.23, and
+        // this path additionally wants the ACTIVE-only filter — see [`crate::audio::device_by_id`]
+        // (audio_wasapi.rs, mounted as `crate::audio` on Windows by lib.rs's `#[path]` swap —
+        // there is no `audio_wasapi` module name).
         let device = crate::audio::device_by_id(&enumerator, &Direction::Render, endpoint_id)
             .map_err(|e| anyhow!("correlated endpoint not found: {e:#}"))?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;

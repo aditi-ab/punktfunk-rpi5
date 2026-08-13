@@ -278,7 +278,10 @@ windows = { version = "0.62", features = [
 # The SCM plumbing for the `service` subcommand (define_windows_service! / dispatcher / control
 # handler / ServiceManager install). Wraps the Win32 service API; the supervision loop itself uses
 # the `windows` crate above.
-windows-service = "0.7"
+# ⭐ Keep this at 0.8+: 0.7 was the LAST crate in the tree pulling `windows-sys 0.52`, so it alone
+# kept a fourth windows-sys major compiling. 0.8.1 moves to `windows-sys 0.61`, which the tree
+# already builds, and that duplicate is gone. (0.8.0 is NOT enough — it lands on 0.59.)
+windows-service = "0.8"
 # Read the GOG.com install registry (HKLM\SOFTWARE\WOW6432Node\GOG.com\Games) for the GOG store
 # provider — ergonomic + correct-by-construction vs. hand-rolled Reg* FFI for subkey enumeration.
 winreg = "0.56"
@@ -286,7 +289,7 @@ winreg = "0.56"
 # provider — a small read-only DOM is all we need (Identity/Executable/ShellVisuals/StoreId).
 roxmltree = "0.21"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
-wasapi = "0.23"
+wasapi = "0.24"
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the
 # control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs, defined ONCE so host<->driver
 # ABI drift is a compile error (used from `capture.rs`). The `bytemuck` that serializes those

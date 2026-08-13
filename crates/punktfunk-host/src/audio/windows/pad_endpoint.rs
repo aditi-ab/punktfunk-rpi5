@@ -911,13 +911,17 @@ fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
 
 /// Open a [`wasapi::Device`] for an endpoint id WITHOUT the crate's `DeviceEnumerator::get_device`.
 ///
-/// `wasapi 0.23` builds that call's argument as
-/// `PCWSTR::from_raw(HSTRING::from(device_id).as_ptr())`. The `HSTRING` is a temporary, so it is
-/// dropped at the end of THAT statement and `IMMDeviceEnumerator::GetDevice` reads freed memory on
-/// the next line. Whether the endpoint is found then depends on what the allocator happened to
+/// Through `wasapi 0.23` that call built its argument as
+/// `PCWSTR::from_raw(HSTRING::from(device_id).as_ptr())`. The `HSTRING` was a temporary, so it was
+/// dropped at the end of THAT statement and `IMMDeviceEnumerator::GetDevice` read freed memory on
+/// the next line. Whether the endpoint was found then depended on what the allocator happened to
 /// leave behind — a heisenbug whose failure mode is `0x80070002` (ERROR_FILE_NOT_FOUND) for an id
-/// that is perfectly valid. [`open_mmdevice`] keeps its wide buffer alive across the call, so
-/// resolve there and only borrow the crate's wrapper around the resulting interface.
+/// that is perfectly valid. **`wasapi 0.24` fixed this upstream** (the `HSTRING` is now bound to a
+/// local that outlives the call), so this helper is no longer load-bearing for correctness.
+///
+/// We still resolve here, because the `IMMDevice` is wanted in its own right: [`probe_activation`]
+/// and the property-store readers below need the raw interface, so routing every lookup through
+/// [`open_mmdevice`] keeps ONE resolution path whose errors name the endpoint id.
 pub(crate) fn open_wasapi_device(endpoint_id: &str) -> Result<wasapi::Device> {
     let dev = open_mmdevice(endpoint_id)?;
     wasapi::Device::from_immdevice(dev)
