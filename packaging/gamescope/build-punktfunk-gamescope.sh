@@ -90,10 +90,14 @@ echo "==> configuring"
 #                               test suite is not our job either way.
 #   -Denable_openvr_support     the VR integration pulls the openvr submodule + its build for a
 #                               code path a headless capture session never enters.
-#   -Denable_gamescope_wsi_layer the WSI layer is a SEPARATE artifact the distro's gamescope
-#                               package already installs; ours must not collide with it.
-#                               (The layer the nested games load is that one — it is version-
-#                               independent of the compositor binary.)
+#   -Denable_gamescope_wsi_layer ON, and installed under our own name below. This used to be off,
+#                               on the grounds that the distro's gamescope package already ships a
+#                               layer and that the layer is "version-independent of the compositor
+#                               binary". That second half is FALSE: the layer and the compositor
+#                               speak `gamescope_swapchain` to each other, and when they disagree
+#                               the compositor rejects the client's `swapchain_feedback` and every
+#                               Vulkan client dies on a black screen. A compositor we ship needs
+#                               the layer we built beside it.
 #
 # `force_fallback_for` includes **wlroots** on purpose, and it is load-bearing for a binary we
 # SHIP: gamescope vendors a wlroots submodule, but meson prefers a system one when the build host
@@ -124,7 +128,7 @@ meson setup "$BUILD" "$SRCDIR" \
   -Dpipewire=enabled \
   -Denable_tests=false \
   -Denable_openvr_support=false \
-  -Denable_gamescope_wsi_layer=false
+  -Denable_gamescope_wsi_layer=true
 
 echo "==> building"
 ninja -C "$BUILD" ${JOBS:+-j "$JOBS"}
@@ -148,6 +152,36 @@ fi
 DEST="${DESTDIR}${PREFIX}/bin/punktfunk-gamescope"
 echo "==> installing $DEST"
 install -Dm755 "$BIN" "$DEST"
+
+# The WSI layer, under OUR name, at OUR path.
+#
+# A game nested under gamescope gets an HDR10 swapchain from this layer and from nothing else —
+# gamescope advertises no runtime colour-management protocol a Mesa/NVIDIA WSI could negotiate
+# through — so a compositor shipped WITHOUT a matching layer simply cannot do HDR for games. Built
+# from this same tree at this same rev, so the two can never drift apart; that is the whole point,
+# and it is what makes the host's old "compare version triples and hope" check unnecessary.
+#
+# It must not collide with the distro's layer and must be switchable independently of it, so the
+# generated manifest is rewritten to carry our layer name, our library path and our own
+# enable/disable variables. The Vulkan loader keys implicit layers on that NAME, so with a distinct
+# one both layers can sit installed side by side and the host picks per session.
+#
+# python3 rather than sed because meson is itself a Python program — it is guaranteed present on any
+# host that got this far — and a JSON edit belongs in a JSON parser.
+LAYER_SO=$(find "$BUILD" -type f -name 'libVkLayer_*gamescope_wsi*.so' | head -1)
+LAYER_SRC_JSON=$(find "$BUILD" -type f -name '*gamescope_wsi*.json' | head -1)
+[ -n "$LAYER_SO" ] && [ -n "$LAYER_SRC_JSON" ] || {
+  echo "the WSI layer did not build (.so=${LAYER_SO:-none} .json=${LAYER_SRC_JSON:-none}) — without" >&2
+  echo "it no game in a punktfunk gamescope session can get an HDR10 swapchain" >&2
+  exit 1
+}
+LAYER_LIB_PATH="${PREFIX}/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+LAYER_DEST_JSON="${DESTDIR}${PREFIX}/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
+echo "==> installing ${DESTDIR}${LAYER_LIB_PATH}"
+install -Dm755 "$LAYER_SO" "${DESTDIR}${LAYER_LIB_PATH}"
+install -d "$(dirname "$LAYER_DEST_JSON")"
+python3 "$(dirname "$0")/rewrite-wsi-layer-manifest.py" \
+  "$LAYER_SRC_JSON" "$LAYER_DEST_JSON" "$LAYER_LIB_PATH"
 
 if [ "$SETCAP" = 1 ] && command -v setcap >/dev/null; then
   # gamescope raises its own scheduling priority; without CAP_SYS_NICE it still runs, just noisier

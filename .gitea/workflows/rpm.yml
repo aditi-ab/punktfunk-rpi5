@@ -293,7 +293,11 @@ jobs:
           dnf -y install wayland-protocols-devel glm-devel cmake libXcursor-devel || true
           if bash packaging/gamescope/build-punktfunk-gamescope.sh \
                --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
-            install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
+            # The WHOLE staged tree, not just the binary: it also carries the Vulkan WSI layer built
+            # beside the compositor, which is the only thing that can give a nested game an HDR10
+            # swapchain. Caching the tree rather than a file per artifact is what keeps the next
+            # addition from needing a change here as well as in every packaging script.
+            mkdir -p gs-cache && cp -a gs-stage/. gs-cache/
           else
             # Warn only, even on a tag — the hard gate is the LAST step of this job. Failing here
             # would skip the sysext build, the sysext feed, AND the release attach below, so a
@@ -311,9 +315,9 @@ jobs:
       # existing SDR/host-composited path. The spec re-checks the +pfhdr marker itself.
       - name: Package punktfunk-gamescope as an RPM
         run: |
-          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
+          if [ -x gs-cache/usr/bin/punktfunk-gamescope ] && gs-cache/usr/bin/punktfunk-gamescope --version >/dev/null 2>&1; then
             bash packaging/gamescope/build-gamescope-rpm.sh \
-              --binary gs-cache/punktfunk-gamescope \
+              --stage gs-cache \
               --release "$PF_RELEASE"
           else
             # Warn only — see the note on the build step. The gate is the last step of this job.
@@ -372,9 +376,9 @@ jobs:
           # whose runtime libs are missing from this container must cost the image its HDR, not the
           # image itself.
           gs=()
-          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
-            gs=(--gamescope gs-cache/punktfunk-gamescope)
-            echo "folding in $(gs-cache/punktfunk-gamescope --version 2>&1 | head -1)"
+          if [ -x gs-cache/usr/bin/punktfunk-gamescope ] && gs-cache/usr/bin/punktfunk-gamescope --version >/dev/null 2>&1; then
+            gs=(--gamescope-stage gs-cache)
+            echo "folding in $(gs-cache/usr/bin/punktfunk-gamescope --version 2>&1 | head -1)"
           else
             echo "::warning::no usable punktfunk-gamescope for f${{ matrix.fedver }} — the sysext ships without it (gamescope sessions stay SDR)"
           fi

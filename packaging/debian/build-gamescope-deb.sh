@@ -10,24 +10,38 @@
 # not Provide/Conflict with it. Only the sessions punktfunk-host starts itself resolve this binary
 # (PUNKTFUNK_GAMESCOPE_BIN > punktfunk-gamescope > gamescope).
 #
+# `--stage` is the DESTDIR build-punktfunk-gamescope.sh wrote, not a single binary: that tree carries
+# the compositor AND the Vulkan WSI layer built beside it, and a game nested under gamescope gets its
+# HDR10 swapchain from that layer or from nowhere. Taking the whole tree is what stops the next file
+# in the package needing a new flag in every packaging script.
+#
 # Usage:
 #   VERSION=3.16.25.pfhdr4~ci42.gdeadbee bash packaging/debian/build-gamescope-deb.sh \
-#     --binary gs-cache/punktfunk-gamescope [--arch amd64]
+#     --stage gs-cache [--arch amd64]
 # Output: dist/punktfunk-gamescope_<version>_<arch>.deb
 set -euo pipefail
 
-BINARY=""
+SRC_STAGE=""
 DEB_ARCH=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
+    --stage)  SRC_STAGE="${2:?--stage needs a path}"; shift 2 ;;
     --arch)   DEB_ARCH="${2:?--arch needs a value}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-[ -n "$BINARY" ] || { echo "ERROR: --binary is required" >&2; exit 2; }
+[ -n "$SRC_STAGE" ] || { echo "ERROR: --stage is required" >&2; exit 2; }
+# The layout build-punktfunk-gamescope.sh writes under its --destdir/--prefix.
+BINARY="$SRC_STAGE/usr/bin/punktfunk-gamescope"
+LAYER_SO="$SRC_STAGE/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+LAYER_JSON="$SRC_STAGE/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
 [ -x "$BINARY" ] || { echo "ERROR: $BINARY is not an executable file" >&2; exit 1; }
+# Hard, not best-effort: a package carrying the compositor without its layer looks perfectly healthy
+# and then silently denies every game an HDR10 swapchain.
+for f in "$LAYER_SO" "$LAYER_JSON"; do
+  [ -f "$f" ] || { echo "ERROR: $f missing from the stage — no game HDR without it" >&2; exit 1; }
+done
 
 PKG="punktfunk-gamescope"
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -60,6 +74,12 @@ trap 'rm -rf "$STAGE"' EXIT
 # root-only and some tooling refuses it.
 chmod 0755 "$STAGE"
 install -Dm0755 "$BINARY" "$STAGE/usr/bin/punktfunk-gamescope"
+# /usr/lib/punktfunk, not a multiarch triplet dir: the layer manifest carries that absolute path
+# baked in at build time, so the two have to agree. Nothing links the .so by soname — the Vulkan
+# loader dlopens it by exactly that path — so multiarch has no say here.
+install -Dm0755 "$LAYER_SO" "$STAGE/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+install -Dm0644 "$LAYER_JSON" \
+  "$STAGE/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
 mkdir -p "$STAGE/DEBIAN"
 
 # Shared-library dependencies straight from the binary's own ELF NEEDED entries. That is what makes
@@ -103,7 +123,10 @@ fi
   echo "  * --pipewire-composite-external-overlay: the mangoapp performance overlay is painted"
   echo "    into the capture stream, so the fps/stats readout is visible remotely."
   echo " ."
-  echo " Installed as /usr/bin/punktfunk-gamescope; your system gamescope is untouched."
+  echo " Installed as /usr/bin/punktfunk-gamescope, with its matching Vulkan WSI layer under"
+  echo " /usr/lib/punktfunk. The layer has its own name and its own enable variable, so it sits"
+  echo " beside your gamescope package's rather than replacing it; your system gamescope is"
+  echo " untouched."
 } > "$STAGE/DEBIAN/control"
 
 mkdir -p dist

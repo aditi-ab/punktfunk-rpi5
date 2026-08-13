@@ -517,15 +517,17 @@ jobs:
           bash packaging/gamescope/build-punktfunk-gamescope.sh \
             --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)" \
             --extra-fallback libdisplay-info
-          install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
+          # The WHOLE staged tree, not just the binary: it also carries the Vulkan WSI layer built
+          # beside the compositor, which is the only route to an HDR10 swapchain for a nested game.
+          mkdir -p gs-cache && cp -a gs-stage/. gs-cache/
 
       # The binary must RUN, not merely link: `--version` is what the old job used as its ship
       # gate, and it is the cheapest proof that the static-libstdc++ trick and the vendored wlroots
       # actually produced a working compositor.
       - name: Build the .deb
         run: |
-          gs-cache/punktfunk-gamescope --version
-          bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
+          gs-cache/usr/bin/punktfunk-gamescope --version
+          bash packaging/debian/build-gamescope-deb.sh --stage gs-cache
 
       - name: Publish to the Gitea apt registry
         env:

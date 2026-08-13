@@ -262,10 +262,12 @@ pub struct HostConfig {
     /// spawn flags included.
     pub gamescope_hdr: bool,
     /// `PUNKTFUNK_GAMESCOPE_SDR_NITS` — the luminance SDR content is mapped to inside the PQ
-    /// container of an HDR gamescope session (gamescope's `--hdr-sdr-content-nits`, default 400).
+    /// container of an HDR gamescope session (gamescope's `--hdr-sdr-content-nits`).
     /// An HDR stream carries the desktop, the Steam overlay and any SDR game through the same PQ
     /// encode, so this is the knob that decides how bright "white" looks on the client's panel.
-    /// `None` = leave gamescope's own default.
+    /// `None` = 203 nits, BT.2408 reference white, which is what our clients decode against —
+    /// NOT gamescope's own default of 400, which sits nearly a stop above it. See `pf-vdisplay`'s
+    /// `SDR_REFERENCE_WHITE_NITS` for why the host pins this rather than letting it float.
     pub gamescope_sdr_nits: Option<u32>,
     /// `PUNKTFUNK_GAMESCOPE_BIND` — may the host bind the patched gamescope over
     /// `/usr/bin/gamescope` inside the session unit's mount namespace? That redirect is the ONLY

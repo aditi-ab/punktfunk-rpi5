@@ -1237,7 +1237,7 @@ fn write_session_plus_dropin(
     wrapper: &std::path::Path,
     mode: Mode,
     hdr: bool,
-    wsi_ok: bool,
+    wsi: WsiPlan,
 ) -> Result<bool> {
     let Some(bind) = arm_session_bind(wrapper) else {
         remove_session_plus_dropin();
@@ -1260,11 +1260,7 @@ fn write_session_plus_dropin(
             .chain(cursor_args())
             .collect::<Vec<_>>()
             .join(" "),
-        wsi = if wsi_ok {
-            String::new()
-        } else {
-            wsi_off_unit_lines()
-        },
+        wsi = wsi.unit_lines(),
     );
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))?;
     Ok(true)
@@ -1579,7 +1575,7 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     // Same two fixes the transient path gets, but this unit is the BOX's own — they have to arrive
     // as a drop-in, and `daemon-reload` before the restart or systemd runs the old unit.
     let mut bound = match write_gamescope_bin_wrapper()
-        .and_then(|w| write_session_plus_dropin(&w, mode, hdr, wsi_layer_matches_our_gamescope()))
+        .and_then(|w| write_session_plus_dropin(&w, mode, hdr, WsiPlan::resolve()))
     {
         Ok(true) => {
             // Record it BEFORE the restart, and persist it: from this instant the box's OWN
@@ -4215,24 +4211,102 @@ const WSI_OFF_ENV: [(&str, &str); 2] = [
     ("ENABLE_GAMESCOPE_WSI", "0"),
 ];
 
-/// [`WSI_OFF_ENV`] as `systemd-run` arguments, for the transient unit.
-fn wsi_off_setenv_args() -> Vec<String> {
-    WSI_OFF_ENV
-        .iter()
-        .map(|(name, value)| format!("--setenv={name}={value}"))
-        .collect()
+/// Our own WSI layer's implicit-layer manifest, laid down beside the compositor by
+/// `packaging/gamescope/build-punktfunk-gamescope.sh`.
+///
+/// It is built from the SAME source tree at the SAME rev as `punktfunk-gamescope`, so the layer and
+/// the compositor cannot disagree about `gamescope_swapchain` — which is what makes every "is the
+/// distro's layer close enough to ours?" guess unnecessary. It carries its own layer name and its
+/// own `enable_environment`, so it coexists with the distro's rather than replacing it.
+const OUR_WSI_LAYER_DIR_DEFAULT: &str = "/usr/lib/punktfunk/vulkan/implicit_layer.d";
+const OUR_WSI_LAYER_MANIFEST_NAME: &str = "punktfunk_gamescope_wsi.json";
+
+/// Where our layer's manifest directory is. FHS by default, because that is where every distro
+/// package puts it; `PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR` overrides for a store with no `/usr` to
+/// speak of — on NixOS the layer lives inside the gamescope derivation and the module points this
+/// at it, the same posture as `PUNKTFUNK_GAMESCOPE_BIN`.
+fn our_wsi_layer_dir() -> String {
+    std::env::var("PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| OUR_WSI_LAYER_DIR_DEFAULT.to_string())
 }
 
-/// [`WSI_OFF_ENV`] as unit-file lines, for the box-session drop-in. Trailing newline included, so
-/// whatever the body puts after it still parses — same contract as [`SessionBind::unit_lines`].
-fn wsi_off_unit_lines() -> String {
-    WSI_OFF_ENV
-        .iter()
-        .map(|(name, value)| format!("Environment={name}={value}\n"))
-        .collect()
+/// Which Vulkan WSI layer a session we spawn should run with. Three states, decided ONCE per
+/// launch because [`WsiPlan::resolve`] can spawn `--version` probes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WsiPlan {
+    /// Our own matching layer is installed: enable it, suppress the distro's. Games get HDR.
+    Ours,
+    /// No layer of ours, and the distro's version triple matches the gamescope we run, so it is
+    /// probably built against the same protocol. Leave the box exactly as it is.
+    DistroKept,
+    /// No layer of ours, and the distro's cannot be trusted. Disable it — a mismatched layer kills
+    /// every Vulkan client — and accept that no game in this session can get an HDR10 swapchain.
+    DistroDisabled,
+}
+
+impl WsiPlan {
+    /// ⚠️ Spawns up to two `gamescope --version` probes in the fallback arms, so resolve once and
+    /// pass the result around rather than calling this per use site.
+    fn resolve() -> Self {
+        let manifest = std::path::Path::new(&our_wsi_layer_dir()).join(OUR_WSI_LAYER_MANIFEST_NAME);
+        if manifest.is_file() {
+            Self::Ours
+        } else if wsi_layer_matches_our_gamescope() {
+            Self::DistroKept
+        } else {
+            Self::DistroDisabled
+        }
+    }
+
+    /// The environment this plan needs, as `(name, value)` pairs.
+    fn env(self) -> Vec<(&'static str, String)> {
+        match self {
+            // `VK_ADD_IMPLICIT_LAYER_PATH` ADDS to the loader's implicit-layer search (loader
+            // 1.3.234+), so the box's own layer directories keep working; the distro's gamescope
+            // layer is then switched off by name through its own variables, leaving exactly one
+            // gamescope WSI layer live — ours.
+            Self::Ours => vec![
+                ("VK_ADD_IMPLICIT_LAYER_PATH", our_wsi_layer_dir()),
+                ("PUNKTFUNK_GAMESCOPE_WSI", "1".to_string()),
+                ("DISABLE_GAMESCOPE_WSI", "1".to_string()),
+                ("ENABLE_GAMESCOPE_WSI", "0".to_string()),
+            ],
+            Self::DistroKept => Vec::new(),
+            Self::DistroDisabled => WSI_OFF_ENV
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    /// As `systemd-run` arguments, for the transient unit.
+    fn setenv_args(self) -> Vec<String> {
+        self.env()
+            .iter()
+            .map(|(name, value)| format!("--setenv={name}={value}"))
+            .collect()
+    }
+
+    /// As unit-file lines, for the box-session drop-in. Trailing newline included, so whatever the
+    /// body puts after it still parses — same contract as [`SessionBind::unit_lines`].
+    fn unit_lines(self) -> String {
+        self.env()
+            .iter()
+            .map(|(name, value)| format!("Environment={name}={value}\n"))
+            .collect()
+    }
 }
 
 /// Whether the box's `VkLayer_FROG_gamescope_wsi` can be trusted against the gamescope we run.
+///
+/// ⚠️ **Fallback only** — reached from [`WsiPlan::resolve`] just when our own layer is absent (a
+/// `punktfunk-gamescope` package older than the one that started shipping it). It is a guess, and a
+/// guess in BOTH directions: a distro at the same upstream tag that patched the protocol compares
+/// EQUAL and keeps a layer that will kill every Vulkan client, while a distro at a different tag
+/// with a byte-identical protocol compares unequal and loses HDR for nothing. Do not build anything
+/// new on it; ship the layer instead, which is what [`WsiPlan::Ours`] does.
 ///
 /// The layer ships with the DISTRO's gamescope and speaks its `gamescope_swapchain` protocol; we
 /// run our own build. When the two disagree the compositor rejects the client's
@@ -4244,8 +4318,13 @@ fn wsi_off_unit_lines() -> String {
 /// byte-identical between those commits, so this is the distro PATCHING gamescope, not a version
 /// bump — which is why the check is "do the version triples differ", not a floor.
 ///
-/// Disabling it costs only the layer's extras (XWayland bypass, present-mode control, client HDR
-/// metadata) — far cheaper than a client that cannot start.
+/// Disabling it costs the layer's extras (XWayland bypass, present-mode control) and, on an HDR
+/// session, **HDR for games**. The layer is the ONLY route to an HDR10 swapchain under gamescope:
+/// gamescope advertises no runtime colour-management protocol for a Mesa/NVIDIA WSI to negotiate
+/// through, so with the layer inactive a client never gets a Surface-state block and lands on
+/// `hdr10_format=None` (measured on a Deck OLED — see the Gamescope WSI notes in the flatpak
+/// manifest). Still cheaper than a client that cannot start at all, but not free, which is why
+/// [`launch_session`] says so out loud when it fires on an HDR session.
 ///
 /// ⚠️ **`ENABLE_GAMESCOPE_WSI=0` is NOT enough on its own**, which is what [`WSI_OFF_ENV`] is for.
 fn wsi_layer_matches_our_gamescope() -> bool {
@@ -4304,16 +4383,30 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
     // The distro's Vulkan WSI layer speaks the distro gamescope's protocol; ours may differ, and a
     // mismatch kills every Vulkan client with no error but a black screen. Steam Big Picture is not
     // one of them, so the casualty is the GAMES — see [`WSI_OFF_ENV`] for why both variables go.
-    let wsi_ok = wsi_layer_matches_our_gamescope();
-    if !wsi_ok {
+    let wsi = WsiPlan::resolve();
+    if wsi == WsiPlan::DistroDisabled {
         tracing::warn!(
             "gamescope: this box's VkLayer_FROG_gamescope_wsi was built for a different gamescope \
-             than the one we run — disabling it for this session (DISABLE_GAMESCOPE_WSI=1, which \
-             the session script cannot clobber the way it clobbers ENABLE_GAMESCOPE_WSI). Left \
-             enabled it rejects the client's swapchain_feedback and every Vulkan client dies; \
-             Steam's own UI is not one, so what you see is a game that runs with sound and input \
-             on a black screen, with no other symptom."
+             than the one we run, and no punktfunk layer is installed to use instead — disabling \
+             it for this session (DISABLE_GAMESCOPE_WSI=1, which the session script cannot clobber \
+             the way it clobbers ENABLE_GAMESCOPE_WSI). Left enabled it rejects the client's \
+             swapchain_feedback and every Vulkan client dies; Steam's own UI is not one, so what \
+             you see is a game that runs with sound and input on a black screen, with no other \
+             symptom. Upgrading the punktfunk-gamescope package fixes this properly — it ships a \
+             layer built from the same tree as the compositor."
         );
+        // The HDR decisions are made independently — `hdr_args` never consults the layer plan — so
+        // without this an HDR session launches advertising HDR while having made game HDR
+        // unreachable in the same breath, and nothing anywhere says so.
+        if hdr {
+            tracing::warn!(
+                "gamescope: this session negotiated HDR, but with the WSI layer disabled no game \
+                 in it can get an HDR10 swapchain — that layer is the only route to one. The \
+                 stream itself stays HDR (the capture really is PQ/BT.2020, and Steam's UI and the \
+                 desktop ride the same container), so what breaks is GAME HDR specifically: a \
+                 title told to render HDR renders it into an SDR swapchain and looks washed out."
+            );
+        }
     }
     let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
         let mut cmd = Command::new("systemd-run");
@@ -4321,10 +4414,8 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         for arg in bind.map(SessionBind::run_args).unwrap_or_default() {
             cmd.arg(arg);
         }
-        if !wsi_ok {
-            for arg in wsi_off_setenv_args() {
-                cmd.arg(arg);
-            }
+        for arg in wsi.setenv_args() {
+            cmd.arg(arg);
         }
         // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
         // user manager env, which can carry a (possibly stale) desktop DISPLAY/WAYLAND_DISPLAY
@@ -4559,22 +4650,37 @@ fn add_bare_gamescope_args(
 ///   fine meanwhile.)
 /// * `--hdr-sdr-content-nits` maps SDR content into the PQ container. Everything that is not an
 ///   HDR game — the desktop, the Steam overlay, an SDR title — rides through it, so it decides
-///   how bright "white" lands on the client's panel. Only passed when the operator set the knob;
-///   otherwise gamescope's own default (400) applies.
+///   how bright "white" lands on the client's panel. We always pass it, because the two ends have
+///   to agree on where diffuse white sits and gamescope's own default does not match ours — see
+///   [`SDR_REFERENCE_WHITE_NITS`].
 fn hdr_args(hdr: bool) -> Vec<String> {
     if !hdr {
         return Vec::new();
     }
-    let mut args = vec![
+    let nits = pf_host_config::config()
+        .gamescope_sdr_nits
+        .unwrap_or(SDR_REFERENCE_WHITE_NITS);
+    vec![
         "--hdr-enabled".to_string(),
         "--hdr-debug-force-support".to_string(),
-    ];
-    if let Some(nits) = pf_host_config::config().gamescope_sdr_nits {
-        args.push("--hdr-sdr-content-nits".to_string());
-        args.push(nits.to_string());
-    }
-    args
+        "--hdr-sdr-content-nits".to_string(),
+        nits.to_string(),
+    ]
 }
+
+/// Where diffuse white sits, in nits, for SDR content carried inside an HDR session's PQ container.
+///
+/// 203 is BT.2408 "HDR Reference White", and it is the value every first-party client anchors to:
+/// the Apple presenter hands exactly 203 to `CAEDRMetadata.hdr10(opticalOutputScale:)`. gamescope's
+/// own default is 400, so leaving the flag off put the host nearly a stop (400/203 ≈ 1.97×) above
+/// what the client decodes against — the 2026-08-13 field report where Steam's Big Picture UI read
+/// as glaring and over-saturated on an iPad while HDR game content came out washed out. Both are
+/// the same error: the UI lands above SDR white, and the client's tone-mapper then works from a
+/// reference point the host never used, flattening the content around it.
+///
+/// This is the anchor, not a taste knob — `PUNKTFUNK_GAMESCOPE_SDR_NITS` is still there for an
+/// operator who wants a brighter or dimmer desktop, and moving it away from 203 re-opens the gap.
+const SDR_REFERENCE_WHITE_NITS: u32 = 203;
 
 /// `--pipewire-composite-cursor` when the resolved gamescope has it (patch level 2+). Paired with
 /// [`crate::gamescope_composites_cursor`], which is what tells the host to STOP compositing the
@@ -4778,12 +4884,12 @@ mod tests {
         any_output_size_is, cgroup_is_punktfunk_owned, cgroup_under_user_manager,
         classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
         dm_survives_masked_unit, game_hz, gamescope_output_size, hdr_args, is_steam_launch,
-        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
-        release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
+        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, our_wsi_layer_dir,
+        plan_bind, release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
         shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
-        wsi_off_setenv_args, wsi_off_unit_lines, xwayland_refusal_marker, BindOff, BindPlan,
-        BoxOutputSize, DmHelperError, SessionBind, TakeoverState, AUTOLOGIN_MASKED,
-        DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
+        xwayland_refusal_marker, BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind,
+        TakeoverState, WsiPlan, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN,
+        WSI_OFF_ENV, X11_SOCKET_DIR,
     };
 
     fn argv(s: &str) -> Vec<String> {
@@ -5611,8 +5717,8 @@ mod tests {
         );
 
         // Both spellings reach both launch paths, and neither may lose the other.
-        let args = wsi_off_setenv_args();
-        let lines = wsi_off_unit_lines();
+        let args = WsiPlan::DistroDisabled.setenv_args();
+        let lines = WsiPlan::DistroDisabled.unit_lines();
         for (name, value) in WSI_OFF_ENV {
             assert!(args.contains(&format!("--setenv={name}={value}")), "{name}");
             assert!(
@@ -5624,5 +5730,32 @@ mod tests {
         // Trailing newline: the drop-in body appends nothing after this block today, but the bind
         // lines above it rely on the same contract and the order has changed before.
         assert!(lines.ends_with('\n'));
+    }
+
+    /// The whole point of shipping our own layer is that BOTH halves happen in one session: ours is
+    /// switched on AND the distro's is forced off. Enabling ours while leaving theirs live would
+    /// put two gamescope WSI layers in the loader's implicit set, and dropping ours while forcing
+    /// theirs off is just the old no-game-HDR behaviour wearing a new name — so assert the pair,
+    /// not either half.
+    #[test]
+    fn our_own_layer_is_enabled_and_the_distro_one_forced_off_together() {
+        let env = WsiPlan::Ours.env();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{k} missing from the Ours plan"))
+        };
+
+        assert_eq!(get("VK_ADD_IMPLICIT_LAYER_PATH"), our_wsi_layer_dir());
+        assert_eq!(get("PUNKTFUNK_GAMESCOPE_WSI"), "1");
+        // The clobber-proof one, for exactly the reason the test above states.
+        assert_eq!(get("DISABLE_GAMESCOPE_WSI"), "1");
+        assert_eq!(get("ENABLE_GAMESCOPE_WSI"), "0");
+
+        // `DistroKept` must stay genuinely inert: it is the arm that runs on a box we decided not
+        // to touch, so a stray variable there would change behaviour we promised not to change.
+        assert!(WsiPlan::DistroKept.env().is_empty());
+        assert!(WsiPlan::DistroKept.unit_lines().is_empty());
     }
 }

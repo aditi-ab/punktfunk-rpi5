@@ -85,8 +85,11 @@ happens. Staying on attach also leaves the stream with no cursor;
 [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the fix for that half.
 
 SDR content rides the same PQ container — the desktop, the Steam overlay, an SDR game — mapped in at
-`PUNKTFUNK_GAMESCOPE_SDR_NITS` (gamescope's own default is 400). That is the knob when white looks
-too bright or too dim on your TV.
+`PUNKTFUNK_GAMESCOPE_SDR_NITS`, which defaults to **203 nits**. That is BT.2408 reference white, and
+it is the level our clients decode against, so the two ends agree out of the box. gamescope's own
+default is 400, nearly a stop brighter; hosts that let it float showed a glaring, over-saturated
+Steam UI and washed-out HDR game content on the same stream. Move the knob if you want a brighter or
+dimmer desktop, but be aware that moving it re-opens that gap.
 
 ### Linux + GNOME
 

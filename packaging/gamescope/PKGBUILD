@@ -98,10 +98,20 @@ build() {
 }
 
 package() {
-  # ONLY the compositor, under our own name: a full `meson install` would also lay down
-  # gamescopectl / gamescopereaper / gamescopestream and the WSI layer, colliding file-for-file
-  # with the distro's `gamescope` package. The host only ever execs the compositor.
+  # The compositor, under our own name: a full `meson install` would also lay down
+  # gamescopectl / gamescopereaper / gamescopestream, colliding file-for-file with the distro's
+  # `gamescope` package. The host only ever execs the compositor.
   install -Dm755 "${srcdir}/stage/usr/bin/punktfunk-gamescope" \
     "${pkgdir}/usr/bin/punktfunk-gamescope"
+
+  # ...and the WSI layer built beside it. NOT a collision: the build script renamed the layer and
+  # rehomed it under /usr/lib/punktfunk, so it sits alongside the distro's rather than over it, and
+  # the host enables whichever it means to per session. Without this file no game in a punktfunk
+  # gamescope session can get an HDR10 swapchain at all — that layer is the only route to one.
+  install -Dm755 "${srcdir}/stage/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so" \
+    "${pkgdir}/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+  install -Dm644 "${srcdir}/stage/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json" \
+    "${pkgdir}/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
+
   install -Dm644 gamescope/LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
