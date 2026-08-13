@@ -100,7 +100,7 @@ installer (all-vendor: NVIDIA, AMD, Intel).
 
 | Platform | Install | Guide |
 |--------|---------|-------|
-| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu / Debian](https://docs.punktfunk.unom.io/docs/ubuntu) · [packaging/debian](packaging/debian/README.md) |
+| **Ubuntu 26.04+ / Debian 13+** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu](https://docs.punktfunk.unom.io/docs/ubuntu) · [Debian](https://docs.punktfunk.unom.io/docs/debian) · [packaging/debian](packaging/debian/README.md) |
 | **Bazzite / Fedora Atomic** (systemd-sysext) | `curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh && sudo bash punktfunk-sysext.sh install` *(no layering, no reboot; rpm-ostree + bootc also supported)* | [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
 | **Fedora** (dnf) | `sudo dnf install punktfunk` *(after adding the repo; the console comes with it)* | [Fedora](https://docs.punktfunk.unom.io/docs/fedora) · [packaging/rpm](packaging/rpm/README.md) |
 | **Arch / CachyOS** (pacman) | `sudo pacman -Syu punktfunk-host` *(binary repo — always a full `-Syu`)* | [Arch Linux](https://docs.punktfunk.unom.io/docs/arch) · [packaging/arch](packaging/arch/README.md) |

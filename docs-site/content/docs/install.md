@@ -16,13 +16,19 @@ On **Windows**, the host ships as a signed installer instead — see [Windows](#
 
 | Distro | Package manager | One-command happy path | Guide |
 |--------|-----------------|------------------------|-------|
-| **Ubuntu** | apt | `sudo apt install punktfunk-host` | [Ubuntu](/docs/ubuntu) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
-| **Debian 13** (incl. LMDE) | apt | `sudo apt install punktfunk-host` | [Debian](/docs/debian) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
+| **Ubuntu 26.04+** ¹ | apt | `sudo apt install punktfunk-host` | [Ubuntu](/docs/ubuntu) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
+| **Debian 13+** (incl. LMDE) | apt | `sudo apt install punktfunk-host` | [Debian](/docs/debian) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
 | **Bazzite / Fedora Atomic** | systemd-sysext | `curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh && sudo bash punktfunk-sysext.sh install` (no layering, no reboot) | [Bazzite](/docs/bazzite) · [packaging/bazzite](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/bazzite/README.md) |
 | **Fedora (dnf)** | dnf / rpm-ostree | `sudo dnf install punktfunk` | [Fedora](/docs/fedora) · [packaging/rpm](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/rpm/README.md) |
 | **Arch** | pacman | `sudo pacman -Syu punktfunk-host` (binary repo — always a full `-Syu`, never `-Sy`) | [Arch Linux](/docs/arch) · [packaging/arch](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md) |
 | **SteamOS (host)** | on-device script | clone the repo, then `bash ~/punktfunk/scripts/steamdeck/install.sh` (builds on-device) | [SteamOS (Host)](/docs/steamos-host) |
 | **NixOS / Nix** | nix flake | `nix run git+https://git.unom.io/unom/punktfunk#punktfunk-host -- serve --gamestream` | [NixOS](#nixos) · [packaging/nix](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/nix/README.md) |
+
+> ¹ **Ubuntu 24.04 LTS installs the package but cannot host.** It ships no compositor that meets
+> the [version floors](/docs/requirements) — KWin 5.27 against 6.5.6, GNOME Shell 46 against 48 —
+> and no `gamescope`. Use 26.04 or newer. This is also why
+> [Linux Mint 22.x cannot host](/docs/debian#linux-mint-22x-cannot-host-yet); LMDE 7 (Debian 13)
+> can.
 
 Each registry is public — no auth, you just trust the repo's signing key. Adding the repo is a
 one-time step covered in the linked guide; after that, normal `apt upgrade` / `dnf upgrade` /

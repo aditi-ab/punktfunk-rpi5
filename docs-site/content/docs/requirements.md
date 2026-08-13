@@ -13,10 +13,34 @@ is also available. Setup splits along two axes: you **install** the package per 
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.
 
+## The floor for a working host
+
+**On apt distros that means Ubuntu 26.04 or newer, or Debian 13 or newer.** Both are supported
+targets and both install from the same repository.
+
+This floor is about the **desktop**, not the package. A host needs a compositor that can create a
+virtual display, and those have version floors of their own ([below](#desktop-session)). Older
+releases will happily install `punktfunk-host` and then have nothing that can produce a stream —
+so read this as the real requirement, not the package's:
+
+| Release | Package installs | Can actually host |
+|---|---|---|
+| **Ubuntu 26.04+** | ✅ | ✅ KWin 6.5+, GNOME 48+, gamescope |
+| **Debian 13+** | ✅ | ✅ GNOME 48.7, sway 1.10, gamescope (its KWin 6.3.6 is below the floor) |
+| Ubuntu 24.04 LTS | ✅ | ❌ KWin 5.27 (floor 6.5.6), GNOME 46 (floor 48), no gamescope available |
+| Debian 12 | ❌ glibc 2.36 | ❌ |
+
+Ubuntu 24.04 is called out because the package *does* install there — it is built on 24.04 precisely
+so one package spans the range — which makes the gap easy to mistake for a bug. It is not: 24.04
+ships no compositor new enough, and no `gamescope` (the patched
+[`punktfunk-gamescope`](/docs/gamescope) cannot run there either — 24.04 is too old on wayland,
+libinput, libavif and pixman). The same gap is why
+[Linux Mint 22.x cannot host](/docs/debian#linux-mint-22x-cannot-host-yet).
+
 **Distros — install the package:**
 
-- [Ubuntu](/docs/ubuntu)
-- [Debian](/docs/debian) — Debian 13 or newer, including LMDE
+- [Ubuntu](/docs/ubuntu) — 26.04 or newer for a working host
+- [Debian](/docs/debian) — 13 or newer, including LMDE
 - [Fedora](/docs/fedora)
 - [Arch](/docs/arch)
 - [Bazzite](/docs/bazzite)
