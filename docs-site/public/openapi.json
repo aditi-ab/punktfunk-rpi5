@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.21.0"
+    "version": "0.27.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -53,7 +53,7 @@
           "clients"
         ],
         "summary": "Unpair a client",
-        "description": "Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer\ndoes not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed\nclient cert — a planned hardening step), so until that lands this removes the client\nfrom the listing without severing its ability to reconnect.",
+        "description": "Removes the client's certificate from the pairing store (persisted — the removal survives a\nhost restart). Revocation is complete: a LIVE GameStream session owned by this certificate is\nended (the client gets the standard TERMINATION+disconnect), and removing the last pairing\nalso closes the ENet control port (UDP 47999), which is only bound while at least one pairing\nexists. The nvhttp TLS layer still completes a handshake with any well-formed client cert BY\nDESIGN (authorization is per-request via the paired-fingerprint check) — an unpaired client\nthat reconnects is rejected at every post-pair endpoint.",
         "operationId": "unpairClient",
         "parameters": [
           {
@@ -997,7 +997,7 @@
           "library"
         ],
         "summary": "List the game library",
-        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns; `?platform=` to one platform (case-insensitive —\ninstalled-store titles are `PC`, custom/provider entries carry whatever was authored).",
+        "description": "Every title this host knows about, sorted by title: the entries each installed library plugin\nhas synced (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …) plus the user's\nown custom entries. Artwork fields are URLs the client fetches directly, except local files on\nthe host, which are rewritten to this API's own art proxy. `?provider=` narrows to the entries a\ngiven external provider owns; `?platform=` to one platform (case-insensitive — whatever the\nsource authored, conventionally `PC` for desktop stores).\n\n**The operator's own lane additionally sees the titles they have HIDDEN**, each carrying\n`hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The\nconsole needs them to offer \"un-hide\", and it is the only surface that does.",
         "operationId": "getLibrary",
         "parameters": [
           {
@@ -1021,13 +1021,13 @@
         ],
         "responses": {
           "200": {
-            "description": "Unified library across all stores",
+            "description": "Unified library across all stores (the operator's lane also gets hidden entries, flagged)",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/GameEntry"
+                    "$ref": "#/components/schemas/OperatorGameEntry"
                   }
                 }
               }
@@ -1052,7 +1052,7 @@
           "library"
         ],
         "summary": "Fetch one cover-art image for a library entry",
-        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —\nit's what the user's Steam client already shows for it), the public Steam CDN's flat URL\nconvention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host\ncan't predict, in which case this 404s and the client falls through to its next art candidate).\nOnly Steam ids are backed today; any other store 404s.",
+        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,\nand a library plugin's claimed-store entries) serves its local art file; anything else 404s and\nthe client falls through to its next art candidate.\n\nThe host fetches nothing here. Art a plugin published as an `http(s)` URL is fetched by the\nclient directly — this proxy exists for the *local* files a plugin finds on the host's own disk\n(a launcher's cover cache), which a client has no way to read.",
         "operationId": "getLibraryArt",
         "parameters": [
           {
@@ -1301,13 +1301,86 @@
         }
       }
     },
+    "/api/v1/library/hidden/{id}": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Hide or un-hide one library title",
+        "description": "Curation, not access control: a hidden title disappears from every play surface — the console\ngrid on a client, native clients, the GameStream app list, and launch resolution — while nothing\nis deleted and un-hiding restores it immediately. The operator's own console still lists it\n(flagged `hidden`) so it can be brought back.\n\nKeyed by the entry's stable `<store>:<external_id>` id, which survives re-scans and reconciles by\nconstruction (D2). The id is **not** validated against the current library on purpose: a title\ncan be legitimately absent at this moment (launcher closed, plugin mid-sync, drive unmounted),\nand refusing the operator's choice in that window would be worse than storing an id that\ncurrently matches nothing. Emits `library.changed` (source = the store) only on a real change.",
+        "operationId": "setLibraryEntryHidden",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The library entry id (e.g. `steam:70`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HiddenToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; the entry's visibility after the call",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HiddenState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty entry id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/library/provider/{provider}": {
       "put": {
         "tags": [
           "library"
         ],
         "summary": "Replace a provider's library entries (declarative reconcile)",
-        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.",
+        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.\n\n`?store=` additionally **claims** that store for the provider: its entries then surface with\ndeterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque\n`custom:<id>` ones — which is what let a library plugin reproduce the entries the in-host scanner\nused to produce, right down to the GameStream app ids and client-side art caches, and is why\nremoving those scanners changed nothing downstream. One provider per store; a second claimant\ngets 409. The claim is released by `DELETE`, not by an empty reconcile (a store can legitimately\nhave zero installed titles).",
         "operationId": "reconcileProviderEntries",
         "parameters": [
           {
@@ -1315,6 +1388,15 @@
             "in": "path",
             "description": "The provider id ([a-z0-9._-], `manual` reserved)",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "store",
+            "in": "query",
+            "description": "Claim this store for the provider ([a-z0-9_-], `custom`/`manual` reserved)",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1348,7 +1430,7 @@
             }
           },
           "400": {
-            "description": "Invalid provider id or payload",
+            "description": "Invalid provider id, store id, or payload",
             "content": {
               "application/json": {
                 "schema": {
@@ -1359,6 +1441,16 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That store is already claimed by another provider",
             "content": {
               "application/json": {
                 "schema": {
@@ -1446,8 +1538,8 @@
         "tags": [
           "library"
         ],
-        "summary": "List the library scanners",
-        "description": "The installed-store scanners this host supports — the list is platform-dependent (Steam\neverywhere; Lutris + Heroic on Linux; Epic, GOG, and Xbox/Game Pass on Windows), so the console\nrenders a toggle only for scanners that can do anything here. Scanners default to enabled;\ndisabling one hides its titles from every library surface from the next read. The user-curated\ncustom store is not a scanner and is always on.",
+        "summary": "List the library sources",
+        "description": "Every game source on this host with its enable state — one row per installed library plugin\n(Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …), so the list reflects what\nthe operator has actually installed rather than what this build happens to support. Sources\ndefault to enabled; disabling one hides its titles from every library surface from the next\nread. The user-curated custom store is not a source and is always on.\n\nOlder hosts (≤ v0.27.x) also listed the six scanners built into the host binary, with\n`origin: \"builtin\"`. Those are gone; every row now reports `origin: \"plugin\"`.",
         "operationId": "listLibraryScanners",
         "responses": {
           "200": {
@@ -1481,8 +1573,8 @@
         "tags": [
           "library"
         ],
-        "summary": "Enable or disable a library scanner",
-        "description": "Persists the toggle and applies it from the next library read (no restart). Disabling a scanner\nhides its titles everywhere — the console grid, native clients, and the GameStream app list —\nand re-enabling brings them straight back (nothing is deleted; the scan just runs again). Emits\n`library.changed` with the scanner id as `source` when the state changed.",
+        "summary": "Enable or disable a library source",
+        "description": "Persists the toggle and applies it from the next library read (no restart). Disabling a source\nhides its titles everywhere — the console grid, native clients, and the GameStream app list —\nand re-enabling brings them straight back. Nothing is deleted: the plugin may keep reconciling\nwhile its source is off, and those entries simply aren't surfaced. Emits `library.changed` with\nthe source id as `source` when the state changed.",
         "operationId": "setLibraryScanner",
         "parameters": [
           {
@@ -2153,6 +2245,51 @@
                   "items": {
                     "$ref": "#/components/schemas/PluginSummary"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugins/logs": {
+      "post": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "Ingest runner log lines",
+        "description": "The plugin/script runner ships its output here so the console's **Logs** page can show it.\n\nPlugins are not host child processes — the runner is a separate `bun` process that `import()`s\neach plugin in-process — so nothing a plugin logs passes through the host's own `tracing`, and\nbefore this endpoint the console's log page could not show a single plugin line. On Linux the\nfallback was `journalctl --user -u punktfunk-scripting`; on Windows the runner task writes no\nlog file at all, so a failing plugin was diagnosable only by stopping the scheduled task and\nre-running the runner by hand. Both are shell access on the host box, which is exactly what the\nconsole exists to avoid.\n\nLines land in the same ring as the host's own, sharing one `seq` cursor, targeted\n`plugin:<source>` — so `GET /logs` needs no second cursor and the console needs no second poll.",
+        "operationId": "ingestPluginLogs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginLogBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Lines ingested"
+          },
+          "400": {
+            "description": "Batch too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -3432,6 +3569,142 @@
           }
         }
       }
+    },
+    "/api/v1/update/apply": {
+      "post": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Apply the available update",
+        "description": "Starts the one-click apply for install kinds that support it (Windows installer). The\nrequest carries no version or URL — the host installs exactly what its verified manifest\nannounced. Progress is polled via `GET /update/status` (`job`); the host restarts as part\nof the apply, and the outcome lands in `last_result` after it comes back.",
+        "operationId": "applyUpdate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Apply started — poll `GET /update/status`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: unsupported install kind, apply disabled (PUNKTFUNK_UPDATE_APPLY=0), a job already running, an active streaming session without `force`, or nothing newer to apply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/update/check": {
+      "post": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Check for updates now",
+        "description": "Forces a manifest fetch + verification and returns the refreshed state. Rate-limited to\none forced check per 30 s.",
+        "operationId": "forceUpdateCheck",
+        "responses": {
+          "200": {
+            "description": "Refreshed update-check state (`last_error` carries a failed check; `not_published` an empty channel, which is not one)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Update checks are disabled on this host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A forced check ran less than 30 s ago",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/update/status": {
+      "get": {
+        "tags": [
+          "update"
+        ],
+        "summary": "Update-check status",
+        "description": "How this host was installed, which channel it follows, whether a newer release is known,\nand how to update. Reading this may kick a background refresh when the cached check is\nolder than 6 h; the response never blocks on the network.",
+        "operationId": "getUpdateStatus",
+        "responses": {
+          "200": {
+            "description": "Current update-check state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3764,6 +4037,15 @@
           }
         }
       },
+      "ApplyRequest": {
+        "type": "object",
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "description": "Proceed even while a streaming session is live (the stream will drop when the host\nrestarts — the console warns before sending this)."
+          }
+        }
+      },
       "ApprovePending": {
         "type": "object",
         "description": "Approve-pending-device request body. Send `{}` to keep the device's own name.",
@@ -3833,6 +4115,51 @@
               "null"
             ],
             "description": "Vertical capsule / poster (Steam `library_600x900.jpg`). Best for a grid."
+          }
+        }
+      },
+      "AudioWiring": {
+        "type": "object",
+        "description": "The Windows host's audio wiring verdict — which endpoint carries each role. The names are\nthe endpoints' friendly names as the Sound settings show them (on current hosts the minted\n\"Punktfunk\" instances of Steam's streaming drivers).",
+        "required": [
+          "readiness",
+          "mic_withheld",
+          "last_resort"
+        ],
+        "properties": {
+          "last_resort": {
+            "type": "boolean",
+            "description": "The loopback is the known-degraded last resort — desktop audio may be silent until the\nendpoint set changes."
+          },
+          "loopback": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the desktop-audio loopback source; absent = desktop audio unavailable."
+          },
+          "mic": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the virtual-mic write target; absent = mic passthrough unavailable."
+          },
+          "mic_withheld": {
+            "type": "boolean",
+            "description": "The mic was WITHHELD so game audio could keep the only working sink — mic passthrough\nneeds Steam installed (the host mints its own microphone) or a virtual cable."
+          },
+          "narrowing": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the chosen loopback endpoint NARROWS the desktop mix (rate/channels), when it does."
+          },
+          "readiness": {
+            "type": "string",
+            "description": "`full` | `audio_only` | `mic_only` | `none` — whether desktop audio and mic passthrough\neach have an endpoint at all.",
+            "example": "full"
           }
         }
       },
@@ -3969,7 +4296,8 @@
           "tier",
           "platforms",
           "compatible",
-          "update_available"
+          "update_available",
+          "categories"
         ],
         "properties": {
           "author": {
@@ -3982,12 +4310,26 @@
             ],
             "description": "A revocation covering the catalogued version — do not offer this without shouting."
           },
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What kind of plugin this is — the console filters Browse by these, and the Game sources\nsurface's \"Add a source\" rail shows exactly the `library` ones (design D5/D6)."
+          },
           "compatible": {
             "type": "boolean",
             "description": "Can this host install it?"
           },
           "description": {
             "type": "string"
+          },
+          "detected": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the launcher this plugin scans looks **installed on this host** (design D8), from the\nindex's own existence probes. `null` = the entry declares no probes for this platform, which\nthe console renders as \"unknown\" rather than \"not installed\"."
           },
           "homepage": {
             "type": [
@@ -4147,6 +4489,13 @@
                 ],
                 "description": "The provider's own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is."
               },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark a client should draw for this entry — see [`GameEntry::icon`]. A token\n(`steam`, `heroic`), never bytes and never a URL."
+              },
               "id": {
                 "type": "string",
                 "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
@@ -4175,6 +4524,17 @@
                 ],
                 "description": "The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous)."
               },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]."
+              },
+              "store": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The **store this entry was claimed under** (D2), stamped by a `?store=`-qualified reconcile.\n`None` = an unclaimed provider entry or a manual one, both of which surface as `custom`.\n\nMaterialized onto the entry rather than looked up in [`Catalog::claims`] on every read so an\nentry is self-describing: its id and its `store` badge derive from the entry alone, and stay\ncorrect even while the claim map is being rewritten."
+              },
               "title": {
                 "type": "string"
               }
@@ -4202,6 +4562,13 @@
                 "$ref": "#/components/schemas/DetectHint",
                 "description": "How to recognize this title's process — see [`CustomEntry::detect`]."
               },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw — see [`GameEntry::icon`]. Hand-settable for the same reason `role`\nis: an operator's own \"Steam\" tile should be able to look like one."
+              },
               "launch": {
                 "oneOf": [
                   {
@@ -4218,6 +4585,10 @@
                   "$ref": "#/components/schemas/PrepCmd"
                 },
                 "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+              },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]. A hand-added launcher\nentry is legal (an operator may want a \"Steam\" tile without installing the steam plugin)."
               },
               "title": {
                 "type": "string"
@@ -4277,6 +4648,17 @@
         "type": "object",
         "description": "What an operator (or a provider plugin) can tell the host about recognizing a title — the wire\nhalf of [`DetectSpec`], and the only part of it that is ever accepted from outside.\n\nDeliberately a **subset**: the store-derived signals (a Steam appid, a launcher's environment\nmarker) are things the host discovers for itself and would be meaningless — or dangerous — to take\non someone's word. What is left is what a provider genuinely knows and the host cannot guess: where\nthe title is installed, which executable is the game, what the process is called. All three are\noptional; supplying none is the same as supplying no hint at all.\n\nNever returned by the catalog API — see the module docs on why detect data does not cross the wire\noutbound.",
         "properties": {
+          "env_marker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvMarker",
+                "description": "A launcher-stamped environment marker (D3) — see [`EnvMarker`]."
+              }
+            ]
+          },
           "exe": {
             "type": [
               "string",
@@ -4297,6 +4679,15 @@
               "null"
             ],
             "description": "The executable's file name (`Hades.exe`), when its location isn't fixed. Weakest of the three\n— see [`DetectSpec::process_name`]."
+          },
+          "steam_appid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The Steam appid, for a title Steam itself installed (D3). On Linux this is the **sharpest**\nsignal that exists — Steam wraps every launch, native or Proton, in\n`reaper SteamLaunch AppId=<appid>`, whose lifetime is exactly the game's — so without it a\nsteam plugin's lease tracking would degrade from reaper-exact to install-dir prefix matching.",
+            "minimum": 0
           }
         }
       },
@@ -4362,6 +4753,10 @@
             "type": "boolean",
             "description": "EXPERIMENTAL (Windows): command physical monitors' panels off over DDC/CI (VCP 0xD6 →\nDPMS off) right before an `Exclusive` isolate deactivates them, and back on at restore.\nTargets the \"connected-but-dark head\" periodic-stutter class (monitor standby\nauto-input-scan / DP link churn while the virtual display is the sole active display) at\nthe monitor-firmware level. Best-effort — monitors without DDC/CI (or with it disabled in\nthe OSD) are skipped. Orthogonal to `preset` (like `game_session`): preserved across\npreset changes; `#[serde(default)]` = off so existing `display-settings.json` files are\nuntouched."
           },
+          "edid_lock": {
+            "type": "boolean",
+            "description": "**EXPERIMENTAL, AMD-only in effect: pin connector EDID emulation while streaming** — the\nsoftware equivalent of an HPD-holding dummy plug (`pf_win_display::adl_emul`). Locked at\nthe first Exclusive isolate BEFORE the physicals deactivate (an awake sink answers its\nlive-EDID read), unlocked at last-member teardown, crash-journaled so a dead host unlocks\non its next start. Targets the standby-sink stall class at its SOURCE: with emulation\npinned the KMD stops servicing the sleeping sink's HPD/DDC/link. Inert without an AMD\ndriver (`atiadlxx.dll` absent) and on non-Windows. Orthogonal to `preset` (like\n`game_session`); `#[serde(default)]` = off."
+          },
           "game_session": {
             "$ref": "#/components/schemas/GameSession",
             "description": "How a game-launching session is served (`design/gamemode-and-dedicated-sessions.md` §5.2).\nOrthogonal to `preset`/lifecycle — preserved across preset changes; `#[serde(default)]` = `Auto`\nso existing `display-settings.json` files are untouched."
@@ -4397,7 +4792,7 @@
           "version": {
             "type": "integer",
             "format": "int32",
-            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject.",
+            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject. Read\nat load time ([`DisplayPolicyStore::load_from`] warns when a file claims a version this host\ndoes not know, then reads it best-effort) and pinned back to the current version on write.",
             "minimum": 0
           }
         }
@@ -4466,7 +4861,7 @@
       },
       "EffectivePolicy": {
         "type": "object",
-        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the Stage-0 call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].",
+        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the policy call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].\n\n**Every field is required on the wire, deliberately.** Unlike [`DisplayPolicy`] — which is only\never a *file* — this shape is also the `fields` member of [`CustomPresetInput`], i.e. the request\nbody of `POST /display/presets` and `PUT /display/presets/{id}`, and a *response* member three\ntimes over (`DisplaySettingsState.effective`, `PresetInfo.fields`, `CustomPreset.fields`).\n`#[serde(default)]` here would (a) turn `{\"name\":\"Kiosk\",\"fields\":{}}` — or any camelCase typo —\nfrom a serde rejection into a 201 storing a preset that expands to six axes nobody chose, and\n(b) make all six OPTIONAL in the generated OpenAPI schema, so every codegen'd client has to\nnull-check them. The *persisted* catalog's tolerance for an entry written before an axis existed\nis bought where it belongs, on the read path only: see [`StoredEffectivePolicy`].",
         "required": [
           "keep_alive",
           "topology",
@@ -4522,6 +4917,27 @@
             "type": "integer",
             "description": "How many waiting games were ended.",
             "minimum": 0
+          }
+        }
+      },
+      "EnvMarker": {
+        "type": "object",
+        "description": "An environment variable a launcher stamps onto the game's process, identifying it.\n\nSerializable because it is now half of the inbound [`DetectHint`] too (D3) — a library plugin\nthat knows its launcher's marker (Heroic's `HEROIC_APP_NAME`, load-bearing under Proton) has to\nbe able to say so, since after extraction the host no longer reads that launcher's files itself.",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The variable name (e.g. `HEROIC_GAME_ID`).",
+            "example": "HEROIC_APP_NAME"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The exact value to require, when the launcher's value identifies *this* title. `None` matches\nthe key's mere presence — only safe for launchers that run one game at a time."
           }
         }
       },
@@ -4801,6 +5217,59 @@
           },
           {
             "type": "object",
+            "description": "A verified update manifest announced a release newer than the running host. Emitted\nonce per discovered version (a steady-state \"newer exists\" doesn't re-fire on every\nrefresh).",
+            "required": [
+              "version",
+              "channel",
+              "install_kind",
+              "kind"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string",
+                "description": "The channel it was announced on (`stable` | `canary`)."
+              },
+              "install_kind": {
+                "type": "string",
+                "description": "This host's install kind (`apt`, `windows-installer`, …) — lets a hook or the\ntray render the right \"how to update\" hint without a second call."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "update.available"
+                ]
+              },
+              "version": {
+                "type": "string",
+                "description": "The newer release's version string."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A host update completed: emitted by boot-time reconciliation, i.e. by the NEW binary's\nfirst start after a successful apply.",
+            "required": [
+              "from",
+              "to",
+              "kind"
+            ],
+            "properties": {
+              "from": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "update.applied"
+                ]
+              },
+              "to": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "id",
               "kind"
@@ -4899,6 +5368,14 @@
               "art": {
                 "$ref": "#/components/schemas/Artwork"
               },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw for this entry, as a **token** — `steam`, `heroic`, `playnite` —\nnever image bytes and never a URL. See [`is_icon_token`].\n\nIt exists for launcher tiles, which by design ship no cover art: a launcher's own icon is\nsquare, every client cover-crops a 2:3 poster, and the crop turns a mark into a strip — so\nuntil now those tiles were the launcher's name on a flat accent face. The token lets a client\ndraw the real mark from art it already ships, at whatever size its tile happens to be.\n\nA token rather than art on the wire because the host's art proxy serves *raster* bytes only\n([`art::local_art_bytes`] sniffs the container and refuses anything else, SVG very much\nincluded — it is script-capable XML and the console renders art in a browser). Sending the\nname of a mark instead of the mark keeps that refusal intact, keeps the glyph vector at every\ntile size, and lets it take the tile's ink.\n\nOrdinary titles may carry one too — nothing here is launcher-specific — but nothing sets it\nfor them: a game has real cover art, which is strictly better than a brand mark.",
+                "example": "steam"
+              },
               "id": {
                 "type": "string",
                 "description": "Stable, store-qualified id: `steam:<appid>` or `custom:<id>`.",
@@ -4920,7 +5397,11 @@
                   "string",
                   "null"
                 ],
-                "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
+                "description": "The external provider owning this entry (entries synced by a provider plugin, RFC §8) —\n`None` only for the manual entries the operator typed in. The console uses it for\nattribution; `GET /library?provider=` filters on it."
+              },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]."
               },
               "store": {
                 "type": "string",
@@ -5053,6 +5534,14 @@
           }
         }
       },
+      "GameRole": {
+        "type": "string",
+        "description": "What a library entry *is* — an ordinary title, or the launcher application itself (Steam Big\nPicture, Heroic, Playnite fullscreen). Purely a presentation hint: a launcher entry launches,\nleases and lists exactly like a game (design D4), and clients that don't know the field render it\nas a plain tile. Serde-default `game` and skip-serialized when default, so the wire is unchanged\nfor every entry that doesn't opt in.",
+        "enum": [
+          "game",
+          "launcher"
+        ]
+      },
       "GameSession": {
         "type": "string",
         "description": "How a session that **launches a game** (a library id on the Hello / apps.json / Decky pin) is\nserved (`design/gamemode-and-dedicated-sessions.md` §5.2). Orthogonal to the preset/lifecycle axes\n— a top-level [`DisplayPolicy`] field, NOT part of [`EffectivePolicy`], so a preset never clobbers\nit. Linux-only in effect (a launching Windows session opens into the one desktop).",
@@ -5160,6 +5649,37 @@
           "version": {
             "type": "string",
             "description": "`punktfunk-host` crate version."
+          }
+        }
+      },
+      "HiddenState": {
+        "type": "object",
+        "description": "What `setLibraryEntryHidden` echoes back.",
+        "required": [
+          "id",
+          "hidden"
+        ],
+        "properties": {
+          "hidden": {
+            "type": "boolean",
+            "description": "Its visibility after the call."
+          },
+          "id": {
+            "type": "string",
+            "description": "The entry id the call addressed."
+          }
+        }
+      },
+      "HiddenToggle": {
+        "type": "object",
+        "description": "Request body for `setLibraryEntryHidden`.",
+        "required": [
+          "hidden"
+        ],
+        "properties": {
+          "hidden": {
+            "type": "boolean",
+            "description": "Whether this title should be hidden from every play surface."
           }
         }
       },
@@ -5399,7 +5919,7 @@
       },
       "Identity": {
         "type": "string",
-        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). Stored\nat Stage 0; carriers wired from the identity stage.",
+        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). The\nslot this resolves to is carried per backend: the Windows EDID serial + IddCx connector index,\nKWin's per-slot output name, and the host-persisted Mutter scale map.",
         "enum": [
           "shared",
           "per-client",
@@ -5616,14 +6136,14 @@
               "seconds": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Linger window in seconds.",
+                "description": "Linger window in seconds, clamped to `0..=86400` on write (see\n[`DisplayPolicy::sanitized`]): a window longer than a day is `forever` by any honest\nreading, and `u32` seconds is ~136 years — a deadline the reaper would never reach and a\nnonsense `expires_in_ms` in `/display/state`.",
                 "minimum": 0
               }
             }
           },
           {
             "type": "object",
-            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\n**Not honored until the display-lifecycle stage** — rejected by the mgmt PUT at Stage 0.",
+            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\nHonored end-to-end: the registry resolves it to `Release::Pin`, so the display survives every\ndisconnect — free it with `POST /display/release` (which force-releases `Pinned` exactly like\na `Lingering` display). This is what the `gaming-rig` preset selects.",
             "required": [
               "mode"
             ],
@@ -5667,6 +6187,7 @@
           },
           "positions": {
             "type": "object",
+            "description": "Keys are the **canonical decimal** identity-slot id (`\"1\"`..`\"15\"`) — the exact string\n`arrange` looks a member up by. [`DisplayPolicy::sanitized`] re-canonicalizes them on write\n(`\"01\"` → `\"1\"`) and drops anything that is not a slot id, because a key that never matches is\na pin the operator can see in the console and in `GET /display/settings` while every session\nsilently auto-rows past it.",
             "additionalProperties": {
               "$ref": "#/components/schemas/Position"
             },
@@ -5678,7 +6199,7 @@
       },
       "LayoutMode": {
         "type": "string",
-        "description": "How group members are arranged in the desktop coordinate space. Stored at Stage 0; applied from\nthe multi-monitor stage.",
+        "description": "How group members are arranged in the desktop coordinate space, resolved by `layout::arrange` —\nwhich both the `/display/state` readout and (on Linux, KWin only) the per-backend position apply\nconsume, so the answer is computed in exactly one place.",
         "enum": [
           "auto-row",
           "manual"
@@ -5838,7 +6359,7 @@
       },
       "ModeConflict": {
         "type": "string",
-        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Stored at Stage 0; enforced from the mode-conflict admission stage.",
+        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Enforced by [`super::admission`] before the Welcome is sent, so a `reject` is a\nclean handshake error rather than a half-built session.",
         "enum": [
           "separate",
           "steal",
@@ -5949,6 +6470,23 @@
           }
         }
       },
+      "OperatorGameEntry": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GameEntry"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "hidden": {
+                "type": "boolean",
+                "description": "The operator hid this title ([`set_entry_hidden`]) — omitted when false, so the shape only\ngrows for entries that actually are hidden."
+              }
+            }
+          }
+        ],
+        "description": "A library entry plus the operator's own view of it — today, whether they hid it.\n\nA separate type rather than a field on [`GameEntry`] for two reasons. It keeps the visibility\nanswer out of the providers entirely: a store parser has no opinion on what the operator hid, and\nadding `hidden: false` to all eight construction sites would imply it does. More importantly it\nmakes the lane rule a TYPE guarantee instead of a discipline — `GET /library` answers\n`Vec<GameEntry>` on every lane but the operator's, so a hidden entry cannot leak to a paired\nclient by someone forgetting a filter; there is no field there to leak.\n\n`flatten` keeps the wire shape identical to a plain entry with one extra key, so the console\nparses one model either way."
+      },
       "PairedClient": {
         "type": "object",
         "description": "A paired (certificate-pinned) Moonlight client.",
@@ -6040,6 +6578,50 @@
           "gamestream"
         ]
       },
+      "PluginLogBatch": {
+        "type": "object",
+        "description": "A batch of runner log lines.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginLogLine"
+            }
+          }
+        }
+      },
+      "PluginLogLine": {
+        "type": "object",
+        "description": "One log line produced by the runner or a plugin inside it (`POST /plugins/logs`).",
+        "required": [
+          "ts_ms",
+          "level",
+          "source",
+          "msg"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "`ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`. Anything else is coerced to `INFO`."
+          },
+          "msg": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Which unit emitted it — a plugin's `definePlugin` name, a package name, or `runner`.\nSurfaced in the console's target column as `plugin:<source>`."
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the line was produced, unix milliseconds. Kept verbatim — see\n[`crate::log_capture::LogRing::push_remote`].",
+            "minimum": 0
+          }
+        }
+      },
       "PluginRegistration": {
         "type": "object",
         "description": "Register/renew body for `PUT /plugins/{id}`.",
@@ -6047,6 +6629,13 @@
           "title"
         ],
         "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What KIND of plugin this is (`^[a-z][a-z0-9-]{0,31}$`), top-level rather than under `ui`\nbecause it describes the plugin, not its surface. The console knows one value today —\n`library` — which it filters **out of the nav**: six installed scanner plugins would otherwise\nflood the sidebar, and their real entry point is the Game sources surface (design D5). A\nlibrary plugin that genuinely wants its own page (rom-manager, which is much more than a\nscanner) simply omits the category."
+          },
           "title": {
             "type": "string",
             "description": "Human-readable title for the console nav entry (1–64 chars; control chars stripped)."
@@ -6079,6 +6668,13 @@
           "title"
         ],
         "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The plugin's kind — see [`PluginRegistration::category`]."
+          },
           "id": {
             "type": "string"
           },
@@ -6300,6 +6896,13 @@
                 "type": "string",
                 "description": "The provider's stable id for this title (the reconcile diff key)."
               },
+              "icon": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which brand mark to draw — see [`GameEntry::icon`]. This is the field a library plugin sets\non its `launchers(cfg)` tiles, and the whole reason the token exists."
+              },
               "launch": {
                 "oneOf": [
                   {
@@ -6316,6 +6919,10 @@
                   "$ref": "#/components/schemas/PrepCmd"
                 },
                 "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+              },
+              "role": {
+                "$ref": "#/components/schemas/GameRole",
+                "description": "Whether this entry is a game or the launcher itself — see [`GameRole`]. A library plugin\nemits its `launchers(cfg)` entries with `role: \"launcher\"`."
               },
               "title": {
                 "type": "string"
@@ -6397,6 +7004,17 @@
             "format": "int32",
             "description": "Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The\nnative server admits concurrent sessions, so this can exceed 1; `session`/`stream` below\ndescribe a single representative session for the detail card.",
             "minimum": 0
+          },
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioWiring",
+                "description": "The audio wiring verdict (Windows hosts; absent on other platforms and before the first\nwiring pass). Present even while idle — the wiring exists for the host's lifetime."
+              }
+            ]
           },
           "audio_streaming": {
             "type": "boolean",
@@ -6493,26 +7111,46 @@
       },
       "ScannerInfo": {
         "type": "object",
-        "description": "One installed-store scanner this host build supports, with its enable state — the unit the\nconsole renders a toggle for. The list is platform-gated at compile time (the scanners are),\nso the console never shows a toggle that cannot do anything on this host.",
+        "description": "One **game source** on this host, with its enable state — the unit the console renders a toggle\nfor. A source is either a scanner compiled into this build or a plugin that reconciles entries in\n(WP2.6); the console treats them identically, which is what makes the extraction invisible.",
         "required": [
           "id",
           "label",
-          "enabled"
+          "enabled",
+          "origin"
         ],
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether this host runs the scanner (default true)."
+            "description": "Whether this host runs the source (default true)."
+          },
+          "entries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many entries this source currently contributes. `None` for a built-in scanner, whose\ncount would mean walking every launcher's files just to render a toggle.",
+            "minimum": 0
           },
           "id": {
             "type": "string",
-            "description": "Stable scanner id — the same string the scanner's entries carry in their `store` field.",
+            "description": "Stable source id — the same string this source's entries carry in their `store` field. For a\nplugin source it is also its provider id and its store claim: one string, by construction, so\na user's disabled state survives a built-in scanner being replaced by its plugin.",
             "example": "steam"
           },
           "label": {
             "type": "string",
             "description": "Human-facing name for the console toggle.",
             "example": "Steam"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SourceOrigin",
+            "description": "Where the source comes from. Always `plugin` from this host build onward — see\n[`SourceOrigin`]."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider id backing a `plugin` source — absent for a built-in scanner."
           }
         }
       },
@@ -6525,7 +7163,7 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether the scanner should run on this host."
+            "description": "Whether this source should contribute titles on this host."
           }
         }
       },
@@ -6674,6 +7312,14 @@
             "type": "string"
           }
         }
+      },
+      "SourceOrigin": {
+        "type": "string",
+        "description": "Where a [`ScannerInfo`] comes from.",
+        "enum": [
+          "builtin",
+          "plugin"
+        ]
       },
       "SourceView": {
         "type": "object",
@@ -7040,6 +7686,233 @@
             "type": "string"
           }
         }
+      },
+      "UpdateJobInfo": {
+        "type": "object",
+        "description": "A running apply job (or a spawned installer that hasn't resolved yet).",
+        "required": [
+          "target_version",
+          "stage",
+          "received_bytes",
+          "started_unix"
+        ],
+        "properties": {
+          "received_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stage": {
+            "type": "string",
+            "description": "`downloading` | `verifying` | `applying` | `restarting`."
+          },
+          "started_unix": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "target_version": {
+            "type": "string",
+            "description": "The version being installed."
+          },
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdateManifestInfo": {
+        "type": "object",
+        "description": "One channel's manifest facts, as much as the console renders.",
+        "required": [
+          "version",
+          "serial",
+          "published_at",
+          "notes_url",
+          "stale"
+        ],
+        "properties": {
+          "notes_url": {
+            "type": "string",
+            "description": "Release-notes link (pinned to our forge by the manifest validator)."
+          },
+          "published_at": {
+            "type": "string",
+            "description": "RFC-3339 publish time (display only)."
+          },
+          "serial": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Publish serial (unix seconds) — monotonic per channel.",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "The last verified manifest is suspiciously old (>45 days) — the freeze/stale hint."
+          },
+          "version": {
+            "type": "string",
+            "description": "The released version this manifest announces."
+          }
+        }
+      },
+      "UpdateResultInfo": {
+        "type": "object",
+        "description": "Durable outcome of the most recent apply attempt (survives the host's own restart).",
+        "required": [
+          "ok",
+          "from",
+          "to",
+          "finished_unix"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_unix": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "from": {
+            "type": "string"
+          },
+          "log_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The installer's own log file on this host, for diagnosis."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stage that failed; absent on success."
+          },
+          "staged": {
+            "type": "boolean",
+            "description": "Applied but activates on the next reboot (rpm-ostree)."
+          },
+          "to": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateStatus": {
+        "type": "object",
+        "description": "The full update-check state for this host.",
+        "required": [
+          "install_kind",
+          "channel",
+          "current_version",
+          "apply",
+          "channel_hint",
+          "check_disabled",
+          "available",
+          "not_published"
+        ],
+        "properties": {
+          "apply": {
+            "type": "string",
+            "description": "What the console may offer for this install: `notify` (show the command) — later\nphases add `full` (one-click apply) and `staged` (apply + reboot to finish)."
+          },
+          "available": {
+            "type": "boolean",
+            "description": "A newer release than `current_version` exists for this channel (definitive\ncomparisons only — an unparseable version pair never flags)."
+          },
+          "channel": {
+            "type": "string",
+            "description": "Release channel this install follows: `stable` | `canary`."
+          },
+          "channel_hint": {
+            "type": "string",
+            "description": "The copy-pastable update command for this install kind."
+          },
+          "check_disabled": {
+            "type": "boolean",
+            "description": "Update checks are disabled on this host (`PUNKTFUNK_UPDATE_CHECK=0`)."
+          },
+          "current_version": {
+            "type": "string",
+            "description": "The running host version."
+          },
+          "install_kind": {
+            "type": "string",
+            "description": "How this host was installed: `windows-installer` | `sysext` | `rpm-ostree` | `apt` |\n`dnf` | `pacman` | `steamos-source` | `nix` | `source`."
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateJobInfo",
+                "description": "The apply in flight, if any."
+              }
+            ]
+          },
+          "last_checked_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the last successful check happened (unix seconds).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last check failed, verbatim, if it did."
+          },
+          "last_result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateResultInfo",
+                "description": "Outcome of the most recent apply attempt."
+              }
+            ]
+          },
+          "manifest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateManifestInfo",
+                "description": "The last verified manifest, if any check has succeeded."
+              }
+            ]
+          },
+          "not_published": {
+            "type": "boolean",
+            "description": "The check reached the feed and found this channel has **no release published yet** —\nan expected state (a channel nobody has announced to answers with a 404), not a\nfailure. Mutually exclusive with `last_error`, so a UI can say \"nothing published yet\"\ninstead of painting an empty feed as a broken host. Never set once a manifest has been\nseen for this channel: a feed that loses a document it used to serve stays an error."
+          },
+          "opt_in_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This install could one-click apply, but the operator hasn't opted in yet — the\ncommand to run (Linux: join the `punktfunk-update` group)."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -7085,7 +7958,7 @@
     },
     {
       "name": "library",
-      "description": "Game library: installed-store titles (Steam) plus user-curated custom entries"
+      "description": "Game library: the titles each installed library plugin syncs, plus user-curated custom entries"
     },
     {
       "name": "stats",
@@ -7110,6 +7983,10 @@
     {
       "name": "store",
       "description": "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"
+    },
+    {
+      "name": "update",
+      "description": "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"
     }
   ]
 }

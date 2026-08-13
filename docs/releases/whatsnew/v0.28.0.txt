@@ -1,0 +1,4 @@
+• Streams now use your device's built-in encryption hardware, instead of falling back to software as every previous build did.
+• The mic button has left the stream overlay. Muting is unchanged — the Select + Y chord still does it.
+• The console gets a proper going-over: the host's real desktop behind it, and an interface that stops shifting under your cursor.
+• A dropped frame no longer leaves the picture frozen longer than it needs to.

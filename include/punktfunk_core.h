@@ -94,7 +94,18 @@
 // Additive and client-local: the v3 tail has been on the wire (and length-tolerant in both
 // decoders) since it landed, and the host sends the same bytes either way, so [`WIRE_VERSION`] is
 // unchanged.
-#define PUNKTFUNK_ABI_VERSION 18
+// v19: added `punktfunk_connection_note_frame_index_ex` and
+// `punktfunk_reanchor_gate_arm_expecting_drops` — the width-carrying half of the reanchor gate.
+// `note_frame_index_ex` reports how MANY frames an arrival revealed as missing where
+// `punktfunk_connection_note_frame_index` reports only whether any were; passing that width to
+// `arm_expecting_drops` pre-credits the reassembler's `frames_dropped` climb that the same loss
+// produces up to ~120 ms later, so the gate does not read one loss as two and re-freeze a stream a
+// fast LTR-RFI anchor has already healed. NEW symbols, not widened ones — the same rule v18 states:
+// both originals keep their signatures and their behaviour, so an embedder that never adopts either
+// is unchanged (it simply keeps the double-arm race the pair exists to close). Additive and
+// client-local: nothing new goes on the wire — the width is computed from frame indices the client
+// already receives — so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 19
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
