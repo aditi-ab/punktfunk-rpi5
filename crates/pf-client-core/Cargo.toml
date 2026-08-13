@@ -89,7 +89,7 @@ libc = "0.2"
 # with libavcodec (`pf-encode`); nothing in this crate does.
 opus = "0.3"
 
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 
 # PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
 # §4.5) — pure Vulkan compute on the presenter's shared device, so it builds wherever the
@@ -141,7 +141,7 @@ pf-vaadec = { path = "../pf-vaadec" }
 # libva itself is dlopen'd, never linked (see `video_vaapi_native`'s module docs): the
 # container can then compile and clippy the whole rung without `libva-dev`, and a machine
 # without a VAAPI runtime gets a clean refusal instead of a packaging dependency.
-libloading = "0.8"
+libloading = "0.9"
 # The gamescope overlay watcher (`overlay_focus`): read two CARDINAL properties off a
 # gamescope root window and block on PropertyNotify. `default-features = false` keeps the
 # pure-Rust `RustConnection` — no libxcb link, so no new C dependency on any client package

@@ -59,7 +59,7 @@ fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
         }
     }
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let token = hex::encode(buf);
     write_token(&path, env_var, &token)?;
     tracing::info!(path = %path.display(), "generated and persisted API token (owner-only)");

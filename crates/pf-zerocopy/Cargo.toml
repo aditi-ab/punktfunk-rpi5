@@ -20,7 +20,7 @@ tracing = "0.1"
 libc = "0.2"
 # `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
 # (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `cuda::ffi`.
-libloading = "0.8"
+libloading = "0.9"
 # EGL imports the PipeWire dmabuf, CUDA maps it (`dynamic` = load the NVIDIA libEGL at runtime).
 khronos-egl = { version = "6", features = ["dynamic"] }
 # Vulkan bridge for LINEAR dmabufs (gamescope): VK_EXT_external_memory_dma_buf import,

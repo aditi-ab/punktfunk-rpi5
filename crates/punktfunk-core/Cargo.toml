@@ -55,7 +55,12 @@ zeroize = "1"
 # Interface enumeration for Wake-on-LAN: computes each NIC's subnet-directed broadcast so a
 # magic packet reaches the host's L2 segment on multi-homed clients (VPN/docker/multiple LANs),
 # not just the default route. Tiny, cross-platform (getifaddrs / GetAdaptersAddresses), no cmake.
-if-addrs = "0.13"
+# `link-local` is named EXPLICITLY, not inherited. mdns-sd declares if-addrs with it, so any build
+# containing both (every host and every client) unifies it on regardless — and a crate whose
+# enumeration silently changes depending on who else is in the selection is the worst of both. On
+# means fe80::/169.254 interfaces are enumerated too, which for WoL is the behaviour we want: a NIC
+# is wake-capable whether or not it currently holds a routable address.
+if-addrs = { version = "0.15", features = ["link-local"] }
 
 # Crypto backend is aws-lc-rs, and rustls/quinn/rcgen must all name it: they each select a
 # backend independently, so one dissenter pulls a SECOND crypto stack in via feature unification.
@@ -72,7 +77,7 @@ quinn = { version = "0.11", optional = true, default-features = false, features 
 ] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 # `generate_simple_self_signed` is backend-agnostic, so the swap is transparent here.
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pki-types = { version = "1", optional = true }
 # `rustls-no-provider`, NOT the default `rustls` feature — ureq's `rustls` feature body pulls
 # `_ring`, which would drag the whole ring backend back into a tree that has deliberately moved to
@@ -121,7 +126,7 @@ windows-sys = { version = "0.59", features = [
 proptest = "1"
 # Tier-1 microbenchmarks (benches/pipeline.rs). default-features off → no plotters/HTML (headless
 # CI just needs the measurement + target/criterion/**/estimates.json for the regression compare).
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "pipeline"

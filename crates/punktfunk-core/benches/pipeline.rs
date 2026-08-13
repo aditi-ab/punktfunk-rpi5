@@ -10,11 +10,15 @@
 //! The GPU capture/NVENC encode path is deliberately out of scope here (no GPU in CI) — that's the
 //! Tier-3 stream benchmark on a self-hosted GPU runner. Run locally with `cargo bench -p punktfunk-core`.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use punktfunk_core::crypto::{SessionCrypto, SessionKey};
 use punktfunk_core::session::Session;
 use punktfunk_core::transport::loopback_pair;
+// NOT `criterion::black_box`: it still exists in 0.8 but is deprecated, and now just forwards to
+// this one. Benches compile under `--all-targets -D warnings`, so importing criterion's would fail
+// the lint gate rather than merely warn.
+use std::hint::black_box;
 
 const TAG_LEN: usize = 16; // AEAD authentication tag (GCM and Poly1305 share the size)
 const SHARD: usize = punktfunk_core::config::mtu1500_shard_payload(); // one MTU-safe data shard

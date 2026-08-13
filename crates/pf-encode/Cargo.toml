@@ -54,7 +54,7 @@ libc = "0.2"
 # the dep stays unconditional to mirror the host's Linux target — unused-but-declared is harmless).
 ash = "0.38"
 # `libnvidia-encode.so.1` is dlopen'd at runtime for the direct-SDK NVENC/CUDA backend.
-libloading = "0.8"
+libloading = "0.9"
 # Direct-SDK NVENC (raw `sys::nvEncodeAPI` types; entry points resolved at runtime). `ci-check` =
 # vendored bindings, no CUDA toolkit at build.
 nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
@@ -67,7 +67,7 @@ nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = 
 # AMD (AMF) + Intel (QSV) hardware encode via libavcodec (behind `amf-qsv`; link-imports FFmpeg).
 ffmpeg-next = { version = "9", optional = true }
 # `libnvidia-encode`/`nvEncodeAPI64.dll` resolved at runtime; the NVENC status→cause table dlopen.
-libloading = "0.8"
+libloading = "0.9"
 # Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.
 libvpl-sys = { path = "../libvpl-sys", optional = true }
 # PyroWave (opt-in wired-LAN wavelet codec) — vendored codec + bindgen'd C API, only under

@@ -801,7 +801,7 @@ fn random_password() -> String {
     use base64::Engine;
     use rand::RngCore;
     let mut b = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     base64::engine::general_purpose::STANDARD
         .encode(b)
         .chars()

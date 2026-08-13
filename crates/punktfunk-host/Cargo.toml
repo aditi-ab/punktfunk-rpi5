@@ -68,36 +68,59 @@ tracing-log = "0.2"
 # tracing-log bridge with `ignore_crate("wasapi")`). Already in the tree transitively.
 log = "0.4"
 axum = "0.8"
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 # Wake-on-LAN: report the host's wake-capable NIC MAC(s) to clients via the mDNS `mac` TXT record.
 # `mac_address` reads a NIC's hardware address; `if-addrs` maps the routed IP to its interface name.
 mac_address = "1"
-if-addrs = "0.13"
+# `link-local` named explicitly for the same reason as in punktfunk-core: mdns-sd (right above)
+# turns it on by unification anyway, and `wake_macs` should not enumerate a different set of NICs
+# depending on which other crates share the build.
+if-addrs = { version = "0.15", features = ["link-local"] }
 tokio = { version = "1", features = ["full"] }
 # GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
 # The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
 # native-only build also sheds the accepted Marvin advisory (RUSTSEC-2023-0071, .cargo/audit.toml).
 #
-# `features = ["sha2"]` re-exports the `sha2` that `rsa`'s OWN trait generation speaks. `rsa` 0.9
-# is built on `digest 0.10`, and the rest of this crate is on the `digest 0.11` wave (sha2 0.11 /
-# hmac 0.13) — so the digest types that appear as `rsa` TYPE PARAMETERS (`SigningKey<Sha256>` in
-# cert.rs, `VerifyingKey<_>` in pairing.rs and tls.rs) must come from `rsa::sha2`, not from the
-# `sha2` below. Everything else (plain hashing, HMAC) uses the 0.11 one. Collapsing the two needs
-# `rsa` 0.10, which is still release-candidate only — not something the Moonlight pairing
-# ceremony should ride.
-rsa = { version = "0.9", optional = true, features = ["sha2"] }
+# TWO independent `rsa` features, arriving from two different bumps in this wave — both are load-
+# bearing, and taking either side alone breaks the build:
+#
+# `sha2` re-exports the `sha2` that `rsa`'s OWN trait generation speaks. `rsa` 0.9 is built on
+# `digest 0.10`, and the rest of this crate is on the `digest 0.11` wave (sha2 0.11 / hmac 0.13) —
+# so the digest types that appear as `rsa` TYPE PARAMETERS (`SigningKey<Sha256>` in cert.rs,
+# `VerifyingKey<_>` in pairing.rs and tls.rs) must come from `rsa::sha2`, not from the `sha2`
+# below. Everything else (plain hashing, HMAC) uses the 0.11 one. Collapsing the two needs `rsa`
+# 0.10, which is still release-candidate only — not something the Moonlight pairing ceremony
+# should ride.
+#
+# `getrandom` is NOT one of rsa's defaults; we ask for it because `RsaPrivateKey::new` wants an
+# rng implementing rand_core **0.6**'s traits, and since our own `rand` moved to 0.9 no rng we
+# hold satisfies that bound any more. The feature exposes `rsa::rand_core::OsRng`, which does —
+# see the keygen in gamestream/cert.rs. Getting it from rsa's own re-export is what keeps the two
+# rand_core majors from being something this crate has to name.
+rsa = { version = "0.9", optional = true, features = ["sha2", "getrandom"] }
 # `oid` is default-on in sha2 0.11 and was only ever needed for the RSA signer, which now takes
 # its digest from `rsa::sha2` (above).
 sha2 = "0.11"
 aes = "0.9"
 aes-gcm = "0.11"
 cbc = { version = "0.2", features = ["alloc"] }
-rand = "0.8"
+# 0.9, matching punktfunk-core and pf-client-core — the host was the last 0.8 holdout, and that
+# was drift, not a pin. NOTE this does NOT take rand 0.8 out of the gamestream build: `rsa` pulls
+# it transitively through `num-bigint-dig`, so 0.8 only disappears from the native-only host
+# (`--no-default-features`, where `rsa` is absent). What it does buy everywhere is that OUR calls
+# all speak one rand major.
+rand = "0.9"
 hex = "0.4"
 # Cover-art delivery in the game library: encode Lutris's local JPEGs into `data:` URLs and decode
 # the Epic launcher's base64 `catcache.bin`. Cross-platform (Linux Lutris art + Windows Epic art).
-base64 = "0.22"
+# `default-features = false` + `std` deliberately: 0.23 added a default-ON `simd-unsafe` feature
+# (hand-written AVX2/NEON engines). ureq already declares base64 exactly this way, so taking the
+# defaults here would unify the feature ON and pull that unsafe code into every build as a side
+# effect of a version bump. Turning it on is a perf decision worth making on purpose, with a
+# measurement — not one to inherit silently. `std` covers everything we call (`Engine::encode`,
+# `decode` to a `Vec`).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Blocking HTTP for the library cover-art warmer (no-auth GOG api.gog.com + Xbox displaycatalog),
 # run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
 # webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
@@ -109,8 +132,12 @@ ureq = { version = "3", default-features = false, features = [
     "rustls-webpki-roots",
     "gzip",
 ] }
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
-x509-parser = "0.16"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# ⚠ Do not float this back below 0.18. 0.16 was the LAST crate pulling `thiserror` 1.0 into the
+# host graph (via asn1-rs 0.6 / der-parser 9 / oid-registry 0.7); 0.18 moves that chain to asn1-rs
+# 0.7 + thiserror 2, so the host now links exactly one thiserror major. `cargo tree -p
+# punktfunk-host -i thiserror@1` must keep reporting no match.
+x509-parser = "0.18"
 # Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
 # tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
 # feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
@@ -198,7 +225,7 @@ pipewire = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
 # (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `zerocopy::cuda`.
-libloading = "0.8"
+libloading = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows host backends. `windows` covers the Win32/CCD APIs the SudoVDA virtual-display backend

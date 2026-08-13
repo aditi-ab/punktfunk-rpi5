@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 /// `n` cryptographically-random bytes.
 pub fn random<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     b
 }
 

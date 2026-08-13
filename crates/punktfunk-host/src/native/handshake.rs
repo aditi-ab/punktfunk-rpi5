@@ -502,14 +502,14 @@ pub(super) async fn negotiate(
     let shard_payload = wire_mtu::negotiated_shard_payload(conn, hello.max_shard_payload).await;
 
     let mut key = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     // Fresh per-session salt alongside the fresh key. GCM nonce uniqueness only *requires* one
     // of the two to be unique per session (the nonce is salt || sequence under the session
     // key), but a constant salt would make a key-reuse bug catastrophic instead of merely
     // wrong — this keeps the second line of defense real. Negotiated via Welcome, so clients
     // just follow.
     let mut salt = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     // Session AEAD: ChaCha20-Poly1305 when the client asked for it (VIDEO_CAP_CHACHA20 — the
     // soft-AES armv7 targets, whose GCM decrypt caps at ~100 Mbps) and the operator
     // kill-switch allows (PUNKTFUNK_CHACHA20, default on — pure rollout safety; perf-only,
@@ -520,7 +520,7 @@ pub(super) async fn negotiate(
     let chacha = client_wants_chacha && pf_host_config::config().chacha20;
     let key_chacha = chacha.then(|| {
         let mut k = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut k);
+        rand::rng().fill_bytes(&mut k);
         k
     });
     tracing::info!(
