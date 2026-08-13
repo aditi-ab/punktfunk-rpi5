@@ -10,8 +10,8 @@ use skia_safe::textlayout::{
     FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle, TypefaceFontProvider,
 };
 use skia_safe::{
-    gradient_shader, Canvas, Color4f, Font, FontMgr, FontStyle, MaskFilter, Paint, PathEffect,
-    Point, RRect, Rect, TileMode, Typeface,
+    gradient, Canvas, Color4f, Font, FontMgr, FontStyle, MaskFilter, Paint, PathEffect, Point,
+    RRect, Rect, TileMode, Typeface,
 };
 
 // --- Ink ----------------------------------------------------------------------------------
@@ -166,18 +166,16 @@ pub(crate) fn panel(
             sp.set_color4f(accent(alpha), None);
         }
         PanelStroke::Gradient | PanelStroke::GradientDashed => {
-            sp.set_shader(gradient_shader::linear(
+            let colors = [fg(0.22), fg(0.04)];
+            sp.set_shader(gradient::shaders::linear_gradient(
                 (
                     Point::new(rect.left, rect.top),
                     Point::new(rect.left, rect.bottom),
                 ),
-                gradient_shader::GradientShaderColors::Colors(&[
-                    fg(0.22).to_color(),
-                    fg(0.04).to_color(),
-                ]),
-                None,
-                TileMode::Clamp,
-                None,
+                &gradient::Gradient::new(
+                    gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+                    gradient::Interpolation::default(),
+                ),
                 None,
             ));
             if matches!(stroke, PanelStroke::GradientDashed) {
