@@ -994,9 +994,15 @@ struct ContentView: View {
                         model?.disconnect() // the captured-state ⌃⌥⇧D combo
                     },
                     onFrame: { [meter = model.meter, latency = model.latency,
-                                split = model.latencySplit, queue = model.clientQueue,
-                                offset = conn.clockOffsetNs] au in
+                                split = model.latencySplit, queue = model.clientQueue] au in
                         meter.note(byteCount: au.data.count)
+                        // Read the offset PER AU (an atomic load), never in the capture list: a
+                        // capture-list `offset =` froze the connect-time estimate for the whole
+                        // session, and on a host whose wall clock steps (VM + NTP) that frozen
+                        // value shifted hostnet/e2e by ~15 ms between sessions while the meter's
+                        // impossible-sample guard hid the damage (field 2026-08-13). See
+                        // `PunktfunkConnection.clockOffsetNs`.
+                        let offset = conn.clockOffsetNs
                         latency.record(ptsNs: au.ptsNs, offsetNs: offset)
                         // The same receipt, keyed by pts, awaiting its 0xCF host timing (the
                         // host/network split — drained by the 1 s stats tick). receivedNs is

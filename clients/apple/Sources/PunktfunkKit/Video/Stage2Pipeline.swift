@@ -271,6 +271,64 @@ final class LatestBox<T>: @unchecked Sendable {
     }
 }
 
+/// The deadline link's frame-latency ASK and property READBACK, published for the HUD to render.
+///
+/// ⚠ A readback is NOT a grant. `preferredFrameLatency` is a plain read-write float
+/// (CAMetalDisplayLink.h carries no doc contract), so reading it returns whatever we last
+/// stored unless the system actively clamps the setter — and the 2026-08-13 field run proved
+/// how misleading that is: it read 1.00 while the measured vend lead sat at 1.95 refresh
+/// periods. The number that tells the truth about scheduling is the vend lead (the HUD's
+/// `os present` floor), never this property. The line still earns its place twice over: a
+/// readback that DIFFERS from the ask is the one clamp signal the API can give, and the ask
+/// must be visible on screen because **on tvOS no log is reachable** — `log stream --device`
+/// is gone from modern macOS, `log collect --device-name` needs root and then fails "Device
+/// not configured" because an Apple TV has no USB to fall back to, and the libimobiledevice
+/// pairing is a different database from Xcode's. Console.app is a GUI.
+///
+/// A process-global rather than a sixth parameter threaded through SessionModel → StreamView →
+/// controller → SessionPresenter → Stage2Pipeline → delegate: it is write-once-per-session
+/// diagnostics, and this file already keeps `presentDebug`/`presentLog` at file scope. Reset by
+/// `clear()` at session start so a stale session's answer can never be read as this one's.
+public final class PresentLinkInfo: @unchecked Sendable {
+    public static let shared = PresentLinkInfo()
+    private let lock = NSLock()
+    private var ask: Float = 0
+    private var latency: Float = 0
+    private var rangeMin: Float = 0
+    private var rangeMax: Float = 0
+    private var drawables: Int = 0
+    private var present = false
+
+    private init() {}
+
+    func publish(ask: Float, latency: Float, rangeMin: Float, rangeMax: Float, drawables: Int) {
+        lock.lock()
+        self.ask = ask
+        self.latency = latency
+        self.rangeMin = rangeMin
+        self.rangeMax = rangeMax
+        self.drawables = drawables
+        present = true
+        lock.unlock()
+    }
+
+    /// Session start — a link that never comes up must not leave the previous one's answer up.
+    public func clear() {
+        lock.lock()
+        present = false
+        lock.unlock()
+    }
+
+    /// `nil` until the link's first update (or on a non-deadline rung, which has no link).
+    public func snapshot()
+        -> (ask: Float, latency: Float, rangeMin: Float, rangeMax: Float, drawables: Int)?
+    {
+        lock.lock()
+        defer { lock.unlock() }
+        return present ? (ask, latency, rangeMin, rangeMax, drawables) : nil
+    }
+}
+
 /// Deadline pacing's staged frame-rate hint. SessionPresenter pushes the stream rate from the
 /// MAIN thread (session start + every layout/Reconfigure); the link's own thread drains and
 /// applies it, so the CAMetalDisplayLink is only ever touched from the thread that runs it. The
@@ -312,9 +370,24 @@ private final class FrameRateHint: @unchecked Sendable {
         return p
     }
     private static func range(hz: Float, boosted: Bool) -> CAFrameRateRange {
+        #if os(tvOS)
+        // A TV is a FIXED-rate display: there is no ProMotion panel to lift and no Pencil to
+        // sample for, so the `max(hz, 120)` ceiling below asks a 60 Hz Apple TV to accept
+        // anything up to 120. A range is a promise about how variable our cadence may be, and a
+        // scheduler handed 60…120 on a fixed 60 Hz display has every reason to keep a frame of
+        // slack in hand — which is what a two-refresh `targetPresentationTimestamp` IS. Pin all
+        // three bounds to the stream rate so the deadline has nothing to hedge against.
+        // (Field 2026-08-13, Apple TV 4K / tvOS 27: `os present` stuck at ~2 × 16.67 with
+        // `preferredFrameLatency = 1` asked for and re-asserted every update; shrinking the
+        // drawable pool to 2 moved it not at all.) `boosted` is deliberately ignored — it exists
+        // for pen proximity, which tvOS does not have.
+        _ = boosted
+        return CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
+        #else
         let cap = max(hz, 120)
         let preferred = boosted ? cap : hz
         return CAFrameRateRange(minimum: preferred, maximum: cap, preferred: preferred)
+        #endif
     }
 }
 
@@ -435,18 +508,28 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private let phase: PhaseReporter?
     /// The OS-floor sampler (design/apple-presentation-rebuild.md): every update's vend→glass
     /// lead is recorded so its p50 becomes the "OS present floor" the HUD subtracts from the
-    /// shown display/e2e numbers. Self-adapting — reads ~2 refresh periods composited today,
-    /// would read ~1 under direct-to-display, tracks VRR rate changes.
+    /// shown display/e2e numbers. Self-adapting: ~1 refresh period is the goal, ~2 means the
+    /// compositor is running a frame ahead of us (what a 3-slot drawable pool bought it before
+    /// `startDeadlinePresenter` clamped stage-4 to 2). Tracks VRR rate changes.
     private let floorMeter: LatencyMeter?
-    /// One-shot: log the link's EFFECTIVE preferredFrameLatency after the first re-assert —
-    /// reads 1 while vendLeadMs sits at ~2 periods ⇒ the scheduler ignores the request while
-    /// the layer is composited (the promotion hunt); reads 2 ⇒ the system clamped it outright.
+    /// The pool depth this session vends from (`startDeadlinePresenter` sets it on the layer).
+    /// Carried only so the one-shot line below reports the two halves of the depth question
+    /// together — a `preferredFrameLatency` of 1 against a 3-slot pool is the configuration that
+    /// measured a two-refresh floor in the field, and reading either number alone hides that.
+    private let drawableCount: Int
+    /// The `preferredFrameLatency` this session asks for — 1 by default, PUNKTFUNK_FRAME_LATENCY
+    /// for the on-device ladder (see `startDeadlinePresenter` for the ladder's design).
+    private let latencyAsk: Float
+    /// One-shot: log the link's preferredFrameLatency READBACK after the first re-assert. A
+    /// readback differing from the ask ⇒ the system clamps the property (the one clamp signal
+    /// it can give); a readback EQUAL to the ask proves nothing — only vendLeadMs does (see
+    /// PresentLinkInfo's doc for the field lesson).
     private var loggedEffective = false
 
     init(
         stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
         hint: FrameRateHint, stats: PresentDebugStats?, floorMeter: LatencyMeter?,
-        phase: PhaseReporter?
+        phase: PhaseReporter?, drawableCount: Int, latencyAsk: Float
     ) {
         self.stash = stash
         self.renderSignal = renderSignal
@@ -454,23 +537,34 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         self.stats = stats
         self.floorMeter = floorMeter
         self.phase = phase
+        self.drawableCount = drawableCount
+        self.latencyAsk = latencyAsk
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
         if let range = hint.drain(), link.preferredFrameRateRange != range {
             link.preferredFrameRateRange = range
         }
-        // Re-assert the minimum-latency request every update (cheap compare): it was set once
-        // before add(to:), and whether a pre-add set survives scheduling is exactly the kind of
+        // Re-assert the latency ask every update (cheap compare): it was set once before
+        // add(to:), and whether a pre-add set survives scheduling is exactly the kind of
         // thing the vendLeadMs stat exists to catch — belt and braces.
-        if link.preferredFrameLatency != 1 { link.preferredFrameLatency = 1 }
+        if link.preferredFrameLatency != latencyAsk { link.preferredFrameLatency = latencyAsk }
+        // Publish every update, not just the first: the range is re-applied from the staged hint
+        // above (mode switch / rate change), and `preferredFrameLatency` is re-asserted right
+        // here — so the readback can change mid-session, and a write-once snapshot would keep
+        // showing the answer to a question we have since asked again. Cheap: five stores under
+        // an uncontended lock, once per refresh.
+        let range = link.preferredFrameRateRange
+        PresentLinkInfo.shared.publish(
+            ask: latencyAsk, latency: link.preferredFrameLatency, rangeMin: range.minimum,
+            rangeMax: range.maximum, drawables: drawableCount)
         if !loggedEffective {
             loggedEffective = true
-            let range = link.preferredFrameRateRange
             let msg = String(
-                format: "deadline link up: effective preferredFrameLatency=%.2f "
-                    + "range=%.0f-%.0f preferred=%.0f",
-                link.preferredFrameLatency, range.minimum, range.maximum, range.preferred ?? 0)
+                format: "deadline link up: preferredFrameLatency ask=%.2f readback=%.2f "
+                    + "maxDrawables=%d range=%.0f-%.0f preferred=%.0f",
+                latencyAsk, link.preferredFrameLatency, drawableCount,
+                range.minimum, range.maximum, range.preferred ?? 0)
             presentLog.info("\(msg, privacy: .public)")
         }
         // The link's own pipeline depth, measured: how far ahead of glass this vend runs.
@@ -729,7 +823,13 @@ public final class Stage2Pipeline {
     /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
     private let gate = ReanchorGate(framesDropped: 0)
     private var token = StopFlag()
-    private var offsetNs: Int64 = 0
+    /// LIVE host↔client clock offset, read AT EACH RECORD — never cached per session. Until
+    /// 2026-08-13 this was a `let` snapshot of the connect-time handshake, and on a host whose
+    /// wall clock steps (a VM under NTP) the frozen value silently shifted every host-anchored
+    /// stat — field evidence: hostnet 17–21 ms one session, a physically impossible 4.4 ms the
+    /// next, same wired host. The core re-syncs the estimate mid-stream (60 s + step detection);
+    /// each call is an atomic load behind the FFI.
+    private var clockOffset: () -> Int64 = { 0 }
     /// Signalled when the pump thread exits, so `stop()` can join it (bounded) before `decoder.reset()`
     /// — otherwise a pump iteration already past its `token.isStopped` check can rebuild a decode session
     /// right after the reset (a brief orphan session). `pumpJoinable` is armed by `start`, consumed by
@@ -831,7 +931,7 @@ public final class Stage2Pipeline {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
-        offsetNs = connection.clockOffsetNs
+        clockOffset = { connection.clockOffsetNs } // live (re-synced) — see the field doc
         recovery.bind(connection) // arm host-keyframe recovery for this session
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
         phaseReporter.bind(connection) // arm phase reports (flushed only by the deadline link)
@@ -1001,7 +1101,7 @@ public final class Stage2Pipeline {
         let ring = ring
         let endToEndMeter = endToEndMeter
         let displayMeter = displayMeter
-        let offsetNs = offsetNs
+        let clockOffset = clockOffset
         let renderSignal = renderSignal
         let renderStopped = renderStopped
         // Present policy — the user's V-Sync setting (default OFF = immediate, the long-proven
@@ -1075,7 +1175,7 @@ public final class Stage2Pipeline {
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
                     // End-to-end = capture→on-glass, measured directly (skew-corrected via the
                     // connect-time clock offset) — the HUD headline.
-                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: clockOffset())
                     // Display stage = decoded → on-glass. Both instants are client CLOCK_REALTIME,
                     // so no skew offset applies.
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
@@ -1134,10 +1234,51 @@ public final class Stage2Pipeline {
         let presenter = presenter
         let endToEndMeter = endToEndMeter
         let displayMeter = displayMeter
-        let offsetNs = offsetNs
+        let clockOffset = clockOffset
         let hint = frameRateHint
         let layer = presenter.layer
         let stash = LatestBox<CAMetalDrawable>()
+
+        // ⭐ Shrink the drawable pool to 2 for THIS pacing — the measured fix for a present floor
+        // stuck at two refreshes (field 2026-08-13, Apple TV 4K / tvOS 27: `os present +32.5` at
+        // 60 Hz = 1.95 × 16.67, i.e. the system running a whole frame ahead of us).
+        //
+        // `maximumDrawableCount` is 3 from MetalVideoPresenter.make(), and its rationale there —
+        // "more in-flight drawables before nextDrawable() has to block" — is a STAGE-2 concern.
+        // Stage-4 never calls nextDrawable(): every drawable is vended by the link
+        // (`update.drawable` → stash → `render(into:)`), so the third slot buys this path nothing
+        // and costs it a refresh — a pool of 3 is exactly the room the compositor needs to keep
+        // two presents queued ahead of scanout, which is what `preferredFrameLatency = 1` is
+        // asking it not to do. Two slots is the shallowest pool that still double-buffers: one
+        // vended (stashed or being rendered), one being scanned out.
+        //
+        // Set HERE, not on the link thread: this runs before either the render thread or the link
+        // thread exists, so the layer still has a single writer (the render thread owns
+        // drawableSize/format afterwards — see MetalVideoPresenter's threading notes).
+        // PUNKTFUNK_DRAWABLE_COUNT=3 restores the old depth for an on-glass A/B without a
+        // rebuild; values outside 2...3 are ignored (CAMetalLayer's own accepted range).
+        let drawableCount =
+            ProcessInfo.processInfo.environment["PUNKTFUNK_DRAWABLE_COUNT"]
+                .flatMap(Int.init)
+                .flatMap { (2...3).contains($0) ? $0 : nil } ?? 2
+        layer.maximumDrawableCount = drawableCount
+
+        // The frame-latency ASK (default 1 — wake as late as fits: latch the NEXT refresh).
+        // PUNKTFUNK_FRAME_LATENCY overrides it for the on-device ladder. The property is a
+        // FLOAT, so sub-frame asks (0.5) are expressible; whether the scheduler honours them —
+        // or reacts to the property at all — is exactly what the ladder measures. Field
+        // 2026-08-13 (Apple TV 4K, tvOS 27): ask 1 → vend lead 1.95 refresh periods, and the
+        // readback echoed the ask throughout (it is a plain property — see PresentLinkInfo).
+        // The discriminating runs, watching `os present` (the vend lead), are:
+        //   ask=2   → lead grows to ~3 ⇒ the property WORKS and the tvOS floor is ~ask+1;
+        //             lead stays ~2 ⇒ the property is INERT here — stop pulling this lever.
+        //   ask=0.5 → any lead below ~1.9 ⇒ a real in-regime win to then tune.
+        // Clamped to 0...4: negatives/NaN are meaningless, and beyond 4 asked-for frames of
+        // latency nothing is being measured.
+        let latencyAsk =
+            ProcessInfo.processInfo.environment["PUNKTFUNK_FRAME_LATENCY"]
+                .flatMap(Float.init)
+                .flatMap { $0.isFinite ? min(max($0, 0), 4) : nil } ?? 1
 
         let floorMeter = presentFloorMeter
         let phaseReporter = phaseReporter
@@ -1151,9 +1292,10 @@ public final class Stage2Pipeline {
             let linkThread = Thread {
                 let delegate = DeadlineLinkDelegate(
                     stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
-                    floorMeter: floorMeter, phase: phaseReporter)
+                    floorMeter: floorMeter, phase: phaseReporter,
+                    drawableCount: drawableCount, latencyAsk: latencyAsk)
                 let link = CAMetalDisplayLink(metalLayer: layer)
-                link.preferredFrameLatency = 1 // wake as late as fits: latch the NEXT refresh
+                link.preferredFrameLatency = latencyAsk // see the ladder note above
                 if let range = hint.drain() { link.preferredFrameRateRange = range }
                 link.delegate = delegate // weak — this closure is the strong ref
                 link.add(to: RunLoop.current, forMode: .default)
@@ -1223,7 +1365,7 @@ public final class Stage2Pipeline {
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     let atNs = presentedNs
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
-                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: clockOffset())
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
                     debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
                 }

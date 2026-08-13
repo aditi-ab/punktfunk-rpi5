@@ -15,8 +15,9 @@ import Foundation
 ///   `record(ptsNs:atNs:offsetNs:)` at present.
 ///
 /// For the host-anchored intervals (capture→…) the sample is `end + offset - pts_ns`, where
-/// `pts_ns` is the host's capture wall clock (the AU's pts) and the connect-time **clock-skew
-/// offset** (`PunktfunkConnection.clockOffsetNs`, host minus client) makes the difference valid
+/// `pts_ns` is the host's capture wall clock (the AU's pts) and the LIVE **clock-skew
+/// offset** (`PunktfunkConnection.clockOffsetNs`, host minus client, mid-stream re-synced —
+/// read it per record, never cached) makes the difference valid
 /// across machines. `offsetNs == 0` means an old host that didn't answer the skew handshake (or
 /// genuinely synced clocks) — the number is then only meaningful same-host, and the HUD tags the
 /// end-to-end line `(same-host clock)`.
@@ -24,6 +25,8 @@ public final class LatencyMeter: @unchecked Sendable {
     private let lock = NSLock()
     private var samplesUs: [Int64] = []
     private var skewCorrected = false
+    /// Samples `record` refused as impossible since the last `drainTrimmed` (see the guard).
+    private var trimmed = 0
     /// The most recent sample and the instant it ended, for `latestSample(asOfNs:maxAgeMs:)` —
     /// a LEVEL, not a window, so `drain` deliberately leaves both alone.
     private var latestNs: Int64 = 0
@@ -49,8 +52,19 @@ public final class LatencyMeter: @unchecked Sendable {
     public func record(ptsNs: UInt64, atNs: Int64, offsetNs: Int64) {
         let latNs = atNs &+ offsetNs &- Int64(bitPattern: ptsNs)
         // Drop absurd values (a clock step, a wildly wrong offset, garbage pts, or a stage whose
-        // start stamp is missing/after its end) — samples are clamped to (0, 10 s).
-        guard latNs > 0, latNs < 10_000_000_000 else { return }
+        // start stamp is missing/after its end) — samples are clamped to (0, 10 s). COUNTED, not
+        // silent: a cluster of non-positive samples is the signature of a wrong clock offset
+        // (client-local stages can't go negative), and a meter that quietly trims the impossible
+        // half of a shifted distribution presents the surviving tail as a plausible small number
+        // — field 2026-08-13: "e2e 0–3 ms p50 / 23 ms p95" on a session whose true hostnet was
+        // ~18 ms. `drainTrimmed` surfaces the count so the window can be MARKED suspect instead
+        // of looking healthy.
+        guard latNs > 0, latNs < 10_000_000_000 else {
+            lock.lock()
+            trimmed += 1
+            lock.unlock()
+            return
+        }
         lock.lock()
         samplesUs.append(latNs / 1000)
         latestNs = latNs
@@ -97,6 +111,18 @@ public final class LatencyMeter: @unchecked Sendable {
         /// True if the skew offset was applied (a host that answered the handshake) — i.e. the
         /// numbers are cross-machine valid, not just same-host.
         public let skewCorrected: Bool
+    }
+
+    /// Take-and-reset the count of impossible samples `record` refused (see its guard). Drained
+    /// SEPARATELY from `drain()` on purpose: with a badly wrong offset EVERY sample of a window
+    /// can be non-positive, `drain()` then returns `nil` — and a count folded into `Stats` would
+    /// vanish with it, hiding the very windows that scream loudest. This survives an empty window.
+    public func drainTrimmed() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = trimmed
+        trimmed = 0
+        return n
     }
 
     /// Percentiles over the samples accumulated since the last drain, then reset the window. `nil`
