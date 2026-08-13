@@ -77,7 +77,7 @@ quinn = { version = "0.11", optional = true, default-features = false, features 
 ] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 # `generate_simple_self_signed` is backend-agnostic, so the swap is transparent here.
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pki-types = { version = "1", optional = true }
 # `rustls-no-provider`, NOT the default `rustls` feature — ureq's `rustls` feature body pulls
 # `_ring`, which would drag the whole ring backend back into a tree that has deliberately moved to
