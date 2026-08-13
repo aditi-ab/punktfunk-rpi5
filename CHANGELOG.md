@@ -14,6 +14,56 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1 — in development
 
+### Android — the audio plane trusted AAudio, and a TV box that opened a stream it never played was silent for the session
+
+🛑 **Reported from the field: no audio at all on an NVIDIA Shield Android TV, stereo, with the same
+host and settings that play fine on an Apple TV.** Video unaffected. Turning off the client's
+low-latency mode — which is what gates the forced HDMI mode switch and the `usage=Game` tagging —
+changed nothing.
+
+The Android client opens AAudio directly (the Apple client goes through AVAudioEngine, which
+reconfigures itself on a route change; that difference is why this was Android-only). Opening
+AAudio is a negotiation with a vendor HAL, and this plane treated it as a formality: one Exclusive
+attempt, one Shared retry, and everything after the open taken on trust. **Three distinct failures
+all presented as "the app has no sound" behind a healthy-looking log**, and none of them was
+detected:
+
+- **A configuration that opens but routes nowhere.** Nothing ever checked that the device actually
+  pulled a sample, so the decode thread would happily decode Opus into a dead stream forever.
+- **`request_start` failing.** The old code gave up on the spot instead of trying anything else, so
+  one unhappy configuration disabled audio for the whole session.
+- **A disconnect.** By AAudio's contract a disconnected stream is dead and the only recovery is
+  close + open a new one. The error callback logged a warning and did nothing else — so an HDMI
+  mode switch, an AVR re-handshake or any route change meant silence for the rest of the session.
+  On a TV that is not a rare event: the client itself drives an HDMI mode switch on the video
+  plane, and the platform's own match-content-frame-rate setting drives more.
+
+The open now walks a **ladder**, every rung has to **prove the device is pulling** before it is
+accepted, and a **supervisor** owns the plane for the session and reopens it when the device goes
+away (bounded retries across the settling time of a route change, so a reopen landing mid-switch
+does not permanently disable audio). The granted rate/channel-count/format are checked against what
+was asked for rather than assumed — the realtime callback casts AAudio's buffer to `f32` and writes
+`num_frames × channels` of them, so a HAL that disagreed was an out-of-bounds write on the audio
+thread, not merely a mistuning.
+
+⚠ **Behaviour change on TV boxes: they now start at Shared instead of Exclusive.** Exclusive is
+MMAP, the lowest-latency path AAudio has, and the one rung whose routing cannot be verified from
+inside the process. The latency it buys here was never actually banked — the jitter-ring depths are
+unchanged from the Shared-only era (`JitterTuning::AAUDIO` still primes at 25 ms) — so on a
+mains-powered HDMI box the few ms are worth less than not betting the audio plane on it. Phones,
+tablets and handhelds are unchanged and still try Exclusive first. If no rung proves itself, the
+first one that opened and started is used anyway: the watchdog must never be able to turn working
+audio into no audio.
+
+⚠ **Embedder-visible:** `NativeBridge.nativeStartAudio` takes a third argument, `isTv`
+(`FEATURE_LEANBACK`, the same source the video plane already used).
+
+Three new sysprops bisect all of it on a device that cannot be handed a custom build, alongside the
+existing `debug.punktfunk.no_av_sync`: `debug.punktfunk.audio_sharing` (`exclusive`|`shared`),
+`debug.punktfunk.audio_perf` (`lowlatency`|`none`) and `debug.punktfunk.audio_reopen` (`0` pins the
+old give-up-on-disconnect behaviour). A stream that stops taking samples after it started now says
+so at `error` level instead of looking exactly like an app with no sound.
+
 ### NixOS — the plugin runner was installed, running, and reported missing
 
 🛑 **On NixOS every plugin *package* op failed with "the plugin runner isn't installed", on a box

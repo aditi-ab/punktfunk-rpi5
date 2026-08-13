@@ -816,7 +816,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                     ?: (runCatching { context.display }.getOrNull()?.refreshRate ?: 0f)
                                         .roundToInt(),
                             )
-                            NativeBridge.nativeStartAudio(handle, lowLatencyMode)
+                            NativeBridge.nativeStartAudio(handle, lowLatencyMode, isTv)
                             if (micWanted) {
                                 val sessionId =
                                     NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)

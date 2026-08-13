@@ -302,12 +302,17 @@ object NativeBridge {
     external fun nativeSetVideoStatsEnabled(handle: Long, enabled: Boolean)
 
     /**
-     * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust.
+     * Start host→client audio: Opus decode → jitter ring → AAudio, all in Rust.
      * [lowLatencyMode] (the experimental toggle) additionally tags the stream usage=Game for the
      * HAL's game-audio routing. No-op if already started. Best-effort — a failure leaves video
      * streaming.
+     *
+     * [isTv] steers the AAudio open ladder: a TV box starts at Shared rather than betting the
+     * audio plane on an Exclusive/MMAP path whose routing we cannot verify from inside the
+     * process. Passed from `FEATURE_LEANBACK` (same source as [nativeStartVideo]) because the
+     * native side's own `ro.build.characteristics` check is not answered by every TV device.
      */
-    external fun nativeStartAudio(handle: Long, lowLatencyMode: Boolean)
+    external fun nativeStartAudio(handle: Long, lowLatencyMode: Boolean, isTv: Boolean)
 
     /** Stop + join the audio thread and close AAudio, without closing the session. No-op on `0`. */
     external fun nativeStopAudio(handle: Long)
