@@ -2,6 +2,9 @@
 # license-allowlist gate (CRA Annex I Part II: know your components; catch a bad dep the moment
 # it lands).
 #   * cargo-audit → the (network-facing, crypto-heavy) Rust tree, against the RustSec advisory DB.
+#                   ⚠ ALL FIVE Rust lockfiles, each named with its own `--file`: a bare `cargo audit`
+#                   reads only the root one, which is how the drivers lock went unscanned for so
+#                   long despite already being in this job's `paths:` filter.
 #   * bun audit   → each Bun-managed tree that ships or publishes: web (the mgmt console BFF —
 #                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
 #                   plugin-kit (@punktfunk/plugin-kit).
@@ -11,7 +14,7 @@
 #                   build chain (node-tar, brace-expansion); clearing them needs coordinated bumps
 #                   verified against the LIVE site (the docs don't build standalone) — tracked in
 #                   punktfunk-planning design/cra-readiness.md. Flip to blocking once clean.
-#   * cargo-about → license-allowlist gate over BOTH Rust workspaces (about.toml `accepted`);
+#   * cargo-about → license-allowlist gate over the host + driver workspaces (about.toml `accepted`);
 #                   fails if any crate carries a license outside the allowlist — the regression
 #                   guard about.toml always promised. (The Android Gradle tree has no lockfile, so
 #                   nothing scans it — see the CRA roadmap.)
