@@ -161,6 +161,13 @@ final class SessionModel: ObservableObject {
     @Published var linkRangeMaxHz: Float = 0
     @Published var linkDrawables = 0
     @Published var linkInfoValid = false
+    /// Impossible samples the HOST-ANCHORED meters (host+network, end-to-end) refused this
+    /// second (`LatencyMeter.drainTrimmed`). Nonzero means the clock offset is lying and every
+    /// host-anchored p50/p95 this window is a TRUNCATED distribution — the HUD marks the window
+    /// suspect instead of letting a trimmed tail pose as a healthy small number (the field
+    /// "e2e 0–3 ms" reading, 2026-08-13). Client-local stages can't go negative, so they carry
+    /// no such term.
+    @Published var skewTrimPerS = 0
     /// The AUDIO plane's latency, from the playback ring (`SessionAudio.Stats`): how much decoded
     /// audio is queued ahead of the speaker, and where that PUTS it relative to the picture
     /// (positive = audio behind). `audioValid` is false until playback runs.
@@ -932,6 +939,10 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.endToEndValid = false
                 }
+                // Drained even when the stats drains came back empty — with a badly wrong offset
+                // an entire window is refused and only this counter still tells the story.
+                self.skewTrimPerS =
+                    self.latency.drainTrimmed() + self.endToEnd.drainTrimmed()
                 if let d = self.decodeStage.drain() {
                     self.decodeP50Ms = d.p50Ms
                     self.decodeValid = true
@@ -991,6 +1002,14 @@ final class SessionModel: ObservableObject {
                         // Swift Int is 64-bit → %lld, NOT %d (which is a 32-bit C int); macOS 26's
                         // strict String(format:) validator rejects the %d/Int mismatch and drops
                         // the whole line (a cascade error that also mis-blames the float args).
+                        //
+                        // ⚠ Every invalid-field fallback below MUST be a typed `-1.0` (or a
+                        // `Double(...)`-wrapped value), never a bare `-1`: in this variadic
+                        // `CVarArg` context the ternary does NOT unify to Double — the untyped
+                        // literal goes in as Int, and `%f` then reads Int64(-1)'s all-ones bit
+                        // pattern, which IS a quiet NaN. Field 2026-08-13 (tvOS, stage-1, the
+                        // first session ever to have invalid fields while frames flowed): every
+                        // fallback printed `nan`. Latent since the line was added.
                         format: "fps=%lld presents=%lld e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
                             + "decode_p50=%.1f display_p50=%.1f lost=%lld "
                             + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f queue_p50=%.1f "
@@ -1003,23 +1022,28 @@ final class SessionModel: ObservableObject {
                             // non-deadline rungs) — appended so the PUNKTFUNK_FRAME_LATENCY
                             // ladder is readable over the stdout channel with the HUD off,
                             // which is the only honest way to run it on a tvOS device.
-                            + "link_ask=%.2f link_readback=%.2f",
+                            + "link_ask=%.2f link_readback=%.2f "
+                            // Impossible samples the host-anchored meters refused this window:
+                            // nonzero ⇒ the clock offset is lying and e2e/hostnet above are
+                            // truncated distributions — disregard their p50/p95.
+                            + "skew_trim=%lld",
                         frames,
                         displayWindow?.count ?? 0,
-                        self.endToEndValid ? self.endToEndP50Ms : -1,
-                        self.endToEndValid ? self.endToEndP95Ms : -1,
-                        self.hostNetworkValid ? self.hostNetworkP50Ms : -1,
-                        self.decodeValid ? self.decodeP50Ms : -1,
-                        self.displayValid ? self.displayP50Ms : -1,
+                        self.endToEndValid ? self.endToEndP50Ms : -1.0,
+                        self.endToEndValid ? self.endToEndP95Ms : -1.0,
+                        self.hostNetworkValid ? self.hostNetworkP50Ms : -1.0,
+                        self.decodeValid ? self.decodeP50Ms : -1.0,
+                        self.displayValid ? self.displayP50Ms : -1.0,
                         lost,
-                        self.osFloorValid ? self.osFloorP50Ms : -1,
-                        self.displayValid ? self.displayAdjP50Ms : -1,
-                        self.endToEndValid ? self.endToEndAdjP50Ms : -1,
-                        self.clientQueueValid ? self.clientQueueP50Ms : -1,
+                        self.osFloorValid ? self.osFloorP50Ms : -1.0,
+                        self.displayValid ? self.displayAdjP50Ms : -1.0,
+                        self.endToEndValid ? self.endToEndAdjP50Ms : -1.0,
+                        self.clientQueueValid ? self.clientQueueP50Ms : -1.0,
                         self.audioValid ? self.audioBufferMs : -1,
                         self.audioValid ? self.audioAvOffsetMs : 0,
-                        self.linkInfoValid ? self.linkLatencyAskFrames : -1,
-                        self.linkInfoValid ? self.linkLatencyFrames : -1)
+                        self.linkInfoValid ? Double(self.linkLatencyAskFrames) : -1.0,
+                        self.linkInfoValid ? Double(self.linkLatencyFrames) : -1.0,
+                        self.skewTrimPerS)
                     statsLog.info("\(line, privacy: .public)")
                     if statsToStdout { print("pf.stats \(line)") }
                 }

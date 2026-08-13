@@ -34,9 +34,6 @@ final class StreamPump {
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         let token = token
-        // Host↔client clock skew, read once like Stage2Pipeline.start does — capture→enqueue
-        // spans machines, so the raw difference is only valid offset-corrected.
-        let offsetNs = connection.clockOffsetNs
         // Coalesced host keyframe requests (100 ms throttle — see KeyframeRecovery).
         let recovery = KeyframeRecovery()
         recovery.bind(connection)
@@ -173,8 +170,10 @@ final class StreamPump {
                     if gate.onDecoded(flags: au.flags) {
                         // Capture→enqueue (see start's doc). Only frames that will DISPLAY:
                         // a withheld frame never reaches glass, so its enqueue instant would
-                        // dilute the population the Metal rungs are compared against.
-                        endToEndMeter?.record(ptsNs: au.ptsNs, offsetNs: offsetNs)
+                        // dilute the population the Metal rungs are compared against. The
+                        // offset is read PER ENQUEUE — it is live (mid-stream re-synced) and
+                        // caching it rebuilds the stale-offset corruption (see clockOffsetNs).
+                        endToEndMeter?.record(ptsNs: au.ptsNs, offsetNs: connection.clockOffsetNs)
                     } else {
                         StreamPump.setDoNotDisplay(sample)
                     }

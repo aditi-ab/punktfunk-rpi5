@@ -139,6 +139,18 @@ struct StreamHUDView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
+                    // The clock-offset tripwire: host-anchored meters refused samples as
+                    // impossible (≤ 0 after offset correction) this second. When this shows,
+                    // e2e and host+network above are TRUNCATED distributions — a wrong skew
+                    // offset shifted them and the impossible half was trimmed — so their
+                    // p50/p95 flatter the stream (the field "e2e 0–3 ms" reading). Orange on
+                    // purpose: every other stat here stays legible-quiet, but a number that
+                    // has stopped meaning anything must not.
+                    if model.skewTrimPerS > 0 {
+                        Text("clock offset suspect — \(model.skewTrimPerS)/s impossible samples trimmed; e2e & host+network unreliable")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
                     // Client-queue wait (reassembly receipt → decode pull, ABI v9 split): ~0 on
                     // a healthy stream and hidden as noise; shown from 2 ms — a persistent value
                     // is a client-side standing backlog that pre-split builds displayed as

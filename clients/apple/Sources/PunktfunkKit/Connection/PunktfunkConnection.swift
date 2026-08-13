@@ -382,12 +382,29 @@ public final class PunktfunkConnection {
     /// the client draws its own (a visible system cursor over the stream).
     public private(set) var resolvedCompositor: Compositor = .auto
 
-    /// Host clock minus client clock (nanoseconds), from the connect-time wall-clock skew handshake
-    /// (`punktfunk_connection_clock_offset_ns`). Add it to a local `CLOCK_REALTIME` instant to
-    /// express that instant in the host's capture clock — the clock each `AccessUnit.ptsNs` is
-    /// stamped in — so a glass-to-glass latency (present/enqueue time minus `ptsNs`) is valid across
-    /// machines. `0` = no correction (an older host that didn't answer, or synchronized clocks).
-    public private(set) var clockOffsetNs: Int64 = 0
+    /// Host clock minus client clock (nanoseconds) — LIVE: the connect-time skew handshake's
+    /// estimate, kept fresh by the core's mid-stream re-syncs (every 60 s plus immediately on a
+    /// suspected wall-clock step; `punktfunk_connection_clock_offset_now_ns`, ABI v10). Add it to
+    /// a local `CLOCK_REALTIME` instant to express that instant in the host's capture clock — the
+    /// clock each `AccessUnit.ptsNs` is stamped in — so a glass-to-glass latency (present/enqueue
+    /// time minus `ptsNs`) is valid across machines. `0` = no correction (an older host that
+    /// didn't answer, synchronized clocks, or a closed connection).
+    ///
+    /// ⚠ LIVE means DO NOT CACHE. Until 2026-08-13 this was a connect-time snapshot, and the
+    /// core's own doc names the failure: "after an NTP step or slow drift the connect-time value
+    /// silently corrupts every capture-clock comparison." The field evidence was stark — two
+    /// sessions minutes apart against the same wired host read hostnet 17–21 ms, then a
+    /// physically impossible 4.4 ms (the host is a VM; VM wall clocks step), and LatencyMeter's
+    /// impossible-sample guard silently trimmed the shifted-negative half, so the HUD showed a
+    /// plausible small number instead of an alarm. Read this property at each use — it is an
+    /// atomic load behind the FFI — and never park it in a `let` or a closure capture list.
+    /// Cross-thread reads follow the `framesDropped()` precedent.
+    public var clockOffsetNs: Int64 {
+        guard let handle else { return 0 }
+        var offset: Int64 = 0
+        _ = punktfunk_connection_clock_offset_now_ns(handle, &offset)
+        return offset
+    }
 
     /// The video encoder bitrate (kbps) the host actually configured — the requested
     /// `bitrateKbps` clamped to the host's range ([500, 2 000 000] kbps), or its default
@@ -635,9 +652,6 @@ public final class PunktfunkConnection {
         var comp: UInt32 = 0
         _ = punktfunk_connection_compositor(handle, &comp)
         resolvedCompositor = Compositor(rawValue: comp) ?? .auto
-        var offset: Int64 = 0
-        _ = punktfunk_connection_clock_offset_ns(handle, &offset)
-        clockOffsetNs = offset
         var br: UInt32 = 0
         _ = punktfunk_connection_bitrate(handle, &br)
         resolvedBitrateKbps = br

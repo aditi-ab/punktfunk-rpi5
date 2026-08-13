@@ -823,7 +823,13 @@ public final class Stage2Pipeline {
     /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
     private let gate = ReanchorGate(framesDropped: 0)
     private var token = StopFlag()
-    private var offsetNs: Int64 = 0
+    /// LIVE host↔client clock offset, read AT EACH RECORD — never cached per session. Until
+    /// 2026-08-13 this was a `let` snapshot of the connect-time handshake, and on a host whose
+    /// wall clock steps (a VM under NTP) the frozen value silently shifted every host-anchored
+    /// stat — field evidence: hostnet 17–21 ms one session, a physically impossible 4.4 ms the
+    /// next, same wired host. The core re-syncs the estimate mid-stream (60 s + step detection);
+    /// each call is an atomic load behind the FFI.
+    private var clockOffset: () -> Int64 = { 0 }
     /// Signalled when the pump thread exits, so `stop()` can join it (bounded) before `decoder.reset()`
     /// — otherwise a pump iteration already past its `token.isStopped` check can rebuild a decode session
     /// right after the reset (a brief orphan session). `pumpJoinable` is armed by `start`, consumed by
@@ -925,7 +931,7 @@ public final class Stage2Pipeline {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
-        offsetNs = connection.clockOffsetNs
+        clockOffset = { connection.clockOffsetNs } // live (re-synced) — see the field doc
         recovery.bind(connection) // arm host-keyframe recovery for this session
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
         phaseReporter.bind(connection) // arm phase reports (flushed only by the deadline link)
@@ -1095,7 +1101,7 @@ public final class Stage2Pipeline {
         let ring = ring
         let endToEndMeter = endToEndMeter
         let displayMeter = displayMeter
-        let offsetNs = offsetNs
+        let clockOffset = clockOffset
         let renderSignal = renderSignal
         let renderStopped = renderStopped
         // Present policy — the user's V-Sync setting (default OFF = immediate, the long-proven
@@ -1169,7 +1175,7 @@ public final class Stage2Pipeline {
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
                     // End-to-end = capture→on-glass, measured directly (skew-corrected via the
                     // connect-time clock offset) — the HUD headline.
-                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: clockOffset())
                     // Display stage = decoded → on-glass. Both instants are client CLOCK_REALTIME,
                     // so no skew offset applies.
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
@@ -1228,7 +1234,7 @@ public final class Stage2Pipeline {
         let presenter = presenter
         let endToEndMeter = endToEndMeter
         let displayMeter = displayMeter
-        let offsetNs = offsetNs
+        let clockOffset = clockOffset
         let hint = frameRateHint
         let layer = presenter.layer
         let stash = LatestBox<CAMetalDrawable>()
@@ -1359,7 +1365,7 @@ public final class Stage2Pipeline {
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     let atNs = presentedNs
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
-                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: clockOffset())
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
                     debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
                 }
