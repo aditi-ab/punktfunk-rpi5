@@ -28,7 +28,7 @@ set -euo pipefail
 GAMESCOPE_REV="5fb8dce4a09d0a68d097b9faf9513782106bc843"
 GAMESCOPE_REPO="https://github.com/ValveSoftware/gamescope.git"
 
-REV="$GAMESCOPE_REV" PREFIX=/usr DESTDIR="" SRCDIR="" JOBS="" SETCAP=1
+REV="$GAMESCOPE_REV" PREFIX=/usr DESTDIR="" SRCDIR="" JOBS="" SETCAP=1 EXTRA_FALLBACK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rev)       REV="${2:?}"; shift 2 ;;
@@ -37,6 +37,15 @@ while [ $# -gt 0 ]; do
     --srcdir)    SRCDIR="${2:?}"; shift 2 ;;
     --jobs)      JOBS="${2:?}"; shift 2 ;;
     --no-setcap) SETCAP=0; shift ;;
+    # Extra `force_fallback_for` entries, comma-separated, appended to the mandatory three below.
+    # Exists for ONE package family: the .deb has to install on both Debian 13 and Ubuntu 26.04,
+    # and those two disagree on the libdisplay-info SONAME (0.2.0 -> libdisplay-info2 vs 0.3.0 ->
+    # libdisplay-info3), so a package built against either one is uninstallable on the other.
+    # Vendoring it makes ONE .deb serve both. Opt-in rather than baked in, so the Arch/Fedora/nix
+    # packages — which have no such split and are shipping fine — keep producing exactly the binary
+    # they produce today. Its only caller is the `build-publish-gamescope` job in
+    # .gitea/workflows/deb.yml, which passes `--extra-fallback libdisplay-info`.
+    --extra-fallback) EXTRA_FALLBACK="${2:?}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -111,7 +120,7 @@ export LDFLAGS="${LDFLAGS:-} -static-libstdc++ -static-libgcc"
 meson setup "$BUILD" "$SRCDIR" \
   --prefix="$PREFIX" \
   --buildtype=release \
-  -Dforce_fallback_for=libliftoff,vkroots,wlroots \
+  -Dforce_fallback_for="libliftoff,vkroots,wlroots${EXTRA_FALLBACK:+,$EXTRA_FALLBACK}" \
   -Dpipewire=enabled \
   -Denable_tests=false \
   -Denable_openvr_support=false \

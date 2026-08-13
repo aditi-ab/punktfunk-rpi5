@@ -1,6 +1,6 @@
-# Build the punktfunk .debs and publish them to Gitea's Debian package registry, so Ubuntu
-# boxes get new builds via `apt update && apt upgrade`. Three jobs, all publishing to the same
-# apt distribution/component:
+# Build the punktfunk .debs and publish them to Gitea's Debian package registry, so Debian and
+# Ubuntu boxes get new builds via `apt update && apt upgrade`. Five jobs; the four builders all
+# publish to the same apt distribution/component, and the fifth checks the result:
 #
 #   build-publish       — client + web + scripting, on the Ubuntu 26.04 rust-ci image (the client
 #                         needs 24.04-absent libs: SDL3, GTK4 ≥ 4.20).
@@ -11,8 +11,17 @@
 #   build-publish-host  — the HOST, on the Ubuntu 24.04 rust-ci-noble image with a from-source
 #                         FFmpeg 8 BUNDLED into the .deb. This lowers the host's glibc floor to 2.39
 #                         and removes the hard `Depends: libavcodec62`, so the ONE host .deb installs
-#                         on Ubuntu 24.04 LTS through 26.04. (A 26.04-built host .deb is uninstallable
-#                         on 24.04 — the reason this job exists; see packaging/debian/README.md.)
+#                         on Ubuntu 24.04 LTS through 26.04 — and, for free, on Debian 13.
+#                         (A 26.04-built host .deb is uninstallable on 24.04 — the reason this job
+#                         exists; see packaging/debian/README.md.)
+#   build-publish-gamescope
+#                       — the patched `punktfunk-gamescope`, on DEBIAN 13. It lived in the host job
+#                         until 2026-08 and never once succeeded there: noble's wayland is 1.22.0
+#                         and the vendored wlroots floors it at 1.23.1, so v0.26.0 and v0.27.0 both
+#                         shipped without the package while the docs told apt users to install it.
+#   smoke-install       — installs what was just published, from the registry, in pristine
+#                         ubuntu:24.04 / ubuntu:26.04 / debian:trixie images. Nothing here used to
+#                         install a package it built, which is how both of the above survived.
 #
 # Both compute VERSION identically (scripts/ci/pf-version.sh is deterministic per commit), so the
 # host and client packages always share a version line. The release-attach helpers are race-safe
@@ -337,82 +346,6 @@ jobs:
           bash scripts/ci/assert-cap-matrix.sh --self-test
           bash scripts/ci/assert-cap-matrix.sh dist/punktfunk-host_*.deb
 
-      # punktfunk-gamescope for apt. Same reasoning as the RPM leg in rpm.yml: without a packaged
-      # build, a Debian/Ubuntu box has no route to the patched gamescope except compiling it, and a
-      # stock gamescope streams SDR, cursorless, and tells every game its display is 60 Hz.
-      #
-      # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
-      # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
-      - uses: actions/cache@v4
-        id: gamescope
-        with:
-          path: gs-cache
-          key: punktfunk-gamescope-noble-${{ hashFiles('packaging/gamescope/**') }}
-
-      - name: Build the patched gamescope
-        if: steps.gamescope.outputs.cache-hit != 'true'
-        # Best-effort, exactly like rpm.yml: the host packages above are the primary delivery and
-        # work without this binary, so a hiccup building an unrelated tree must not fail the job.
-        # `build-dep gamescope` resolves the distro's much older packaged version, so it can come up
-        # short — that is what the `|| true`s absorb, and the marker check downstream is what makes
-        # a half-built result impossible to ship.
-        run: |
-          set -x
-          apt-get update
-          apt-get install -y --no-install-recommends meson ninja-build glslc git || true
-          apt-get build-dep -y gamescope || true
-          # NOT best-effort. `build-dep gamescope` resolves the distro's much older packaged
-          # gamescope — where noble has one at all — so it misses what the master tree needs, and
-          # wayland-protocols is the gap that actually stops the build: meson dies in
-          # protocol/meson.build with "Neither a subproject directory nor a wayland-protocols.wrap
-          # file was found", because the tree has no wrap fallback for it. That is what happened on
-          # the v0.26.0 tag: the step warned and skipped, the job stayed green, and the release
-          # shipped with no gamescope .deb while the notes said it had one.
-          apt-get install -y --no-install-recommends wayland-protocols
-          # The remaining Arch makedepends the older packaged gamescope does not necessarily pull.
-          # Best-effort: meson falls back or does without, and a name that moves between Ubuntu
-          # releases should not fail the job. (No libstdc++ static package is needed here — g++
-          # ships libstdc++.a, which is why only Fedora tripped the sanity check.)
-          # `build-dep gamescope` gives noble almost nothing — the distro has no comparable package
-          # — so the tree's real dependency set has to be named outright. One `apt-get` per name on
-          # purpose: a single transaction aborts wholesale on one unknown package, which would
-          # install NOTHING and hide the real gap behind a name typo. Best-effort per package, with
-          # the missing one named; the end-of-job gate below is what actually decides.
-          for p in libxdamage-dev libxcomposite-dev libxrender-dev libxext-dev libxxf86vm-dev \
-                   libxtst-dev libx11-dev libxres-dev libxmu-dev libxcursor-dev libxi-dev \
-                   libxfixes-dev libxkbcommon-dev libxkbcommon-x11-dev libcap-dev libdrm-dev \
-                   libinput-dev libudev-dev libpipewire-0.3-dev libseat-dev libsdl2-dev \
-                   libluajit-5.1-dev libavif-dev libdecor-0-dev hwdata libglm-dev libbenchmark-dev \
-                   glslang-tools libvulkan-dev libwayland-dev libxcb1-dev libxcb-composite0-dev \
-                   libxcb-xfixes0-dev libxcb-res0-dev libxcb-ewmh-dev libxcb-icccm4-dev \
-                   libxcb-errors-dev libpixman-1-dev libdisplay-info-dev libgbm-dev libegl-dev \
-                   cmake xwayland; do
-            apt-get install -y --no-install-recommends "$p" \
-              || echo "::warning::no such noble package: $p (gamescope may still build without it)"
-          done
-          if bash packaging/gamescope/build-punktfunk-gamescope.sh \
-               --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)"; then
-            install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
-          else
-            # Warn only, even on a tag. The hard gate moved to the END of this job: failing HERE
-            # skips the host .deb's own publish + release-attach steps below, which is how the
-            # v0.26.0 release ended up still carrying the pre-CAP_SYS_NICE host .deb from an
-            # earlier tag commit — a KDE-breaking artifact withheld from replacement by a gate
-            # meant to protect the release. Never let a missing EXTRA stop a good artifact
-            # shipping; go red afterwards instead.
-            echo "::warning::punktfunk-gamescope failed to build on noble — no .deb this run (gamescope sessions stay SDR)"
-          fi
-
-      - name: Build punktfunk-gamescope .deb
-        # Picked up by the publish loop below, which globs dist/*.deb.
-        run: |
-          if [ -x gs-cache/punktfunk-gamescope ] && gs-cache/punktfunk-gamescope --version >/dev/null 2>&1; then
-            bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
-          else
-            # Warn only — see the note on the build step. The gate is the last step of this job.
-            echo "::warning::no usable punktfunk-gamescope — skipping its .deb"
-          fi
-
       - name: Publish to the Gitea apt registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
@@ -440,25 +373,109 @@ jobs:
             upsert_asset "$RID" "$DEB"
           done
 
-      # A release must not be able to make a claim its own CI silently dropped: v0.26.0's notes and
-      # docs-site said the patched gamescope was apt-installable while no .deb had ever been built,
-      # because every failure on this path was a `::warning::` that returned 0.
-      #
-      # ⚠ LAST step on purpose. The first version of this gate failed at the build step instead, and
-      # that skipped the host .deb's own publish + attach below — so the release kept the PREVIOUS
-      # tag commit's host .deb, which still carried the CAP_SYS_NICE postinst that breaks KDE. A
-      # gate protecting the release withheld the fix for it. Everything good ships first; the job
-      # goes red afterwards.
-      - name: A stable tag must ship the gamescope .deb
-        if: startsWith(gitea.ref, 'refs/tags/v')
+  # ---------------------------------------------------------------------------------------------
+  # `punktfunk-gamescope` for apt — the patched build that gives a gamescope session HDR, a cursor,
+  # and the client's real refresh rate instead of a hardcoded 60 Hz. Same reasoning as the RPM leg
+  # in rpm.yml: without a package, a Debian/Ubuntu box has no route to it except compiling by hand.
+  #
+  # ⚠ THIS IS ITS OWN JOB, ON DEBIAN 13, BECAUSE THE NOBLE BUILD COULD NEVER HAVE WORKED.
+  # It used to be a few best-effort steps inside build-publish-host (Ubuntu 24.04), where it failed
+  # every single time:
+  #     wlroots| Dependency wayland-server found: NO found 1.22.0 but need: '>=1.23.1'
+  # Our pin vendors wlroots 0.19.3, which floors wayland-server at 1.23.1; noble ships 1.22.0 and
+  # always will. v0.26.0 AND v0.27.0 both shipped with no gamescope .deb — while the release notes
+  # and docs-site told apt users to install it — because every rung of that path was a `::warning::`
+  # that returned 0, and the one hard gate ran last by design (so good artifacts still publish) and
+  # was simply never acted on. Moving it to trixie makes the build possible; making it a job of its
+  # own makes its failure visible instead of a footnote in someone else's log.
+  #
+  # Debian 13 is the OLDEST apt distro the tree configures on (wayland 1.23.1, libxcb-errors,
+  # libdisplay-info 0.2). The binary it produces needs GLIBC_2.38 and links no libstdc++, so what
+  # actually bounds it is wayland: Debian 13 and Ubuntu 26.04 YES, Ubuntu 24.04 NO — and 24.04
+  # could not run this binary however it was built, so nothing was lost by leaving noble.
+  build-publish-gamescope:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-gamescope-trixie:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Byte-identical to the other jobs' version step (pf-version.sh is deterministic per commit)
+      # — but only DISTRIBUTION is used here. The package version is the gamescope upstream
+      # version + our patch level, which build-gamescope-deb.sh derives itself; it deliberately
+      # does NOT follow the punktfunk version line, because this package moves on its own cadence.
+      - name: Channel
         run: |
-          shopt -s nullglob
-          built=(dist/punktfunk-gamescope_*.deb)
-          if [ ${#built[@]} -eq 0 ]; then
-            echo "::error::no punktfunk-gamescope .deb was built — a stable tag must not ship without it (the release notes and docs-site say it is apt-installable). Everything else in this job published normally; see the gamescope build step above for the meson error."
-            exit 1
-          fi
-          echo "gamescope .deb present: ${built[*]}"
+          git config --global --add safe.directory "$PWD"
+          case "$GITHUB_REF" in
+            refs/tags/v*) DIST=stable ;;
+            *)            DIST=canary ;;
+          esac
+          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
+          echo "gamescope -> apt distribution '$DIST'"
+
+      # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
+      # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
+      # Keyed `-trixie-` so the noble cache entries (which only ever held misses) can't be hit.
+      - uses: actions/cache@v4
+        id: gamescope
+        with:
+          path: gs-cache
+          key: punktfunk-gamescope-trixie-${{ hashFiles('packaging/gamescope/**') }}
+
+      # NOT best-effort, unlike the noble version of this step. Every dependency now comes from the
+      # image (which asserts the wayland floor at build time), so a failure here is a real
+      # regression in the tree or the pin — exactly the thing the previous arrangement hid.
+      - name: Build the patched gamescope
+        if: steps.gamescope.outputs.cache-hit != 'true'
+        # `--extra-fallback libdisplay-info` is what makes ONE .deb serve both Debian 13 and
+        # Ubuntu 26.04. Built against the distro's copy, the package picks up
+        # `Depends: libdisplay-info2 (>= 0.2.0)` on trixie — and Ubuntu 26.04 carries
+        # libdisplay-info **3** (0.3.0), so apt refuses it there ("Depends libdisplay-info2 …" —
+        # measured, not predicted). gamescope vendors the library as a submodule, so linking the
+        # vendored copy drops the dependency entirely. Same reasoning the build script already
+        # applies to wlroots: a binary we SHIP must not follow the build host's shared libraries.
+        run: |
+          bash packaging/gamescope/build-punktfunk-gamescope.sh \
+            --destdir "$PWD/gs-stage" --prefix /usr --jobs "$(nproc)" \
+            --extra-fallback libdisplay-info
+          install -Dm0755 gs-stage/usr/bin/punktfunk-gamescope gs-cache/punktfunk-gamescope
+
+      # The binary must RUN, not merely link: `--version` is what the old job used as its ship
+      # gate, and it is the cheapest proof that the static-libstdc++ trick and the vendored wlroots
+      # actually produced a working compositor.
+      - name: Build the .deb
+        run: |
+          gs-cache/punktfunk-gamescope --version
+          bash packaging/debian/build-gamescope-deb.sh --binary gs-cache/punktfunk-gamescope
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/punktfunk-gamescope_*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published gamescope to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the gamescope .deb to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/punktfunk-gamescope_*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
 
   # ---------------------------------------------------------------------------------------------
   # The aarch64 CLIENT .deb. Cross-compiled on the ordinary amd64 runner in the
@@ -560,3 +577,57 @@ jobs:
           for DEB in dist/*.deb; do
             upsert_asset "$RID" "$DEB"
           done
+
+  # ---------------------------------------------------------------------------------------------
+  # Does the thing we just published actually INSTALL? Nothing in this repo asked that before, and
+  # the cost of not asking was two independent, long-lived facts nobody knew:
+  #   * `punktfunk-host` has installed cleanly on Debian 13 for a long time — while docs-site said
+  #     "Debian isn't a supported target … nobody has verified it".
+  #   * `punktfunk-gamescope` was missing from apt entirely across two releases.
+  # Both are exactly what a five-minute install check catches, so it is now a job.
+  #
+  # It runs on the RUNNER (no `container:`) and drives docker directly — the same access
+  # docker.yml's image builds use — because the check must happen in a pristine distro image, not
+  # in a builder image with the deps already present.
+  #
+  # It installs FROM THE REGISTRY, after the publish jobs, rather than from a local .deb: that
+  # exercises the real path a user takes (repo key, apt distribution, dependency resolution against
+  # the distro's own package set), and it matches this workflow's established order — publish the
+  # good artifacts first, go red afterwards, never let a gate withhold a shipping fix.
+  smoke-install:
+    needs: [build-publish, build-publish-host, build-publish-gamescope]
+    # `needs` for ORDER only — this must still run when a builder went red, or the failure that
+    # matters most (a package that did not publish) is exactly the one that skips its own check and
+    # leaves the run looking merely "partly red" instead of saying what a user would hit.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recomputes the SAME version string the builder jobs stamped — pf-version.sh is
+      # deterministic per commit and GITHUB_RUN_NUMBER is shared across a run's jobs — so the check
+      # below can insist the registry is serving THIS run's build. Without that, a smoke job that
+      # beats the index regeneration installs the previous build, passes, and proves nothing.
+      - name: Channel + expected version
+        run: |
+          git config --global --add safe.directory "$PWD"
+          eval "$(bash scripts/ci/pf-version.sh)"
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
+            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
+          esac
+          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
+          echo "EXPECT_VERSION=$V" >> "$GITHUB_ENV"
+          echo "expecting $V in apt distribution '$DIST'"
+
+      # The support matrix, asserted rather than asserted-in-prose. Each row names the packages
+      # that MUST install on that distro; anything absent from the row is expected not to and is
+      # not checked here (the client's glibc 2.43 floor keeps it off 24.04 and Debian 13 —
+      # see docs-site/content/docs/debian.md).
+      - name: Install from the apt registry on every supported distro
+        run: bash scripts/ci/deb-install-smoke.sh
+        env:
+          PF_APT_DISTRIBUTION: ${{ env.DISTRIBUTION }}
+          PF_EXPECT_VERSION: ${{ env.EXPECT_VERSION }}

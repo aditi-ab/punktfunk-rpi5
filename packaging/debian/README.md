@@ -1,5 +1,18 @@
 # punktfunk-host — Debian/Ubuntu package (apt)
 
+> **Which distros the published packages install on** — measured by installing them, not inferred
+> from the build image (`scripts/ci/deb-install-smoke.sh` asserts this on every run):
+>
+> | | Ubuntu 24.04 | Ubuntu 26.04 | Debian 13 | Debian 12 |
+> |---|---|---|---|---|
+> | `punktfunk-host` | ✅ | ✅ | ✅ | ❌ glibc 2.36 < 2.39 |
+> | `punktfunk-web` / `punktfunk-scripting` | ✅ | ✅ | ✅ | ✅ |
+> | `punktfunk-gamescope` | ❌ wayland 1.22 | ✅ | ✅ | ❌ |
+> | `punktfunk-client` | ❌ `libc6 >= 2.43` | ✅ | ❌ `libc6 >= 2.43` | ❌ |
+>
+> Debian 13 is a supported host target ([docs](https://docs.punktfunk.unom.io/docs/debian)); the
+> client is the one gap, since it is built on 26.04 and floors at that release's glibc.
+
 `punktfunk-host` is published as a `.deb` to **Gitea's Debian package registry** in the public
 `unom` org, so the Ubuntu hosts update with plain `apt`. CI (`.gitea/workflows/deb.yml`) builds
 and publishes on every push to `main` (a rolling `<next-minor>~ciN.g<sha>` build — the base is
@@ -35,6 +48,37 @@ dropped from `Depends`). The result is **one** host `.deb` that installs on **Ub
 26.04** (glibc floor 2.39; no distro-FFmpeg dependency). The client/web/scripting `.deb`s still build
 on 26.04 (the native client needs SDL3 / GTK4 ≥ 4.20, absent on 24.04) — install the client on the box
 you stream *to*, which is independent of the host's distro.
+
+## `punktfunk-gamescope` is built on Debian 13, not Ubuntu
+
+The patched gamescope has its own job (`build-publish-gamescope`) in a **Debian 13** image
+(`ci/gamescope-trixie.Dockerfile`), and that is not a preference — it is the only apt distro the
+tree configures on. Built in the noble host image, as it was until 2026-08, it failed every single
+run:
+
+```
+wlroots| Dependency wayland-server found: NO found 1.22.0 but need: '>=1.23.1'
+subprojects/wlroots/meson.build:96:17: ERROR: Dependency 'wayland-server' is required but not found
+```
+
+Our pin vendors wlroots 0.19.3, which floors wayland-server at 1.23.1; noble ships 1.22.0 (and has
+no `libxcb-errors-dev`, and only libdisplay-info 0.1.1). Because every rung of that path was a
+`::warning::` returning 0, **v0.26.0 and v0.27.0 both shipped with no gamescope .deb** while the
+release notes and docs-site said it was apt-installable. Debian 13 has wayland 1.23.1 exactly —
+the oldest apt base that works.
+
+Two things make the one package serve both Debian 13 and Ubuntu 26.04:
+
+- **`--extra-fallback libdisplay-info`** (see `packaging/gamescope/build-punktfunk-gamescope.sh`).
+  Linked against the distro copy, the package picks up `Depends: libdisplay-info2 (>= 0.2.0)` on
+  trixie — and Ubuntu 26.04 carries libdisplay-info **3** (0.3.0), so apt refuses it there.
+  gamescope vendors the library as a submodule, so the vendored build drops the dependency. Same
+  reasoning the script already applies to wlroots: a binary we ship must not follow the build
+  host's shared libraries.
+- The **static C++ runtime** the build script already forces, so `libstdc++` never appears in
+  `NEEDED`. The binary asks only for `GLIBC_2.38`.
+
+**Ubuntu 24.04 gets no gamescope package** and cannot: the wayland floor is a runtime one too.
 
 ## Install on a host (one-time)
 
