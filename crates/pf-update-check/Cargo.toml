@@ -33,7 +33,9 @@ serde_json = "1"
 # runner. Naming it here makes the crate build standalone instead of relying on who else is in
 # the selection.
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-base64 = "0.22"
+# Feature selection matched to ureq's (and punktfunk-host's) on purpose — 0.23's default-on
+# `simd-unsafe` engine stays off, so a currency bump doesn't quietly add unsafe SIMD to the tree.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
 # Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
 # ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would

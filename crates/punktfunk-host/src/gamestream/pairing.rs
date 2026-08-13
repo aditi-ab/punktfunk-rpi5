@@ -10,7 +10,9 @@ use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::RsaPublicKey;
-use sha2::Sha256;
+// `rsa`'s own re-export — `VerifyingKey<Sha256>` below is an `rsa 0.9` / `digest 0.10` type
+// parameter, distinct from the crate-wide `sha2 0.11`. See Cargo.toml.
+use rsa::sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;

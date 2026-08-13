@@ -820,7 +820,8 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
     if let Some(path) = secret_file {
         match std::fs::read(path) {
             Ok(secret) => {
-                use hmac::{Hmac, Mac};
+                // `new_from_slice` moved from `Mac` to `KeyInit` in the digest 0.11 wave.
+                use hmac::{Hmac, KeyInit, Mac};
                 let mut mac = match Hmac::<sha2::Sha256>::new_from_slice(&secret) {
                     Ok(m) => m,
                     Err(_) => {

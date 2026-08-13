@@ -131,7 +131,7 @@ pub fn server(addr: std::net::SocketAddr) -> anyhow_result::Result<quinn::Endpoi
     let cert = rcgen::generate_simple_self_signed(vec!["punktfunk".into()])
         .map_err(|e| anyhow_result::Error::msg(format!("self-signed cert: {e}")))?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     server_from_der(cert_der, key_der.into(), addr, DEFAULT_IDLE_TIMEOUT)
 }
 
@@ -198,7 +198,7 @@ fn server_from_der(
 pub fn generate_identity() -> anyhow_result::Result<(String, String)> {
     let cert = rcgen::generate_simple_self_signed(vec!["punktfunk-client".into()])
         .map_err(|e| anyhow_result::Error::msg(format!("self-signed cert: {e}")))?;
-    Ok((cert.cert.pem(), cert.key_pair.serialize_pem()))
+    Ok((cert.cert.pem(), cert.signing_key.serialize_pem()))
 }
 
 /// Fingerprint of the client certificate a connection presented (host side), if any.

@@ -3,7 +3,7 @@
 use crate::anim::{approach, ease_out_cubic};
 use crate::glyphs::{hint_bar, Hint, HintKey};
 use crate::theme::{fg, Fonts, PanelStroke, W};
-use skia_safe::{gradient_shader, Canvas, Paint, Point, Rect, TileMode};
+use skia_safe::{gradient, Canvas, Paint, Point, Rect, TileMode};
 
 use super::{Shell, BOTTOM_BAND};
 
@@ -170,16 +170,16 @@ impl Shell {
         // A soft pool of shade under the centre seats the text against a bright field —
         // dark on a dark palette, light on a pale one, so it always separates.
         let mut vignette = Paint::default();
-        vignette.set_shader(gradient_shader::radial(
-            Point::new(cx as f32, (h / 2.0) as f32),
-            (w.max(h) * 0.42) as f32,
-            gradient_shader::GradientShaderColors::Colors(&[
-                crate::theme::shade(0.5).to_color(),
-                crate::theme::shade(0.0).to_color(),
-            ]),
-            None,
-            TileMode::Clamp,
-            None,
+        let shades = [crate::theme::shade(0.5), crate::theme::shade(0.0)];
+        vignette.set_shader(gradient::shaders::radial_gradient(
+            (
+                Point::new(cx as f32, (h / 2.0) as f32),
+                (w.max(h) * 0.42) as f32,
+            ),
+            &gradient::Gradient::new(
+                gradient::Colors::new_evenly_spaced(&shades, TileMode::Clamp, None),
+                gradient::Interpolation::default(),
+            ),
             None,
         ));
         canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &vignette);

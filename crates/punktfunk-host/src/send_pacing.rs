@@ -288,9 +288,9 @@ pub(crate) fn inject_video_drop<T>(packets: &mut Vec<T>) -> u64 {
         return 0;
     }
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let before = packets.len();
-    packets.retain(|_| rng.gen_range(0..100) >= pct);
+    packets.retain(|_| rng.random_range(0..100) >= pct);
     (before - packets.len()) as u64
 }
 

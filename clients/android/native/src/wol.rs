@@ -3,8 +3,9 @@
 //! host has no ARP entry, so the broadcast the core sends is what wakes it, and Kotlin calls this
 //! just before connecting to an offline saved host.
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
-use jni::JNIEnv;
+use jni::EnvUnowned;
 
 /// `NativeBridge.nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean` — send a Wake-on-LAN
 /// magic packet. `macsCsv` is comma-separated MACs (`aa:bb:..,cc:dd:..`, learned from the host's
@@ -12,29 +13,25 @@ use jni::JNIEnv;
 /// Returns true if at least one datagram went out.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeWakeOnLan<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     macs_csv: JString<'local>,
     last_ip: JString<'local>,
 ) -> jni::sys::jboolean {
-    let macs_csv: String = match env.get_string(&macs_csv) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
-    };
-    let last_ip: String = env
-        .get_string(&last_ip)
-        .map(Into::<String>::into)
-        .unwrap_or_default();
-    let macs: Vec<[u8; 6]> = macs_csv
-        .split(',')
-        .filter_map(|s| punktfunk_core::wol::parse_mac(s.trim()))
-        .collect();
-    if macs.is_empty() {
-        return 0;
-    }
-    let ip = last_ip.trim().parse::<std::net::Ipv4Addr>().ok();
-    match punktfunk_core::wol::send_magic_packet(&macs, ip) {
-        Ok(()) => 1,
-        Err(_) => 0,
-    }
+    env.with_env(|env| -> jni::errors::Result<bool> {
+        let macs_csv: String = macs_csv.try_to_string(env)?;
+        // Unlike `macs_csv`, an unreadable `lastIp` is not fatal: the core falls back to the
+        // subnet broadcast when it has no address, so keep the old lenient default.
+        let last_ip: String = last_ip.try_to_string(env).unwrap_or_default();
+        let macs: Vec<[u8; 6]> = macs_csv
+            .split(',')
+            .filter_map(|s| punktfunk_core::wol::parse_mac(s.trim()))
+            .collect();
+        if macs.is_empty() {
+            return Ok(false);
+        }
+        let ip = last_ip.trim().parse::<std::net::Ipv4Addr>().ok();
+        Ok(punktfunk_core::wol::send_magic_packet(&macs, ip).is_ok())
+    })
+    .resolve::<LogErrorAndDefault>()
 }

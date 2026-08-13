@@ -1,12 +1,10 @@
 //! Plane start/stop: video (HEVC decode → Surface), host→client audio, mic uplink — plus the
 //! ~1 Hz decode-stats drain for the HUD.
 
-use jni::objects::JObject;
-// Used only by the android-gated `nativeStartVideo`; on the host build that fn is cfg'd out.
-#[cfg(target_os = "android")]
-use jni::objects::JString;
-use jni::sys::{jboolean, jdoubleArray, jintArray, jlong, jsize, jstring};
-use jni::JNIEnv;
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{JDoubleArray, JIntArray, JObject, JString};
+use jni::sys::{jboolean, jlong};
+use jni::EnvUnowned;
 
 use super::{jni_guard, lock_recover, SessionHandle};
 
@@ -21,7 +19,7 @@ use super::{jni_guard, lock_recover, SessionHandle};
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     surface: JObject,
@@ -37,53 +35,58 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    if handle == 0 {
-        return;
-    }
-    // The decoder name Kotlin picked (empty string / read failure ⇒ None ⇒ default resolver).
-    let decoder = env
-        .get_string(&decoder_name)
-        .ok()
-        .map(String::from)
-        .filter(|s| !s.is_empty());
-    // SAFETY: live handle per the nativeConnect/nativeClose contract.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    let mut guard = lock_recover(&h.video);
-    if guard.is_some() {
-        return; // already streaming
-    }
-    // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
-    // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers).
-    let window = match unsafe {
-        ndk::native_window::NativeWindow::from_surface(
-            env.get_native_interface() as *mut _,
-            surface.as_raw() as *mut _,
-        )
-    } {
-        Some(w) => w,
-        None => {
-            log::error!("nativeStartVideo: no ANativeWindow from Surface");
-            return;
+    env.with_env(|env| -> jni::errors::Result<()> {
+        if handle == 0 {
+            return Ok(());
         }
-    };
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let client = h.client.clone();
-    let sd = shutdown.clone();
-    let st = h.stats.clone(); // session-lifetime stats (gate survives surface recreate)
-    let opts = crate::decode::DecodeOptions {
-        decoder_name: decoder,
-        ll_feature: ll_feature != 0,
-        low_latency_mode: low_latency_mode != 0,
-        is_tv: is_tv != 0,
-        present_priority,
-        smooth_buffer,
-        panel_hz: panel_fps,
-    };
-    let join = std::thread::Builder::new()
-        .name("pf-decode".into())
-        .spawn(move || crate::decode::run(client, window, sd, st, opts))
-        .ok();
-    *guard = Some(VideoThread { shutdown, join });
+        // The decoder name Kotlin picked (empty string / read failure ⇒ None ⇒ default resolver).
+        let decoder = decoder_name
+            .try_to_string(env)
+            .ok()
+            .filter(|s| !s.is_empty());
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let mut guard = lock_recover(&h.video);
+        if guard.is_some() {
+            return Ok(()); // already streaming
+        }
+        // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
+        // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers)
+        // — a real skew here, not a hypothetical one: `jni` is on jni-sys 0.4 while the vendored
+        // `ndk` is still on 0.3.
+        let window = match unsafe {
+            ndk::native_window::NativeWindow::from_surface(
+                env.get_raw() as *mut _,
+                surface.as_raw() as *mut _,
+            )
+        } {
+            Some(w) => w,
+            None => {
+                log::error!("nativeStartVideo: no ANativeWindow from Surface");
+                return Ok(());
+            }
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let client = h.client.clone();
+        let sd = shutdown.clone();
+        let st = h.stats.clone(); // session-lifetime stats (gate survives surface recreate)
+        let opts = crate::decode::DecodeOptions {
+            decoder_name: decoder,
+            ll_feature,
+            low_latency_mode,
+            is_tv,
+            present_priority,
+            smooth_buffer,
+            panel_hz: panel_fps,
+        };
+        let join = std::thread::Builder::new()
+            .name("pf-decode".into())
+            .spawn(move || crate::decode::run(client, window, sd, st, opts))
+            .ok();
+        *guard = Some(VideoThread { shutdown, join });
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeVideoMime(handle): String` — the MediaCodec MIME for the codec the host
@@ -93,21 +96,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
-) -> jstring {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         if handle == 0 {
-            return std::ptr::null_mut();
+            return Ok(JString::default());
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        match env.new_string(crate::decode::codec_mime(h.client.codec)) {
-            Ok(s) => s.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        env.new_string(crate::decode::codec_mime(h.client.codec))
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeVideoCodecLabel(handle): String` — a short human label for the codec the
@@ -118,21 +119,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecLabel<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
-) -> jstring {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         if handle == 0 {
-            return std::ptr::null_mut();
+            return Ok(JString::default());
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        match env.new_string(crate::decode::codec_label(h.client.codec)) {
-            Ok(s) => s.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        env.new_string(crate::decode::codec_label(h.client.codec))
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeVideoDecoderLabel(handle): String` — the resolved decoder identity for the
@@ -142,28 +141,26 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecL
 /// device).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDecoderLabel<'local>(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
-) -> jstring {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JString<'local> {
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         if handle == 0 {
-            return std::ptr::null_mut();
+            return Ok(JString::default());
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        match env.new_string(h.stats.decoder_label()) {
-            Ok(s) => s.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        env.new_string(h.stats.decoder_label())
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeStopVideo(handle)` — stop + join the decode thread (without closing the
 /// session). No-op on `0`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
@@ -211,19 +208,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
-    env: JNIEnv,
-    _this: JObject,
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handle: jlong,
-) -> jdoubleArray {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JDoubleArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JDoubleArray<'local>> {
         if handle == 0 {
-            return std::ptr::null_mut();
+            return Ok(JDoubleArray::default());
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
         if lock_recover(&h.video).is_none() {
-            return std::ptr::null_mut(); // not streaming → no stats
+            return Ok(JDoubleArray::default()); // not streaming → no stats
         }
         let snap = h
             .stats
@@ -294,15 +291,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             h.client.audio_buffer_ms() as f64,
             h.client.audio_av_offset_ms() as f64,
         ];
-        let arr = match env.new_double_array(buf.len() as jsize) {
-            Ok(a) => a,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        if env.set_double_array_region(&arr, 0, &buf).is_err() {
-            return std::ptr::null_mut();
-        }
-        arr.into_raw()
+        let arr = env.new_double_array(buf.len())?;
+        arr.set_region(env, 0, &buf)?;
+        Ok(arr)
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeVideoSize(handle): IntArray?` — the negotiated video mode as
@@ -313,14 +306,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
 /// on a `0` handle. Not android-gated — pure `jni` + a connector read, so it links on the host
 /// build too. Cheap; safe on the UI thread.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
-    env: JNIEnv,
-    _this: JObject,
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handle: jlong,
-) -> jintArray {
-    jni_guard(std::ptr::null_mut(), || {
+) -> JIntArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JIntArray<'local>> {
         if handle == 0 {
-            return std::ptr::null_mut();
+            return Ok(JIntArray::default());
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
@@ -330,15 +323,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
             mode.height as i32,
             mode.refresh_hz as i32,
         ];
-        let arr = match env.new_int_array(buf.len() as jsize) {
-            Ok(a) => a,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        if env.set_int_array_region(&arr, 0, &buf).is_err() {
-            return std::ptr::null_mut();
-        }
-        arr.into_raw()
+        let arr = env.new_int_array(buf.len())?;
+        arr.set_region(env, 0, &buf)?;
+        Ok(arr)
     })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeSetVideoStatsEnabled(handle, enabled)` — gate per-frame stats sampling on the
@@ -348,7 +337,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize(
 /// pure `jni` + an atomic store, so it links on the host build too.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoStatsEnabled(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     enabled: jboolean,
@@ -360,7 +349,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
             // The current cumulative counters seed the window baselines, so the first snapshot's
             // `lost`/`FEC` cover only time the HUD was actually up.
             h.stats.set_enabled(
-                enabled != 0,
+                enabled,
                 h.client.frames_dropped(),
                 h.client.fec_recovered_shards(),
             );
@@ -375,7 +364,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     low_latency_mode: jboolean,
@@ -389,7 +378,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     if guard.is_some() {
         return; // already playing
     }
-    match crate::audio::AudioPlayback::start(h.client.clone(), low_latency_mode != 0) {
+    match crate::audio::AudioPlayback::start(h.client.clone(), low_latency_mode) {
         Some(p) => *guard = Some(p),
         None => log::error!("nativeStartAudio: playback init failed (video unaffected)"),
     }
@@ -400,7 +389,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
@@ -424,7 +413,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     echo_cancel: jboolean,
@@ -440,7 +429,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     }
     // The capture SHARES the session's mute flag, so one started while muted stays muted (and
     // sends nothing) from its very first frame — see `SessionHandle::mic_muted`.
-    match crate::mic::MicCapture::start(h.client.clone(), echo_cancel != 0, h.mic_muted.clone()) {
+    match crate::mic::MicCapture::start(h.client.clone(), echo_cancel, h.mic_muted.clone()) {
         Some(m) => {
             let session_id = m.session_id();
             *guard = Some(m);
@@ -459,7 +448,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
@@ -487,7 +476,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
 #[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAudio(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jni::sys::jint,
@@ -495,9 +484,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
     haptics: jboolean,
     speaker: jboolean,
 ) -> jboolean {
-    jni_guard(0, || {
+    jni_guard(false, || {
         if handle == 0 || fd < 0 || !(0..16).contains(&pad) {
-            return 0;
+            return false;
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
@@ -512,14 +501,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
             std::sync::Arc::clone(&h.client),
             pad as u8,
             fd,
-            haptics != 0,
-            speaker != 0,
+            haptics,
+            speaker,
         ) {
             Some(p) => {
                 *lock_recover(&h.pad_audio) = Some(p);
-                1
+                true
             }
-            None => 0,
+            None => false,
         }
     })
 }
@@ -533,7 +522,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
 #[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSelfTest(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     fd: jni::sys::jint,
     seconds: jni::sys::jint,
@@ -556,7 +545,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadAudioSel
 #[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudio(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     pad: jni::sys::jint,
@@ -596,7 +585,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
 /// no captured audio leaves the process.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     muted: jboolean,
@@ -606,7 +595,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted
             // SAFETY: live handle per the nativeConnect/nativeClose contract.
             let h = unsafe { &*(handle as *const SessionHandle) };
             h.mic_muted
-                .store(muted != 0, std::sync::atomic::Ordering::Relaxed);
+                .store(muted, std::sync::atomic::Ordering::Relaxed);
         }
     })
 }
@@ -619,16 +608,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    jni_guard(0, || {
+    jni_guard(false, || {
         if handle == 0 {
-            return 0;
+            return false;
         }
         // SAFETY: live handle per the nativeConnect/nativeClose contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        jboolean::from(lock_recover(&h.mic).is_some())
+        lock_recover(&h.mic).is_some()
     })
 }

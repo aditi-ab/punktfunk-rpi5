@@ -8,9 +8,10 @@
 //! compile on the host build too (parity with the input shims in [`crate::session`]).
 
 use crate::session::{jni_guard, SessionHandle};
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jint, jlong};
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use punktfunk_core::quic::HidOutput;
 use std::time::Duration;
 
@@ -62,7 +63,7 @@ const TAG_HID_RAW: u8 = 0x05;
 /// poll thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jlong {
@@ -101,94 +102,103 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
 /// Returns the byte count written, or `-1` on timeout / session closed / buffer too small.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     buf: JByteBuffer,
 ) -> jint {
     // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
+    //
+    // Deliberately `with_env_no_catch` INSIDE `jni_guard`, not the usual `with_env`: every error
+    // policy resolves a failure to `T::default()`, and `jint::default()` is 0 — a *valid* byte
+    // count — whereas this method's contract says -1. Letting the panic travel out to `jni_guard`
+    // keeps the -1 sentinel exact. Every non-panic failure path below likewise returns `Ok(-1)`
+    // rather than `Err`, so the policy's default is unreachable by construction.
     jni_guard(-1, || {
-        if handle == 0 {
-            return -1;
-        }
-        // SAFETY: live handle per the contract; next_hidout is &self on the Sync connector.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        let ev = match h.client.next_hidout(PULL_TIMEOUT) {
-            Ok(ev) => ev,
-            Err(_) => return -1, // timeout or closed — Kotlin loops
-        };
+        env.with_env_no_catch(|env| -> jni::errors::Result<jint> {
+            if handle == 0 {
+                return Ok(-1);
+            }
+            // SAFETY: live handle per the contract; next_hidout is &self on the Sync connector.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            let ev = match h.client.next_hidout(PULL_TIMEOUT) {
+                Ok(ev) => ev,
+                Err(_) => return Ok(-1), // timeout or closed — Kotlin loops
+            };
 
-        // The caller passes a direct ByteBuffer (allocateDirect) so we write its backing store directly.
-        let cap = match env.get_direct_buffer_capacity(&buf) {
-            Ok(c) => c,
-            Err(_) => return -1,
-        };
-        let ptr = match env.get_direct_buffer_address(&buf) {
-            Ok(p) if !p.is_null() => p,
-            _ => return -1,
-        };
-        // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call.
-        let out = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
+            // The caller passes a direct ByteBuffer (allocateDirect) so we write its backing store directly.
+            let cap = match env.get_direct_buffer_capacity(&buf) {
+                Ok(c) => c,
+                Err(_) => return Ok(-1),
+            };
+            let ptr = match env.get_direct_buffer_address(&buf) {
+                Ok(p) if !p.is_null() => p,
+                _ => return Ok(-1),
+            };
+            // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call.
+            let out = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
 
-        // out[0] = wire pad index; out[1] = kind tag; the rest is the per-kind payload.
-        let n = match ev {
-            HidOutput::Led { pad, r, g, b } => {
-                if cap < 5 {
-                    return -1;
+            // out[0] = wire pad index; out[1] = kind tag; the rest is the per-kind payload.
+            let n = match ev {
+                HidOutput::Led { pad, r, g, b } => {
+                    if cap < 5 {
+                        return Ok(-1);
+                    }
+                    out[0] = pad;
+                    out[1] = TAG_LED;
+                    out[2] = r;
+                    out[3] = g;
+                    out[4] = b;
+                    5
                 }
-                out[0] = pad;
-                out[1] = TAG_LED;
-                out[2] = r;
-                out[3] = g;
-                out[4] = b;
-                5
-            }
-            HidOutput::PlayerLeds { pad, bits } => {
-                if cap < 3 {
-                    return -1;
+                HidOutput::PlayerLeds { pad, bits } => {
+                    if cap < 3 {
+                        return Ok(-1);
+                    }
+                    out[0] = pad;
+                    out[1] = TAG_PLAYER_LEDS;
+                    out[2] = bits;
+                    3
                 }
-                out[0] = pad;
-                out[1] = TAG_PLAYER_LEDS;
-                out[2] = bits;
-                3
-            }
-            HidOutput::Trigger { pad, which, effect } => {
-                let n = 3 + effect.len();
-                if cap < n {
-                    return -1; // the raw DS5 trigger block is ~11 bytes; Kotlin allocates 64
+                HidOutput::Trigger { pad, which, effect } => {
+                    let n = 3 + effect.len();
+                    if cap < n {
+                        return Ok(-1); // the raw DS5 trigger block is ~11 bytes; Kotlin allocates 64
+                    }
+                    out[0] = pad;
+                    out[1] = TAG_TRIGGER;
+                    out[2] = which;
+                    out[3..n].copy_from_slice(&effect);
+                    n
                 }
-                out[0] = pad;
-                out[1] = TAG_TRIGGER;
-                out[2] = which;
-                out[3..n].copy_from_slice(&effect);
-                n
-            }
-            HidOutput::TrackpadHaptic { .. } => {
-                // Steam Controller trackpad-coil haptics — no Android equivalent; drop it (motor
-                // rumble already rides the universal 0xCA plane).
-                return -1;
-            }
-            HidOutput::HidRaw { pad, kind, data } => {
-                // As-is SC2 passthrough: the host's hidraw consumer (Steam) wrote this report to
-                // the virtual pad; Kotlin replays it verbatim on the physical controller.
-                // `[pad][0x05][kind][report…]` — kind 0 = output report, 1 = feature report.
-                let n = 3 + data.len();
-                if cap < n {
-                    return -1; // reports are ≤ 64 bytes; Kotlin allocates 128
+                HidOutput::TrackpadHaptic { .. } => {
+                    // Steam Controller trackpad-coil haptics — no Android equivalent; drop it (motor
+                    // rumble already rides the universal 0xCA plane).
+                    return Ok(-1);
                 }
-                out[0] = pad;
-                out[1] = TAG_HID_RAW;
-                out[2] = kind;
-                out[3..n].copy_from_slice(&data);
-                n
-            }
-            HidOutput::AudioCtl { .. } => {
-                // DS5 pad-audio routing/volumes — no Android replay path yet (the 0xD1 sample
-                // plane isn't rendered here either); drop it like TrackpadHaptic.
-                return -1;
-            }
-        };
-        n as jint
+                HidOutput::HidRaw { pad, kind, data } => {
+                    // As-is SC2 passthrough: the host's hidraw consumer (Steam) wrote this report to
+                    // the virtual pad; Kotlin replays it verbatim on the physical controller.
+                    // `[pad][0x05][kind][report…]` — kind 0 = output report, 1 = feature report.
+                    let n = 3 + data.len();
+                    if cap < n {
+                        return Ok(-1); // reports are ≤ 64 bytes; Kotlin allocates 128
+                    }
+                    out[0] = pad;
+                    out[1] = TAG_HID_RAW;
+                    out[2] = kind;
+                    out[3..n].copy_from_slice(&data);
+                    n
+                }
+                HidOutput::AudioCtl { .. } => {
+                    // DS5 pad-audio routing/volumes — no Android replay path yet (the 0xD1 sample
+                    // plane isn't rendered here either); drop it like TrackpadHaptic.
+                    return Ok(-1);
+                }
+            };
+            Ok(n as jint)
+        })
+        .resolve::<LogErrorAndDefault>()
     })
 }
 

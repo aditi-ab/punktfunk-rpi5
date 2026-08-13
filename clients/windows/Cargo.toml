@@ -89,7 +89,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # (see the `gamepad` field in app/); the spawned punktfunk-session does the actual forwarding. SDL3
 # itself (built from source via the bundled CMake on Windows) is pulled transitively by
 # pf-client-core with the same `build-from-source,hidapi` features, so it is not a direct dep here.
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 async-channel = "2"
 serde_json = "1"
 tracing = "0.1"

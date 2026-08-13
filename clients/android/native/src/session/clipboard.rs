@@ -15,9 +15,10 @@
 
 use std::time::Duration;
 
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jint, jlong, jstring};
-use jni::JNIEnv;
+use jni::sys::{jboolean, jint, jlong};
+use jni::EnvUnowned;
 use punktfunk_core::clipboard::ClipEventCore;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::quic::{ClipKind, CLIP_FILE_INDEX_NONE, HOST_CAP_CLIPBOARD};
@@ -42,26 +43,24 @@ fn client(handle: jlong) -> Option<&'static SessionHandle> {
 /// `NativeBridge.nativeClipSupported(handle)` — the host advertised `HOST_CAP_CLIPBOARD`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipSupported(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    client(handle).map_or(0, |h| {
-        u8::from(h.client.host_caps() & HOST_CAP_CLIPBOARD != 0)
-    })
+    client(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_CLIPBOARD != 0)
 }
 
 /// `NativeBridge.nativeClipControl(handle, enabled)` — session-level opt-in/out. Nothing
 /// clipboard-related happens on either side until an `enabled: true` crosses.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipControl(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     enabled: jboolean,
 ) {
     if let Some(h) = client(handle) {
-        let _ = h.client.clip_control(enabled != 0, 0);
+        let _ = h.client.clip_control(enabled, 0);
     }
 }
 
@@ -70,7 +69,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipControl
 /// counter, newest wins.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipOfferText(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     seq: jint,
@@ -90,7 +89,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipOfferTe
 /// Returns the transfer id echoed on the matching `data:`/`error:` event, or −1.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipFetchText(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     seq: jint,
@@ -108,26 +107,32 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipFetchTe
 /// clipboard's current text (the host is pasting our offer).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipServeText(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     req_id: jint,
     text: JString,
 ) {
-    let Some(h) = client(handle) else { return };
-    let Ok(s) = env.get_string(&text) else {
-        let _ = h.client.clip_cancel(req_id as u32);
-        return;
-    };
-    let _ = h
-        .client
-        .clip_serve(req_id as u32, String::from(s).into_bytes(), true);
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let Some(h) = client(handle) else {
+            return Ok(());
+        };
+        // An unreadable payload still has to answer the host's `fetch:` — leaving it unanswered
+        // stalls the paste — so cancel the transfer rather than propagating the error.
+        let Ok(s) = text.try_to_string(env) else {
+            let _ = h.client.clip_cancel(req_id as u32);
+            return Ok(());
+        };
+        let _ = h.client.clip_serve(req_id as u32, s.into_bytes(), true);
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// `NativeBridge.nativeClipCancel(handle, id)` — abort a transfer (either direction).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipCancel(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
     id: jint,
@@ -145,38 +150,41 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipCancel(
 /// clipboard task delivers a whole payload in ONE event (`last = true`), so a chunk boundary
 /// can never split a UTF-8 sequence.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextClip(
-    env: JNIEnv,
-    _this: JObject,
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextClip<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handle: jlong,
-) -> jstring {
-    let Some(h) = client(handle) else {
-        return std::ptr::null_mut();
-    };
-    let msg = match h.client.next_clip(Duration::from_millis(250)) {
-        Ok(ClipEventCore::State { enabled, .. }) => format!("state:{}", u8::from(enabled)),
-        Ok(ClipEventCore::RemoteOffer { seq, kinds }) => {
-            let has_text = kinds.iter().any(|k| k.mime.starts_with("text/plain"));
-            format!("offer:{seq}:{}", u8::from(has_text))
-        }
-        Ok(ClipEventCore::FetchRequest { req_id, mime, .. }) => {
-            if mime.starts_with("text/plain") {
-                format!("fetch:{req_id}")
-            } else {
-                // We only ever offer text; cancel anything else rather than stall the host.
-                let _ = h.client.clip_cancel(req_id);
-                return std::ptr::null_mut();
+) -> JString<'local> {
+    // `JString::default()` is the null reference the old `std::ptr::null_mut()` returned, so the
+    // "null on timeout" contract in the doc comment above is unchanged.
+    env.with_env(|env| -> jni::errors::Result<JString<'local>> {
+        let Some(h) = client(handle) else {
+            return Ok(JString::default());
+        };
+        let msg = match h.client.next_clip(Duration::from_millis(250)) {
+            Ok(ClipEventCore::State { enabled, .. }) => format!("state:{}", u8::from(enabled)),
+            Ok(ClipEventCore::RemoteOffer { seq, kinds }) => {
+                let has_text = kinds.iter().any(|k| k.mime.starts_with("text/plain"));
+                format!("offer:{seq}:{}", u8::from(has_text))
             }
-        }
-        Ok(ClipEventCore::Data { xfer_id, bytes, .. }) => {
-            format!("data:{xfer_id}:{}", String::from_utf8_lossy(&bytes))
-        }
-        Ok(ClipEventCore::Cancelled { id }) => format!("cancel:{id}"),
-        Ok(ClipEventCore::Error { id, code }) => format!("error:{id}:{code}"),
-        Err(PunktfunkError::NoFrame) => return std::ptr::null_mut(),
-        Err(_) => "closed".into(),
-    };
-    env.new_string(msg)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+            Ok(ClipEventCore::FetchRequest { req_id, mime, .. }) => {
+                if mime.starts_with("text/plain") {
+                    format!("fetch:{req_id}")
+                } else {
+                    // We only ever offer text; cancel anything else rather than stall the host.
+                    let _ = h.client.clip_cancel(req_id);
+                    return Ok(JString::default());
+                }
+            }
+            Ok(ClipEventCore::Data { xfer_id, bytes, .. }) => {
+                format!("data:{xfer_id}:{}", String::from_utf8_lossy(&bytes))
+            }
+            Ok(ClipEventCore::Cancelled { id }) => format!("cancel:{id}"),
+            Ok(ClipEventCore::Error { id, code }) => format!("error:{id}:{code}"),
+            Err(PunktfunkError::NoFrame) => return Ok(JString::default()),
+            Err(_) => "closed".into(),
+        };
+        env.new_string(msg)
+    })
+    .resolve::<LogErrorAndDefault>()
 }

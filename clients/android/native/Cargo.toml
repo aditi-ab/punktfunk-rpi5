@@ -18,20 +18,38 @@ crate-type = ["cdylib"]
 # the punktfunk/1 control plane, whose TLS runs on aws-lc-rs (see punktfunk-core/Cargo.toml) —
 # aws-lc-sys cross-compiles for all three ABIs with the NDK clang cargo-ndk already exports.
 punktfunk-core = { path = "../../../crates/punktfunk-core", features = ["quic"] }
-jni = "0.21"
+# 0.22, NOT 0.21 — and the version is load-bearing beyond currency: `rustls-platform-verifier`
+# (via quinn-proto, for Android cert verification) already depends on jni 0.22, so pinning 0.21
+# here compiled TWO jni copies into the one .so. Matching it collapses them and, with them, the
+# whole windows-rs 0.42 generation jni 0.21 dragged in behind `cfg(windows)` (windows-sys 0.45 —
+# the oldest crate in the tree — plus windows-targets 0.42.2 and its seven per-arch import libs)
+# and jni 0.21's `cesu8`: 11 crates, for a dependency that never even builds on Android.
+#
+# NOTE for whoever next tries to retire thiserror 1.0 or the jni-sys 0.3/0.4 split: jni is no
+# longer why they are here. Both now come solely from `vendor/ndk` 0.9.0 (thiserror 1.0.23,
+# jni-sys 0.3) and the crates.io `ndk-sys` 0.6 (jni-sys 0.3). jni-sys 0.3.1 is itself a facade
+# over 0.4.1, so the "split" cannot close until ndk + ndk-sys move — and ndk is vendored for one
+# visibility patch, so bumping its deps would mean rewriting the vendor rather than a version edit.
+jni = "0.22"
 log = "0.4"
 # LAN host discovery: browse the host's `_punktfunk._udp` mDNS advert — the SAME crate + service the
 # Linux/Windows clients use (`crates/pf-client-core/src/discovery.rs`), replacing Android's per-OEM
 # `NsdManager` system daemon with one tested browse path. Pure Rust (socket2/if-addrs/mio), so it
 # cross-compiles to the Android targets AND builds on the host (the JNI seam links into
 # `cargo build --workspace`). Kotlin keeps only the Wi-Fi `MulticastLock` + permission UX.
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 
 # Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
 # compiles this crate (as a host cdylib) — the Android-framework glue (logging, AMediaCodec + AAudio
 # via `ndk`, the Opus codec) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
+# Default features only, DELIBERATELY: 0.15 added an opt-in `android-api-30` feature that routes
+# level filtering through `__android_log_is_loggable_len` so logcat's system-wide/process-wide
+# level overrides (`setprop log.tag.*`) are honoured. That symbol is API 30 and the feature
+# HARD-LINKS it — on our minSdk-28 floor (Android 9/10) `System.loadLibrary` would fail outright,
+# the same way ndk 0.9.0 hard-linking `AMediaCodec_setOnFrameRenderedCallback` broke every
+# pre-Android-13 device (see the `ndk-sys` note below). Do not enable it while minSdk is 28.
+android_logger = "0.15"
 # Feature bridge, no code here: punktfunk-core logs through `tracing`, but this client only
 # installs `android_logger` (a `log` backend). Core transport warnings (e.g. "UDP socket buffer
 # capped well below target") reach logcat only via tracing's "log" feature, which forwards events
