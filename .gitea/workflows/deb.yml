@@ -180,7 +180,31 @@ jobs:
           cargo build --release --locked \
             -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
 
+      # ── The web console, built ONCE per (web+sdk content, bun) rather than once per job ────────
+      # This bundle was being rebuilt six times on every push — ci.yml, here, both RPM legs, arch,
+      # and the docker app image — at ~2.5 min each, for output that is a pure function of web/ and
+      # sdk/. windows-host.yml has cached it this way for a while; this is the same arrangement for
+      # the Linux packaging legs, sharing one key family so a hit in one warms the others.
+      #
+      # The bun version is IN THE KEY. Each builder image installs its own bun (rust-ci, fedora-rpm
+      # and arch-ci each run the bun.sh installer at image-build time), so without it a bundle built
+      # by one image's bun could be shipped by a job running a different one. They are usually the
+      # same version and do share; when they diverge, they simply stop sharing instead of silently
+      # mixing.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
       - name: Build + smoke-boot web console (bun preset)
+        # Skipped when the cache already holds this exact (web+sdk, bun) bundle — the assertion step
+        # below is what makes that safe. The bundle in the cache was smoke-booted by the run that
+        # produced it, and ci.yml's `web` job still builds and tests the console on every push.
+        if: steps.webconsole.outputs.cache-hit != 'true'
         # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
         # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
         # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
@@ -209,6 +233,22 @@ jobs:
           kill "$NP" 2>/dev/null || true
           echo "web console smoke: /login -> $code"
           [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under bun"; exit 1; }
+
+      # ⚠ NOT optional, and it must run on BOTH paths (cache hit and fresh build). The packaging
+      # scripts treat a missing web/.output as "build it yourself", which is right for a local run
+      # and wrong here: it would silently turn a broken cache restore into a slow, quiet rebuild, or
+      # — with the build step skipped and the restore empty — into a package with no console at all.
+      # windows-host.yml shipped exactly that in 0.22.1/0.22.2 (an unset WEB_OUTPUT_DIR behind a
+      # single Write-Host), which is why its equivalent step throws too. Fail loudly instead.
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
 
       - name: Build .debs
         run: |

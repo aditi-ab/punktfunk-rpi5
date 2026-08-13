@@ -228,6 +228,39 @@ jobs:
           echo "REPO=$REPO" >> "$GITHUB_ENV"
           echo "pacman $V-$R -> repo '$REPO'"
 
+      # ── The web console, built once per (web+sdk content, bun) instead of once per job ─────────
+      # Shares deb.yml's key family — see the fuller note there. Unlike the RPM leg this needs no
+      # hand-off macro: makepkg builds with PF_SRCDIR pointing at this workspace, so a restored
+      # web/.output is already exactly where PKGBUILD's build-if-missing guard looks for it.
+      #
+      # Built here as root, BEFORE the makepkg step's `chown -R builder:` sweeps the tree, so the
+      # bundle ends up owned like everything else the builder user is handed.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build the web console (cache miss only)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        run: |
+          cd web
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
       - name: Build packages (makepkg)
         run: |
           git config --global --add safe.directory "$PWD"
