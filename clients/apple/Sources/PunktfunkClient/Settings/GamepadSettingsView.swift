@@ -395,6 +395,14 @@ struct GamepadSettingsView: View {
             }
             Spacer(minLength: 0)
         }
+        // Line up with the ROWS, not the screen. They are a centred column of `rowMaxWidth`
+        // (920 on a TV, against a 1920-wide screen), so a full-width identity card started a few
+        // hundred points to the left of every row under it and read as a separate banner. Same
+        // column, same inner inset as a row's contents, so the icon sits directly above the row
+        // icons — then centred in the header the way the list centres its rows.
+        .padding(.horizontal, metrics.rowHPad)
+        .frame(maxWidth: metrics.rowMaxWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
         .padding(.horizontal, 24)
     }
 

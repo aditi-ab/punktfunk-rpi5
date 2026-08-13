@@ -278,7 +278,14 @@ struct AppIconView: View {
                 monogram
             }
         }
+        // tvOS's icon is a 400×240 rectangle, not a squircle — framing it square would letterbox
+        // it inside a box two thirds empty. `side` means HEIGHT there, and the width follows the
+        // real 5:3 art.
+        #if os(tvOS)
+        .frame(width: side * (400.0 / 240.0), height: side)
+        #else
         .frame(width: side, height: side)
+        #endif
         .accessibilityHidden(true) // the app's name is the next line
     }
 
@@ -312,7 +319,14 @@ struct AppIconView: View {
         else { return nil }
         return (Image(uiImage: image), true)
         #else
-        return nil // tvOS: layered icons have no single image to load
+        // tvOS ships the icon as a parallax image STACK (Back/Circle1/Circle2/Front), which has
+        // no single image to load — which is why this used to return nil and every About page on
+        // the TV drew the "P" monogram instead of the app's own mark. `AboutAppIcon` is those
+        // four layers flattened into one asset, generated from the SAME art the stack uses so it
+        // cannot drift into being a second, subtly different icon. Already masked and composited,
+        // so it needs no rounding of ours.
+        guard let image = UIImage(named: "AboutAppIcon") else { return nil }
+        return (Image(uiImage: image), false)
         #endif
     }
 }
