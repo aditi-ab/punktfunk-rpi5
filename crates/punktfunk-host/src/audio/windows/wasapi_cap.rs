@@ -43,6 +43,15 @@ pub struct WasapiLoopbackCapturer {
     channels: u32,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// Whether a session is currently CONSUMING this capturer, shared with the capture thread
+    /// so the drop counter can tell "the encode thread fell behind" from "nobody is reading".
+    /// The native/gamestream planes park a capturer between sessions
+    /// ([`idle`](AudioCapturer::idle)) instead of dropping it, and the hand-off channel is
+    /// bounded — so without this the thread fills it once, then counts every subsequent chunk
+    /// as a drop and warns that "the stream will click" with no stream to click. Proven on the
+    /// Linux twin by a 2026-08-13 field log (100 % drop rate across session gaps); the parking
+    /// call sites are platform-independent, so this half had the same defect.
+    active: Arc<AtomicBool>,
 }
 
 impl WasapiLoopbackCapturer {
@@ -58,10 +67,13 @@ impl WasapiLoopbackCapturer {
         // rather than a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
         let stop_t = stop.clone();
+        // Opens at session start, so the consumer is live from the first chunk.
+        let active = Arc::new(AtomicBool::new(true));
+        let active_t = active.clone();
         let join = thread::Builder::new()
             .name("punktfunk-wasapi-audio".into())
             .spawn(move || {
-                if let Err(e) = capture_thread(tx, stop_t, ready_tx, channels) {
+                if let Err(e) = capture_thread(tx, stop_t, ready_tx, channels, active_t) {
                     tracing::error!(error = %format!("{e:#}"), "wasapi loopback thread failed");
                 }
             })
@@ -76,6 +88,7 @@ impl WasapiLoopbackCapturer {
                     channels,
                     stop,
                     join: Some(join),
+                    active,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -92,6 +105,9 @@ impl WasapiLoopbackCapturer {
 
 impl Drop for WasapiLoopbackCapturer {
     fn drop(&mut self) {
+        // The receiver dies with us; anything the thread still pushes is unwanted by
+        // definition, and must not be reported as the encode thread falling behind.
+        self.active.store(false, Ordering::Relaxed);
         self.stop.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -114,6 +130,14 @@ impl AudioCapturer for WasapiLoopbackCapturer {
     }
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
+        // Ordered AFTER the backlog drain, so the capture thread never counts a drop against a
+        // channel this call is still emptying.
+        self.active.store(true, Ordering::Relaxed);
+    }
+    fn idle(&mut self) {
+        // Parked: from here the channel fills and stays full, and those drops are nobody's
+        // fault. See [`WasapiLoopbackCapturer::active`].
+        self.active.store(false, Ordering::Relaxed);
     }
 }
 
@@ -167,6 +191,7 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<()>>,
     channels: u32,
+    active: Arc<AtomicBool>,
 ) -> Result<()> {
     // COM must be initialized on THIS thread (MTA), before any device call.
     if let Err(e) = wasapi::initialize_mta()
@@ -192,7 +217,7 @@ fn capture_thread(
     // is said once per topology — the field log drowned in 256+ copies of the same line.
     let mut unsat_logged: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
-        match capture_once(&tx, &stop, &mut ready, channels, mode) {
+        match capture_once(&tx, &stop, &mut ready, channels, mode, &active) {
             Ok(Next::Stopped) => break,
             Ok(Next::Reopen(m)) => {
                 mode = m;
@@ -357,6 +382,7 @@ fn capture_once(
     ready: &mut Option<SyncSender<Result<()>>>,
     channels: u32,
     mode: TargetMode,
+    active: &AtomicBool,
 ) -> Result<Next> {
     // Interleaved f32: channels * 4 bytes per frame.
     let block_align = channels as usize * 4;
@@ -611,10 +637,14 @@ fn capture_once(
                 samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             stats.observe(&samples, channels);
-            // Non-blocking, lossy — same discipline as PipeWire. Now COUNTED: a full channel
-            // means the encode thread is not keeping up, and every dropped chunk is a click plus
-            // a permanent shift of everything after it.
-            if tx.try_send(samples).is_err() {
+            // Non-blocking, lossy — same discipline as PipeWire. COUNTED, and only while a
+            // session is actually reading: a full channel under a LIVE consumer means the encode
+            // thread is not keeping up, and every dropped chunk is a click plus a permanent
+            // shift of everything after it. A full channel under a PARKED capturer means nothing
+            // — the planes park capturers between sessions rather than dropping them, so the
+            // channel fills once and then refuses everything
+            // ([`WasapiLoopbackCapturer::active`]).
+            if tx.try_send(samples).is_err() && active.load(Ordering::Relaxed) {
                 stats.dropped_chunks += 1;
             }
         }
