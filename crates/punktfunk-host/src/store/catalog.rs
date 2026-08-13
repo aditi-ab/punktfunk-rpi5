@@ -266,11 +266,27 @@ mod tests {
     /// on someone's host.
     #[test]
     fn ureq_returns_304_as_ok() {
-        use std::io::Write as _;
+        use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
+                // Drain the request BEFORE answering. Closing a socket that still has unread
+                // received data makes Windows send an RST rather than a FIN, which destroys the
+                // response we just wrote — the client then sees a transport error (os error 10053)
+                // instead of the 304 this test exists to pin. A GET has no body, so the header
+                // terminator is the whole request.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = sock.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
                 let _ = sock.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n");
                 let _ = sock.flush();
             }

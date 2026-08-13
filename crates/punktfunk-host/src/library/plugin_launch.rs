@@ -281,13 +281,27 @@ mod tests {
 
     #[test]
     fn asks_the_registered_plugin_and_takes_its_answer() {
-        let (port, server) =
-            stub_plugin(200, r#"{"command":"retroarch 'smw.sfc'","cwd":"/opt/emu"}"#);
+        // The cwd has to be absolute FOR THE HOST PLATFORM: `/opt/emu` has no drive letter, so
+        // `Path::is_absolute` is false on Windows and `validate_reply` refuses the recipe — this
+        // test could never pass there. Same split as `a_working_directory_must_be_absolute`.
+        // (The `\\` is JSON escaping; the decoded value is `C:\emu`.)
+        let (answer, cwd) = if cfg!(windows) {
+            (
+                r#"{"command":"retroarch 'smw.sfc'","cwd":"C:\\emu"}"#,
+                r"C:\emu",
+            )
+        } else {
+            (
+                r#"{"command":"retroarch 'smw.sfc'","cwd":"/opt/emu"}"#,
+                "/opt/emu",
+            )
+        };
+        let (port, server) = stub_plugin(200, answer);
         crate::mgmt::register_ui_for_test("stub-launcher", port, "s3cr3t");
 
         let got = ask_plugin_launch("stub-launcher", "snes/smw.sfc").expect("a recipe");
         assert_eq!(got.command, "retroarch 'smw.sfc'");
-        assert_eq!(got.cwd.as_deref(), Some(std::path::Path::new("/opt/emu")));
+        assert_eq!(got.cwd.as_deref(), Some(std::path::Path::new(cwd)));
 
         let req = server.join().expect("stub thread");
         assert!(req.starts_with("POST /__launch "), "request was {req:?}");
