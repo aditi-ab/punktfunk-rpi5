@@ -2803,6 +2803,7 @@ mod tests {
                 plane1: None,
                 offset: 0,
                 stride: 64 * 4,
+                hold: None,
             }
         };
         let fd_count = || std::fs::read_dir("/proc/self/fd").expect("procfs").count();

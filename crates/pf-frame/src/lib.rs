@@ -231,6 +231,23 @@ pub struct CapturedFrame {
     pub cursor: Option<CursorOverlay>,
 }
 
+/// Keeps the producer's buffer behind a zero-copy frame OUT of the producer's pool.
+///
+/// The fd on a [`DmabufFrame`] only keeps the buffer object from being *freed*; nothing stops the
+/// compositor from *re-rendering into it* once the capture layer hands the buffer back — which it
+/// used to do at `.process` return, before the encoder had even imported the dmabuf (the
+/// gamescope-at-120fps torn-frame race). This handle is the fix: the PipeWire capture attaches one
+/// to every raw-passthrough frame (pool depth permitting) and defers the requeue until the LAST
+/// clone drops. A consumer that reads the dmabuf asynchronously (the Vulkan encoder's ring) clones
+/// it into whatever tracks the read (its ring slot) and drops it when the GPU is provably done
+/// (the slot's fence), so content stability covers exactly the read window. Consumers that finish
+/// their read while the frame is alive need to do nothing — the frame's own clone is enough.
+///
+/// Opaque on purpose: the concrete guard lives in the capture crate; everyone else only clones and
+/// drops.
+#[cfg(target_os = "linux")]
+pub type FrameHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
 /// A captured frame still living in a DMA-BUF. Packed RGB uses one plane. Native Linux NV12
 /// (gamescope PipeWire) travels in ONE fd: Y starts at `offset`, and the interleaved UV plane
 /// lives at `plane1`'s offset/stride when the producer reported them — else at the contiguous
@@ -238,8 +255,9 @@ pub struct CapturedFrame {
 ///
 /// Owns a *dup* of the PipeWire buffer's fd, so the frame can travel to the encode thread and be
 /// imported there without the compositor's buffer being closed underneath it. Content stability
-/// across the brief import window relies on the compositor's buffer pool depth, like any zero-copy
-/// capture.
+/// across the read window comes from [`hold`](Self::hold) when present (the producer does not get
+/// the buffer back until the hold drops); a `None` hold falls back to the old contract — the
+/// compositor's pool depth outrunning the import+encode window.
 #[cfg(target_os = "linux")]
 pub struct DmabufFrame {
     pub fd: std::os::fd::OwnedFd,
@@ -253,6 +271,9 @@ pub struct DmabufFrame {
     pub plane1: Option<(u32, u32)>,
     pub offset: u32,
     pub stride: u32,
+    /// Deferred-requeue hold on the producer's buffer (see [`FrameHold`]); `None` when the
+    /// capture could not spare a buffer from the pool (shallow pool, or `PUNKTFUNK_ZEROCOPY_HOLD=0`).
+    pub hold: Option<FrameHold>,
 }
 
 /// Where a captured frame's pixels live.

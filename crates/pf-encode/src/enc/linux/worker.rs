@@ -692,6 +692,9 @@ fn encode_one(
             plane1: req.plane1,
             offset: req.offset,
             stride: req.stride,
+            // The deferred-requeue hold stays host-side: this backend is synchronous at depth 1
+            // (see below), so the host's frame — hold and all — outlives the whole encode.
+            hold: None,
         }),
         cursor,
     };

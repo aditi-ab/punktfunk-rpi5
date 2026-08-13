@@ -322,12 +322,14 @@ pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
 
 /// PW5 stage 2: the buffer-pool depth we ASK for on the zero-copy path, as a Choice range.
 ///
-/// The zero-copy path hands the SPA buffer back to the producer at `.process` return, while the
-/// encode thread still holds a dup of its dmabuf fd and has not yet imported, let alone read, the
-/// contents. Nothing bounds that window — see the `queue_raw_buffer` comment in `pipewire.rs` — so
-/// the only thing that keeps capture untorn is the producer round-robining a pool deeper than our
-/// import+encode latency. Until PW5 stage 1 nobody had ever counted what that pool was; we never
-/// even asked for a size (`build_dmabuf_buffers` set `dataType` and nothing else).
+/// The raw-passthrough arm now WITHHOLDS each published buffer from the producer until the
+/// consumer's hold drops (`DeferredRequeue` in `pipewire.rs` — the fix for the producer
+/// rewriting a buffer mid-encode), spending up to `pool - HOLD_POOL_RESERVE` buffers of this
+/// depth. A pool at the old floor of 2 has nothing to spend and falls back to the racy
+/// immediate requeue, where only the producer round-robining a pool deeper than our
+/// import+encode latency keeps capture untorn. Until PW5 stage 1 nobody had ever counted what
+/// that pool was; we never even asked for a size (`build_dmabuf_buffers` set `dataType` and
+/// nothing else).
 ///
 /// A **range**, deliberately, not a fixed count: SPA intersects the consumer's and producer's
 /// Buffers params, so a fixed 8 against a producer that can only afford 4 empties the intersection
