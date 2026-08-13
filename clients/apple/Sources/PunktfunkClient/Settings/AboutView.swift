@@ -28,6 +28,10 @@ struct AboutView: View {
 
     #if !os(tvOS)
     @State private var showAcknowledgements = false
+    /// The in-session controls. They used to announce themselves in a 6-second banner at the start
+    /// of every stream; that banner is gone, so this page is where they live now — including for
+    /// touch users on a Mac, who saw it too.
+    @State private var showShortcuts = false
     #endif
 
     var body: some View {
@@ -43,6 +47,9 @@ struct AboutView: View {
                     // fighting the centring.
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
+            }
+            Section {
+                shortcutsRow
             }
             Section {
                 linkRow("Documentation", systemImage: "book", url: Destination.docs)
@@ -63,6 +70,21 @@ struct AboutView: View {
         // A SHEET, not a push — on iPad the settings detail column is deliberately not a
         // NavigationStack (an inner one doubles the title bar), so a NavigationLink from here
         // pushed into a context with no back button and stranded the licenses on screen.
+        // A sheet for the same reason Acknowledgements is one — see that modifier's note on the
+        // iPad detail column not being a NavigationStack.
+        .sheet(isPresented: $showShortcuts) {
+            NavigationStack {
+                ShortcutsView(micAvailable: ShortcutsCatalog.micPlausible)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showShortcuts = false }
+                        }
+                    }
+            }
+            #if os(macOS)
+            .frame(width: 560, height: 460)
+            #endif
+        }
         .sheet(isPresented: $showAcknowledgements) {
             NavigationStack {
                 AcknowledgementsView()
@@ -135,6 +157,24 @@ struct AboutView: View {
         .foregroundStyle(.primary)
     }
 
+    private var shortcutsRow: some View {
+        Button {
+            showShortcuts = true
+        } label: {
+            HStack {
+                Label("Shortcuts", systemImage: "command")
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+    }
+
     private var acknowledgementsRow: some View {
         Button {
             showAcknowledgements = true
@@ -167,6 +207,11 @@ struct AboutView: View {
                     tvAddress("Documentation", Destination.docs)
                     tvAddress("Community", Destination.community)
                     tvAddress("Source code", Destination.source)
+                }
+                // Both push here: this page really is inside a navigation stack on tvOS, which is
+                // the case the sheets above exist to work around elsewhere.
+                NavigationLink("Shortcuts") {
+                    ShortcutsView(micAvailable: false) // tvOS has no app-accessible mic
                 }
                 NavigationLink("Acknowledgements") { AcknowledgementsView() }
                 Text("Punktfunk's source is open under MIT or Apache-2.0.")
@@ -219,21 +264,39 @@ struct AppIconView: View {
     var body: some View {
         Group {
             if let icon = Self.bundleIcon {
-                icon.image
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    // iOS ships the icon UNMASKED — the springboard applies the rounded shape at
-                    // draw time, so used raw it is a hard-cornered square. macOS bakes its own
-                    // shape (and margins) into the image, and clipping that would cut into it.
-                    .clipShape(RoundedRectangle(
-                        cornerRadius: icon.needsMask ? side * Self.iOSCornerRatio : 0,
-                        style: .continuous))
+                // The mask is applied ONLY where it is wanted. A `cornerRadius: 0` RoundedRectangle
+                // is not a no-op — it still clips to the layout frame, which crops any art whose
+                // aspect ratio isn't the frame's (the TV's 400x240 icon lost its ends to it).
+                // iOS ships the icon UNMASKED — the springboard applies the rounded shape at draw
+                // time, so used raw it is a hard-cornered square. macOS bakes its own shape (and
+                // margins) into the image, and clipping that would cut into it.
+                if icon.needsMask {
+                    icon.image
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(
+                            cornerRadius: side * Self.iOSCornerRatio, style: .continuous))
+                } else {
+                    icon.image
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                }
             } else {
                 monogram
             }
         }
+        // tvOS's icon is a 400×240 rectangle, not a squircle — framing it square would letterbox
+        // it inside a box two thirds empty. `side` means HEIGHT there, and the width follows the
+        // real 5:3 art. A MAX frame rather than a fixed one: with a fixed width the image cannot
+        // shrink when its row is tight, so it overflows and is clipped by whatever is above it
+        // instead — `.fit` inside a max frame gives back the whole icon, just smaller.
+        #if os(tvOS)
+        .frame(maxWidth: side * (400.0 / 240.0), maxHeight: side)
+        #else
         .frame(width: side, height: side)
+        #endif
         .accessibilityHidden(true) // the app's name is the next line
     }
 
@@ -267,7 +330,14 @@ struct AppIconView: View {
         else { return nil }
         return (Image(uiImage: image), true)
         #else
-        return nil // tvOS: layered icons have no single image to load
+        // tvOS ships the icon as a parallax image STACK (Back/Circle1/Circle2/Front), which has
+        // no single image to load — which is why this used to return nil and every About page on
+        // the TV drew the "P" monogram instead of the app's own mark. `AboutAppIcon` is those
+        // four layers flattened into one asset, generated from the SAME art the stack uses so it
+        // cannot drift into being a second, subtly different icon. Already masked and composited,
+        // so it needs no rounding of ours.
+        guard let image = UIImage(named: "AboutAppIcon") else { return nil }
+        return (Image(uiImage: image), false)
         #endif
     }
 }

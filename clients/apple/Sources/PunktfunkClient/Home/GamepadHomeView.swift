@@ -94,6 +94,10 @@ struct GamepadHomeView: View {
     /// Launch a library title on a host — the in-place library layer's activate path (iOS; the
     /// cover/sheet presentations wire ContentView's `launchTitle` into LibraryView themselves).
     let launchTitle: (LibraryTarget, String) -> Void
+    /// Wake a host WITHOUT connecting (ContentView's `wakeOnly`) — the host menu's Wake row. The
+    /// tile's own A already wakes-and-connects; this is the other half, for bringing a machine up
+    /// to look at it rather than to stream from it right now.
+    let wakeOnly: (StoredHost) -> Void
     /// A console prompt (GamepadPromptView) is up over the home — it polls the same controller, so
     /// this screen must stand down for as long as it is. Same handoff contract as the connect
     /// takeover and the shell's own layers; without it the carousel keeps scrolling underneath the
@@ -122,6 +126,11 @@ struct GamepadHomeView: View {
     @State private var selection: GamepadHomeTarget?
     @State private var showSettings = false
     @State private var showAddHost = false
+    /// The card whose options menu is up (UP on a saved tile) — see GamepadHostOptionsView.
+    @State private var hostOptionsTarget: HostOptionsTarget?
+    /// The host being edited. Set from the options menu, which closes itself as it opens this so
+    /// the two are never stacked — depth stays ≤ 1, which is what `GamepadScreen` assumes.
+    @State private var editTarget: StoredHost?
     /// The console's input drop: true for the transition's 0.26 s, during which NO layer polls
     /// the controller — a double-tapped A can't push two screens, and the held button that
     /// caused the change is long released before the next poller starts (whose own
@@ -204,18 +213,36 @@ struct GamepadHomeView: View {
         // shell's layers above ARE the presentation.
         #if os(macOS)
         .sheet(isPresented: $showSettings) {
-            GamepadSettingsView(store: store)
+            GamepadSettingsView(store: store, micAvailable: model.micAvailable)
                 .frame(width: 720, height: 640)
         }
         .sheet(isPresented: $showAddHost) {
             GamepadAddHostView { store.add($0) }
                 .frame(width: 660, height: 620)
         }
+        // Shorter than the forms above: a menu is five rows, and a sheet sized for a settings
+        // screen would be mostly empty field under them.
+        .sheet(item: $hostOptionsTarget) { target in
+            hostOptionsView(target, active: true)
+                .frame(width: 620, height: 460)
+        }
+        .sheet(item: $editTarget) { host in
+            editHostView(host, active: true)
+                .frame(width: 660, height: 620)
+        }
         .frame(minWidth: 640, minHeight: 420)
         #elseif os(tvOS)
-        .fullScreenCover(isPresented: $showSettings) { GamepadSettingsView(store: store) }
+        .fullScreenCover(isPresented: $showSettings) {
+            GamepadSettingsView(store: store, micAvailable: model.micAvailable)
+        }
         .fullScreenCover(isPresented: $showAddHost) {
             GamepadAddHostView { store.add($0) }
+        }
+        .fullScreenCover(item: $hostOptionsTarget) { target in
+            hostOptionsView(target, active: true)
+        }
+        .fullScreenCover(item: $editTarget) { host in
+            editHostView(host, active: true)
         }
         #endif
     }
@@ -264,6 +291,10 @@ struct GamepadHomeView: View {
         // can be raised from ON TOP of the library (launching a title on an unpaired host), where
         // it has to win. Backing out of it reveals whatever it interrupted.
         if let host = pairingTarget { return .pair(host) }
+        // Editing leads the menu that raised it: the menu clears itself on the way, so the two are
+        // never both set, and if they somehow were, the screen the user asked for last should win.
+        if let host = editTarget { return .editHost(host) }
+        if let target = hostOptionsTarget { return .hostOptions(target) }
         if showSettings { return .settings }
         if showAddHost { return .addHost }
         if let shelf = libraryTarget { return .library(shelf) }
@@ -280,12 +311,17 @@ struct GamepadHomeView: View {
                 GamepadSettingsView(
                     store: store,
                     close: { if !transitioning { showSettings = false } },
-                    controllerActive: active)
+                    controllerActive: active,
+                    micAvailable: model.micAvailable)
             case .addHost:
                 GamepadAddHostView(
                     onAdd: { store.add($0) },
                     close: { if !transitioning { showAddHost = false } },
                     controllerActive: active)
+            case .hostOptions(let target):
+                hostOptionsView(target, active: active)
+            case .editHost(let host):
+                editHostView(host, active: active)
             case .pair(let host):
                 GamepadPairView(
                     host: host,
@@ -417,6 +453,7 @@ struct GamepadHomeView: View {
             onActivate: { $0.activate() },
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
+            onUp: { openOptionsForSelected() },
             isActive: homeOwnsController
         ) { tile, entrance in
             hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight), entrance: entrance)
@@ -471,6 +508,14 @@ struct GamepadHomeView: View {
             hints.append(.init(
                 glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library",
                 action: { openLibraryForSelected() }))
+        }
+        // Only a saved card has a menu, so the cell appears only where the press does something —
+        // the same honesty rule the Library cell above follows. A direction, not a button, so it
+        // is a plain arrow rather than a `buttonGlyph` (see the settings screen's "Adjust").
+        if case .saved = selected?.id {
+            hints.append(.init(
+                glyph: "arrow.up", text: "Options",
+                action: { openOptionsForSelected() }))
         }
         hints.append(.init(
             glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Settings",
@@ -546,6 +591,60 @@ struct GamepadHomeView: View {
     /// `HostCardView`-only action never offered on `DiscoveredCardView`. A pinned card opens its
     /// own shelf: the selection already names which card Y was pressed on, and that card's profile
     /// is what its launches run with.
+    /// The host menu, built once for all three presentations (the iOS shell layer, the macOS
+    /// sheet, the tvOS cover) so the actions can't drift between them.
+    ///
+    /// Edit REPLACES this menu rather than stacking on it — `hostOptionsTarget` is cleared as
+    /// `editTarget` is set — which is the desktop console's `Nav::Replace` and what keeps the
+    /// shell's "depth ≤ 1 by construction" claim true.
+    @ViewBuilder
+    private func hostOptionsView(_ target: HostOptionsTarget, active: Bool) -> some View {
+        let host = target.host
+        GamepadHostOptionsView(
+            host: host,
+            pinnedProfile: target.profile,
+            isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
+            canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
+                && !host.wakeMacs.isEmpty,
+            onEdit: {
+                guard !transitioning else { return }
+                hostOptionsTarget = nil
+                editTarget = host
+            },
+            onWake: { wakeOnly(host) },
+            onForgetPairing: { store.forgetIdentity(host) },
+            onRemove: { store.remove(host) },
+            onUnpin: {
+                guard let profile = target.profile else { return }
+                store.setPinned(host.id, profileID: profile.id, pinned: false)
+            },
+            close: { if !transitioning { hostOptionsTarget = nil } },
+            controllerActive: active)
+    }
+
+    /// The add-host form in edit mode. `store.update` writes the record back by id, so the
+    /// fingerprint, MACs, pins and binding the form never shows are preserved.
+    @ViewBuilder
+    private func editHostView(_ host: StoredHost, active: Bool) -> some View {
+        GamepadAddHostView(
+            onAdd: { store.update($0) },
+            close: { if !transitioning { editTarget = nil } },
+            controllerActive: active,
+            editingHost: host)
+    }
+
+    /// UP on a saved tile opens that card's menu. Only SAVED hosts have one: a discovered-but-
+    /// unsaved host is not ours to rename or remove, and the two action tiles have nothing to
+    /// offer — the same `HostOptionsScreen::available` gate the desktop console applies.
+    private func openOptionsForSelected() {
+        guard case .saved(let id, let profileID) = selection,
+              let host = store.hosts.first(where: { $0.id == id })
+        else { return }
+        hostOptionsTarget = HostOptionsTarget(
+            host: host,
+            profile: profileID.flatMap { pid in profiles.profiles.first { $0.id == pid } })
+    }
+
     private func openLibraryForSelected() {
         guard libraryEnabled, case .saved(let id, let profileID) = selection,
               let host = store.hosts.first(where: { $0.id == id })

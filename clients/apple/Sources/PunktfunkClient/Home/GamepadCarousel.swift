@@ -48,6 +48,13 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     var onTertiary: (() -> Void)?
     /// B → back/dismiss; nil disables it (e.g. the root launcher has nowhere to go back to).
     var onBack: (() -> Void)?
+    /// UP → the focused item's own menu (the launcher's host options). Wiring it takes the whole
+    /// VERTICAL axis away from scrolling: up opens the menu and down goes inert, rather than up
+    /// meaning "menu" while down still stepped the strip. A horizontal carousel has no vertical
+    /// travel to spend, and the desktop and Android consoles both read the axis this way — one
+    /// meaning per direction is what makes the gesture learnable across the three of them.
+    /// nil leaves up/down as a second way to step (what every carousel without a menu still does).
+    var onUp: (() -> Void)?
     /// L1/R1 → jump this many items at once (clamped to the ends); 0 disables the shoulders.
     var shoulderJump: Int = 0
     /// Whether this carousel currently owns controller input. A presenting screen (e.g. the host
@@ -301,6 +308,17 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         // The poll carries only the buttons focus has no concept of: Y/X, the screen actions.
         input.onSecondary = onSecondary
         input.onTertiary = onTertiary
+        // UP is the one direction the poll may also read here, and ONLY to open the menu — it
+        // never calls `step`, so it cannot double-move against the focus engine. Routing it
+        // through `.onMoveCommand` instead was the obvious alternative and the wrong one: that
+        // stream is 4-way and its interception is input-source-dependent on real hardware (see
+        // GamepadMenuList's tvOS note), so claiming up there risks left/right focus with it.
+        // Nothing sits above the strip for the engine to move to, so this direction is free.
+        if let onUp {
+            input.onMove = { direction in
+                if direction == .up { onUp() }
+            }
+        }
         #else
         input.onMove = { move($0) }
         input.onConfirm = { activate() }
@@ -312,6 +330,14 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     }
 
     private func move(_ direction: GamepadMenuInput.Direction) {
+        // With a menu wired, vertical is the menu's axis, not a second scroll axis — see `onUp`.
+        if let onUp {
+            switch direction {
+            case .up: return onUp()
+            case .down: return
+            case .left, .right: break
+            }
+        }
         let forward = direction == .right || direction == .down
         step(by: forward ? 1 : -1, clampAtEnds: false)
     }
