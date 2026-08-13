@@ -161,21 +161,27 @@ The only settings that matter (GPU zero-copy is on by default):
 ```sh
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
-PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session — SDR, and no cursor (see below)
 ```
 
 ### Gaming Mode: attach vs managed
 
-For Gaming Mode there are two models (pick one; the shipped default is **attach**):
+For Gaming Mode there are two models. The template forces **neither** — the host picks per connect,
+and on Bazzite (which ships `gamescope-session-plus`) that is **managed**:
 
-- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the template's default) — the **box** owns its
-  gamescope session on its own display, and the host attaches to whatever's live without ever
-  tearing it down (on a headless box, a box-owned autologin session is restarted at the client's
-  resolution on a mismatch; with a display connected it streams at the box's own mode). Switching
-  Desktop ↔ Game is rock-solid.
-- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host takes the
-  box's gamescope over and relaunches it **headless** at the *client's* exact resolution and
-  refresh — Game Mode on the virtual screen — restoring the box on idle.
+- **Managed** (what you get by default here) — the host takes the box's gamescope over and
+  relaunches it **headless** at the *client's* exact resolution and refresh — Game Mode on the
+  virtual screen — restoring the box on idle. This is the model that gives the client a display of
+  its **own**, and the only one under which a game launched from a client's library gets a
+  dedicated session. It needs the [`punktfunk` group](#allow-controller-input): the takeover stops
+  the display manager for the length of the stream, and without that grant it cannot.
+- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`) — the **box** owns its gamescope session on its own
+  display, and the host attaches to whatever's live without ever tearing it down (on a headless
+  box, a box-owned autologin session is restarted at the client's resolution on a mismatch; with a
+  display connected it streams at the box's own mode). Switching Desktop ↔ Game is rock-solid, and
+  the cost is that a box with a screen attached serves the client a **mirror** of that screen
+  rather than its own display. Setting it also outranks a dedicated game session.
+
+`=0` turns the attach override off, the same as removing the line.
 
 Full treatment: [Steam / gamescope → How the host gets a
 gamescope](/docs/gamescope#how-the-host-gets-a-gamescope).
@@ -227,14 +233,17 @@ These apply to the **Gaming Mode (gamescope)** path; the KDE Desktop path is una
   headless capture can deadlock; between the two, capture works but the Steam overlay (Shift+Tab /
   the Quick Access Menu) is never painted into the captured node. Bazzite's current gamescope is
   past both; this only bites if you've pinned an old one.
-- **The template pins attach, and that costs you both the cursor and HDR.** The sysext ships the
-  `punktfunk-gamescope` build, but it only reaches a session the host starts itself — and the
-  `host.env` template above sets `PUNKTFUNK_GAMESCOPE_ATTACH=1`, where the live session is
-  Bazzite's own stock gamescope. Comment that line out and let the managed default take over: you
-  get the compositor-drawn pointer and real HDR. To stay on attach instead, set
-  `PUNKTFUNK_GAMESCOPE_HDR=0` and `PUNKTFUNK_GAMESCOPE_BIN=/usr/bin/gamescope`. Why each half
-  breaks: [gamescope → Known limits](/docs/gamescope#known-limits) for the cursor,
+- **Forcing attach costs you the cursor, HDR and your own display.** The sysext ships the
+  `punktfunk-gamescope` build, but it only reaches a session the host starts itself — under
+  `PUNKTFUNK_GAMESCOPE_ATTACH=1` the live session is Bazzite's own stock gamescope. The managed
+  default gets you the compositor-drawn pointer, real HDR and a display of the client's own. If you
+  deliberately stay on attach, also set `PUNKTFUNK_GAMESCOPE_HDR=0` and
+  `PUNKTFUNK_GAMESCOPE_BIN=/usr/bin/gamescope`. Why each half breaks:
+  [gamescope → Known limits](/docs/gamescope#known-limits) for the cursor,
   [HDR → Linux + gamescope](/docs/hdr#linux--gamescope) for the failed connect.
+  ⚠ Older templates set `PUNKTFUNK_GAMESCOPE_ATTACH=1` for you — if you copied one, delete that
+  line from `~/.config/punktfunk/host.env`, because an upgrade never rewrites a file you already
+  have.
 
 Those are the two that bite on Bazzite. The full set — touch, mouse modes, the clipboard — is on
 [gamescope → Known limits](/docs/gamescope#known-limits).

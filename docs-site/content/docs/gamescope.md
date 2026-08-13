@@ -18,8 +18,8 @@ from the install guide for your OS: [Bazzite](/docs/bazzite) or [SteamOS (Host)]
 ## How the host gets a gamescope
 
 There are three models; the host picks one per session, and you rarely have to. With **nothing
-set**, a box that has gamescope session infrastructure (Bazzite, SteamOS, Nobara) gets **managed**;
-the [Bazzite template](/docs/bazzite) ships with **attach** chosen instead.
+set** — which is what every shipped template does — a box that has gamescope session infrastructure
+(Bazzite, SteamOS, Nobara) gets **managed**.
 
 - **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`) — the **box** owns its gamescope session and decides
   Gaming vs Desktop via the normal Steam UI. Game Mode stays on the box's own (physical) display;
@@ -208,8 +208,8 @@ you and the two ways out.
 
 The cursor is the half this page owns. The host leaves the pointer to the compositor whenever the
 installed build can paint it (below) — so on an attached session, which can't, nothing draws it and
-the stream has no cursor at all. Commenting
-`PUNKTFUNK_GAMESCOPE_ATTACH=1` out of the [Bazzite template](/docs/bazzite) and letting the managed
+the stream has no cursor at all. Removing
+`PUNKTFUNK_GAMESCOPE_ATTACH=1` from your `host.env` and letting the managed
 default take over fixes that along with HDR. To stay on attach, point `PUNKTFUNK_GAMESCOPE_BIN` at
 your distro's own `gamescope` (`/usr/bin/gamescope`) instead: the host goes back to compositing the
 cursor itself, and — since the HDR answer comes from the same binary — stops attempting HDR too.

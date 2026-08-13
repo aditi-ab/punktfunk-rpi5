@@ -261,9 +261,6 @@ PUNKTFUNK_VIDEO_SOURCE=virtual
 # PUNKTFUNK_ZEROCOPY=0
 
 #RUST_LOG=info
-
-# Gaming Mode = ATTACH: the box owns its gamescope session; the host captures + follows it.
-PUNKTFUNK_GAMESCOPE_ATTACH=1
 ```
 
 **What each knob means and why these are the Bazzite defaults:**
@@ -272,7 +269,7 @@ PUNKTFUNK_GAMESCOPE_ATTACH=1
 |---|---|---|
 | *(no compositor / no anchors)* | — | The host **auto-detects** the live session per connect (Gaming Mode gamescope vs the KDE desktop) and follows switches mid-stream; a `systemctl --user` service inherits the right `XDG_RUNTIME_DIR` and the host derives the bus itself. Pinning `PUNKTFUNK_COMPOSITOR` or hardcoding uid-1000 anchors only breaks this — leave them out. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` | Create a per-client virtual output at the client's exact WxH@Hz (the flagship "native resolution, no scaling" mode), vs. `portal` which captures an existing monitor. |
-| `PUNKTFUNK_GAMESCOPE_ATTACH` | `1` | Gaming Mode model: the **box** owns its gamescope session; the host attaches to whatever's live and never tears it down. Swap for `PUNKTFUNK_GAMESCOPE_MANAGED=1` to have the host relaunch the gaming session headless at the **client's** exact mode instead (see the template's comments). |
+| `PUNKTFUNK_GAMESCOPE_ATTACH` | *(unset)* | Gaming Mode model. Left unset the host picks one per connect, which on Bazzite is **managed**: it relaunches the gaming session headless at the **client's** exact mode, so the client gets a display of its own. Set `=1` to force **attach** instead — the box keeps its session and the client is served a mirror of the box's own screen at the box's mode (see the template's comments). |
 | `PUNKTFUNK_ZEROCOPY` | `on` *(default)* | GPU zero-copy capture (dmabuf → CUDA → NVENC), on by default. Falls back to CPU automatically if unavailable; set `0` to force the CPU path. |
 | `RUST_LOG` | (commented) | Uncomment `RUST_LOG=info` for verbose logs while debugging. |
 

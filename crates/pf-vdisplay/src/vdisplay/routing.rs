@@ -111,9 +111,15 @@ struct OperatorGamescope {
 #[cfg(target_os = "linux")]
 fn operator_gamescope() -> &'static OperatorGamescope {
     OPERATOR_GAMESCOPE.get_or_init(|| {
+        // Explicit-off grammar, NOT a presence test. These two used to be `var_os(..).is_some()`,
+        // which read `PUNKTFUNK_GAMESCOPE_ATTACH=0` as ATTACH ON — the exact opposite of what the
+        // line says, and of every other knob on this host (`env_on` is shared for that reason).
+        // Anyone turning a shipped `=1` off does it the way the rest of the file works, and the
+        // rung this feeds outranks a dedicated game session, so a silent inversion here costs the
+        // client its own display for the whole stream.
         let ov = with_env_lock(|| OperatorGamescope {
-            managed: std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
-            attach: std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
+            managed: pf_host_config::env_on("PUNKTFUNK_GAMESCOPE_MANAGED").unwrap_or(false),
+            attach: pf_host_config::env_on("PUNKTFUNK_GAMESCOPE_ATTACH").unwrap_or(false),
             node: std::env::var("PUNKTFUNK_GAMESCOPE_NODE")
                 .ok()
                 .filter(|v| !v.is_empty()),
