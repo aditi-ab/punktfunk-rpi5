@@ -155,9 +155,11 @@ impl Presenter {
         // 1.3: Vulkan Video decode and PyroWave's compute kernels both need a 1.3
         // device, and the instance version caps what the device can report (any current
         // loader accepts 1.3 regardless of device support; device-level gating is below).
+        // `SharedDevice::api_version` republishes this constant to the overlay — keep the
+        // two the same by construction rather than by two spellings of `API_VERSION_1_3`.
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
-            .api_version(vk::API_VERSION_1_3);
+            .api_version(super::INSTANCE_API_VERSION);
         // HDR10 presentation needs the extended colorspaces at the INSTANCE level.
         let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
         let inst_available =
@@ -749,7 +751,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     let app_name = CString::new("punktfunk-session").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
-        .api_version(vk::API_VERSION_1_3);
+        .api_version(super::INSTANCE_API_VERSION);
     // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
     // builder structs that are locals outliving the call; the handle it returns is owned by the
     // value being built here.
@@ -902,7 +904,7 @@ pub fn list_adapters() -> Result<Vec<String>> {
     let app_name = CString::new("punktfunk-session").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
-        .api_version(vk::API_VERSION_1_3);
+        .api_version(super::INSTANCE_API_VERSION);
     // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
     // and live for the call, and every builder struct is a local that outlives it.
     let instance = unsafe {

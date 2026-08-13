@@ -26,6 +26,17 @@ pub struct SharedDevice {
     /// with [`pf_client_core::video::QueueLock::guard`], whose RAII form is what every
     /// Rust caller wants.
     pub queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
+    /// The Vulkan version an overlay renderer may size its function table to — the lower of
+    /// [`crate::vk::INSTANCE_API_VERSION`] (what `VkApplicationInfo::apiVersion` declared for
+    /// `instance`) and what the loader provides.
+    ///
+    /// **Cap yourself here; do not ask the loader yourself.** Entry points above this version
+    /// were never promised to us — `vkGetDeviceProcAddr` returns null for them — so a renderer
+    /// that probes `vkEnumerateInstanceVersion` instead (a current Mesa answers 1.4 where we
+    /// asked for 1.3) validates a function table it can never fill and refuses to start. That
+    /// is exactly how the Skia console UI died in 0.28.0; see the note in `pf-console-ui`'s
+    /// `SkiaOverlay::init`.
+    pub api_version: u32,
 }
 
 /// What the overlay may draw this frame — composed by the run loop from session state.

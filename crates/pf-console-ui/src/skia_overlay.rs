@@ -245,11 +245,22 @@ impl Overlay for SkiaOverlay {
                 shared.queue_family_index as usize,
             ),
             &get_proc,
-            // `None` leaves Skia's `fMaxAPIVersion` at its `0` sentinel, so it caps entry-point
-            // validation at whatever `vkEnumerateInstanceVersion()` reports — byte-for-byte what
-            // the (now removed) `BackendContext::new` did. The presenter owns the instance and its
-            // `VkApplicationInfo`, so pinning a version here would just duplicate its choice.
-            None,
+            // 🛑 MUST be the presenter's declared version, never `None`.
+            //
+            // `None` leaves Skia's `fMaxAPIVersion` at its `0` sentinel, which makes Skia fall
+            // back to `vkEnumerateInstanceVersion()` — the LOADER's ceiling, not ours. Those are
+            // not the same number: the presenter asks for 1.3, while a current Mesa loader answers
+            // 1.4 (1.4.321 on SteamOS 3.7). Skia then validates a 1.4 function table against an
+            // instance that only ever promised 1.3, `vkGetDeviceProcAddr` returns null for the
+            // entry points above 1.3, validation fails, and `make_vulkan` hands back `None` — so
+            // the console UI refuses to start and `--browse` dies with it.
+            //
+            // ⚠ The `0` sentinel was harmless at skia-safe 0.87 (that Skia knew nothing of 1.4, so
+            // clamping to the loader was a no-op) and the 0.99 migration preserved it as
+            // "byte-for-byte what `BackendContext::new` did" — true of the VALUE, false of the
+            // BEHAVIOUR. It shipped in 0.28.0 and took the Deck's launcher out. 0.99's own doc for
+            // this parameter says it should match `VkApplicationInfo::apiVersion`; this is that.
+            Some(skvk::Version::from(shared.api_version)),
         );
         // SAFETY: the instance/physical-device/device handles come from `shared`, which owns them
         // and outlives this backend context, and `get_proc` above resolves through those same
