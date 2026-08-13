@@ -32,20 +32,12 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MicOff
-import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -57,7 +49,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -130,12 +121,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // it, and survives the same recreate because the composition outlives the surface.
     var micMuted by remember(handle) { mutableStateOf(false) }
     // Whether a capture is actually RUNNING, not merely wanted — set from surfaceCreated on what
-    // nativeMicActive reports. A device that refused every AAudio input rung gets no mute control
-    // rather than one that lies about a mic being heard.
+    // nativeMicActive reports. A device that refused every AAudio input rung gets no mute chord and
+    // no chord line in the start banner, rather than an offer to mute a mic nobody is hearing.
     var micRunning by remember(handle) { mutableStateOf(false) }
-    // Transient confirmation of a mic-chord toggle (null = nothing showing). Only the gamepad path
-    // needs it: the touch button confirms itself by changing under the finger, but a chord has no
-    // on-screen state of its own, and "did that register?" is exactly the doubt to answer.
+    // Transient confirmation of a mic-chord toggle (null = nothing showing). With no standing mic
+    // element on screen, this is mute's only feedback: a chord has no on-screen state of its own,
+    // and "did that register?" is exactly the doubt to answer.
     var micHint by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(micHint) {
         if (micHint != null) {
@@ -413,9 +404,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Show a "hold to quit" hint the moment the chord completes (the router debounces the actual
         // exit); it clears when the buttons release early or the hold elapses. Runs on the main thread.
         router.onExitArmed = { armed -> exitArming = armed }
-        // Select + Y toggles the mic — the couch reach for the on-screen mute button, which a
-        // gamepad/TV user has no pointer for. Ignored when no capture is running (there is nothing
-        // to mute, and claiming otherwise would be the lie the control exists to avoid).
+        // Select + Y toggles the mic — with no on-screen mute element, this chord is the whole of
+        // the control. Ignored when no capture is running (there is nothing to mute, and a hint
+        // saying "Microphone muted" over a mic nobody opened would be a lie).
         // A captured Sony pad whose motion this session cannot carry. Fires once per pad, at the
         // moment it is claimed, on the main thread.
         router.onMotionUnreachable = { motionHint = true }
@@ -981,19 +972,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 }
             },
         )
-        // Mic mute, LAST in the stack — the one in-stream control, so unlike the purely visual
-        // overlays above it has to sit on top of the gesture layer to receive its own taps (it
-        // costs the stream that small corner of touch area, which is why it exists only while a
-        // capture actually runs). On TV it is the indicator alone: the Select + Y chord is the
-        // control there, and a focusable button would fight the game for the D-pad.
-        if (micRunning && (micMuted || !isTv)) {
-            MicMuteControl(
-                muted = micMuted,
-                onToggle = if (isTv) null else ({ setMicMuted(!micMuted) }),
-                modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
-            )
-        }
-        // Chord confirmation (gamepad/TV) — the counterpart to the button changing under a finger.
+        // No standing mic element here: the in-stream mute control is deliberately absent until the
+        // on-screen overlay UI lands and can carry it as one of its controls. Mute itself is intact
+        // — the Select + Y chord toggles it, and the hint below is what confirms the toggle.
+        // Chord confirmation (gamepad/TV) — mute has no standing indicator, so this is the whole
+        // of its feedback: a toggle that showed nothing at all would be indistinguishable from one
+        // that never registered.
         micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
         // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
         // notice landing on top of one of those would cost the user both.
@@ -1030,47 +1014,8 @@ private fun releaseMicEffects(effects: MutableList<AudioEffect>) {
 }
 
 /**
- * The in-stream mic control and its muted indicator, in one element: a dim mic glyph while the
- * uplink is live, a red **Muted** badge while it isn't — so the state that matters is the loud one,
- * readable at couch distance and impossible to mistake for the stream's own picture.
- *
- * [onToggle] `null` makes it a pure indicator (the TV/gamepad surface, where the Select + Y chord
- * is the control); non-null makes the badge itself the touch target. Rendering it at all is the
- * caller's decision — it means a capture is genuinely running.
- */
-@Composable
-private fun MicMuteControl(muted: Boolean, onToggle: (() -> Unit)?, modifier: Modifier = Modifier) {
-    val shape = RoundedCornerShape(10.dp)
-    Row(
-        modifier = modifier
-            .clip(shape)
-            .background(if (muted) Color(0xE0B3261E) else Color.Black.copy(alpha = 0.45f))
-            .then(if (onToggle != null) Modifier.clickable(onClick = onToggle) else Modifier)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
-            // Spoken state first, then the action — a talkback user needs to know they are muted
-            // before they need to know how to stop being muted.
-            contentDescription = if (muted) {
-                "Microphone muted. Activate to unmute."
-            } else {
-                "Microphone live. Activate to mute."
-            },
-            tint = Color.White,
-            modifier = Modifier.size(20.dp),
-        )
-        if (muted) {
-            Spacer(Modifier.width(6.dp))
-            Text("Muted", color = Color.White, fontSize = 14.sp)
-        }
-    }
-}
-
-/**
- * Transient confirmation that the mic chord (Select + Y) registered. The badge above already says
- * *muted*, but nothing on screen says *un*muted — and "did that press do anything?" is the whole
+ * Transient confirmation that the mic chord (Select + Y) registered. Nothing else on screen says
+ * *muted* or *un*muted, so this pill carries both — "did that press do anything?" is the whole
  * doubt a chord with no button under the finger creates. Same pill vocabulary as the other
  * in-stream cues; the caller clears it after a beat.
  */
