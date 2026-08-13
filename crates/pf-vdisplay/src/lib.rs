@@ -321,11 +321,7 @@ pub fn detect() -> Result<Compositor> {
     #[cfg(target_os = "linux")]
     {
         if let Some(v) = pf_host_config::config().compositor.as_deref() {
-            return compositor_from_pin(v).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown PUNKTFUNK_COMPOSITOR '{v}' (kwin|wlroots|hyprland|mutter|gamescope)"
-                )
-            });
+            return compositor_from_pin(v).ok_or_else(|| unknown_pin_error(v));
         }
         if let Some(c) = compositor_for_kind(detect_active_session().kind) {
             return Ok(c);
@@ -340,6 +336,32 @@ pub fn detect() -> Result<Compositor> {
             .to_ascii_uppercase();
         compositor_from_xdg(&desktop)
     }
+}
+
+/// The error for a `PUNKTFUNK_COMPOSITOR` value that names no backend.
+///
+/// `cinnamon`/`muffin` get their own answer rather than the bare list: it is the value a Mint or
+/// LMDE user reaches for first, and the plain list invites them to try the next-closest name
+/// (`mutter` — Muffin *is* a Mutter fork), which starts a session that then fails deep inside a
+/// `org.gnome.Mutter.ScreenCast` call Muffin does not serve. There is no working value; say so, and
+/// name the route that does work.
+#[cfg(target_os = "linux")]
+fn unknown_pin_error(v: &str) -> anyhow::Error {
+    const ACCEPTED: &str = "kwin|wlroots|hyprland|mutter|gamescope";
+    if matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "cinnamon" | "muffin"
+    ) {
+        return anyhow::anyhow!(
+            "PUNKTFUNK_COMPOSITOR='{v}' is not a backend and cannot become one: Cinnamon's \
+             compositor Muffin has no virtual-output API (no `RecordVirtual`), so it cannot make a \
+             screen for a client. Do NOT substitute 'mutter' — Muffin is a Mutter fork but serves \
+             none of that interface. Use PUNKTFUNK_COMPOSITOR=gamescope to stream games through a \
+             headless gamescope, which needs no desktop compositor. See \
+             https://docs.punktfunk.unom.io/docs/debian#cinnamon-linux-mint-and-lmde"
+        );
+    }
+    anyhow::anyhow!("unknown PUNKTFUNK_COMPOSITOR '{v}' ({ACCEPTED})")
 }
 
 /// The last-resort `XDG_CURRENT_DESKTOP` sniff, as a **pure function of the (uppercased) value** so
@@ -878,6 +900,28 @@ mod tests {
             assert!(err.contains("gamescope"), "no gamescope route named: {err}");
             assert!(err.contains("Muffin"), "does not say why: {err}");
         }
+    }
+
+    /// Pinning `cinnamon` explicitly must not answer with the plain list of accepted values: the
+    /// next thing a Mint user tries is `mutter` (Muffin is a Mutter fork), which fails much later
+    /// and much less clearly. A typo'd pin still gets the ordinary list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinning_cinnamon_explains_instead_of_listing_backends() {
+        for v in ["cinnamon", "Cinnamon", "muffin", " MUFFIN "] {
+            let err = unknown_pin_error(v).to_string();
+            assert!(err.contains("gamescope"), "no working route named: {err}");
+            assert!(
+                err.contains("Muffin"),
+                "does not explain why it cannot work: {err}"
+            );
+        }
+        let typo = unknown_pin_error("kwim").to_string();
+        assert!(
+            typo.contains("kwin|wlroots|hyprland|mutter|gamescope"),
+            "{typo}"
+        );
+        assert!(!typo.contains("Muffin"), "{typo}");
     }
 
     /// An unknown desktop keeps the generic advice — the Cinnamon arm must not swallow it.
