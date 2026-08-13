@@ -264,25 +264,36 @@ struct AppIconView: View {
     var body: some View {
         Group {
             if let icon = Self.bundleIcon {
-                icon.image
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    // iOS ships the icon UNMASKED — the springboard applies the rounded shape at
-                    // draw time, so used raw it is a hard-cornered square. macOS bakes its own
-                    // shape (and margins) into the image, and clipping that would cut into it.
-                    .clipShape(RoundedRectangle(
-                        cornerRadius: icon.needsMask ? side * Self.iOSCornerRatio : 0,
-                        style: .continuous))
+                // The mask is applied ONLY where it is wanted. A `cornerRadius: 0` RoundedRectangle
+                // is not a no-op — it still clips to the layout frame, which crops any art whose
+                // aspect ratio isn't the frame's (the TV's 400x240 icon lost its ends to it).
+                // iOS ships the icon UNMASKED — the springboard applies the rounded shape at draw
+                // time, so used raw it is a hard-cornered square. macOS bakes its own shape (and
+                // margins) into the image, and clipping that would cut into it.
+                if icon.needsMask {
+                    icon.image
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(
+                            cornerRadius: side * Self.iOSCornerRatio, style: .continuous))
+                } else {
+                    icon.image
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                }
             } else {
                 monogram
             }
         }
         // tvOS's icon is a 400×240 rectangle, not a squircle — framing it square would letterbox
         // it inside a box two thirds empty. `side` means HEIGHT there, and the width follows the
-        // real 5:3 art.
+        // real 5:3 art. A MAX frame rather than a fixed one: with a fixed width the image cannot
+        // shrink when its row is tight, so it overflows and is clipped by whatever is above it
+        // instead — `.fit` inside a max frame gives back the whole icon, just smaller.
         #if os(tvOS)
-        .frame(width: side * (400.0 / 240.0), height: side)
+        .frame(maxWidth: side * (400.0 / 240.0), maxHeight: side)
         #else
         .frame(width: side, height: side)
         #endif

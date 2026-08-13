@@ -375,7 +375,11 @@ struct GamepadSettingsView: View {
     /// icon-name-version-tagline would leave no room for the rows underneath it.
     private var aboutIdentity: some View {
         HStack(alignment: .center, spacing: compact ? 12 : 16) {
+            // The icon gets the row first: the tagline beside it is happy to wrap or shorten,
+            // and a TV icon is 5:3, so it is the element that suffers first if the text takes
+            // the width it asks for.
             AppIconView(side: aboutIconSide)
+                .layoutPriority(1)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Punktfunk")
                     .font(.geist(metrics.labelFont, .bold, relativeTo: .headline))
