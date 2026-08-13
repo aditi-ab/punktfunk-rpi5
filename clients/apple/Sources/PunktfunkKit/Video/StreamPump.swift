@@ -17,14 +17,26 @@ final class StreamPump {
 
     /// Pump thread: pull AUs, wrap, enqueue. Non-IDR AUs before the first format
     /// description are dropped. `onFrame`/`onSessionEnd` fire on the pump thread.
+    ///
+    /// `endToEndMeter` is stage-1's ONLY latency instrument, and it measures capture→ENQUEUE —
+    /// not capture→glass like the Metal rungs: the layer decodes AND presents after our hand-off,
+    /// and AVSampleBufferDisplayLayer has no presented callback, so the tail past enqueue (its
+    /// internal decode + the video-plane flip) is unmeasurable from the app. Cross-rung
+    /// comparisons must read this as e2e MINUS decode+display and settle the remainder on
+    /// camera. It is still worth wiring: matching pre-tail halves between rungs pins any felt
+    /// difference on the present tail — the video-plane-vs-compositor question itself.
     func start(
         connection: PunktfunkConnection,
         layer: AVSampleBufferDisplayLayer,
+        endToEndMeter: LatencyMeter? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         let token = token
+        // Host↔client clock skew, read once like Stage2Pipeline.start does — capture→enqueue
+        // spans machines, so the raw difference is only valid offset-corrected.
+        let offsetNs = connection.clockOffsetNs
         // Coalesced host keyframe requests (100 ms throttle — see KeyframeRecovery).
         let recovery = KeyframeRecovery()
         recovery.bind(connection)
@@ -158,7 +170,12 @@ final class StreamPump {
                     // flagging it DoNotDisplay — the layer still decodes it (keeping the reference
                     // chain fed) but shows the last GOOD picture until a clean re-anchor lifts the
                     // gate. Folded from the AU's wire flags (stage-1 has no decode callback).
-                    if !gate.onDecoded(flags: au.flags) {
+                    if gate.onDecoded(flags: au.flags) {
+                        // Capture→enqueue (see start's doc). Only frames that will DISPLAY:
+                        // a withheld frame never reaches glass, so its enqueue instant would
+                        // dilute the population the Metal rungs are compared against.
+                        endToEndMeter?.record(ptsNs: au.ptsNs, offsetNs: offsetNs)
+                    } else {
                         StreamPump.setDoNotDisplay(sample)
                     }
                     layer.enqueue(sample)

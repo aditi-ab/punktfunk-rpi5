@@ -20,6 +20,18 @@ import SwiftUI
 /// instrument: any visible overlay forces the metal layer through the compositor, which costs a
 /// refresh period on the vsync-latched platforms — this is how to measure with it off.
 private let statsLog = Logger(subsystem: "io.unom.punktfunk", category: "stats")
+/// Mirror the 1 Hz vitals line to STDOUT as well as the unified log.
+///
+/// Exists for **tvOS, where the unified log is unreachable**: `log stream --device` is gone from
+/// modern macOS, `log collect --device-name` needs root and then fails "Device not configured"
+/// (an Apple TV has no USB to fall back to), and libimobiledevice pairs against a different
+/// database than Xcode. Stdout, however, IS bridged — `xcrun devicectl device process launch
+/// --console -e '{"PUNKTFUNK_STATS_STDOUT":"1"}' io.unom.punktfunk` streams these lines straight
+/// to the Mac. That is the only way to read a session's numbers with the **stats overlay OFF**,
+/// which matters because the overlay is itself a composited layer over the Metal one — i.e. a
+/// plausible cause of the very present-floor inflation the overlay is used to measure.
+/// Env-gated: no cost, and no stdout noise, unless someone is deliberately measuring.
+private let statsToStdout = ProcessInfo.processInfo.environment["PUNKTFUNK_STATS_STDOUT"] == "1"
 
 /// Pump-thread-side frame counters; a 1 Hz main-actor timer drains them into @Published
 /// values. NSLock instead of an actor — the writer is the (non-async) pump thread.
@@ -137,6 +149,18 @@ final class SessionModel: ObservableObject {
     /// and under stage-1.
     @Published var osFloorP50Ms = 0.0
     @Published var osFloorValid = false
+    /// The deadline link's `preferredFrameLatency` ASK beside its property READBACK (see
+    /// `PresentLinkInfo` — it exists because tvOS has no reachable log). ⚠ The readback is NOT
+    /// a grant: it is a plain float property, so it echoes whatever was stored unless the
+    /// system clamps the setter. readback ≠ ask ⇒ a visible clamp (the one signal the API can
+    /// give); readback == ask proves nothing — `osFloorP50Ms` (the measured vend lead) is the
+    /// truth-teller (field 2026-08-13: readback 1.00 beside a 32.5 ms floor).
+    @Published var linkLatencyAskFrames: Float = 0
+    @Published var linkLatencyFrames: Float = 0
+    @Published var linkRangeMinHz: Float = 0
+    @Published var linkRangeMaxHz: Float = 0
+    @Published var linkDrawables = 0
+    @Published var linkInfoValid = false
     /// The AUDIO plane's latency, from the playback ring (`SessionAudio.Stats`): how much decoded
     /// audio is queued ahead of the speaker, and where that PUTS it relative to the picture
     /// (positive = audio behind). `audioValid` is false until playback runs.
@@ -683,6 +707,10 @@ final class SessionModel: ObservableObject {
         displayValid = false
         clientQueueValid = false
         osFloorValid = false
+        linkInfoValid = false
+        // Drop the previous session's grant too — the shared box outlives the session, and a new
+        // link may never come up (a non-deadline rung has none at all).
+        PresentLinkInfo.shared.clear()
         audioValid = false
         lostFrames = 0
         lostPct = 0
@@ -923,6 +951,18 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.osFloorValid = false
                 }
+                // The display link's latency ask + property readback (deadline rung only) — a
+                // LEVEL, not a window, so it is read rather than drained.
+                if let l = PresentLinkInfo.shared.snapshot() {
+                    self.linkLatencyAskFrames = l.ask
+                    self.linkLatencyFrames = l.latency
+                    self.linkRangeMinHz = l.rangeMin
+                    self.linkRangeMaxHz = l.rangeMax
+                    self.linkDrawables = l.drawables
+                    self.linkInfoValid = true
+                } else {
+                    self.linkInfoValid = false
+                }
                 if let q = self.clientQueue.drain() {
                     self.clientQueueP50Ms = q.p50Ms
                     self.clientQueueValid = true
@@ -958,7 +998,12 @@ final class SessionModel: ObservableObject {
                             // In the log as well as on the HUD because the overlay is only up when
                             // someone thought to turn it on, and the reports that need these
                             // numbers arrive after the fact.
-                            + "audio_buffer=%lld audio_av_offset=%lld",
+                            + "audio_buffer=%lld audio_av_offset=%lld "
+                            // The deadline link's latency ask + property readback (both -1 on
+                            // non-deadline rungs) — appended so the PUNKTFUNK_FRAME_LATENCY
+                            // ladder is readable over the stdout channel with the HUD off,
+                            // which is the only honest way to run it on a tvOS device.
+                            + "link_ask=%.2f link_readback=%.2f",
                         frames,
                         displayWindow?.count ?? 0,
                         self.endToEndValid ? self.endToEndP50Ms : -1,
@@ -972,8 +1017,11 @@ final class SessionModel: ObservableObject {
                         self.endToEndValid ? self.endToEndAdjP50Ms : -1,
                         self.clientQueueValid ? self.clientQueueP50Ms : -1,
                         self.audioValid ? self.audioBufferMs : -1,
-                        self.audioValid ? self.audioAvOffsetMs : 0)
+                        self.audioValid ? self.audioAvOffsetMs : 0,
+                        self.linkInfoValid ? self.linkLatencyAskFrames : -1,
+                        self.linkInfoValid ? self.linkLatencyFrames : -1)
                     statsLog.info("\(line, privacy: .public)")
+                    if statsToStdout { print("pf.stats \(line)") }
                 }
             }
         }

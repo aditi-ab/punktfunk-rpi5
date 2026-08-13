@@ -260,13 +260,22 @@ final class SessionPresenter {
         // value is deliberately ignored). The user-facing choice is the INTENT
         // (PresentPriority): latency (newest-wins zero-queue store) vs smoothness (a FIFO jitter
         // buffer; on macOS it additionally paces presents onto the vsync grid so the buffer
-        // drains on display cadence). Stage-1 is reachable only via env in DEBUG; release maps
-        // it back to the default (the stage-1 pump below stays the automatic Metal-missing
-        // fallback).
+        // drains on display cadence). Stage-1 resolves from the persisted picker only in DEBUG;
+        // in release the ENV alone reaches it (the stage-1 pump below stays the automatic
+        // Metal-missing fallback either way).
         #if DEBUG
         let allowStage1 = true
         #else
-        let allowStage1 = false
+        // The gate exists so a LEFTOVER value can't revive the freeze-prone fallback — but the
+        // persisted picker is no longer read at all (setting: nil below), so the only channel
+        // left is the env, and an env var is never leftover: it takes a devicectl/Xcode launch
+        // to exist. It must stay openable on Release because Release is the only build that
+        // measures presentation honestly, and stage-1 is the one rung that presents on the
+        // hardware video plane instead of through the GPU compositor — the A/B for the tvOS
+        // two-refresh present floor (field 2026-08-13: PUNKTFUNK_PRESENTER=stage1 on a Release
+        // build silently ran stage-4, which would have false-negatived that A/B).
+        let allowStage1 =
+            ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"] == "stage1"
         #endif
         let explicit = PresenterChoice.explicit(
             setting: nil, // the legacy DefaultsKey.presenter picker value is no longer read
@@ -336,7 +345,7 @@ final class SessionPresenter {
         } else {
             let pump = StreamPump()
             pump.start(
-                connection: connection, layer: baseLayer,
+                connection: connection, layer: baseLayer, endToEndMeter: endToEndMeter,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
             self.pump = pump
         }
