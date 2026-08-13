@@ -10,14 +10,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:-THIRD-PARTY-NOTICES.txt}"
 
-if command -v cargo-about >/dev/null 2>&1; then
-    echo "==> cargo about generate -> $OUT" >&2
-    cargo about generate about.hbs --output-file "$OUT"
-else
-    echo "==> cargo-about not installed; using offline fallback" >&2
-    echo "    (install the full generator with: cargo install cargo-about)" >&2
-    python3 scripts/gen-third-party-notices.py --out "$OUT"
-fi
+# ⚠ The root file goes through the PYTHON generator, NOT `cargo about` — deliberately, and this
+# is not a fallback. `cargo about` only ever sees CARGO dependencies, so it silently omits the
+# VENDORED_TREES below: pyrowave, the Granite subset, volk, Vulkan-Headers, the Font Awesome brand
+# icons and Simple Icons. Those are third-party sources shipped INSIDE first-party crates, each
+# under its own licence, and dropping them from an attribution file is a legal regression rather
+# than an untidiness. Measured 2026-08-13: `cargo about` produced 7,274 lines / ~514 crates with
+# zero mentions of volk, Vulkan-Headers or Font Awesome, against the python generator's 17,324
+# lines / 575 crates with all of them. This script used to prefer cargo-about whenever it was
+# installed, so simply HAVING it on your PATH silently degraded the file.
+#
+# `cargo about` is still what the CI licence GATE runs (.gitea/workflows/audit.yml) — that job
+# checks every licence is in the about.toml allowlist and writes to /dev/null, which is a
+# different question from what this file must contain. If about.hbs ever learns to emit the
+# vendored trees, preferring cargo-about here again would be reasonable.
+echo "==> gen-third-party-notices.py -> $OUT" >&2
+python3 scripts/gen-third-party-notices.py --out "$OUT"
 echo "==> wrote $OUT" >&2
 
 # Regenerate the per-client in-tree copies. EVERY client has one now, because every client SHOWS
