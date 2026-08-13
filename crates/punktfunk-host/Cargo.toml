@@ -78,12 +78,22 @@ tokio = { version = "1", features = ["full"] }
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
 # The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
 # native-only build also sheds the accepted Marvin advisory (RUSTSEC-2023-0071, .cargo/audit.toml).
-rsa = { version = "0.9", optional = true }
+# `getrandom` is NOT one of rsa's defaults; we ask for it because `RsaPrivateKey::new` wants an
+# rng implementing rand_core **0.6**'s traits, and since our own `rand` moved to 0.9 no rng we
+# hold satisfies that bound any more. The feature exposes `rsa::rand_core::OsRng`, which does —
+# see the keygen in gamestream/cert.rs. Getting it from rsa's own re-export is what keeps the two
+# rand_core majors from being something this crate has to name.
+rsa = { version = "0.9", optional = true, features = ["getrandom"] }
 sha2 = { version = "0.10", features = ["oid"] }
 aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
-rand = "0.8"
+# 0.9, matching punktfunk-core and pf-client-core — the host was the last 0.8 holdout, and that
+# was drift, not a pin. NOTE this does NOT take rand 0.8 out of the gamestream build: `rsa` pulls
+# it transitively through `num-bigint-dig`, so 0.8 only disappears from the native-only host
+# (`--no-default-features`, where `rsa` is absent). What it does buy everywhere is that OUR calls
+# all speak one rand major.
+rand = "0.9"
 hex = "0.4"
 # Cover-art delivery in the game library: encode Lutris's local JPEGs into `data:` URLs and decode
 # the Epic launcher's base64 `catcache.bin`. Cross-platform (Linux Lutris art + Windows Epic art).

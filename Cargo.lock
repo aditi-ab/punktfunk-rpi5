@@ -3645,7 +3645,7 @@ dependencies = [
  "pipewire",
  "punktfunk-core",
  "quinn",
- "rand 0.8.7",
+ "rand 0.9.5",
  "rcgen",
  "roxmltree",
  "rsa",
@@ -3821,7 +3821,6 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
- "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]

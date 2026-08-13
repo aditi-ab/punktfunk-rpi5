@@ -86,8 +86,14 @@ fn generate() -> Result<(String, String)> {
     //
     // This path runs ONLY when no cert exists yet — a fresh install — so an upgraded box never
     // re-executes it.
-    let mut rng = rand::thread_rng();
-    let priv_key = RsaPrivateKey::new(&mut rng, 2048).context("generate RSA-2048 host key")?;
+    //
+    // The rng comes from `rsa`'s OWN rand_core re-export, not from our `rand`. `RsaPrivateKey::new`
+    // is bounded on rand_core **0.6**'s `CryptoRngCore`, and since the host moved to rand 0.9 its
+    // `ThreadRng` implements rand_core 0.9's traits instead — a different trait of the same name,
+    // so it no longer satisfies the bound. `rsa::rand_core::OsRng` is the OS CSPRNG under the
+    // exact traits `rsa` compiled against, which keeps the two rand_core majors from meeting.
+    let priv_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
+        .context("generate RSA-2048 host key")?;
     let key_pem = priv_key
         .to_pkcs8_pem(LineEnding::LF)
         .context("encode host key as PKCS#8 PEM")?

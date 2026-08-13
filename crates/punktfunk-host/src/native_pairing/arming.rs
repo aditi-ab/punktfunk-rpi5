@@ -35,7 +35,7 @@ pub enum PinAttempt {
 
 fn random_pin() -> String {
     use rand::Rng;
-    format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
+    format!("{:04}", rand::rng().random_range(0..10_000u32))
 }
 
 /// A snapshot of the arming window for the management API: `(armed, pin, expires_in_secs)`.
