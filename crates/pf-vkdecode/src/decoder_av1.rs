@@ -100,6 +100,7 @@ use pf_bitstream::av1::NUM_REF_SLOTS;
 use pf_bitstream::h264::DisplayCrop;
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
 
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
@@ -688,6 +689,10 @@ pub struct VkAv1Decoder {
     /// through a temporal unit, which is why the skip is per FRAME while the error
     /// is per ACCESS UNIT.
     awaiting_key: bool,
+    /// One-shot latch for the over-declared-level warning, so a stream whose
+    /// sequence header sits above the device ceiling says so once per decoder
+    /// rather than once per access unit (`ensure_state` runs per AU).
+    level_advisory_warned: bool,
 }
 
 impl VkAv1Decoder {
@@ -728,6 +733,7 @@ impl VkAv1Decoder {
             device_lost: false,
             recovery: RecoveryLatch::default(),
             awaiting_key: false,
+            level_advisory_warned: false,
         })
     }
 
@@ -745,8 +751,10 @@ impl VkAv1Decoder {
     ///
     /// The negotiated facts are a HINT (the in-band sequence header is
     /// authoritative), so this is deliberately not a promise that decode will
-    /// succeed: the level ceiling and a sequence header that disagrees with the
-    /// Welcome still surface at the first AU.
+    /// succeed: a coded extent outside the caps, a DPB deeper than the device
+    /// allows, and a sequence header that disagrees with the Welcome all still
+    /// surface at the first AU. The declared LEVEL is not among them — it is
+    /// advisory, and `ensure_state` only warns on it.
     pub fn probe_stream_support(
         &self,
         chroma_format_idc: u8,
@@ -1478,8 +1486,9 @@ impl VkAv1Decoder {
         self.flush();
     }
 
-    /// Session/caps for THIS plan exist and match its extent + profile, and the
-    /// stream sits inside the device's level ceiling.
+    /// Session/caps for THIS plan exist and match its extent + profile. A declared
+    /// level above the device ceiling warns once and proceeds — see the gate below
+    /// for why an AV1 `seq_level_idx` is advisory and 31 is not even a level.
     fn ensure_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         let key = profile_key_for(plan)?;
         if self.caps.as_ref().map(|(k, _)| *k) != Some(key) {
@@ -1491,17 +1500,39 @@ impl VkAv1Decoder {
                 unsafe { query_av1_caps(&self.dev, key) }.map_err(|r| caps_query_error(r, key))?;
             self.caps = Some((key, derive_caps_av1(&raw, wanted)?));
         }
-        // The level gate. AV1's `StdVideoAV1Level` is index-coded exactly like the
-        // bitstream's `seq_level_idx` (2.0 = 0 … 7.3 = 23) and ascends with the
-        // level, so this is a plain comparison — of AV1 code points against an AV1
-        // ceiling, the pairing `MaxLevelIdc`'s tag exists to keep honest.
+        // The declared level vs the device ceiling: a DECLARED level above `maxLevel`
+        // is NOT a refusal, for the reason `VkH265Decoder::ensure_state` spells out —
+        // the level is a CLAIM, and the stream's real demands are enforced where they
+        // are physical facts (coded extent and DPB depth, checked in `rebuild_state`).
+        //
+        // AV1 makes the point sharper than H.265 did. `seq_level_idx` is a 5-bit
+        // field; Annex A defines 0…23 (levels 2.0…7.3) and reserves 24…30, but **31 is
+        // the "maximum parameters" level — the spec's own way of saying the bitstream
+        // is not constrained to any level at all**. `StdVideoAV1Level` has no code
+        // point for it (it stops at 7.3 = 23), so the index-coded comparison that
+        // holds across 0…23 is meaningless against 31: the sentinel is not a level
+        // and 31 > 23 is not "too demanding". Real-time encoders emit it as a matter
+        // of course — a 2026-08-13 field report (RTX 5060 client, 4K120) had EVERY
+        // AV1 session demote to D3D11VA on "stream level (seq_level_idx 31) above the
+        // device's maxLevel (AV1 Std level 23)" while the same hardware decoded the
+        // stream trivially. We never write an AV1 level on any host encode path, so
+        // whatever the vendor defaults to is what the client must accept.
+        //
+        // Unlike H.265 there is nothing to clamp: `StdVideoAV1SequenceHeader` carries
+        // no level field (see `params_av1`), so the declaration never reaches the
+        // driver and cannot be invalid usage. Warn once, proceed.
         let caps_max_level = self.caps.as_ref().expect("queried above").1.max_level_idc;
         let stream_level = u32::from(stream_level_idx(plan));
-        if stream_level > caps_max_level.code_point() {
-            return Err(VkDecodeError::Unsupported(format!(
-                "stream level (seq_level_idx {stream_level}) above the device's \
-                 maxLevel ({caps_max_level})"
-            )));
+        if stream_level > caps_max_level.code_point() && !self.level_advisory_warned {
+            self.level_advisory_warned = true;
+            warn!(
+                stream_level,
+                ceiling = %caps_max_level,
+                "stream declares an AV1 level above the device ceiling — the declared \
+                 level is advisory (seq_level_idx 31 means \"maximum parameters\", and \
+                 encoders over-declare); proceeding, since the level never reaches the \
+                 driver"
+            );
         }
         let coded = coded_extent(plan);
         match &self.state {
@@ -2907,8 +2938,43 @@ mod tests {
         assert_eq!(key.output_format(), Some(crate::caps::NV12));
         assert!(!key.film_grain);
 
-        // The level gate reads operating point 0 and stays inside the Std range.
+        // The level gate reads operating point 0. This vector declares a real level,
+        // inside the Std range — the sentinel case is pinned separately below.
         assert!(stream_level_idx(&plan) <= 23);
+    }
+
+    /// `seq_level_idx` 31 is Annex A's "maximum parameters" — "not constrained to a
+    /// level" — not a level above 7.3, and `StdVideoAV1Level` has no code point for
+    /// it. Comparing it as an ordinary level is what demoted every AV1 session on a
+    /// 2026-08-13 field report (RTX 5060, 4K120): `maxLevel` came back 23 (7.3, the
+    /// device's own maximum) and 31 > 23 refused a stream the hardware decodes fine.
+    ///
+    /// This pins the ARITHMETIC that made the refusal look reasonable, so nobody
+    /// restores the gate by reading `31 > 23` as "too demanding":
+    #[test]
+    fn the_av1_max_parameters_sentinel_is_not_a_level_above_the_ceiling() {
+        // The ceiling as the gate reads it, on a device that decodes everything the
+        // Std enum can name — 7.3, the top code point there is.
+        let ceiling = crate::caps::MaxLevelIdc::Av1(hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_7_3);
+        assert_eq!(ceiling.code_point(), 23, "the Std enum's top code point");
+
+        // Every `seq_level_idx` the Std enum names compares sanely against it…
+        for idx in 0..=ceiling.code_point() {
+            assert!(idx <= ceiling.code_point());
+        }
+        // …and everything above is OUTSIDE that code space, not above the ceiling:
+        // 24…30 are reserved and 31 is "maximum parameters". A maxed-out device
+        // cannot satisfy the comparison, which is why it is not a capability test.
+        for idx in (ceiling.code_point() + 1)..=31 {
+            assert!(
+                idx > ceiling.code_point(),
+                "seq_level_idx {idx} is outside the Std range, not a more demanding level"
+            );
+        }
+
+        // The field report's exact pairing, kept legible: 31 against a ceiling of 23.
+        assert!(31 > ceiling.code_point());
+        assert_eq!(format!("{ceiling}"), "AV1 Std level 23");
     }
 
     #[test]
@@ -2951,7 +3017,7 @@ mod tests {
     /// `PlanError::AwaitingIdr`, and the reason [`VkAv1Decoder::awaiting_key`]'s
     /// docs carry: a clean `Ok(None)` resets the consumer's demotion streak once
     /// per frame, so a rung whose every key frame fails (film grain on a device
-    /// without the grain profile; a level above `maxLevelIdc`; a sequence header
+    /// without the grain profile; a coded extent outside the caps; a sequence header
     /// disagreeing with the negotiation) would never demote and the session would
     /// hold a frozen screen with a clean bill of health.
     ///

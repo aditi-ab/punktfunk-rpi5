@@ -211,9 +211,16 @@ pub struct RawAv1Caps {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_reference_pictures: u32,
-    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel` (index-coded Std level — the
-    /// SAME numbering as the bitstream's `seq_level_idx`, which is what makes the
-    /// decoder's level gate a plain comparison).
+    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel` (index-coded Std level — the same
+    /// numbering as the bitstream's `seq_level_idx` OVER 0…23, which is the whole
+    /// range `StdVideoAV1Level` enumerates).
+    ///
+    /// ⚠ That correspondence does not extend to the rest of the bitstream field.
+    /// `seq_level_idx` is 5 bits: 24…30 are reserved and 31 is Annex A's "maximum
+    /// parameters" sentinel — "not constrained to a level" — which has no Std code
+    /// point and is NOT an ordering above 7.3. The decoder's gate therefore treats
+    /// a stream above this ceiling as advisory rather than comparing it as a level
+    /// (`VkAv1Decoder::ensure_state`).
     pub max_level: hh::StdVideoAV1Level,
     /// `VkVideoCapabilitiesKHR::stdHeaderVersion` — session creation echoes it back.
     pub std_header_version: vk::ExtensionProperties,
