@@ -2722,14 +2722,35 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 last_forced_idr = Some(now);
                 rfi_echo_swallowed = 0; // the IDR resets the episode — echoes of IT coalesce via the cooldown
                 if let Some(period) = recovery_cadence.note(now) {
-                    tracing::warn!(
-                        period_s = format!("{:.1}", period.as_secs_f64()),
-                        "client keyframe recoveries are METRONOMIC — a periodic host/display \
-                         disturbance (display-topology churn, display-poller software, \
-                         virtual-display timing) is the likely cause, not random network loss; \
-                         correlate with 'slow display-descriptor poll' / 'display descriptor \
-                         changed' / 'IDD-push capture stall' lines"
-                    );
+                    // A period that lands on the CLIENT's jump-to-live cooldown is not evidence
+                    // of a periodic disturbance here at all — it is the client shedding a
+                    // standing receive queue, which it is rate-limited to do exactly this often
+                    // (`punktfunk_core::client::FLUSH_COOLDOWN`), so the cadence is a property of
+                    // our own backpressure code rather than of anything physical. Naming display
+                    // churn there sent a 2026-08-13 field investigation at three innocent
+                    // subsystems while the real chain was: client refused the codec → demoted to
+                    // a slower decode rung → could not sustain the rate → standing queue.
+                    // Perfect periodicity argues FOR a software cooldown, not against it.
+                    if matches_client_flush_cadence(period) {
+                        tracing::warn!(
+                            period_s = format!("{:.1}", period.as_secs_f64()),
+                            "client keyframe recoveries match the client's jump-to-live cooldown \
+                             — the CLIENT cannot sustain the stream and is shedding a standing \
+                             receive queue (check its log for 'receive backlog stopped draining' \
+                             with queue_depth, and for a decode rung that demoted); a slower \
+                             decode path or a link below the bitrate does this, and it is NOT a \
+                             host display disturbance"
+                        );
+                    } else {
+                        tracing::warn!(
+                            period_s = format!("{:.1}", period.as_secs_f64()),
+                            "client keyframe recoveries are METRONOMIC — a periodic host/display \
+                             disturbance (display-topology churn, display-poller software, \
+                             virtual-display timing) is the likely cause, not random network \
+                             loss; correlate with 'slow display-descriptor poll' / 'display \
+                             descriptor changed' / 'IDD-push capture stall' lines"
+                        );
+                    }
                 }
             }
         }
@@ -3785,6 +3806,23 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     Ok(())
 }
 
+/// Whether a measured keyframe-recovery period is the CLIENT's jump-to-live cooldown rather
+/// than anything happening on this host.
+///
+/// Every jump-to-live sends a keyframe request and is rate-limited to one per
+/// [`punktfunk_core::client::FLUSH_COOLDOWN`], so a client that simply cannot sustain the
+/// stream asks at exactly that spacing for as long as it stays behind. The recovery-cadence
+/// detector reads perfect periodicity as evidence of a periodic *disturbance*, which is
+/// backwards here: a fixed software cooldown is the most periodic thing in the system.
+///
+/// ±10 % — wide enough for scheduling jitter and the request's network trip, narrow enough that
+/// it cannot swallow the disturbance cadences the other branch exists to report (display-mode
+/// churn and descriptor polls run at their own, unrelated periods).
+fn matches_client_flush_cadence(period: std::time::Duration) -> bool {
+    let flush = punktfunk_core::client::FLUSH_COOLDOWN;
+    period.abs_diff(flush) < flush / 10
+}
+
 /// One mode's capture/encode pipeline: (capturer, encoder, first frame, frame interval).
 /// Dropping the capturer tears down the PipeWire stream and the virtual output with it.
 type Pipeline = (
@@ -4596,6 +4634,26 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-08-13 field log's exact reading — `period_s=2.0` — must be attributed to the
+    /// client's backlog shedding, not to a host display disturbance. The whole point of routing
+    /// on the shared constant is that this stays true if the cooldown is ever retuned, so the
+    /// test derives its cases from `FLUSH_COOLDOWN` instead of hardcoding two seconds.
+    #[test]
+    fn a_recovery_cadence_on_the_clients_cooldown_is_not_blamed_on_the_display() {
+        let flush = punktfunk_core::client::FLUSH_COOLDOWN;
+        assert!(matches_client_flush_cadence(flush), "the field reading");
+        // Scheduling jitter and the request's trip across the link stay inside the band.
+        assert!(matches_client_flush_cadence(flush + flush / 20));
+        assert!(matches_client_flush_cadence(flush - flush / 20));
+
+        // Cadences that are NOT the cooldown still reach the display-disturbance branch — the
+        // band must not be so wide that it swallows them.
+        assert!(!matches_client_flush_cadence(flush / 2));
+        assert!(!matches_client_flush_cadence(flush * 2));
+        assert!(!matches_client_flush_cadence(flush + flush / 5));
+        assert!(!matches_client_flush_cadence(std::time::Duration::ZERO));
+    }
 
     #[test]
     fn an_escalated_but_caught_up_encoder_stops_refusing_climbs() {

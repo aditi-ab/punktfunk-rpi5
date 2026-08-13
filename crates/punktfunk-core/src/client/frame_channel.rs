@@ -47,7 +47,15 @@ pub(crate) const FLUSH_AFTER: Duration = Duration::from_millis(250);
 /// Minimum spacing between jump-to-live events, so a bottleneck that instantly rebuilds the queue (a
 /// link/consumer that can't sustain the bitrate at all) degrades into a periodic skip + a logged
 /// warning instead of a continuous flush/keyframe storm.
-pub(crate) const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
+///
+/// **Public because the HOST needs it to read its own logs.** Each jump-to-live sends a keyframe
+/// request, so a client that cannot sustain the rate asks for one at exactly this spacing,
+/// forever — and the host's recovery-cadence detector saw that perfect periodicity and blamed a
+/// periodic *display* disturbance (2026-08-13 field log: `period_s=2.0`, three subsystems named,
+/// none of them the cause). Perfect periodicity is the signature of a fixed software cooldown,
+/// not of a physical disturbance. The host compares against this constant rather than a copy of
+/// the number, so the two can never drift apart.
+pub const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// A clock-triggered jump-to-live that discarded fewer datagrams than this (and no queued AUs)
 /// found NO local backlog: the frames read as late, but nothing here was actually behind. Two
