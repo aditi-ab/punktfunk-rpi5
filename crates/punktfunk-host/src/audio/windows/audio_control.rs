@@ -509,9 +509,10 @@ pub(crate) fn restore_default_playback() {
 
 /// Open a device by endpoint id, with a name for error context.
 ///
-/// Resolves through [`super::pad_endpoint::open_wasapi_device`], NOT the `wasapi` crate's
-/// `DeviceEnumerator::get_device` — that one hands `GetDevice` a freed string (see the helper's
-/// docs), so it fails at random on ids that are perfectly valid.
+/// Resolves through [`super::pad_endpoint::open_wasapi_device`] rather than the `wasapi` crate's
+/// `DeviceEnumerator::get_device`: that one handed `GetDevice` a freed string through 0.23, so it
+/// failed at random on ids that are perfectly valid. `wasapi 0.24` fixed that, but we keep the one
+/// resolution path — see the helper's docs.
 pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
     super::pad_endpoint::open_wasapi_device(&ep.1)
         .map_err(|e| anyhow!("open endpoint {:?}: {e:#}", ep.0))

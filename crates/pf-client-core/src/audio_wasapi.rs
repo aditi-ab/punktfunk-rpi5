@@ -100,12 +100,14 @@ pub fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
 /// audio keeps working, like the PipeWire twin's `target.object` behavior.
 /// Resolve an active endpoint by id WITHOUT `DeviceEnumerator::get_device`.
 ///
-/// That helper builds its argument as `PCWSTR::from_raw(HSTRING::from(id).as_ptr())` — the
-/// `HSTRING` is a temporary, dropped at the end of that statement, so `GetDevice` reads freed
-/// memory and misses ids that are perfectly valid. Scanning the active collection touches only
-/// safe crate APIs, so it cannot regress the same way. (`punktfunk-host` fixes the same bug with
-/// raw COM instead; this crate cannot, because it pins a different `windows` revision than
-/// `wasapi` does, making the two `IMMDevice` types incompatible.)
+/// Through `wasapi 0.23` that helper built its argument as
+/// `PCWSTR::from_raw(HSTRING::from(id).as_ptr())` — the `HSTRING` was a temporary, dropped at the
+/// end of that statement, so `GetDevice` read freed memory and missed ids that are perfectly valid.
+/// `wasapi 0.24` fixed that upstream. Scanning the active collection touches only safe crate APIs,
+/// so it cannot regress the same way, and it additionally filters to ACTIVE endpoints — which is
+/// why it stays. (`punktfunk-host` routes around the same bug with raw COM instead; this crate
+/// cannot, because it pins a different `windows` revision than `wasapi` does, making the two
+/// `IMMDevice` types incompatible.)
 pub(crate) fn device_by_id(
     enumerator: &DeviceEnumerator,
     direction: &Direction,

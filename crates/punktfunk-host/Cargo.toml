@@ -286,7 +286,7 @@ winreg = "0.56"
 # provider — a small read-only DOM is all we need (Identity/Executable/ShellVisuals/StoreId).
 roxmltree = "0.21"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
-wasapi = "0.23"
+wasapi = "0.24"
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the
 # control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs, defined ONCE so host<->driver
 # ABI drift is a compile error (used from `capture.rs`). The `bytemuck` that serializes those
