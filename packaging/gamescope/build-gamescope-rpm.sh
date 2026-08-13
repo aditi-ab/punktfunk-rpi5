@@ -7,19 +7,24 @@
 # had no packaged route at all, which is how a field report ended up on a stock gamescope streaming
 # a session that told every game the display was 60 Hz.
 #
-# The binary is NOT built here; CI builds it once per Fedora major and caches it
+# Nothing is BUILT here; CI builds once per Fedora major and caches the staged tree
 # (.gitea/workflows/rpm.yml). See punktfunk-gamescope.spec's header for why repacking beats
 # rebuilding.
 #
+# `--stage` is the DESTDIR that build-punktfunk-gamescope.sh wrote, not a single binary: that tree
+# carries the compositor AND the WSI layer built beside it, and a game gets an HDR10 swapchain from
+# that layer or from nowhere. Taking the whole tree rather than a file per artifact is deliberate —
+# it is what stops the next file added to the package needing a new flag in four packaging scripts.
+#
 # Usage:
 #   bash packaging/gamescope/build-gamescope-rpm.sh \
-#     --binary gs-cache/punktfunk-gamescope \
+#     --stage gs-cache \
 #     [--version 3.16.25] [--release 1] [--outdir dist]
 #
 # Output: <outdir>/punktfunk-gamescope-<version>-<release>.<arch>.rpm
 set -euo pipefail
 
-BINARY=""
+STAGE=""
 # Default the version to the upstream gamescope the pinned revision describes as, suffixed with the
 # patch-set revision — same shape as the Arch package's `pkgver`, so the two channels read alike.
 VERSION=""
@@ -28,7 +33,7 @@ OUTDIR="dist"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --binary)  BINARY="${2:?--binary needs a path}"; shift 2 ;;
+    --stage)   STAGE="${2:?--stage needs a path}"; shift 2 ;;
     --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     --release) RELEASE="${2:?--release needs a value}"; shift 2 ;;
     --outdir)  OUTDIR="${2:?--outdir needs a value}"; shift 2 ;;
@@ -36,8 +41,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$BINARY" ] || { echo "ERROR: --binary is required" >&2; exit 2; }
+[ -n "$STAGE" ] || { echo "ERROR: --stage is required" >&2; exit 2; }
+# The layout build-punktfunk-gamescope.sh writes under its --destdir/--prefix.
+BINARY="$STAGE/usr/bin/punktfunk-gamescope"
+LAYER_SO="$STAGE/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+LAYER_JSON="$STAGE/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
 [ -x "$BINARY" ] || { echo "ERROR: $BINARY is not an executable file" >&2; exit 1; }
+# Hard, not best-effort. A package that carries the compositor without its layer looks completely
+# healthy and then silently denies every game an HDR10 swapchain — the failure this whole change
+# exists to end. Better to fail the packaging step than to ship that quietly again.
+for f in "$LAYER_SO" "$LAYER_JSON"; do
+  [ -f "$f" ] || { echo "ERROR: $f missing from the stage — no game HDR without it" >&2; exit 1; }
+done
 
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
@@ -66,6 +81,8 @@ TOP="$(mktemp -d)"
 trap 'rm -rf "$TOP"' EXIT
 mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 install -m0755 "$BINARY" "$TOP/SOURCES/punktfunk-gamescope"
+install -m0755 "$LAYER_SO" "$TOP/SOURCES/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+install -m0644 "$LAYER_JSON" "$TOP/SOURCES/punktfunk_gamescope_wsi.json"
 
 mkdir -p "$OUTDIR"
 rpmbuild \

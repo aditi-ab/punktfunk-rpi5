@@ -4218,9 +4218,19 @@ const WSI_OFF_ENV: [(&str, &str); 2] = [
 /// the compositor cannot disagree about `gamescope_swapchain` — which is what makes every "is the
 /// distro's layer close enough to ours?" guess unnecessary. It carries its own layer name and its
 /// own `enable_environment`, so it coexists with the distro's rather than replacing it.
-const OUR_WSI_LAYER_DIR: &str = "/usr/lib/punktfunk/vulkan/implicit_layer.d";
-const OUR_WSI_LAYER_MANIFEST: &str =
-    "/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json";
+const OUR_WSI_LAYER_DIR_DEFAULT: &str = "/usr/lib/punktfunk/vulkan/implicit_layer.d";
+const OUR_WSI_LAYER_MANIFEST_NAME: &str = "punktfunk_gamescope_wsi.json";
+
+/// Where our layer's manifest directory is. FHS by default, because that is where every distro
+/// package puts it; `PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR` overrides for a store with no `/usr` to
+/// speak of — on NixOS the layer lives inside the gamescope derivation and the module points this
+/// at it, the same posture as `PUNKTFUNK_GAMESCOPE_BIN`.
+fn our_wsi_layer_dir() -> String {
+    std::env::var("PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| OUR_WSI_LAYER_DIR_DEFAULT.to_string())
+}
 
 /// Which Vulkan WSI layer a session we spawn should run with. Three states, decided ONCE per
 /// launch because [`WsiPlan::resolve`] can spawn `--version` probes.
@@ -4240,7 +4250,8 @@ impl WsiPlan {
     /// ⚠️ Spawns up to two `gamescope --version` probes in the fallback arms, so resolve once and
     /// pass the result around rather than calling this per use site.
     fn resolve() -> Self {
-        if std::path::Path::new(OUR_WSI_LAYER_MANIFEST).is_file() {
+        let manifest = std::path::Path::new(&our_wsi_layer_dir()).join(OUR_WSI_LAYER_MANIFEST_NAME);
+        if manifest.is_file() {
             Self::Ours
         } else if wsi_layer_matches_our_gamescope() {
             Self::DistroKept
@@ -4250,20 +4261,23 @@ impl WsiPlan {
     }
 
     /// The environment this plan needs, as `(name, value)` pairs.
-    fn env(self) -> Vec<(&'static str, &'static str)> {
+    fn env(self) -> Vec<(&'static str, String)> {
         match self {
             // `VK_ADD_IMPLICIT_LAYER_PATH` ADDS to the loader's implicit-layer search (loader
             // 1.3.234+), so the box's own layer directories keep working; the distro's gamescope
             // layer is then switched off by name through its own variables, leaving exactly one
             // gamescope WSI layer live — ours.
             Self::Ours => vec![
-                ("VK_ADD_IMPLICIT_LAYER_PATH", OUR_WSI_LAYER_DIR),
-                ("PUNKTFUNK_GAMESCOPE_WSI", "1"),
-                ("DISABLE_GAMESCOPE_WSI", "1"),
-                ("ENABLE_GAMESCOPE_WSI", "0"),
+                ("VK_ADD_IMPLICIT_LAYER_PATH", our_wsi_layer_dir()),
+                ("PUNKTFUNK_GAMESCOPE_WSI", "1".to_string()),
+                ("DISABLE_GAMESCOPE_WSI", "1".to_string()),
+                ("ENABLE_GAMESCOPE_WSI", "0".to_string()),
             ],
             Self::DistroKept => Vec::new(),
-            Self::DistroDisabled => WSI_OFF_ENV.to_vec(),
+            Self::DistroDisabled => WSI_OFF_ENV
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_string()))
+                .collect(),
         }
     }
 
@@ -4870,12 +4884,12 @@ mod tests {
         any_output_size_is, cgroup_is_punktfunk_owned, cgroup_under_user_manager,
         classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
         dm_survives_masked_unit, game_hz, gamescope_output_size, hdr_args, is_steam_launch,
-        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, plan_bind,
-        release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
+        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, our_wsi_layer_dir,
+        plan_bind, release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
         shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
         xwayland_refusal_marker, BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind,
-        TakeoverState, WsiPlan, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, OUR_WSI_LAYER_DIR,
-        STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
+        TakeoverState, WsiPlan, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN,
+        WSI_OFF_ENV, X11_SOCKET_DIR,
     };
 
     fn argv(s: &str) -> Vec<String> {
@@ -5729,11 +5743,11 @@ mod tests {
         let get = |k: &str| {
             env.iter()
                 .find(|(name, _)| *name == k)
-                .map(|(_, v)| *v)
+                .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| panic!("{k} missing from the Ours plan"))
         };
 
-        assert_eq!(get("VK_ADD_IMPLICIT_LAYER_PATH"), OUR_WSI_LAYER_DIR);
+        assert_eq!(get("VK_ADD_IMPLICIT_LAYER_PATH"), our_wsi_layer_dir());
         assert_eq!(get("PUNKTFUNK_GAMESCOPE_WSI"), "1");
         // The clobber-proof one, for exactly the reason the test above states.
         assert_eq!(get("DISABLE_GAMESCOPE_WSI"), "1");

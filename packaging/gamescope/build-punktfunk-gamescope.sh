@@ -180,26 +180,8 @@ LAYER_DEST_JSON="${DESTDIR}${PREFIX}/lib/punktfunk/vulkan/implicit_layer.d/punkt
 echo "==> installing ${DESTDIR}${LAYER_LIB_PATH}"
 install -Dm755 "$LAYER_SO" "${DESTDIR}${LAYER_LIB_PATH}"
 install -d "$(dirname "$LAYER_DEST_JSON")"
-python3 - "$LAYER_SRC_JSON" "$LAYER_DEST_JSON" "$LAYER_LIB_PATH" <<'PY'
-import json, sys
-
-src, dst, lib = sys.argv[1:4]
-with open(src) as f:
-    manifest = json.load(f)
-layer = manifest["layer"]
-# A distinct name is what lets our layer and the distro's coexist: the loader deduplicates implicit
-# layers by name, and with both called VK_LAYER_FROG_gamescope_wsi which one wins is unspecified.
-layer["name"] = "VK_LAYER_PUNKTFUNK_gamescope_wsi"
-# Absolute, so resolution never depends on where the loader happened to find the manifest.
-layer["library_path"] = lib
-# Our own gates. The distro layer's ENABLE_GAMESCOPE_WSI / DISABLE_GAMESCOPE_WSI keep working on the
-# distro layer alone, so the host can switch the two independently in one session.
-layer["enable_environment"] = {"PUNKTFUNK_GAMESCOPE_WSI": "1"}
-layer["disable_environment"] = {"PUNKTFUNK_GAMESCOPE_WSI_DISABLE": "1"}
-with open(dst, "w") as f:
-    json.dump(manifest, f, indent=2)
-    f.write("\n")
-PY
+python3 "$(dirname "$0")/rewrite-wsi-layer-manifest.py" \
+  "$LAYER_SRC_JSON" "$LAYER_DEST_JSON" "$LAYER_LIB_PATH"
 
 if [ "$SETCAP" = 1 ] && command -v setcap >/dev/null; then
   # gamescope raises its own scheduling priority; without CAP_SYS_NICE it still runs, just noisier

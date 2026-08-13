@@ -69,6 +69,10 @@
           # from source and would make `nix flake check` an hour long.
           punktfunk-gamescope = pkgs.callPackage ./packaging/nix/gamescope.nix {
             patchDir = ./packaging/gamescope/patches;
+            # Shared verbatim with build-punktfunk-gamescope.sh, which is the whole reason it is a
+            # file: the FHS packages and the Nix store must rename the WSI layer identically, or
+            # the host looks for a layer name that only one of them produces.
+            manifestRewriter = ./packaging/gamescope/rewrite-wsi-layer-manifest.py;
           };
         };
     in
