@@ -62,6 +62,17 @@ pub struct PwAudioCapturer {
     /// active). Toggled by open/[`drain`](AudioCapturer::drain) (claim) and
     /// [`idle`](AudioCapturer::idle)/Drop (release).
     claimed: bool,
+    /// Whether a session is currently CONSUMING this capturer, shared with the PipeWire
+    /// thread so the drop counter can tell "the encode thread fell behind" from "nobody is
+    /// reading". The capturer is host-lifetime and merely PARKED between sessions
+    /// ([`idle`](AudioCapturer::idle)), so without this the producer keeps filling the bounded
+    /// hand-off channel, every `try_send` fails once it is full, and the plane reports a 100 %
+    /// drop rate — warning that "the stream will click" when there is no stream. A 2026-08-13
+    /// field host log carried ten such warnings, up to `dropped_chunks=11251` (= 30 s × 375
+    /// chunks/s, i.e. every single chunk), each one straddling a session boundary and each one
+    /// meaningless. Distinct from `claimed`, which tracks the sink-routing claim and only
+    /// exists when the stream sink is enabled at all.
+    active: Arc<AtomicBool>,
 }
 
 impl PwAudioCapturer {
@@ -90,10 +101,21 @@ impl PwAudioCapturer {
         // mode the sink node must exist before we claim the default to its name.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
         let thread_sink_name = sink_name.clone();
+        // Opens at session start (see the routing claim below), so the consumer is live from
+        // the first chunk.
+        let active = Arc::new(AtomicBool::new(true));
+        let thread_active = Arc::clone(&active);
         thread::Builder::new()
             .name("punktfunk-pw-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(tx, quit_rx, channels, thread_sink_name, ready_tx) {
+                if let Err(e) = pw_thread(
+                    tx,
+                    quit_rx,
+                    channels,
+                    thread_sink_name,
+                    ready_tx,
+                    thread_active,
+                ) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire audio thread failed");
                 }
             })
@@ -118,12 +140,16 @@ impl PwAudioCapturer {
             quit: quit_tx,
             sink_name,
             claimed,
+            active,
         })
     }
 }
 
 impl Drop for PwAudioCapturer {
     fn drop(&mut self) {
+        // The receiver dies with us; anything the producer still pushes is unwanted by
+        // definition, and it must not be reported as the encode thread falling behind.
+        self.active.store(false, Ordering::Relaxed);
         if self.claimed {
             self.claimed = false;
             stream_sink::release();
@@ -157,9 +183,15 @@ impl AudioCapturer for PwAudioCapturer {
             stream_sink::claim(name);
             self.claimed = true;
         }
+        // Ordered AFTER the backlog drain, so the producer never counts a drop against a
+        // channel this call is still emptying.
+        self.active.store(true, Ordering::Relaxed);
     }
 
     fn idle(&mut self) {
+        // Parked: from here the channel fills and stays full, and those drops are nobody's
+        // fault. See `PwAudioCapturer::active`.
+        self.active.store(false, Ordering::Relaxed);
         if self.claimed {
             self.claimed = false;
             stream_sink::release();
@@ -644,6 +676,7 @@ fn pw_thread(
     channels: u32,
     sink_name: Option<String>,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
+    active: Arc<AtomicBool>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -735,6 +768,9 @@ fn pw_thread(
             /// never again — the one number that identifies a clamped quantum, invisible on every
             /// subsequent open (including every reopen after a device change).
             reported_quantum: bool,
+            /// Shared with the capturer — see [`PwAudioCapturer::active`]. Read on every
+            /// failed hand-off to keep parked-capturer backpressure out of the drop count.
+            active: Arc<AtomicBool>,
         }
         let ud = CapUd {
             tx,
@@ -742,6 +778,7 @@ fn pw_thread(
             stats: Default::default(),
             last_stats: std::time::Instant::now(),
             reported_quantum: false,
+            active,
         };
         let _listener = stream
             .add_local_listener_with_user_data(ud)
@@ -844,11 +881,15 @@ fn pw_thread(
                         samples.push(f32::from_le_bytes(b));
                     }
                     ud.stats.observe(&samples, ud.channels);
-                    // Non-blocking and lossy, as before — but COUNTED. A full channel means the
-                    // encode thread is not keeping up, and because the encoder simply
-                    // concatenates across the hole every dropped chunk is a click AND a
-                    // permanent shift of everything after it.
-                    if ud.tx.try_send(samples).is_err() {
+                    // Non-blocking and lossy, as before — but COUNTED, and only while a session
+                    // is actually reading. A full channel under a LIVE consumer means the encode
+                    // thread is not keeping up, and because the encoder simply concatenates
+                    // across the hole every dropped chunk is a click AND a permanent shift of
+                    // everything after it. A full channel under a PARKED capturer means nothing
+                    // at all: the capturer is host-lifetime, so between sessions the channel
+                    // fills once and then refuses everything, which counted as a 100 % drop rate
+                    // and warned about a stream that did not exist (`PwAudioCapturer::active`).
+                    if ud.tx.try_send(samples).is_err() && ud.active.load(Ordering::Relaxed) {
                         ud.stats.dropped_chunks += 1;
                     }
                     if ud.last_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {

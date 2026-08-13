@@ -185,8 +185,12 @@ pub enum MaxLevelIdc {
     H265(hh::StdVideoH265LevelIdc),
     /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel`. Unlike the other two this code
     /// space is the BITSTREAM's own: `StdVideoAV1Level` is index-coded exactly like
-    /// AV1's `seq_level_idx` (2.0 = 0, 2.1 = 1, … 7.3 = 23), so the decoder's gate
-    /// compares the sequence header's value against it directly.
+    /// AV1's `seq_level_idx` (2.0 = 0, 2.1 = 1, … 7.3 = 23).
+    ///
+    /// ⚠ Only over 0…23. `seq_level_idx` is 5 bits, and 31 is Annex A's "maximum
+    /// parameters" sentinel — no level constraint — which outranks even a device
+    /// reporting the enum's top value. The AV1 gate therefore treats a stream above
+    /// this ceiling as advisory instead of refusing it (`VkAv1Decoder::ensure_state`).
     Av1(hh::StdVideoAV1Level),
 }
 
