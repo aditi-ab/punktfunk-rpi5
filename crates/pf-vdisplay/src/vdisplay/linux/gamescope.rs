@@ -4244,8 +4244,13 @@ fn wsi_off_unit_lines() -> String {
 /// byte-identical between those commits, so this is the distro PATCHING gamescope, not a version
 /// bump — which is why the check is "do the version triples differ", not a floor.
 ///
-/// Disabling it costs only the layer's extras (XWayland bypass, present-mode control, client HDR
-/// metadata) — far cheaper than a client that cannot start.
+/// Disabling it costs the layer's extras (XWayland bypass, present-mode control) and, on an HDR
+/// session, **HDR for games**. The layer is the ONLY route to an HDR10 swapchain under gamescope:
+/// gamescope advertises no runtime colour-management protocol for a Mesa/NVIDIA WSI to negotiate
+/// through, so with the layer inactive a client never gets a Surface-state block and lands on
+/// `hdr10_format=None` (measured on a Deck OLED — see the Gamescope WSI notes in the flatpak
+/// manifest). Still cheaper than a client that cannot start at all, but not free, which is why
+/// [`launch_session`] says so out loud when it fires on an HDR session.
 ///
 /// ⚠️ **`ENABLE_GAMESCOPE_WSI=0` is NOT enough on its own**, which is what [`WSI_OFF_ENV`] is for.
 fn wsi_layer_matches_our_gamescope() -> bool {
@@ -4313,6 +4318,19 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
              enabled it rejects the client's swapchain_feedback and every Vulkan client dies; \
              Steam's own UI is not one, so what you see is a game that runs with sound and input \
              on a black screen, with no other symptom."
+        );
+    }
+    // The two HDR decisions are made independently — `hdr_args` never consults the layer check — so
+    // without this an HDR session launches advertising HDR while having made game HDR unreachable
+    // in the same breath, and nothing anywhere says so.
+    if !wsi_ok && hdr {
+        tracing::warn!(
+            "gamescope: this session negotiated HDR, but with the WSI layer disabled no game in it \
+             can get an HDR10 swapchain — that layer is the only route to one. The stream itself \
+             stays HDR (the capture really is PQ/BT.2020, and Steam's UI and the desktop ride the \
+             same container), so what breaks is GAME HDR specifically: a title told to render HDR \
+             renders it into an SDR swapchain and looks washed out. Fix by installing a \
+             VkLayer_FROG_gamescope_wsi built for the gamescope we run."
         );
     }
     let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
@@ -4559,22 +4577,37 @@ fn add_bare_gamescope_args(
 ///   fine meanwhile.)
 /// * `--hdr-sdr-content-nits` maps SDR content into the PQ container. Everything that is not an
 ///   HDR game — the desktop, the Steam overlay, an SDR title — rides through it, so it decides
-///   how bright "white" lands on the client's panel. Only passed when the operator set the knob;
-///   otherwise gamescope's own default (400) applies.
+///   how bright "white" lands on the client's panel. We always pass it, because the two ends have
+///   to agree on where diffuse white sits and gamescope's own default does not match ours — see
+///   [`SDR_REFERENCE_WHITE_NITS`].
 fn hdr_args(hdr: bool) -> Vec<String> {
     if !hdr {
         return Vec::new();
     }
-    let mut args = vec![
+    let nits = pf_host_config::config()
+        .gamescope_sdr_nits
+        .unwrap_or(SDR_REFERENCE_WHITE_NITS);
+    vec![
         "--hdr-enabled".to_string(),
         "--hdr-debug-force-support".to_string(),
-    ];
-    if let Some(nits) = pf_host_config::config().gamescope_sdr_nits {
-        args.push("--hdr-sdr-content-nits".to_string());
-        args.push(nits.to_string());
-    }
-    args
+        "--hdr-sdr-content-nits".to_string(),
+        nits.to_string(),
+    ]
 }
+
+/// Where diffuse white sits, in nits, for SDR content carried inside an HDR session's PQ container.
+///
+/// 203 is BT.2408 "HDR Reference White", and it is the value every first-party client anchors to:
+/// the Apple presenter hands exactly 203 to `CAEDRMetadata.hdr10(opticalOutputScale:)`. gamescope's
+/// own default is 400, so leaving the flag off put the host nearly a stop (400/203 ≈ 1.97×) above
+/// what the client decodes against — the 2026-08-13 field report where Steam's Big Picture UI read
+/// as glaring and over-saturated on an iPad while HDR game content came out washed out. Both are
+/// the same error: the UI lands above SDR white, and the client's tone-mapper then works from a
+/// reference point the host never used, flattening the content around it.
+///
+/// This is the anchor, not a taste knob — `PUNKTFUNK_GAMESCOPE_SDR_NITS` is still there for an
+/// operator who wants a brighter or dimmer desktop, and moving it away from 203 re-opens the gap.
+const SDR_REFERENCE_WHITE_NITS: u32 = 203;
 
 /// `--pipewire-composite-cursor` when the resolved gamescope has it (patch level 2+). Paired with
 /// [`crate::gamescope_composites_cursor`], which is what tells the host to STOP compositing the
