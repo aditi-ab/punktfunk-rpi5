@@ -75,6 +75,20 @@ const CURSOR_EMBEDDED: u32 = 1;
 /// appearing at once, "the connector absent from MY pre-snapshot" can name a sibling's monitor.
 /// Each session runs on its own dedicated thread (see [`session_thread`]), so blocking on a std
 /// mutex — including across the awaits of its single-threaded setup future — is safe.
+///
+/// The lock alone is NOT enough, because Mutter's rebuilds outlive our D-Bus calls: `Stop` /
+/// `RecordVirtual` / `ApplyMonitorsConfig` return while the shell is still rebuilding (and, for a
+/// session whose config was applied `APPLY_TEMPORARY`, still auto-reverting it). Releasing the lock
+/// at that point hands the next session a NON-QUIESCENT Mutter, and its first mutation rebuilds
+/// concurrently with the leftover one — the exact `meta_monitor_manager_rebuild` SIGSEGV again,
+/// reproduced on 2026-08-08 (mid-bringup mode switch: two `RecordVirtual`s ~1 s apart) and
+/// 2026-08-13 (keep-alive reuse dead on first frame → teardown + immediate re-create; A/B'd
+/// identical on 0.27.0 and the 0.28.0 RC, so it was never a regression). So every locked mutation
+/// section ends with [`settle_topology`] — poll DisplayConfig until the change is visible and the
+/// config serial stops moving — BEFORE the guard drops. And because ordering across sessions runs
+/// through the keepalive drop, [`StopGuard`]'s `Drop` must be SYNCHRONOUS (wait for the session
+/// thread to finish its Stop + settle): a fire-and-forget flag let the A2 re-create win the lock
+/// before the doomed session's thread had even woken to take it.
 static TOPOLOGY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The Mutter virtual-display driver. Each [`create`](VirtualDisplay::create) spins up a
@@ -183,11 +197,18 @@ impl VirtualDisplay for MutterDisplay {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        // Teardown confirmation: the sender lives exactly as long as the session thread, so the
+        // guard's `Drop` can WAIT on `Disconnected` for the thread to finish its Stop + settle
+        // (see TOPOLOGY_LOCK — the drop is the only happens-before edge ordering "old monitor
+        // removed" against "next monitor created").
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let first_in_group = self.first_in_group;
         let hw_cursor = self.hw_cursor;
         thread::Builder::new()
             .name("punktfunk-mutter-vout".into())
             .spawn(move || {
+                // Dropped when the thread returns — every exit path signals `done_rx`.
+                let _done = done_tx;
                 session_thread(
                     setup_tx,
                     stop_thread,
@@ -204,7 +225,10 @@ impl VirtualDisplay for MutterDisplay {
         // that finishes after we gave up then parks for at most one 200 ms tick. `report_node` is
         // the primary defence (it stops the session outright); this is the belt-and-braces half,
         // and it also covers a thread that is somewhere else entirely when the timeout fires.
-        let guard = StopGuard(stop);
+        let guard = StopGuard {
+            stop,
+            done: done_rx,
+        };
 
         // 45 s (was 20 s): setups now queue on TOPOLOGY_LOCK, so a session behind a slow sibling
         // (whose guard spans up to a ~10 s stream wait + 6 s connector wait + the apply) must
@@ -230,11 +254,35 @@ impl VirtualDisplay for MutterDisplay {
 
 /// Dropping this ends the keepalive thread, closing the D-Bus connection — Mutter then tears
 /// the remote-desktop + screencast sessions (and the virtual monitor) down.
-struct StopGuard(Arc<AtomicBool>);
+///
+/// The drop is SYNCHRONOUS: it waits (bounded) for the session thread to confirm the teardown —
+/// Stop issued, the monitor removal settled under [`TOPOLOGY_LOCK`]. The registry drops these
+/// outside its pool lock and documents that the drop may block, and the callers that immediately
+/// re-create (the A2 dead-reuse teardown, a mode-switch retire) are exactly the ones that NEED the
+/// wait: with the old fire-and-forget flag, the fresh session's `RecordVirtual` could win
+/// `TOPOLOGY_LOCK` before this session's thread had woken (≤200 ms park tick) to take it, adding a
+/// monitor while the doomed one still stood — gnome-shell then died rebuilding the monitor manager
+/// (`meta_monitor_manager_rebuild`, 2026-08-13, byte-identical on 0.27.0 and the 0.28.0 RC).
+struct StopGuard {
+    stop: Arc<AtomicBool>,
+    /// Signals `Disconnected` when the session thread — which owns the paired sender — returns.
+    done: std::sync::mpsc::Receiver<()>,
+}
 
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        // Generous: teardown is one ~200 ms park tick + Stop + a ≤4 s settle, but the thread may
+        // first have to outwait a sibling's setup holding TOPOLOGY_LOCK (up to ~16 s of stream +
+        // connector waits). Timing out is degraded-but-safe: the next mutation still queues on the
+        // lock; only the wake-up ordering guarantee is lost.
+        match self.done.recv_timeout(Duration::from_secs(20)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                "mutter: virtual-output teardown did not confirm within 20 s — proceeding; the \
+                 next topology mutation may race the shell's rebuild"
+            ),
+        }
     }
 }
 
@@ -318,6 +366,10 @@ fn session_thread(
             Ok(s) => s,
             Err(e) => {
                 let _ = setup_tx.send(Err(format!("{e:#}")));
+                // A half-built session can still have ADDED the monitor (`RecordVirtual` succeeded,
+                // the node-id wait didn't) — its connections dropped inside `connect`, so Mutter is
+                // now removing it. Settle that rebuild before the guard releases the lock.
+                settle_topology(None, None).await;
                 return;
             }
         };
@@ -325,6 +377,10 @@ fn session_thread(
         // mutates the operator's desktop topology on behalf of a session that, past this point,
         // would have no way to undo it.
         if !report_node(&setup_tx, &session).await {
+            // `report_node` already stopped the session — the virtual monitor is being removed.
+            // Settle under the still-held lock (same reasoning as the teardown below).
+            drop(session);
+            settle_topology(None, None).await;
             return;
         }
         // The send can also LAND in the moment the opener's `recv_timeout` gives up — the value sits
@@ -338,6 +394,8 @@ fn session_thread(
                  the desktop topology"
             );
             let _ = session.rd_session.call_method("Stop", &()).await;
+            drop(session);
+            settle_topology(None, None).await;
             return;
         }
 
@@ -382,6 +440,11 @@ fn session_thread(
             }
         }
 
+        // The lock's promise is "one rebuild at a time", which holds only if the rebuilds THIS
+        // setup caused — the `RecordVirtual` add, the `ApplyMonitorsConfig`, and Mutter's own
+        // auto-revert of any sibling's temporary config — are finished before it is released.
+        // Cheap when Mutter is already quiet (one confirming read + one 150 ms recheck).
+        settle_topology(tracked.as_ref().map(|(dc, _, _)| dc), None).await;
         drop(topology_guard);
 
         // Park, keeping `session` (and its zbus connection) alive until told to stop. Every ~5 s,
@@ -414,11 +477,94 @@ fn session_thread(
         // the virtual output disappears and our DisplayConfig connection (in `tracked`) closes — so we
         // just drop it here and let the revert happen Mutter-side, never touching the layout ourselves.
         // The Stop (+ the revert it triggers) is a topology mutation too — take TOPOLOGY_LOCK so a
-        // sibling's teardown or setup can't interleave with the rebuild it causes.
+        // sibling's teardown or setup can't interleave with the rebuild it causes. And HOLD it
+        // until the removal has actually settled: `Stop` returns while the shell is still
+        // rebuilding, and the very next thing after this teardown is often a fresh create (the A2
+        // dead-reuse re-create, a mode-switch retire) whose `RecordVirtual` must not land in that
+        // window — that overlap is the reproduced `meta_monitor_manager_rebuild` SIGSEGV.
         let _topology_guard = TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = session.rd_session.call_method("Stop", &()).await;
+        let vconn = tracked.as_ref().map(|(_, _, v)| v.clone());
+        // Close our own handles FIRST — the APPLY_TEMPORARY revert waits on the DisplayConfig
+        // connection in `tracked` closing (see above) — then observe the settle on a fresh one.
         drop(tracked);
+        drop(session);
+        settle_topology(None, vconn.as_deref()).await;
     });
+}
+
+/// Wait, bounded, for Mutter's monitor topology to go QUIET — called at the end of every
+/// [`TOPOLOGY_LOCK`]-holding mutation section, before the guard drops (see the lock's docs for the
+/// two field crashes this closes). Two phases, both polled over `GetCurrentState`:
+///
+/// 1. when `gone` names a just-removed virtual connector, wait until it is actually absent (its
+///    `Stop` returned before the shell finished the removal rebuild);
+/// 2. wait until the config serial holds still across two consecutive reads — the rebuilds we
+///    caused (add/remove/apply, plus Mutter's own auto-revert of a temporary config) each bump it.
+///
+/// `dc` reuses the session's open DisplayConfig proxy when it has one; otherwise a fresh
+/// short-lived connection is opened (the teardown path deliberately closes its own first — the
+/// APPLY_TEMPORARY revert waits on that close). Best-effort by design: a read error usually means
+/// the shell is gone (crashed or logging out), and the deadline keeps an unrelated hotplug storm
+/// from parking a session forever — both degrade to "proceed", which is exactly the old behavior.
+async fn settle_topology(dc: Option<&zbus::Proxy<'_>>, gone: Option<&str>) {
+    let fresh;
+    let dc = match dc {
+        Some(p) => p,
+        None => match display_config().await {
+            Ok(p) => {
+                fresh = p;
+                &fresh
+            }
+            Err(_) => {
+                // Nothing to observe (no DisplayConfig — a crashed shell?): a fixed grace still
+                // beats returning into the next mutation instantly.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                return;
+            }
+        },
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(4);
+    if let Some(conn) = gone {
+        loop {
+            match get_state(dc).await {
+                Ok(s) if !connectors(&s).contains(conn) => break,
+                Ok(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                _ => break, // read error (shell gone) or deadline — proceed either way
+            }
+        }
+    }
+    let mut last: Option<u32> = None;
+    loop {
+        match get_state(dc).await {
+            Ok(s) => {
+                if last == Some(s.0) {
+                    break;
+                }
+                last = Some(s.0);
+            }
+            Err(_) => break,
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "mutter: the monitor topology did not settle within 4 s — proceeding (a concurrent \
+                 hotplug?)"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(600) {
+        tracing::info!(
+            waited_ms = waited.as_millis() as u64,
+            removed = gone.is_some(),
+            "mutter: waited out a monitor-topology rebuild before releasing the lock"
+        );
+    }
 }
 
 /// Record an **existing** monitor by connector — the monitor-mirror path
@@ -1543,10 +1689,13 @@ mod tests {
         );
 
         std::thread::sleep(std::time::Duration::from_secs(3));
+        // The keepalive's Drop is synchronous: it returns only once the session thread has run the
+        // Stop and settled the removal rebuild (see `StopGuard`), so no grace sleep is needed.
+        let dropped_at = std::time::Instant::now();
         drop(out);
-        // The keepalive's Drop only SIGNALS the thread; give it more than one 200 ms tick to run
-        // the Stop + topology revert before the harness exits and takes the process with it.
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        println!("dropped — gnome-shell should have removed the monitor and reverted the topology");
+        println!(
+            "dropped in {:?} — gnome-shell should have removed the monitor and reverted the topology",
+            dropped_at.elapsed()
+        );
     }
 }
