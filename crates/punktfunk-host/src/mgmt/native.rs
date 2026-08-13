@@ -256,6 +256,52 @@ pub(crate) async fn unpair_native_client(
     }
 }
 
+/// Unpair every native client
+///
+/// The collection form of [`unpair_native_client`]: empties the punktfunk/1 trust store in ONE
+/// persisted write (not a loop of them — a failure partway would leave a half-emptied store), and
+/// ends every live native session the removed clients own.
+///
+/// Idempotent, hence a 200 rather than the single unpair's 204/404: an already-empty store
+/// satisfies the request, and the count still tells the operator what it meant.
+#[utoipa::path(
+    delete,
+    path = "/native/clients",
+    tag = "native",
+    operation_id = "unpairAllNativeClients",
+    responses(
+        (status = OK, description = "Every native client unpaired (possibly none)", body = UnpairAllResult),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the trust store", body = ApiError),
+    )
+)]
+pub(crate) async fn unpair_all_native_clients(State(st): State<Arc<MgmtState>>) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
+    };
+    match np.remove_all() {
+        Ok(removed) => {
+            // Revocation reaches LIVE sessions too — the same guarantee the single unpair gives,
+            // applied across the set.
+            let stopped: usize = removed
+                .iter()
+                .map(|fp| crate::session_status::stop_by_fingerprint(&fp.to_ascii_lowercase()))
+                .sum();
+            if stopped > 0 {
+                tracing::info!(stopped, "unpair-all: live native session(s) stopped");
+            }
+            let unpaired = removed.len() as u32;
+            tracing::info!(unpaired, "management API: all native clients unpaired");
+            Json(UnpairAllResult { unpaired }).into_response()
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not persist trust store: {e}"),
+        ),
+    }
+}
+
 /// List devices awaiting pairing approval
 ///
 /// Unpaired devices that tried to connect while the host requires pairing. Approve one to pair
