@@ -2,7 +2,7 @@
 
 The Windows client ships as **signed MSIX** packages so Windows boxes get a real package (Start
 tile, clean install/uninstall) instead of a loose exe. CI builds + publishes them from
-[`.gitea/workflows/windows-msix.yml`](../../../.gitea/workflows/windows-msix.yml) to Gitea's
+[`.gitea/workflows/windows-client.yml`](../../../.gitea/workflows/windows-client.yml) to Gitea's
 **generic** package registry (`https://git.unom.io/unom/-/packages`), on every `main` push that
 touches the client (canary) and on `vX.Y.Z` release tags (stable) — see
 [Release Channels](https://punktfunk.unom.io/docs/channels).
@@ -14,7 +14,7 @@ package links FFmpeg, so neither arch needs a per-arch `FFMPEG_DIR` tree staged 
 one less thing the ARM64 leg can be missing). Artifacts are arch-suffixed
 (`..._x64.msix` / `..._arm64.msix`, each with its matching `.cer`); `pack-msix.ps1 -Arch x64|arm64`
 stamps the manifest `ProcessorArchitecture` and names the output. See
-[`windows.yml`](../../../.gitea/workflows/windows.yml) for the cross-build rationale.
+[`windows-client.yml`](../../../.gitea/workflows/windows-client.yml) for the cross-build rationale.
 
 ## What's in the package
 

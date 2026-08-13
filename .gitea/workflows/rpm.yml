@@ -51,6 +51,14 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, the vendored libopus, openh264's C++). Safe at
+  # workflow level here: unlike ci.yml/deb.yml this workflow has no cross-compiling job whose
+  # image sets its own CC_x86_64_unknown_linux_gnu. See ci.yml's `rust` job for that trap.
+  # This matters twice per push — the f43 and f44 legs are the two longest jobs in the fleet.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
   # sccache and incremental compilation are mutually exclusive; CI wants the shared
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"
@@ -80,14 +88,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # rpmbuild + git archive need the checkout trusted; cache the crates download.
       # The client link deps are also baked into the fedora-rpm image, but this job runs
@@ -145,11 +148,63 @@ jobs:
           echo "GROUP=$GROUP" >> "$GITHUB_ENV"
           echo "rpm $V-$R -> group '$GROUP'"
 
+      # ── The web console, built once per (web+sdk content, bun) instead of once per leg ─────────
+      # Two legs run here (f43 + f44) and each built its own identical copy of a bundle that is a
+      # pure function of web/ and sdk/ — see the fuller note in deb.yml, whose key family this
+      # shares, so whichever job builds it first warms the rest of the fleet.
+      #
+      # ⚠ The build has to happen HERE, in the workspace, rather than being left to the spec. Two
+      # reasons, and both are load-bearing:
+      #   * build-rpm.sh packages a `git archive` tarball and web/.output is gitignored, so a
+      #     bundle sitting in the workspace is invisible to rpmbuild — it must be handed over by
+      #     absolute path (PF_PREBUILT_WEB_OUTPUT -> the spec's pf_prebuilt_web macro).
+      #   * the reverse direction is worse: the spec builds into rpmbuild's %{_topdir}, which
+      #     build-rpm.sh creates with mktemp and removes on EXIT. A console built in there is gone
+      #     before actions/cache's post step runs, so the cache would never populate and every run
+      #     would be a miss that quietly rebuilt — the cache would look present and do nothing.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build the web console (cache miss only)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        run: |
+          cd web
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      # Same mandatory assertion as deb.yml — a missing or wrong-preset bundle must fail here, not
+      # become a quietly console-less RPM. The spec re-checks the marker on whatever it packages.
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
       - name: Build RPM
         # PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 → also build the punktfunk-web console + the
         # punktfunk-scripting runner subpackages (the publish loop globs them in; the host RPM
         # Recommends both). Both need bun (ensured in Prep).
-        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 bash packaging/rpm/build-rpm.sh
+        run: |
+          PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" \
+            PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 \
+            PF_PREBUILT_WEB_OUTPUT="$GITHUB_WORKSPACE/web/.output" \
+            bash packaging/rpm/build-rpm.sh
+
+      # Visibility only — the two RPM legs are the longest jobs in the fleet, so a cache
+      # regression here is the most expensive one to leave undetected.
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
       # Signs with packages@unom.io (org secret) and self-verifies before publish. On a v* tag a
       # missing key FAILS the build rather than publishing unsigned RPMs into a gpgcheck=1 repo.

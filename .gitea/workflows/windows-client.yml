@@ -1,0 +1,318 @@
+# Windows CLIENT — build, lint, test and package, on a self-hosted windows-amd64 runner (host mode;
+# the generic runner + MSVC/WinUI toolchain come from unom/infra's windows-runner/, punktfunk's own
+# extras — WDK, Inno Setup, the ARM64 rustup target — self-provision via the "Ensure Windows
+# toolchain" step, a fast no-op once present, so any runner with that label works).
+#
+# Covers BOTH client binaries: the WinUI 3 shell (windows-reactor + WASAPI + SDL3) and the
+# punktfunk-session Vulkan client (pf-presenter/pf-client-core/pf-console-ui — every stream runs in
+# it, spawned by the shell), plus punktfunk-cli, whose `punktfunk.exe` alias the MSIX manifest
+# references.
+#
+# ⚠ WHY THIS IS ONE FILE. This was `windows.yml` (build+lint+test, DEBUG, x64 + arm64) and
+# `windows-msix.yml` (build+package, RELEASE, x64 + arm64) — four full compiles of the same crates
+# per client push, on ONE runner, from three copies of the same `paths:` list that had already
+# started to drift. windows-host.yml learned the hard way that debug trees on this machine are pure
+# liability: a second dep tree tips it into `cabac_decoder.cpp: fatal error C1069` building
+# openh264-sys2's vendored C++, which is disk/temp exhaustion, not a source error. So there is now
+# ONE release build per arch, and clippy/fmt/test run against it. Do not reintroduce a debug leg.
+#
+# Renamed from windows-msix.yml deliberately, and safely: `github.run_number` is REPO-WIDE in Gitea
+# (consecutive runs of DIFFERENT workflows get consecutive numbers), so the canary MSIX version
+# `<minor>.<run>.0` keeps climbing across the rename — on GitHub, where run_number is per-workflow,
+# this same rename would have reset it to 1 and made every canary sort below the published ones.
+#
+# Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and aarch64-pc-windows-msvc
+# by cross-compiling. The x64 MSVC toolset ships an ARM64 cross compiler
+# (VC\Tools\MSVC\<ver>\bin\Hostx64\arm64\cl.exe) and aarch64-pc-windows-msvc is a tier-2 Rust target
+# with host tools, so no ARM64 runner is needed — the cc/cmake crates pick the ARM64 compiler from
+# the target triple (SDL3 + libopus build-from-source cross-compile fine). The one thing the aarch64
+# build can't do is *run* on the x64 host, so fmt + test run only for x64.
+#
+# ARM64 note: rust-skia publishes no aarch64-pc-windows-msvc prebuilt binaries, so the session builds
+# --no-default-features there (no Skia console UI; streaming is unaffected) — flip when
+# skia-binaries adds the target.
+#
+# NO FFmpeg here since M10 (design/client-native-decode.md §6): the client decodes with
+# pf-vkdecode / pf-dxvadec / openh264+rav1d and links no libav* at all, so this workflow sets
+# no FFMPEG_DIR, no PF_FFVK_VULKAN_INCLUDE and prepends nothing to PATH. The provisioning
+# script still fetches the FFmpeg trees because the HOST keeps FFmpeg — windows-host.yml's
+# `amf-qsv` leg link-imports them.
+#
+# The MSVC/WinUI toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, CARGO_HOME,
+# CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout / per-arch
+# vars are set in a step:
+#   - CARGO_TARGET_DIR=C:\t…  the runner's host workdir is buried deep under
+#                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
+#                          so the default target\ path blows past Windows' MAX_PATH (260) inside the
+#                          CMake-from-source builds (audiopus_sys / SDL3) — MSBuild's tracker then
+#                          can't create its .tlog (DirectoryNotFoundException -> MSB6003). A short
+#                          root keeps every nested path well under the limit (per-arch so the two
+#                          matrix legs don't share a target dir).
+#
+# Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
+# `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (that
+# var silently never gets set). pwsh writes no BOM.
+# The runner's daemon wrapper puts C:\Program Files\PowerShell\7 on PATH so the job finds pwsh.
+#
+# ── Packaging (the `Pack + sign MSIX` step onward; skipped on pull requests) ──────────────────────
+#
+# Publishes signed MSIX packages (x64 + ARM64) to Gitea's generic package registry, so Windows boxes
+# can install a real package (Start tile, clean install/uninstall) instead of a loose exe.
+#
+# Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
+# Packaging internals: clients/windows/packaging/README.md.
+#
+# Versioning — single project version; MSIX requires a strictly 4-part numeric version, so:
+#   vX.Y.Z tag -> X.Y.Z.0  (THE release; any -rc/+meta pre-release suffix is dropped for MSIX).
+#                Published to the generic registry + the stable `latest/` alias + attached to the
+#                unified Gitea Release alongside every other platform's artifact.
+#   main push / dispatch -> <next-minor>.<run_number>.0  (canary; base is one minor ahead of the
+#                latest stable tag via scripts/ci/pf-version.ps1, run number climbs monotonically).
+# Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
+#
+# Signing (clients/windows/packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD
+# Actions secrets are set (a real or shared code-signing .pfx whose subject DN == Publisher), the
+# package is signed with them. Otherwise an ephemeral self-signed cert is generated and its public
+# .cer is published next to the .msix (users import it to Trusted People before install).
+#
+# That fallback is for canary/CI ONLY. On a v* tag the pack script FAILS CLOSED — a missing secret
+# aborts the build instead of quietly shipping a release signed by a per-build throwaway cert that
+# no one can pin. Nothing to opt into here: the script reads GITHUB_REF itself.
+name: windows-client
+# One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
+# it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
+# cancel each other). Keeps a busy push cadence from piling ~10 queued runs per commit onto the
+# runner fleet. Gitea honors this for push triggers (PR triggers: see gitea#35933).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+on:
+  push:
+    branches: [main]
+    # ONE list now, not three. The old windows.yml + windows-msix.yml pair carried this same set
+    # three times (push, pull_request, and the second file), which is exactly how a crate goes
+    # missing from one copy — windows-host.yml documents the "Cargo.lock luck" gap that produced.
+    paths:
+      - 'clients/windows/**'
+      - 'clients/session/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-client.yml'
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'clients/windows/**'
+      - 'clients/session/**'
+      - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-bitstream/**'
+      - 'crates/pf-vkdecode/**'
+      - 'crates/pf-dxvadec/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-client.yml'
+  workflow_dispatch:
+
+# Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
+# unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
+# never collide; every Rust job on every host feeds and reads one warm cache.
+#
+# NOTE the C/C++ launcher wiring the Linux workflows carry (CMAKE_*_COMPILER_LAUNCHER, CC_*) is
+# deliberately NOT set here. This runner's failure mode under extra compiler processes is the
+# C1069 disk/temp exhaustion documented in windows-host.yml, so sccache-for-MSVC is its own
+# change, to be made with a measurement rather than folded into a reorganisation.
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-client-windows
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # sccache and incremental compilation are mutually exclusive; CI wants the shared
+  # cache, dev boxes keep incremental.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # SECURITY: this job builds PULL-REQUEST code (attacker-controllable build.rs / cargo build) on the
+  # host-mode, persistent `windows-amd64` runner that the release-SIGNING steps below and
+  # windows-host.yml (which decrypt MSIX_CERT_PFX_B64 + REGISTRY_TOKEN to disk) also run on. Untrusted
+  # PR code could therefore persist on that machine or harvest signing material a later job exposes.
+  # The DEFINITIVE fix is operational and lives outside this file: enable Gitea's "require approval to
+  # run workflows for PRs from outside collaborators/forks", and/or route PR CI to isolated ephemeral
+  # runners. The `if:` below is only a backstop — it skips fork PRs where Gitea reports the fork flag,
+  # and FAILS OPEN (still runs) for same-repo PRs and on Gitea versions that don't populate it, so it
+  # never blocks internal PR CI.
+  client:
+    runs-on: windows-amd64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.fork != true
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            td: C:\t
+            session_flags: ''
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            td: C:\t-a64
+            # No skia-binaries prebuilt for aarch64-pc-windows-msvc: the session ships
+            # without the Skia console UI on ARM64 (streaming unaffected) — flip when
+            # rust-skia adds the target.
+            session_flags: '--no-default-features'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Windows toolchain (WDK, Inno Setup, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
+      - name: Configure + version
+        shell: pwsh
+        run: |
+          # CARGO_TARGET_DIR (per-arch, short) dodges the MAX_PATH wall in the CMake-from-source
+          # crates (see this file's header). No FFMPEG_DIR: nothing in this package links libav*
+          # (M10), and pack-msix.ps1 no longer copies runtime DLLs from one.
+          "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
+          $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
+          $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            # MSIX needs a purely-numeric 4-part version: drop any -rc/+meta pre-release suffix.
+            (($env:GITHUB_REF_NAME -replace '^v', '') -replace '[-+].*$', '').Split('.')
+          } else {
+            # Canary: <major>.<minor>.<run>.0 — major.minor track one minor ahead of stable, run climbs monotonically.
+            @($pf.PF_MAJOR, $pf.PF_MINOR, $env:GITHUB_RUN_NUMBER)
+          }
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $v = ($parts[0..3] -join '.')
+          "MSIX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "MSIX version $v  arch ${{ matrix.arch }}  target ${{ matrix.target }}  target-dir ${{ matrix.td }}"
+
+      # All three client binaries, ONCE, in release. The shell spawns punktfunk-session.exe (a
+      # package sibling) for every stream, and punktfunk-cli builds the `punktfunk.exe` the manifest
+      # aliases and pack-msix.ps1 requires (bf981027 added the requirement without the build — the
+      # same gap 90c84ef4 closed for deb). --no-default-features on ARM64 is a no-op for the shell.
+      #
+      # Release, not debug, even for the lint/test legs below: a debug build here would compile the
+      # whole dep tree into a SECOND target dir and re-run openh264-sys2's vendored C++ through
+      # cc-rs's cl.exe fan-out, which is what tips this runner into C1069 (see the header).
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli ${{ matrix.session_flags }} --target ${{ matrix.target }}
+
+      - name: Clippy (-D warnings)
+        shell: pwsh
+        run: |
+          # Every crate in the `paths:` trigger above is named here: `cargo clippy -p X` BUILDS a
+          # dependency but only LINTS the packages it is given, so a decode crate that starts the
+          # run but is missing from this list would be gated by nothing.
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-bitstream','-p','pf-vkdecode','-p','pf-dxvadec')
+          $sf = @()
+          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui') }
+          cargo clippy --release @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
+          if ($LASTEXITCODE) { throw "clippy" }
+
+      - name: Rustfmt check
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec -- --check
+          if ($LASTEXITCODE) { throw "rustfmt" }
+
+      - name: Test
+        # x64 only: the aarch64 binaries cross-compile here but cannot RUN on this host.
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          cargo test --release -p punktfunk-client-windows -p punktfunk-client-session -p punktfunk-cli -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-dxvadec --target ${{ matrix.target }}
+          if ($LASTEXITCODE) { throw "tests" }
+
+      - name: sccache stats (visibility only)
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
+
+      # ── Packaging: pushes, tags and dispatch only. A PR gets the build/lint/test signal above and
+      # stops there — packing would sign with a throwaway cert and publish nothing.
+      - name: Pack + sign MSIX
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          & clients/windows/packaging/pack-msix.ps1 `
+            -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
+            -TargetDir ${{ matrix.td }}\${{ matrix.target }}\release -OutDir ${{ matrix.td }}\msix
+
+      - name: Publish to Gitea generic registry
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
+          # stable release -> `latest/` alias; canary main build -> `canary/` alias.
+          $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
+          # version-less, arch-suffixed alias names so each channel keeps one predictable URL.
+          $aliasNames = @{
+            "$($env:MSIX_PATH)"     = "$($env:PKG)_${{ matrix.arch }}.msix"
+            "$($env:MSIX_CER_PATH)" = "$($env:PKG)_${{ matrix.arch }}.cer"
+          }
+          $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $files) { throw "pack produced no artifacts to publish" }
+          function Put($f, $url) {
+            # The generic registry makes a versioned path immutable and 409s a re-upload, so a tag
+            # re-run re-publishing the identical artifact must be tolerated as a no-op. (The channel
+            # alias below is delete-then-reuploaded and never 409s.) No curl -f, so we can read the
+            # status code instead of aborting on it.
+            $code = [int](curl.exe -sS -o NUL -w "%{http_code}" --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url")
+            if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE): $url" }
+            if ($code -eq 409) { Write-Output "already published (409, immutable): $url"; return }
+            if ($code -lt 200 -or $code -ge 300) { throw "upload failed (HTTP $code): $url" }
+            Write-Output "published ($code): $url"
+          }
+          foreach ($f in $files) {
+            $name = Split-Path $f -Leaf
+            # 1) immutable, versioned path
+            Put $f "$base/$($env:MSIX_VERSION)/$name"
+            # 2) channel alias (delete-then-reupload; the generic registry 409s on an existing file)
+            $an = $aliasNames["$f"]
+            curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null
+            Put $f "$base/$alias/$an"
+          }
+
+      # On a real release, also attach the MSIX (+ its .cer) to the unified Gitea Release. Both
+      # arch legs attach to the same release concurrently — the helper's create-or-fetch handles
+      # the race, and x64/arm64 filenames differ so the assets don't collide.
+      - name: Attach MSIX to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in @($env:MSIX_PATH, $env:MSIX_CER_PATH)) {
+            if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
+          }

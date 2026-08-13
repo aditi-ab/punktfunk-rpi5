@@ -2,7 +2,7 @@
 # Shared Gitea Release helpers for the punktfunk CI workflows (Linux + macOS runners).
 #
 # Source this file, then call ensure_release / upsert_asset. It replaces the three
-# copy-pasted inline blocks that used to live in release.yml / flatpak.yml / decky.yml,
+# copy-pasted inline blocks that used to live in apple.yml / flatpak.yml / decky.yml,
 # and fixes a latent bug those had: the bare asset POST returns 409 if an asset with the
 # same name already exists, so re-running a workflow — or reusing the rolling `canary`
 # release with stable filenames — would fail. upsert_asset deletes the old asset first.

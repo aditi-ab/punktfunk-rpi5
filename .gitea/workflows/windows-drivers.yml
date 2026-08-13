@@ -9,7 +9,7 @@
 # only live NVENC encode does, which defers to the RTX box.
 #
 # shell: pwsh deliberately (PowerShell 5.1's Out-File -Encoding utf8 prepends a BOM that corrupts the
-# first GITHUB_ENV line — see windows.yml).
+# first GITHUB_ENV line — see windows-client.yml).
 name: windows-drivers
 # One pending run per workflow+ref: a newer push supersedes the queued/running one and cancels
 # it (a canary only needs the latest commit; each release tag is its own ref so tag runs never
@@ -39,7 +39,7 @@ on:
 
 jobs:
   # SECURITY: builds PULL-REQUEST code on the host-mode, persistent `windows-amd64` runner shared with
-  # the release-signing jobs (windows-host.yml / windows-msix.yml). See windows.yml for the full
+  # the release-signing jobs (windows-host.yml / windows-client.yml). See windows-client.yml for the full
   # rationale. Definitive fix is server-side (Gitea outside-collaborator approval + isolated PR
   # runners); the `if:` is a fail-open backstop that never blocks internal PR CI.
   probe-and-proto:
@@ -111,7 +111,7 @@ jobs:
 
       - name: Build + test pf-driver-proto (MSVC)
         run: |
-          # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows.yml).
+          # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows-client.yml).
           $env:CARGO_TARGET_DIR = "C:\t\drv"
           cargo build -p pf-driver-proto
           cargo test  -p pf-driver-proto
@@ -144,7 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
-        # Shared self-provision step (also used by windows.yml/windows-msix.yml/windows-host.yml) so
+        # Shared self-provision step (also used by windows-client.yml/windows-host.yml) so
         # driver-build is self-sufficient on any windows-amd64 runner and never races a manually
         # dispatched provisioning workflow landing on a different one. Path is relative to the job
         # working-directory (packaging/windows/drivers). Near-noop once the toolchain is present.

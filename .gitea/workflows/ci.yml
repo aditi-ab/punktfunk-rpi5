@@ -23,6 +23,12 @@ on:
 # Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
 # unbound). Keys include compiler hash + target + flags, so cross-OS/arch entries can
 # never collide; every Rust job on every host feeds and reads one warm cache.
+#
+# RUSTC_WRAPPER covers RUST compilations and nothing else. The C/C++ half of this workspace —
+# aws-lc-sys, openh264-sys2's vendored C++, the CMake-built libopus behind audiopus_sys, pyrowave —
+# was paid in full on every run until the CMAKE_*_COMPILER_LAUNCHER / CC_* wiring below existed.
+# Linking is the third phase and is cacheable by nothing: that one is addressed in the builder
+# images with mold (ci/cargo-config-mold.toml).
 env:
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: unom-ci-sccache
@@ -30,6 +36,11 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # Route CMake-driven C/C++ through the same cache. Safe at workflow level: it names no
+  # triple, and cmake-rs overrides it per-invocation with a `-D` flag when cc-rs reports a
+  # wrapper, so the two can never double-wrap into `sccache sccache cc`.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
   # sccache and incremental compilation are mutually exclusive; CI wants the shared
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"
@@ -40,18 +51,25 @@ jobs:
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 90
+    env:
+      # cc-rs recognises `sccache` as a compiler wrapper when it leads CC/CXX, and cmake-rs then
+      # forwards it as -DCMAKE_C_COMPILER_LAUNCHER, so this covers both build-script styles.
+      #
+      # ⚠ JOB-scoped, NOT workflow-scoped, and it must stay that way: the `rust-arm64` job below
+      # runs in the cross image, which sets CC_x86_64_unknown_linux_gnu=/usr/local/bin/pf-host-cc
+      # (ci/rust-ci-arm64cross.Dockerfile) — a wrapper that strips arm64 include dirs off
+      # HOST-targeted compiles so ffmpeg-sys-next's probe resolves against the amd64 headers.
+      # Setting this at workflow level would silently overwrite that wrapper and break the cross
+      # build in a way that looks like a header mismatch, not a CI config error.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
     steps:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # punktfunk-client-linux link deps. Also baked into rust-ci.Dockerfile — but ci.yml
       # runs against the image from the PREVIOUS push (docker.yml bootstrap note), so this
@@ -105,8 +123,17 @@ jobs:
           # out of disk mid-build and actions/cache saved a truncated target/ (a dep's .rmeta
           # went missing -> E0463 "can't find crate"). A suffix bump wouldn't help — restore-keys
           # would fall back to the poisoned prefix — so the prefix itself is versioned.
-          key: cargo-target-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-v3-${{ env.rustc }}-
+          #
+          # `-debug-`: THIS JOB BUILDS DEBUG. deb.yml builds RELEASE and used to share this exact
+          # key, with a comment claiming the release build "reuses ci.yml's clean artifacts" — it
+          # never could. actions/cache is first-saver-wins on an exact key and this job is the
+          # faster of the two, so what landed under the shared key was always a debug-only target/
+          # (target/debug, no target/release). deb.yml restored a tree containing nothing it could
+          # use and, because the key was already taken, never got to save its own — so every
+          # release build re-linked from scratch, forever. Splitting the profiles into separate key
+          # families is the fix; do not merge them again, however tempting the dedupe looks.
+          key: cargo-target-debug-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-debug-v3-${{ env.rustc }}-
 
       - name: Format
         run: cargo fmt --all --check
@@ -220,14 +247,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
@@ -242,8 +264,16 @@ jobs:
         with:
           path: target
           # Its OWN prefix: aarch64 artifacts must never share the amd64 jobs' target cache.
-          key: cargo-target-arm64-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-arm64-v1-${{ env.rustc }}-
+          #
+          # `-debug-` in the name is load-bearing. This job builds DEBUG (clippy + a
+          # `cargo build`), while deb.yml's arm64 leg builds RELEASE into the same
+          # target/aarch64-unknown-linux-gnu tree. They used to share this exact key, and
+          # actions/cache is first-saver-wins on an exact key: this job finishes in ~1.5 min and
+          # saved a debug-only tree, so the .deb leg's release artifacts were NEVER persisted and
+          # it re-linked everything from sccache on every run. Same disease as the amd64 pair —
+          # see the note on deb.yml's `cargo-target-release-v1-` key.
+          key: cargo-target-arm64-debug-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-debug-v1-${{ env.rustc }}-
 
       - name: Clippy for aarch64 (deny warnings)
         run: |
@@ -258,6 +288,14 @@ jobs:
         run: |
           cargo build --release --target aarch64-unknown-linux-gnu --locked \
             -p punktfunk-client-session --no-default-features
+
+      # Visibility only — but the ONLY way to tell a warm cache from a cold one after the fact.
+      # Every Rust job in this repo ends with this line for that reason; a hit rate that quietly
+      # collapses (a toolchain bump, a flag change, an S3 outage) is otherwise invisible and just
+      # looks like "CI got slower".
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
   web:
     runs-on: ubuntu-24.04

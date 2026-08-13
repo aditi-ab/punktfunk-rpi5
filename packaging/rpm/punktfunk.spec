@@ -265,9 +265,30 @@ cargo build --release --locked -p punktfunk-tray
 %endif
 
 %if %{with web}
-# Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
-# TLS entry). bun is both the build tool AND the runtime (vendored in %%install below).
+# Management web console: the Nitro SSR bundle (the `bun` preset + our Bun.serve TLS entry). bun is
+# both the build tool AND the runtime (vendored in %%install below).
+#
+# `pf_prebuilt_web` (optional, absolute path to an already-built web/.output) lets CI hand over a
+# bundle it has already produced instead of building a second, identical one here. It exists because
+# this console was being rebuilt SIX times per push — ci.yml, deb, both RPM legs, arch, and the
+# docker app image — at ~2.5 min each. rpm.yml restores it from the shared actions cache and passes
+# this macro; see build-rpm.sh. Undefined (a plain rpmbuild, or COPR) takes the build path exactly
+# as before, so nothing outside CI changes.
+#
+# It has to be a MACRO carrying an absolute path, not simply a pre-populated web/.output: this spec
+# builds from the `git archive` tarball build-rpm.sh generates, and web/.output is gitignored — it
+# is not in the tarball and cannot be, so there is nothing here to find without being told where to
+# look.
+%if %{defined pf_prebuilt_web}
+echo "==> reusing the prebuilt web console from %{pf_prebuilt_web}"
+mkdir -p web/.output
+cp -a %{pf_prebuilt_web}/. web/.output/
+%else
 (cd web && bun install --frozen-lockfile && bun run build)
+%endif
+# Asserted for BOTH paths on purpose. This is the check that says the artifact about to be packaged
+# is the bun preset (node cannot run Bun.serve) — a handed-over bundle deserves it at least as much
+# as a freshly built one, because a cache is one more place a wrong artifact can come from.
 if ! grep -q 'Bun\.serve' web/.output/server/index.mjs; then
   echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry" >&2
   exit 1

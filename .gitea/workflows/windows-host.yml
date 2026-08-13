@@ -3,7 +3,7 @@
 # pf-vdisplay virtual-display driver + the web management console + the opt-in plugin/script runner,
 # run by scheduled tasks on a bundled bun) from one signed setup.exe. Runs on a self-hosted
 # windows-amd64 runner
-# (host mode; same MSVC/Windows-SDK/LLVM env as windows.yml — generic from unom/infra's
+# (host mode; same MSVC/Windows-SDK/LLVM env as windows-client.yml — generic from unom/infra's
 # windows-runner/, FFmpeg/Inno Setup self-provision via the "Ensure Windows toolchain" step below).
 #
 # Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
@@ -143,7 +143,7 @@ jobs:
           "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # FFMPEG_DIR: the BtbN lgpl-shared x64 tree, provisioned by
           # scripts/ci/provision-windows-punktfunk-extras.ps1. The CLIENT used to link it too; since M10
-          # it links no libav* at all (windows.yml sets no FFMPEG_DIR), so this tree is the HOST's alone
+          # it links no libav* at all (windows-client.yml sets no FFMPEG_DIR), so this tree is the HOST's alone
           # and the provisioning step keeps fetching it for that reason. The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
           # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.

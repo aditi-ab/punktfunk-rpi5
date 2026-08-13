@@ -13,6 +13,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # toolchain + bindgen; nodejs runs the JS actions (checkout/cache); unzip is for the bun installer
     build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs unzip \
+    # mold: the link-phase accelerator. Linking is the one thing sccache cannot cache, and this
+    # image relinks the whole workspace on every job. Wired via cargo-config-mold.toml below.
+    mold \
     # ffmpeg-next 9, built against whatever libav* 26.04 ships (FFmpeg 8 / libavcodec 62 today).
     # The crate major is a CEILING — ffmpeg-sys-next 9 spans libavcodec 56..63 — so this image does
     # not need to move in lockstep with Arch's FFmpeg 9; it just links what the distro has.
@@ -61,3 +64,12 @@ ARG SCCACHE_VERSION=0.10.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
     && sccache --version
+
+# Link x86_64 with mold (see the file's own header for the rustflags-precedence traps).
+#
+# The assertion is the point: an image carrying the flag but NOT the linker would fail every cargo
+# invocation in every consuming job, which is a catastrophic way to find out that a base image
+# renamed the package. `mold --version` fails the docker build instead, so nothing is pushed and
+# `:latest` keeps pointing at the previous working image — consumers never see it.
+COPY cargo-config-mold.toml /usr/local/cargo/config.toml
+RUN mold --version && test -r /usr/local/cargo/config.toml

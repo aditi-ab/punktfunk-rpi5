@@ -8,7 +8,7 @@
 # installed. Safe to run repeatedly. Runs non-interactively (/q /norestart) — never auto-reboots.
 #
 # Invoked by scripts/ci/ensure-windows-toolchain.ps1, the shared self-provision step every Windows
-# CI workflow runs at job start (windows-drivers.yml, windows.yml, windows-msix.yml,
+# CI workflow runs at job start (windows-drivers.yml, windows-client.yml,
 # windows-host.yml), on top of the generic runner unom/infra provisions (windows-runner/) and
 # provision-windows-punktfunk-extras.ps1's FFmpeg/Inno Setup/ARM64-target layer. Run as the
 # runner's account (SYSTEM) with admin rights.

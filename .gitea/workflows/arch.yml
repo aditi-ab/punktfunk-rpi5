@@ -81,6 +81,14 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # The C/C++ half of the cache (aws-lc-sys, vendored libopus, openh264's C++). Safe at workflow
+  # level — no cross-compiling job here (see ci.yml's `rust` job for that trap). NOTE these ALSO
+  # have to be named in the makepkg step's `sudo -u builder env …` list: sudo's env_reset drops
+  # everything not listed, which is why the sccache vars are already spelled out there.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+  CC_x86_64_unknown_linux_gnu: sccache cc
+  CXX_x86_64_unknown_linux_gnu: sccache c++
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -220,6 +228,39 @@ jobs:
           echo "REPO=$REPO" >> "$GITHUB_ENV"
           echo "pacman $V-$R -> repo '$REPO'"
 
+      # ── The web console, built once per (web+sdk content, bun) instead of once per job ─────────
+      # Shares deb.yml's key family — see the fuller note there. Unlike the RPM leg this needs no
+      # hand-off macro: makepkg builds with PF_SRCDIR pointing at this workspace, so a restored
+      # web/.output is already exactly where PKGBUILD's build-if-missing guard looks for it.
+      #
+      # Built here as root, BEFORE the makepkg step's `chown -R builder:` sweeps the tree, so the
+      # bundle ends up owned like everything else the builder user is handed.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
+      - name: Build the web console (cache miss only)
+        if: steps.webconsole.outputs.cache-hit != 'true'
+        run: |
+          cd web
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
       - name: Build packages (makepkg)
         run: |
           git config --global --add safe.directory "$PWD"
@@ -252,8 +293,19 @@ jobs:
             SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
             SCCACHE_REGION="$SCCACHE_REGION" \
             AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            CMAKE_C_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER" \
+            CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_CXX_COMPILER_LAUNCHER" \
+            CC_x86_64_unknown_linux_gnu="$CC_x86_64_unknown_linux_gnu" \
+            CXX_x86_64_unknown_linux_gnu="$CXX_x86_64_unknown_linux_gnu" \
             makepkg -f -d --holdver
           ls -lh "$GITHUB_WORKSPACE/dist"
+          # Visibility only. The stats have to be read as the SAME user that ran the compiles —
+          # sccache keeps its stats in a per-user server process, so a root `--show-stats` here
+          # would report an idle server and zero everything.
+          sudo -u builder env SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+            SCCACHE_REGION="$SCCACHE_REGION" \
+            AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+            sccache --show-stats || true
 
       # The host must ship a VERSIONED libav soname dep, and nothing else in this pipeline proves
       # it. packaging/arch/PKGBUILD lists bare `libavcodec.so` etc. and relies on makepkg rewriting

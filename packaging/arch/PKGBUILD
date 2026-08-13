@@ -126,8 +126,23 @@ build() {
   fi
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.
+  #
+  # Build-if-missing, matching packaging/debian/build-web-deb.sh. An in-tree CI build runs with
+  # PF_SRCDIR pointing at the workspace, so when arch.yml has restored web/.output from the shared
+  # actions cache it is already sitting right here and rebuilding it would be pure duplication —
+  # this console was being built six times per push across the fleet. A local `makepkg` has no
+  # .output and builds exactly as before.
+  #
+  # The Bun.serve assertion covers BOTH paths: a reused bundle is one more thing that can be wrong,
+  # and node cannot run a Bun.serve entry, so shipping the wrong preset is a dead console.
   if [ "${PF_WITH_WEB:-0}" = 1 ]; then
-    ( cd web && bun install --frozen-lockfile && bun run build )
+    if [ -f web/.output/server/index.mjs ]; then
+      echo "==> reusing the already-built web console at web/.output"
+    else
+      ( cd web && bun install --frozen-lockfile && bun run build )
+    fi
+    grep -q 'Bun\.serve' web/.output/server/index.mjs \
+      || { echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry" >&2; exit 1; }
   fi
   # Plugin/script runner (opt-in): one self-contained JS via `bun build --target=bun` (effect + the
   # SDK inlined; the dynamic plugin import stays a runtime import). bun is also its vendored runtime.

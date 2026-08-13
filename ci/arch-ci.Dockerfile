@@ -48,6 +48,11 @@ RUN pacman -Syu --noconfirm --needed \
         hwdata luajit seatd sdl2-compat vulkan-icd-loader \
         xcb-util-errors xcb-util-wm xorg-xwayland \
         meson glm wayland-protocols benchmark libxcursor \
+        # mold: link-phase accelerator (sccache cannot cache linking). makepkg links the release
+        # host, client, worker and tray on every arch.yml run. Wired via cargo-config-mold.toml
+        # below. It does NOT affect the gamescope companion leg — that is meson + its own linker,
+        # and its `-static-libstdc++` link is untouched.
+        mold \
     && pacman -Scc --noconfirm
 
 # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored
@@ -64,3 +69,16 @@ ARG SCCACHE_VERSION=0.10.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
     && sccache --version
+
+# CARGO_HOME is declared here only so this image agrees with what arch.yml already sets at job
+# level (and so `cargo` finds the config below when the image is used by hand). The workflow still
+# passes CARGO_HOME explicitly across the `sudo -u builder env …` boundary, which strips ambient
+# env — that is why the C/C++ sccache wiring has to be re-exported there by name while THIS file,
+# being a file, crosses the boundary for free.
+ENV CARGO_HOME=/usr/local/cargo
+RUN mkdir -p /usr/local/cargo && chmod -R a+w /usr/local/cargo
+
+# Link x86_64 with mold — see cargo-config-mold.toml's header for the rustflags traps, and
+# rust-ci.Dockerfile for why the `mold --version` assertion sits next to the COPY.
+COPY cargo-config-mold.toml /usr/local/cargo/config.toml
+RUN mold --version && test -r /usr/local/cargo/config.toml

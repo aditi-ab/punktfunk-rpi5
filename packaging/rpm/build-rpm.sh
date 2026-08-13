@@ -15,6 +15,23 @@ PF_RELEASE="${PF_RELEASE:-1}"
 # builder image, not in a plain mock chroot). Default off so a bare `rpmbuild`/COPR still works.
 WEB_OPT=()
 [ "${PF_WITH_WEB:-0}" = "1" ] && WEB_OPT=(--with web)
+# PF_PREBUILT_WEB_OUTPUT: an already-built web/.output to package instead of building the console a
+# second time (see the pf_prebuilt_web note in the spec's %build). CI restores one from the shared
+# actions cache and points this at it; a plain build leaves it unset and nothing changes.
+# Deliberately validated HERE rather than trusted: an empty or half-restored cache directory must
+# fall back to building, not produce a console-less package. The spec re-asserts the Bun.serve
+# marker on whatever it ends up with.
+PREBUILT_WEB_OPT=()
+if [ "${PF_WITH_WEB:-0}" = "1" ] && [ -n "${PF_PREBUILT_WEB_OUTPUT:-}" ]; then
+  if [ -f "${PF_PREBUILT_WEB_OUTPUT}/server/index.mjs" ]; then
+    # rpmbuild resolves the macro inside the extracted tarball dir, so it must be absolute.
+    PREBUILT_WEB_ABS="$(cd "$PF_PREBUILT_WEB_OUTPUT" && pwd)"
+    PREBUILT_WEB_OPT=(--define "pf_prebuilt_web ${PREBUILT_WEB_ABS}")
+    echo "==> reusing prebuilt web console: $PREBUILT_WEB_ABS"
+  else
+    echo "==> PF_PREBUILT_WEB_OUTPUT=$PF_PREBUILT_WEB_OUTPUT has no server/index.mjs — building the console" >&2
+  fi
+fi
 # PF_WITH_SCRIPTING=1 builds the punktfunk-scripting subpackage (the plugin/script runner). Same bun
 # requirement as web; default off so a bare `rpmbuild`/COPR still works.
 SCRIPTING_OPT=()
@@ -61,6 +78,7 @@ fi
 # rust-toolchain.toml's pinned channel works) and the -devel libs via dnf, neither of which
 # rpmbuild's RPM-level check sees — skip it; a genuinely missing dep fails the compile/link.
 rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" "${HOST_OPT[@]}" \
+  "${PREBUILT_WEB_OPT[@]}" \
   --define "_topdir $TOP" \
   --define "pf_version ${PF_VERSION}" \
   --define "pf_release ${PF_RELEASE}" \

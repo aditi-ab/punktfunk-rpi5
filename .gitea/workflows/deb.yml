@@ -79,6 +79,11 @@ env:
   SCCACHE_REGION: home-central
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  # CMake-driven C/C++ through the same cache (aws-lc-sys, the vendored libopus). Workflow level
+  # is safe — it names no triple; the CC_*/CXX_* half is per-job below, because the arm64 leg's
+  # image needs its own CC_x86_64 wrapper. See ci.yml's `rust` job for the full note.
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
   # sccache and incremental compilation are mutually exclusive; CI wants the shared
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"
@@ -89,18 +94,18 @@ jobs:
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 90
+    env:
+      # ⚠ Job-scoped, never workflow-scoped: build-publish-client-arm64 runs in the cross image,
+      # whose own CC_x86_64_unknown_linux_gnu=pf-host-cc must survive. See ci.yml's `rust` job.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
     steps:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       - name: Version + channel
         # vX.Y.Z tag -> X.Y.Z, published to the `stable` apt distribution (a real release).
@@ -138,7 +143,9 @@ jobs:
           apt-get install -y --no-install-recommends dpkg-dev python3 \
             libgtk-4-dev libadwaita-1-dev libsdl3-dev
 
-      # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
+      # The cargo-home (registry/git) cache IS shared with ci.yml — those are pure downloads,
+      # profile-independent, and deduping them across the fleet is the whole point. The target
+      # cache is NOT; see below.
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
@@ -151,10 +158,20 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target
-          # -v3-: bypass a target cache poisoned by a disk-full build (see ci.yml). Shares the
-          # key with ci.yml so the release build reuses its clean artifacts.
-          key: cargo-target-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-v3-${{ env.rustc }}-
+          # -v3-: bypass a target cache poisoned by a disk-full build (see ci.yml).
+          #
+          # `-release-`, and NOT ci.yml's key. This step used to read
+          # `cargo-target-v3-<rustc>-<lock>` — byte-identical to ci.yml's — under a comment saying
+          # the release build "reuses its clean artifacts". It never did, and could not: ci.yml
+          # builds DEBUG, this job builds RELEASE, and actions/cache is first-saver-wins on an
+          # exact key. ci.yml's `rust` job finishes in ~6 min against this job's ~7-8, so ci.yml
+          # always won the save, this job always restored a target/ with an empty target/release,
+          # and — the expensive half — its own release artifacts were then never persisted,
+          # because the key it would have saved under was already taken. Every canary .deb has
+          # therefore been a from-scratch release build (sccache-assisted, but every link and
+          # every build script re-run) for as long as both keys have existed.
+          key: cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-release-v3-${{ env.rustc }}-
 
       - name: Build release clients
         env:
@@ -172,7 +189,31 @@ jobs:
           cargo build --release --locked \
             -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
 
+      # ── The web console, built ONCE per (web+sdk content, bun) rather than once per job ────────
+      # This bundle was being rebuilt six times on every push — ci.yml, here, both RPM legs, arch,
+      # and the docker app image — at ~2.5 min each, for output that is a pure function of web/ and
+      # sdk/. windows-host.yml has cached it this way for a while; this is the same arrangement for
+      # the Linux packaging legs, sharing one key family so a hit in one warms the others.
+      #
+      # The bun version is IN THE KEY. Each builder image installs its own bun (rust-ci, fedora-rpm
+      # and arch-ci each run the bun.sh installer at image-build time), so without it a bundle built
+      # by one image's bun could be shipped by a job running a different one. They are usually the
+      # same version and do share; when they diverge, they simply stop sharing instead of silently
+      # mixing.
+      - name: Web console cache key
+        run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
+      - name: Cache the built web console
+        id: webconsole
+        uses: actions/cache@v4
+        with:
+          path: web/.output
+          key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
+
       - name: Build + smoke-boot web console (bun preset)
+        # Skipped when the cache already holds this exact (web+sdk, bun) bundle — the assertion step
+        # below is what makes that safe. The bundle in the cache was smoke-booted by the run that
+        # produced it, and ci.yml's `web` job still builds and tests the console on every push.
+        if: steps.webconsole.outputs.cache-hit != 'true'
         # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
         # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
         # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
@@ -185,7 +226,12 @@ jobs:
           }
           export PATH="$HOME/.bun/bin:$PATH"
           cd web
-          bun install --frozen-lockfile
+          # --ignore-scripts, like every other web install in CI (ci.yml, web-screenshots.yml,
+          # windows-host.yml, the SDK installs). This was the ONE site still running lifecycle
+          # scripts, and web's `postinstall` is `bun2nix -o bun.nix` — a Nix codegen step this job
+          # neither consumes nor commits, whose only effect here is to make the install depend on
+          # bun2nix resolving. `build` re-runs its own `prebuild` codegen regardless.
+          bun install --frozen-lockfile --ignore-scripts
           bun run build
           if ! grep -q 'Bun\.serve' .output/server/index.mjs; then
             echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry"; exit 1
@@ -197,6 +243,22 @@ jobs:
           echo "web console smoke: /login -> $code"
           [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under bun"; exit 1; }
 
+      # ⚠ NOT optional, and it must run on BOTH paths (cache hit and fresh build). The packaging
+      # scripts treat a missing web/.output as "build it yourself", which is right for a local run
+      # and wrong here: it would silently turn a broken cache restore into a slow, quiet rebuild, or
+      # — with the build step skipped and the restore empty — into a package with no console at all.
+      # windows-host.yml shipped exactly that in 0.22.1/0.22.2 (an unset WEB_OUTPUT_DIR behind a
+      # single Write-Host), which is why its equivalent step throws too. Fail loudly instead.
+      - name: The console must exist (cache hit or fresh build)
+        run: |
+          if [ ! -f web/.output/server/index.mjs ]; then
+            echo "::error::web/.output is missing — neither the cache restore nor the build produced it"
+            exit 1
+          fi
+          grep -q 'Bun\.serve' web/.output/server/index.mjs || {
+            echo "::error::web/.output is not a bun bundle (wrong nitro preset)"; exit 1; }
+          echo "web console present: $(du -sh web/.output | cut -f1)"
+
       - name: Build .debs
         run: |
           export PATH="$HOME/.bun/bin:$PATH"
@@ -206,6 +268,13 @@ jobs:
           VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-web-deb.sh
           # The plugin/script runner (bun-bundled Effect SDK) — same vendored-bun mechanics.
           VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-scripting-deb.sh
+
+      # Visibility only. With the target cache now actually saving release artifacts (see the
+      # cache key note above), this is how a regression in that arrangement becomes visible:
+      # a run that suddenly reports thousands of misses is a cache that stopped restoring.
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
       - name: Publish to the Gitea apt registry
         env:
@@ -251,18 +320,17 @@ jobs:
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci-noble:latest
     timeout-minutes: 90
+    env:
+      # ⚠ Job-scoped — see build-publish above and ci.yml's `rust` job.
+      CC_x86_64_unknown_linux_gnu: sccache cc
+      CXX_x86_64_unknown_linux_gnu: sccache c++
     steps:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       - name: Version + channel
         run: |
@@ -298,9 +366,12 @@ jobs:
         with:
           path: target
           # Own key: this target dir is built against 24.04's glibc/toolchain and must NOT share
-          # ci.yml's 26.04 target cache (mixing would poison both).
-          key: cargo-target-noble-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-noble-v1-${{ env.rustc }}-
+          # ci.yml's 26.04 target cache (mixing would poison both). It is also the only job using
+          # this prefix, so — unlike the amd64/arm64 pairs above — it has always been able to save
+          # and restore its own release artifacts. `-release-` is spelled out anyway so the whole
+          # file reads consistently and nobody "unifies" it back into a shared key later.
+          key: cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-noble-release-v1-${{ env.rustc }}-
 
       - name: Build release host
         env:
@@ -334,6 +405,12 @@ jobs:
         # defaults to /opt/ffmpeg (the image's ENV also sets it).
         run: |
           VERSION="$VERSION" BUNDLE_FFMPEG=1 bash packaging/debian/build-deb.sh
+
+      # Visibility only — placed here, right after the last compile, rather than at the end of the
+      # job: the gamescope gate below must stay the final step (see its own note).
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
       # Read the capability matrix out of the BUILT .deb before it is published. dpkg carries no
       # capability metadata — the postinst applies them — so this reads the postinst that will
@@ -493,14 +570,14 @@ jobs:
       - uses: actions/checkout@v4
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
-      # images; this fetch keeps the job green while the running :latest predates the bake.
+      # images; this heals the job while the running :latest predates the bake.
+      #
+      # NOTE this job deliberately sets no CC_x86_64_unknown_linux_gnu: the cross image already
+      # points it at /usr/local/bin/pf-host-cc, which is what keeps ffmpeg-sys-next's HOST probe
+      # from picking up arm64 include dirs. The target-side compiles go through
+      # CC_aarch64_unknown_linux_gnu (also set by the image) and are not sccache-wrapped.
       - name: sccache (no-op once the image bakes it)
-        run: |
-          command -v sccache >/dev/null 2>&1 || {
-            curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \
-              | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache'
-          }
-          sccache --version
+        run: sh scripts/ci/ensure-sccache.sh
 
       # Byte-identical to build-publish's version step (pf-version.sh is deterministic per
       # commit), so the arm64 package always shares the amd64 version line.
@@ -537,8 +614,13 @@ jobs:
           path: target
           # Its OWN key — these are aarch64 artifacts under target/aarch64-unknown-linux-gnu/
           # and must never share the amd64 jobs' target cache.
-          key: cargo-target-arm64-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-arm64-v1-${{ env.rustc }}-
+          #
+          # `-release-`: this key was previously identical to ci.yml's `rust-arm64` key, which
+          # builds DEBUG (clippy) and finishes in ~1.5 min against this job's ~5. Exactly the
+          # amd64 collision described on the release key above — ci.yml won every save, this job
+          # restored a tree with no release artifacts and could never persist its own.
+          key: cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-arm64-release-v1-${{ env.rustc }}-
 
       - name: Build the arm64 client .deb
         env:
@@ -550,6 +632,10 @@ jobs:
           # Fail here rather than shipping an amd64 binary under an arm64 package name.
           readelf -h target/aarch64-unknown-linux-gnu/release/punktfunk-session \
             | grep -q AArch64 || { echo "ERROR: session binary is not AArch64"; exit 1; }
+
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats
 
       - name: Publish to the Gitea apt registry
         env:
