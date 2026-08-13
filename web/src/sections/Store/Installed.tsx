@@ -17,10 +17,22 @@ import { SourceChip, TierBadge } from "./TierBadge";
  */
 export const InstalledTab: FC<{
 	onUpdate: (plugin: InstalledPlugin) => void;
+	onUpdateAll: () => void;
 	onUninstall: (plugin: InstalledPlugin) => void;
+	/** How many plugins "Update all" would install; the button hides at zero. */
+	updateCount: number;
 	/** Package whose install/uninstall is in flight, or null — only that row's actions disable. */
 	busyPkg: string | null;
-}> = ({ onUpdate, onUninstall, busyPkg }) => {
+	/** An Update-all run is working through the queue — every action here waits for it. */
+	batchRunning: boolean;
+}> = ({
+	onUpdate,
+	onUpdateAll,
+	onUninstall,
+	updateCount,
+	busyPkg,
+	batchRunning,
+}) => {
 	const installed = useInstalledPlugins();
 	return (
 		<div className="flex flex-col gap-card">
@@ -28,8 +40,11 @@ export const InstalledTab: FC<{
 			<InstalledList
 				installed={installed}
 				onUpdate={onUpdate}
+				onUpdateAll={onUpdateAll}
 				onUninstall={onUninstall}
+				updateCount={updateCount}
 				busyPkg={busyPkg}
+				batchRunning={batchRunning}
 			/>
 		</div>
 	);
@@ -43,15 +58,33 @@ export const InstalledTab: FC<{
 export const InstalledList: FC<{
 	installed: Loadable<InstalledPlugin[]>;
 	onUpdate: (plugin: InstalledPlugin) => void;
+	onUpdateAll: () => void;
 	onUninstall: (plugin: InstalledPlugin) => void;
+	updateCount: number;
 	busyPkg: string | null;
-}> = ({ installed, onUpdate, onUninstall, busyPkg }) => {
+	batchRunning: boolean;
+}> = ({
+	installed,
+	onUpdate,
+	onUpdateAll,
+	onUninstall,
+	updateCount,
+	busyPkg,
+	batchRunning,
+}) => {
 	const rows = installed.data ?? [];
 	return (
 		<Card>
 			<CardContent flush>
-				<CardHeader>
+				{/* The bulk action sits with the list it acts on, the way Sources' "Refresh all" does. */}
+				<CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
 					<CardTitle>{m.store_installed_title()}</CardTitle>
+					{updateCount > 0 && (
+						<Button size="sm" disabled={batchRunning} onClick={onUpdateAll}>
+							<ArrowUpCircle className="size-4" />
+							{m.store_update_all_count({ count: updateCount })}
+						</Button>
+					)}
 				</CardHeader>
 
 				<QueryState
@@ -108,7 +141,7 @@ export const InstalledList: FC<{
 												{p.update_available !== undefined && (
 													<Button
 														size="sm"
-														disabled={busyPkg === p.pkg}
+														disabled={batchRunning || busyPkg === p.pkg}
 														onClick={() => onUpdate(p)}
 													>
 														<ArrowUpCircle className="size-4" />
@@ -121,7 +154,7 @@ export const InstalledList: FC<{
 													variant="ghost"
 													size="icon"
 													aria-label={m.store_uninstall()}
-													disabled={busyPkg === p.pkg}
+													disabled={batchRunning || busyPkg === p.pkg}
 													onClick={() => onUninstall(p)}
 												>
 													<Trash2 className="size-4 text-destructive" />

@@ -1,6 +1,6 @@
 import { BadgeCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
-import type { StoreEntry } from "@/api/store";
+import type { PendingUpdate, StoreEntry } from "@/api/store";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -79,6 +79,95 @@ export const InstallDialog: FC<{
 							{external
 								? m.store_install_external_confirm()
 								: m.store_install_confirm()}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			)}
+		</Dialog>
+	);
+};
+
+/**
+ * "Update all": one confirmation for a whole run of catalog installs.
+ *
+ * It is the same trust decision as `InstallDialog`, taken once for several packages, so it keeps
+ * the same escalation rule — if ANY entry in the run comes from an operator-added source, the whole
+ * dialog wears the external treatment and names those sources. A bulk action must not be a way to
+ * wave through, in one click, a warning each package would have shown on its own.
+ */
+export const UpdateAllDialog: FC<{
+	/** The updates to run, in order — null when the dialog is closed. */
+	updates: PendingUpdate[] | null;
+	/** Plugins with an update the run will not attempt; named so the count adds up on screen. */
+	skipped: string[];
+	onCancel: () => void;
+	onConfirm: (updates: PendingUpdate[]) => void;
+	isPending: boolean;
+}> = ({ updates, skipped, onCancel, onConfirm, isPending }) => {
+	const external = (updates ?? []).filter((u) => u.entry.tier === "external");
+	// Each source named once, in the order the run meets it.
+	const sources = [...new Set(external.map((u) => u.entry.source))];
+	return (
+		<Dialog
+			open={updates !== null}
+			onOpenChange={(open) => !open && onCancel()}
+		>
+			{updates && (
+				<DialogContent className="max-w-lg">
+					<DialogHeader>
+						<DialogTitle className="flex items-center gap-2">
+							{sources.length > 0 ? (
+								<ShieldQuestion className="size-5 shrink-0 text-amber-600 dark:text-amber-500" />
+							) : (
+								<BadgeCheck className="size-5 shrink-0 text-[var(--success)]" />
+							)}
+							{m.store_update_all_title()}
+						</DialogTitle>
+						<DialogDescription>{m.store_update_all_body()}</DialogDescription>
+					</DialogHeader>
+
+					{/* Every version change, spelled out: a bulk confirm that only says "3 plugins" is
+					    asking the operator to trust a number. Scrolls rather than growing past the
+					    dialog's own max-height when a host has a lot installed. */}
+					<ul className="max-h-64 space-y-1 overflow-y-auto rounded-md bg-muted p-3 text-xs">
+						{updates.map((u) => (
+							<li
+								key={u.plugin.pkg}
+								className="flex items-baseline justify-between gap-3"
+							>
+								<span className="truncate font-medium">
+									{u.plugin.title ?? u.plugin.pkg}
+								</span>
+								<span className="shrink-0 font-mono tabular-nums text-muted-foreground">
+									{u.plugin.version ? `v${u.plugin.version}` : "—"} → v
+									{u.entry.version}
+								</span>
+							</li>
+						))}
+					</ul>
+
+					{sources.length > 0 && (
+						<p className="rounded-md border border-amber-600/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:border-amber-500/40 dark:text-amber-500">
+							{m.store_update_all_external_note({
+								sources: sources.join(", "),
+							})}
+						</p>
+					)}
+
+					{skipped.length > 0 && (
+						<p className="text-xs text-muted-foreground">
+							{m.store_update_all_skipped({ names: skipped.join(", ") })}
+						</p>
+					)}
+
+					<DialogFooter>
+						<Button variant="outline" onClick={onCancel} disabled={isPending}>
+							{m.common_cancel()}
+						</Button>
+						<Button disabled={isPending} onClick={() => onConfirm(updates)}>
+							{sources.length > 0
+								? m.store_update_all_external_confirm()
+								: m.store_update_all_confirm()}
 						</Button>
 					</DialogFooter>
 				</DialogContent>
