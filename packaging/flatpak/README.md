@@ -138,8 +138,10 @@ are now expressed properly rather than hardcoded:
 * **The prebuilt Skia archive** is per-target and pinned by sha256. There are now two `type: file`
   sources discriminated by `only-arches`, both landing on the same `dest-filename`, so
   `SKIA_BINARIES_URL` stays one literal path. Upstream publishes the aarch64 archive under the
-  same skia commit hash and the same resolved-feature key (`pdf-textlayout-vulkan`), so on a
-  skia-safe bump update both URLs and both hashes together.
+  same skia commit hash and the same resolved-feature key (at 0.99:
+  `jpegd-jpege-pdf-textlayout-vulkan`), so on a skia-safe bump update both URLs and both hashes
+  together. The feature key is **not** stable across bumps — 0.87 was `pdf-textlayout-vulkan`;
+  `jpeg` entering skia-safe's defaults at 0.99 renamed it.
 
 ```sh
 ARCH=aarch64 bash packaging/flatpak/build-flatpak.sh
@@ -179,8 +181,16 @@ build host that lacks those (the Deck), rsync the generated file in alongside th
 downloads prebuilt `libskia` binaries at build time, which is dead in the offline sandbox — so the
 manifest pins a `skia-binaries-….tar.gz` source and points the build at it with
 `SKIA_BINARIES_URL: file://…`. When bumping the `skia-safe`/`skia-bindings` crate version, update
-that pinned tarball (URL + sha256) to the matching `skia-binaries` release or the build breaks
-offline.
+that pinned tarball (URL + sha256) to the matching `skia-binaries` release **in the same commit**,
+or the build breaks offline.
+
+The failure is not a download error, because `file://` always succeeds — skia-bindings unpacks the
+stale archive verbatim, *including the `bindings.rs` it was generated with*, so the new crate's
+`src/defaults.rs` compiles against old bindings and the leg dies on missing associated consts
+(`SkPathFillType::Default`, `SkPathDirection::Default` — they live in the generated `bindings.rs`,
+so they travel with the archive, not the crate). Everything else in the offline chain is derived
+from `Cargo.lock` and self-corrects; this tarball is the only hand-maintained pin, and the
+0.87 → 0.99 bump (#193) left it behind.
 
 ## Hosting the repo (unom-1) + one-time setup
 

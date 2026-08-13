@@ -369,7 +369,7 @@ modules:
         path: ../..
       # Generated offline crate cache (see the comment block above). Remove for --share=network.
       - cargo-sources.json
-      # Prebuilt Skia for skia-bindings 0.87.0 (SKIA_BINARIES_URL above). The key encodes the
+      # Prebuilt Skia for skia-bindings 0.99.0 (SKIA_BINARIES_URL above). The key encodes the
       # crate's pinned skia commit + target + resolved features — when bumping skia-safe, build
       # the workspace once locally and take the new name from
       # target/release/build/skia-bindings-*/out/.cache/, then update url + sha256 together.
@@ -378,13 +378,24 @@ modules:
       # release publishes the aarch64 archive under the same skia commit hash and the same
       # resolved-feature key, so the two stay in lockstep on a skia-safe bump — take both new
       # names and sha256s together.
+      #
+      # ⚠ This pin MUST be bumped in the same commit as the skia-safe version in
+      # crates/pf-console-ui/Cargo.toml. `SKIA_BINARIES_URL: file://…` makes skia-bindings
+      # unpack this archive verbatim — INCLUDING its pre-generated bindings.rs — into
+      # target/…/build/skia-bindings-*/out/skia/. A stale archive therefore compiles the NEW
+      # crate's src/defaults.rs against the OLD bindings, and the flatpak leg dies with
+      # `no variant, associated function, or constant named 'Default' found for enum
+      # SkPathFillType` (that const is generated INTO bindings.rs, so it moves with the
+      # archive, not with the crate). Cargo.lock and cargo-sources.json are regenerated
+      # automatically; this file is the one place the skia archive is pinned by hand, which
+      # is exactly how the 0.87 → 0.99 bump (#193) left it behind.
       - type: file
         only-arches: [x86_64]
-        url: https://github.com/rust-skia/skia-binaries/releases/download/0.87.0/skia-binaries-e551f334ad5cbdf43abf-x86_64-unknown-linux-gnu-pdf-textlayout-vulkan.tar.gz
-        sha256: b46e7061e6b9df792025acaf9b8b90180224c7cec63f4c3ce09af7ddddb8abfa
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-jpegd-jpege-pdf-textlayout-vulkan.tar.gz
+        sha256: 158407a4b5ce8738431bb76498be3a44fda770e51d61aac18a0e0e97becdc1de
         dest-filename: skia-binaries.tar.gz
       - type: file
         only-arches: [aarch64]
-        url: https://github.com/rust-skia/skia-binaries/releases/download/0.87.0/skia-binaries-e551f334ad5cbdf43abf-aarch64-unknown-linux-gnu-pdf-textlayout-vulkan.tar.gz
-        sha256: 6994fb993064d7d4fff00bf7c79544ffc881bb5441b6768b31cc088540f4bef7
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-unknown-linux-gnu-jpegd-jpege-pdf-textlayout-vulkan.tar.gz
+        sha256: cf5469d1d963f704cc997f9b3342d11c49b917002361947e5c7bf7dcc3f13534
         dest-filename: skia-binaries.tar.gz
