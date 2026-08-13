@@ -100,7 +100,11 @@ ureq = { version = "3", default-features = false, features = [
     "gzip",
 ] }
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
-x509-parser = "0.16"
+# ⚠ Do not float this back below 0.18. 0.16 was the LAST crate pulling `thiserror` 1.0 into the
+# host graph (via asn1-rs 0.6 / der-parser 9 / oid-registry 0.7); 0.18 moves that chain to asn1-rs
+# 0.7 + thiserror 2, so the host now links exactly one thiserror major. `cargo tree -p
+# punktfunk-host -i thiserror@1` must keep reporting no match.
+x509-parser = "0.18"
 # Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
 # tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
 # feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
