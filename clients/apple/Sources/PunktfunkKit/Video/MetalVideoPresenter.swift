@@ -56,17 +56,27 @@ enum WindowedPresentMode: String, Sendable {
 /// 203-nit diffuse white at EDR 1.0 (the display's SDR-white level) and lets the system tone-map the
 /// brighter highlights into the panel's headroom. This is the missing anchor that made the old HDR path
 /// render "way too bright" (no `edrMetadata` → no reference-white anchoring); a LARGER value renders
-/// dimmer. Matches the host's standard PQ reference white.
+/// dimmer.
+///
+/// ⚠️ This is one half of a pair: the host has to map SDR content into the PQ container at the SAME
+/// luminance, and pins it to 203 in `pf-vdisplay`'s `SDR_REFERENCE_WHITE_NITS`. When they disagree
+/// every pixel is off by the ratio — a gamescope host left on gamescope's own 400-nit default put
+/// the stream nearly a stop bright, which read as a glaring, over-saturated Steam UI and washed-out
+/// HDR game content at the same time. Change one end without the other and that gap re-opens.
 private let hdrReferenceWhiteNits: Float = 203.0
 
-/// PUNKTFUNK_SDR_COLORSPACE=srgb — A/B hatch for the SDR layer's colour tag. Today the SDR layer
-/// ships with `colorspace = nil`, which on macOS means NO colour matching: the BT.709/sRGB-encoded
-/// stream is displayed with the panel's native primaries — mild oversaturation on every P3 Mac.
-/// `srgb` tags the layer so CoreAnimation colour-matches it into the panel's gamut (the strictly
-/// correct rendering). Kept OFF by default until the on-glass A/B confirms it (the nil path is the
-/// long-proven look, and some users may prefer the vivid rendition); flip the default once verified.
-private let sdrColorspaceOverride: CGColorSpace? = {
-    guard ProcessInfo.processInfo.environment["PUNKTFUNK_SDR_COLORSPACE"] == "srgb" else {
+/// The SDR layer's colour tag. `colorspace = nil` means NO colour matching: the BT.709-encoded
+/// stream is handed to the compositor untagged and drawn in the display's native space. That is
+/// mild oversaturation on a P3 Mac or iPad, and on a tvOS display composited for HDR it also lifts
+/// the black floor — the 2026-08-13 field report of greys where blacks should be, which arrived
+/// with the client's own HDR switch already OFF, so no other stage had tagged those pixels either.
+/// Tagging lets CoreAnimation colour-match into whatever the output actually is, which is the
+/// strictly correct rendering, so it is now the default.
+///
+/// `PUNKTFUNK_SDR_COLORSPACE=none` restores the old untagged look — the A/B lever if a panel
+/// regresses, or for anyone who preferred the more vivid rendition.
+private let sdrColorspace: CGColorSpace? = {
+    guard ProcessInfo.processInfo.environment["PUNKTFUNK_SDR_COLORSPACE"] != "none" else {
         return nil
     }
     return CGColorSpace(name: CGColorSpace.sRGB)
@@ -425,6 +435,14 @@ public final class MetalVideoPresenter {
     /// Render-thread confined once the pipeline runs (Stage2Pipeline.start's one pre-thread
     /// `configure` call is ordered before the thread starts, so it doesn't race).
     private var hdrActive = false
+    /// Has `configureColor` run even once? `hdrActive` starts `false`, so a session that is SDR from
+    /// the first frame matches the initial state and used to fall straight through `configure`'s
+    /// guard — the layer then kept `make()`'s bare config, which never assigns a colour space, and
+    /// the SDR stream presented untagged for the whole session. That also made
+    /// `PUNKTFUNK_SDR_COLORSPACE` dead code on exactly the sessions it was meant to fix, so an
+    /// operator A/B-ing it in the field saw nothing change. Same-state calls after the first are
+    /// still no-ops, which is what the guard is for.
+    private var didConfigureColor = false
     /// tvOS only: whether HDR frames currently present as PQ PASSTHROUGH (display has HDR headroom
     /// — its own tone-map applies) vs the in-shader tone-map fallback. Render-thread confined;
     /// derived from the staged display headroom at the top of every `render`.
@@ -592,13 +610,16 @@ public final class MetalVideoPresenter {
         stagingLock.lock()
         let passthrough = stagedDisplayHeadroom > 1.0
         stagingLock.unlock()
-        guard hdr != hdrActive || (hdr && passthrough != hdrPassthroughActive) else { return }
+        guard !didConfigureColor || hdr != hdrActive
+            || (hdr && passthrough != hdrPassthroughActive)
+        else { return }
         hdrActive = hdr
         hdrPassthroughActive = passthrough
         #else
-        guard hdr != hdrActive else { return }
+        guard !didConfigureColor || hdr != hdrActive else { return }
         hdrActive = hdr
         #endif
+        didConfigureColor = true
         configureColor(hdr: hdr)
     }
 
@@ -628,9 +649,10 @@ public final class MetalVideoPresenter {
                 layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
             } else {
                 // SDR-composited display: PQ would render untone-mapped (blown out) — the
-                // pf_frag_hdr_tv shader tone-maps to SDR instead.
+                // pf_frag_hdr_tv shader tone-maps to SDR instead. Its output is BT.709, so it
+                // carries the same SDR tag as a genuinely SDR session.
                 layer.pixelFormat = .bgra8Unorm
-                layer.colorspace = nil
+                layer.colorspace = sdrColorspace
             }
             #else
             layer.pixelFormat = .rgba16Float
@@ -641,12 +663,11 @@ public final class MetalVideoPresenter {
             layer.edrMetadata = makeEDR(lastHdrMeta)
             #endif
         } else {
-            // SDR: gamma-encoded BT.709 [0,1] in an 8-bit drawable. Default: nil colorspace = NO
-            // colour matching on macOS (the panel's native primaries — the long-proven look,
-            // slightly oversaturated on P3 panels); PUNKTFUNK_SDR_COLORSPACE=srgb tags the layer
-            // for correct colour matching instead (A/B pending — see sdrColorspaceOverride).
+            // SDR: gamma-encoded BT.709 [0,1] in an 8-bit drawable, tagged so CoreAnimation
+            // colour-matches it into the output rather than drawing it in the panel's native
+            // space (see sdrColorspace; PUNKTFUNK_SDR_COLORSPACE=none restores untagged).
             layer.pixelFormat = .bgra8Unorm
-            layer.colorspace = sdrColorspaceOverride
+            layer.colorspace = sdrColorspace
             #if !os(tvOS)
             layer.wantsExtendedDynamicRangeContent = false
             layer.edrMetadata = nil
