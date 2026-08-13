@@ -37,7 +37,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sy
 # visibility from gamescope's nested Xwayland via XFixes instead and feed the existing cursor slot.
 # `RustConnection` is the pure-Rust default (no libxcb link → no new C dependency on the host); the
 # `xfixes` feature (auto-pulls `render` + `shape`) is what exposes GetCursorImage/SelectCursorInput.
-x11rb = { version = "0.13", default-features = false, features = ["xfixes"] }
+x11rb = { version = "0.14", default-features = false, features = ["xfixes"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The host<->driver wire contract for the sealed frame channel (control IOCTL structs + frame header).

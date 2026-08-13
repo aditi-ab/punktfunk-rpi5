@@ -58,7 +58,7 @@ wayland-backend = "0.3"
 bitflags = "2"
 # The gamescope bare-spawn splash client (gamescope/splash.rs): pure-Rust X11 core protocol (the
 # same no-libxcb-link stance as pf-capture's XFixes cursor source), no extension features needed.
-x11rb = { version = "0.13", default-features = false }
+x11rb = { version = "0.14", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows-only, all three, and gated here rather than unconditionally so the LINUX build does not

@@ -3791,11 +3791,19 @@ fn plan_bind(
 /// the bind only arms for a resolved `punktfunk-gamescope`, whose patch level 2+ paints the pointer
 /// into the capture node itself, so `SessionPlan::gamescope_cursor` is false and the reader is
 /// never spawned (`session_plan::gamescope_needs_host_cursor`). On the ATTACH route, where the
-/// reader IS spawned, it reaches the display over the ABSTRACT socket `@/tmp/.X11-unix/X<n>` —
-/// x11rb tries that before the filesystem path, and an abstract socket lives in the network
-/// namespace, which this unit does not get one of. If that ever fails, the reader logs and retries
-/// forever; the stream runs without a composited pointer. Nothing else host-side opens an X
-/// connection: capture is PipeWire, injection is libei/EIS, clipboard is Wayland.
+/// reader IS spawned, we never arm this bind — the session is someone else's, started by
+/// `gamescope-session-plus`, and its `/tmp` is the real one — so the filesystem socket
+/// `/tmp/.X11-unix/X<n>` is exactly where `DISPLAY` says it is and the reader reaches it by path.
+/// (`punktfunk-host.service` sets no `PrivateTmp`, on purpose, so the host shares that `/tmp`.)
+///
+/// That last sentence used to lean on x11rb trying the ABSTRACT socket `@/tmp/.X11-unix/X<n>`
+/// first, which would have survived even a bind, since an abstract socket lives in the network
+/// namespace and this unit gets none of its own. **x11rb 0.14 dropped the abstract attempt**
+/// (`rust_connection::stream`, "Connect to this Unix socket by path"), so the filesystem path is
+/// now the only one. Should the two ever have to coexist — a bind armed on a route that also
+/// spawns the reader — the reader would not connect; it logs and retries forever, and the stream
+/// runs without a composited pointer. Nothing else host-side opens an X connection: capture is
+/// PipeWire, injection is libei/EIS, clipboard is Wayland.
 struct SessionBind {
     wrapper: std::path::PathBuf,
     /// The user-owned directory bound over [`X11_SOCKET_DIR`], or `None` when the real one is

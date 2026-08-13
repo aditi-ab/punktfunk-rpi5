@@ -147,7 +147,7 @@ libloading = "0.8"
 # pure-Rust `RustConnection` — no libxcb link, so no new C dependency on any client package
 # — the same stance pf-capture and pf-vdisplay already take on this crate. No extension
 # features: root-window properties and an event mask are core X11.
-x11rb = { version = "0.13", default-features = false }
+x11rb = { version = "0.14", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
