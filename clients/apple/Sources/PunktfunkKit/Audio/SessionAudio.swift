@@ -234,11 +234,23 @@ public final class SessionAudio {
                 try session.setCategory(
                     .playAndRecord, mode: .default,
                     options: [.allowBluetoothA2DP, .mixWithOthers])
-                // Uplink latency: ask for 5 ms IO quanta at the wire rate (the default ~10-23 ms
+                // Uplink latency: ask for 10 ms IO quanta at the wire rate (the default ~23 ms
                 // quantum is most of the mic path's burst latency). Best-effort — the hardware
                 // has the final word (a Bluetooth route will ignore both), and whatever quantum
                 // is actually granted, the capture tap handles the buffers it gets.
-                try? session.setPreferredIOBufferDuration(0.005)
+                //
+                // 10 ms, NOT the 5 ms this used to ask for. The IO buffer duration is a property
+                // of the whole IO unit, so a shorter quantum is not free to the PLAYBACK side —
+                // and it bought the uplink nothing, because the encoder frames at 10 ms
+                // (`installMicTap` installs with `bufferSize: 480` and `OpusEncoder` consumes
+                // whole `framesPerPacket` chunks): at a 5 ms quantum the tap simply fired twice
+                // per packet, for the same packet latency. What it did buy was a halved deadline
+                // for the render callback and — because the de-prime fuse used to be a callback
+                // COUNT — half the starvation hysteresis in the jitter ring, on the one platform
+                // whose transport bunches hardest. Both ends of that are fixed now (`AudioRing`
+                // measures the fuse in ms), but there is still no reason to ask for a quantum
+                // finer than the packets we send.
+                try? session.setPreferredIOBufferDuration(0.010)
                 try? session.setPreferredSampleRate(48_000)
             } else {
                 try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
@@ -247,6 +259,16 @@ public final class SessionAudio {
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             #endif
             try session.setActive(true)
+            // What we were actually GRANTED, not what we asked for. Both are best-effort, and the
+            // ring's behaviour depends on the quantum it really gets — without this, a report of
+            // audio jitter arrives with no way to tell a 10 ms session from a 5 ms or a 23 ms one,
+            // which is exactly the gap that made the last round of this take a simulation to close.
+            log.info("""
+                AVAudioSession active: io_buffer_ms=\
+                \(session.ioBufferDuration * 1000, format: .fixed(precision: 2)) \
+                sample_rate=\(Int(session.sampleRate)) \
+                route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "none")
+                """)
             #if os(iOS)
             // Only the `.playAndRecord` session can land on the earpiece, and only it accepts an
             // output override — so the mic-off (`.playback`) path deliberately does neither.

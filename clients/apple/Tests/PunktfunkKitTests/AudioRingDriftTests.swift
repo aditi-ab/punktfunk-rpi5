@@ -106,6 +106,77 @@ final class AudioRingDriftTests: XCTestCase {
             "a single short read must not force a full re-prime")
     }
 
+    /// THE regression that made an iPad crackle where a Mac did not: the de-prime fuse must be the
+    /// same SPAN OF TIME whatever the device's IO quantum. It used to be a callback COUNT (4), and
+    /// a callback is not a unit of time — the same 4 was ~44 ms on a Mac's ~11 ms quantum and 20 ms
+    /// on iOS, whose session asked for a 5 ms IO buffer. A Wi-Fi delivery stall therefore de-primed
+    /// this ring on every bunching cycle where the identical policy rode it out elsewhere (measured
+    /// on the shared Rust policy: 120 audible gaps per 10 min at a 5 ms quantum against 3 at 8 ms).
+    /// Plant the defect by restoring a fixed count and the quanta below stop agreeing.
+    ///
+    /// Mirrors `deprime_fuse_is_a_duration_not_a_callback_count` in `punktfunk_core::audio`.
+    func testDeprimeFuseIsADurationNotACallbackCount() {
+        let deprimeMS = 60 // AudioRing.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
+        let quanta = [5, 8, 10, 16, 21]
+        var deprimedAt: [Int: Int] = [:]
+        for quantumMS in quanta {
+            let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+            let want = quantumMS * perMS
+            var scratch = [Float](repeating: 0, count: want)
+            // Prime DEEP: the depth average is seeded with the refill, so `hollow` stays false for
+            // the EWMA's whole settling second and the starvation fuse — not the hollow shortcut —
+            // is what this measures.
+            let big = [Float](repeating: 0.5, count: 80 * perMS)
+            big.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: big.count) }
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+            XCTAssertTrue(
+                scratch.contains { $0 != 0 }, "q=\(quantumMS)ms: must play after priming")
+
+            // Starve on a trickle far under what the device takes: every read runs short but still
+            // carries audio, so an all-zero read can only mean the ring gave up and re-primed.
+            let trickle = [Float](repeating: 0.5, count: max(perMS, want / 4))
+            var starvedMS = 0
+            var deprimedAfterMS: Int?
+            for _ in 0..<2_000 {
+                trickle.withUnsafeBufferPointer {
+                    ring.write($0.baseAddress!, count: trickle.count)
+                }
+                let short = ring.bufferedSamples < want
+                scratch.withUnsafeMutableBufferPointer {
+                    ring.read(into: $0.baseAddress!, count: want)
+                }
+                if scratch.allSatisfy({ $0 == 0 }) {
+                    deprimedAfterMS = starvedMS
+                    break
+                }
+                if short { starvedMS += quantumMS }
+            }
+            guard let deprimedAfterMS else {
+                return XCTFail("q=\(quantumMS)ms: never de-primed at all")
+            }
+            deprimedAt[quantumMS] = deprimedAfterMS
+        }
+
+        // Each quantum must give up somewhere around the fuse. The band is wide on purpose: at a
+        // short quantum the HOLLOW shortcut legitimately fires a little before the fuse does (the
+        // target has grown, the depth was never re-banked, so the click is taken early and spent
+        // on a full refill — see `deprimeDebtMS`), and that is the policy working, not drift.
+        for (q, ms) in deprimedAt.sorted(by: { $0.key < $1.key }) {
+            XCTAssertTrue(
+                (deprimeMS - 20...deprimeMS + 25).contains(ms),
+                "q=\(q)ms de-primed after \(ms) ms, nowhere near the \(deprimeMS) ms fuse — "
+                    + "\(deprimedAt.sorted { $0.key < $1.key })")
+        }
+        // ...and THE property: the fuse must not SCALE with the quantum. As a callback count these
+        // same devices de-primed after 20/32/40/64/84 ms — a 4.2x spread, which is exactly why an
+        // iPad crackled where a Mac did not. Measured in time the spread collapses to ~1.3x.
+        let spread = Double(deprimedAt.values.max()!) / Double(deprimedAt.values.min()!)
+        XCTAssertLessThan(
+            spread, 1.6,
+            "de-prime time still scales with the IO quantum (\(String(format: "%.2f", spread))x "
+                + "across \(deprimedAt.sorted { $0.key < $1.key })) — the fuse is a count again")
+    }
+
     /// Mirror of the Rust `target_grows_on_underruns_and_relaxes_when_quiet`, updated for
     /// near-miss growth: the drain's LAST full read (less than a frame left over) already grows
     /// the floor before anything was audible, clustered genuine underruns raise it further, and

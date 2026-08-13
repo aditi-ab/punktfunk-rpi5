@@ -39,7 +39,18 @@ final class AudioRing: @unchecked Sendable {
     private static let maxTargetMS = 70
     private static let headroomMS = 30
     private static let hardCapMS = 90
-    private static let deprimeAfter = 4
+    /// How long the ring may run short before it goes back to priming, in MILLISECONDS of
+    /// starvation — not a count of callbacks. As a count (it was 4) the hysteresis meant a
+    /// different span of time on every device, because a callback is not a unit of time: 4 of them
+    /// is ~44 ms on a Mac's ~11 ms quantum and **20 ms on iOS**, whose session asks for a short IO
+    /// buffer. A Wi-Fi delivery stall therefore de-primed this ring on every bunching cycle where
+    /// the same policy rode it out elsewhere — measured on the shared Rust policy at 120 audible
+    /// gaps per 10 minutes at a 5 ms quantum, against 3 at 8 ms and 1 at 16 ms on an identical
+    /// link. Mirrors `JitterTuning::COREAUDIO.deprime_ms`.
+    private static let deprimeMS = 60
+    /// Floor in callbacks under `deprimeMS`, so a large-quantum device keeps real hysteresis
+    /// instead of de-priming on the first short read. Mirrors `MIN_DEPRIME_CALLBACKS`.
+    private static let minDeprimeCallbacks = 2
     /// The protocol's frame: the shed unit, and the slack added over a large device quantum.
     private static let frameMS = 5
     /// Depth average must exceed target by this before drift correction fires — the middle of the
@@ -93,7 +104,12 @@ final class AudioRing: @unchecked Sendable {
     private var writeIdx = 0
     private var primed = false
     private var renderQuantum = 0
+    /// Consecutive short reads, and the audio they starved for in interleaved samples. BOTH gate
+    /// the de-prime (see `deprimeMS`): the run must be at least that long AND at least
+    /// `minDeprimeCallbacks` callbacks, so the fuse is the same span of time whatever the device's
+    /// quantum without collapsing to a hair trigger on a large-quantum device.
     private var emptyReads = 0
+    private var emptyRun = 0
     private var depthAvg: Double = 0
     private var overRun = 0
     /// The live target in interleaved samples — `targetMS` grown by underrun pressure
@@ -240,8 +256,10 @@ final class AudioRing: @unchecked Sendable {
             min(target + Self.headroomMS * perMS, Self.hardCapMS * perMS),
             target + renderQuantum)
         if writeIdx - readIdx > cap {
-            readIdx = writeIdx - cap
-            depthAvg = Double(cap)
+            // Crossfaded, like the smooth shed — see `dropFront`. This is the correction a
+            // bunching link actually pays, so it is the one that most needs not to click.
+            dropFront(writeIdx - readIdx - cap)
+            depthAvg = Double(writeIdx - readIdx)
             overRun = 0
         }
     }
@@ -262,6 +280,7 @@ final class AudioRing: @unchecked Sendable {
             if available >= target {
                 primed = true
                 emptyReads = 0
+                emptyRun = 0
                 // The refill just banked this much: seed the average with it rather than letting
                 // it climb from wherever the drought left it — a freshly-primed ring would
                 // otherwise read as hollow for the EWMA's whole settling time, and the FIRST
@@ -348,15 +367,23 @@ final class AudioRing: @unchecked Sendable {
         if ranShort {
             quietRun = 0
             emptyReads += 1
+            emptyRun += count
             underrunCount += 1
-            if emptyReads >= Self.deprimeAfter || hollow {
-                // The consecutive-empties hysteresis protects a FULL ring from one late packet.
+            // Starved for `deprimeMS` of audio, over at least `minDeprimeCallbacks` callbacks.
+            // Both, because either alone is wrong at one end of the quantum range: time alone is a
+            // hair trigger on a device whose single quantum already exceeds the window, and a
+            // callback count alone is the device-dependent fuse this replaced.
+            let starved = emptyRun >= Self.deprimeMS * perMS
+                && emptyReads >= Self.minDeprimeCallbacks
+            if starved || hollow {
+                // The starvation hysteresis protects a FULL ring from one late packet.
                 // A hollow ring is the opposite case: the target has been raised but the depth
                 // never re-banked (growth is a promise; only a re-prime cashes it), and riding
                 // that out is a click per bunching period, forever. The click just heard has
                 // already paid for the refill — take it now.
                 primed = false
                 emptyReads = 0
+                emptyRun = 0
             }
             if !restored {
                 underrunsInWindow += 1
@@ -375,12 +402,14 @@ final class AudioRing: @unchecked Sendable {
             // the path above takes over. A near-miss is pressure, not quiet.
             quietRun = 0
             emptyReads = 0
+            emptyRun = 0
             if !nearMissGrown, !restored {
                 nearMissGrown = true
                 targetLive = min(targetLive + Self.growStepMS * perMS, Self.maxTargetMS * perMS)
             }
         } else {
             emptyReads = 0
+            emptyRun = 0
             quietRun += count
             // Without a sync request, time is the only evidence that hard-won slack is no longer
             // needed, so a grown target waits out the long window. A request for less IS evidence,
@@ -402,13 +431,21 @@ final class AudioRing: @unchecked Sendable {
         }
     }
 
-    /// Drop one protocol frame from the front, linearly crossfading the seam so the correction is
-    /// inaudible rather than a click. Mirrors `punktfunk_core::audio::crossfade_drop`; caller holds
-    /// the lock.
-    private func shedOneFrame() {
-        let drop = Self.frameMS * perMS
+    /// Drop one protocol frame from the front — the smooth drift correction.
+    private func shedOneFrame() { dropFront(Self.frameMS * perMS) }
+
+    /// Drop `drop` interleaved samples from the front, linearly crossfading the seam so the
+    /// correction is inaudible rather than a click. Mirrors `punktfunk_core::audio::crossfade_drop`;
+    /// caller holds the lock.
+    ///
+    /// Used by BOTH corrections. The hard-cap trim in `write` used to splice raw, on the reasoning
+    /// that a ring which blew its ceiling is already a discontinuity — but that describes the
+    /// ARRIVALS, not the samples either side of the seam, which are ordinary continuous audio. It
+    /// is also the drop that actually fires here: a bunching Wi-Fi link trims far more often than
+    /// drift sheds, so the one path left unfaded was the audible one.
+    private func dropFront(_ drop: Int) {
         let available = writeIdx - readIdx
-        guard available > drop else { return }
+        guard drop > 0, available > drop else { return }
         let fade = min(Self.crossfadeMS * perMS, min(drop, available - drop))
         let capacity = buf.count
         if fade > 0 {

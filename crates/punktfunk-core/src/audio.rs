@@ -407,10 +407,23 @@ pub struct JitterTuning {
     pub headroom_ms: u32,
     /// Absolute bound on buffered audio — the only hard guarantee on added latency.
     pub hard_cap_ms: u32,
-    /// Consecutive short reads before the ring goes back to priming. `1` reproduces the old
-    /// `if ring.is_empty() { primed = false }`, where a single transient drain manufactured a
-    /// whole target's worth of fresh silence; every platform now uses hysteresis.
-    pub deprime_after: u32,
+    /// How long the ring may run short before it gives up and goes back to priming, in
+    /// MILLISECONDS of starvation — not a count of callbacks.
+    ///
+    /// It used to be a callback count, and that made the hysteresis mean something different on
+    /// every platform, because a callback is not a unit of time: the same `4` was ~40 ms of slack
+    /// on a 10 ms WASAPI quantum and **20 ms on iOS**, whose session asks for a 5 ms IO buffer —
+    /// the shortest fuse of any client, on the one with the burstiest transport. A 100 ms Wi-Fi
+    /// delivery stall then de-primed the Apple ring on every single bunching cycle (measured: 120
+    /// audible gaps in 10 minutes at a 5 ms quantum, versus 3 at 8 ms and 1 at 16 ms, on an
+    /// otherwise identical link) while the same policy rode it out everywhere else. Expressed in
+    /// time, one number means one thing on all four clients and a device's buffer size stops
+    /// silently re-tuning the de-prime behaviour.
+    ///
+    /// A floor of `MIN_DEPRIME_CALLBACKS` callbacks still applies, so a large-quantum device
+    /// keeps real hysteresis: `1` reproduces the old `if ring.is_empty() { primed = false }`, where
+    /// a single transient drain manufactured a whole target's worth of fresh silence.
+    pub deprime_ms: u32,
 }
 
 impl JitterTuning {
@@ -421,7 +434,7 @@ impl JitterTuning {
         max_target_ms: 60,
         headroom_ms: 25,
         hard_cap_ms: 80,
-        deprime_after: 4,
+        deprime_ms: 40,
     };
     /// WASAPI shared-mode event-driven render: the engine buffers for us, but nothing rate-matches.
     pub const WASAPI: JitterTuning = JitterTuning {
@@ -429,15 +442,21 @@ impl JitterTuning {
         max_target_ms: 70,
         headroom_ms: 30,
         hard_cap_ms: 90,
-        deprime_after: 4,
+        deprime_ms: 50,
     };
-    /// CoreAudio via AVAudioEngine — comparable to WASAPI; the iOS IO buffer is already 5 ms.
+    /// CoreAudio via AVAudioEngine — comparable to WASAPI, but the transport is not: this is the
+    /// preset an iPad on Wi-Fi runs, so it gets the longer fuse for the same reason [`AAUDIO`]
+    /// does. (The old comment here read "the iOS IO buffer is already 5 ms" as grounds for using
+    /// WASAPI's callback count unchanged; that quantum is precisely why a count was the wrong unit
+    /// — see [`JitterTuning::deprime_ms`].)
+    ///
+    /// [`AAUDIO`]: JitterTuning::AAUDIO
     pub const COREAUDIO: JitterTuning = JitterTuning {
         base_target_ms: 20,
         max_target_ms: 70,
         headroom_ms: 30,
         hard_cap_ms: 90,
-        deprime_after: 4,
+        deprime_ms: 60,
     };
     /// AAudio hands us a raw realtime callback and makes us own the buffer, and Wi-Fi power-save
     /// bunching lands as underruns = crackle. Android therefore starts DEEPER — but at 25 ms, not
@@ -448,7 +467,7 @@ impl JitterTuning {
         max_target_ms: 90,
         headroom_ms: 40,
         hard_cap_ms: 120,
-        deprime_after: 5,
+        deprime_ms: 60,
     };
 
     /// How far above the live target the depth average must sit before drift correction sheds:
@@ -471,11 +490,21 @@ impl JitterTuning {
 pub struct JitterStep {
     /// Interleaved samples to discard from the FRONT of the ring before reading.
     pub drop_front: usize,
-    /// When non-zero, `drop_front` is a smooth drift correction and this many interleaved samples
-    /// of linear crossfade should be applied across the seam ([`crossfade_drop`] does it for a
-    /// `VecDeque<f32>` ring). Zero means discard hard — either nothing is being dropped, or the
-    /// ring blew the hard cap and is already a discontinuity.
+    /// Interleaved samples of linear crossfade to apply across the seam left by `drop_front`
+    /// ([`crossfade_drop`] does it for a `VecDeque<f32>` ring). Zero only when nothing is dropped.
+    ///
+    /// BOTH kinds of drop are faded. The hard-cap trim used to splice raw, on the reasoning that a
+    /// ring which blew its ceiling "is already a discontinuity" — but that is a statement about the
+    /// ARRIVALS, not about the samples either side of the seam, which are ordinary continuous
+    /// audio. It is also the drop that actually fires in the field: a bunching Wi-Fi link trimmed
+    /// 120 times in 10 simulated minutes where the smooth shed fired for drift a handful of times.
+    /// The gentle path that almost never runs was the one being faded.
     pub crossfade: usize,
+    /// `drop_front` was the hard-cap backstop (a burst blew the ceiling) rather than the smooth
+    /// drift shed. Both fade now, so the fade length no longer distinguishes them — and the two
+    /// mean very different things to anyone reading logs or a test: sheds are the policy working,
+    /// trims are the link outrunning the headroom.
+    pub hard_trim: bool,
     /// Emit silence this callback: still priming, or re-priming after a sustained drain.
     pub silence: bool,
 }
@@ -515,6 +544,19 @@ const SHRINK_PROBE_MS: u32 = 5_000;
 /// consecutive-empties hysteresis alone converges to. A full ring's underrun (one packet a few
 /// ms late) is nowhere near hollow and keeps the hysteresis.
 const DEPRIME_DEBT_MS: u32 = GROW_STEP_MS;
+/// Floor, in callbacks, under `JitterTuning::deprime_ms`: however short the starvation window works
+/// out to in time, a de-prime always needs at least this many consecutive short reads. A device
+/// with a quantum at or above `deprime_ms` would otherwise de-prime on the FIRST short read —
+/// exactly the "a single transient drain manufactures a whole target of fresh silence" defect the
+/// hysteresis exists to prevent, reintroduced at the other end of the quantum range.
+///
+/// Deliberately NOT `pub`: it is an internal detail of the policy, and cbindgen exports every
+/// public const into the C header, where this one would land unprefixed next to
+/// `PUNKTFUNK_AUDIO_*` and pollute every embedder's macro namespace.
+const MIN_DEPRIME_CALLBACKS: u32 = 2;
+// A de-prime on the FIRST short read is the defect the hysteresis exists to prevent, so hold the
+// floor at build time rather than in a test: tuning it to 1 should not compile.
+const _: () = assert!(MIN_DEPRIME_CALLBACKS >= 2);
 /// How long a failed probe keeps the sync loop from driving another shrink. Without this the
 /// loop pays an audible starvation event every [`SHRINK_QUIET_SYNC_MS`] on any link whose jitter
 /// genuinely needs the depth — sync asks for less, the ring shrinks, the link answers, the ring
@@ -545,8 +587,12 @@ pub struct JitterPolicy {
     /// The live target, in interleaved samples — `base_target_ms` grown by underrun pressure.
     target: usize,
     primed: bool,
-    /// Consecutive short reads (de-prime hysteresis).
+    /// Consecutive short reads, and the audio they starved for in interleaved samples. BOTH gate
+    /// the de-prime: the run must be at least [`JitterTuning::deprime_ms`] long AND at least
+    /// [`MIN_DEPRIME_CALLBACKS`] callbacks, so the hysteresis means the same span of time whatever
+    /// the device's quantum, without collapsing to a hair trigger on a large-quantum device.
     empties: u32,
+    empties_run: usize,
     /// EWMA of ring depth, interleaved samples.
     depth_avg: f32,
     /// Consumed samples for which the EWMA has stayed above the shed threshold.
@@ -594,6 +640,7 @@ impl JitterPolicy {
             target: tuning.base_target_ms as usize * per_ms,
             primed: false,
             empties: 0,
+            empties_run: 0,
             depth_avg: 0.0,
             over_run: 0,
             underruns: 0,
@@ -693,9 +740,14 @@ impl JitterPolicy {
 
         let mut out = JitterStep::default();
         if depth > cap {
-            // Blew the ceiling: a burst arrived, or we were wedged. Already a discontinuity —
-            // discard hard, and reset the drift timer so the trim isn't double-counted as drift.
+            // Blew the ceiling: a burst arrived, or we were wedged. Discard down to the cap and
+            // reset the drift timer so the trim isn't double-counted as drift. Faded like any
+            // other drop — see `JitterStep::crossfade` for why this used to splice raw and why
+            // that was backwards.
             out.drop_front = depth - cap;
+            out.hard_trim = true;
+            out.crossfade = (SHED_CROSSFADE_MS as usize * self.per_ms)
+                .min(depth.saturating_sub(out.drop_front));
             self.over_run = 0;
         } else if self.depth_avg
             > (target + self.tuning.shed_excess_ms() as usize * self.per_ms) as f32
@@ -717,6 +769,7 @@ impl JitterPolicy {
         if !self.primed && depth.saturating_sub(out.drop_front) >= target {
             self.primed = true;
             self.empties = 0;
+            self.empties_run = 0;
             // The refill just banked this much: seed the average with it rather than letting it
             // climb from wherever the drought left it — a freshly-primed ring would otherwise
             // read as hollow for the EWMA's whole settling time, and the FIRST late packet
@@ -784,14 +837,22 @@ impl JitterPolicy {
         if ran_short {
             self.quiet_run = 0;
             self.empties += 1;
-            if self.empties >= self.tuning.deprime_after || self.hollow {
-                // The consecutive-empties hysteresis protects a FULL ring from one late packet.
-                // A hollow ring is the opposite case: the target has been raised but the depth
-                // never re-banked (growth is a promise; only a re-prime cashes it), and riding
-                // that out is a click per bunching period, forever. The click just heard has
-                // already paid for the refill — take it now.
+            self.empties_run += want;
+            // Starved for `deprime_ms` of audio, over at least MIN_DEPRIME_CALLBACKS callbacks.
+            // Both, because either alone is wrong at one end of the quantum range: time alone is a
+            // hair trigger on a device whose single quantum already exceeds the window, and a
+            // callback count alone is the platform-dependent fuse this replaced.
+            let starved = self.empties_run >= self.tuning.deprime_ms as usize * self.per_ms
+                && self.empties >= MIN_DEPRIME_CALLBACKS;
+            if starved || self.hollow {
+                // The starvation hysteresis protects a FULL ring from one late packet. A hollow
+                // ring is the opposite case: the target has been raised but the depth never
+                // re-banked (growth is a promise; only a re-prime cashes it), and riding that out
+                // is a click per bunching period, forever. The click just heard has already paid
+                // for the refill — take it now.
                 self.primed = false;
                 self.empties = 0;
+                self.empties_run = 0;
             }
             if !restored {
                 self.underruns += 1;
@@ -814,6 +875,7 @@ impl JitterPolicy {
             // the path above takes over. A near-miss is pressure, not quiet.
             self.quiet_run = 0;
             self.empties = 0;
+            self.empties_run = 0;
             if !self.near_miss_grown && !restored {
                 self.near_miss_grown = true;
                 let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
@@ -821,6 +883,7 @@ impl JitterPolicy {
             }
         } else {
             self.empties = 0;
+            self.empties_run = 0;
             self.quiet_run += want;
             // A grown target normally relaxes only after a long quiet spell, because without other
             // evidence the only thing that can justify giving up hard-won slack is time. When the
@@ -862,9 +925,10 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 /// `fade` samples so a drift correction is inaudible rather than a click.
 ///
 /// The dropped region's tail fades out while the surviving head fades in, so the waveform is
-/// continuous across the splice. `fade == 0` discards hard (what a hard-cap trim wants — that
-/// backlog is already a discontinuity). Shared by the three `VecDeque<f32>` rings; the Apple ring
-/// is index-based and mirrors this in Swift.
+/// continuous across the splice. `fade == 0` discards hard; no caller in the policy asks for that
+/// any more (see [`JitterStep::crossfade`]), but it stays honoured for callers that splice at a
+/// point they know is already discontinuous. Shared by the three `VecDeque<f32>` rings; the Apple
+/// ring is index-based and mirrors this in Swift.
 pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, fade: usize) {
     if drop == 0 || ring.len() < drop {
         return;
@@ -876,17 +940,19 @@ pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, f
     }
     // The last `fade` samples of what we are about to discard are the fade-OUT source; they blend
     // into the first `fade` samples of what survives.
-    let mut faded = Vec::with_capacity(fade);
+    //
+    // Blended in place and BEFORE the drain, with no scratch buffer: a value written at `drop + i`
+    // can never be read again as a fade-OUT source, because those sources are `drop - fade + j` for
+    // `j < fade`, i.e. strictly below `drop`. One ascending pass is therefore safe — and this runs
+    // inside realtime audio callbacks, where the `Vec` this used to allocate had no business being.
+    // It now runs on every hard-cap trim too, which is the common case on a bunching link.
     for i in 0..fade {
         let old = ring[drop - fade + i];
         let new = ring[drop + i];
         let t = (i + 1) as f32 / (fade + 1) as f32;
-        faded.push(old * (1.0 - t) + new * t);
+        ring[drop + i] = old * (1.0 - t) + new * t;
     }
     ring.drain(..drop);
-    for (i, v) in faded.into_iter().enumerate() {
-        ring[i] = v;
-    }
 }
 
 // ---- per-platform channel-layout helpers (pure data; no platform deps) --------------------
@@ -1460,11 +1526,17 @@ mod tests {
 
             let s = p.step(depth, want);
             if s.drop_front > 0 {
-                if s.crossfade > 0 {
-                    out.soft_sheds += 1;
-                } else {
+                // Told apart by `hard_trim`, not by the fade length — both kinds fade now.
+                if s.hard_trim {
                     out.hard_trims += 1;
+                } else {
+                    out.soft_sheds += 1;
                 }
+                assert!(
+                    s.crossfade > 0,
+                    "every drop must be faded: dropped {} with no crossfade",
+                    s.drop_front
+                );
                 depth -= s.drop_front.min(depth);
             }
             if s.silence {
@@ -1508,7 +1580,22 @@ mod tests {
                 "{name}: the headroom band is cut short by the hard cap"
             );
             assert!(t.max_target_ms >= t.base_target_ms, "{name}");
-            assert!(t.deprime_after >= 2, "{name}: needs real hysteresis");
+            // Real hysteresis, in time: a drought has to outlast several protocol frames before
+            // the ring gives up, or one late packet manufactures a whole target of fresh silence.
+            assert!(
+                t.deprime_ms >= 4 * FRAME_MS,
+                "{name}: de-primes after {} ms — a single late packet would trip it",
+                t.deprime_ms
+            );
+            // ...and never longer than the deepest buffer this preset would ever hold: past that
+            // point the drought has already cost more than the re-prime it is trying to avoid, and
+            // every callback in between is dribbling partial reads at the listener.
+            assert!(
+                t.deprime_ms <= t.max_target_ms,
+                "{name}: waits {} ms to de-prime but never buffers more than {} ms",
+                t.deprime_ms,
+                t.max_target_ms
+            );
         }
     }
 
@@ -1619,7 +1706,20 @@ mod tests {
             s.drop_front > 0,
             "a 500 ms backlog must be trimmed on the spot"
         );
-        assert_eq!(s.crossfade, 0, "a blown cap is already a discontinuity");
+        assert!(s.hard_trim, "a cap trim must announce itself as one");
+        // ...and it is FADED. This used to assert the opposite ("a blown cap is already a
+        // discontinuity"), which confused the arrivals with the audio: the samples either side of
+        // the splice are ordinary continuous sound, and a raw seam through them is a click. It is
+        // also the drop that actually fires in the field — a bunching Wi-Fi link trims far more
+        // often than drift sheds — so the one path that was left unfaded was the audible one.
+        assert!(
+            s.crossfade > 0,
+            "a cap trim splices real audio and must be faded"
+        );
+        assert!(
+            s.crossfade <= s.drop_front,
+            "the fade cannot outrun what is being dropped"
+        );
         let left = 500 * pm - s.drop_front;
         assert!(
             left <= JitterTuning::AAUDIO.hard_cap_ms as usize * pm,
@@ -1647,10 +1747,44 @@ mod tests {
         assert!(p.is_primed());
         p.note_read(true); // one short read
         assert!(p.is_primed(), "a single short read must not de-prime");
-        for _ in 1..JitterTuning::PIPEWIRE.deprime_after {
+        let deprime = JitterTuning::PIPEWIRE.deprime_ms as usize;
+        for _ in 1..(deprime / 5) {
             p.note_read(true);
         }
         assert!(!p.is_primed(), "a sustained drain must re-prime");
+    }
+
+    /// THE regression this replaced a callback count for: the de-prime fuse must be the same
+    /// SPAN OF TIME whatever the device's IO quantum. As a count it was not — the same `4` was
+    /// ~40 ms on a 10 ms WASAPI quantum and 20 ms on iOS, whose session asks for a 5 ms IO buffer.
+    /// A Wi-Fi delivery stall therefore de-primed the Apple ring on every bunching cycle while the
+    /// identical policy rode it out everywhere else. Plant the defect by restoring a fixed count
+    /// and the two quanta below stop agreeing.
+    #[test]
+    fn deprime_fuse_is_a_duration_not_a_callback_count() {
+        for quantum_ms in [5usize, 8, 10, 16, 21] {
+            let t = JitterTuning::COREAUDIO;
+            let pm = per_ms(2);
+            let want = quantum_ms * pm;
+            let mut p = JitterPolicy::new(t, 2);
+            // Prime well above target so the hysteresis path is what we measure, not `hollow`.
+            assert!(!p.step(80 * pm, want).silence);
+            assert!(p.is_primed());
+            let mut starved_ms = 0;
+            while p.is_primed() && starved_ms < 10 * t.deprime_ms as usize {
+                p.note_read(true);
+                starved_ms += quantum_ms;
+            }
+            assert!(!p.is_primed(), "q={quantum_ms}ms: never de-primed at all");
+            // One quantum of granularity either side — the fuse can only be checked per callback.
+            let floor = (t.deprime_ms as usize).min(quantum_ms * MIN_DEPRIME_CALLBACKS as usize);
+            assert!(
+                starved_ms >= floor && starved_ms < t.deprime_ms as usize + quantum_ms,
+                "q={quantum_ms}ms de-primed after {starved_ms} ms, not ~{} ms — the fuse is still \
+                 scaling with the quantum",
+                t.deprime_ms
+            );
+        }
     }
 
     /// A device that pulls a big quantum cannot sustain a target below it: the effective target
