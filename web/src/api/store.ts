@@ -108,6 +108,74 @@ export interface InstalledPlugin {
 	blocked?: string;
 }
 
+/** An installed plugin paired with the catalog entry an update would install. */
+export interface PendingUpdate {
+	plugin: InstalledPlugin;
+	entry: StoreEntry;
+}
+
+/** What "Update all" would do: the run, and what it deliberately left out of it. */
+export interface UpdatePlan {
+	/** Ready to install, in the order the run will work through them. */
+	updates: PendingUpdate[];
+	/** Display names of plugins offering an update this host cannot take right now. */
+	skipped: string[];
+}
+
+/**
+ * The catalog entry an installed plugin updates FROM.
+ *
+ * Resolve by the entry the plugin was actually installed from (source + entry id) before falling
+ * back to the package name: two sources may carry the same `pkg`, and matching on the name alone
+ * could offer a row badged "verified" an entry from somebody else's source at a different version.
+ */
+export function catalogEntryFor(
+	plugin: InstalledPlugin,
+	entries: StoreEntry[] | undefined,
+): StoreEntry | undefined {
+	const list = entries ?? [];
+	return (
+		(plugin.source && plugin.entry_id
+			? list.find((e) => e.source === plugin.source && e.id === plugin.entry_id)
+			: undefined) ??
+		(plugin.source
+			? list.find((e) => e.source === plugin.source && e.pkg === plugin.pkg)
+			: undefined) ??
+		list.find((e) => e.pkg === plugin.pkg)
+	);
+}
+
+/**
+ * Everything an "Update all" run would install, in the installed list's own order — so the run
+ * follows the rows on screen rather than some order of its own.
+ *
+ * Two things are dropped rather than attempted, and both are reported instead of hidden: an update
+ * with no catalog entry to install (the same dead end a single row's button reports on click), and
+ * an entry this host will refuse — incompatible ones are a `400` from `POST /store/install`, and a
+ * blocked one is what Browse already greys its Install button out for. Either would end the run on
+ * a failure card that says nothing about the updates still queued behind it, so they never enter
+ * the queue in the first place.
+ *
+ * `plugin.blocked` is NOT a reason to skip: that advisory is against the version installed right
+ * now, and updating away from it is the fix, not the risk.
+ */
+export function planUpdates(
+	installed: InstalledPlugin[] | undefined,
+	entries: StoreEntry[] | undefined,
+): UpdatePlan {
+	const plan: UpdatePlan = { updates: [], skipped: [] };
+	for (const plugin of installed ?? []) {
+		if (plugin.update_available === undefined) continue;
+		const entry = catalogEntryFor(plugin, entries);
+		if (entry?.compatible && entry.blocked === undefined) {
+			plan.updates.push({ plugin, entry });
+		} else {
+			plan.skipped.push(plugin.title ?? plugin.pkg);
+		}
+	}
+	return plan;
+}
+
 export type JobKind = "install" | "uninstall";
 export type JobState = "running" | "done" | "failed";
 

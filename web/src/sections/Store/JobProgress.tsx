@@ -27,6 +27,13 @@ const phaseLabel = (phase: string): string => PHASES[phase]?.() ?? phase;
 /** Keep the tail — an install log can run long and only the end is ever interesting. */
 const LOG_TAIL = 200;
 
+/** Where a job sits in an "Update all" run. Absent for a job the operator started on its own. */
+export interface BatchStep {
+	/** 1-based, so it reads the way it is written: "Update 2 of 5". */
+	index: number;
+	total: number;
+}
+
 /**
  * Container: the in-flight install/uninstall. Polls the job once a second while it runs (the query
  * stops polling itself once the job settles), and refreshes everything the job touched — catalog,
@@ -35,24 +42,39 @@ const LOG_TAIL = 200;
 export const JobProgressSection: FC<{
 	jobId: string;
 	onDismiss: () => void;
-}> = ({ jobId, onDismiss }) => {
+	/**
+	 * Called once, with the final job, when it reaches `done` or `failed` — how an Update-all run
+	 * learns it may start the next install. The host takes one package operation at a time, so the
+	 * run has to be driven by this rather than by a timer.
+	 */
+	onSettled?: (job: StoreJob) => void;
+	step?: BatchStep;
+}> = ({ jobId, onDismiss, onSettled, step }) => {
 	const qc = useQueryClient();
 	const job = useStoreJob(jobId);
-	const settled = job.data?.state === "done" || job.data?.state === "failed";
-	// Refresh once per job, not on every re-render while the finished card sits there.
+	const final =
+		job.data?.state === "done" || job.data?.state === "failed"
+			? job.data
+			: undefined;
+	// Refresh once per job, not on every re-render while the finished card sits there. The settle
+	// handler starts the next install of a run, so riding the same guard is what keeps a run from
+	// double-stepping when a later poll re-renders this with the same finished job.
 	const refreshed = useRef<string | null>(null);
 
 	useEffect(() => {
-		if (!settled || refreshed.current === jobId) return;
+		if (!final || refreshed.current === jobId) return;
 		refreshed.current = jobId;
 		invalidateStore(qc);
-	}, [settled, jobId, qc]);
+		onSettled?.(final);
+	}, [final, jobId, qc, onSettled]);
 
 	// A job the host can no longer tell us about — it restarted, and jobs live in memory. This used
 	// to render `null`, so the card simply vanished while the Install buttons stayed armed and the
 	// query kept polling a dead id once a second forever. Say what happened and offer the way out.
 	if (!job.data) {
-		if (!job.isError) return null;
+		// Mid-run, "no data yet" is just the first poll of the install we only now started, and
+		// rendering nothing would blink the run's progress off the page between every package.
+		if (!job.isError) return step ? <BatchPendingCard step={step} /> : null;
 		return (
 			<Card className="ring-2 ring-destructive/60">
 				<CardContent className="flex items-start gap-3">
@@ -75,14 +97,36 @@ export const JobProgressSection: FC<{
 			</Card>
 		);
 	}
-	return <JobProgressCard job={job.data} onDismiss={onDismiss} />;
+	return <JobProgressCard job={job.data} onDismiss={onDismiss} step={step} />;
 };
+
+/**
+ * The gap between two installs of a run: the last one finished, the next has not been accepted yet.
+ *
+ * It exists so the run never appears to stop. Without it the card unmounts the moment the finished
+ * job is let go and comes back a request later, which reads as "it gave up" precisely when the
+ * operator is watching to see that it hasn't.
+ */
+export const BatchPendingCard: FC<{ step: BatchStep }> = ({ step }) => (
+	<Card aria-live="polite">
+		<CardContent className="flex items-start gap-3">
+			<Spinner className="mt-0.5 size-5 shrink-0" />
+			<div className="min-w-0 flex-1">
+				<p className="text-sm font-medium">{m.store_update_all_running()}</p>
+				<p className="text-sm text-muted-foreground">
+					{m.store_update_all_step({ index: step.index, total: step.total })}
+				</p>
+			</div>
+		</CardContent>
+	</Card>
+);
 
 /** The progress card: phase (or outcome), a collapsible log tail, and the failure reason if any. */
 export const JobProgressCard: FC<{
 	job: StoreJob;
 	onDismiss: () => void;
-}> = ({ job, onDismiss }) => {
+	step?: BatchStep;
+}> = ({ job, onDismiss, step }) => {
 	const running = job.state === "running";
 	const failed = job.state === "failed";
 	const log = job.log.slice(-LOG_TAIL);
@@ -107,6 +151,16 @@ export const JobProgressCard: FC<{
 								? m.store_job_uninstall({ target: job.target })
 								: m.store_job_install({ target: job.target })}
 						</p>
+						{/* Which package is being installed answers "what is happening"; the step answers
+						    "how much longer", which is the only question a multi-package run adds. */}
+						{step && (
+							<p className="text-xs text-muted-foreground">
+								{m.store_update_all_step({
+									index: step.index,
+									total: step.total,
+								})}
+							</p>
+						)}
 						<p className="text-sm text-muted-foreground">
 							{running
 								? phaseLabel(job.phase)
