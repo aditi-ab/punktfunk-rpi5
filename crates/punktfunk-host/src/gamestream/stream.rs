@@ -1095,10 +1095,31 @@ fn stream_body(
     // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
     if frame.width != cfg.width || frame.height != cfg.height {
+        // Deliberately NOT fatal, and deliberately not "resize the output" (which read as an
+        // instruction nothing was carrying out). A mismatch has two very different causes and only
+        // one of them is a fault:
+        //
+        //   * Mirroring a pinned monitor — EXPECTED. §7.3: a panel runs at the mode its owner set
+        //     and the client scales, so `open_gs_mirror_source` passes the client's mode purely to
+        //     keep the argument honest and the backend ignores it. Failing here would break every
+        //     mirror session.
+        //   * A virtual display — a FAULT. That output was created at the client's negotiated size
+        //     precisely so this can't happen, so a mismatch means the backend did not build what it
+        //     was asked for. The KWin backend now reads its output back and re-asserts the mode, so
+        //     look for its `KWin built our virtual output at a DIFFERENT size` / `would not
+        //     re-assert` lines just above this one — they carry the cause and the remedy.
+        //
+        // What the client does with it is the part worth stating plainly: the encoder opens at the
+        // CAPTURED size below, so Moonlight receives a bitstream that disagrees with the resolution
+        // it configured its decoder from. Tolerant decoders re-init off the SPS and scale; strict
+        // ones (Media Foundation on Xbox) may instead produce nothing and ask for a keyframe every
+        // ~50 ms until the client gives up and drops the session.
         tracing::warn!(
             captured = ?(frame.width, frame.height),
             negotiated = ?(cfg.width, cfg.height),
-            "captured size != negotiated size — Moonlight expects the negotiated size; resize the output"
+            "captured size != negotiated size — the client decodes a stream that disagrees with \
+             what it negotiated (expected when mirroring a monitor; a virtual-display backend fault \
+             otherwise — see the vdisplay lines above)"
         );
     }
     let mut enc = encode::open_video(

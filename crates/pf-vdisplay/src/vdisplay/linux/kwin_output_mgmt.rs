@@ -1030,6 +1030,44 @@ pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32)
     }
 }
 
+/// The size + scale our just-created virtual output ACTUALLY landed at, read only.
+///
+/// [`resolve_ours`] keys on the size we asked KWin for, which answers "is our output there?" but
+/// can never answer "did KWin give us what we asked for?" — a miss is indistinguishable from an
+/// output that simply hasn't appeared. That gap is not theoretical: KWin restores per-output config
+/// (mode AND scale) from `kwinoutputconfig.json` keyed by output NAME, and ours is deliberately
+/// stable across sessions (see the note on [`is_mirroring`]), so a stored 1080p mode left by an
+/// earlier session is re-applied on top of the 4K we just requested. Every dims-keyed caller then
+/// silently misses — topology, de-mirror, position — and the capture pipeline builds at a size the
+/// client never negotiated.
+///
+/// Resolution is by NAME ALONE, so it deliberately declines (`None`) unless EXACTLY ONE output
+/// carries our prefix. Two matches means a supersede is in flight, and the dims filter is the only
+/// thing that can tell the replacement from the predecessor it reuses the name of — picking wrong
+/// here would hand the caller the doomed output's size and, worse, invite it to reconfigure the
+/// output that is about to disappear. Failing closed leaves today's behaviour untouched; the
+/// verification is an addition, never a new way to get it wrong. (A prefix that is also a prefix of
+/// a sibling slot's name — `-7` vs `-70` — reads as ambiguous and declines for the same reason.)
+///
+/// Returns `(width, height, refresh_mHz, scale)`. Scale is reported for the log rather than acted
+/// on: KWin's output screencast streams the source's PIXEL size, so a restored scale shifts the
+/// desktop's logical layout without changing what we capture — but it is the other half of the
+/// stored config, and naming it in the log is what turns "why is this 1080p" into one glance.
+pub(crate) fn actual_dims(our_prefix: &str) -> Option<(u32, u32, u32, f64)> {
+    let sess = Session::open("verify_dims").ok()?;
+    let mut matches = sess.state.devices.values().filter(|d| {
+        // `seen_done`: a device mid-announce has no coherent current_mode to read, and reading one
+        // anyway is how you get a "KWin gave us 0x0" correction that stomps a healthy output.
+        d.seen_done && d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
+    });
+    let ours = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let (w, h, mhz) = sess.current_dims(ours)?;
+    Some((w, h, mhz, ours.scale.filter(|s| *s > 0.0).unwrap_or(1.0)))
+}
+
 /// Install + select a `want_w`×`want_h`@`want_hz` custom mode on the just-created virtual output
 /// (name starts with `our_prefix`, currently at its sacrificial birth size `birth_w`×`birth_h`) —
 /// entirely over `kde_output_management_v2`, the in-process replacement for the `kscreen-doctor`
