@@ -12,6 +12,48 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.28.1 — in development
+
+### NixOS — the plugin runner was installed, running, and reported missing
+
+🛑 **On NixOS every plugin *package* op failed with "the plugin runner isn't installed", on a box
+where the runner was installed, enabled and running.** `punktfunk-host plugins status` said so, and
+the console's Plugins screen still refused to install anything.
+
+The host resolved `punktfunk-scripting` by checking FHS locations exclusively —
+`/usr/bin/punktfunk-scripting`, the `/usr/lib` + `/usr/share` pair behind it, and the `~/.local`
+mirror the SteamOS installer lays down. Nix installs a wrapper at `$out/bin/punktfunk-scripting` in
+a **derivation of its own**, so it is neither beside the host binary nor anywhere under `/usr`, and
+nothing the resolver looked at could ever match. Service ops (`enable`/`disable`/`status`) go
+through systemd and were unaffected, which is what made the failure read as arbitrary: the runner
+demonstrably worked, and only the half that had to *locate the executable* was blind.
+
+Resolution now matches `punktfunk-encode-worker`'s: **`PUNKTFUNK_SCRIPTING` → beside the host
+binary → `PATH` → the `/usr` layout → the `~/.local` layout.** `PATH` is the rung Nix lands on. The
+`/usr` rungs are kept after it rather than dropped, because a systemd unit's `PATH` need not include
+`/usr/bin`. As with the encode worker, an explicit `PUNKTFUNK_SCRIPTING` is deliberately *not*
+existence-checked — a named path that is wrong should fail naming itself, not fall through to some
+other runner. The "not installed" text now also names NixOS and the override, instead of pointing
+every operator at `apt`.
+
+⚠ **Packager-visible, and the other half of the fix:** the NixOS module now puts
+`services.punktfunk.scripting.package` on the **host unit's** `path`. `environment.systemPackages`
+only ever covered an operator's interactive shell, and the console installs plugins from *inside*
+the host service — whose `PATH` is exactly that unit list. Without it the CLI would have been fixed
+and the console would not. Anyone packaging the host separately wants the same property: the runner
+must be on the service's `PATH`, or `PUNKTFUNK_SCRIPTING` set for it.
+
+The `ln -s "$(command -v punktfunk-scripting)" ~/.local/bin/punktfunk-scripting` workaround is no
+longer needed and can be removed.
+
+### `/bin/true` and `/bin/false` are not portable — two tests failed on NixOS
+
+NixOS ships only `sh` in `/bin`, so `gamelease`'s hand-off test and `pyrowave_remote`'s
+handshake-rung test failed there for reasons unrelated to the code under test. Both now resolve a
+real binary rather than assuming an FHS path.
+
+---
+
 ## v0.28.0
 
 180 commits since v0.27.0.
@@ -305,38 +347,6 @@ availability probe. The `comm` fast path is still one read for every ordinary di
 
 Also reached by the same rung: `gamescope` carries `cap_sys_nice` on a number of distros, so a
 *wrapped and capped* gamescope was equally invisible to the foreign-gamescope probe.
-
-### NixOS — the plugin runner was installed, running, and reported missing
-
-🛑 **On NixOS every plugin *package* op failed with "the plugin runner isn't installed", on a box
-where the runner was installed, enabled and running.** `punktfunk-host plugins status` said so, and
-the console's Plugins screen still refused to install anything.
-
-The host resolved `punktfunk-scripting` by checking FHS locations exclusively —
-`/usr/bin/punktfunk-scripting`, the `/usr/lib` + `/usr/share` pair behind it, and the `~/.local`
-mirror the SteamOS installer lays down. Nix installs a wrapper at `$out/bin/punktfunk-scripting` in
-a **derivation of its own**, so it is neither beside the host binary nor anywhere under `/usr`, and
-nothing the resolver looked at could ever match. Service ops (`enable`/`disable`/`status`) go
-through systemd and were unaffected, which is what made the failure read as arbitrary: the runner
-demonstrably worked, and only the half that had to *locate the executable* was blind.
-
-Resolution now matches `punktfunk-encode-worker`'s: **`PUNKTFUNK_SCRIPTING` → beside the host
-binary → `PATH` → the `/usr` layout → the `~/.local` layout.** `PATH` is the rung Nix lands on. The
-`/usr` rungs are kept after it rather than dropped, because a systemd unit's `PATH` need not include
-`/usr/bin`. As with the encode worker, an explicit `PUNKTFUNK_SCRIPTING` is deliberately *not*
-existence-checked — a named path that is wrong should fail naming itself, not fall through to some
-other runner. The "not installed" text now also names NixOS and the override, instead of pointing
-every operator at `apt`.
-
-⚠ **Packager-visible, and the other half of the fix:** the NixOS module now puts
-`services.punktfunk.scripting.package` on the **host unit's** `path`. `environment.systemPackages`
-only ever covered an operator's interactive shell, and the console installs plugins from *inside*
-the host service — whose `PATH` is exactly that unit list. Without it the CLI would have been fixed
-and the console would not. Anyone packaging the host separately wants the same property: the runner
-must be on the service's `PATH`, or `PUNKTFUNK_SCRIPTING` set for it.
-
-The `ln -s "$(command -v punktfunk-scripting)" ~/.local/bin/punktfunk-scripting` workaround is no
-longer needed and can be removed.
 
 ### Game Mode on Nobara — the WSI opt-out never reached the games
 
