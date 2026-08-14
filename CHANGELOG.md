@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1
 
-50 commits since v0.28.0.
+60 commits since v0.28.0.
 
 A patch release in the strict sense: **nothing on the wire, in the C ABI, in the driver protocol or
 in the plugin contract moves.** Every host, client, driver and plugin built against v0.28.0 keeps
