@@ -37,9 +37,17 @@ export const PendingDevicesSection: FC = () => {
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
-	const onApprove = async (id: number, currentName: string) => {
+	// The dialog names the device it is about — the field is pre-filled with the same string, but a
+	// pre-filled field is editable text, not a statement of WHICH knock this is. With two devices
+	// waiting the operator would otherwise be approving whichever row they hope they clicked, so the
+	// fingerprint rides along: it is the only thing that stays unique when two devices share a name.
+	const onApprove = async (id: number, currentName: string, fingerprint: string) => {
 		const name = await promptText({
 			title: m.pairing_pending_name_title(),
+			description: m.pairing_pending_name_desc({
+				name: currentName,
+				fp: `${fingerprint.slice(0, 16)}…`,
+			}),
 			label: m.pairing_pending_name_prompt(),
 			defaultValue: currentName,
 			confirmLabel: m.pairing_pending_approve(),
@@ -75,7 +83,7 @@ export const PendingDevicesSection: FC = () => {
  */
 export const PendingDevices: FC<{
 	pending: Loadable<PendingDevice[]>;
-	onApprove: (id: number, currentName: string) => void;
+	onApprove: (id: number, currentName: string, fingerprint: string) => void;
 	onDeny: (id: number) => void;
 	/** Id of the row whose approve/deny is in flight, or null — only that row disables. */
 	pendingId: number | null;
@@ -136,7 +144,7 @@ export const PendingDevices: FC<{
 											<Button
 												size="sm"
 												disabled={pendingId === p.id}
-												onClick={() => onApprove(p.id, p.name)}
+												onClick={() => onApprove(p.id, p.name, p.fingerprint)}
 											>
 												{m.pairing_pending_approve()}
 											</Button>

@@ -604,6 +604,7 @@ public final class PunktfunkConnection {
         preferredCodec: UInt8 = 0, // 0 = auto; else PUNKTFUNK_CODEC_* soft preference
         clientCaps: UInt8 = 0, // ABI v11: PUNKTFUNK_CLIENT_CAP_CURSOR = render the host cursor locally
         launchID: String? = nil,
+        deviceName: String? = nil, // nil = this device's OS name (`DeviceName.current`)
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
@@ -616,25 +617,33 @@ public final class PunktfunkConnection {
         // host upgrades to a 10-bit / BT.2020 PQ stream only when set. 0 = 8-bit BT.709 SDR.
         // `launchID` (a host library id like "steam:570") asks the host to launch that title in
         // the session; the host resolves it against its own library — nil = the host's default.
+        // `label` is what an unpaired knock shows up as in the host's approval list (and the web
+        // console's outstanding-pairings view): this device's OS name unless the caller overrode
+        // it. Without it the core falls back to environment variables no Apple app has, and every
+        // device pending approval reads "This device".
+        let override = deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let label = override.isEmpty ? DeviceName.current : override
         handle = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
-                        if let pin = pinSHA256 {
-                            return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex9(
-                                    cs, port, width, height, refreshHz, compositor.rawValue,
-                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                                    videoCodecs, preferredCodec, clientCaps, launch,
-                                    p.bindMemory(to: UInt8.self).baseAddress, &observed,
-                                    cert, key, timeoutMs, &connectStatus)
+                        label.withCString { name in
+                            if let pin = pinSHA256 {
+                                return pin.withUnsafeBytes { p in
+                                    punktfunk_connect_ex10(
+                                        cs, port, width, height, refreshHz, compositor.rawValue,
+                                        gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                                        videoCodecs, preferredCodec, clientCaps, launch,
+                                        p.bindMemory(to: UInt8.self).baseAddress, &observed,
+                                        cert, key, name, timeoutMs, &connectStatus)
+                                }
                             }
+                            return punktfunk_connect_ex10(
+                                cs, port, width, height, refreshHz, compositor.rawValue,
+                                gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                                videoCodecs, preferredCodec, clientCaps, launch,
+                                nil, &observed, cert, key, name, timeoutMs, &connectStatus)
                         }
-                        return punktfunk_connect_ex9(
-                            cs, port, width, height, refreshHz, compositor.rawValue,
-                            gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                            videoCodecs, preferredCodec, clientCaps, launch,
-                            nil, &observed, cert, key, timeoutMs, &connectStatus)
                     }
                 }
             }

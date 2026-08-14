@@ -276,6 +276,7 @@
 	"pairing_pending_deny": "Deny",
 	"pairing_pending_name_prompt": "Name this device",
 	"pairing_pending_name_title": "Approve this device",
+	"pairing_pending_name_desc": "{name} — fingerprint {fp}. It is stored under the name you leave here.",
 	"pairing_pending_age_just_now": "just now",
 	"pairing_pending_age_secs": "{s}s ago",
 	"pairing_pending_age_mins": "{min} min ago",

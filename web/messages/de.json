@@ -276,6 +276,7 @@
 	"pairing_pending_deny": "Ablehnen",
 	"pairing_pending_name_prompt": "Gerät benennen",
 	"pairing_pending_name_title": "Dieses Gerät zulassen",
+	"pairing_pending_name_desc": "{name} — Fingerprint {fp}. Gespeichert wird der Name, der hier steht.",
 	"pairing_pending_age_just_now": "gerade eben",
 	"pairing_pending_age_secs": "vor {s}s",
 	"pairing_pending_age_mins": "vor {min} min",

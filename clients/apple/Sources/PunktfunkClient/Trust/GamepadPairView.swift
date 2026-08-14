@@ -48,11 +48,8 @@ struct GamepadPairView: View {
 
     @StateObject private var ceremony = PairCeremony()
     @State private var pin = ""
-    #if os(macOS)
-    @State private var clientName = Host.current().localizedName ?? "Mac"
-    #else
-    @State private var clientName = UIDevice.current.name
-    #endif
+    // Same source the connect path knocks with — see the note in `PairSheet`.
+    @State private var clientName = DeviceName.current
     @State private var focusID: String?
     /// The field row the keyboard tray is editing; nil ⇒ the row list owns the controller.
     @State private var editing: String?

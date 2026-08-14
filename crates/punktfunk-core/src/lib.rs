@@ -185,7 +185,17 @@ pub use stats::Stats;
 /// every existing function keeps its signature and behaviour, and an embedder that never calls it
 /// is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
 /// (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 20;
+/// v21: added `punktfunk_connect_ex10` — `connect_ex9` plus `device_name`, the label an unpaired
+/// client knocks with: what the host's pending-approval list (and the web console's
+/// outstanding-pairings view and approve dialog) shows, and the trust-store name on approval. The
+/// C ABI had no such parameter, so every embedder took [`client::device_name`]'s OS default —
+/// which resolves through `COMPUTERNAME`/`HOSTNAME`, neither of which exists in an Apple GUI
+/// process, leaving every Mac, iPad, iPhone and Apple TV knocking as the literal "This device"
+/// (a console with three of them pending showed three identical rows). A NEW symbol, not a
+/// widened one: `ex9` keeps its parameter list AND its behaviour — it passes a null name, which
+/// selects that same default. Additive and client-local: the name rides the `Hello::name` field
+/// hosts have read since the pending list existed, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 21;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
