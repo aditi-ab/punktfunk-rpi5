@@ -50,6 +50,7 @@ import coil.ImageLoader
 import coil.test.FakeImageLoaderEngine
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
+import io.unom.punktfunk.AddHostSheet
 import io.unom.punktfunk.ConsoleControllersScreen
 import io.unom.punktfunk.ConsoleHeader
 import io.unom.punktfunk.ConsoleLegendInset
@@ -567,6 +568,23 @@ internal fun ControllersScene() =
     Surface(color = MaterialTheme.colorScheme.background) {
         ControllersScreen(gamepadSetting = 0, onBack = {}, padsOverride = shotPads())
     }
+
+/**
+ * The "Add a host" bottom sheet over the host grid — the store's onboarding frame. State is
+ * hoisted in production (ConnectScreen), so the scene passes a filled-in form directly; the
+ * mode label mirrors what a paired 120 Hz phone shows on the connect button.
+ */
+@Composable
+internal fun AddHostScene() {
+    HostsScene()
+    AddHostSheet(
+        hostName = "Living Room PC", onHostNameChange = {},
+        host = "192.168.1.42", onHostChange = {},
+        port = "9777", onPortChange = {},
+        connecting = false, modeLabel = "2992×1344@120",
+        onDismiss = {}, onConnect = { _, _, _ -> },
+    )
+}
 
 /** The two pads the store listing names: DualSense (adaptive triggers, LEDs, rumble) and Xbox. */
 internal fun shotPads() = listOf(

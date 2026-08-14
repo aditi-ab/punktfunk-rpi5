@@ -46,7 +46,9 @@ class ScreenshotTest {
     private fun shootScreen(name: String, content: @androidx.compose.runtime.Composable () -> Unit) {
         compose.mainClock.autoAdvance = false
         compose.setContent { ShotTheme(content) }
-        compose.mainClock.advanceTimeBy(800)
+        // 1.6 s, not 0.8: a ModalBottomSheet's entrance spring is still mid-rise at 0.8 s and the
+        // add-host sheet's Connect button was captured half below the frame.
+        compose.mainClock.advanceTimeBy(1600)
         captureScreenRoboImage("$out/phone-$name.png")
     }
 
@@ -219,4 +221,13 @@ class ScreenshotTest {
         HostsScene()
         PairDialog()
     }
+
+    /**
+     * The add-host sheet (separate window → whole-screen capture). Pixel-like geometry, not the
+     * default 360×800dp: same 1080×2400 px, but at 420 dpi the extra dp headroom is what lets the
+     * sheet's Connect button — the row that carries the resolution promise — fit in frame.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w411dp-h915dp-420dpi")
+    fun addHost() = shootScreen("add-host") { AddHostScene() }
 }
