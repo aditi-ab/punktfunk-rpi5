@@ -231,6 +231,46 @@ object Gamepad {
     }
 
     /**
+     * The BTN_* bit for one key event from a SOURCE_GAMEPAD device — [buttonBit] plus the
+     * Select-family button of every pad that carries no `BUTTON_SELECT` scancode at all.
+     *
+     * Plenty of controllers deliver that button as the plain `KEYCODE_BACK` a remote's Back uses,
+     * with no `BUTTON_SELECT` behind it: it is the Android-TV shape, where every input device is
+     * expected to offer Back, and a pad reaches it whether the vendor prints "Back" on the button
+     * (NVIDIA's SHIELD controller) or "Select"/"View" (most pads in an Android mode). Which one is
+     * on the couch cannot be told from here, and does not need to be — the keycode is what routes.
+     *
+     * Read through [buttonBit] alone that button mapped to nothing, so it fell out of the
+     * streaming branch unconsumed and reached the activity's back stack, which is the
+     * deliberate-quit exit: ONE press of Select dropped the session and the host logged a client
+     * quit. `KEYCODE_BACK` is in fact the ONLY keycode that can get there from a pad — a mapped
+     * button is consumed here, anything with a VK is consumed on the keycode path, volume/power go
+     * to the system, and a FLAG_FALLBACK BACK is swallowed — which is what identifies this as the
+     * cause of such a report without knowing the hardware.
+     *
+     * It also meant such a pad could not produce [BTN_BACK] at all, so every shortcut built on
+     * Select — the emergency exit chord this client's own start banner advertises, the mic mute,
+     * the stats tier — was unreachable on exactly the devices whose users have no keyboard.
+     *
+     * A pad that DOES carry `BUTTON_SELECT` is unaffected in both directions: it never had the
+     * bug, and this changes nothing for it.
+     *
+     * FLAG_FALLBACK events are excluded: those are the synthetic BACK the framework raises after
+     * an unconsumed `BUTTON_*` press (a pad reporting L2/R2 as keys, say), not a button anyone
+     * touched, and forwarding one would put a phantom Select on the wire. `MainActivity` drops
+     * them on the keycode path for the same reason.
+     *
+     * Callers must gate on `SOURCE_GAMEPAD` before asking, exactly as [buttonBit]'s `KEYCODE_DPAD_*`
+     * rows require: a remote's or keyboard's BACK shares this keycode and has to keep leaving the
+     * stream — for a device with no pad on it, Back IS the documented way out.
+     */
+    fun padButtonBit(keyCode: Int, flags: Int): Int = when {
+        keyCode != KeyEvent.KEYCODE_BACK -> buttonBit(keyCode)
+        flags and KeyEvent.FLAG_FALLBACK != 0 -> 0
+        else -> BTN_BACK
+    }
+
+    /**
      * Maps one controller's joystick MotionEvents to axis (+ HAT→dpad) sends on wire pad index [pad],
      * **on change only**. Holds the previous axis/hat state so an unchanged frame emits nothing. One
      * instance per forwarded controller (owned by [GamepadRouter], which routes each device's events

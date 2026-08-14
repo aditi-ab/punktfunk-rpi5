@@ -526,10 +526,25 @@ class MainActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val handle = streamHandle
         if (handle != 0L) {
+            // A mouse's side buttons, when they arrive key-shaped, are X1/X2 — not navigation.
+            // Resolved before the gamepad and remote-pointer hooks so neither can claim them as
+            // its own BACK. See [mouseSideButton] for how a mouse's BACK is told from a pad's or
+            // a remote's; it answers null for every device that cannot be a mouse, so asking it
+            // first re-routes nothing else.
+            mouseSideButton(event)?.let { back ->
+                when (event.action) {
+                    KeyEvent.ACTION_DOWN ->
+                        if (event.repeatCount == 0) mouseForwarder?.sideButtonKey(back, true)
+                    KeyEvent.ACTION_UP -> mouseForwarder?.sideButtonKey(back, false)
+                }
+                return true
+            }
             // Gamepad buttons (incl. DPAD only when truly from a gamepad — else KEYCODE_DPAD_* are
-            // keyboard arrows and belong to the VK path below).
+            // keyboard arrows and belong to the VK path below — and BACK, which is how a pad with
+            // no BUTTON_SELECT scancode delivers its Select: see [Gamepad.padButtonBit], which is
+            // why this asks it rather than `buttonBit`).
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
-                val bit = Gamepad.buttonBit(event.keyCode)
+                val bit = Gamepad.padButtonBit(event.keyCode, event.flags)
                 if (bit != 0) {
                     // The router forwards the bit on this device's own wire pad index and tracks held
                     // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
@@ -539,17 +554,6 @@ class MainActivity : ComponentActivity() {
                     gamepadRouter?.onButton(event, bit)
                     return true // consumed
                 }
-            }
-            // A mouse's side buttons, when they arrive key-shaped, are X1/X2 — not navigation.
-            // Resolved before the remote-pointer hook so pointer mode can't eat them as its own
-            // BACK. See [mouseSideButton] for how a mouse's BACK is told from a remote's.
-            mouseSideButton(event)?.let { back ->
-                when (event.action) {
-                    KeyEvent.ACTION_DOWN ->
-                        if (event.repeatCount == 0) mouseForwarder?.sideButtonKey(back, true)
-                    KeyEvent.ACTION_UP -> mouseForwarder?.sideButtonKey(back, false)
-                }
-                return true
             }
             // TV remote-as-pointer sees non-gamepad keys first (SELECT long-press toggles it;
             // while active it owns the D-pad/SELECT/PLAY-PAUSE/BACK).
@@ -567,12 +571,13 @@ class MainActivity : ComponentActivity() {
                 return true
             }
             when (event.keyCode) {
-                // Whatever [mouseSideButton] didn't claim. A view-level FALLBACK BACK appears when
-                // a BUTTON_* press goes unconsumed, and an air-mouse remote stamps its own BACK
-                // SOURCE_MOUSE; both are duplicates of something already handled, and letting
-                // either through doubles as Android navigation and yanks the user out of the
-                // stream. A remote/keyboard BACK is never mouse-sourced, so it still falls through
-                // to the BackHandler and exits.
+                // Whatever [mouseSideButton] and the pad branch didn't claim. A view-level FALLBACK
+                // BACK appears when a BUTTON_* press goes unconsumed, and an air-mouse remote stamps
+                // its own BACK SOURCE_MOUSE; both are duplicates of something already handled, and
+                // letting either through doubles as Android navigation and yanks the user out of the
+                // stream. A remote/keyboard BACK is never mouse-sourced and never gamepad-sourced,
+                // so it still falls through to the BackHandler and exits — which for a device with
+                // no pad on it is the documented way out.
                 KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_FORWARD ->
                     if (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
                         event.flags and KeyEvent.FLAG_FALLBACK != 0
