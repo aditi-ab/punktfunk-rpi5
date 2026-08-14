@@ -64,7 +64,7 @@ Add the flake and enable the host and/or client:
         ({ ... }: {
           services.punktfunk.host = {
             enable = true;
-            users = [ "alice" ];        # → added to the `input` group for virtual gamepads
+            users = [ "alice" ];        # → `input` group for gamepads, AND scopes the units to alice
             openFirewall = true;        # native + GameStream ports
             desktopSession = true;      # a machine you log into — restart the host with the desktop
             settings = {
@@ -235,6 +235,14 @@ services.punktfunk.host = {
 };
 users.users.streamer.linger = true;
 ```
+
+**Set `users` whenever `autoStart` is on.** `systemd.user.*` installs into *every* user's systemd
+manager — root's included, and root gets one the moment anybody logs in as root. Without `users` to
+scope them, `autoStart` therefore starts a *second* host in root's manager, which wins the race for
+the fixed ports and leaves the real one restarting forever on `bind RTSP 48010: Address already in
+use` (every other listener having bound fine, so it reads like a clash with an unrelated program).
+The module renders `ConditionUser=` from this list to prevent that; with the list empty it falls
+back to refusing system users, which keeps root out but cannot tell two logins apart.
 
 Leave `desktopSession` off here — an appliance starts its own compositor and may never reach
 `graphical-session.target`, which would leave the host permanently stopped. `gamescopeHdr` (on by
