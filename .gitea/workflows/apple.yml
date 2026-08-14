@@ -676,20 +676,23 @@ jobs:
   # Skipped on PRs (cost); runs on main pushes + manual dispatch. Needs the build/test job green
   # first, and is a separate job so a capture hiccup can never red the core signal.
   #
-  # Scope = the two REQUIRED iOS sizes (iPhone 6.9" + iPad 13"), captured on the Simulator
-  # (`simctl io screenshot`, no Screen Recording grant needed). macOS and tvOS are deliberately
-  # NOT in CI: the self-hosted runner is headless (no window-server session), so the mac window
-  # capture can't run there; tvOS needs the Tier-3 build-std slice. Generate those two locally on
-  # a GUI Mac with `clients/apple/tools/screenshots.sh macos tvos`.
+  # Scope = the two REQUIRED iOS sizes (iPhone 6.9" + iPad 13") + Apple TV (1920×1080), captured
+  # on the Simulator (`simctl io screenshot`, no Screen Recording grant needed). The tvOS slice is
+  # Tier-3 (nightly -Zbuild-std, same as the distribute job — slow cold, cached on the self-hosted
+  # runner). The tvOS scene list is explicit: the gamepad-console scenes are iOS/macOS-only, and an
+  # unknown scene name falls back to a NORMAL app launch — the capture would silently be of the
+  # real empty app. macOS stays deliberately NOT in CI: the runner is headless (no window-server
+  # session), so the mac window capture can't run there — generate it locally on a GUI Mac with
+  # `clients/apple/tools/screenshots.sh macos`.
   screenshots:
     needs: swift
     if: gitea.event_name != 'pull_request'
     runs-on: macos-arm64
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust toolchain + iOS Simulator targets
+      - name: Rust toolchain + iOS Simulator targets (+ nightly for the tvOS slices)
         run: |
           if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -699,6 +702,10 @@ jobs:
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          # tvOS targets are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with
+          # nightly + -Zbuild-std, so ensure nightly + rust-src are present (see the swift job).
+          "$RUSTUP" toolchain install nightly --profile minimal
+          "$RUSTUP" component add rust-src --toolchain nightly
 
       # Shared compile cache. The script handles the macOS side (user-prefix install +
       # GITHUB_PATH, bsdtar globbing) — see scripts/ci/ensure-sccache.sh.
@@ -735,10 +742,10 @@ jobs:
               -mtime +7 -exec rm -rf {} + 2>/dev/null || true
           fi
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS slices)
-        run: BUILD_IOS=1 bash scripts/build-xcframework.sh
+      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS slices)
+        run: BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh
 
-      - name: Capture screenshots (iPhone 6.9" + iPad 13"; auto-creates the Simulators)
+      - name: Capture screenshots (iPhone 6.9" + iPad 13" + Apple TV; auto-creates the Simulators)
         working-directory: clients/apple
         env:
           SETTLE: "8" # Simulators settle slower than a local run
@@ -746,6 +753,10 @@ jobs:
           # Independent invocations: one platform failing skips it, not the other.
           bash tools/screenshots.sh ios  || echo "::warning::iOS (iPhone 6.9\") screenshots skipped"
           bash tools/screenshots.sh ipad || echo "::warning::iPad 13\" screenshots skipped"
+          # tvOS shoots only the scenes that exist there — the 06–09 gamepad-console scenes are
+          # compiled out on tvOS (native focus engine), and an unknown name = a normal app launch.
+          SCENES="01-stream 02-hosts 05-settings 03-pair" \
+            bash tools/screenshots.sh tvos || echo "::warning::Apple TV screenshots skipped"
           echo "Produced:"; ls -la screenshots || true
 
       - name: Shut the Simulators down (leaked booted sims once piled up 846 deep)
