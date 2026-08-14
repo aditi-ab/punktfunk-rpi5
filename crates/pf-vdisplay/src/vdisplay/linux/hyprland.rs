@@ -889,16 +889,15 @@ fn portal_thread(
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
-    // Multi-thread runtime: the zbus background reader must be pumped across the
-    // create_session → select_sources → start handshake (see capture/linux.rs).
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
+    // 🛑 The SHARED, never-dropped runtime — NOT a per-cast one. ashpd caches its D-Bus connection
+    // process-globally, and a per-cast runtime takes that connection's background reader down with
+    // it when the cast ends, leaving every later handshake in this process awaiting a reply nothing
+    // is alive to read. That is the whole "the first stream works, the rest are black" bug. See
+    // [`crate::portal_rt`] for the measurement.
+    let rt = match crate::portal_rt::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = setup_tx.send(Err(format!("build tokio runtime: {e}")));
+            let _ = setup_tx.send(Err(e));
             return;
         }
     };
@@ -906,9 +905,21 @@ fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            let proxy = Screencast::new().await.context(
-                "connect ScreenCast portal (is xdg-desktop-portal running with the hyprland backend/xdph?)",
-            )?;
+            // Inside the bound below, deliberately: when the cached connection was orphaned this is
+            // where the thread hung — `Screencast::new()` itself, before a single handshake call —
+            // and a bound that started after it reported the caller's generic timeout instead.
+            let connect = async {
+                Screencast::new().await.context(
+                    "connect ScreenCast portal (is xdg-desktop-portal running with the hyprland backend/xdph?)",
+                )
+            };
+            let proxy = match tokio::time::timeout(HANDSHAKE_BUDGET, connect).await {
+                Ok(v) => v?,
+                Err(_) => bail!(
+                    "connecting to the ScreenCast portal did not return within {}s",
+                    HANDSHAKE_BUDGET.as_secs()
+                ),
+            };
             // NEGOTIATED against what xdph advertises, never asserted from `hw_cursor` alone: a
             // cursor mode the backend does not offer does not degrade — xdg-desktop-portal's
             // FRONTEND fails the call ("Unavailable cursor mode %x") before xdph sees it.

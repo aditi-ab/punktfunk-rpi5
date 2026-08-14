@@ -580,14 +580,13 @@ fn portal_thread(
 
     // Multi-thread runtime: the zbus background reader must be pumped across the
     // create_session → select_sources → start handshake (see capture/linux.rs).
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
+    // The SHARED, never-dropped runtime — see [`crate::portal_rt`] and the long note on
+    // `hyprland.rs`'s copy: a per-cast runtime kills ashpd's process-global cached connection when
+    // the cast ends, and every later handshake in the process then hangs.
+    let rt = match crate::portal_rt::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = setup_tx.send(Err(format!("build tokio runtime: {e}")));
+            let _ = setup_tx.send(Err(e));
             return;
         }
     };
@@ -595,9 +594,20 @@ fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            let proxy = Screencast::new().await.context(
-                "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
-            )?;
+            // Bounded, like `hyprland.rs`'s copy: an orphaned cached connection hangs HERE, before
+            // any handshake call, so a bound that starts later never fires.
+            let connect = async {
+                Screencast::new().await.context(
+                    "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
+                )
+            };
+            let proxy = match tokio::time::timeout(HANDSHAKE_BUDGET, connect).await {
+                Ok(v) => v?,
+                Err(_) => bail!(
+                    "connecting to the ScreenCast portal did not return within {}s",
+                    HANDSHAKE_BUDGET.as_secs()
+                ),
+            };
             // NEGOTIATED against what xdpw advertises, never asserted from `hw_cursor` alone — see
             // the xdph copy in `hyprland.rs` for the incident. xdpw is the sharper case: its
             // screencast.c refuses the mode outright —
