@@ -45,7 +45,7 @@ BUNDLE_ID="io.unom.punktfunk"
 # The App Store set, in listing order — the first three are what most people ever see, so they are
 # the stream itself, the machines it found, and the couch/controller mode. Everything else in
 # ShotScenes.all is a dev scene; capture those with `SCENES="06-gamepad-home 10-edithost" ...`.
-SCENES=(${SCENES:-01-stream 02-hosts 06-gamepad-home 09e-waking-modal 05-settings 03-pair})
+SCENES=(${SCENES:-01-stream 02-hosts 11-library 12-controllers 06-gamepad-home 09e-waking-modal 05-settings 03-pair})
 SETTLE="${SETTLE:-4}" # seconds to let a scene lay out before capturing
 
 mkdir -p "$OUT"
@@ -63,9 +63,13 @@ require_xcode() {
 # ---------------------------------------------------------------------------- macOS
 
 shoot_macos() {
-  log "macOS — building (swift build -c release)…"
-  swift build -c release >/dev/null
-  local bin=".build/release/PunktfunkClient"
+  # DEBUG build, deliberately: the whole shot harness lives behind `#if DEBUG`
+  # (ScreenshotHost/ScreenshotScenes), so a release binary launches as the NORMAL app, never
+  # prints PF_SHOT_WINDOW, and every scene "never reported a window". Debug renders the same
+  # pixels — SwiftUI has no release-only visuals.
+  log "macOS — building (swift build)…"
+  swift build >/dev/null
+  local bin=".build/debug/PunktfunkClient"
   [ -x "$bin" ] || die "build produced no $bin"
 
   for scene in "${SCENES[@]}"; do
@@ -142,6 +146,14 @@ shoot_sim() {
   # incremental build instead of cold-building into a throwaway tmpdir — CI pins this
   # (apple.yml); local runs keep the self-cleaning mktemp default.
   local dd; dd="${PF_SHOT_DERIVED_DATA:-$(mktemp -d)}"; mkdir -p "$dd"
+  # tvOS-SIMULATOR trap (Xcode 26.6 and the 27 beta, local only so far): the build planner
+  # schedules the SwiftPM MACRO plugin targets that swiftui-navigation-transitions pulls in
+  # (OnceMacro/SwizzlingMacro/AssociationMacro) for the *tvOS* triple and never plans their
+  # swift-syntax dependencies at all — "unable to resolve module dependency: 'SwiftSyntax'".
+  # Device archives and iOS builds don't hit it (only the tvOS target links that package), and
+  # prebuilt-vs-source swift-syntax makes no difference. Until Xcode fixes the planner, the
+  # workaround is temporarily unlinking SwiftUINavigationTransitions from the tvOS target
+  # (HomeView's use is canImport-guarded — the push transition degrades to the crossfade).
   xcodebuild -project Punktfunk.xcodeproj -scheme "$scheme" -configuration Debug \
     -sdk "$sdk" -destination "id=$udid" -derivedDataPath "$dd" \
     CODE_SIGNING_ALLOWED=NO build >/dev/null \

@@ -69,7 +69,7 @@ import kotlinx.coroutines.delay
  * to be the same one whichever interface asked.
  */
 @Composable
-fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
+internal fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit, padsOverride: List<PadInfo>? = null) {
     BackHandler(onBack = onBack)
     var testing by remember { mutableStateOf(false) }
     ControllersBody(
@@ -77,6 +77,7 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
         scroll = rememberScrollState(),
         testing = testing,
         onTestingChange = { testing = it },
+        padsOverride = padsOverride,
         // The touch screen holds the probes for its whole life: events are OBSERVED (not consumed)
         // while the test is off, which is what keeps the "Last input" line live while browsing.
         // Nothing else here wants the pad, so there is no one to hand them to.
@@ -99,7 +100,12 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
  *    drops out of the probe slots and B is a HOLD (below). Everything reverts the moment it ends.
  */
 @Composable
-fun ConsoleControllersScreen(gamepadSetting: Int, onBack: () -> Unit, navActive: Boolean = true) {
+internal fun ConsoleControllersScreen(
+    gamepadSetting: Int,
+    onBack: () -> Unit,
+    navActive: Boolean = true,
+    padsOverride: List<PadInfo>? = null,
+) {
     BackHandler(onBack = onBack)
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val hazeState = remember { HazeState() }
@@ -139,6 +145,7 @@ fun ConsoleControllersScreen(gamepadSetting: Int, onBack: () -> Unit, navActive:
                         scroll = scroll,
                         testing = testing,
                         onTestingChange = { testing = it },
+                        padsOverride = padsOverride,
                         // Only while testing: the rest of the time the screen's own nav holds the
                         // probes, so the "Last input" line is a test-time readout here rather than
                         // an always-on one. A pad that reaches this screen at all has already
@@ -200,14 +207,17 @@ private fun ControllersBody(
     onTestingChange: (Boolean) -> Unit,
     observeInput: Boolean,
     contentPadding: PaddingValues,
+    padsOverride: List<PadInfo>? = null,
     heading: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
     val activity = context as? MainActivity
 
-    // Device list, re-read on every hot-plug event.
+    // Device list, re-read on every hot-plug event. [padsOverride] replaces it wholesale: the
+    // screenshot harness runs where no InputDevice can exist, and the connected-pad card is the
+    // point of that shot.
     var generation by remember { mutableIntStateOf(0) }
-    val pads = remember(generation) { Gamepad.pads() }
+    val pads = padsOverride ?: remember(generation) { Gamepad.pads() }.map(::padInfoOf)
     val others = remember(generation) {
         InputDevice.getDeviceIds()
             .toList()
@@ -392,8 +402,8 @@ private fun ControllersBody(
             // Every real controller is forwarded now (Automatic forwards them all, each on its own
             // wire pad index) — not just the first. A joystick-only device Android doesn't classify as
             // a gamepad still can't be forwarded (the host wants a gamepad), so gate the badge on it.
-            pads.forEach { dev ->
-                PadRow(dev, forwarded = isForwarded(dev), gamepadSetting = gamepadSetting)
+            pads.forEach { info ->
+                PadRow(info, gamepadSetting = gamepadSetting)
             }
         }
 
@@ -675,19 +685,19 @@ private fun DsRow(usbDev: android.hardware.usb.UsbDevice) {
 
 /** One detected gamepad: identity, what it streams as, and a rumble test. */
 @Composable
-private fun PadRow(dev: InputDevice, forwarded: Boolean, gamepadSetting: Int) {
+private fun PadRow(info: PadInfo, gamepadSetting: Int) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(dev.name, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                if (forwarded) {
+                Text(info.name, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                if (info.forwarded) {
                     // Android's own controller number (1-based; 0 = unassigned), shown so a multi-pad
                     // user can tell which physical pad is which. The stream's wire pad index is
                     // assigned separately (lowest-free per device) once streaming starts.
-                    val number = dev.controllerNumber
+                    val number = info.controllerNumber
                     Text(
                         if (number > 0) "forwarded · player $number" else "forwarded to host",
                         style = MaterialTheme.typography.labelSmall,
@@ -696,11 +706,11 @@ private fun PadRow(dev: InputDevice, forwarded: Boolean, gamepadSetting: Int) {
                 }
             }
             Text(
-                deviceDetail(dev),
+                info.detail,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            val resolved = Gamepad.prefFor(dev)
+            val resolved = info.resolvedPref
             Text(
                 if (gamepadSetting == Gamepad.PREF_AUTO) {
                     "Streams as: ${prefLabel(resolved)} (automatic)"
@@ -711,9 +721,8 @@ private fun PadRow(dev: InputDevice, forwarded: Boolean, gamepadSetting: Int) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            val canRumble = deviceHasVibrator(dev)
-            if (canRumble) {
-                OutlinedButton(onClick = { testRumble(dev) }) { Text("Test rumble") }
+            if (info.canRumble) {
+                OutlinedButton(onClick = { info.dev?.let(::testRumble) }) { Text("Test rumble") }
             } else {
                 Text(
                     "No rumble motors reported — host rumble will be silent",
@@ -793,6 +802,32 @@ private fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
  */
 private fun isForwarded(dev: InputDevice): Boolean =
     !dev.isVirtual && dev.sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
+
+/**
+ * Everything [PadRow] renders, decoupled from [InputDevice] so the screenshot harness can compose
+ * the connected-pad card at all — Robolectric enumerates no input devices, and a marketing shot of
+ * "no controller detected" sells nothing. Production always maps a real device via [padInfoOf];
+ * [dev] powers the rumble test and is absent only in the harness (the button then no-ops).
+ */
+internal data class PadInfo(
+    val name: String,
+    val detail: String,
+    val forwarded: Boolean,
+    val controllerNumber: Int,
+    val resolvedPref: Int,
+    val canRumble: Boolean,
+    val dev: InputDevice? = null,
+)
+
+internal fun padInfoOf(dev: InputDevice): PadInfo = PadInfo(
+    name = dev.name,
+    detail = deviceDetail(dev),
+    forwarded = isForwarded(dev),
+    controllerNumber = dev.controllerNumber,
+    resolvedPref = Gamepad.prefFor(dev),
+    canRumble = deviceHasVibrator(dev),
+    dev = dev,
+)
 
 /** Whether the controller reports a rumble motor — via VibratorManager (API 31+) or the legacy Vibrator. */
 private fun deviceHasVibrator(dev: InputDevice): Boolean =

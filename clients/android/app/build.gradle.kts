@@ -142,6 +142,10 @@ dependencies {
     // job runs `:app:testDebugUnitTest -PskipRustBuild` (see kit/build.gradle.kts). ---
     testImplementation(composeBom)
     testImplementation("androidx.compose.ui:ui-test-junit4")
+    // Deterministic cover art for the library scene: FakeImageLoaderEngine answers the coverflow's
+    // AsyncImage synchronously with generated posters — no network, no async race under the frozen
+    // animation clock.
+    testImplementation("io.coil-kt:coil-test:2.7.0")
     debugImplementation("androidx.compose.ui:ui-test-manifest") // the ComponentActivity test host
     testImplementation("junit:junit:4.13.2")
     // Real `org.json` for the shared-vectors test: the `org.json` inside `android.jar` is a stub

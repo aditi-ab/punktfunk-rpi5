@@ -35,6 +35,11 @@ enum ShotScenes {
             ShotScene(name: "05-settings", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotSettings())
             },
+            // 06–10 are the iOS/macOS console-shell block below; the library is cross-platform
+            // (tvOS renders the same coverflow), hence the number above that range.
+            ShotScene(name: "11-library", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary())
+            },
         ]
         #if os(iOS) || os(macOS)
         // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
@@ -67,6 +72,13 @@ enum ShotScenes {
             },
             ShotScene(name: "09f-wake-timed-out-modal", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .timedOut, gamepadUI: false))
+            },
+            // FEEL THE GAME — the controller test panel with injected pads. Gated with the
+            // console block because ControllerTestView doesn't build on tvOS, not because it
+            // is a console screen. Landscape like the rest of the store set: the app is built
+            // for horizontal use, so the two pads sit as side-by-side columns (see the scene).
+            ShotScene(name: "12-controllers", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotControllers())
             },
         ]
         #endif
@@ -193,6 +205,24 @@ enum ShotMock {
         #endif
     }
 
+    /// A believable shelf for the library coverflow. Decoded rather than constructed:
+    /// `GameEntry`'s memberwise init is internal to PunktfunkKit, and Codable is its public
+    /// construction surface. No art URLs — the posters render their deterministic fallback
+    /// (title tiles, the Steam entry its brand mark), which is also what keeps the shot offline.
+    static let games: [GameEntry] = {
+        let json = """
+        [
+          {"id": "custom:aurora", "store": "custom", "title": "Aurora Drift", "art": {}},
+          {"id": "steam:starfall", "store": "steam", "title": "Starfall Vale", "art": {}},
+          {"id": "heroic:neon", "store": "heroic", "title": "Neon Circuit", "art": {}},
+          {"id": "gog:ember", "store": "gog", "title": "Ember Peaks", "art": {}},
+          {"id": "steam:launcher", "store": "steam", "title": "Steam", "art": {},
+           "role": "launcher", "icon": "steam"}
+        ]
+        """
+        return (try? JSONDecoder().decode([GameEntry].self, from: Data(json.utf8))) ?? []
+    }()
+
     /// A plausible-looking 32-byte SHA-256 for the trust card / pin lock glyphs.
     static let fingerprint = hostFingerprint(0)
 
@@ -227,6 +257,19 @@ private struct ShotHome: View {
             connect: { _, _ in }, connectDiscovered: { _ in },
             onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #endif
+    }
+}
+
+// MARK: - Library
+
+/// The library coverflow with the mock shelf — the store listing's PICK & PLAY frame. The real
+/// `LibraryCoverflowView`, no network: artless entries settle to their deterministic fallback
+/// posters, and the entrance's 700 ms backstop has long fired by the time the driver captures.
+private struct ShotLibrary: View {
+    var body: some View {
+        LibraryCoverflowView(
+            games: ShotMock.games, artLoader: nil,
+            onLaunch: { _ in }, onDismiss: {}, controllerActive: false)
     }
 }
 
@@ -310,6 +353,61 @@ private struct ShotConnect: View {
             ShotHome()
         }
     }
+}
+
+// MARK: - Controllers (the pads the store listing names)
+
+/// The FEEL THE GAME frame: the controller test panel rendering the two pads the listing talks
+/// about. A GCController cannot be constructed, so the panel draws injected `ShotPad`s — the
+/// DualSense leads with the feedback surface (adaptive-trigger effects, rumble backend, lightbar
+/// + player LEDs), the Xbox pad carries the input readout, frozen mid-game.
+private struct ShotControllers: View {
+    var body: some View {
+        #if os(macOS)
+        // The panel is a window-modal sheet in the app — float it at sheet width over the
+        // dimmed host grid, the way the other mac sheet shots read.
+        ZStack {
+            ShotHome().blur(radius: 24).overlay(Color.black.opacity(0.45))
+            ControllerTestView(shotPads: Self.pads)
+                .frame(width: 500, height: 840)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(radius: 40, y: 16)
+        }
+        #else
+        // Landscape canvas: one column per pad, so neither story is cut by the short height —
+        // the DualSense feedback surface left, the Xbox live-input readout right.
+        HStack(spacing: 0) {
+            ControllerTestView(shotPads: [Self.pads[0]])
+            ControllerTestView(shotPads: [Self.pads[1]])
+        }
+        #endif
+    }
+
+    /// Transport/battery/player ride in `detail` — the panel has no dedicated battery row.
+    /// Each pad shows a different half of the panel: the DualSense skips the input card (the
+    /// effect grid is the marketing point), the Xbox pad skips rumble and shows the readout.
+    static let pads: [ControllerTestView.ShotPad] = [
+        .init(
+            name: "DualSense Wireless Controller",
+            detail: "Bluetooth · 85% · Player 1",
+            isDualSense: true, hasAdaptiveTriggers: true, hasLight: true,
+            rumbleBackend: "DualSense HID · Bluetooth"),
+        .init(
+            name: "Xbox Wireless Controller",
+            detail: "Bluetooth · 60% · Player 2",
+            isDualSense: false, hasAdaptiveTriggers: false, hasLight: false,
+            input: .init(
+                leftStick: .init(x: -0.31, y: 0.54),
+                rightStick: .init(x: 0.72, y: -0.16),
+                leftTrigger: 0.08, rightTrigger: 0.62,
+                buttons: [
+                    ("A", true), ("B", false), ("X", false), ("Y", false),
+                    ("LB", false), ("RB", true), ("L3", false), ("R3", false),
+                    ("Menu", false), ("Opts", false),
+                    ("↑", false), ("↓", false), ("←", false), ("→", false),
+                ])),
+    ]
 }
 #endif
 

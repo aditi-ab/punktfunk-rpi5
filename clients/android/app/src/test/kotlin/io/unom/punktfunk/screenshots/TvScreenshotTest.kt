@@ -50,6 +50,10 @@ class TvScreenshotTest {
     @Test
     fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
 
+    /** The library coverflow at TV geometry — the store's PICK & PLAY frame for the TV listing. */
+    @Test
+    fun library() = shootRoot("library") { LibraryScene() }
+
     @Test
     fun connectingConsole() = shootRoot("connecting-console") { ConnectConsoleScene() }
 }
