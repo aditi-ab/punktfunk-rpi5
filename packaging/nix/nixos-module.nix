@@ -497,6 +497,15 @@ in
         group = "root";
       };
 
+      # CPU-side thread priority for the host's data-plane threads (capture/encode/send and the
+      # 5 ms audio loop) rides RealtimeKit: the host asks rtkit to renice the thread when a direct
+      # setpriority() is refused — the same unprivileged broker PipeWire clients use, so nothing
+      # ever enters the host's permitted set and the KWin identification above stays intact.
+      # NixOS is the one distro family where rtkit is not a given, hence the default here;
+      # mkDefault so an operator who runs without rtkit can turn it off (the host then keeps its
+      # pre-0.29 best-effort no-op behaviour, a pacing cost only).
+      security.rtkit.enable = mkDefault true;
+
       systemd.user.services.punktfunk-host = {
         description = "punktfunk GameStream + punktfunk/1 streaming host";
         documentation = [ "https://git.unom.io/unom/punktfunk" ];
