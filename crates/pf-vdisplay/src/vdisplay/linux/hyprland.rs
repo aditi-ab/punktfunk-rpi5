@@ -115,12 +115,21 @@ fn output_owner_pid(name: &str) -> Option<u32> {
 /// The Hyprland virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) adds one
 /// named headless output and spins up a portal thread owning the cast on it.
 pub struct HyprlandDisplay {
-    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): portal
+    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): PREFER portal
     /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
-    /// composite blend. Off (every non-channel session): `Embedded` — the compositor paints the
-    /// pointer into frames, zero host-side cursor work (the pre-channel default this backend
-    /// always had). ⚠️ Metadata is UNTESTED on-glass for this backend (Phase B wired it so the
-    /// channel isn't silently dead here; KWin/Mutter are the validated legs).
+    /// composite blend. Off (every non-channel session): prefer `Embedded` — the compositor paints
+    /// the pointer into frames, zero host-side cursor work (the pre-channel default this backend
+    /// always had).
+    ///
+    /// Both are only a PREFERENCE: [`crate::portal_cursor`] settles it against what xdph actually
+    /// advertises, because requesting an unadvertised mode makes xdg-desktop-portal fail the call.
+    /// This used to be asserted instead, which is exactly how a cursor-forward session here became
+    /// a black client.
+    ///
+    /// ⚠️ On current xdph the metadata arm is UNREACHABLE, not merely untested: measured on .21
+    /// 2026-08-14 (Hyprland 0.56.2, xdph 1.4.1) `AvailableCursorModes` = 3 — `Hidden|Embedded`
+    /// only. Every session on this backend therefore resolves to `Embedded` today; KWin/Mutter
+    /// remain the legs where the metadata channel is actually exercised.
     hw_cursor: bool,
 }
 
@@ -788,13 +797,7 @@ fn portal_thread(
     stop: Arc<AtomicBool>,
     hw_cursor: bool,
 ) {
-    // Portal cursor mode per the session's channel negotiation (see the struct doc).
-    let cursor_mode = if hw_cursor {
-        CursorMode::Metadata
-    } else {
-        CursorMode::Embedded
-    };
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
@@ -818,6 +821,14 @@ fn portal_thread(
             let proxy = Screencast::new().await.context(
                 "connect ScreenCast portal (is xdg-desktop-portal running with the hyprland backend/xdph?)",
             )?;
+            // NEGOTIATED against what xdph advertises, never asserted from `hw_cursor` alone: a
+            // cursor mode the backend does not offer does not degrade — xdg-desktop-portal's
+            // FRONTEND fails the call ("Unavailable cursor mode %x") before xdph sees it.
+            // MEASURED on .21 2026-08-14, Hyprland 0.56.2 + xdph 1.4.1 (both current):
+            // `AvailableCursorModes` = 3 (Hidden|Embedded) — metadata is NOT offered. So the old
+            // hardcode killed EVERY cursor-forward session here, on today's packages, not just on
+            // old installs: `unavailable cursor mode 4`, "pipeline build failed", black client.
+            let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdph").await;
             let session = proxy
                 .create_session(Default::default())
                 .await

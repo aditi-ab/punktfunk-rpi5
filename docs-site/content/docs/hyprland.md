@@ -84,6 +84,31 @@ and fails the session with a clear error rather than streaming a blank surface. 
 capture the Hyprland log (`hyprctl` instance dir → `hyprland.log`) and check your GPU's GBM support;
 running Hyprland as a real session (not nested) is the supported configuration.
 
+## Troubleshooting: black client + "unavailable cursor mode 4"
+
+A black client, `pipeline build failed` in the host log, and **`unavailable cursor mode 4`** from
+xdph are one failure, not three.
+
+`4` is the ScreenCast portal's *metadata* cursor mode, which the host prefers when the client draws
+the pointer locally (desktop mouse mode). xdg-desktop-portal-hyprland **does not offer that mode** —
+on a current stack (Hyprland 0.56.2, xdph 1.4.1) its `AvailableCursorModes` is `3`, meaning hidden
+and embedded only. Asking for a mode the backend does not advertise is not a soft failure:
+`xdg-desktop-portal` rejects the call outright, so the cast died during setup and the client had
+nothing to show.
+
+Updating xdph does **not** fix this — the mode is absent on current versions, not just old ones.
+Hosts from this release check what your portal advertises and use an embedded cursor instead, so the
+session streams. If you are on an older host, switch the client to **game mouse mode**: that stops
+it asking for the metadata cursor at all.
+
+If the pointer misbehaves on an xdph that *does* advertise metadata support, pin the mode:
+
+```sh
+PUNKTFUNK_PORTAL_CURSOR_MODE=embedded
+```
+
+See [Configuration](/docs/configuration#compositor-specific-linux).
+
 ## Permission system
 
 Hyprland's permission system (`ecosystem.enforce_permissions`, 0.49+, **off by default**) can deny

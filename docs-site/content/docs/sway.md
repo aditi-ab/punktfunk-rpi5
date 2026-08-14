@@ -82,6 +82,20 @@ For how long the virtual output lives, and extend-vs-exclusive topology, see
   Then `systemctl --user restart xdg-desktop-portal`. On a box with only xdpw installed there is
   nothing to choose between, so you can skip this.
 
+## Troubleshooting: black client + "unsupported cursor mode requested"
+
+A black client with `pipeline build failed` in the host log and **`dbus: unsupported cursor mode
+requested, cancelling`** from xdpw is one failure, not two.
+
+xdpw refuses the ScreenCast *metadata* cursor mode and cancels the cast, and the portal spec makes
+that fatal rather than a fallback. Hosts before this release asked for it whenever the client drew
+the pointer itself (desktop mouse mode), so those sessions never produced a frame. Hosts from this
+release check what xdpw advertises first and use an embedded cursor instead, so the session streams.
+
+On an older host, switch the client to **game mouse mode** — it stops asking for the metadata cursor
+and the stream comes up. The same failure on Hyprland reads `unavailable cursor mode 4`; see
+[Hyprland](/docs/hyprland).
+
 ## Start the host
 
 With the backend selected, start the host from **inside your Sway session**:

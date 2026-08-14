@@ -214,6 +214,15 @@ pub struct HostConfig {
     /// showing the wrong monitor is worse than showing none). Linux-only today; see
     /// `design/per-monitor-portal-capture.md`.
     pub capture_monitor: Option<String>,
+    /// `PUNKTFUNK_PORTAL_CURSOR_MODE` — `auto` (default) · `hidden` · `embedded` · `metadata`.
+    /// Pin the ScreenCast cursor mode the Linux portal backends PREFER, instead of the one the
+    /// session negotiates (`metadata` when the client draws the pointer itself, `embedded`
+    /// otherwise). The pin is a preference, not a command: it still runs through
+    /// `portal_cursor::pick`, so it can never ask a backend for a mode the backend does not
+    /// advertise — that closes the session rather than degrading, which is the failure this knob
+    /// sits next to. Exists for the backend that advertises a mode it implements badly, where
+    /// negotiation has nothing to go on; `embedded` is the safe answer there.
+    pub portal_cursor_mode: Option<String>,
     /// `PUNKTFUNK_COMPOSITOR` — explicit compositor override (operator/CI/test). NOT the runtime-detected
     /// session — this one is a constant operator knob; `apply_session_env` never writes it.
     pub compositor: Option<String>,
@@ -399,6 +408,12 @@ impl HostConfig {
             // Trimmed + emptied-to-None: `PUNKTFUNK_CAPTURE_MONITOR=` in a host.env means "not
             // set", not "match the monitor named empty string".
             capture_monitor: val("PUNKTFUNK_CAPTURE_MONITOR")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            // Same emptied-to-None rule: a bare `PUNKTFUNK_PORTAL_CURSOR_MODE=` left in a host.env
+            // means "not set", not an unrecognised value to warn about. The spellings are parsed
+            // (and warned about) at the use site, `pf-vdisplay`'s `portal_cursor::want`.
+            portal_cursor_mode: val("PUNKTFUNK_PORTAL_CURSOR_MODE")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             compositor: val("PUNKTFUNK_COMPOSITOR"),

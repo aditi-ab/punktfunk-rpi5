@@ -824,6 +824,15 @@ pub mod admission;
 #[path = "vdisplay/linux/portal_config.rs"]
 mod portal_config;
 
+/// Which ScreenCast cursor mode to REQUEST — negotiated against `AvailableCursorModes` instead of
+/// hardcoded, because a mode the backend does not advertise closes the session outright.
+///
+/// Declared unconditionally for the same reason as `portal_config` above: the ladder is pure
+/// integer work whose tests are the only place its behaviour is observable without a compositor,
+/// so they should run on every platform's CI rather than only where the callers compile.
+#[path = "vdisplay/linux/portal_cursor.rs"]
+mod portal_cursor;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
